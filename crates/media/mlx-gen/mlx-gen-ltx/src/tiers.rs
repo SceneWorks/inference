@@ -24,7 +24,7 @@
 //! | DiT attention + FFN Linears (1344) | **yes** | 37.04 GB | [`crate::transformer::Linear`] (`.scales` predicate) |
 //! | the two embeddings connectors' attention + FFN Linears (96) | **yes** | 4.02 GB | [`crate::connector::Connector`] (sc-18775) |
 //! | the two `text_embedding_projection.*_aggregate_embed` Linears | **yes** | 2.31 GB | [`crate::text_encoder::LtxTextEncoder`] (sc-18775) |
-//! | Gemma 4 attention + MLP projections (328) | **yes** | 21.85 GB | `mlx_llm::primitives::projection::Projection` (`config.quantization`) |
+//! | Gemma 4 attention + MLP projections (328) | **q8 only** | 21.85 GB | `mlx_llm::primitives::projection::Projection` (`config.quantization`); q4 measured too lossy — [`TEXT_ENCODER_Q4_QUALITY`] |
 //! | `model.embed_tokens` | no | 2.01 GB | an embedding **lookup**, not a matmul — mlx-llm has no quantized-embedding read path, and the weight is tied to an LM head LTX never runs |
 //! | the Gemma vision tower / audio + multimodal projectors | no | 0.08 GB | not on the LTX text path at all; carried verbatim so the pack stays self-contained |
 //! | conv video VAE, audio VAE, vocoder, both latent upsamplers | no | 3.07 GB | **zero** rank-2 Linear weights between them — every weight is a Conv1d/2d/3d kernel, a norm, or a per-channel statistic, and MLX has no quantized convolution |
@@ -54,10 +54,11 @@
 //!   `model_version`, the transformer's `gemma_source_checkpoint`, the text encoder's `gemma_config`,
 //!   and the embedded licence text) rather than being re-emitted bare. The loader reads config from
 //!   metadata; a converter that drops it produces a bundle that loads as garbage or not at all;
-//! * the text encoder's `gemma_config` gains a `quantization` block in the quantized tiers, which is
-//!   exactly the trigger `mlx_llm::config::ModelConfig::from_json` reads to bind pre-quantized
+//! * the text encoder's `gemma_config` gains a `quantization` block in the tiers that pack it, which
+//!   is exactly the trigger `mlx_llm::config::ModelConfig::from_json` reads to bind pre-quantized
 //!   projections. It is stamped **inside `text_config`** for the Gemma 4 wrapper the LTX-2.5 encoder
-//!   ships — see [`stamp_gemma_quantization`].
+//!   ships — see [`stamp_gemma_quantization`] — and is deliberately absent from `q4`, which ships the
+//!   encoder dense on measured evidence ([`TEXT_ENCODER_Q4_QUALITY`]).
 //!
 //! # Traps this module is written around
 //!
@@ -179,6 +180,13 @@ pub enum DenseReason {
     /// quantized emission could not be exercised by any test — it would be unverified weights on a
     /// rehost. Carries the story that lands the port.
     NoMlxPort(&'static str),
+    /// **Measured**, not structural: the component quantizes cleanly at this tier's width, and the
+    /// result is too far from bf16 to ship. Carries the measurement that says so, so the exemption
+    /// can be re-litigated against a number rather than a memory.
+    ///
+    /// The only current holder is the Gemma 4 text encoder at `q4` — see
+    /// [`TEXT_ENCODER_Q4_QUALITY`].
+    BelowQualityBar(&'static str),
     /// A dense tier: nothing is quantized anywhere, by definition.
     DenseTier,
 }
@@ -189,6 +197,7 @@ impl DenseReason {
         match self {
             DenseReason::NoLinearWeights => "no-linear-weights",
             DenseReason::NoMlxPort(_) => "no-mlx-port",
+            DenseReason::BelowQualityBar(_) => "below-quality-bar",
             DenseReason::DenseTier => "dense-tier",
         }
     }
@@ -203,6 +212,10 @@ impl DenseReason {
             DenseReason::NoMlxPort(story) => format!(
                 "this crate has no MLX port that can run these weights yet ({story}); quantizing \
                  them would ship weights no test can exercise"
+            ),
+            DenseReason::BelowQualityBar(evidence) => format!(
+                "quantizing this component at this tier's width is structurally fine and \
+                 measurably too lossy to ship: {evidence}"
             ),
             DenseReason::DenseTier => "the bf16 tier is dense by definition".to_string(),
         }
@@ -254,6 +267,38 @@ fn is_text_encoder_quantizable(key: &str) -> bool {
         return false;
     }
     matches_quant_suffix(key, GEMMA_QUANT_SUFFIXES)
+}
+
+/// **The TE quantization decision, and the measurement behind it (sc-18775).**
+///
+/// `crates/llm/mlx-llm/tests/ltx_2_5_te_tier_quality.rs` runs one prompt through the Gemma 4 encoder
+/// at each width and reports every one of the 49 hidden states against bf16 — all 49, because the
+/// LTX-2.5 feature extractor **concatenates the whole stack** and then per-token-RMS normalizes it,
+/// which scales a low-norm middle layer's error straight back up into the conditioning the DiT sees.
+/// The last layer alone would have said everything was fine.
+///
+/// Measured 2026-08-25 on the real 22.31 GiB encoder, worst case over the 49 states:
+///
+/// | width | worst cos | worst rel L2 | bar (cos / rel) | |
+/// |---|---|---|---|---|
+/// | q8 | 0.999086 | 0.04320 | > 0.995 / < 0.10 | **passes** |
+/// | q4 | 0.889414 | 0.53488 | > 0.97 / < 0.30 | **fails** |
+///
+/// So `q8` packs the encoder and `q4` does **not** — the `q4` tier ships the dense bf16 encoder.
+/// That is a deliberate, measured exception to the whole-pipeline tier contract, declared in the
+/// manifest as [`DenseReason::BelowQualityBar`] rather than left as an unexplained dense component,
+/// and it is the reason a `q4` tier is only ~2 % smaller than a `q8` one (41.0 GB vs 41.8 GB) —
+/// a number sc-18781's footprints have to carry rather than assume.
+pub const TEXT_ENCODER_Q4_QUALITY: &str = "sc-18775: over the 49 hidden states the LTX-2.5 feature \
+     extractor concatenates, q4 lands at worst cos 0.889414 / rel L2 0.53488 against bf16 (bar: cos \
+     > 0.97, rel L2 < 0.30); q8 lands at 0.999086 / 0.04320 and passes";
+
+/// Whether this tier ships the text encoder dense, and why. See [`TEXT_ENCODER_Q4_QUALITY`].
+fn text_encoder_dense_reason(tier: LtxTier) -> Option<DenseReason> {
+    match tier {
+        LtxTier::Q4 => Some(DenseReason::BelowQualityBar(TEXT_ENCODER_Q4_QUALITY)),
+        _ => None,
+    }
 }
 
 /// The DiffVAE decoder Linears [`crate::diff_vae::NaDiffusionDecoder`] binds through
@@ -871,15 +916,19 @@ pub fn convert_2_5_tier(
             connector.insert(key, value);
         }
 
+        // The measured exception (sc-18775). See [`TEXT_ENCODER_Q4_QUALITY`].
+        let exempt = text_encoder_dense_reason(tier);
         let mut metadata = component_metadata(resolved, tier);
-        stamp_gemma_quantization(&mut metadata, tier, group_size, resolved.path())?;
+        if exempt.is_none() {
+            stamp_gemma_quantization(&mut metadata, tier, group_size, resolved.path())?;
+        }
         components.push(emit_component(
             out,
             Emit {
                 name: "text_encoder",
                 weights: encoder,
                 metadata,
-                exempt: None,
+                exempt,
             },
             tier,
             group_size,

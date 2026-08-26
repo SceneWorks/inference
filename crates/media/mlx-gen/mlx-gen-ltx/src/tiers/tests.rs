@@ -350,26 +350,24 @@ fn write_conv_vae(root: &Path) -> PathBuf {
 }
 
 fn write_audio_vae(root: &Path) -> PathBuf {
-    let mut t: Vec<(String, Array)> = Vec::new();
-    t.push((
-        "audio_vae.decoder.conv_in.conv.weight".into(),
-        ones(&[8, 4, 3, 3]),
-    ));
-    t.push(("audio_vae.decoder.conv_in.conv.bias".into(), ones(&[8])));
-    t.push((
-        "audio_vae.per_channel_statistics.mean-of-means".into(),
-        ones(&[4]),
-    ));
-    t.push((
-        "audio_vae.per_channel_statistics.std-of-means".into(),
-        ones(&[4]),
-    ));
-    t.push(("vocoder.vocoder.conv_pre.weight".into(), ones(&[8, 4, 3])));
-    t.push(("vocoder.vocoder.conv_pre.bias".into(), ones(&[8])));
-    t.push((
-        "vocoder.bwe_generator.ups.0.weight".into(),
-        ones(&[4, 8, 3]),
-    ));
+    let t: Vec<(String, Array)> = vec![
+        (
+            "audio_vae.decoder.conv_in.conv.weight".into(),
+            ones(&[8, 4, 3, 3]),
+        ),
+        ("audio_vae.decoder.conv_in.conv.bias".into(), ones(&[8])),
+        (
+            "audio_vae.per_channel_statistics.mean-of-means".into(),
+            ones(&[4]),
+        ),
+        (
+            "audio_vae.per_channel_statistics.std-of-means".into(),
+            ones(&[4]),
+        ),
+        ("vocoder.vocoder.conv_pre.weight".into(), ones(&[8, 4, 3])),
+        ("vocoder.vocoder.conv_pre.bias".into(), ones(&[8])),
+        ("vocoder.bwe_generator.ups.0.weight".into(), ones(&[4, 8, 3])),
+    ];
     let path = root.join("vae/ltx-2.5-audio-vae-bf16.safetensors");
     write_file(
         &path,
@@ -431,10 +429,7 @@ fn write_diff_vae(root: &Path) -> PathBuf {
 
     // The encoder half — conv kernels only, which is why `diffusion_vae_encoder` keeps its
     // `no-linear-weights` exemption while the decoder loses its `no-mlx-port` one.
-    t.push((
-        "encoder.conv_in.conv.weight".into(),
-        ones(&[8, 4, 3, 3, 3]),
-    ));
+    t.push(("encoder.conv_in.conv.weight".into(), ones(&[8, 4, 3, 3, 3])));
     t.push(("encoder.conv_in.conv.bias".into(), ones(&[8])));
     t.push(("encoder.norm_out.weight".into(), ones(&[8])));
 
@@ -475,8 +470,14 @@ fn write_diff_vae(root: &Path) -> PathBuf {
         }
     }
     t.push(("decoder.norm_out.weight".into(), ones(&[DIM])));
-    t.push(("per_channel_statistics.mean-of-means".into(), ones(&[LATENT])));
-    t.push(("per_channel_statistics.std-of-means".into(), ones(&[LATENT])));
+    t.push((
+        "per_channel_statistics.mean-of-means".into(),
+        ones(&[LATENT]),
+    ));
+    t.push((
+        "per_channel_statistics.std-of-means".into(),
+        ones(&[LATENT]),
+    ));
 
     let path = root.join("vae/ltx-2.5-video-vae-diffusion-bf16.safetensors");
     write_file(
@@ -662,16 +663,22 @@ fn every_quantizable_segment_lands_at_the_tier_precision() {
             ("connector", connector),
             ("text_encoder", gemma),
         ] {
+            // The text encoder is the one measured exception: `q4` ships it dense
+            // (`TEXT_ENCODER_Q4_QUALITY`). Asking the policy rather than hardcoding "q4 too" keeps
+            // this test and the converter unable to disagree about which tiers pack it.
+            let packs = quantized
+                && !(component == "text_encoder"
+                    && text_encoder_dense_reason(report.tier).is_some());
             let entry = report.component(component).expect(component);
             assert_eq!(
                 entry.quantized_linears,
-                if quantized { expected } else { 0 },
+                if packs { expected } else { 0 },
                 "{} / {component}: quantized-Linear count",
                 report.tier
             );
             assert_eq!(
                 entry.dense_reason.is_some(),
-                !quantized,
+                !packs,
                 "{} / {component}: a quantized component must carry no dense reason",
                 report.tier
             );
@@ -683,12 +690,15 @@ fn every_quantizable_segment_lands_at_the_tier_precision() {
             ("connector", connector),
             ("text_encoder", gemma),
         ] {
+            let packs = quantized
+                && !(component == "text_encoder"
+                    && text_encoder_dense_reason(report.tier).is_some());
             let header = tier_header(&out, report.tier, component);
             let scales = header.keys_ending(".scales");
             let biases = header.keys_ending(".biases");
             assert_eq!(
                 scales.len(),
-                if quantized { expected } else { 0 },
+                if packs { expected } else { 0 },
                 "{} / {component}: `.scales` tensors on disk",
                 report.tier
             );
@@ -743,11 +753,26 @@ fn tier_sizes_are_ordered_and_the_exempt_components_do_not_move() {
         q8.bytes,
         bf16.bytes
     );
-    for component in ["transformer", "connector", "text_encoder"] {
+    for component in ["transformer", "connector"] {
         let a = q4.component(component).unwrap().bytes;
         let b = q8.component(component).unwrap().bytes;
         let c = bf16.component(component).unwrap().bytes;
         assert!(a < b && b < c, "{component}: {a} < {b} < {c}");
+    }
+    // The text encoder is the measured exception and breaks the ladder on purpose:
+    // `q4` ships it dense (`TEXT_ENCODER_Q4_QUALITY`), so it is the **q8** file that is smallest,
+    // and `q4`'s matches the dense tier's. Asserting the plain ordering here would either fail or,
+    // worse, have to be relaxed into `<=` — which would stop noticing a q8 encoder that silently
+    // went dense too.
+    {
+        let a = q4.component("text_encoder").unwrap().bytes;
+        let b = q8.component("text_encoder").unwrap().bytes;
+        let c = bf16.component("text_encoder").unwrap().bytes;
+        assert!(b < a, "q8 must pack the encoder: q8 {b} < q4 {a}");
+        assert!(
+            a.abs_diff(c) < 64,
+            "q4 ships the dense encoder, so it must match bf16's size: {a} vs {c}"
+        );
     }
     // An exempt component carries the *same tensors* in every tier. Its file size is not literally
     // equal — the `sceneworks_tier` metadata value is 2 characters in `q4` and 4 in `bf16`, and the
@@ -836,12 +861,67 @@ fn the_diff_vae_decoder_is_packed_except_the_linear_no_affine_group_divides() {
         );
         // The SwiGLU projections are biasless upstream; packing must not invent an output bias.
         assert!(
-            !packed
-                .tensors
-                .contains_key("diff_blocks.0.mlp.w_gate.bias"),
+            !packed.tensors.contains_key("diff_blocks.0.mlp.w_gate.bias"),
             "{tier}: the SwiGLU projections carry no output bias in any tier"
         );
     }
+}
+
+/// **The measured TE exception, shipped**: `q8` packs the Gemma 4 encoder, `q4` does not.
+///
+/// `q4`'s encoder failed the quality bar in `mlx-llm`'s `ltx_2_5_te_tier_quality` measurement — worst
+/// cos 0.889414 / rel L2 0.53488 over the 49 hidden states the LTX-2.5 feature extractor
+/// concatenates — so the `q4` tier ships it dense. Three things have to agree for that to be a
+/// decision rather than a bug, and this pins all three: no packed tensors, a declared
+/// `below-quality-bar` reason carrying the evidence, and **no `quantization` block** (which would
+/// send `mlx_llm` looking for `.scales` that are not there).
+#[test]
+fn q4_ships_the_text_encoder_dense_on_measured_evidence_and_q8_packs_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = fixture_bundle(&tmp.path().join("src"));
+    let out = tmp.path().join("tiers");
+    let reports = convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+
+    for report in &reports {
+        let te = report.component("text_encoder").expect("a text encoder");
+        let header = tier_header(&out, report.tier, "text_encoder");
+        let packed = header
+            .tensors
+            .keys()
+            .filter(|k| k.ends_with(".scales"))
+            .count();
+        match report.tier {
+            LtxTier::Q8 => {
+                assert!(
+                    packed > 0 && te.dense_reason.is_none(),
+                    "q8 packs the encoder: {packed} scales, reason {:?}",
+                    te.dense_reason
+                );
+            }
+            LtxTier::Q4 => {
+                assert_eq!(packed, 0, "q4 must ship the encoder dense");
+                let reason = te
+                    .dense_reason
+                    .expect("q4's dense encoder must declare why");
+                assert_eq!(reason.id(), "below-quality-bar");
+                assert!(
+                    reason.describe().contains("0.889414"),
+                    "the exemption must carry the measurement that drove it, got: {}",
+                    reason.describe()
+                );
+            }
+            LtxTier::Bf16 => assert_eq!(packed, 0),
+        }
+    }
+
+    // q4's encoder is byte-for-byte the dense tier's, modulo the tier stamp — the only honest
+    // meaning of "q4 ships the bf16 encoder".
+    let q4 = tier_header(&out, LtxTier::Q4, "text_encoder");
+    let dense = tier_header(&out, LtxTier::Bf16, "text_encoder");
+    assert_eq!(
+        q4.tensors, dense.tensors,
+        "q4's encoder must carry exactly the dense tier's tensors"
+    );
 }
 
 /// Every dense component of a quantized tier declares **why**, and the structural reason is checked
@@ -1008,20 +1088,25 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
         // tier's packed encoder then fails to load at all. Asserting on the top level is the
         // convergence-point mistake that let that ship — this reads `text_config` and pins the top
         // level empty so the block has exactly one home.
+        //
+        // The block is present iff *this tier packs the encoder*, which is not the same as "this
+        // tier packs" — `q4` ships the encoder dense on measured evidence (`TEXT_ENCODER_Q4_QUALITY`)
+        // and must therefore carry no block, or `mlx_llm` would look for `.scales` that are not
+        // there.
         let nested = &gemma["text_config"];
         assert!(
             gemma.get("quantization").is_none(),
             "{tier}: the `quantization` block belongs in `text_config`, not the wrapper's top level"
         );
-        match tier.bits() {
-            Some(bits) => {
+        match (tier.bits(), text_encoder_dense_reason(*tier)) {
+            (Some(bits), None) => {
                 assert_eq!(nested["quantization"]["bits"], bits);
                 assert_eq!(nested["quantization"]["group_size"], DEFAULT_GROUP_SIZE);
                 assert_eq!(nested["quantization"]["mode"], "affine");
             }
-            None => assert!(
+            _ => assert!(
                 nested.get("quantization").is_none(),
-                "the dense tier must not claim a quantization block"
+                "{tier}: a tier that ships the encoder dense must not claim a quantization block"
             ),
         }
     }

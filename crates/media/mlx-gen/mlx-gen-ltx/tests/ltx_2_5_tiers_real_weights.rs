@@ -320,12 +320,27 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
                 let reason = entry.get("dense_reason").and_then(|v| v.as_str());
                 match tier.bits() {
                     None => assert_eq!(reason, Some("dense-tier"), "{tier}/{name}"),
+                    // `below-quality-bar` is the measured exception (the q4 text encoder,
+                    // `TEXT_ENCODER_Q4_QUALITY`); the other two are structural. All three are
+                    // declarations carried in the manifest — the point of this branch is that a
+                    // dense component inside a quantized tier is never silent.
                     Some(_) => assert!(
-                        matches!(reason, Some("no-linear-weights") | Some("no-mlx-port")),
+                        matches!(
+                            reason,
+                            Some("no-linear-weights")
+                                | Some("no-mlx-port")
+                                | Some("below-quality-bar")
+                        ),
                         "{tier}/{name}: a component dense inside a quantized tier must declare \
                          why; got {reason:?}"
                     ),
                 }
+                // A declared reason must carry its justification, not just an id.
+                let detail = entry.get("dense_reason_detail").and_then(|v| v.as_str());
+                assert!(
+                    detail.is_some_and(|d| !d.is_empty()),
+                    "{tier}/{name}: the dense reason must ship its justification, got {detail:?}"
+                );
             }
 
             // Every packed weight really is packed, and every unpacked float really is bf16 — the
@@ -367,8 +382,12 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
             assert_eq!(packed, want, "{tier}/{name}: packed Linear count");
         }
         // The text encoder's set is per-layer and per-layer-type, so derive it from the file:
-        // every `{q,k,v,o}_proj` / `{gate,up,down}_proj` present must be packed, and the embedding
-        // table must not be.
+        // every `{q,k,v,o}_proj` / `{gate,up,down}_proj` present must be packed — **in the tiers
+        // that pack the encoder at all**. `q4` is not one of them: 4-bit measured worst cos 0.889414
+        // / rel L2 0.53488 over the 49 concatenated hidden states, outside the bar, so the q4 tier
+        // ships the dense encoder (`tiers::TEXT_ENCODER_Q4_QUALITY`). Either way, all 328
+        // projections must agree with each other — a half-packed encoder is the real failure here.
+        let te_packs = *tier == LtxTier::Q8;
         let te = component_header(&root, *tier, "text_encoder");
         let mut projections = 0usize;
         for key in te.tensors.keys() {
@@ -390,8 +409,8 @@ fn every_tier_is_quantized_end_to_end_and_its_size_is_measured() {
             let base = key.strip_suffix(".weight").unwrap();
             assert_eq!(
                 te.tensors.contains_key(&format!("{base}.scales")),
-                tier.bits().is_some(),
-                "{tier}/text_encoder/{key}: packed state must follow the tier"
+                te_packs,
+                "{tier}/text_encoder/{key}: packed state must follow the tier's encoder decision"
             );
         }
         assert_eq!(
@@ -708,8 +727,9 @@ fn every_component_loads_and_forwards_at_every_tier() {
             let (f, h, wid) = (2, 4, 4);
             let latent = Array::ones::<f32>(&[1, cfg.in_channels, f, h, wid]).unwrap();
             let shape5 = cfg.noise_shape(f, h, wid);
-            let noise = Array::zeros::<f32>(&[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]])
-                .unwrap();
+            let noise =
+                Array::zeros::<f32>(&[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]])
+                    .unwrap();
             let t = Instant::now();
             let out = decoder
                 .decode(&latent, &noise)
@@ -991,11 +1011,39 @@ fn the_gemma_4_checkpoint_shapes_survive_at_every_tier() {
         assert_eq!(ids.shape(), &[1, 128]);
         assert_eq!(mask.shape(), &[1, 128]);
 
-        // The `quantization` block that binds the packed projections is present iff the tier packs.
+        // The `quantization` block that binds the packed projections is present iff **this tier
+        // packs the encoder** — which is not the same as "this tier packs": `q4` ships the encoder
+        // dense on measured evidence (`TEXT_ENCODER_Q4_QUALITY`). Read from `text_config`, where
+        // `mlx_llm::config::ModelConfig::from_json` looks for it on a Gemma 4 wrapper (it rebinds to
+        // `text_config` before reading `quantization`). This assertion previously read the wrapper's
+        // top level and passed against tiers whose packed encoder `mlx_llm` refused to load at all.
+        // Ground truth for "this tier packs the encoder" is the file's own tensors, never the tier
+        // id: `q4` packs everywhere else and not here.
+        let packed = te.tensors.keys().any(|k| k.ends_with(".scales"));
+        assert_eq!(
+            packed,
+            *tier == LtxTier::Q8,
+            "{tier}: q8 is the only tier that packs the encoder (TEXT_ENCODER_Q4_QUALITY)"
+        );
         let gemma: serde_json::Value = serde_json::from_str(&te.metadata["gemma_config"]).unwrap();
-        match tier.bits() {
-            Some(bits) => assert_eq!(gemma["quantization"]["bits"], bits, "{tier}"),
-            None => assert!(gemma.get("quantization").is_none(), "{tier}"),
+        let nested = &gemma["text_config"];
+        assert!(
+            gemma.get("quantization").is_none(),
+            "{tier}: the block belongs in `text_config`, not the wrapper's top level"
+        );
+        assert_eq!(
+            nested.get("quantization").is_some(),
+            packed,
+            "{tier}: the encoder must declare a quantization block iff it carries packed weights — \
+             a block without `.scales` sends `mlx_llm` looking for tensors that are not there, and \
+             `.scales` without a block makes it refuse the file outright"
+        );
+        if packed {
+            assert_eq!(
+                nested["quantization"]["bits"],
+                tier.bits().unwrap(),
+                "{tier}"
+            );
         }
     }
     let _ = DenseReason::NoLinearWeights;
