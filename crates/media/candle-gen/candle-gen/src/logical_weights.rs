@@ -52,6 +52,9 @@ use gen_core::checkpoint_codec::{
     WeightEncoding, DENSE_BF16_CODEC, DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC,
     FP8_E5M2_SCALAR_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
+use gen_core::checkpoint_facts::{
+    CheckpointWeightFacts, ExecutionRepresentation, NativeExecutionCapability,
+};
 use gen_core::ProviderRegistryBuilder;
 
 use crate::quant::Nvfp4Tensor;
@@ -118,6 +121,26 @@ impl CandleCodecResidency {
         nvfp4_native: false,
     };
 
+    /// Render this policy as the backend-neutral **host capability** that crosses the worker
+    /// boundary (sc-21484): the codec rows this host can execute in their stored packing, with no
+    /// checkpoint in hand.
+    ///
+    /// This is the declaration [`gen_core::checkpoint_facts::CheckpointWeightFacts`] checks a
+    /// native receipt row against, so a host below a floor cannot produce facts that label its run
+    /// native. Datacenter `sm_100` is below the NVFP4 leg's `(12, 0)` floor
+    /// ([`crate::quant::NVFP4_COMPUTE_CAP_FLOOR`]) and so lists nothing here — the exclusion is the
+    /// floor comparison itself, not a special case.
+    pub fn native_execution_capability(&self) -> NativeExecutionCapability {
+        let mut ids: Vec<&'static str> = Vec::new();
+        if self.fp8_e4m3_native {
+            ids.push(FP8_E4M3_SCALAR_CODEC.codec_id);
+        }
+        if self.nvfp4_native {
+            ids.push(NVFP4_CODEC.codec_id);
+        }
+        NativeExecutionCapability::new(ids)
+    }
+
     /// Probe the device's eligibility for each native leg. Non-CUDA devices (and every build
     /// without the `cuda` feature) are dense-only; a CUDA device whose capability cannot be read is
     /// treated as below both floors (dense fallback — the safe direction, never the silent-packed
@@ -126,6 +149,27 @@ impl CandleCodecResidency {
         Self {
             fp8_e4m3_native: cuda_meets_sm89_floor(device),
             nvfp4_native: cuda_meets_sm120_floor(device),
+        }
+    }
+
+    /// This policy with the fp8 E4M3 native leg **masked off** (sc-11045 fix round, MAJOR 10 —
+    /// the E3 packed-FP8 seam has no provider consumer yet).
+    ///
+    /// The engine can *price and read* a packed E4M3 row (`LogicalTensor::PackedFp8E4M3`, the
+    /// `matmul_fp8` operands), but no provider construction path consumes one: krea's
+    /// `linear_detect_planned` and flux2's `PlannedDitWeights::qlinear` both answer the arm with a
+    /// typed refusal, and `Fp8Linear` has neither a packed-parts constructor nor an `AdaptLinear`
+    /// base arm to ride the shared additive seam. On an `sm_89+` host the unmasked policy
+    /// therefore made a **mixed fp8+NVFP4 native file hard-error at construction on a plan the
+    /// engine itself priced**. Until the consumer is wired, providers importing native single
+    /// files plan — and price admission — under this masked policy: fp8 rows take the exact dense
+    /// decode on every host, NVFP4 keeps its own floor, and the provider refusal arms become
+    /// unreachable-but-typed. The unmasked pricing (and the cuda packed read it selects) stays
+    /// tested engine capability for the future consumer.
+    pub fn with_dense_fp8(self) -> Self {
+        Self {
+            fp8_e4m3_native: false,
+            ..self
         }
     }
 }
@@ -425,82 +469,354 @@ pub fn read_logical_weights(
     plan: &LogicalWeightPlan,
     device: &Device,
 ) -> Result<LogicalWeights> {
-    // SAFETY: read-only mmap of a weight file; the standard candle loading path.
-    let st = unsafe { MmapedSafetensors::new(path)? };
-    let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
-    on_disk.sort_unstable();
-    let mut planned: Vec<&str> = plan.all_physical_keys().collect();
-    planned.sort_unstable();
-    if on_disk
-        .iter()
-        .map(String::as_str)
-        .ne(planned.iter().copied())
-    {
-        let missing = planned
-            .iter()
-            .filter(|key| {
-                on_disk
-                    .binary_search_by(|name| name.as_str().cmp(key))
-                    .is_err()
-            })
-            .count();
-        let unplanned = on_disk
-            .iter()
-            .filter(|name| planned.binary_search(&name.as_str()).is_err())
-            .count();
-        return Err(CandleError::Msg(format!(
-            "logical weight read of {}: tensor set changed since planning ({missing} planned \
-             tensor(s) missing, {unplanned} unplanned tensor(s) present); refusing to load a \
-             different checkpoint",
-            path.display(),
-        )));
+    let reader = LogicalWeightReader::open(path, plan.clone(), device)?;
+    let mut tensors = HashMap::new();
+    for tensor in &plan.tensors {
+        tensors.insert(
+            tensor.logical_key.clone(),
+            reader.read(&tensor.logical_key)?,
+        );
+    }
+    Ok(LogicalWeights {
+        tensors,
+        receipt: reader.receipt(),
+    })
+}
+
+/// The engine's **incremental** shared logical-weight reader (sc-21482): the same plan-driven,
+/// codec-dispatched decode as [`read_logical_weights`], exposed one logical tensor at a time so a
+/// provider that constructs its model layer-by-layer (Krea's trunk, ~260 projections) can
+/// materialize each planned tensor exactly when its layer is built — without a whole-file
+/// intermediate map and without owning any decode or classification logic of its own.
+///
+/// * **Opening** validates the on-disk tensor set against the plan's full physical-key surface
+///   (weights **and** companions); any difference is source drift and refuses before a single
+///   tensor is materialized. Per-tensor drift after opening (shape/dtype changes under the mmap)
+///   is still refused by the decode's stored-header guards.
+/// * **Reading** dispatches the one shared per-layer decode — the same code path
+///   [`read_logical_weights`] uses — and records what the codec actually left resident.
+/// * **The receipt** ([`Self::receipt`]) is measured over the tensors materialized *so far*: each
+///   codec row's `resident_bytes` comes off the decoded values themselves
+///   ([`LogicalTensor::resident_bytes`]), never copied from the plan's pricing, so plan and
+///   receipt remain the independent pair the contract requires. A companion's source bytes are
+///   attributed to its owner's codec row only once that owner has materialized.
+pub struct LogicalWeightReader {
+    st: MmapedSafetensors,
+    plan: LogicalWeightPlan,
+    device: Device,
+    /// Logical key → index into `plan.tensors`, built once at [`Self::open`].
+    ///
+    /// Without it [`Self::planned`] is a linear scan, and a whole-file read (or Krea's trunk,
+    /// which resolves the same key three times per projection) turns the load into O(n²) over a
+    /// ~2600-tensor plan (sc-21482 review).
+    by_logical_key: BTreeMap<String, usize>,
+    /// Logical key → measured resident bytes for every tensor materialized through [`Self::read`].
+    /// A re-read overwrites (the decode is deterministic), so nothing double-counts.
+    measured: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Logical key → resident dense bytes for every `Packed`-planned row the provider **demoted**
+    /// to a dense-BF16 execution after construction settled its real regime
+    /// ([`Self::demote_to_dense_fallback`], sc-11045 fix round). The receipt reports such a row as
+    /// [`ExecutionRepresentation::DenseFallback`] carrying these measured bytes, with a matching
+    /// typed [`gen_core::checkpoint_codec::RegimeDemotion`] entry so the facts validator can
+    /// reconcile it against the plan's packed pricing instead of diagnosing drift.
+    demoted: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// The host's native-execution declaration, carried from the same
+    /// [`CandleCodecResidency`] that priced the plan (sc-21484). A native receipt row is only
+    /// representable when this licenses it.
+    capability: NativeExecutionCapability,
+}
+
+impl LogicalWeightReader {
+    /// mmap `path` and verify its tensor surface equals the plan's before anything materializes.
+    ///
+    /// The host capability is probed from `device`. A loader that priced its plan under an
+    /// explicitly constructed [`CandleCodecResidency`] must use
+    /// [`Self::open_with_capability`] instead, so the capability the facts are validated against is
+    /// the one the plan was priced under.
+    pub fn open(path: &Path, plan: LogicalWeightPlan, device: &Device) -> Result<Self> {
+        let capability = CandleCodecResidency::probe(device).native_execution_capability();
+        Self::open_with_capability(path, plan, device, capability)
     }
 
-    let mut tensors = HashMap::new();
-    let mut residency: BTreeMap<&'static str, CodecResidencyReport> = BTreeMap::new();
-    let mut codec_by_owner: BTreeMap<&str, &'static str> = BTreeMap::new();
-    for tensor in &plan.tensors {
-        codec_by_owner.insert(tensor.physical_key.as_str(), tensor.codec_id);
-        let decoded = decode(&st, tensor, device)?;
-        let report = residency
-            .entry(tensor.codec_id)
-            .or_insert(CodecResidencyReport {
+    /// [`Self::open`] with the host capability supplied by the caller — the residency policy that
+    /// priced this plan, rendered through
+    /// [`CandleCodecResidency::native_execution_capability`].
+    pub fn open_with_capability(
+        path: &Path,
+        plan: LogicalWeightPlan,
+        device: &Device,
+        capability: NativeExecutionCapability,
+    ) -> Result<Self> {
+        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
+        let st = unsafe { MmapedSafetensors::new(path)? };
+        let mut on_disk: Vec<String> = st.tensors().into_iter().map(|(name, _)| name).collect();
+        on_disk.sort_unstable();
+        let mut planned: Vec<&str> = plan.all_physical_keys().collect();
+        planned.sort_unstable();
+        // A transformed tensor contributes one plan entry per logical output, all naming the same
+        // physical key (sc-21547), so the plan's *surface* is the deduplicated set. Without this the
+        // comparison below reads a fused-QKV split as three unplanned tensors and refuses every
+        // checkpoint the transforms exist to load.
+        planned.dedup();
+        if on_disk
+            .iter()
+            .map(String::as_str)
+            .ne(planned.iter().copied())
+        {
+            let missing = planned
+                .iter()
+                .filter(|key| {
+                    on_disk
+                        .binary_search_by(|name| name.as_str().cmp(key))
+                        .is_err()
+                })
+                .count();
+            let unplanned = on_disk
+                .iter()
+                .filter(|name| planned.binary_search(&name.as_str()).is_err())
+                .count();
+            return Err(CandleError::Msg(format!(
+                "logical weight read of {}: tensor set changed since planning ({missing} planned \
+                 tensor(s) missing, {unplanned} unplanned tensor(s) present); refusing to load a \
+                 different checkpoint",
+                path.display(),
+            )));
+        }
+        let by_logical_key = plan
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (tensor.logical_key.clone(), index))
+            .collect();
+        Ok(Self {
+            st,
+            plan,
+            device: device.clone(),
+            by_logical_key,
+            measured: std::sync::Mutex::new(BTreeMap::new()),
+            demoted: std::sync::Mutex::new(BTreeMap::new()),
+            capability,
+        })
+    }
+
+    /// Record that the provider served `logical_key` — a row the plan priced
+    /// [`ResidencyMode::Packed`] — as a **dense BF16** weight holding `resident_bytes` on-device
+    /// (sc-11045 fix round, epic E5).
+    ///
+    /// This is the seam that keeps the receipt truthful about W4A16 and the transparent
+    /// construction-time fallbacks: the plan prices from checkpoint geometry and device floors
+    /// alone, but a provider's role table (or a missing fused quantizer, a staging failure) can
+    /// still hold a `Packed`-priced row as the dequantized dense weight. Without this call the
+    /// receipt would report that row `NativePacked` at packed byte counts — dense BF16 execution
+    /// labelled native, which is exactly the dishonest report E5 forbids.
+    ///
+    /// `resident_bytes` is measured off the constructed layer
+    /// (`Nvfp4Linear::resident_weight_bytes`), never derived here. Refuses a key the plan does not
+    /// contain and a row the plan priced `Dense` (nothing packed exists to demote). Re-demoting the
+    /// same key with the same measurement is idempotent (a staged provider can rebuild a layer);
+    /// a *different* measurement for the same key is a contradiction and refuses.
+    pub fn demote_to_dense_fallback(&self, logical_key: &str, resident_bytes: u64) -> Result<()> {
+        let tensor = self.planned(logical_key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "logical weight demotion: `{logical_key}` has no entry in the compiled plan \
+                 (mapping {})",
+                self.plan.mapping_id
+            ))
+        })?;
+        if tensor.residency.mode != ResidencyMode::Packed {
+            return Err(CandleError::Msg(format!(
+                "logical weight demotion: `{logical_key}` was priced Dense by the plan; there is \
+                 no packed pricing to demote from"
+            )));
+        }
+        let mut demoted = self
+            .demoted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = demoted.get(logical_key) {
+            if *previous != resident_bytes {
+                return Err(CandleError::Msg(format!(
+                    "logical weight demotion: `{logical_key}` was already demoted at {previous} \
+                     resident byte(s); re-demoting it at {resident_bytes} contradicts the first \
+                     measurement"
+                )));
+            }
+            return Ok(());
+        }
+        demoted.insert(logical_key.to_owned(), resident_bytes);
+        Ok(())
+    }
+
+    /// This host's native-execution declaration — the capability the plan was priced under.
+    pub fn native_execution_capability(&self) -> &NativeExecutionCapability {
+        &self.capability
+    }
+
+    /// The plan this reader materializes.
+    pub fn plan(&self) -> &LogicalWeightPlan {
+        &self.plan
+    }
+
+    /// The planned entry for one **logical** key, or `None` when the plan has no such tensor.
+    ///
+    /// O(log n) through the index built at [`Self::open`] — the hot path of a whole-plan read.
+    pub fn planned(&self, logical_key: &str) -> Option<&LogicalTensorPlan> {
+        self.by_logical_key
+            .get(logical_key)
+            .map(|index| &self.plan.tensors[*index])
+    }
+
+    /// Materialize one planned logical tensor through its codec and record what it keeps resident.
+    pub fn read(&self, logical_key: &str) -> Result<LogicalTensor> {
+        let tensor = self.planned(logical_key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "logical weight read: `{logical_key}` has no entry in the compiled plan \
+                 (mapping {})",
+                self.plan.mapping_id
+            ))
+        })?;
+        let decoded = decode(&self.st, tensor, &self.device)?;
+        self.measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(logical_key.to_owned(), decoded.resident_bytes());
+        Ok(decoded)
+    }
+
+    /// The receipt **measured** over everything materialized through [`Self::read`] so far.
+    ///
+    /// A reader none of whose tensors has materialized yet reports zero rows — the truth about
+    /// this instant, not a claim that the load was free. Once every planned tensor has been read,
+    /// the receipt covers the plan's whole surface: its per-codec `resident_bytes` are directly
+    /// comparable to the plan's pricing and its `source_bytes` total the plan's
+    /// (weights + companions + descriptor payloads all attributed).
+    ///
+    /// # Source bytes count each *physical* tensor once
+    ///
+    /// A transformed tensor contributes one plan entry per logical output, all naming the same
+    /// physical key (sc-21547). Their source bytes must still total the file **once**, and the
+    /// rule that makes that true lives in the plan compiler, not here: exactly one output per
+    /// physical tensor carries `source_bytes` and its siblings carry zero
+    /// ([`LogicalTensorPlan::transform`]). So this loop simply *sums* — summing a plain sum is
+    /// what makes it correct, and de-duplicating by physical key here would be actively wrong,
+    /// because `plan.tensors` is sorted by logical key and the byte-carrying output is not
+    /// generally the first one a fused key is seen at.
+    ///
+    /// `gen_core::checkpoint_facts::SourceCodecSummary` sums under the same convention, and
+    /// [`CheckpointWeightFacts::new`] cross-checks the two totals per codec. `tensor_count` and
+    /// `resident_bytes` stay **per logical row** — each output is separately counted and
+    /// separately occupies memory; only the source bytes are shared.
+    pub fn receipt(&self) -> LogicalWeightReceipt {
+        let measured = self
+            .measured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let demoted = self
+            .demoted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut residency: BTreeMap<(&'static str, ExecutionRepresentation), CodecResidencyReport> =
+            BTreeMap::new();
+        let mut codec_by_owner: BTreeMap<&str, (&'static str, ExecutionRepresentation)> =
+            BTreeMap::new();
+        let mut tensor_count = 0usize;
+        let mut source_bytes = 0u64;
+        let mut demotions: Vec<gen_core::checkpoint_codec::RegimeDemotion> = Vec::new();
+        for tensor in &self.plan.tensors {
+            let Some(resident) = measured.get(&tensor.logical_key) else {
+                continue;
+            };
+            // The representation this row was *actually* materialized as. It is read from the
+            // planned residency because that is what `decode` dispatched on — the reader never
+            // substitutes one for the other (a `Packed` fp8 plan on a non-`cuda` build is a typed
+            // refusal, not a dense decode), so plan mode and outcome cannot disagree here —
+            // EXCEPT for a provider-demoted row (sc-11045 fix round): construction resolved a
+            // `Packed`-priced row to the dense-BF16 regime (W4A16 role table, or a transparent
+            // fallback), the provider said so through `demote_to_dense_fallback`, and the receipt
+            // reports the dense truth with a typed `RegimeDemotion` alongside it.
+            let demotion = demoted.get(&tensor.logical_key);
+            let representation = match demotion {
+                Some(_) => ExecutionRepresentation::DenseFallback,
+                None => ExecutionRepresentation::from_residency(tensor.residency.mode),
+            };
+            let resident = match demotion {
+                // The dense bytes measured off the constructed layer, not the packed decode.
+                Some(dense_bytes) => {
+                    demotions.push(gen_core::checkpoint_codec::RegimeDemotion {
+                        logical_key: tensor.logical_key.clone(),
+                        codec_id: tensor.codec_id,
+                        resident_bytes: *dense_bytes,
+                    });
+                    dense_bytes
+                }
+                None => resident,
+            };
+            let key = (tensor.codec_id, representation);
+            codec_by_owner.insert(tensor.physical_key.as_str(), key);
+            tensor_count += 1;
+            source_bytes = source_bytes.saturating_add(tensor.source_bytes);
+            let report = residency.entry(key).or_insert(CodecResidencyReport {
                 codec_id: tensor.codec_id,
+                representation,
                 tensor_count: 0,
                 source_bytes: 0,
                 resident_bytes: 0,
             });
-        report.tensor_count += 1;
-        report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
-        // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] reads it
-        // off the decoded value itself — including the scale companions a packed load retained,
-        // which the packed variant *owns* (it holds them as f32 values, not as file rows). The
-        // companion loop below therefore attributes source bytes only. Reading the retained half
-        // back off `plan.companions` would make `receipt == plan` self-referential on exactly the
-        // packed row the pair exists to cross-check.
-        report.resident_bytes = report
-            .resident_bytes
-            .saturating_add(decoded.resident_bytes());
-        tensors.insert(tensor.logical_key.clone(), decoded);
-    }
-    for companion in &plan.companions {
-        let Some(codec_id) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
-            continue;
+            report.tensor_count += 1;
+            report.source_bytes = report.source_bytes.saturating_add(tensor.source_bytes);
+            // The single measured source of resident cost: [`LogicalTensor::resident_bytes`] read
+            // it off the decoded value itself — including the scale companions a packed load
+            // retained, which the packed variant *owns* (it holds them as f32 values, not as file
+            // rows). The companion loop below therefore attributes source bytes only. Reading the
+            // retained half back off `plan.companions` would make `receipt == plan`
+            // self-referential on exactly the packed row the pair exists to cross-check.
+            report.resident_bytes = report.resident_bytes.saturating_add(*resident);
+        }
+        // A companion's source bytes belong to the codec row of the layer that owns it, and only
+        // once that layer has actually materialized.
+        for companion in &self.plan.companions {
+            let Some(key) = codec_by_owner.get(companion.owner_physical_key.as_str()) else {
+                continue;
+            };
+            source_bytes = source_bytes.saturating_add(companion.source_bytes);
+            if let Some(report) = residency.get_mut(key) {
+                report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
+            }
+        }
+        // Honest coverage label (sc-11045 fix round): `Materialized` claims every planned tensor
+        // was evaluated, so it is only stated when that is true. A front-only snapshot of a
+        // block-streamed load is `Partial`; a reader nothing has consumed yet is `Deferred` (its
+        // payloads are, at this instant, exactly as lazy as a deferred read's).
+        let materialization = if tensor_count == self.plan.tensor_count() {
+            LogicalReadMaterialization::Materialized
+        } else if tensor_count == 0 {
+            LogicalReadMaterialization::Deferred
+        } else {
+            LogicalReadMaterialization::Partial
         };
-        if let Some(report) = residency.get_mut(codec_id) {
-            report.source_bytes = report.source_bytes.saturating_add(companion.source_bytes);
+        LogicalWeightReceipt {
+            mapping_id: self.plan.mapping_id,
+            tensor_count,
+            source_bytes,
+            materialization,
+            residency: residency.into_values().collect(),
+            demotions,
         }
     }
-    Ok(LogicalWeights {
-        tensors,
-        receipt: LogicalWeightReceipt {
-            mapping_id: plan.mapping_id,
-            tensor_count: plan.tensors.len(),
-            source_bytes: plan.source_bytes,
-            materialization: LogicalReadMaterialization::Materialized,
-            residency: residency.into_values().collect(),
-        },
-    })
+
+    /// The **three correlated facts** about this load (sc-21484): the source-codec inventory
+    /// compiled from the plan, the measured receipt split per execution representation, and this
+    /// host's native-execution capability — validated against each other by
+    /// [`CheckpointWeightFacts::new`].
+    ///
+    /// This is the surface a consumer across the worker boundary reads instead of joining a plan
+    /// and a receipt by hand: it answers "the source is stored `nvfp4-v1`" and "this run executed
+    /// it dense" as *separate* questions that cannot contradict one another. It errors only when
+    /// they already do, which on this reader means a contract bug rather than input.
+    pub fn checkpoint_weight_facts(&self) -> Result<CheckpointWeightFacts> {
+        CheckpointWeightFacts::new(&self.plan, self.capability.clone(), self.receipt())
+            .map_err(|error| CandleError::Msg(error.to_string()))
+    }
 }
 
 fn guard_stored(
@@ -560,7 +876,11 @@ fn decode(
     }
 
     let view = st.get(&tensor.physical_key)?;
-    match &tensor.codec {
+    // The codec decodes the *physical* tensor, so every geometry below is the pre-transform shape;
+    // `tensor.shape` is the post-transform shape the model sees and is applied by
+    // [`apply_transform`] at the end. For an untransformed entry the two are the same slice.
+    let source_shape = tensor.source_shape();
+    let decoded = match &tensor.codec {
         TensorCodecSpec::Dense => {
             let expected = match tensor.codec_id {
                 id if id == DENSE_BF16_CODEC.codec_id => StDtype::BF16,
@@ -574,9 +894,9 @@ fn decode(
                     )))
                 }
             };
-            guard_stored(tensor, view.dtype(), view.shape(), expected, &tensor.shape)?;
+            guard_stored(tensor, view.dtype(), view.shape(), expected, source_shape)?;
             // Byte-preserving: no cast, no substitution can hide inside the dense rows.
-            Ok(LogicalTensor::Dense(st.load(&tensor.physical_key, device)?))
+            LogicalTensor::Dense(st.load(&tensor.physical_key, device)?)
         }
         TensorCodecSpec::ScalarFp8 {
             scale, input_scale, ..
@@ -603,7 +923,7 @@ fn decode(
                 view.dtype(),
                 view.shape(),
                 expected_dtype,
-                &tensor.shape,
+                source_shape,
             )?;
             let (weight_scale, weight_scale_from_companion) = match scale {
                 ScalarScaleSource::Unit => (1.0_f32, false),
@@ -619,11 +939,7 @@ fn decode(
                         .iter()
                         .map(|&byte| element(byte) * weight_scale)
                         .collect();
-                    Ok(LogicalTensor::Dense(upload_bf16(
-                        values,
-                        &tensor.shape,
-                        device,
-                    )?))
+                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
                 }
                 ResidencyMode::Packed => {
                     #[cfg(feature = "cuda")]
@@ -633,22 +949,22 @@ fn decode(
                             .map(|key| scalar_f32(companion_bytes(st, tensor, key)?, key))
                             .transpose()?;
                         let codes = st.load(&tensor.physical_key, device)?;
-                        Ok(LogicalTensor::PackedFp8E4M3 {
+                        LogicalTensor::PackedFp8E4M3 {
                             codes,
                             weight_scale,
                             weight_scale_from_companion,
                             input_scale,
-                        })
+                        }
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
                         let _ = (input_scale, weight_scale_from_companion);
-                        Err(CandleError::Msg(format!(
+                        return Err(CandleError::Msg(format!(
                             "codec {}: tensor {:?} was planned with packed-native fp8 residency, \
                              but this build has no CUDA fp8 leg; replan with a dense residency \
                              policy instead of silently substituting the dense fallback",
                             tensor.codec_id, tensor.physical_key
-                        )))
+                        )));
                     }
                 }
             }
@@ -671,7 +987,7 @@ fn decode(
                 view.data(),
                 scales,
                 *stored_shape,
-                [tensor.shape[0], tensor.shape[1]],
+                [source_shape[0], source_shape[1]],
                 &mut values,
             )
             .map_err(|error| {
@@ -680,11 +996,7 @@ fn decode(
                     tensor.codec_id, tensor.physical_key
                 ))
             })?;
-            Ok(LogicalTensor::Dense(upload_bf16(
-                values,
-                &tensor.shape,
-                device,
-            )?))
+            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
         }
         TensorCodecSpec::Nvfp4 {
             block_scale,
@@ -712,7 +1024,7 @@ fn decode(
                         scales,
                         global,
                         *stored_shape,
-                        [tensor.shape[0], tensor.shape[1]],
+                        [source_shape[0], source_shape[1]],
                         &mut values,
                     )
                     .map_err(|error| {
@@ -721,11 +1033,7 @@ fn decode(
                             tensor.codec_id, tensor.physical_key
                         ))
                     })?;
-                    Ok(LogicalTensor::Dense(upload_bf16(
-                        values,
-                        &tensor.shape,
-                        device,
-                    )?))
+                    LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
                 }
                 ResidencyMode::Packed => {
                     // The repack into the container `Nvfp4Linear` consumes: nibble-order swap plus
@@ -735,14 +1043,30 @@ fn decode(
                     // plans Dense otherwise; refuse here rather than trust it, because silently
                     // repacking a padded layer widens it and feeds the GEMM padding as real
                     // contraction elements (sc-20641).
-                    if tensor.shape.as_slice() != stored_shape.as_slice() {
+                    if source_shape != stored_shape.as_slice() {
                         return Err(CandleError::Msg(format!(
                             "codec {}: tensor {:?} planned packed-native NVFP4 residency but its \
-                             logical shape {:?} is not its stored shape {stored_shape:?}; ComfyUI \
-                             padded this layer and the packed container cannot express the unpad",
-                            tensor.codec_id, tensor.physical_key, tensor.shape
+                             logical shape {source_shape:?} is not its stored shape \
+                             {stored_shape:?}; ComfyUI padded this layer and the packed container \
+                             cannot express the unpad",
+                            tensor.codec_id, tensor.physical_key
                         )));
                     }
+                    // Codec-owned scale-payload value check (sc-21482): the dense arm gets this
+                    // inside `decode_nvfp4`; the packed repack preserves scale bytes verbatim, so
+                    // a NaN or sign-bit E4M3 block scale must be refused here or it reaches the
+                    // GEMM as a corrupted multiplier no later stage re-examines.
+                    gen_core::validate_nvfp4_block_scale_payload(
+                        scales,
+                        *stored_shape,
+                        [source_shape[0], source_shape[1]],
+                    )
+                    .map_err(|error| {
+                        CandleError::Msg(format!(
+                            "codec {}: tensor {:?}: {error}",
+                            tensor.codec_id, tensor.physical_key
+                        ))
+                    })?;
                     let tensor_packed = Nvfp4Tensor::from_kitchen_parts(
                         view.data(),
                         scales,
@@ -761,10 +1085,10 @@ fn decode(
                         .as_deref()
                         .map(|key| scalar_f32(companion_bytes(st, tensor, key)?, key))
                         .transpose()?;
-                    Ok(LogicalTensor::PackedNvfp4 {
+                    LogicalTensor::PackedNvfp4 {
                         tensor: Box::new(tensor_packed),
                         input_scale,
-                    })
+                    }
                 }
             }
         }
@@ -774,11 +1098,11 @@ fn decode(
                 view.dtype(),
                 view.shape(),
                 StDtype::I8,
-                &tensor.shape,
+                source_shape,
             )?;
             let scale_bytes = companion_bytes(st, tensor, scale)?;
-            let rows = tensor.shape[0];
-            let cols = tensor.shape[1];
+            let rows = source_shape[0];
+            let cols = source_shape[1];
             let scales: Vec<f32> = if scale_bytes.len() == 4 && rows == 1 {
                 vec![scalar_f32(scale_bytes, scale)?]
             } else {
@@ -805,18 +1129,111 @@ fn decode(
                 cols,
                 &mut values,
             );
-            Ok(LogicalTensor::Dense(upload_bf16(
-                values,
-                &tensor.shape,
-                device,
-            )?))
+            LogicalTensor::Dense(upload_bf16(values, source_shape, device)?)
+        }
+    };
+    apply_transform(tensor, decoded)
+}
+
+/// Apply the plan entry's adapter-declared logical transform to the codec's whole-tensor output
+/// (sc-21547).
+///
+/// The transform is a **row re-labelling**, never arithmetic: a contiguous slice of the leading
+/// axis and, for dense rows, an exchange of that slice's two halves. It runs after the codec so no
+/// codec knowledge lives in the provider that declared it (epic requirement E1), and it runs on the
+/// codec's *own* representation so a packed source is never dequantized to be split (E3): a packed
+/// fp8 slice narrows the stored code matrix, and a packed NVFP4 slice goes through
+/// [`Nvfp4Tensor::slice_rows`], which re-emits block scales without touching a nibble.
+///
+/// Every slice is made [`Tensor::contiguous`] (and the NVFP4 container copies), so the output owns
+/// its bytes and [`LogicalTensor::resident_bytes`] measures the slice rather than the whole source
+/// buffer it was cut from — the measurement the receipt is built on.
+fn apply_transform(tensor: &LogicalTensorPlan, decoded: LogicalTensor) -> Result<LogicalTensor> {
+    let Some(transform) = tensor.transform.as_ref() else {
+        return Ok(decoded);
+    };
+    let (start, len) = (transform.rows.start, transform.rows.len);
+    match decoded {
+        LogicalTensor::Dense(dense) => {
+            let sliced = dense.narrow(0, start, len)?;
+            let out = if transform.half_swap {
+                let half = len / 2;
+                Tensor::cat(
+                    &[sliced.narrow(0, half, half)?, sliced.narrow(0, 0, half)?],
+                    0,
+                )?
+            } else {
+                sliced.contiguous()?
+            };
+            Ok(LogicalTensor::Dense(out))
+        }
+        LogicalTensor::PackedFp8E4M3 {
+            codes,
+            weight_scale,
+            weight_scale_from_companion,
+            input_scale,
+        } => {
+            // `half_swap` on a packed row is refused at plan time, but `transform` is a public
+            // field on a public struct: a plan that did not come from the compiler can carry one
+            // here. A `debug_assert!` would compile out and return UNSWAPPED rows under the
+            // swapped logical key in every shipping build — plausible-but-wrong weights. Refuse.
+            if transform.half_swap {
+                return Err(half_swap_on_packed(tensor));
+            }
+            Ok(LogicalTensor::PackedFp8E4M3 {
+                codes: codes.narrow(0, start, len)?.contiguous()?,
+                weight_scale,
+                weight_scale_from_companion,
+                input_scale,
+            })
+        }
+        LogicalTensor::PackedNvfp4 {
+            tensor: packed,
+            input_scale,
+        } => {
+            // Same reasoning as the packed-fp8 arm above: a real refusal, not a `debug_assert!`.
+            if transform.half_swap {
+                return Err(half_swap_on_packed(tensor));
+            }
+            let sliced = packed.slice_rows(start, len).map_err(|error| {
+                CandleError::Msg(format!(
+                    "codec {}: tensor {:?} logical output {:?}: {error}",
+                    tensor.codec_id, tensor.physical_key, tensor.logical_key
+                ))
+            })?;
+            Ok(LogicalTensor::PackedNvfp4 {
+                tensor: Box::new(sliced),
+                input_scale,
+            })
         }
     }
+}
+
+/// The read-time refusal for a `half_swap` declared on a tensor this backend decoded **packed**.
+///
+/// The plan compiler already refuses this combination by name
+/// (`LogicalTransformError::HalfSwapOnPackedResidency`); this is the
+/// local restatement at the site that depends on it, because
+/// [`LogicalTensorPlan::transform`] is a public field on a public struct reached through the public
+/// [`read_logical_weights`] entry. Permuting packed rows would require re-deriving the codec's
+/// scale surface, so the packed arms cannot honour the swap — and quietly returning the unswapped
+/// rows under the swapped logical key is silent corruption, so they refuse instead. The wording
+/// mirrors gen-core's, plus the physical and logical keys the reader knows and the compiler's
+/// error does not carry.
+fn half_swap_on_packed(tensor: &LogicalTensorPlan) -> CandleError {
+    CandleError::Msg(format!(
+        "codec {}: tensor {:?} logical output {:?} declares a half swap but this backend decoded a \
+         packed-native residency for it; permuting packed rows would require re-deriving the \
+         codec's scale surface. Plan this file with a dense residency policy, or declare the swap \
+         on a dense layer",
+        tensor.codec_id, tensor.physical_key, tensor.logical_key
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gen_core::checkpoint_codec::{LogicalTensorTransform, PlannedResidency, RowRange};
 
     struct StripModel;
 
@@ -1564,7 +1981,147 @@ mod tests {
                     wrong.len()
                 );
             }
+
+            // sc-21547 review (major): the arms index `source_shape()`, not `shape`. A plan whose
+            // `shape` is a perfectly good rank-2 grid but whose `transform.source_shape` is rank 1
+            // slips past a `shape`-only guard and then panics on `source_shape[1]`. The transform
+            // is a public field on a public struct, so this plan is constructible by any caller.
+            let mut forced = plan.clone();
+            forced.tensors[0].transform = Some(LogicalTensorTransform {
+                source_shape: vec![2_usize],
+                rows: RowRange { start: 0, len: 1 },
+                half_swap: false,
+            });
+            assert_eq!(
+                forced.tensors[0].shape.len(),
+                2,
+                "{codec}: the shape stays rank 2, so only the source-shape rank can refuse below"
+            );
+            let error = read_logical_weights(path, &forced, &Device::Cpu)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("{codec}: a rank-1 transform.source_shape must refuse, not panic")
+                })
+                .to_string();
+            assert!(
+                error.contains(&format!("codec {codec}:"))
+                    && error.contains("expected rank 2")
+                    && error.contains("observed rank 1"),
+                "{codec}: the source-shape rank refusal must name the codec and both ranks, got: \
+                 {error}"
+            );
         }
+    }
+
+    /// sc-21547 review (major): a `half_swap` on a **packed** decode must be a real `Err`, not a
+    /// `debug_assert!`.
+    ///
+    /// The plan compiler refuses that combination, but [`LogicalTensorPlan::transform`] is a public
+    /// field on a public struct reached through the public [`read_logical_weights`] entry, so a
+    /// plan that did not come from the compiler can carry one. A `debug_assert!` compiles out under
+    /// `--release`, and the packed arms would then return the rows **unswapped** under the swapped
+    /// logical key — plausible-but-wrong weights that every downstream shape check agrees with.
+    ///
+    /// This drives [`apply_transform`] directly with hand-made packed decodes (both packed
+    /// variants) because that is the only way to reach the arm without a CUDA device, and it
+    /// asserts on the refusal rather than on a debug-only panic, so it is a real assertion in both
+    /// profiles.
+    #[test]
+    fn a_half_swap_on_a_packed_decode_refuses_in_every_profile() {
+        fn packed_plan(codec_id: &'static str, logical_key: &str) -> LogicalTensorPlan {
+            LogicalTensorPlan {
+                logical_key: logical_key.to_string(),
+                physical_key: "model.qkv.weight".to_string(),
+                encoding: WeightEncoding::Fp8E4M3,
+                shape: vec![128, 64],
+                source_bytes: 128 * 64,
+                codec_id,
+                resident_encoding: WeightEncoding::Fp8E4M3,
+                codec: TensorCodecSpec::Dense,
+                residency: PlannedResidency {
+                    mode: ResidencyMode::Packed,
+                    resident_bytes: 128 * 64,
+                },
+                transform: Some(LogicalTensorTransform {
+                    source_shape: vec![256, 64],
+                    rows: RowRange { start: 0, len: 128 },
+                    half_swap: true,
+                }),
+            }
+        }
+
+        // Packed fp8: the codes tensor's dtype is irrelevant to the transform arm.
+        let fp8_plan = packed_plan(FP8_E4M3_SCALAR_CODEC.codec_id, "q.weight");
+        let codes = Tensor::zeros((256, 64), DType::U8, &Device::Cpu).expect("codes");
+        let error = apply_transform(
+            &fp8_plan,
+            LogicalTensor::PackedFp8E4M3 {
+                codes,
+                weight_scale: 1.0,
+                weight_scale_from_companion: false,
+                input_scale: None,
+            },
+        )
+        .err()
+        .expect("a half swap on a packed fp8 decode must refuse")
+        .to_string();
+        assert!(
+            error.contains(&format!("codec {}:", FP8_E4M3_SCALAR_CODEC.codec_id))
+                && error.contains("\"model.qkv.weight\"")
+                && error.contains("\"q.weight\"")
+                && error.contains("half swap")
+                && error.contains("packed-native residency"),
+            "the packed-fp8 refusal must name the codec, the physical key, the logical key and the \
+             half swap, got: {error}"
+        );
+
+        // Packed NVFP4: the host container, so this leg runs on every lane.
+        let nvfp4_plan = packed_plan(NVFP4_CODEC.codec_id, "k.weight");
+        let packed = Nvfp4Tensor::pack_from_slice(&vec![0.5_f32; 256 * 64], 256, 64)
+            .expect("pack nvfp4 fixture");
+        let error = apply_transform(
+            &nvfp4_plan,
+            LogicalTensor::PackedNvfp4 {
+                tensor: Box::new(packed),
+                input_scale: None,
+            },
+        )
+        .err()
+        .expect("a half swap on a packed NVFP4 decode must refuse")
+        .to_string();
+        assert!(
+            error.contains(&format!("codec {}:", NVFP4_CODEC.codec_id))
+                && error.contains("\"model.qkv.weight\"")
+                && error.contains("\"k.weight\"")
+                && error.contains("half swap")
+                && error.contains("packed-native residency"),
+            "the packed-NVFP4 refusal must name the codec, the physical key, the logical key and \
+             the half swap, got: {error}"
+        );
+
+        // The same transform on a DENSE decode is honoured, not refused — the refusal is about the
+        // packed representation, not about half swaps.
+        let mut dense_plan = packed_plan(DENSE_BF16_CODEC.codec_id, "v.weight");
+        dense_plan.residency.mode = ResidencyMode::Dense;
+        let rows = Tensor::from_vec(
+            (0..256_u32).map(|row| row as f32).collect::<Vec<f32>>(),
+            (256, 1),
+            &Device::Cpu,
+        )
+        .expect("dense rows");
+        let LogicalTensor::Dense(swapped) =
+            apply_transform(&dense_plan, LogicalTensor::Dense(rows)).expect("dense half swap")
+        else {
+            panic!("a dense decode stays dense");
+        };
+        let values = swapped
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("values");
+        assert_eq!(values.len(), 128);
+        assert_eq!(values[0], 64.0, "the swap puts the second half first");
+        assert_eq!(values[64], 0.0);
     }
 
     /// The packed-native policy is a pure layout+hardware predicate: it selects `Packed` only for
@@ -1685,6 +2242,59 @@ mod tests {
             8 + 4 + 4,
             "a retained input_scale is priced too"
         );
+    }
+
+    /// **sc-11045 fix round (MAJOR 10): the fp8 mask.** `with_dense_fp8` prices every fp8 row
+    /// dense — the pricing the providers with no packed-fp8 consumer plan under — while leaving
+    /// the NVFP4 leg untouched, so a mixed fp8+NVFP4 file plans "fp8 dense decode + NVFP4 packed"
+    /// instead of hard-erroring at the provider's typed packed-fp8 refusal.
+    ///
+    /// # Mutation
+    ///
+    /// Make `with_dense_fp8` return `self` unchanged: the fp8 row prices `Packed` and the first
+    /// two asserts go red.
+    #[test]
+    fn the_fp8_mask_prices_fp8_dense_and_leaves_nvfp4_alone() {
+        let masked = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: true,
+        }
+        .with_dense_fp8();
+        assert!(!masked.fp8_e4m3_native);
+        assert_eq!(
+            masked.residency(
+                &FP8_E4M3_SCALAR_CODEC,
+                &TensorCodecSpec::ScalarFp8 {
+                    scale: ScalarScaleSource::Unit,
+                    input_scale: None,
+                    full_precision_matrix_mult: false,
+                },
+                &[64, 64],
+            ),
+            ResidencyMode::Dense,
+            "a masked policy prices the eligible fp8 row dense"
+        );
+        assert_eq!(
+            masked.residency(
+                &NVFP4_CODEC,
+                &TensorCodecSpec::Nvfp4 {
+                    block_scale: "s".into(),
+                    global_scale: "s2".into(),
+                    input_scale: None,
+                    stored_shape: [64, 64],
+                    logical_shape: [64, 64],
+                    logical_shape_declared: true,
+                    full_precision_matrix_mult: false,
+                },
+                &[64, 32],
+            ),
+            ResidencyMode::Packed,
+            "the mask must not touch the NVFP4 leg"
+        );
+        // And the capability rendered from the masked policy licenses no native fp8 label.
+        let capability = masked.native_execution_capability();
+        assert!(!capability.executes_natively(FP8_E4M3_SCALAR_CODEC.codec_id));
+        assert!(capability.executes_natively(NVFP4_CODEC.codec_id));
     }
 
     /// AC1 (Candle). A header-declared NVFP4 golden fixture — packed E2M1 values, block-16 FP8
@@ -1872,6 +2482,321 @@ mod tests {
         }
         // Residency measured off the container, independently of the plan rows above.
         assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
+    }
+
+    /// One NVFP4 layer plus a dense sibling — the fixture the handoff-contract tests read as both a
+    /// native and a non-native host.
+    fn nvfp4_and_dense_fixture(path: &Path, rows: usize, cols: usize) {
+        let values = nvfp4_fixture_values(rows, cols);
+        let (packed, scales, global, _) = nvfp4_reference_quantize(&values, rows, cols);
+        write_safetensors_with_metadata(
+            path,
+            &[
+                ("model.q.weight", "U8", &[rows, cols / 2], packed),
+                ("model.q.weight_scale", "F8_E4M3", &[256, 8], scales),
+                (
+                    "model.q.weight_scale_2",
+                    "F32",
+                    &[],
+                    global.to_le_bytes().to_vec(),
+                ),
+                (
+                    "model.norm.weight",
+                    "F32",
+                    &[4],
+                    vec![0u8; 4 * std::mem::size_of::<f32>()],
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4"}}}"#,
+            )],
+        );
+    }
+
+    /// **sc-21484 handoff contract: the source codec and the executed representation are separate,
+    /// correlated facts.**
+    ///
+    /// The same file, read on two hosts. Both report the source as `nvfp4-v1` with the same tensor
+    /// count and source bytes — that fact is device-independent. Only the *receipt* differs, and
+    /// only the native host's receipt carries a
+    /// [`ExecutionRepresentation::NativePacked`] row. This is exactly what the SceneWorks half
+    /// reads to tell "stored NVFP4" from "ran NVFP4".
+    #[test]
+    fn checkpoint_facts_separate_the_nvfp4_source_from_the_representation_executed() {
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-facts.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+
+        let facts_for = |residency: CandleCodecResidency| {
+            let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
+            let reader = LogicalWeightReader::open_with_capability(
+                &path,
+                plan.clone(),
+                &Device::Cpu,
+                residency.native_execution_capability(),
+            )
+            .expect("open");
+            for tensor in &plan.tensors {
+                reader.read(&tensor.logical_key).expect("read");
+            }
+            (plan, reader)
+        };
+
+        // ---- a non-native host: the declared dense fallback (AC3) ---------------------------
+        let (dense_plan, dense_reader) = facts_for(CandleCodecResidency::DENSE);
+        let dense = dense_reader.checkpoint_weight_facts().expect("facts");
+        assert!(
+            dense.source().declares(NVFP4_CODEC.codec_id),
+            "the source is stored nvfp4-v1 on every host"
+        );
+        let dense_entry = dense.source().entry(NVFP4_CODEC.codec_id).expect("row");
+        assert_eq!(dense_entry.tensor_count, 1);
+        assert_eq!(dense_entry.planned_native_packed_tensors, 0);
+        assert!(
+            !dense.executes_natively(NVFP4_CODEC.codec_id),
+            "a host below the sm_120 floor never labels its run native NVFP4"
+        );
+        assert!(dense.capability().is_dense_only());
+        assert!(dense
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+            .is_none());
+        let dense_row = dense
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("a dense-fallback row");
+        assert_eq!(dense_row.tensor_count, 1);
+        assert!(dense.is_complete());
+        assert_eq!(dense.resident_bytes(), dense_plan.resident_bytes());
+
+        // ---- a native host: the same source, executed packed --------------------------------
+        let (packed_plan, packed_reader) = facts_for(CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        });
+        let packed = packed_reader.checkpoint_weight_facts().expect("facts");
+        // Fact 2 is identical across the two hosts — it is a property of the file.
+        let packed_entry = packed.source().entry(NVFP4_CODEC.codec_id).expect("row");
+        assert_eq!(packed_entry.tensor_count, dense_entry.tensor_count);
+        assert_eq!(packed_entry.source_bytes, dense_entry.source_bytes);
+        // Fact 3 is not.
+        assert_eq!(packed_entry.planned_native_packed_tensors, 1);
+        assert!(packed.executes_natively(NVFP4_CODEC.codec_id));
+        assert!(packed
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .is_none());
+        assert_eq!(packed.resident_bytes(), packed_plan.resident_bytes());
+        assert!(
+            packed.resident_bytes() < dense.resident_bytes(),
+            "packed execution is resident at the NVFP4 footprint, not the bf16 one"
+        );
+        // The dense sibling is its own codec row on both hosts and is never confused with either.
+        assert!(packed.source().declares(DENSE_F32_CODEC.codec_id));
+        assert!(!packed.executes_natively(DENSE_F32_CODEC.codec_id));
+    }
+
+    /// **sc-11045 fix round (epic E5): a `Packed`-priced row the provider demotes to the
+    /// dequant-bf16 regime is reported `DenseFallback` at the measured dense bytes**, with its
+    /// typed `RegimeDemotion` reconciling the receipt against the plan's packed pricing — never a
+    /// native row, never packed byte counts, and the companion scales the dense decode consumed
+    /// leave the packed expectation too.
+    #[test]
+    fn a_demoted_packed_row_reports_the_dense_fallback_truthfully() {
+        use gen_core::checkpoint_codec::LogicalReadMaterialization;
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-demotion.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+        let residency = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let plan = plan_logical_weights(&path, &mapping, &residency).expect("plan");
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            residency.native_execution_capability(),
+        )
+        .expect("open");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("read");
+        }
+
+        // A dense-priced row has no packed pricing to demote from — typed refusal.
+        assert!(reader
+            .demote_to_dense_fallback("norm.weight", 16)
+            .unwrap_err()
+            .to_string()
+            .contains("priced Dense"));
+        // An unknown row refuses by name.
+        assert!(reader
+            .demote_to_dense_fallback("ghost.weight", 16)
+            .unwrap_err()
+            .to_string()
+            .contains("no entry in the compiled plan"));
+
+        // The provider's W4A16 construction: the packed container dequantized to a resident dense
+        // bf16 [rows, cols] weight.
+        let dense_bytes = (rows * cols * 2) as u64;
+        reader
+            .demote_to_dense_fallback("q.weight", dense_bytes)
+            .expect("demote the W4A16 row");
+        // Idempotent at the same measurement; a contradicting re-demotion refuses.
+        reader
+            .demote_to_dense_fallback("q.weight", dense_bytes)
+            .expect("re-demoting at the same bytes is idempotent");
+        assert!(reader
+            .demote_to_dense_fallback("q.weight", dense_bytes + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("contradicts the first measurement"));
+
+        let receipt = reader.receipt();
+        assert_eq!(
+            receipt.materialization,
+            LogicalReadMaterialization::Materialized
+        );
+        assert_eq!(receipt.demotions.len(), 1);
+        assert_eq!(receipt.demotions[0].logical_key, "q.weight");
+        assert_eq!(receipt.demotions[0].resident_bytes, dense_bytes);
+
+        let facts = reader.checkpoint_weight_facts().expect(
+            "a demoted row with its typed accounting must reconcile against the packed plan",
+        );
+        assert!(facts.source().declares(NVFP4_CODEC.codec_id));
+        assert!(
+            !facts.executes_natively(NVFP4_CODEC.codec_id),
+            "the demoted run executed nothing natively"
+        );
+        assert!(facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::NativePacked)
+            .is_none());
+        let row = facts
+            .materialized_as(NVFP4_CODEC.codec_id, ExecutionRepresentation::DenseFallback)
+            .expect("the demoted row reports dense-fallback");
+        assert_eq!(row.tensor_count, 1);
+        assert_eq!(
+            row.resident_bytes, dense_bytes,
+            "the receipt carries the measured dense bytes, not the plan's packed pricing"
+        );
+        assert!(facts.is_complete());
+    }
+
+    /// **sc-21484 mutation gate.** Two doctored receipts the handoff contract must reject, run
+    /// against the engine's own dense-host read:
+    ///
+    /// * relabel the dense-fallback NVFP4 row `native-packed` — the lie AC3 forbids;
+    /// * alias the source codec to `int8-per-row-v1` — the "call it q4" lie AC2 forbids.
+    ///
+    /// Both are rejected by [`CheckpointWeightFacts::new`], which is the only constructor, so a
+    /// consumer cannot be handed either.
+    #[test]
+    fn a_doctored_receipt_cannot_relabel_the_representation_or_alias_the_source() {
+        use gen_core::checkpoint_facts::CheckpointWeightFactsError;
+
+        let dir = fixture_dir();
+        let path = dir.path().join("nvfp4-mutation.safetensors");
+        let (rows, cols) = (256_usize, 128_usize);
+        nvfp4_and_dense_fixture(&path, rows, cols);
+        let mapping = StripModelDeclaring(vec![rows, cols]);
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+        let capability = CandleCodecResidency::DENSE.native_execution_capability();
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            capability.clone(),
+        )
+        .expect("open");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("read");
+        }
+        let honest = reader.receipt();
+        // The honest receipt validates.
+        CheckpointWeightFacts::new(&plan, capability.clone(), honest.clone()).expect("honest");
+
+        let nvfp4_row = |receipt: &LogicalWeightReceipt| {
+            receipt
+                .residency
+                .iter()
+                .position(|row| row.codec_id == NVFP4_CODEC.codec_id)
+                .expect("the read has an nvfp4 row")
+        };
+
+        // Mutation 1: this dense decode, labelled native.
+        let mut relabelled = honest.clone();
+        let index = nvfp4_row(&relabelled);
+        relabelled.residency[index].representation = ExecutionRepresentation::NativePacked;
+        let error = CheckpointWeightFacts::new(&plan, capability.clone(), relabelled)
+            .expect_err("a dense fallback must not be labelled native");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::NativeWithoutCapability {
+                codec_id: NVFP4_CODEC.codec_id,
+                tensor_count: 1,
+            }
+        );
+
+        // Mutation 2: this NVFP4 source, aliased to the int-affine row a `q4` product fact would
+        // carry.
+        let mut aliased = honest;
+        let index = nvfp4_row(&aliased);
+        aliased.residency[index].codec_id = INT8_PER_ROW_CODEC.codec_id;
+        let error = CheckpointWeightFacts::new(&plan, capability, aliased)
+            .expect_err("a receipt must not re-label the source codec");
+        assert_eq!(
+            error,
+            CheckpointWeightFactsError::UnplannedCodec {
+                codec_id: INT8_PER_ROW_CODEC.codec_id,
+            }
+        );
+    }
+
+    /// **AC3: `sm_100` is excluded from the native gate, and the capability says so.**
+    ///
+    /// Datacenter Blackwell reports compute capability `(10, 0)`, which is numerically *below* the
+    /// consumer `sm_120` floor this leg's `VEC16_UE4M3` kernel needs. The exclusion is the floor
+    /// comparison itself — asserted here on the shared predicate and on the rendered capability, so
+    /// a future floor edit that let `sm_100` through reds this test rather than shipping a host
+    /// that labels a run it cannot execute.
+    #[test]
+    fn the_nvfp4_native_gate_excludes_sm_100_and_the_capability_reflects_the_floor() {
+        use crate::quant::{compute_cap_meets_fp8_floor, compute_cap_meets_nvfp4_floor};
+
+        assert!(
+            !compute_cap_meets_nvfp4_floor((10, 0)),
+            "datacenter sm_100 is outside this leg"
+        );
+        assert!(!compute_cap_meets_nvfp4_floor((11, 9)));
+        assert!(compute_cap_meets_nvfp4_floor((12, 0)));
+
+        // A host at sm_100 probes `nvfp4_native: false`, so its capability lists nothing and no
+        // receipt it produces can carry a native NVFP4 row.
+        let sm_100 = CandleCodecResidency {
+            fp8_e4m3_native: compute_cap_meets_fp8_floor((10, 0)),
+            nvfp4_native: compute_cap_meets_nvfp4_floor((10, 0)),
+        };
+        let capability = sm_100.native_execution_capability();
+        assert!(!capability.executes_natively(NVFP4_CODEC.codec_id));
+        // sm_100 clears the fp8 sm_89 floor, so the capability is not vacuously empty — the NVFP4
+        // absence is a real, codec-specific exclusion.
+        assert!(capability.executes_natively(FP8_E4M3_SCALAR_CODEC.codec_id));
+
+        let sm_120 = CandleCodecResidency {
+            fp8_e4m3_native: compute_cap_meets_fp8_floor((12, 0)),
+            nvfp4_native: compute_cap_meets_nvfp4_floor((12, 0)),
+        };
+        assert!(sm_120
+            .native_execution_capability()
+            .executes_natively(NVFP4_CODEC.codec_id));
+        assert!(CandleCodecResidency::DENSE
+            .native_execution_capability()
+            .is_dense_only());
     }
 
     /// sc-20641 review. ComfyUI pads NVFP4 storage to 16, so a layer can be stored WIDER than it
@@ -2435,6 +3360,370 @@ mod tests {
         assert!(
             error.contains("tensor set changed since planning"),
             "{error}"
+        );
+    }
+
+    // ---- adapter-declared logical transforms (sc-21547) ---------------------------------------
+
+    /// A mapping that declares the two fused layouts this seam exists for: a fused-QKV projection
+    /// split into three logical weights, and an AdaLN modulation whose two halves are exchanged.
+    /// The Klein shapes are fixtures only — nothing below knows what family it is reading.
+    struct FusedLayouts {
+        /// The physical tensor's declared logical shape, if any (NVFP4 needs one).
+        source_logical_shape: Option<Vec<usize>>,
+        /// Rows per fused-QKV part.
+        part_rows: usize,
+    }
+
+    impl LogicalKeyMapping for FusedLayouts {
+        fn mapping_id(&self) -> &'static str {
+            "fused-layouts-test"
+        }
+        fn logical_key(&self, physical_key: &str) -> Option<String> {
+            physical_key.strip_prefix("model.").map(str::to_owned)
+        }
+        fn logical_transform(
+            &self,
+            physical_key: &str,
+        ) -> Option<gen_core::checkpoint_codec::LogicalTransformDeclaration> {
+            use gen_core::checkpoint_codec::{LogicalTransformDeclaration, LogicalTransformOutput};
+            let part = self.part_rows;
+            let declaration = match physical_key {
+                "model.qkv.weight" => LogicalTransformDeclaration::new(vec![
+                    LogicalTransformOutput::row_slice("attn.q.weight", 0, part),
+                    LogicalTransformOutput::row_slice("attn.k.weight", part, part),
+                    LogicalTransformOutput::row_slice("attn.v.weight", 2 * part, part),
+                ]),
+                "model.norm.modulation" => {
+                    LogicalTransformDeclaration::new(vec![LogicalTransformOutput::half_swap(
+                        "norm.modulation",
+                    )])
+                }
+                _ => return None,
+            };
+            Some(match &self.source_logical_shape {
+                Some(shape) => declaration.with_source_logical_shape(shape.clone()),
+                None => declaration,
+            })
+        }
+    }
+
+    /// Dense fused layouts: the reader publishes the compiled plan's logical keys and shapes, the
+    /// row splits carry the source's own rows, the half swap exchanges them, and the receipt
+    /// measured off the materialized tensors equals the plan's pricing.
+    #[test]
+    fn dense_row_splits_and_half_swaps_produce_the_compiled_logical_keys_and_shapes() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused-dense.safetensors");
+        // Row `r` of the fused QKV matrix is `[10*r, 10*r + 1]`, so every row is identifiable.
+        let qkv: Vec<f32> = (0..6)
+            .flat_map(|row| [10.0 * row as f32, 10.0 * row as f32 + 1.0])
+            .collect();
+        // A 4-row modulation whose halves are `shift` (rows 0..2) and `scale` (rows 2..4).
+        let modulation: Vec<f32> = (0..4).flat_map(|row| [100.0 + row as f32]).collect();
+        write_safetensors(
+            &path,
+            &[
+                (
+                    "model.norm.modulation",
+                    "BF16",
+                    &[4, 1],
+                    bf16_bytes(&modulation),
+                ),
+                ("model.qkv.weight", "BF16", &[6, 2], bf16_bytes(&qkv)),
+            ],
+        );
+
+        let mapping = FusedLayouts {
+            source_logical_shape: None,
+            part_rows: 2,
+        };
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+        assert_eq!(
+            plan.logical_keys().collect::<Vec<_>>(),
+            [
+                "attn.k.weight",
+                "attn.q.weight",
+                "attn.v.weight",
+                "norm.modulation"
+            ]
+        );
+
+        let weights = read_logical_weights(&path, &plan, &Device::Cpu).expect("read");
+        // Produced keys and shapes equal the compiled plan's, entry by entry.
+        for tensor in &plan.tensors {
+            let LogicalTensor::Dense(materialized) = weights
+                .tensors
+                .get(&tensor.logical_key)
+                .expect("logical tensor")
+            else {
+                panic!("{} is dense in this plan", tensor.logical_key);
+            };
+            assert_eq!(
+                materialized.dims(),
+                tensor.shape.as_slice(),
+                "{}",
+                tensor.logical_key
+            );
+        }
+        assert_eq!(dense_f32(&weights, "attn.q.weight"), [0.0, 1.0, 10.0, 11.0]);
+        assert_eq!(
+            dense_f32(&weights, "attn.k.weight"),
+            [20.0, 21.0, 30.0, 31.0]
+        );
+        assert_eq!(
+            dense_f32(&weights, "attn.v.weight"),
+            [40.0, 41.0, 50.0, 51.0]
+        );
+        // The halves are exchanged, and nothing else moves.
+        assert_eq!(
+            dense_f32(&weights, "norm.modulation"),
+            [102.0, 103.0, 100.0, 101.0]
+        );
+
+        // Source bytes counted once for the transformed tensor, and the whole file accounted for.
+        assert_eq!(weights.receipt.source_bytes, plan.source_bytes);
+        assert_eq!(weights.receipt.source_bytes, (6 * 2 + 4) * 2);
+        // Measured residency equals the plan's pricing, per codec row and in total.
+        assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
+        assert_eq!(plan.resident_bytes(), (6 * 2 + 4) * 2);
+    }
+
+    /// The packed half of the same mechanism: an NVFP4 fused-QKV matrix is split into three packed
+    /// operands **without dequantizing anything**. Each output is still an [`Nvfp4Tensor`], holding
+    /// its own share of the nibble payload and its own whole scale-factor atoms; dequantizing each
+    /// afterwards reproduces exactly the rows of the golden reference it was cut from.
+    #[test]
+    fn a_packed_nvfp4_fused_qkv_splits_into_packed_operands_without_dequantizing() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused-nvfp4.safetensors");
+        let (rows, cols, part) = (384_usize, 128_usize, 128_usize);
+        let values = nvfp4_fixture_values(rows, cols);
+        let (packed, scales, global, reference) = nvfp4_reference_quantize(&values, rows, cols);
+        write_safetensors_with_metadata(
+            &path,
+            &[
+                ("model.qkv.weight", "U8", &[rows, cols / 2], packed),
+                ("model.qkv.weight_scale", "F8_E4M3", &[384, 8], scales),
+                (
+                    "model.qkv.weight_scale_2",
+                    "F32",
+                    &[],
+                    global.to_le_bytes().to_vec(),
+                ),
+            ],
+            &[(
+                "_quantization_metadata",
+                r#"{"format_version": "1.0", "layers": {"qkv": {"format": "nvfp4"}}}"#,
+            )],
+        );
+
+        let native = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let mapping = FusedLayouts {
+            source_logical_shape: Some(vec![rows, cols]),
+            part_rows: part,
+        };
+        let plan = plan_logical_weights(&path, &mapping, &native).expect("plan");
+        assert_eq!(plan.tensor_count(), 3);
+        for tensor in &plan.tensors {
+            assert_eq!(tensor.residency.mode, ResidencyMode::Packed);
+            assert_eq!(tensor.shape, vec![part, cols]);
+            assert_eq!(tensor.source_shape(), [rows, cols]);
+            assert_eq!(tensor.residency.resident_bytes, (part * cols / 2) as u64);
+        }
+
+        let weights = read_logical_weights(&path, &plan, &Device::Cpu).expect("read");
+        for (index, key) in ["attn.q.weight", "attn.k.weight", "attn.v.weight"]
+            .into_iter()
+            .enumerate()
+        {
+            let LogicalTensor::PackedNvfp4 { tensor, .. } =
+                weights.tensors.get(key).expect("logical tensor")
+            else {
+                panic!("{key} must stay packed: the split never dequantizes");
+            };
+            assert_eq!((tensor.rows, tensor.cols), (part, cols));
+            assert_eq!(tensor.global_scale, global);
+            let recovered = tensor.dequantize_to_vec();
+            let expected = &reference[index * part * cols..(index + 1) * part * cols];
+            for (element, want) in recovered.iter().zip(expected) {
+                assert_eq!(element, want, "{key}");
+            }
+        }
+
+        // Planned vs measured: the nibble payload partitions across the three operands, the
+        // swizzled block scales partition with it, and each operand owns one copy of the F32
+        // per-tensor scale.
+        assert_eq!(
+            plan.resident_bytes(),
+            (rows * cols / 2) as u64 + 384 * 8 + 3 * 4
+        );
+        assert_eq!(weights.receipt.resident_bytes(), plan.resident_bytes());
+        // One physical tensor, its source bytes counted once across three logical outputs.
+        assert_eq!(weights.receipt.source_bytes, plan.source_bytes);
+        assert_eq!(
+            plan.tensors
+                .iter()
+                .map(|tensor| tensor.source_bytes)
+                .sum::<u64>(),
+            (rows * cols / 2) as u64
+        );
+        assert_eq!(weights.receipt.tensor_count, 3);
+        let nvfp4 = weights
+            .receipt
+            .residency
+            .iter()
+            .find(|report| report.codec_id == NVFP4_CODEC.codec_id)
+            .expect("one nvfp4 codec row");
+        assert_eq!(nvfp4.tensor_count, 3);
+        assert_eq!(nvfp4.source_bytes, plan.source_bytes);
+    }
+
+    /// The reader's incremental entry point resolves each logical output of a transformed tensor
+    /// independently, and its receipt covers only what has materialized so far — the property a
+    /// layer-by-layer provider depends on. Re-reading one output does not double-count it.
+    #[test]
+    fn a_transformed_tensor_materializes_one_logical_output_at_a_time() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused-incremental.safetensors");
+        let qkv: Vec<f32> = (0..6).map(|row| row as f32).collect();
+        write_safetensors(
+            &path,
+            &[("model.qkv.weight", "BF16", &[6, 1], bf16_bytes(&qkv))],
+        );
+        let mapping = FusedLayouts {
+            source_logical_shape: None,
+            part_rows: 2,
+        };
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+        let reader = LogicalWeightReader::open(&path, plan.clone(), &Device::Cpu).expect("open");
+        assert_eq!(reader.receipt().tensor_count, 0);
+
+        let LogicalTensor::Dense(k) = reader.read("attn.k.weight").expect("read k") else {
+            panic!("dense");
+        };
+        assert_eq!(k.dims(), [2, 1]);
+        assert_eq!(
+            k.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            [2.0, 3.0]
+        );
+        let _ = reader.read("attn.k.weight").expect("re-read k");
+        let receipt = reader.receipt();
+        assert_eq!(
+            receipt.tensor_count, 1,
+            "a re-read overwrites, never accumulates"
+        );
+        assert_eq!(receipt.resident_bytes(), 2 * 2);
+
+        for key in ["attn.q.weight", "attn.v.weight"] {
+            let _ = reader.read(key).expect("read");
+        }
+        let receipt = reader.receipt();
+        assert_eq!(receipt.tensor_count, 3);
+        assert_eq!(receipt.resident_bytes(), plan.resident_bytes());
+        assert_eq!(receipt.source_bytes, plan.source_bytes);
+    }
+
+    /// **A real fused load produces valid [`CheckpointWeightFacts`] (sc-21484 review).**
+    ///
+    /// The review's major finding: the receipt producer and `SourceCodecSummary::of` must count
+    /// source bytes by the *same* rule, or a perfectly valid fused load hard-errors
+    /// `SourceBytesExceedPlan` and `checkpoint_weight_facts()` becomes unusable the moment
+    /// sc-21547's transforms are in play.
+    ///
+    /// Both now simply **sum** plan entries, which is correct because the compiler carries the
+    /// physical tensor's `source_bytes` on exactly one output and zeroes its siblings. This drives
+    /// that end to end on a real fused-QKV plan compiled by [`FusedLayouts`] — no hand-built
+    /// receipt, no hand-built plan.
+    ///
+    /// # Mutation
+    ///
+    /// De-duplicate by physical key in either accounting (`receipt()` or `SourceCodecSummary::of`)
+    /// — the shape an earlier draft of this story had. `plan.tensors` is sorted by logical key, so
+    /// the first sighting of `model.qkv.weight` is `attn.k.weight`, whose `source_bytes` is ZERO;
+    /// the deduping side loses the real bytes and the two accountings disagree. Dedup in `of()`
+    /// alone reds this at `CodecSourceBytesExceedEntry`; dedup in `receipt()` alone reds the
+    /// `receipt.source_bytes` assertion below.
+    #[test]
+    fn a_real_fused_plan_yields_valid_checkpoint_weight_facts() {
+        let dir = fixture_dir();
+        let path = dir.path().join("fused-facts.safetensors");
+        let qkv: Vec<f32> = (0..6)
+            .flat_map(|row| [10.0 * row as f32, 10.0 * row as f32 + 1.0])
+            .collect();
+        write_safetensors(
+            &path,
+            &[("model.qkv.weight", "BF16", &[6, 2], bf16_bytes(&qkv))],
+        );
+        let mapping = FusedLayouts {
+            source_logical_shape: None,
+            part_rows: 2,
+        };
+        let plan =
+            plan_logical_weights(&path, &mapping, &CandleCodecResidency::DENSE).expect("plan");
+
+        // The premise this test rests on: three logical outputs of ONE physical tensor, sorted so
+        // that the byte-carrying output is NOT the first sighting of the fused key.
+        assert_eq!(plan.tensors.len(), 3);
+        assert!(plan
+            .tensors
+            .iter()
+            .all(|tensor| tensor.physical_key == "model.qkv.weight"));
+        assert_eq!(plan.tensors[0].logical_key, "attn.k.weight");
+        assert_eq!(
+            plan.tensors[0].source_bytes, 0,
+            "the first entry of the fused key is a zero-carrying sibling"
+        );
+        assert_eq!(
+            plan.tensors.iter().map(|t| t.source_bytes).sum::<u64>(),
+            plan.source_bytes,
+            "summing plan entries totals the file exactly once"
+        );
+
+        let reader = LogicalWeightReader::open_with_capability(
+            &path,
+            plan.clone(),
+            &Device::Cpu,
+            NativeExecutionCapability::dense_only(),
+        )
+        .expect("a fused plan names exactly the file's tensor set");
+        for tensor in &plan.tensors {
+            reader.read(&tensor.logical_key).expect("logical output");
+        }
+
+        let receipt = reader.receipt();
+        assert_eq!(
+            receipt.tensor_count, 3,
+            "three LOGICAL outputs materialized"
+        );
+        assert_eq!(
+            receipt.source_bytes, plan.source_bytes,
+            "one PHYSICAL tensor's source bytes, totalled once"
+        );
+
+        // The whole point: this receipt validates against the plan it came from.
+        let facts = reader
+            .checkpoint_weight_facts()
+            .expect("the fused load is valid");
+        assert!(facts.is_complete());
+        assert_eq!(
+            facts
+                .source()
+                .entry(DENSE_BF16_CODEC.codec_id)
+                .expect("the bf16 row")
+                .source_bytes,
+            plan.source_bytes,
+            "both accountings of the fused tensor's source bytes agree"
         );
     }
 }

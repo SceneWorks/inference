@@ -31,8 +31,14 @@ mod img2img_real_weights;
 #[path = "imported_cuda_smoke.rs"]
 mod imported_cuda_smoke;
 
+#[path = "nvfp4_adapters_real_weights.rs"]
+mod nvfp4_adapters_real_weights;
+
 #[path = "nvfp4_krea_dit_gpu.rs"]
 mod nvfp4_krea_dit_gpu;
+
+#[path = "nvfp4_shared_reader_real_weights.rs"]
+mod nvfp4_shared_reader_real_weights;
 
 #[path = "preview_real_weights.rs"]
 mod preview_real_weights;

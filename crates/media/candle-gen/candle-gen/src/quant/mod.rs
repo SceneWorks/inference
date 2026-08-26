@@ -104,7 +104,8 @@ pub use cublaslt::{CublasLt, DevNvfp4};
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
 pub use nvfp4_linear::{
-    ActPrecision, Nvfp4Context, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime, NVFP4_M_ALIGN,
+    ActPrecision, Nvfp4Context, Nvfp4Fallback, Nvfp4Linear, Nvfp4Partition, Nvfp4Regime,
+    NVFP4_M_ALIGN,
 };
 pub use nvfp4_outlier::{OutlierClass, OutlierSparsity};
 
