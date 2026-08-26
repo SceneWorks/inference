@@ -44,8 +44,9 @@ mod gguf;
 // mapping the checkpoint registry names, the plan producer, and its typed refusals. The module
 // itself stays private — everything else in it is loader internals.
 pub use gguf::{
-    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_receipt, GgufDitPlan,
-    GgufPlanError, WanNativeToDiffusersMapping, GGUF_CODEC_IMPLEMENTATION_ID,
+    compile_gguf_dit_plan, gguf_codec_registry, load_wan_dit_gguf_with_facts,
+    load_wan_dit_gguf_with_receipt, GgufDitPlan, GgufPlanError, WanNativeToDiffusersMapping,
+    GGUF_CODEC_IMPLEMENTATION_ID,
 };
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;
@@ -237,6 +238,10 @@ struct Pipeline {
     /// **additive** residuals ([`adapters::install_additive`], sc-10094) — a packed tier has no dense
     /// `W` to fold into.
     adapters: Vec<AdapterSpec>,
+    /// The clonable seam that carries a GGUF DiT load's [`gen_core::CheckpointWeightFacts`] up to
+    /// the [`WanGenerator`] handle a worker holds (sc-11045 fix round, BLOCKER 1). The snapshot
+    /// (dense/packed-tier) routes compile no plan and publish nothing.
+    facts: gen_core::CheckpointFactsSink,
 }
 
 fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
@@ -256,6 +261,7 @@ impl Pipeline {
         device: &Device,
         adapters: Vec<AdapterSpec>,
         dit_source: DitSource,
+        facts: gen_core::CheckpointFactsSink,
     ) -> Self {
         Self {
             adapters,
@@ -265,6 +271,7 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             dit_source,
+            facts,
         }
     }
 
@@ -348,11 +355,12 @@ impl Pipeline {
                     crate::gguf::GGUF_ENV
                 )));
             }
-            return Ok(crate::gguf::load_wan_dit_gguf(
+            return Ok(crate::gguf::load_wan_dit_gguf_publishing(
                 gguf,
                 &self.dit_cfg,
                 &self.device,
                 DIT_DTYPE,
+                &self.facts,
             )?);
         }
         let vb = self.component_vb("transformer", DIT_DTYPE)?;
@@ -854,6 +862,10 @@ pub struct WanGenerator {
     /// resident cache without racing another request that holds cloned component `Arc`s.
     lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
+    /// The generator's end of the GGUF facts seam (sc-11045 fix round, BLOCKER 1): a clone travels
+    /// into every [`Pipeline`] this generator builds, and the GGUF DiT load publishes into it. Read
+    /// back through [`gen_core::Generator::checkpoint_weight_facts`].
+    checkpoint_facts: gen_core::CheckpointFactsSink,
 }
 
 fn run_serialized_request<T>(
@@ -906,6 +918,7 @@ impl WanGenerator {
             &self.device,
             self.adapters.clone(),
             self.dit_source.clone(),
+            self.checkpoint_facts.clone(),
         )
     }
 
@@ -935,6 +948,15 @@ fn needs_ti2v_encoder(req: &GenerationRequest) -> bool {
 impl Generator for WanGenerator {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
+    }
+
+    /// The three correlated facts about the GGUF DiT this generator loaded (sc-11045 fix round,
+    /// BLOCKER 1): what the container stores (`gguf-container-v1`), that ggml blocks execute in
+    /// their stored packing on every host, and the measured receipt — published by the GGUF DiT
+    /// load (`gguf::load_wan_dit_gguf_publishing`). `None` on the snapshot
+    /// (dense/packed-tier) routes, which compile no plan, and before the lazy DiT has loaded.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.checkpoint_facts.facts()
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
@@ -1260,6 +1282,7 @@ fn build_generator_with_source(
         offload,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        checkpoint_facts: gen_core::CheckpointFactsSink::new(),
     })
 }
 
@@ -1892,6 +1915,7 @@ mod tests {
             root: root.to_path_buf(),
             device: Device::Cpu,
             dit_source: DitSource::Snapshot,
+            facts: gen_core::CheckpointFactsSink::new(),
         }
     }
 

@@ -18,6 +18,7 @@ pub mod audio_transform;
 pub mod block_window;
 pub mod caption;
 pub mod checkpoint_codec;
+pub mod checkpoint_facts;
 pub mod comfy_quant;
 pub mod control;
 pub mod encoder_contract;
@@ -81,16 +82,21 @@ pub use checkpoint_codec::{
     DENSE_F16_CODEC, DENSE_F32_CODEC, FP8_E4M3_SCALAR_CODEC, FP8_E5M2_SCALAR_CODEC,
     GGUF_CONTAINER_CODEC, INT8_PER_ROW_CODEC, MXFP8_CODEC, NVFP4_CODEC,
 };
+pub use checkpoint_facts::{
+    CheckpointFactsSink, CheckpointWeightFacts, CheckpointWeightFactsError,
+    ExecutionRepresentation, NativeExecutionCapability, SourceBinding, SourceCodecEntry,
+    SourceCodecSummary,
+};
 pub use comfy_quant::{
     blocked_scale_index, blocked_scale_shape, decode_fp8_e4m3fn_scalar, decode_fp8_e5m2_scalar,
     decode_int8_per_row, decode_mxfp8, decode_nvfp4, descriptor_from_json, e2m1_to_f32,
     e8m0_to_f32, fp8_e4m3fn_to_f32, fp8_e5m2_to_f32, mxfp8_padded_shape, mxfp8_scale_shape,
     mxfp8_swizzled_scale_index, nvfp4_padded_shape, nvfp4_scale_shape, nvfp4_swizzled_scale_index,
     parse_comfy_quant_descriptor, parse_quantization_metadata, partial_descriptor_from_json,
-    validate_mxfp8_geometry, validate_nvfp4_geometry, ComfyQuantDescriptor,
-    ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError, Nvfp4GeometryError,
-    PartialComfyQuantDescriptor, QuantizationMetadataError, E2M1_LUT, MXFP8_BLOCK, NVFP4_BLOCK,
-    NVFP4_PAD,
+    validate_mxfp8_geometry, validate_nvfp4_block_scale_payload, validate_nvfp4_geometry,
+    ComfyQuantDescriptor, ComfyQuantDescriptorError, ComfyQuantFormat, Mxfp8GeometryError,
+    Nvfp4GeometryError, PartialComfyQuantDescriptor, QuantizationMetadataError, E2M1_LUT,
+    MXFP8_BLOCK, NVFP4_BLOCK, NVFP4_PAD,
 };
 pub use control::{
     reject_unknown_components, require_base_dir, require_base_snapshot, require_component,
@@ -110,12 +116,13 @@ pub use execution_domains::{
 };
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, effective_component_quant, ActivationMemoryAnchor, AudioEditMode, AudioEditRef,
-    AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning, ConditioningKind,
-    ControlClipRef, ControlKind, ConversationRole, ConversationSession, ConversationTurn,
-    GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest, Generator, KeyframeRef,
-    Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent, ReplacementMode, SizeFloor,
-    SpeechSegment, StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+    default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
+    AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
+    ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
+    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
+    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent,
+    ReplacementMode, SizeFloor, SpeechSegment, StagedResidencyAvailability, StepSupport,
+    TimeRegion, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;

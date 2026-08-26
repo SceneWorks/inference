@@ -13,7 +13,7 @@ use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
 
 use super::rope::apply_interleaved_rope;
 use crate::loader::{linear_detect, linear_detect_planned, rms_scale, rms_scale_weight, Weights};
-use crate::nvfp4_dit::DitPlan;
+use crate::nvfp4_dit::{BlockLeaf, DitPlan};
 use crate::quant::QLinear;
 #[cfg(test)]
 use candle_gen::gen_core::attention_budget::AttentionBudget;
@@ -224,13 +224,18 @@ impl GatedAttention {
         eps: f64,
         plan: &DitPlan,
     ) -> Result<Self> {
-        let p = |leaf: &str| linear_detect_planned(w, &join(prefix, leaf), false, plan);
+        // sc-12121: the leaf strings come from the role table itself (`BlockLeaf::module_leaf`), so
+        // the keys this loader creates and the keys `KreaSite::classify` recognises are literally the
+        // same literals. Editing one without the other is impossible rather than merely tested.
+        let p = |leaf: BlockLeaf| {
+            linear_detect_planned(w, &join(prefix, leaf.module_leaf()), false, plan)
+        };
         Ok(Self {
-            q: p("to_q")?,
-            k: p("to_k")?,
-            v: p("to_v")?,
-            gate: p("to_gate")?,
-            o: p("to_out.0")?,
+            q: p(BlockLeaf::AttnQ)?,
+            k: p(BlockLeaf::AttnK)?,
+            v: p(BlockLeaf::AttnV)?,
+            gate: p(BlockLeaf::AttnGate)?,
+            o: p(BlockLeaf::AttnOut)?,
             norm_q: RmsScale::load(w, &join(prefix, "norm_q.weight"), eps)?,
             norm_k: RmsScale::load(w, &join(prefix, "norm_k.weight"), eps)?,
             heads,
@@ -247,14 +252,14 @@ impl GatedAttention {
         prefix: &str,
     ) -> Vec<(String, &'a crate::quant::QLinear)> {
         [
-            ("to_q", &self.q),
-            ("to_k", &self.k),
-            ("to_v", &self.v),
-            ("to_gate", &self.gate),
-            ("to_out.0", &self.o),
+            (BlockLeaf::AttnQ, &self.q),
+            (BlockLeaf::AttnK, &self.k),
+            (BlockLeaf::AttnV, &self.v),
+            (BlockLeaf::AttnGate, &self.gate),
+            (BlockLeaf::AttnOut, &self.o),
         ]
         .into_iter()
-        .map(|(leaf, p)| (join(prefix, leaf), p))
+        .map(|(leaf, p)| (join(prefix, leaf.module_leaf()), p))
         .collect()
     }
 
@@ -374,11 +379,14 @@ impl SwiGlu {
     /// FLOPs — the layers SC#1's ~2× has to come from, and the reason the `N = 16384` amortization
     /// prediction is testable here at all (sc-12110).
     pub fn load_planned(w: &Weights, prefix: &str, plan: &DitPlan) -> Result<Self> {
-        let p = |leaf: &str| linear_detect_planned(w, &join(prefix, leaf), false, plan);
+        // sc-12121: leaf strings read off the role table — see `GatedAttention::load_planned`.
+        let p = |leaf: BlockLeaf| {
+            linear_detect_planned(w, &join(prefix, leaf.module_leaf()), false, plan)
+        };
         Ok(Self {
-            gate: p("gate")?,
-            up: p("up")?,
-            down: p("down")?,
+            gate: p(BlockLeaf::FfGate)?,
+            up: p(BlockLeaf::FfUp)?,
+            down: p(BlockLeaf::FfDown)?,
         })
     }
 
@@ -387,10 +395,14 @@ impl SwiGlu {
         &'a self,
         prefix: &str,
     ) -> Vec<(String, &'a crate::quant::QLinear)> {
-        [("gate", &self.gate), ("up", &self.up), ("down", &self.down)]
-            .into_iter()
-            .map(|(leaf, p)| (join(prefix, leaf), p))
-            .collect()
+        [
+            (BlockLeaf::FfGate, &self.gate),
+            (BlockLeaf::FfUp, &self.up),
+            (BlockLeaf::FfDown, &self.down),
+        ]
+        .into_iter()
+        .map(|(leaf, p)| (join(prefix, leaf.module_leaf()), p))
+        .collect()
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -476,14 +488,14 @@ impl TextFusionBlock {
             postnorm: RmsScale::load(w, &join(prefix, "norm2.weight"), eps)?,
             attn: GatedAttention::load_planned(
                 w,
-                &join(prefix, "attn"),
+                &join(prefix, BlockLeaf::AttnQ.module()),
                 heads,
                 kv_heads,
                 head_dim,
                 eps,
                 plan,
             )?,
-            mlp: SwiGlu::load_planned(w, &join(prefix, "ff"), plan)?,
+            mlp: SwiGlu::load_planned(w, &join(prefix, BlockLeaf::FfGate.module()), plan)?,
         })
     }
 
@@ -492,8 +504,13 @@ impl TextFusionBlock {
         &'a self,
         prefix: &str,
     ) -> Vec<(String, &'a crate::quant::QLinear)> {
-        let mut v = self.attn.projections(&join(prefix, "attn"));
-        v.extend(self.mlp.projections(&join(prefix, "ff")));
+        let mut v = self
+            .attn
+            .projections(&join(prefix, BlockLeaf::AttnQ.module()));
+        v.extend(
+            self.mlp
+                .projections(&join(prefix, BlockLeaf::FfGate.module())),
+        );
         v
     }
 
@@ -508,8 +525,10 @@ impl TextFusionBlock {
         prefix: &str,
         f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
-        self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
+        self.attn
+            .visit_adaptable_mut(&join(prefix, BlockLeaf::AttnQ.module()), f)?;
+        self.mlp
+            .visit_adaptable_mut(&join(prefix, BlockLeaf::FfGate.module()), f)?;
         Ok(())
     }
 
@@ -591,14 +610,14 @@ impl SingleStreamBlock {
             postnorm: RmsScale::load(w, &join(prefix, "norm2.weight"), eps)?,
             attn: GatedAttention::load_planned(
                 w,
-                &join(prefix, "attn"),
+                &join(prefix, BlockLeaf::AttnQ.module()),
                 heads,
                 kv_heads,
                 head_dim,
                 eps,
                 plan,
             )?,
-            mlp: SwiGlu::load_planned(w, &join(prefix, "ff"), plan)?,
+            mlp: SwiGlu::load_planned(w, &join(prefix, BlockLeaf::FfGate.module()), plan)?,
         })
     }
 
@@ -607,8 +626,13 @@ impl SingleStreamBlock {
         &'a self,
         prefix: &str,
     ) -> Vec<(String, &'a crate::quant::QLinear)> {
-        let mut v = self.attn.projections(&join(prefix, "attn"));
-        v.extend(self.mlp.projections(&join(prefix, "ff")));
+        let mut v = self
+            .attn
+            .projections(&join(prefix, BlockLeaf::AttnQ.module()));
+        v.extend(
+            self.mlp
+                .projections(&join(prefix, BlockLeaf::FfGate.module())),
+        );
         v
     }
 
@@ -676,8 +700,10 @@ impl SingleStreamBlock {
         prefix: &str,
         f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
     ) -> candle_gen::Result<()> {
-        self.attn.visit_adaptable_mut(&join(prefix, "attn"), f)?;
-        self.mlp.visit_adaptable_mut(&join(prefix, "ff"), f)?;
+        self.attn
+            .visit_adaptable_mut(&join(prefix, BlockLeaf::AttnQ.module()), f)?;
+        self.mlp
+            .visit_adaptable_mut(&join(prefix, BlockLeaf::FfGate.module()), f)?;
         Ok(())
     }
 
