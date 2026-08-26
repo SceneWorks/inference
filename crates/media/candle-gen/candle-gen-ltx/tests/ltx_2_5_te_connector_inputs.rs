@@ -4,27 +4,25 @@
 //! `#![cfg(feature = "cuda")]`: candle's plain CPU backend has no bf16 matmul, the same reason
 //! `tests/conformance.rs` and `tests/te_parity.rs` are cuda-only on this backend.
 //!
-//! # What this file can and cannot gate — read before adding a numeric assertion
+//! # The two fixtures this file reads
 //!
-//! The committed fixture `mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors` holds the
-//! reference connector inputs (`features`, `audio_features`) **for LTX-2.3 / eros** — the same file
-//! this crate's `connector_parity.rs` and `te_parity.rs` consume across the backend boundary.
+//! Both live in `mlx-gen-ltx/tests/fixtures/` and are reached across the backend boundary exactly
+//! as `connector_parity.rs` reaches them — one file, one oracle, both backends.
 //!
-//! There is **no LTX-2.5 connector-input golden in the repository.** The 2.5 text encoder is a
-//! different model with different weights, so its connector inputs are numerically unrelated to the
-//! 2.3 fixture; asserting equality against it would be meaningless, and manufacturing a 2.5 golden
-//! from our own implementation would be circular. A genuine 2.5 golden needs the gated upstream
-//! reference and belongs to the epic's terminal measurement campaign (sc-18783).
-//!
-//! So this file gates the connector-input **contract** — geometry read off the committed fixture
-//! rather than hard-coded, dtype, finiteness, non-degeneracy, and mask semantics — and asserts it
-//! in the same terms as the MLX twin, which is what makes the cross-backend comparison meaningful.
+//! * `ltx25_te_connector_golden.safetensors` — the **numeric oracle**, dumped from the upstream
+//!   reference (Lightricks/LTX-2 v1.2.0) on the real *unquantized* `gemma4-12b-with-proj` encoder
+//!   and the real 2.5 DiT connectors by `mlx-gen/tools/dump_ltx25_te_connector_golden.py`. It
+//!   carries its own `input_ids` / `mask01`, so this test does not re-tokenize.
+//! * `ltx_connector_golden.safetensors` — the LTX-2.3 / eros fixture, read **only** for its
+//!   connector-input geometry. Never a numeric oracle for 2.5.
 //!
 //! Run:
 //! `LTX25_TIER_DIR=<tiers> cargo test -p candle-gen-ltx --features cuda --release --test integration
 //!  -- ltx_2_5_te_connector_inputs:: --ignored --nocapture`
 
 #![cfg(feature = "cuda")]
+
+use std::collections::HashMap;
 
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
@@ -39,6 +37,12 @@ use candle_gen_ltx::tokenizer::Ltx25Tokenizer;
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../mlx-gen/mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors"
+);
+
+/// The LTX-**2.5** connector-input golden — the numeric oracle (see the module docs).
+const GOLDEN_25: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../mlx-gen/mlx-gen-ltx/tests/fixtures/ltx25_te_connector_golden.safetensors"
 );
 
 const PROMPT: &str = "A slow dolly shot across a rain-slicked street at night, neon reflections.";
@@ -193,6 +197,153 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
         "ltx_2_5 connector inputs (candle): video {:?} audio {:?}",
         vf.dims3().unwrap(),
         af.dims3().unwrap()
+    );
+}
+
+/// `max|got - want| / max|want|` — the peak-relative error the 2.3 TE sibling (`te_parity.rs`)
+/// asserts on, and the same bars are used below.
+fn peak_rel(got: &Tensor, want: &Tensor) -> f32 {
+    let g = got
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .expect("host copy");
+    let w = want
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .expect("host copy");
+    assert_eq!(g.len(), w.len(), "peak_rel over mismatched shapes");
+    let denom = w.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-12);
+    g.iter()
+        .zip(&w)
+        .fold(0f32, |a, (x, y)| a.max((x - y).abs()))
+        / denom
+}
+
+/// [`peak_rel`] restricted to token rows `[lo, hi)`, with the denominator taken over the same
+/// slice.
+///
+/// The global peak denominator is `max|want|` over the *whole* tensor, which the register / pad
+/// region can dominate; a mismatch confined to the valid rows would then be divided by a number
+/// that has nothing to do with it. This asks the question again where it matters.
+fn peak_rel_rows(got: &Tensor, want: &Tensor, lo: usize, hi: usize) -> f32 {
+    let g = got.narrow(1, lo, hi - lo).expect("slice got");
+    let w = want.narrow(1, lo, hi - lo).expect("slice want");
+    peak_rel(&g, &w)
+}
+
+/// The four tensors both numeric tests compare, run once off the golden's own tokenization.
+///
+/// The **bf16 (dense) tier**, not `q8`: the oracle is an f32 forward over the unquantized upstream
+/// checkpoint, so the port must be given dense bf16 weights or the tier's own quantization error
+/// is folded into a text-encoder correctness gate. Same choice the MLX twin makes.
+fn against_the_golden(device: &Device) -> (HashMap<String, Tensor>, usize, [Tensor; 4]) {
+    let root = std::env::var("LTX25_TIER_DIR").expect("LTX25_TIER_DIR");
+    let dir = std::path::PathBuf::from(root).join("bf16");
+    let g = safetensors::load(GOLDEN_25, device).expect("the LTX-2.5 connector-input golden");
+    let input_ids = g["input_ids"]
+        .to_dtype(DType::U32)
+        .expect("input_ids as u32");
+    assert_eq!(
+        input_ids.dims2().expect("rank 2"),
+        (1, MAX_LEN),
+        "the golden's tokenization must be the geometry this file runs at"
+    );
+    // Feed the golden's own ids/mask rather than re-tokenizing: the oracle and the port must be
+    // answering the same question, and a tokenizer drift would otherwise read as a numeric one.
+    let mask01: Vec<u32> = g["mask01"]
+        .to_dtype(DType::U32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<u32>())
+        .expect("mask01");
+    let nv = mask01.iter().filter(|&&m| m != 0).count();
+    assert!(
+        nv > 0 && nv < MAX_LEN,
+        "the golden must carry a real pad run, got {nv} valid of {MAX_LEN}"
+    );
+
+    let (te, _) = encoder(&dir, device);
+    let (vf, af, ve, ae) = te
+        .encode_both_with_features(&input_ids, &mask01)
+        .expect("encode_both_with_features");
+    (g, nv, [vf, af, ve, ae])
+}
+
+/// **The numeric gate on the text encoder**, asserted in exactly the terms the MLX twin asserts,
+/// against exactly the same file: `video_features` / `audio_features`, the connector *inputs*,
+/// which is what this story is about.
+///
+/// The bar is the 2.3 TE sibling's `1.5e-2` peak-relative (`te_parity.rs`) — a bf16 port against
+/// an f32 reference. Asserted twice, globally and over the valid-token rows alone (the suffix,
+/// since the features keep the tokenizer's left-padded order), so a mismatch confined to the
+/// prompt cannot hide behind a peak denominator set by the pad region.
+///
+/// The MLX twin measured `2.282e-3` / `1.432e-3` here; this backend's number is CUDA-lane
+/// evidence.
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 bf16 tier (LTX25_TIER_DIR) and a CUDA GPU"]
+fn connector_inputs_match_the_2_5_reference_golden() {
+    let device = Device::new_cuda(0).expect("cuda device");
+    let (g, nv, [vf, af, _, _]) = against_the_golden(&device);
+    let (want_vf, want_af) = (&g["video_features"], &g["audio_features"]);
+
+    let (pr_vf, pr_af) = (peak_rel(&vf, want_vf), peak_rel(&af, want_af));
+    let lo = MAX_LEN - nv;
+    let v_vf = peak_rel_rows(&vf, want_vf, lo, MAX_LEN);
+    let v_af = peak_rel_rows(&af, want_af, lo, MAX_LEN);
+    eprintln!(
+        "ltx_2_5 connector INPUTS vs reference (candle): video_features {pr_vf:.3e} (valid \
+         {v_vf:.3e}) audio_features {pr_af:.3e} (valid {v_af:.3e})"
+    );
+
+    assert!(pr_vf < 1.5e-2, "video_features peak_rel {pr_vf:.3e}");
+    assert!(pr_af < 1.5e-2, "audio_features peak_rel {pr_af:.3e}");
+    assert!(
+        v_vf < 1.5e-2,
+        "video_features valid-row peak_rel {v_vf:.3e}"
+    );
+    assert!(
+        v_af < 1.5e-2,
+        "audio_features valid-row peak_rel {v_af:.3e}"
+    );
+}
+
+/// The same gate one stage further on — and **it is RED on MLX today**, on a defect this golden
+/// found. See the MLX twin's `connector_outputs_match_the_2_5_reference_golden` for the full
+/// analysis; in short, `video_embeddings 1.275e0` / `audio_embeddings 1.771e0` against a `6e-2`
+/// bar on the dense bf16 tier, while the connector *inputs* on the same run reproduce to
+/// `2.282e-3`. The defect is in the connector — shared with LTX-2.3 and pinned only against
+/// `mlx_video`'s `Embeddings1DConnector`, never against `ltx_core`'s — not in this adapter.
+///
+/// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
+/// own, on both backends.
+#[test]
+#[ignore = "sc-18770: RED — records a connector defect the 2.5 golden surfaced; see the doc \
+            comment. Needs the bf16 tier (LTX25_TIER_DIR) and a CUDA GPU."]
+fn connector_outputs_match_the_2_5_reference_golden() {
+    let device = Device::new_cuda(0).expect("cuda device");
+    let (g, nv, [_, _, ve, ae]) = against_the_golden(&device);
+    let (want_ve, want_ae) = (&g["video_embeddings"], &g["audio_embeddings"]);
+
+    let (pr_ve, pr_ae) = (peak_rel(&ve, want_ve), peak_rel(&ae, want_ae));
+    // The connector reorders its input, so here the valid rows are the PREFIX.
+    let v_ve = peak_rel_rows(&ve, want_ve, 0, nv);
+    let v_ae = peak_rel_rows(&ae, want_ae, 0, nv);
+    eprintln!(
+        "ltx_2_5 connector OUTPUTS vs reference (candle): video_emb {pr_ve:.3e} (valid \
+         {v_ve:.3e}) audio_emb {pr_ae:.3e} (valid {v_ae:.3e})"
+    );
+
+    assert!(pr_ve < 6e-2, "video_embeddings peak_rel {pr_ve:.3e}");
+    assert!(pr_ae < 6e-2, "audio_embeddings peak_rel {pr_ae:.3e}");
+    assert!(
+        v_ve < 6e-2,
+        "video_embeddings valid-row peak_rel {v_ve:.3e}"
+    );
+    assert!(
+        v_ae < 6e-2,
+        "audio_embeddings valid-row peak_rel {v_ae:.3e}"
     );
 }
 

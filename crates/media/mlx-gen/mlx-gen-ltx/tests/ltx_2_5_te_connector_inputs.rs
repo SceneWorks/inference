@@ -6,30 +6,22 @@
 //! [`Ltx25TextEncoder::encode_av_with_features`] returns the 2.5 pair, deliberately in the same
 //! shape so the two are comparable.
 //!
-//! # What this file can and cannot gate — read before adding a numeric assertion
+//! # The two fixtures this file reads
 //!
-//! The committed fixture `tests/fixtures/ltx_connector_golden.safetensors` holds the reference
-//! connector inputs (`features`, `audio_features`) **for LTX-2.3 / eros**, dumped from the PyTorch
-//! reference by `tools/dump_ltx_connector_golden.py`. It is the fixture `connector_parity.rs` and
-//! its candle twin consume, and it is what pins the connector itself on both backends.
-//!
-//! There is **no LTX-2.5 connector-input golden in the repository.** The 2.5 text encoder is a
-//! different model with different weights, so its connector inputs are numerically unrelated to the
-//! 2.3 fixture — asserting equality against it would be meaningless, and manufacturing a 2.5 golden
-//! here would mean re-recording an oracle from our own implementation, which is exactly the
-//! circularity a golden exists to prevent. Producing a genuine 2.5 golden needs the gated upstream
-//! reference and belongs to the epic's terminal measurement campaign (sc-18783).
-//!
-//! So this file gates what is honestly checkable on real weights: the connector-input **contract**
-//! (geometry, dtype, finiteness, non-degeneracy, mask semantics) read off the committed fixture
-//! rather than hard-coded, and the fact that the produced features are actually accepted by the 2.5
-//! connector. The numeric oracle gate is named above so nobody mistakes this for one.
+//! * `tests/fixtures/ltx25_te_connector_golden.safetensors` — the **numeric oracle**, dumped from
+//!   the upstream reference (Lightricks/LTX-2 v1.2.0) on the real *unquantized*
+//!   `gemma4-12b-with-proj` encoder and the real 2.5 DiT connectors by
+//!   `tools/dump_ltx25_te_connector_golden.py`. Backend-neutral: it carries its own `input_ids` and
+//!   `mask01`, so this test and its candle twin consume one tokenization and one oracle.
+//! * `tests/fixtures/ltx_connector_golden.safetensors` — the LTX-2.3 / eros fixture, read **only**
+//!   for its connector-input geometry, so the contract this file enforces is the reference's rather
+//!   than this file's opinion. Never a numeric oracle for 2.5.
 //!
 //! Run:
 //! `LTX25_TIER_DIR=/Volumes/Models/scratch-tiers-sc18775/tiers cargo test -p mlx-gen-ltx --release
 //!  --test integration -- ltx_2_5_te_connector_inputs:: --ignored --nocapture`
 
-use mlx_rs::ops::{abs, max};
+use mlx_rs::ops::{abs, max, subtract, sum};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
@@ -45,6 +37,12 @@ use mlx_gen_ltx::transformer::Precision;
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_connector_golden.safetensors"
+);
+
+/// The LTX-**2.5** connector-input golden — the numeric oracle (see the module docs).
+const GOLDEN_25: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/ltx25_te_connector_golden.safetensors"
 );
 
 const PROMPT: &str = "A slow dolly shot across a rain-slicked street at night, neon reflections.";
@@ -65,6 +63,24 @@ fn tier_dir() -> std::path::PathBuf {
         )
     });
     std::path::PathBuf::from(root).join("q8")
+}
+
+/// The tier the **numeric** gate runs on: `bf16`, i.e. the dense one.
+///
+/// Not a convenience — it is what makes the comparison meaningful. The oracle is an f32 forward
+/// over the unquantized upstream checkpoint, so the port must be given the closest thing it has:
+/// dense bf16 weights, bf16 activations. That is exactly the shape of comparison the 2.3 TE
+/// sibling makes (LTX-2.3 ships its connector dense), which is why its `1.5e-2` / `6e-2` bars
+/// transfer. Running this against the `q8` tier instead would fold the tier's own quantization
+/// error into a text-encoder correctness gate — a *tier-quality* question, which
+/// `mlx-llm`'s `ltx_2_5_te_tier_quality.rs` owns and this file must not silently answer.
+fn golden_tier_dir() -> std::path::PathBuf {
+    let root = std::env::var("LTX25_TIER_DIR").unwrap_or_else(|_| {
+        panic!(
+            "set LTX25_TIER_DIR to the built LTX-2.5 tier root (the directory holding q4/q8/bf16)"
+        )
+    });
+    std::path::PathBuf::from(root).join("bf16")
 }
 
 /// `(video_dim, audio_dim)` read off the committed reference fixture rather than hard-coded, so the
@@ -168,6 +184,156 @@ fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
         "ltx_2_5 connector inputs: video {:?} audio {:?}",
         vf.shape(),
         af.shape()
+    );
+}
+
+/// `max|got - want| / max|want|` — the peak-relative error the 2.3 TE sibling (`te_parity.rs`)
+/// asserts on, and the same bars are used below.
+fn peak_rel(got: &Array, want: &Array) -> f32 {
+    let got = got.as_dtype(mlx_rs::Dtype::Float32).expect("f32");
+    let diff = abs(subtract(&got, want).unwrap()).unwrap();
+    let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
+    max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
+}
+
+/// [`peak_rel`] restricted to token rows `[lo, hi)`, with the denominator taken over the same
+/// slice.
+///
+/// The global peak denominator is `max|want|` over the *whole* tensor, which the register /
+/// pad region can dominate; a mismatch confined to the valid rows would then be divided by a
+/// number that has nothing to do with it. This asks the question again where it matters.
+fn peak_rel_rows(got: &Array, want: &Array, lo: i32, hi: i32) -> f32 {
+    let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
+    let g = got.take_axis(idx.clone(), 1).expect("slice got");
+    let w = want.take_axis(idx, 1).expect("slice want");
+    peak_rel(&g, &w)
+}
+
+/// The four tensors both numeric tests compare, run once off the golden's own tokenization.
+fn against_the_golden() -> (Weights, i32, Array, Array, Array, Array) {
+    let dir = golden_tier_dir();
+    let g = Weights::from_file(GOLDEN_25).expect("the LTX-2.5 connector-input golden");
+    let input_ids = g.require("input_ids").expect("input_ids").clone();
+    let mask01 = g.require("mask01").expect("mask01").clone();
+    assert_eq!(
+        input_ids.shape(),
+        &[1, MAX_LEN as i32],
+        "the golden's tokenization must be the geometry this file runs at"
+    );
+    // Feed the golden's own ids/mask rather than re-tokenizing: the oracle and the port must be
+    // answering the same question, and a tokenizer drift would otherwise read as a numeric one.
+    let nv = sum(&mask01, None).unwrap().item::<i32>();
+    assert!(
+        nv > 0 && nv < MAX_LEN as i32,
+        "the golden must carry a real pad run, got {nv} valid of {MAX_LEN}"
+    );
+
+    let (te, _) = encoder(&dir);
+    let (vf, af, ve, ae) = te
+        .encode_av_with_features(&input_ids, &mask01)
+        .expect("encode_av_with_features");
+    (g, nv, vf, af, ve, ae)
+}
+
+/// **The numeric gate on the text encoder.** `video_features` / `audio_features` — the connector
+/// *inputs*, which is what this story is about — must reproduce the upstream reference.
+///
+/// This is the whole Gemma 4 stack under test: 49 hidden states under the causal+padding mask, the
+/// per-token-RMS V2 extractor, and both `text_embedding_projection.*_aggregate_embed` heads.
+///
+/// The bar is the 2.3 TE sibling's `1.5e-2` peak-relative (`te_parity.rs`), not the diffvae
+/// golden's 2e-3 — this compares a bf16 port against an f32 reference. Measured on the bf16 tier:
+/// `video_features 2.282e-3`, `audio_features 1.432e-3`, i.e. ~6× inside the bar.
+///
+/// Each bar is asserted **twice**: once globally, and once over the valid-token rows alone (the
+/// suffix, since the features keep the tokenizer's left-padded order), so a mismatch confined to
+/// the prompt cannot hide behind a peak denominator set by the pad region.
+///
+/// **This test is what the padding-mask fix is proved against.** With
+/// `masked_hidden_states_in_order` reverted to `AttnMask::Causal` it goes RED at
+/// `video_features 8.212e-1`; with the fix it is `2.282e-3`.
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 bf16 tier (LTX25_TIER_DIR); one ~24 GB encoder load"]
+fn connector_inputs_match_the_2_5_reference_golden() {
+    let (g, nv, vf, af, _, _) = against_the_golden();
+    let want_vf = g.require("video_features").expect("video_features");
+    let want_af = g.require("audio_features").expect("audio_features");
+
+    let (pr_vf, pr_af) = (peak_rel(&vf, want_vf), peak_rel(&af, want_af));
+    let lo = MAX_LEN as i32 - nv;
+    let v_vf = peak_rel_rows(&vf, want_vf, lo, MAX_LEN as i32);
+    let v_af = peak_rel_rows(&af, want_af, lo, MAX_LEN as i32);
+    eprintln!(
+        "ltx_2_5 connector INPUTS vs reference: video_features {pr_vf:.3e} (valid {v_vf:.3e}) \
+         audio_features {pr_af:.3e} (valid {v_af:.3e})"
+    );
+
+    assert!(pr_vf < 1.5e-2, "video_features peak_rel {pr_vf:.3e}");
+    assert!(pr_af < 1.5e-2, "audio_features peak_rel {pr_af:.3e}");
+    assert!(
+        v_vf < 1.5e-2,
+        "video_features valid-row peak_rel {v_vf:.3e}"
+    );
+    assert!(
+        v_af < 1.5e-2,
+        "audio_features valid-row peak_rel {v_af:.3e}"
+    );
+}
+
+/// The same gate one stage further on — and **it is RED today**, on a defect this golden found.
+///
+/// Measured on the bf16 (dense) tier, so tier quantization is not in play — the q8 tier gives the
+/// same numbers to three digits:
+///
+/// ```text
+/// video_embeddings  1.275e0  (valid rows 4.877e-1)     bar 6e-2
+/// audio_embeddings  1.771e0  (valid rows 4.363e-2)     bar 6e-2
+/// ```
+///
+/// What that rules out. The connector *inputs* reproduce the reference to `2.282e-3` on the same
+/// run, so the Gemma 4 backbone, the padding mask, the V2 extractor and both aggregate projections
+/// are correct. The 2.5 checkpoint's connector config is byte-identical in shape to 2.3's (32 × 128
+/// video / 32 × 64 audio, 8 layers, 128 registers, `max_pos [4096]`, theta 10000, gated,
+/// `connector_ff_bias` absent ⇒ true), so this is not a 2.5-specific config the loader mis-reads.
+/// The register-block ordering matches: upstream sorts the features right-padded *outside* the
+/// connector and replaces pads in place, `crate::connector` does both inside, and both land valid
+/// tokens at rows `0..num_valid` with `registers[num_valid..seq]` after.
+///
+/// What it leaves. The defect is in `crate::connector` — code **shared with LTX-2.3** and pinned
+/// only against `tools/dump_ltx_connector_golden.py`, whose oracle is `mlx_video`'s
+/// `Embeddings1DConnector`, *not* `ltx_core`'s. This is the first time the connector has been
+/// compared against upstream's own implementation, and the two disagree. Diagnosing that belongs to
+/// the connector's story (sc-18757), not to this text-encoder adapter: nothing in `gemma4_te.rs`
+/// can affect it, as the input-side gate above demonstrates.
+///
+/// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
+/// own.
+#[test]
+#[ignore = "sc-18770: RED — records a crate::connector defect the 2.5 golden surfaced; see the doc \
+            comment. Needs the bf16 tier (LTX25_TIER_DIR)."]
+fn connector_outputs_match_the_2_5_reference_golden() {
+    let (g, nv, _, _, ve, ae) = against_the_golden();
+    let want_ve = g.require("video_embeddings").expect("video_embeddings");
+    let want_ae = g.require("audio_embeddings").expect("audio_embeddings");
+
+    let (pr_ve, pr_ae) = (peak_rel(&ve, want_ve), peak_rel(&ae, want_ae));
+    // The connector reorders its input, so here the valid rows are the PREFIX.
+    let v_ve = peak_rel_rows(&ve, want_ve, 0, nv);
+    let v_ae = peak_rel_rows(&ae, want_ae, 0, nv);
+    eprintln!(
+        "ltx_2_5 connector OUTPUTS vs reference: video_emb {pr_ve:.3e} (valid {v_ve:.3e}) \
+         audio_emb {pr_ae:.3e} (valid {v_ae:.3e})"
+    );
+
+    assert!(pr_ve < 6e-2, "video_embeddings peak_rel {pr_ve:.3e}");
+    assert!(pr_ae < 6e-2, "audio_embeddings peak_rel {pr_ae:.3e}");
+    assert!(
+        v_ve < 6e-2,
+        "video_embeddings valid-row peak_rel {v_ve:.3e}"
+    );
+    assert!(
+        v_ae < 6e-2,
+        "audio_embeddings valid-row peak_rel {v_ae:.3e}"
     );
 }
 
