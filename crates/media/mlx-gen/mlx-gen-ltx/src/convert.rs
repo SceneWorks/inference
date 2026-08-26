@@ -56,7 +56,7 @@ use mlx_rs::{Array, Dtype};
 /// (minus the `.weight` suffix) ends with one of these. Matches all attention `to_q/k/v/out` (self,
 /// cross, and the cross-modal audio↔video attentions) plus the video/audio FFN in/out projections;
 /// leaves `q_norm`/`k_norm`/`to_gate_logits`/adaLN/patchify/`proj_out` dense.
-const QUANT_SUFFIXES: &[&str] = &[
+pub(crate) const TRANSFORMER_QUANT_SUFFIXES: &[&str] = &[
     ".to_q",
     ".to_k",
     ".to_v",
@@ -65,6 +65,33 @@ const QUANT_SUFFIXES: &[&str] = &[
     ".ff.proj_out",
     ".audio_ff.proj_in",
     ".audio_ff.proj_out",
+];
+
+/// The embeddings-connector Linears the LTX-2.5 tiers quantize (sc-18775).
+///
+/// The connector component keeps the checkpoint's **raw** naming (`to_out.0`, `ff.net.0.proj`,
+/// `ff.net.2`) — [`build_connector`] deliberately does not sanitize it the way the transformer is
+/// sanitized — so this is a separate list from [`TRANSFORMER_QUANT_SUFFIXES`] rather than the same
+/// one reused.
+///
+/// `to_gate_logits` is **excluded**, mirroring the reference `_quantize_ltx_predicate`'s treatment
+/// of the DiT's own gate projections: it is a `[num_heads, dim]` projection feeding a sigmoid gate,
+/// 4 MB across both connectors, and quantizing a multiplicative gate buys nothing measurable while
+/// perturbing every attention output. Norms, biases and the learnable registers are excluded for the
+/// same reason the DiT excludes them — they are not matmul weights.
+/// The two `text_embedding_projection.*_aggregate_embed` Linears are included: they live in the
+/// LTX-2.5 text-encoder file but the tier moves them into this component (where LTX-2.3 keeps them
+/// and where [`crate::text_encoder::LtxTextEncoder`]'s feature heads read them from), and at
+/// `[4096, 188160]` and `[2048, 188160]` they are 2.31 GB of the two together.
+pub(crate) const CONNECTOR_QUANT_SUFFIXES: &[&str] = &[
+    ".attn1.to_q",
+    ".attn1.to_k",
+    ".attn1.to_v",
+    ".attn1.to_out.0",
+    ".ff.net.0.proj",
+    ".ff.net.2",
+    "text_embedding_projection.video_aggregate_embed",
+    "text_embedding_projection.audio_aggregate_embed",
 ];
 
 /// The LTX-2.3 latent-upsampler component specs (component prefix → source filename in the base
@@ -353,7 +380,7 @@ fn quantize_transformer(
     let mut out = HashMap::with_capacity(m.len());
     for (k, v) in m {
         let base = k.strip_suffix(".weight");
-        let is_q = base.is_some_and(|b| QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
+        let is_q = base.is_some_and(|b| TRANSFORMER_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
         if let (true, Some(base)) = (is_q, base) {
             let (wq, scales, biases) = quantize(&v, group_size, bits)?;
             out.insert(format!("{base}.weight"), wq);
@@ -814,10 +841,11 @@ pub fn convert_vae_components(
             // `per_channel_statistics` remap is the same one the conv decoder wants.
             let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
             // `sanitize_vae_decoder` also sweeps in the two `per_channel_statistics` tensors, so
-            // "not empty" is not the same as "has a decoder": check for both stage families.
-            let has_stages = vae_decoder.keys().any(|k| k.starts_with("det_stages."));
-            let has_blocks = vae_decoder.keys().any(|k| k.starts_with("diff_blocks."));
-            if !(has_stages && has_blocks) {
+            // "not empty" is not the same as "has a decoder": classify through `crate::diff_vae`'s
+            // own predicate, the one the loader uses, rather than re-deriving it here.
+            if !crate::diff_vae::keys_look_like_diffusion_decoder(
+                vae_decoder.keys().map(String::as_str),
+            ) {
                 return Err(Error::Msg(format!(
                     "ltx: {} declares {class} but carries no `decoder.det_stages.*` / \
                      `decoder.diff_blocks.*` tensors",
@@ -891,6 +919,53 @@ pub fn convert_vae_components(
     Ok(components)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The component builders, shared with the LTX-2.5 tier converter (sc-18775)
+// ---------------------------------------------------------------------------------------------
+//
+// [`crate::tiers`] applies the *same* sanitizers to LTX-2.5's split components that this module
+// applies to a 2.3 all-in-one checkpoint — that equivalence is the sc-18765 finding and the reason
+// the 2.5 ports are the 2.3 ports. These wrappers are the seam: one implementation, two callers,
+// with the video-VAE namespace detected rather than passed, because a 2.5 caller always has a
+// component file and a 2.3 caller always has a bundled one.
+
+/// [`sanitize_transformer`], for the tier converter.
+pub(crate) fn sanitize_transformer_component(raw: &Weights) -> HashMap<String, Array> {
+    sanitize_transformer(raw)
+}
+
+/// [`build_connector`], for the tier converter. On an LTX-2.5 transformer this yields the two
+/// `{video,audio}_embeddings_connector.*` towers; the `text_embedding_projection.*` Linears the 2.3
+/// checkpoint kept here moved into the 2.5 text-encoder file, so they simply do not appear.
+pub(crate) fn build_connector_component(raw: &Weights) -> HashMap<String, Array> {
+    build_connector(raw)
+}
+
+/// [`sanitize_vae_decoder`] with the namespace detected from the key set.
+pub(crate) fn sanitize_vae_decoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vae_decoder(raw, VaeNamespace::detect(raw))
+}
+
+/// [`sanitize_vae_encoder`] with the namespace detected from the key set.
+pub(crate) fn sanitize_vae_encoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vae_encoder(raw, VaeNamespace::detect(raw))
+}
+
+/// [`sanitize_audio_vae`], for the tier converter.
+pub(crate) fn sanitize_audio_vae_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_audio_vae(raw)
+}
+
+/// [`sanitize_vocoder`], for the tier converter.
+pub(crate) fn sanitize_vocoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vocoder(raw)
+}
+
+/// [`cast_floats_bf16`], for the tier converter.
+pub(crate) fn cast_component_floats_bf16(map: &mut HashMap<String, Array>) -> Result<()> {
+    cast_floats_bf16(map)
+}
+
 /// Pretty-print a JSON value to `path` (matching the reference `json.dump(..., indent=2)`).
 fn write_json(path: PathBuf, value: &serde_json::Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
@@ -915,7 +990,7 @@ mod tests {
     fn quant_predicate_selects_reference_linears() {
         let q = |k: &str| {
             k.strip_suffix(".weight")
-                .is_some_and(|b| QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)))
+                .is_some_and(|b| TRANSFORMER_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)))
         };
         // Quantized.
         for k in [

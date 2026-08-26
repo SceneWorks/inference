@@ -105,7 +105,7 @@ impl Precision {
         }
     }
 
-    fn dtype(self) -> Dtype {
+    pub(crate) fn dtype(self) -> Dtype {
         match self.mode {
             Mode::DenseF32 | Mode::QuantF32 => Dtype::Float32,
             Mode::QuantBf16 => Dtype::Bfloat16,
@@ -121,7 +121,7 @@ impl Precision {
     /// cast). bf16 → `QuantBf16`; f32 preserves whether the base was kept packed (`QuantF32`) or
     /// dequantized to dense (`DenseF32`). Used by [`LtxDiT::cast_weights`] to flip the whole forward
     /// to bf16 activations once the leaves are cast.
-    fn with_compute_dtype(self, dtype: Dtype) -> Self {
+    pub(crate) fn with_compute_dtype(self, dtype: Dtype) -> Self {
         let mode = match dtype {
             Dtype::Bfloat16 => Mode::QuantBf16,
             _ if self.keep_quant() => Mode::QuantF32,
@@ -463,7 +463,7 @@ pub struct Linear {
 impl Linear {
     /// Every Linear except the LTX-2.5 `ff_bias:false` FFN Linears carries a bias — see
     /// [`load_with_bias`](Self::load_with_bias).
-    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
         Self::load_with_bias(w, prefix, prec, true)
     }
 
@@ -472,7 +472,12 @@ impl Linear {
     /// doesn't exist in the checkpoint — and must not silently zero-fill a *missing* bias it should
     /// have found, so this only ever skips the read when the caller (the FFN construction, gated on
     /// `LtxConfig::ff_bias`/`audio_ff_bias`/`connector_ff_bias`) says the tensor was never shipped.
-    fn load_with_bias(w: &Weights, prefix: &str, prec: Precision, has_bias: bool) -> Result<Self> {
+    pub(crate) fn load_with_bias(
+        w: &Weights,
+        prefix: &str,
+        prec: Precision,
+        has_bias: bool,
+    ) -> Result<Self> {
         let dt = prec.dtype();
         let b = has_bias
             .then(|| to_dtype(w.require(&format!("{prefix}.bias"))?, dt))
@@ -514,7 +519,7 @@ impl Linear {
         Ok(Linear { kind, lora: None })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
+    pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
         let mut out = self.kind.forward(x)?;
         if let Some(stack) = &self.lora {
             let pass = stack.pass.get();

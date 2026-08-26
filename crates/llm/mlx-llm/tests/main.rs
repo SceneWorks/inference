@@ -56,6 +56,9 @@ mod gguf_tokenizer;
 #[path = "joycaption.rs"]
 mod joycaption;
 
+#[path = "ltx_2_5_te_tier_quality.rs"]
+mod ltx_2_5_te_tier_quality;
+
 #[path = "paged.rs"]
 mod paged;
 
