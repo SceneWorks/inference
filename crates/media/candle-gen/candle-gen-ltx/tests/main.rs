@@ -44,6 +44,9 @@ mod trainer_conformance;
 #[path = "trainer_e2e.rs"]
 mod trainer_e2e;
 
+#[path = "upsampler_parity.rs"]
+mod upsampler_parity;
+
 #[path = "vae_decode_sweep.rs"]
 mod vae_decode_sweep;
 

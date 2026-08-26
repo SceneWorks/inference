@@ -45,17 +45,35 @@ pub(crate) struct ZeroPaddedConv3d {
 impl ZeroPaddedConv3d {
     pub(crate) fn load(vb: VarBuilder, prefix: &str) -> Result<Self> {
         let weight = guard_no_scales(&vb, prefix, vb.dtype())?.contiguous()?;
+        let bias = vb.get_unchecked(&format!("{prefix}.bias"))?;
+        Self::from_parts(weight, bias)
+    }
+
+    /// Build from tensors already pulled out of a checkpoint, for callers that had to inspect the
+    /// weight's shape before deciding which module to construct (the latent upsampler's resampler
+    /// branch) and must not pay a second materialization to do it.
+    pub(crate) fn from_parts(weight: Tensor, bias: Tensor) -> Result<Self> {
+        let weight = weight.contiguous()?;
         let dims = weight.dims();
+        if dims.len() != 5 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx conv3d: weight must be rank 5 [O,I,kt,kh,kw], got {dims:?}"
+            )));
+        }
         let (out_c, kt, kh) = (dims[0], dims[2], dims[3]);
-        let bias = vb
-            .get_unchecked(&format!("{prefix}.bias"))?
-            .reshape((1, out_c, 1, 1, 1))?;
+        let bias = bias.reshape((1, out_c, 1, 1, 1))?;
         Ok(Self {
             weight,
             bias,
             kt,
             spatial_pad: (kh - 1) / 2,
         })
+    }
+
+    /// The checkpoint-native `[O, I, kt, kh, kw]` weight shape, for callers that must cross-check a
+    /// declared channel count against the tensor that actually loaded.
+    pub(crate) fn weight_dims(&self) -> &[usize] {
+        self.weight.dims()
     }
 
     /// `[B,C,T,H,W]` -> `[B,O,T,H,W]`, using symmetric zero padding in every

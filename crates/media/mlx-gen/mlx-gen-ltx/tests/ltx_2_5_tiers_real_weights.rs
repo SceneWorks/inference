@@ -48,7 +48,7 @@ use mlx_rs::ops::{abs, max as max_op, mean, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{
-    discover_split_bundle, LtxBundle, LtxCheckpointLayout, LtxComponent,
+    discover_split_bundle, LatentUpsamplerMode, LtxBundle, LtxCheckpointLayout, LtxComponent,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
@@ -796,17 +796,14 @@ fn every_component_loads_and_forwards_at_every_tier() {
 
         // ---- latent upsamplers --------------------------------------------------------------------
         //
-        // Only the **spatial** one is driven. Both files carry the same key families, but the
-        // temporal upsampler's `upsampler.0.weight` is a rank-5 Conv3d where the spatial one's is a
-        // rank-4 Conv2d, and this crate's `LatentUpsampler` implements the spatial resampler only —
-        // its temporal twin is a later story in this epic. Running it here would measure that gap
-        // rather than the tier. The temporal component is still asserted structurally, which is the
-        // part a tier conversion can actually break.
+        // Both shipped upsamplers are **forwarded**, not just header-checked: the spatial one's
+        // `upsampler.0.weight` is a rank-4 Conv2d and the temporal one's is a rank-5 Conv3d, and
+        // `LatentUpsampler` selects the branch from that rank, so only running each proves the
+        // tier's file selects the branch it should. The header assertions stay alongside — the
+        // PyTorch conv layout and the BF16 dtype are what a tier conversion can silently change.
         {
-            let w = Weights::from_file(dir.join("spatial_upsampler.safetensors")).unwrap();
-            let up = LatentUpsampler::from_weights(&w)
+            let up = LatentUpsampler::from_checkpoint(dir.join("spatial_upsampler.safetensors"))
                 .unwrap_or_else(|e| panic!("{tier}: build the spatial upsampler: {e}"));
-            drop(w);
             clear_cache();
             let latent = Array::ones::<f32>(&[1, 128, 2, 8, 8]).unwrap();
             let out = up
@@ -834,7 +831,7 @@ fn every_component_loads_and_forwards_at_every_tier() {
             let header = component_header(&root, *tier, "temporal_upsampler");
             // Raw PyTorch layout, exactly as it ships: `LatentUpsampler`'s loader does the
             // channels-last transpose itself, so a converter that pre-transposed here would break
-            // the port that eventually consumes it.
+            // the port that consumes it.
             assert_eq!(
                 header.tensors["initial_conv.weight"].shape,
                 vec![512, 128, 3, 3, 3],
@@ -844,6 +841,38 @@ fn every_component_loads_and_forwards_at_every_tier() {
             for (key, h) in &header.tensors {
                 assert_eq!(h.dtype, "BF16", "{tier}: temporal_upsampler/{key}");
             }
+
+            let up = LatentUpsampler::from_checkpoint(dir.join("temporal_upsampler.safetensors"))
+                .unwrap_or_else(|e| panic!("{tier}: build the temporal upsampler: {e}"));
+            clear_cache();
+            assert_eq!(
+                up.mode(),
+                LatentUpsamplerMode::Temporal2x,
+                "{tier}: the temporal file must select the temporal branch"
+            );
+            // 9 latent frames is the smallest multi-frame `n % 8 == 1` size; `2·9−1 = 17` is what
+            // preserves that invariant on the way out.
+            let latent = Array::ones::<f32>(&[1, 128, 9, 8, 8]).unwrap();
+            let out = up
+                .forward(&latent)
+                .unwrap_or_else(|e| panic!("{tier}: temporal upsampler forward: {e}"));
+            out.eval().unwrap();
+            eprintln!(
+                "[{tier}] temporal upsampler: {:?} -> {:?}",
+                latent.shape(),
+                out.shape()
+            );
+            assert_eq!(
+                out.shape(),
+                &[1, 128, 17, 8, 8],
+                "{tier}: the temporal upsampler must map F -> 2F-1 and leave H,W alone"
+            );
+            assert!(
+                max_abs(&out).is_finite(),
+                "{tier}: the temporal upsampler produced non-finite latents"
+            );
+            drop(up);
+            clear_cache();
         }
     }
 }
