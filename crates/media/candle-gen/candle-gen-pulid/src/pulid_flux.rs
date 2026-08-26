@@ -83,6 +83,20 @@ fn reject_below_floor(req: &PulidFluxRequest) -> Result<()> {
     Ok(())
 }
 
+/// Poll cancellation at every boundary of the expensive identity preparation stack. A cancellation
+/// that arrives while a synchronous face/EVA/IDFormer stage is running is observed before the next
+/// stage or any generation setup begins.
+fn identity_stage<T>(cancel: &CancelFlag, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    let output = work()?;
+    if cancel.is_cancelled() {
+        return Err(CandleError::Canceled);
+    }
+    Ok(output)
+}
+
 /// Default PuLID `id_weight` (the reference-face strength; 0–3, upstream default 1.0).
 pub const DEFAULT_ID_WEIGHT: f32 = 1.0;
 /// Default dev guidance for the PuLID photoreal recipe.
@@ -322,8 +336,19 @@ impl PulidFlux {
     }
 
     /// Reference face (RGB [`Image`]) → `id_embedding` `[1,32,2048]` (f32). Mirrors PuLID's
-    /// `get_id_embedding` (the conditional side).
+    /// `get_id_embedding` (the conditional side). Direct callers retain the historical non-cancelable
+    /// API; generation uses the cancellation-aware internal path below.
     pub fn compute_id_embedding(&self, reference: &Image) -> Result<Tensor> {
+        self.compute_id_embedding_with_cancel(reference, &CancelFlag::new())
+    }
+
+    /// Cancellation-aware identity preparation used by generation. Polls `cancel` between each
+    /// synchronous face/EVA/IDFormer stage before any denoise setup can begin.
+    fn compute_id_embedding_with_cancel(
+        &self,
+        reference: &Image,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
         let inner = self.face.inner();
         let (h, w) = (reference.height as usize, reference.width as usize);
         // Detect-then-embed-the-largest (sc-11249 / F-138), matching the `candle-gen-face` /
@@ -332,21 +357,31 @@ impl PulidFlux {
         // avoids `analyze`'s N−1 wasted host norm-crops + N-row batched forward for a group-photo
         // reference; iresnet100 has no cross-batch ops, so the kept embedding is bit-identical to the
         // old `analyze(..).first()`.
-        let dets = inner.detect(&reference.pixels, h, w)?;
+        let dets = identity_stage(cancel, || inner.detect(&reference.pixels, h, w))?;
         let det = dets.first().ok_or_else(|| {
             CandleError::Msg("pulid_flux: no face detected in the reference image".into())
         })?;
-        let face = inner.embed(&reference.pixels, h, w, det)?;
+        let face = identity_stage(cancel, || inner.embed(&reference.pixels, h, w, det))?;
         // ArcFace 512-d (raw, un-normalized) → [1, 512] f32.
         let dim = face.embedding.len();
-        let arcface = Tensor::from_vec(face.embedding.clone(), (1, dim), &self.device)?;
+        let arcface = identity_stage(cancel, || {
+            Ok(Tensor::from_vec(
+                face.embedding.clone(),
+                (1, dim),
+                &self.device,
+            )?)
+        })?;
         // face_features_image (512² NCHW) → EVA 336² transform → tower.
-        let ffi = inner.face_features_image(&reference.pixels, h, w, &face)?;
-        let eva_in = transform::eva_transform(&ffi, self.eva.config().image_size)?;
-        let eva_out = self.eva.forward(&eva_in)?;
-        let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
-        let id_cond = Tensor::cat(&[&arcface, &id_cond_vit], 1)?; // [1,1280]
-        self.idformer.forward(&id_cond, &eva_out.hidden)
+        let ffi = identity_stage(cancel, || {
+            inner.face_features_image(&reference.pixels, h, w, &face)
+        })?;
+        let eva_in = identity_stage(cancel, || {
+            transform::eva_transform(&ffi, self.eva.config().image_size)
+        })?;
+        let eva_out = identity_stage(cancel, || Ok(self.eva.forward(&eva_in)?))?;
+        let id_cond_vit = identity_stage(cancel, || Ok(l2_normalize_rows(&eva_out.id_cond_vit)?))?; // [1,768]
+        let id_cond = identity_stage(cancel, || Ok(Tensor::cat(&[&arcface, &id_cond_vit], 1)?))?; // [1,1280]
+        identity_stage(cancel, || self.idformer.forward(&id_cond, &eva_out.hidden))
     }
 
     /// Reference-image identity T2I: condition the FLUX.1-dev generation on `reference`'s PuLID
@@ -418,15 +453,17 @@ impl PulidFlux {
             .validate_native_vae_request(req.use_pid, &req.cancel)?;
 
         // Identity conditioning (computed once; constant across the denoise).
-        let id_embedding = self.compute_id_embedding(reference)?;
-        let pulid_ca = PulidCa::from_weights(
-            &self.pulid,
-            "pulid_ca",
-            id_embedding,
-            req.id_weight as f64,
-            NUM_DOUBLE_BLOCKS,
-            NUM_SINGLE_BLOCKS,
-        )?;
+        let id_embedding = self.compute_id_embedding_with_cancel(reference, &req.cancel)?;
+        let pulid_ca = identity_stage(&req.cancel, || {
+            PulidCa::from_weights(
+                &self.pulid,
+                "pulid_ca",
+                id_embedding,
+                req.id_weight as f64,
+                NUM_DOUBLE_BLOCKS,
+                NUM_SINGLE_BLOCKS,
+            )
+        })?;
 
         // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
         // encoders, same token ids either way).
@@ -626,6 +663,49 @@ mod tests {
         assert_eq!(r.guidance, DEFAULT_GUIDANCE);
         assert_eq!(r.id_weight, DEFAULT_ID_WEIGHT);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// F-108: a request canceled before identity preparation starts returns the shared cancellation
+    /// error without invoking the first identity stage.
+    #[test]
+    fn identity_stage_pre_cancelled_skips_work() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut calls = 0;
+        let result = identity_stage(&cancel, || {
+            calls += 1;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(calls, 0);
+    }
+
+    /// F-108: cancellation observed after an identity operation prevents every later identity or
+    /// generation stage from starting, and preserves the shared `CandleError::Canceled` result.
+    #[test]
+    fn identity_stage_cancellation_checkpoint_stops_before_next_stage() {
+        let cancel = CancelFlag::new();
+        let mut first_calls = 0;
+        let mut next_calls = 0;
+        let result: Result<()> = (|| {
+            identity_stage(&cancel, || {
+                first_calls += 1;
+                cancel.cancel();
+                Ok(())
+            })?;
+            identity_stage(&cancel, || {
+                next_calls += 1;
+                Ok(())
+            })
+        })();
+
+        assert!(matches!(result, Err(CandleError::Canceled)));
+        assert_eq!(first_calls, 1);
+        assert_eq!(
+            next_calls, 0,
+            "generation setup must not follow a canceled identity stage"
+        );
     }
 
     #[test]
