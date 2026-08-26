@@ -314,7 +314,8 @@ fn connector_inputs_match_the_2_5_reference_golden() {
 /// analysis; in short, `video_embeddings 1.275e0` / `audio_embeddings 1.771e0` against a `6e-2`
 /// bar on the dense bf16 tier, while the connector *inputs* on the same run reproduce to
 /// `2.282e-3`. The defect is in the connector — shared with LTX-2.3 and pinned only against
-/// `mlx_video`'s `Embeddings1DConnector`, never against `ltx_core`'s — not in this adapter.
+/// `mlx_video`'s `Embeddings1DConnector`, never against `ltx_core`'s — not in this adapter, and is
+/// tracked as **sc-21663**.
 ///
 /// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
 /// own, on both backends.

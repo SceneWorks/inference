@@ -302,9 +302,9 @@ fn connector_inputs_match_the_2_5_reference_golden() {
 /// What it leaves. The defect is in `crate::connector` — code **shared with LTX-2.3** and pinned
 /// only against `tools/dump_ltx_connector_golden.py`, whose oracle is `mlx_video`'s
 /// `Embeddings1DConnector`, *not* `ltx_core`'s. This is the first time the connector has been
-/// compared against upstream's own implementation, and the two disagree. Diagnosing that belongs to
-/// the connector's story (sc-18757), not to this text-encoder adapter: nothing in `gemma4_te.rs`
-/// can affect it, as the input-side gate above demonstrates.
+/// compared against upstream's own implementation, and the two disagree. Diagnosing that is
+/// **sc-21663**, not this text-encoder adapter: nothing in `gemma4_te.rs` can affect it, as the
+/// input-side gate above demonstrates. (sc-18757, which owns the connector, is already Done.)
 ///
 /// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
 /// own.
