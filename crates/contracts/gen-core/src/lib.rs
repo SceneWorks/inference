@@ -67,8 +67,9 @@ pub use audio_transform::{
     AudioTransformKind, AudioTransformRequest,
 };
 pub use caption::{
-    CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
-    CaptionSampling, Captioner, CaptionerDescriptor,
+    apply_caption_trigger_words, CaptionCapabilities, CaptionFinishReason, CaptionOptions,
+    CaptionOutput, CaptionRequest, CaptionSampling, CaptionTriggerWordConformanceCase, Captioner,
+    CaptionerDescriptor, CAPTION_TRIGGER_WORD_CONFORMANCE,
 };
 pub use checkpoint_codec::{
     compile_logical_weight_plan, compile_logical_weight_plan_with_metadata,

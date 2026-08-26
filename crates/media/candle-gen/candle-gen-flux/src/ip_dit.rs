@@ -178,6 +178,8 @@ pub(crate) struct EmbedNd {
     dim: usize,
     theta: usize,
     axes_dim: Vec<usize>,
+    #[cfg(test)]
+    forward_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EmbedNd {
@@ -186,12 +188,23 @@ impl EmbedNd {
             dim,
             theta,
             axes_dim,
+            #[cfg(test)]
+            forward_calls: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_calls(&self) -> usize {
+        self.forward_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl candle_core::Module for EmbedNd {
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        self.forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let n_axes = ids.dim(D::Minus1)?;
         let mut emb = Vec::with_capacity(n_axes);
         for idx in 0..n_axes {
@@ -204,6 +217,51 @@ impl candle_core::Module for EmbedNd {
         }
         let emb = Tensor::cat(&emb, 2)?;
         emb.unsqueeze(1)
+    }
+}
+
+/// Request-owned FLUX positional conditioning. The denoise latent changes every evaluation, but its
+/// token geometry and the text/image position ids do not.
+pub(crate) struct PreparedConditioning {
+    pub(crate) img_shape: Vec<usize>,
+    pub(crate) img_ids_shape: Vec<usize>,
+    pub(crate) txt_shape: Vec<usize>,
+    pub(crate) txt_ids_shape: Vec<usize>,
+    pub(crate) dtype: DType,
+    pub(crate) img_ids_dtype: DType,
+    pub(crate) txt_dtype: DType,
+    pub(crate) txt_ids_dtype: DType,
+    pub(crate) device: candle_core::DeviceLocation,
+    pub(crate) pe: Tensor,
+}
+
+impl PreparedConditioning {
+    pub(crate) fn validate(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<()> {
+        let matches = img.dims() == self.img_shape
+            && img_ids.dims() == self.img_ids_shape
+            && txt.dims() == self.txt_shape
+            && txt_ids.dims() == self.txt_ids_shape
+            && img.dtype() == self.dtype
+            && img_ids.dtype() == self.img_ids_dtype
+            && txt.dtype() == self.txt_dtype
+            && txt_ids.dtype() == self.txt_ids_dtype
+            && img.device().location() == self.device
+            && img_ids.device().location() == self.device
+            && txt.device().location() == self.device
+            && txt_ids.device().location() == self.device;
+        if !matches {
+            return Err(candle_gen::CandleError::Msg(
+                "flux: prepared conditioning geometry, dtype, or device does not match inputs"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -612,6 +670,29 @@ enum FluxBlocks {
 }
 
 impl IpFlux {
+    pub(crate) fn prepare_conditioning(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+        let pe = ids.apply(&self.pe_embedder)?;
+        Ok(PreparedConditioning {
+            img_shape: img.dims().to_vec(),
+            img_ids_shape: img_ids.dims().to_vec(),
+            txt_shape: txt.dims().to_vec(),
+            txt_ids_shape: txt_ids.dims().to_vec(),
+            dtype: img.dtype(),
+            img_ids_dtype: img_ids.dtype(),
+            txt_dtype: txt.dtype(),
+            txt_ids_dtype: txt_ids.dtype(),
+            device: img.device().location(),
+            pe,
+        })
+    }
+
     /// The number of XLabs-adapted double blocks (the IP adapter carries exactly this many K/V pairs).
     pub fn num_double_blocks(&self) -> usize {
         match &self.blocks {
@@ -807,6 +888,43 @@ impl IpFlux {
             attention_plan,
             transformer_window,
             cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_core(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            y,
+            guidance,
+            ip,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            Some(prepared),
         )
     }
 
@@ -851,6 +969,7 @@ impl IpFlux {
             )),
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -887,6 +1006,7 @@ impl IpFlux {
             attention_plan,
             transformer_window,
             cancel,
+            None,
         )
     }
 
@@ -937,6 +1057,7 @@ impl IpFlux {
             )),
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -974,6 +1095,7 @@ impl IpFlux {
             attention_plan,
             transformer_window,
             cancel,
+            None,
         )
     }
 
@@ -1010,6 +1132,7 @@ impl IpFlux {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        prepared: Option<&PreparedConditioning>,
     ) -> candle_gen::Result<Tensor> {
         if txt.rank() != 3 {
             return Err(candle_gen::CandleError::Msg(format!(
@@ -1024,9 +1147,15 @@ impl IpFlux {
             )));
         }
         let dtype = img.dtype();
-        let pe = {
-            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
-            ids.apply(&self.pe_embedder)?
+        let pe = match prepared {
+            Some(prepared) => {
+                prepared.validate(img, img_ids, txt, txt_ids)?;
+                prepared.pe.clone()
+            }
+            None => {
+                let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+                ids.apply(&self.pe_embedder)?
+            }
         };
         let mut txt = self.txt_in.forward(txt)?;
         let mut img = self.img_in.forward(img)?;
@@ -1448,6 +1577,105 @@ mod tests {
         let timesteps = Tensor::from_vec(vec![0.7f32], (1,), dev).unwrap();
         let y = fill((1, 1, cfg.vec_in_dim), 1.0).squeeze(1).unwrap(); // (1, vec_in_dim)
         (img, img_ids, txt, txt_ids, timesteps, y)
+    }
+
+    #[test]
+    fn prepared_ipflux_conditioning_is_reused_by_base_and_control_forwards() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let model = tiny_ipflux(&dev);
+        let (img, img_ids, txt, txt_ids, timesteps, y) = tiny_inputs(&dev, &cfg);
+        let guidance = Tensor::from_vec(vec![3.5f32], (1,), &dev).unwrap();
+        let mut prepared = model
+            .prepare_conditioning(&img, &img_ids, &txt, &txt_ids)
+            .unwrap();
+        assert_eq!(model.pe_embedder.forward_calls(), 1);
+        let plan =
+            || AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let first = model
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .unwrap();
+        let residual = Tensor::zeros((1, 4, cfg.hidden_size), DType::F32, &dev).unwrap();
+        let control = model
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                Some((std::slice::from_ref(&residual), 0.7)),
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .unwrap();
+        assert_close(&first, &control);
+        assert_eq!(
+            model.pe_embedder.forward_calls(),
+            1,
+            "base/control forwards must not reconstruct PE"
+        );
+        let stale = Tensor::zeros((1, 5, cfg.in_channels), DType::F32, &dev).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(
+                &stale,
+                &Tensor::zeros((1, 5, 3), DType::F32, &dev).unwrap(),
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        let wrong_dtype = img.to_dtype(DType::F64).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(
+                &wrong_dtype,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        prepared.device = candle_core::DeviceLocation::Cuda { gpu_id: 7 };
+        assert!(prepared.validate(&img, &img_ids, &txt, &txt_ids).is_err());
     }
 
     /// sc-9003 / F-023: the three public forwards were consolidated onto one `forward_core`. Each is a
