@@ -913,8 +913,12 @@ mod tests {
             .load_text()
             .err()
             .expect("request-scoped ComfyUI load must retain its original checkpoint pin");
-        let error = error.to_string();
-        assert!(error.contains("changed after load"), "{error}");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     #[test]

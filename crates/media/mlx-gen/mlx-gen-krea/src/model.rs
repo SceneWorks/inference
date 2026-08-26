@@ -2888,9 +2888,13 @@ mod tests {
 
         std::fs::write(&adapter, b"replacement adapter bytes").unwrap();
         let error = adapters_have_diff_patch_for_spec(&spec)
-            .expect_err("header classification must consume the prepared adapter token")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("header classification must consume the prepared adapter token");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     #[test]
