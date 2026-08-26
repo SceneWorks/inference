@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::diffusion_schedule::{KOLORS_BETA_END, KOLORS_BETA_START, KOLORS_TRAIN_STEPS};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
 use candle_gen::gen_core::{
@@ -60,14 +61,6 @@ const PID_BACKBONE: &str = "sdxl";
 /// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215). `pub(crate)` so
 /// the IP-Adapter provider (sc-5488) shares the exact decode scale.
 pub(crate) const VAE_SCALE: f64 = 0.13025;
-
-/// Kolors' `scaled_linear` β endpoints + train-step count — the diffusers `EulerDiscreteScheduler`
-/// config the native [`KolorsEulerSampler`](crate::sampler) is built from (β₁ = **0.014**, NOT SDXL's
-/// 0.012; N = **1100**, NOT SDXL's 1000). The curated [`DiscreteModelSampling`] σ-table (sc-7124) is
-/// built from these same values so the ε/DDPM menu integrates over Kolors' own noise schedule.
-const KOLORS_BETA_START: f32 = 0.00085;
-const KOLORS_BETA_END: f32 = 0.014;
-const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
 
 /// Build Kolors' ε-prediction α-cumprod schedule (`scaled_linear` β over the 1100 train steps) — the
 /// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
@@ -1054,6 +1047,14 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn kolors_schedule_constants_match_the_canonical_candle_grid() {
+        let shared = kolors_alpha_schedule().unwrap();
+        let direct =
+            AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END);
+        assert_eq!(shared.alphas_cumprod, direct.alphas_cumprod);
+    }
 
     /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
     /// path — it was previously dropped on the floor by txt2img, silently rendering the native

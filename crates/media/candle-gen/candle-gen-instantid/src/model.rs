@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
@@ -51,7 +53,6 @@ use rand::SeedableRng;
 
 use crate::kps;
 use crate::openpose::{self, BodyPoint, STICKWIDTH};
-use crate::resample::resize_lanczos_u8;
 use crate::restore;
 
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
@@ -77,13 +78,6 @@ pub const FACE_RESTORE_PROMPT: &str =
     "close-up portrait of the face, soft natural light, photorealistic, sharp focus";
 /// The face-restore crop padding factor (`instantid_adapter.py:483` `* 1.9`).
 const FACE_RESTORE_CROP_PAD: f32 = 1.9;
-
-/// SDXL ε-prediction α-cumprod schedule params (`scaled_linear` β over 1000 train steps) — the source
-/// for the curated unified-sampler path's [`DiscreteModelSampling`] (epic 7114, sc-7297). The same
-/// values the base candle SDXL pipeline uses; InstantID rides the stock SDXL noise schedule.
-const SDXL_TRAIN_STEPS: usize = 1000;
-const SDXL_BETA_START: f32 = 0.00085;
-const SDXL_BETA_END: f32 = 0.012;
 
 /// Reject a caller-supplied `kps` slice shorter than [`FACE_KP_COUNT`] with a typed error (without it,
 /// `kps::draw_kps` would panic on a truncated landmark list — F-079).
@@ -1395,7 +1389,7 @@ impl InstantId {
         };
         let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
         let (restored_h, restored_w) = restored_image_dims(&restored);
-        let small_f = resize_lanczos_u8(&restored.pixels, restored_h, restored_w, crop_h, crop_w);
+        let small_f = resize_lanczos_u8(&restored.pixels, restored_h, restored_w, crop_h, crop_w)?;
         let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
 
         // Feathered elliptical paste-back onto a copy of the base.

@@ -13,13 +13,11 @@
 //!  - Euler step (ε-pred, γ=0): `x_next = x + ε·(σ_next − σ)`.
 
 use candle_gen::candle_core::Tensor;
+use candle_gen::diffusion_schedule::{KOLORS_BETA_END, KOLORS_BETA_START};
 
 /// Kolors' `num_train_timesteps` — the length of the `scaled_linear` schedule the sampler interpolates
 /// over. `num_steps` must lie in `1..=NUM_TRAIN_TIMESTEPS`.
-pub const NUM_TRAIN_TIMESTEPS: usize = 1100;
-
-const BETA_START: f64 = 0.00085;
-const BETA_END: f64 = 0.014;
+pub use candle_gen::diffusion_schedule::KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS;
 const STEPS_OFFSET: i64 = 1;
 
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
@@ -49,7 +47,10 @@ impl KolorsEulerSampler {
 
         // scaled_linear betas → alphas → alphas_cumprod (f64 throughout, matching diffusers).
         let n_train = NUM_TRAIN_TIMESTEPS;
-        let (b0, b1) = (BETA_START.sqrt(), BETA_END.sqrt());
+        let (b0, b1) = (
+            f64::from(KOLORS_BETA_START).sqrt(),
+            f64::from(KOLORS_BETA_END).sqrt(),
+        );
         let mut acp = 1.0f64;
         let mut full: Vec<f64> = Vec::with_capacity(n_train);
         for i in 0..n_train {

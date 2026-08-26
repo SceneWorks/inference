@@ -9,11 +9,12 @@
 //! proven against the frozen Python fork (slices 1–3); the e2e bf16 path is gated by
 //! `tests/e2e_real_weights.rs`.
 
+use mlx_gen::img2img::resolve_reference;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
+    gen_core, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_wan::OwnedWanSingleFrameDecoder;
@@ -294,32 +295,6 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     })
 }
 
-impl QwenImage {
-    /// Extract the single img2img init image + its strength from the request's conditioning. The
-    /// per-reference strength wins over `req.strength`. Qwen-Image T2I img2img conditions on exactly
-    /// one init image, so more than one `Reference` is an error (the multi-image edit path is
-    /// `qwen_image_edit` + `MultiReference`, sc-2529). Returns `None` for pure txt2img.
-    fn resolve_reference<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "qwen_image: multiple reference images are not supported (single img2img \
-                         init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
-    }
-}
-
 impl Generator for QwenImage {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -393,7 +368,7 @@ impl QwenImage {
         let params = resolve_run_params(req, req.width, req.height);
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
-        let reference = self.resolve_reference(req)?;
+        let reference = resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => init_time_step(params.steps, strength),
             None => 0,
@@ -657,6 +632,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Conditioning;
 
     /// Documents + guards the PiD `from_ldm` capture-index policy (sc-7993) on the **production
     /// flow-match** schedule — the 50-step trajectory the sc-7843 runB validation captured. A σ ceiling

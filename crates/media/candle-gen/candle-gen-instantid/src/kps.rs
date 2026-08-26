@@ -15,10 +15,9 @@
 //! Also here: [`letterbox`] (resize-keep-aspect + center-pad, the sc-2009 kps-distortion rule) and the
 //! canonical [`VIEW_ANGLE_KPS`] multi-view landmark sets.
 
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
-
-use crate::resample::resize_lanczos_u8;
 
 // The openpose limb stick width — shared with the body-pose renderer rather than redefined here, so
 // there's a single `STICKWIDTH` in the crate (F-086).
@@ -591,7 +590,7 @@ pub fn letterbox(image: &Image, width: u32, height: u32) -> Result<Image> {
         iw as usize,
         new_h as usize,
         new_w as usize,
-    ); // f32 HWC, integer-valued [0,255]
+    )?; // f32 HWC, integer-valued [0,255]
     let mut canvas = vec![0u8; (width as usize) * (height as usize) * 3];
     let ox = ((width - new_w) / 2) as usize;
     let oy = ((height - new_h) / 2) as usize;
@@ -856,5 +855,27 @@ mod tests {
         assert_eq!((out.width, out.height), (4, 4));
         assert_eq!(out.pixels.len(), 4 * 4 * 3);
         assert!(out.pixels.iter().all(|&b| b > 200), "canvas fully covered");
+    }
+
+    #[test]
+    fn letterbox_pins_the_shared_lanczos_fixture() {
+        let source = Image {
+            width: 3,
+            height: 2,
+            pixels: vec![
+                0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220, 240, 230, 210, 190, 170, 150,
+            ],
+        };
+        let output = letterbox(&source, 6, 4).unwrap();
+        assert_eq!(
+            output.pixels,
+            vec![
+                0, 0, 2, 0, 0, 16, 2, 25, 51, 58, 84, 112, 97, 124, 152, 116, 143, 170, 40, 56, 77,
+                51, 69, 88, 81, 97, 110, 119, 131, 140, 134, 145, 155, 139, 149, 161, 130, 152,
+                176, 150, 167, 181, 186, 189, 186, 200, 191, 177, 182, 171, 158, 168, 158, 148,
+                200, 226, 251, 227, 241, 253, 255, 255, 245, 255, 238, 205, 219, 192, 161, 191,
+                164, 139,
+            ]
+        );
     }
 }

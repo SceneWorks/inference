@@ -652,7 +652,6 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-pid",
  "candle-gen-sdxl",
- "image",
  "rand",
  "tempfile",
 ]
