@@ -12,9 +12,11 @@
 //!     forcing the materialized O(seq²) math attention whose activations must be bounded.
 //!
 //! The flash-attn path is dropped (non-differentiable; see [`attention`]); training uses the math /
-//! sliced attention. VAE + CLIP stay **stock** (frozen at train time, no adapter, no checkpointing).
-//! Inference is unchanged — it still runs the stock candle-transformers UNet; a CPU forward-parity
-//! test pins this vendored copy to that stock module so the two never drift.
+//! sliced attention. CLIP stays **stock** (frozen at train time, no adapter, no checkpointing). The
+//! frozen VAE encoder and native decoder reuse this module's faithful `AttentionBlock`/mid-block so
+//! their spatial attention can share the i32-safe score budget. Inference is unchanged for ordinary
+//! UNet shapes; a CPU forward-parity test pins this vendored copy to the stock module so the two
+//! never drift.
 //!
 //! As vendored this is a byte-faithful replica; the LoRA seam + checkpoint boundaries are layered on
 //! in subsequent slices of this story.
@@ -95,6 +97,7 @@ pub use controlnet::{ControlNet, ControlNetConfig, ControlResiduals};
 // IP-Adapter provider (sc-5488), which loads the SDXL-family Kolors UNet into this vendored stack.
 pub use controlnet::sdxl_unet_config;
 pub use unet_2d::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
+pub(crate) use unet_2d_blocks::{UNetMidBlock2D, UNetMidBlock2DConfig};
 pub use vae_encode::VaeMomentsEncoder;
 
 #[cfg(test)]

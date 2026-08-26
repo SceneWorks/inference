@@ -9,9 +9,9 @@
 //! encode path — a byte-faithful copy of candle's `vae::Encoder::{new,forward}` + `quant_conv`, reusing
 //! the VAE building blocks already vendored for the UNet ([`DownEncoderBlock2D`]/[`UNetMidBlock2D`]).
 //!
-//! This is **encode-only and frozen**: no adapter, no gradient checkpointing, no decoder (the trainer
-//! never decodes). Inference's VAE *decode* stays the stock `AutoEncoderKL`, untouched. Loaded f32 for
-//! a clean latent mean; the latents are cached once then frozen.
+//! This is **encode-only and frozen**: no adapter and no gradient checkpointing. The native VAE decoder
+//! reuses these same faithful blocks so both VAE mid-block attention sites share the i32-safe attention
+//! budget. Loaded f32 for a clean latent mean; the latents are cached once then frozen.
 
 use candle_core::{Result, Tensor};
 use candle_nn::{self as nn, Module};
