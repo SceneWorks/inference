@@ -55,6 +55,7 @@ pub mod pipeline;
 pub mod positions;
 pub mod rope;
 pub mod text_encoder;
+pub mod tiers;
 pub mod tokenizer;
 pub mod training;
 pub mod transformer;
@@ -94,6 +95,10 @@ pub use pipeline::{
     StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
+pub use tiers::{
+    convert_2_5_tier, convert_2_5_tiers, DenseReason, LtxTier, LtxTierComponentReport,
+    LtxTierReport,
+};
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config
 // so `mlx_gen_ltx::tiling::*` / `mlx_gen_ltx::TilingConfig` keep resolving for existing callers.
 pub use config::{VocoderConfig, VocoderGenConfig};

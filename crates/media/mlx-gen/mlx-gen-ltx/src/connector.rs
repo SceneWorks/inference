@@ -17,49 +17,40 @@ use std::f64::consts::PI;
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, sigmoid, sum, tile};
+use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, sum, tile};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
 use crate::rope::apply_split_rotary_emb;
+use crate::transformer::{Linear, Precision};
 
 const CONNECTOR_EPS: f32 = 1e-6;
 
-/// `y = x·Wᵀ [+ b]` — the FF bias-optional twin of `mlx_gen::nn::linear` (sc-18758:
-/// `connector_ff_bias:false` leaves `blk.ff_{in,out}_b` `None`; every other connector Linear always
-/// carries a bias).
-fn linear_opt(x: &Array, w: &Array, b: Option<&Array>) -> Result<Array> {
-    match b {
-        Some(b) => linear(x, w, b),
-        None => Ok(matmul(x, w.t())?),
-    }
-}
-
 /// One connector transformer block (attn1 + gelu FF, both pre-normed with a unit-weight RMSNorm).
-/// `ff_in_b`/`ff_out_b` are `None` only when `connector_ff_bias:false` (sc-18758 — reference
+///
+/// Every projection is a [`Linear`], the same dense-or-quantized carrier the DiT uses: an LTX-2.5
+/// `q4`/`q8` tier packs the connector's attention and FFN Linears (sc-18775 — 4.03 GB dense across
+/// both towers, 21 % of a q4 tier), and a `Linear` binds the packed `weight`/`scales`/`biases`
+/// triple or a dense weight from the **same** call, selected by whether `{prefix}.scales` is in the
+/// checkpoint. LTX-2.3's dense `connector.safetensors` therefore takes the identical path it always
+/// did.
+///
+/// `ff_in`/`ff_out` carry no bias when `connector_ff_bias:false` (sc-18758 — reference
 /// `Embeddings1DConnectorConfigurator`/`AudioEmbeddings1DConnectorConfigurator`, independent of the
-/// DiT's own `ff_bias`); neither shipped checkpoint sets it, so it is `Some` in practice today.
+/// DiT's own `ff_bias`); neither shipped checkpoint sets it, so a bias is present in practice today.
 struct ConnectorBlock {
-    to_q_w: Array,
-    to_q_b: Array,
-    to_k_w: Array,
-    to_k_b: Array,
-    to_v_w: Array,
-    to_v_b: Array,
-    to_out_w: Array,
-    to_out_b: Array,
+    to_q: Linear,
+    to_k: Linear,
+    to_v: Linear,
+    to_out: Linear,
     q_norm_w: Array,
     k_norm_w: Array,
-    gate_w: Array,
-    gate_b: Array,
-    ff_in_w: Array,
-    ff_in_b: Option<Array>,
-    ff_out_w: Array,
-    ff_out_b: Option<Array>,
+    gate: Linear,
+    ff_in: Linear,
+    ff_out: Linear,
 }
 
 /// The video text-feature connector.
@@ -76,9 +67,19 @@ pub struct Connector {
 
 impl Connector {
     /// Build the **video** connector from a `Weights` map (e.g. `connector.safetensors`) under
-    /// `prefix` (`"video_embeddings_connector."`). Weights are cast to `dtype` (bf16 to match the
-    /// reference pipeline end-to-end; f32 for the isolated bit-exact gate).
-    pub fn from_weights(w: &Weights, prefix: &str, cfg: &LtxConfig, dtype: Dtype) -> Result<Self> {
+    /// `prefix` (`"video_embeddings_connector."`).
+    ///
+    /// `prec` supplies both the compute dtype (bf16 to match the reference pipeline end-to-end; f32
+    /// for the isolated bit-exact gate) **and** the checkpoint's quant geometry, exactly as it does
+    /// for the DiT. Whether any given Linear is actually packed is decided per-Linear by the
+    /// presence of `{prefix}.scales`, so a dense LTX-2.3 connector and a quantized LTX-2.5 tier
+    /// connector both load through this one call.
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        cfg: &LtxConfig,
+        prec: Precision,
+    ) -> Result<Self> {
         Self::from_weights_dims(
             w,
             prefix,
@@ -88,7 +89,7 @@ impl Connector {
             cfg.positional_embedding_theta,
             cfg.connector_positional_embedding_max_pos,
             cfg.connector_ff_bias,
-            dtype,
+            prec,
         )
     }
 
@@ -105,40 +106,33 @@ impl Connector {
         theta: f64,
         max_pos: i32,
         ff_bias: bool,
-        dtype: Dtype,
+        prec: Precision,
     ) -> Result<Self> {
         let n = num_layers as usize;
         let dim = num_heads * head_dim;
-        // Load a weight cast to the caller-supplied `dtype` (bf16 on the production path, not f32).
+        let dtype = prec.dtype();
+        // A non-Linear parameter (norm weight, registers) cast to the compute dtype.
         let w_at_dtype = |key: &str| -> Result<Array> {
             w.get(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?
                 .as_dtype(dtype)
                 .map_err(Error::from)
         };
-        // The `ff.proj_{in,out}.bias` tensors, absent when `connector_ff_bias:false` (sc-18758).
-        let w_at_dtype_opt =
-            |key: &str| -> Result<Option<Array>> { ff_bias.then(|| w_at_dtype(key)).transpose() };
         let mut blocks = Vec::with_capacity(n);
         for i in 0..n {
             let b = format!("{prefix}transformer_1d_blocks.{i}.");
             blocks.push(ConnectorBlock {
-                to_q_w: w_at_dtype(&format!("{b}attn1.to_q.weight"))?,
-                to_q_b: w_at_dtype(&format!("{b}attn1.to_q.bias"))?,
-                to_k_w: w_at_dtype(&format!("{b}attn1.to_k.weight"))?,
-                to_k_b: w_at_dtype(&format!("{b}attn1.to_k.bias"))?,
-                to_v_w: w_at_dtype(&format!("{b}attn1.to_v.weight"))?,
-                to_v_b: w_at_dtype(&format!("{b}attn1.to_v.bias"))?,
-                to_out_w: w_at_dtype(&format!("{b}attn1.to_out.0.weight"))?,
-                to_out_b: w_at_dtype(&format!("{b}attn1.to_out.0.bias"))?,
+                to_q: Linear::load(w, &format!("{b}attn1.to_q"), prec)?,
+                to_k: Linear::load(w, &format!("{b}attn1.to_k"), prec)?,
+                to_v: Linear::load(w, &format!("{b}attn1.to_v"), prec)?,
+                to_out: Linear::load(w, &format!("{b}attn1.to_out.0"), prec)?,
                 q_norm_w: w_at_dtype(&format!("{b}attn1.q_norm.weight"))?,
                 k_norm_w: w_at_dtype(&format!("{b}attn1.k_norm.weight"))?,
-                gate_w: w_at_dtype(&format!("{b}attn1.to_gate_logits.weight"))?,
-                gate_b: w_at_dtype(&format!("{b}attn1.to_gate_logits.bias"))?,
-                ff_in_w: w_at_dtype(&format!("{b}ff.net.0.proj.weight"))?,
-                ff_in_b: w_at_dtype_opt(&format!("{b}ff.net.0.proj.bias"))?,
-                ff_out_w: w_at_dtype(&format!("{b}ff.net.2.weight"))?,
-                ff_out_b: w_at_dtype_opt(&format!("{b}ff.net.2.bias"))?,
+                gate: Linear::load(w, &format!("{b}attn1.to_gate_logits"), prec)?,
+                // The `ff.net.{0.proj,2}.bias` tensors are absent when `connector_ff_bias:false`
+                // (sc-18758); `has_bias:false` must not `require` a tensor that was never shipped.
+                ff_in: Linear::load_with_bias(w, &format!("{b}ff.net.0.proj"), prec, ff_bias)?,
+                ff_out: Linear::load_with_bias(w, &format!("{b}ff.net.2"), prec, ff_bias)?,
             });
         }
         let registers = w_at_dtype(&format!("{prefix}learnable_registers"))?;
@@ -232,17 +226,9 @@ impl Connector {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
         let (h, d) = (self.num_heads, self.head_dim);
-        let q = rms_norm(
-            &linear(x, &blk.to_q_w, &blk.to_q_b)?,
-            &blk.q_norm_w,
-            CONNECTOR_EPS,
-        )?;
-        let k = rms_norm(
-            &linear(x, &blk.to_k_w, &blk.to_k_b)?,
-            &blk.k_norm_w,
-            CONNECTOR_EPS,
-        )?;
-        let v = linear(x, &blk.to_v_w, &blk.to_v_b)?;
+        let q = rms_norm(&blk.to_q.forward(x)?, &blk.q_norm_w, CONNECTOR_EPS)?;
+        let k = rms_norm(&blk.to_k.forward(x)?, &blk.k_norm_w, CONNECTOR_EPS)?;
+        let v = blk.to_v.forward(x)?;
         let q = q.reshape(&[b, s, h, d])?.transpose_axes(&[0, 2, 1, 3])?;
         let k = k.reshape(&[b, s, h, d])?.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.reshape(&[b, s, h, d])?.transpose_axes(&[0, 2, 1, 3])?;
@@ -265,20 +251,16 @@ impl Connector {
         .as_dtype(self.dtype)?; // (b,h,s,d)
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, -1])?;
         // Gated: out_head *= sigmoid(to_gate_logits(x)).
-        let gates = sigmoid(&linear(x, &blk.gate_w, &blk.gate_b)?)?.reshape(&[b, s, h, 1])?;
+        let gates = sigmoid(&blk.gate.forward(x)?)?.reshape(&[b, s, h, 1])?;
         let out = multiply(&out.reshape(&[b, s, h, d])?, &gates)?.reshape(&[b, s, -1])?;
-        linear(&out, &blk.to_out_w, &blk.to_out_b)
+        blk.to_out.forward(&out)
     }
 
     fn block(&self, blk: &ConnectorBlock, x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
         let n = rms_norm(x, &self.ones, CONNECTOR_EPS)?;
         let x = add(x, &self.attn(blk, &n, cos, sin)?)?;
         let n = rms_norm(&x, &self.ones, CONNECTOR_EPS)?;
-        let ff = linear_opt(
-            &gelu(&linear_opt(&n, &blk.ff_in_w, blk.ff_in_b.as_ref())?)?,
-            &blk.ff_out_w,
-            blk.ff_out_b.as_ref(),
-        )?;
+        let ff = blk.ff_out.forward(&gelu(&blk.ff_in.forward(&n)?)?)?;
         Ok(add(&x, &ff)?)
     }
 

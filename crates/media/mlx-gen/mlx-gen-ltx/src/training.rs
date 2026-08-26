@@ -173,7 +173,10 @@ fn load_trainer_from_dir(root: &Path, te_override: Option<&WeightsSource>) -> Re
         GemmaConfig::gemma_3_12b(),
         gemma_quant,
         &cfg,
-        Dtype::Bfloat16,
+        // bf16 activations at the checkpoint's own quant geometry: the connector and the
+        // feature-extractor Linear take the packed arm on an LTX-2.5 tier and the dense arm on
+        // LTX-2.3's dense `connector.safetensors`, decided per tensor by `.scales` presence.
+        Precision::quant_bf16(split.bits, split.group),
     )?;
     let transformer = LtxDiT::from_weights(
         &transformer_w,
