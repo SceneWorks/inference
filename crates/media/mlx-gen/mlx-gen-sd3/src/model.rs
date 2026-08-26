@@ -38,9 +38,9 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, resolve_flow_schedule, Conditioning, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision,
-    Progress, Quant, Residency, Result, WeightsSource,
+    default_seed, Conditioning, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
+    Residency, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
@@ -48,7 +48,7 @@ use mlx_gen_z_image::vae::Vae;
 
 use crate::config::Sd3Variant;
 use crate::loader;
-use crate::pipeline::{self, SCHEDULE_SHIFT};
+use crate::pipeline;
 use crate::text::{Sd3Conditioning, Sd3TextEncoders};
 use crate::transformer::Sd3Transformer;
 
@@ -338,9 +338,7 @@ impl Sd3Large {
         // is loaded), so this routes for Large/Medium (true-CFG) and the distilled Large-Turbo alike.
         // Seed-independent; resolved above the residency lifecycle.
         let reference = single_reference(req)?;
-        let strength = reference
-            .and_then(|(_, s)| s.or(req.strength))
-            .unwrap_or(0.5);
+        let strength = img2img_strength(reference.and_then(|(_, s)| s), req.strength);
         let sampler_name = req.sampler.as_deref();
 
         self.residency.run(
@@ -398,12 +396,9 @@ impl Sd3Large {
                 // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build
                 // once. An unset req.scheduler keeps it byte-exact; a curated name re-shapes σ over the
                 // same mu=ln(3).
-                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+                let scheduler = FlowMatchEuler::from_sigmas(pipeline::resolve_sd3_sigmas(
                     req.scheduler.as_deref(),
-                    SCHEDULE_SHIFT.ln(),
                     steps,
-                    &native.sigmas,
                 ))?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
@@ -519,6 +514,13 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
             "sd3: img2img supports exactly one Reference image".into(),
         )),
     }
+}
+
+/// Resolve SD3.5's reference strength with the explicit product default shared by Candle.
+fn img2img_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
+    reference
+        .or(request)
+        .unwrap_or(mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH)
 }
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
@@ -676,6 +678,16 @@ mod tests {
         assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
         // More than one → error (SD3.5 conditions on a single reference).
         assert!(single_reference(&ref_req(2, None)).is_err());
+    }
+
+    #[test]
+    fn missing_img2img_strength_defaults_to_midpoint() {
+        assert_eq!(
+            img2img_strength(None, None),
+            mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH
+        );
+        assert_eq!(img2img_strength(Some(0.75), Some(0.2)), 0.75);
+        assert_eq!(img2img_strength(None, Some(0.2)), 0.2);
     }
 
     #[test]
