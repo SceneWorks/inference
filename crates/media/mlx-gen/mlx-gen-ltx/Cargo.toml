@@ -11,6 +11,18 @@ autotests = false
 
 [dependencies]
 mlx-gen = { path = ".." }
+# sc-18770: the FIRST `mlx-gen-* → mlx-llm` edge, and the documented direction of the inversion —
+# `mlx-llm/Cargo.toml` has said "the inversion: mlx-gen will consume mlx-llm" since the crate was
+# created. LTX-2.5's text encoder is a Gemma 4 unified decoder, which lives in `mlx-llm` alongside
+# every other decoder architecture rather than being duplicated a fourth time inside a media crate.
+# Only `gemma4_te.rs` uses it; LTX-2.3's Gemma 3 path (`gemma.rs`) is untouched.
+#
+# The edge is sound only because both crates take `mlx-rs` from `[workspace.dependencies]`, so the
+# graph resolves ONE `mlx-rs` and both halves share a single `Array` type. Two copies would not be
+# a clean failure — they would surface as `expected Array, found Array`. Proof:
+#   cargo tree --target aarch64-apple-darwin -p mlx-gen-ltx -i mlx-rs
+# must report a single package. Never give either crate its own `mlx-rs` pin.
+mlx-llm = { path = "../../../llm/mlx-llm" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.

@@ -1,0 +1,225 @@
+//! LTX-2.5 text encoder → **connector inputs**, on real tier weights (sc-18770) — the candle twin
+//! of `mlx-gen-ltx`'s `tests/ltx_2_5_te_connector_inputs.rs`.
+//!
+//! `#![cfg(feature = "cuda")]`: candle's plain CPU backend has no bf16 matmul, the same reason
+//! `tests/conformance.rs` and `tests/te_parity.rs` are cuda-only on this backend.
+//!
+//! # What this file can and cannot gate — read before adding a numeric assertion
+//!
+//! The committed fixture `mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors` holds the
+//! reference connector inputs (`features`, `audio_features`) **for LTX-2.3 / eros** — the same file
+//! this crate's `connector_parity.rs` and `te_parity.rs` consume across the backend boundary.
+//!
+//! There is **no LTX-2.5 connector-input golden in the repository.** The 2.5 text encoder is a
+//! different model with different weights, so its connector inputs are numerically unrelated to the
+//! 2.3 fixture; asserting equality against it would be meaningless, and manufacturing a 2.5 golden
+//! from our own implementation would be circular. A genuine 2.5 golden needs the gated upstream
+//! reference and belongs to the epic's terminal measurement campaign (sc-18783).
+//!
+//! So this file gates the connector-input **contract** — geometry read off the committed fixture
+//! rather than hard-coded, dtype, finiteness, non-degeneracy, and mask semantics — and asserts it
+//! in the same terms as the MLX twin, which is what makes the cross-backend comparison meaningful.
+//!
+//! Run:
+//! `LTX25_TIER_DIR=<tiers> cargo test -p candle-gen-ltx --features cuda --release --test integration
+//!  -- ltx_2_5_te_connector_inputs:: --ignored --nocapture`
+
+#![cfg(feature = "cuda")]
+
+use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
+use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
+use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
+use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
+use candle_gen_ltx::tier::TierPaths;
+use candle_gen_ltx::tokenizer::Ltx25Tokenizer;
+
+/// The committed 2.3 reference fixture, reached across the backend boundary exactly as
+/// `connector_parity.rs` reaches it. Consumed **by path** for its geometry; never re-recorded, and
+/// never used as a numeric oracle for 2.5 (see the module docs).
+const GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../mlx-gen/mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors"
+);
+
+const PROMPT: &str = "A slow dolly shot across a rain-slicked street at night, neon reflections.";
+
+/// The reference fixture's sequence length, and not an arbitrary choice: the connector prepends 128
+/// learnable registers and refuses a shorter sequence (measured on the real q8 tier at 64). 256 is
+/// what `tools/dump_ltx_connector_golden.py` dumped, so the geometry checked here is the geometry
+/// the reference was recorded at — and the same length the MLX twin uses.
+const MAX_LEN: usize = 256;
+
+/// The tier root. A missing env var is a hard failure, not a skip: `#[ignore]` is the only opt-out.
+fn tier_dir() -> std::path::PathBuf {
+    let root = std::env::var("LTX25_TIER_DIR").unwrap_or_else(|_| {
+        panic!(
+            "set LTX25_TIER_DIR to the built LTX-2.5 tier root (the directory holding q4/q8/bf16)"
+        )
+    });
+    std::path::PathBuf::from(root).join("q8")
+}
+
+/// `(video_dim, audio_dim)` read off the committed reference fixture rather than hard-coded, so the
+/// contract this test enforces is the reference's — and demonstrably the same one the MLX twin
+/// enforces, since both read the same file.
+fn golden_connector_dims(device: &Device) -> (usize, usize) {
+    let g = safetensors::load(GOLDEN, device).expect("committed connector golden");
+    let (_, seq, video) = g["features"].dims3().expect("features rank 3");
+    let audio = g["audio_features"]
+        .dims3()
+        .expect("audio_features rank 3")
+        .2;
+    assert_eq!(
+        seq, MAX_LEN,
+        "MAX_LEN must track the reference fixture's sequence length"
+    );
+    (video, audio)
+}
+
+fn max_abs(t: &Tensor) -> f32 {
+    t.to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .expect("host copy")
+        .into_iter()
+        .fold(0f32, |a, v| a.max(v.abs()))
+}
+
+fn finite(name: &str, t: &Tensor) {
+    let hi = max_abs(t);
+    assert!(hi.is_finite(), "{name} contains a non-finite value");
+    // A head that failed to bind, or a stack that never got past the embedding, produces an
+    // all-zero tensor that every shape assertion would still pass.
+    assert!(
+        hi > 0.0,
+        "{name} is identically zero — the head produced nothing"
+    );
+}
+
+fn encoder(dir: &std::path::Path, device: &Device) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
+    let te_path = dir.join("text_encoder.safetensors");
+    let checkpoint = LtxCheckpointMetadata::from_file(dir.join("transformer.safetensors"))
+        .expect("transformer metadata");
+    let paths = TierPaths::detect(dir, None).expect("LTX25_TIER_DIR/q8 must be a tier directory");
+    let root = paths
+        .connector_vb(DType::BF16, device)
+        .expect("connector varbuilder")
+        .pp("model.diffusion_model");
+
+    // The 2.5 gate is fed a real per-checkpoint caption-feature version, not a constant.
+    let av_cfg = AvConfig::ltx_2_3();
+
+    let te = Ltx25TextEncoder::from_packed_av(
+        &checkpoint,
+        &te_path,
+        root.clone(),
+        root,
+        &av_cfg,
+        &ConnectorConfig::ltx_2_3(),
+        &ConnectorConfig::ltx_2_3_audio(),
+    )
+    .expect("build the LTX-2.5 text encoder");
+
+    let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
+    (te, tok)
+}
+
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 tiers (LTX25_TIER_DIR) and a CUDA GPU"]
+fn connector_inputs_match_the_reference_geometry_and_are_well_formed() {
+    let device = Device::new_cuda(0).expect("cuda device");
+    let dir = tier_dir();
+    let (video_dim, audio_dim) = golden_connector_dims(&device);
+    let (te, tok) = encoder(&dir, &device);
+
+    let (input_ids, mask01) = tok.encode(PROMPT, MAX_LEN, &device).expect("tokenize");
+    let (vf, af, ve, ae) = te
+        .encode_both_with_features(&input_ids, &mask01)
+        .expect("encode_both_with_features");
+
+    assert_eq!(
+        vf.dims3().expect("rank 3"),
+        (1, MAX_LEN, video_dim),
+        "video connector input geometry"
+    );
+    assert_eq!(
+        af.dims3().expect("rank 3"),
+        (1, MAX_LEN, audio_dim),
+        "audio connector input geometry"
+    );
+    finite("video_features", &vf);
+    finite("audio_features", &af);
+
+    assert_eq!(ve.dims3().expect("rank 3"), (1, MAX_LEN, video_dim));
+    assert_eq!(ae.dims3().expect("rank 3"), (1, MAX_LEN, audio_dim));
+    finite("video_embeddings", &ve);
+    finite("audio_embeddings", &ae);
+
+    eprintln!(
+        "ltx_2_5 connector inputs (candle): video {:?} audio {:?}",
+        vf.dims3().unwrap(),
+        af.dims3().unwrap()
+    );
+}
+
+/// The mask half of the contract, asserted in the same terms as the MLX twin.
+///
+/// The extractor zeroes the padded rows of `normed`, but the aggregate projection then adds its
+/// bias, so a pad row equals the bias — not zero. The property that actually holds is that every
+/// pad row is identical to every other: whatever constant the bias contributes, no pad position may
+/// vary with the prompt.
+#[test]
+#[ignore = "sc-18770: needs the built LTX-2.5 tiers (LTX25_TIER_DIR) and a CUDA GPU"]
+fn padded_positions_carry_no_token_dependent_conditioning() {
+    let device = Device::new_cuda(0).expect("cuda device");
+    let dir = tier_dir();
+    let (te, tok) = encoder(&dir, &device);
+
+    let (input_ids, mask01) = tok.encode(PROMPT, MAX_LEN, &device).expect("tokenize");
+    let pads = mask01.iter().filter(|&&m| m == 0).count();
+    assert!(
+        pads >= 2,
+        "the prompt must be short enough to leave at least two padded positions, got {pads}"
+    );
+    assert!(
+        mask01[..pads].iter().all(|&m| m == 0),
+        "the tokenizer must left-pad, so the pad run is the prefix"
+    );
+
+    let (vf, _, _, _) = te
+        .encode_both_with_features(&input_ids, &mask01)
+        .expect("encode_both_with_features");
+    let dim = vf.dims3().expect("rank 3").2;
+    let v = vf
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+        .expect("host copy");
+    let row = |t: usize| &v[t * dim..(t + 1) * dim];
+
+    let first = row(0);
+    let mut worst = 0f32;
+    for t in 1..pads {
+        for (a, b) in row(t).iter().zip(first.iter()) {
+            worst = worst.max((a - b).abs());
+        }
+    }
+    eprintln!("pad-row spread across {pads} padded positions: {worst:.3e}");
+    assert!(
+        worst < 1e-2,
+        "padded connector-input rows must not vary with the prompt (spread {worst:.3e}) — the \
+         feature extractor's mask was dropped"
+    );
+
+    let last = row(MAX_LEN - 1);
+    let signal = last
+        .iter()
+        .zip(first.iter())
+        .fold(0f32, |acc, (a, b)| acc.max((a - b).abs()));
+    eprintln!("valid-vs-pad row separation: {signal:.3e}");
+    assert!(
+        signal > 1e-2,
+        "a valid position must differ from the padded constant (separation {signal:.3e}) — the \
+         encoder produced no conditioning at all"
+    );
+}
