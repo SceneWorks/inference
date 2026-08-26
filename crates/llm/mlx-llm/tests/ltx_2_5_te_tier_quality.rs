@@ -19,7 +19,14 @@
 //! therefore make the evidence for a rejection depend on shipping the thing it rejected — the
 //! q4 number would silently become a bf16-vs-bf16 comparison the moment the decision took effect.
 //! Deriving both packed encoders here keeps the finding reproducible and independent of the layout
-//! it produced. The shipped decision is pinned separately, at the bottom.
+//! it produced.
+//!
+//! The **shipped** tiers are pinned separately, at the bottom, and those two tests do read the tier
+//! files: one opens every tier's `text_encoder.safetensors` through `Weights` + `CausalLm` and runs
+//! a forward (nothing else in the tree loads a shipped tier's encoder, so a header-only check would
+//! pass on a file whose `.scales` were mis-keyed or absent), and one derives the packed projection
+//! set from `q8`'s `.scales` keys so the hand-copied [`GEMMA_QUANT_SUFFIXES`] below cannot drift
+//! away from the converter's list unnoticed.
 //!
 //! ```text
 //! LTX25_TIER_DIR=/path/to/scratch/ltx25-tiers \
@@ -30,7 +37,7 @@
 //! **Cost.** One 22.3 GiB dense load plus two in-test quantizations of it; ~25 GB peak. One model
 //! resident at a time; run it alone.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -139,8 +146,9 @@ fn pack(dense: &Weights, bits: Option<i32>) -> (Weights, usize) {
     (Weights::from_map(map), packed)
 }
 
-/// Read a safetensors file's `__metadata__` without touching tensor payload.
-fn safetensors_metadata(path: &Path) -> HashMap<String, String> {
+/// Read a safetensors file's header (`__metadata__` plus every tensor's descriptor) without touching
+/// tensor payload.
+fn safetensors_header(path: &Path) -> Value {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).expect("open the tier's text encoder");
     let mut len = [0u8; 8];
@@ -149,8 +157,23 @@ fn safetensors_metadata(path: &Path) -> HashMap<String, String> {
     f.seek(SeekFrom::Start(8)).expect("seek to header");
     let mut buf = vec![0u8; len];
     f.read_exact(&mut buf).expect("read header");
-    let header: Value = serde_json::from_slice(&buf).expect("parse safetensors header");
-    header
+    serde_json::from_slice(&buf).expect("parse safetensors header")
+}
+
+/// Every tensor key in a safetensors file, header-only.
+fn safetensors_keys(path: &Path) -> BTreeSet<String> {
+    safetensors_header(path)
+        .as_object()
+        .expect("a safetensors header is an object")
+        .keys()
+        .filter(|k| *k != "__metadata__")
+        .cloned()
+        .collect()
+}
+
+/// Read a safetensors file's `__metadata__` without touching tensor payload.
+fn safetensors_metadata(path: &Path) -> HashMap<String, String> {
+    safetensors_header(path)
         .get("__metadata__")
         .and_then(|m| m.as_object())
         .map(|m| {
@@ -468,18 +491,31 @@ fn the_text_encoder_survives_quantization_at_every_tier() {
     );
 }
 
-/// **The decision, as shipped.** The `q4` tier carries a dense encoder; `q8` carries a packed one.
+/// **The decision, as shipped — read out of the tiers' own tensors.** The `q4` tier carries a dense
+/// encoder; `q8` carries a packed one; both load and run.
 ///
-/// Separate from the measurement above on purpose: that test proves *what quantizing costs*, this
+/// Separate from the measurement above on purpose: that test proves *what quantizing costs* (from
+/// weights it packs itself, so the evidence for rejecting `q4` cannot depend on shipping `q4`), this
 /// one proves *what the converter did about it*. Keeping them in one test would let a converter
 /// regression hide behind a passing measurement, or vice versa.
+///
+/// It **opens each tier's `text_encoder.safetensors` through `mlx_llm`** rather than parsing
+/// `gemma_config` out of the header: after sc-18775 nothing else in the tree loads a shipped tier's
+/// encoder, so a header-only check would pass on a file whose `.scales` were mis-keyed, mis-shaped,
+/// or absent. Config, tensors and a forward all have to agree here.
+///
+/// **Cost.** Three encoder loads (22.3 GiB dense, 12.8 GiB packed) plus a 16-token forward each, one
+/// resident at a time.
 #[test]
-#[ignore = "sc-18775: needs the built LTX-2.5 tiers (LTX25_TIER_DIR)"]
+#[ignore = "sc-18775: needs the built LTX-2.5 tiers (LTX25_TIER_DIR); three encoder loads, ~25 GB peak"]
 fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
     let Some(root) = tier_root() else {
         eprintln!("skip: set LTX25_TIER_DIR to a directory holding the built q4/q8/bf16 tiers");
         return;
     };
+    // Short, but a real forward: 16 tokens through all 48 layers binds every projection.
+    let prompt: Vec<i32> = (0..16).map(|i| ((i * 7919 + 11) % 250_000) + 5).collect();
+
     for (tier, packed) in [("q4", false), ("q8", true), ("bf16", false)] {
         let path = root.join(tier).join("text_encoder.safetensors");
         let meta = safetensors_metadata(&path);
@@ -493,6 +529,9 @@ fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
             declared, packed,
             "{tier}: `text_config.quantization` must be declared iff this tier packs the encoder"
         );
+        // One home for the block, deliberately — the wrapper's vision/audio/multimodal towers ship
+        // dense at every tier, so a top-level block would claim packed weights that are not there.
+        // See `mlx_gen_ltx::tiers`'s `stamp_gemma_quantization`.
         assert!(
             json.get("quantization").is_none(),
             "{tier}: the block belongs in `text_config`, not the wrapper's top level"
@@ -503,6 +542,99 @@ fn the_shipped_tiers_match_the_measured_text_encoder_decision() {
             packed,
             "{tier}: what `mlx_llm` actually reads must agree with what the tier shipped"
         );
-        eprintln!("[TE shipped] {tier}: packed={declared}");
+
+        // …and the weights themselves. `from_weights` is what a real caller does with this file.
+        let weights = Weights::from_file(&path).expect("load the tier's text encoder");
+        materialize_in_batches(&weights);
+        let model = CausalLm::from_weights(&weights, "", cfg).unwrap_or_else(|e| {
+            panic!("{tier}: the shipped tier's encoder must build through mlx_llm: {e}")
+        });
+        assert_eq!(
+            model.is_quantized(),
+            packed,
+            "{tier}: the built decoder's quantized state must match what the tier shipped"
+        );
+        drop(weights);
+        memory::clear_cache();
+
+        let mut cache = model.new_cache();
+        let states = model
+            .hidden_states(&input_ids(&prompt), &mut cache, 0)
+            .unwrap_or_else(|e| panic!("{tier}: hidden-state forward: {e}"));
+        // Walk in order: forcing only the last submits the whole 48-layer graph as one command
+        // buffer, which at this size comes back as a submission error.
+        for (i, s) in states.iter().enumerate() {
+            eval([s]).unwrap_or_else(|e| panic!("{tier}: evaluating hidden_states[{i}]: {e}"));
+        }
+        let last = host(states.last().expect("48 layers plus the input embeddings"));
+        assert!(
+            last.iter().all(|x| x.is_finite()),
+            "{tier}: the last hidden state must be finite — a mis-bound `.scales` grid lands here \
+             as NaN/Inf rather than as a load error"
+        );
+        assert!(
+            last.iter().any(|x| *x != 0.0),
+            "{tier}: an all-zero final state is a weight that never loaded, not an encoding"
+        );
+        eprintln!(
+            "[TE shipped] {tier}: packed={declared}, is_quantized={}, {} states, last |max| {:.4e}",
+            model.is_quantized(),
+            states.len(),
+            last.iter().fold(0.0f32, |m, x| m.max(x.abs())),
+        );
+        drop(states);
+        drop(cache);
+        drop(model);
+        memory::clear_cache();
     }
+}
+
+/// **The packed set, derived from the shipped tier rather than restated here.**
+///
+/// [`GEMMA_QUANT_SUFFIXES`] above is a hand copy of `mlx_gen_ltx::tiers`'s list, and a hand copy with
+/// no drift detection is a comment: if the converter's list gained or lost a projection, this file's
+/// measurement would keep packing the old set and keep reporting a number for weights the tier does
+/// not ship. So take the truth from the artifact — every `{base}.scales` in `q8`'s encoder — and
+/// require it to be exactly what this file's predicate selects over the **dense** encoder's keys.
+/// Header-only: no tensor payload is read.
+#[test]
+#[ignore = "sc-18775: needs the built LTX-2.5 tiers (LTX25_TIER_DIR); header-only, seconds"]
+fn the_packed_projection_set_matches_this_files_predicate() {
+    let Some(root) = tier_root() else {
+        eprintln!("skip: set LTX25_TIER_DIR to a directory holding the built q4/q8/bf16 tiers");
+        return;
+    };
+    let packed: BTreeSet<String> = safetensors_keys(&root.join("q8/text_encoder.safetensors"))
+        .iter()
+        .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+        .collect();
+    let selected: BTreeSet<String> = safetensors_keys(&root.join("bf16/text_encoder.safetensors"))
+        .iter()
+        .filter(|k| is_quantizable(k))
+        .map(|k| {
+            k.strip_suffix(".weight")
+                .expect("is_quantizable only matches `.weight` keys")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !packed.is_empty(),
+        "the q8 tier must actually carry packed projections"
+    );
+    assert_eq!(
+        packed, selected,
+        "the tier's packed set and this file's `GEMMA_QUANT_SUFFIXES` have drifted apart — the \
+         measurement above would be reporting numbers for a set the tier does not ship"
+    );
+    // The dense tier is the control: the same file, packed by nobody.
+    assert!(
+        safetensors_keys(&root.join("bf16/text_encoder.safetensors"))
+            .iter()
+            .all(|k| !k.ends_with(".scales")),
+        "the bf16 tier must carry no packed tensor at all"
+    );
+    eprintln!(
+        "[TE packed set] {} projections, derived from q8",
+        packed.len()
+    );
 }

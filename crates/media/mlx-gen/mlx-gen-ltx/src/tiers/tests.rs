@@ -96,8 +96,18 @@ fn transformer_config() -> String {
 }
 
 fn write_transformer(root: &Path) -> PathBuf {
+    write_transformer_with(root, &[])
+}
+
+/// [`write_transformer`] plus `extra` tensors, for the tests that need a transformer carrying a
+/// weight the converter's quant list and expected-dense allowlist have never heard of. Keys are
+/// written under the checkpoint's `model.diffusion_model.` prefix, exactly as the real file's are.
+fn write_transformer_with(root: &Path, extra: &[(&str, Array)]) -> PathBuf {
     let mut t: Vec<(String, Array)> = Vec::new();
     let p = "model.diffusion_model.";
+    for (key, value) in extra {
+        t.push((format!("{p}{key}"), value.clone()));
+    }
     for b in 0..BLOCKS {
         for attn in [
             "attn1",
@@ -366,7 +376,10 @@ fn write_audio_vae(root: &Path) -> PathBuf {
         ),
         ("vocoder.vocoder.conv_pre.weight".into(), ones(&[8, 4, 3])),
         ("vocoder.vocoder.conv_pre.bias".into(), ones(&[8])),
-        ("vocoder.bwe_generator.ups.0.weight".into(), ones(&[4, 8, 3])),
+        (
+            "vocoder.bwe_generator.ups.0.weight".into(),
+            ones(&[4, 8, 3]),
+        ),
     ];
     let path = root.join("vae/ltx-2.5-audio-vae-bf16.safetensors");
     write_file(
@@ -421,6 +434,14 @@ fn write_upsampler(root: &Path, temporal: bool) -> PathBuf {
 /// `conv_in_x_t`'s input axis is 48, which the group width 64 does not divide, so it is the Linear
 /// the quantized set must leave out.
 fn write_diff_vae(root: &Path) -> PathBuf {
+    write_diff_vae_with(root, true)
+}
+
+/// [`write_diff_vae`], optionally **without** the `NADiffusionDecoder` half — a file that still
+/// declares `CausalDiffusionVAE` and still yields a non-empty "decoder" map (the two
+/// `per_channel_statistics` tensors survive `sanitize_vae_decoder_component`), which is exactly the
+/// shape that used to be silently skipped.
+fn write_diff_vae_with(root: &Path, with_decoder: bool) -> PathBuf {
     /// The DiffVAE decoder's latent width — `conv_out`'s output and `conv_in_x_t`'s input, and
     /// deliberately **not** a multiple of [`DEFAULT_GROUP_SIZE`], exactly as upstream's 48 is not.
     const LATENT: i32 = 48;
@@ -436,6 +457,27 @@ fn write_diff_vae(root: &Path) -> PathBuf {
     fn linear(t: &mut Vec<(String, Array)>, name: &str, out: i32, inp: i32) {
         t.push((format!("decoder.{name}.weight"), ones(&[out, inp])));
         t.push((format!("decoder.{name}.bias"), ones(&[out])));
+    }
+    if !with_decoder {
+        t.push((
+            "per_channel_statistics.mean-of-means".into(),
+            ones(&[LATENT]),
+        ));
+        t.push((
+            "per_channel_statistics.std-of-means".into(),
+            ones(&[LATENT]),
+        ));
+        let path = root.join("vae/ltx-2.5-video-vae-diffusion-bf16.safetensors");
+        let config = diff_vae_config(LATENT);
+        write_file(
+            &path,
+            t,
+            &[
+                ("model_version", LTX_2_5_MODEL_VERSION),
+                ("config", &config),
+            ],
+        );
+        return path;
     }
     linear(&mut t, "conv_in", DIM, DIM);
     linear(&mut t, "conv_in_x_t", DIM, LATENT);
@@ -480,26 +522,30 @@ fn write_diff_vae(root: &Path) -> PathBuf {
     ));
 
     let path = root.join("vae/ltx-2.5-video-vae-diffusion-bf16.safetensors");
+    let config = diff_vae_config(LATENT);
     write_file(
         &path,
         t,
         &[
             ("model_version", LTX_2_5_MODEL_VERSION),
-            (
-                "config",
-                &serde_json::json!({
-                    "vae": {
-                        "_class_name": "CausalDiffusionVAE",
-                        "dims": 3, "in_channels": 3, "out_channels": 3,
-                        "latent_channels": LATENT, "patch_size": 4,
-                        "latent_log_var": "constant",
-                    }
-                })
-                .to_string(),
-            ),
+            ("config", &config),
         ],
     );
     path
+}
+
+/// The `CausalDiffusionVAE` config slice both DiffVAE fixtures declare — the same block either way,
+/// so "the file says it is a diffusion VAE" is held fixed while the decoder tensors vary.
+fn diff_vae_config(latent: i32) -> String {
+    serde_json::json!({
+        "vae": {
+            "_class_name": "CausalDiffusionVAE",
+            "dims": 3, "in_channels": 3, "out_channels": 3,
+            "latent_channels": latent, "patch_size": 4,
+            "latent_log_var": "constant",
+        }
+    })
+    .to_string()
 }
 
 fn write_duration_head(root: &Path) -> PathBuf {
@@ -1093,18 +1139,22 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
         // tier packs" — `q4` ships the encoder dense on measured evidence (`TEXT_ENCODER_Q4_QUALITY`)
         // and must therefore carry no block, or `mlx_llm` would look for `.scales` that are not
         // there.
+        //
+        // The expectation is **hardcoded per tier**, deliberately: keying it off
+        // `text_encoder_dense_reason` — the decision function under test — would make this pass no
+        // matter which way that decision flipped, which is the one thing it exists to catch.
         let nested = &gemma["text_config"];
         assert!(
             gemma.get("quantization").is_none(),
             "{tier}: the `quantization` block belongs in `text_config`, not the wrapper's top level"
         );
-        match (tier.bits(), text_encoder_dense_reason(*tier)) {
-            (Some(bits), None) => {
-                assert_eq!(nested["quantization"]["bits"], bits);
+        match tier {
+            LtxTier::Q8 => {
+                assert_eq!(nested["quantization"]["bits"], 8);
                 assert_eq!(nested["quantization"]["group_size"], DEFAULT_GROUP_SIZE);
                 assert_eq!(nested["quantization"]["mode"], "affine");
             }
-            _ => assert!(
+            LtxTier::Q4 | LtxTier::Bf16 => assert!(
                 nested.get("quantization").is_none(),
                 "{tier}: a tier that ships the encoder dense must not claim a quantization block"
             ),
@@ -1374,6 +1424,124 @@ fn the_text_encoder_predicate_covers_the_projections_and_nothing_else() {
             "should stay dense: {key}"
         );
     }
+}
+
+/// **A Linear nobody listed is a conversion error, not a bf16 tensor inside a q4 tier.**
+///
+/// [`quantize_selected`] is an allowlist over *names*, so before this check a renamed `conv_in_x_t`,
+/// a new upstream Linear, or a drifted suffix sailed through dense with no [`DenseReason`] anywhere:
+/// the component still quantized hundreds of other Linears, so the "quantized nothing" guard stayed
+/// quiet and the tier shipped a weight the loader would bind dense where the manifest promised
+/// packed. The doctored transformer here carries exactly one such weight.
+#[test]
+fn an_unlisted_rank2_linear_is_refused_rather_than_shipped_dense() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("src");
+    let transformer = write_transformer_with(&root, &[("mystery_proj.weight", ones(&[DIM, DIM]))]);
+    let bundle = LtxBundleBuilder::new()
+        .with_component(LtxComponent::Transformer, transformer)
+        .with_component(LtxComponent::TextEncoder, write_text_encoder(&root))
+        .with_component(LtxComponent::ConvVideoVae, write_conv_vae(&root))
+        .build()
+        .unwrap();
+    let err = convert_2_5_tier(
+        &bundle,
+        tmp.path().join("q4"),
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+    )
+    .expect_err("an unlisted rank-2 Linear must fail the conversion");
+    let text = err.to_string();
+    assert!(text.contains("mystery_proj.weight"), "{text}");
+    assert!(text.contains("expected-dense"), "{text}");
+
+    // …and the same bundle without that one weight converts, so the refusal is about the weight
+    // rather than about anything else the doctored fixture did.
+    let root = tmp.path().join("clean");
+    let bundle = LtxBundleBuilder::new()
+        .with_component(LtxComponent::Transformer, write_transformer(&root))
+        .with_component(LtxComponent::TextEncoder, write_text_encoder(&root))
+        .with_component(LtxComponent::ConvVideoVae, write_conv_vae(&root))
+        .build()
+        .unwrap();
+    convert_2_5_tier(
+        &bundle,
+        tmp.path().join("q4-clean"),
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+    )
+    .expect("the same bundle minus the unlisted Linear must convert");
+}
+
+/// The expected-dense allowlist names **whole keys** for index-free weights and only pattern-matches
+/// where an index forces it, so an entry cannot quietly cover a per-block weight that happens to end
+/// the same way.
+///
+/// `proj_out` is the live collision: the DiT's top-level unpatchify projection is expected-dense,
+/// while every block's `ff.proj_out` is a **quantized** Linear. An `ends_with` allowlist would cover
+/// both and re-open the hole the check above closes.
+#[test]
+fn the_expected_dense_allowlist_does_not_swallow_a_quantized_namesake() {
+    assert!(is_expected_dense("proj_out", TRANSFORMER_EXPECTED_DENSE));
+    assert!(is_expected_dense(
+        "audio_proj_out",
+        TRANSFORMER_EXPECTED_DENSE
+    ));
+    assert!(
+        !is_expected_dense(
+            "transformer_blocks.7.ff.proj_out",
+            TRANSFORMER_EXPECTED_DENSE
+        ),
+        "a block's FFN output projection is quantized, and the allowlist must not claim it"
+    );
+    // The indexed sites still match through their `*` patterns.
+    assert!(is_expected_dense(
+        "transformer_blocks.7.attn1.to_gate_logits",
+        TRANSFORMER_EXPECTED_DENSE
+    ));
+    assert!(is_expected_dense(
+        "audio_adaln_single.emb.timestep_embedder.linear1",
+        TRANSFORMER_EXPECTED_DENSE
+    ));
+    assert!(!is_expected_dense(
+        "transformer_blocks.7.attn1.to_q",
+        TRANSFORMER_EXPECTED_DENSE
+    ));
+}
+
+/// **A DiffVAE source with no diffusion decoder fails the conversion** rather than producing a tier
+/// that declares one.
+///
+/// The tier's `embedded_config.json` gains its `diffusion_vae` section from the same source file, so
+/// skipping the decoder emission — which is what the old `if has_stages && has_blocks` did — shipped
+/// a bundle whose declared decoder had no file behind it, with nothing said at conversion time.
+#[test]
+fn a_diffusion_vae_with_no_decoder_is_an_error_not_a_silent_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("src");
+    let bundle = LtxBundleBuilder::new()
+        .with_component(LtxComponent::Transformer, write_transformer(&root))
+        .with_component(LtxComponent::TextEncoder, write_text_encoder(&root))
+        .with_component(LtxComponent::ConvVideoVae, write_conv_vae(&root))
+        .with_component(
+            LtxComponent::DiffusionVideoVae,
+            write_diff_vae_with(&root, false),
+        )
+        .build()
+        .unwrap();
+    let err = convert_2_5_tier(
+        &bundle,
+        tmp.path().join("q4"),
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+    )
+    .expect_err("a diffusion VAE with no decoder tensors must fail the conversion");
+    let text = err.to_string();
+    assert!(
+        text.contains(crate::diff_vae::DIFFUSION_DECODER_COMPONENT),
+        "{text}"
+    );
+    assert!(text.contains("det_stages"), "{text}");
 }
 
 /// A selected weight whose input axis does not divide the group size is a hard error, never a

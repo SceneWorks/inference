@@ -56,13 +56,14 @@
 //!   metadata; a converter that drops it produces a bundle that loads as garbage or not at all;
 //! * the text encoder's `gemma_config` gains a `quantization` block in the tiers that pack it, which
 //!   is exactly the trigger `mlx_llm::config::ModelConfig::from_json` reads to bind pre-quantized
-//!   projections. It is stamped **inside `text_config`** for the Gemma 4 wrapper the LTX-2.5 encoder
-//!   ships — see [`stamp_gemma_quantization`] — and is deliberately absent from `q4`, which ships the
-//!   encoder dense on measured evidence ([`TEXT_ENCODER_Q4_QUALITY`]).
+//!   projections. It is stamped **inside `text_config`**, and only there, for the Gemma 4 wrapper the
+//!   LTX-2.5 encoder ships — see `stamp_gemma_quantization`, which also records why that is a
+//!   deliberate divergence from `mlx_llm`'s snapshot writer — and is deliberately absent from `q4`,
+//!   which ships the encoder dense on measured evidence ([`TEXT_ENCODER_Q4_QUALITY`]).
 //!
 //! # Traps this module is written around
 //!
-//! * **This conversion runs on MLX's CPU stream** ([`CpuConversion`]). It is bandwidth-bound work
+//! * **This conversion runs on MLX's CPU stream** (`CpuConversion`). It is bandwidth-bound work
 //!   with no kernel worth dispatching, and on the GPU stream the multi-GB materializations trip
 //!   Metal's command-buffer watchdog — measured, twice, on the 26.3 GB text encoder.
 //! * **`save_file` metadata order is not stable.** Two byte-identical conversions can produce
@@ -339,6 +340,66 @@ pub(crate) fn is_diff_vae_decoder_quantizable(key: &str) -> bool {
 }
 
 // =================================================================================================
+// The expected-dense allowlists
+// =================================================================================================
+
+/// Whether `base` (a key with its `.weight` suffix removed) is on a component's expected-dense
+/// allowlist.
+///
+/// An entry beginning with `*` is a **suffix** pattern, for a site that repeats per block and
+/// therefore carries an index no literal key can name. Every other entry is the **whole** key, which
+/// is what a top-level, index-free weight gets: an `ends_with` entry for one of those would also
+/// swallow any per-block weight that happened to end the same way (`proj_out` would cover
+/// `transformer_blocks.7.ff.proj_out`), and swallowing is the exact failure these lists exist to
+/// stop.
+fn is_expected_dense(base: &str, allowlist: &[&str]) -> bool {
+    allowlist.iter().any(|entry| match entry.strip_prefix('*') {
+        Some(suffix) => base.ends_with(suffix),
+        None => base == *entry,
+    })
+}
+
+/// The DiT's rank-2 Linears that a quantized tier deliberately leaves bf16.
+///
+/// * `to_gate_logits` is a `[num_heads, dim]` projection feeding a sigmoid gate — the reference
+///   `_quantize_ltx_predicate` excludes it, and quantizing a multiplicative gate perturbs every
+///   attention output for no measurable size win;
+/// * the eight adaLN heads' `linear` / `timestep_embedder.linear{1,2}` and the four
+///   patchify/unpatchify projections are the reference predicate's exclusions too — they run once
+///   per step rather than once per token, and `patchify_proj` / `proj_out`'s input axis is 128.
+///
+/// Measured on the real 2.5 transformer: 316 tensors, all of them named by this list.
+const TRANSFORMER_EXPECTED_DENSE: &[&str] = &[
+    "*.to_gate_logits",
+    "*adaln_single.linear",
+    "*adaln_single.emb.timestep_embedder.linear1",
+    "*adaln_single.emb.timestep_embedder.linear2",
+    "patchify_proj",
+    "audio_patchify_proj",
+    "proj_out",
+    "audio_proj_out",
+];
+
+/// The connectors' expected-dense Linears — the same gate projection the DiT exempts, in the two
+/// connector towers (16 tensors on the real component).
+const CONNECTOR_EXPECTED_DENSE: &[&str] = &["*.to_gate_logits"];
+
+/// The text encoder's expected-dense rank-2 weights: the embedding table (a **lookup**, with no
+/// quantized read path in `mlx_llm`, tied to an LM head LTX never runs) and the three
+/// vision/audio/multimodal projector weights that are not on the LTX text path at all but ride along
+/// so the pack stays self-contained. Measured on the real encoder: exactly these four.
+const TEXT_ENCODER_EXPECTED_DENSE: &[&str] = &[
+    "model.embed_tokens",
+    "vision_model.patch_dense",
+    "multi_modal_projector.embedding_projection",
+    "audio_projector.embedding_projection",
+];
+
+/// The DiffVAE decoder's one expected-dense Linear. See [`DIFF_VAE_DECODER_QUANT_SUFFIXES`] for why
+/// `conv_in_x_t` — and only `conv_in_x_t` — has no affine grid.
+const DIFF_VAE_DECODER_EXPECTED_DENSE: &[&str] = &["conv_in_x_t"];
+
+// =================================================================================================
 // Reports
 // =================================================================================================
 
@@ -496,9 +557,8 @@ fn quantize_selected(
     Ok((out, count))
 }
 
-/// Count the rank-2 float weight tensors in a map — the population
-/// [`DenseReason::NoLinearWeights`] claims is empty.
-fn rank2_float_weights(map: &HashMap<String, Array>) -> usize {
+/// Every rank-2 float `*.weight` key in a map — the Linears MLX's affine grid is defined over.
+fn rank2_float_weight_keys(map: &HashMap<String, Array>) -> Vec<&str> {
     map.iter()
         .filter(|(key, value)| {
             key.ends_with(".weight")
@@ -508,7 +568,53 @@ fn rank2_float_weights(map: &HashMap<String, Array>) -> usize {
                     Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
                 )
         })
-        .count()
+        .map(|(key, _)| key.as_str())
+        .collect()
+}
+
+/// Refuse a quantized component that still carries a rank-2 float Linear nobody declared.
+///
+/// [`quantize_selected`] is an **allowlist over names**, so anything it does not recognize —
+/// a renamed `conv_in_x_t`, a Linear a new upstream revision added, a suffix that drifted — sails
+/// through as bf16 inside a `q4` tier with no [`DenseReason`] anywhere, which is precisely the
+/// "quietly stayed dense" failure this module exists to prevent. The quant list says what *is*
+/// packed; this says what is allowed *not* to be, and between them nothing is unaccounted for.
+fn refuse_undeclared_dense_linears(
+    component: &str,
+    tier: LtxTier,
+    map: &HashMap<String, Array>,
+    allowlist: &[&str],
+) -> Result<()> {
+    let mut unlisted: Vec<&str> = rank2_float_weight_keys(map)
+        .into_iter()
+        .filter(|key| {
+            let base = key.strip_suffix(".weight").expect("filtered on the suffix");
+            !is_expected_dense(base, allowlist)
+        })
+        .collect();
+    if unlisted.is_empty() {
+        return Ok(());
+    }
+    unlisted.sort_unstable();
+    let shown = unlisted
+        .iter()
+        .take(8)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = unlisted.len().saturating_sub(8);
+    Err(Error::Msg(format!(
+        "ltx tiers: {component} at {}: {} rank-2 float Linear weight(s) were neither quantized nor \
+         declared expected-dense, so the tier would ship them bf16 with no `dense_reason`: {shown}{} \
+         — add them to the component's quant suffixes or to its expected-dense allowlist",
+        tier.id(),
+        unlisted.len(),
+        if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        }
+    )))
 }
 
 /// Byte budget for one `eval` submission (measured against the arrays' logical size).
@@ -634,13 +740,15 @@ fn write_component(
 ///
 /// This is the single place a component becomes a file, so the "nothing silently stays bf16" rule
 /// has exactly one enforcement point: a quantized tier + a component with no declared exemption +
-/// zero quantized Linears is an error here, not a surprise on the rehost.
+/// zero quantized Linears is an error here, not a surprise on the rehost. `expected_dense` closes
+/// the same rule at tensor granularity — see [`refuse_undeclared_dense_linears`].
 fn emit_component(
     dir: &Path,
     mut emit: Emit,
     tier: LtxTier,
     group_size: i32,
     is_quantizable: impl Fn(&str) -> bool,
+    expected_dense: &[&str],
 ) -> Result<LtxTierComponentReport> {
     cast_component_floats_bf16(&mut emit.weights)?;
 
@@ -652,7 +760,7 @@ fn emit_component(
 
     // Validate the structural exemption against the weights rather than trusting the declaration.
     if matches!(dense_reason, Some(DenseReason::NoLinearWeights)) {
-        let linears = rank2_float_weights(&emit.weights);
+        let linears = rank2_float_weight_keys(&emit.weights).len();
         if linears != 0 {
             return Err(Error::Msg(format!(
                 "ltx tiers: {} declares `no-linear-weights` but carries {linears} rank-2 float \
@@ -672,6 +780,7 @@ fn emit_component(
                 is_quantizable,
             )?;
             emit.weights = weights;
+            refuse_undeclared_dense_linears(emit.name, tier, &emit.weights, expected_dense)?;
             if count == 0 {
                 return Err(Error::Msg(format!(
                     "ltx tiers: {} quantized nothing at {} but declares no exemption — a tier is a \
@@ -742,8 +851,19 @@ fn derived_metadata(
 /// block written at the wrapper's top level is invisible to it. Stamping only the top level built
 /// tiers whose packed text encoder could not be loaded at all: `mlx_llm` refused them with the very
 /// error above (measured on sc-18775's first `ltx_2_5_te_tier_quality` run against the tiers built at
-/// the 2026-08-19 pause). The block is therefore written into the object the decoder fields were read
-/// from — `text_config` when the wrapper nests, the top level otherwise.
+/// the 2026-08-19 pause). The block is therefore written into the object the decoder fields were
+/// read from — `text_config` when the wrapper nests, the top level otherwise.
+///
+/// **Exactly one home, deliberately — and that is a divergence from `mlx_llm`'s own snapshot
+/// writer**, which stamps the block at *both* the top level and `text_config`. That writer emits a
+/// snapshot whose every projection-like tensor it quantized itself, so "this model is quantized" is
+/// true of the whole config object it writes. It is not true here: this file is the *multimodal*
+/// wrapper, and its `vision_model`, `multi_modal_projector` and `audio_projector` towers — plus
+/// `model.embed_tokens` — ship dense at every tier (they are not on the LTX text path, and MLX has
+/// no quantized-embedding read path). A top-level block would assert packed weights for those towers
+/// that are not there. Since `ModelConfig::from_json` rebinds to `text_config` before reading the
+/// block, the top-level copy would also be inert for every reader that matters, so it would buy
+/// nothing but a false claim.
 fn stamp_gemma_quantization(
     metadata: &mut BTreeMap<String, String>,
     tier: LtxTier,
@@ -856,6 +976,7 @@ pub fn convert_2_5_tier(
             tier,
             group_size,
             |key| matches_quant_suffix(key, TRANSFORMER_QUANT_SUFFIXES),
+            TRANSFORMER_EXPECTED_DENSE,
         )?);
         // The two embeddings connectors are lifted out of the transformer file and emitted as their
         // own component, exactly as the 2.3 bundle does: the text-encoder stage runs them long
@@ -933,6 +1054,7 @@ pub fn convert_2_5_tier(
             tier,
             group_size,
             is_text_encoder_quantizable,
+            TEXT_ENCODER_EXPECTED_DENSE,
         )?);
         drop(raw);
         mlx_rs::memory::clear_cache();
@@ -950,6 +1072,7 @@ pub fn convert_2_5_tier(
         tier,
         group_size,
         |key| matches_quant_suffix(key, CONNECTOR_QUANT_SUFFIXES),
+        CONNECTOR_EXPECTED_DENSE,
     )?);
     mlx_rs::memory::clear_cache();
 
@@ -998,6 +1121,7 @@ pub fn convert_2_5_tier(
                 tier,
                 group_size,
                 |_| false,
+                &[],
             )?);
         }
         drop(raw);
@@ -1031,29 +1155,43 @@ pub fn convert_2_5_tier(
             tier,
             group_size,
             |_| false,
+            &[],
         )?);
 
         // As with the conv VAE, the decoder is the file that carries `config.vae` — here declaring
-        // `CausalDiffusionVAE`, so it is the one that classifies as `diffusion_video_vae`. A DiffVAE
-        // file carrying no diffusion decoder is not a DiffVAE, and leaving the slot unclaimed in
-        // that case is the honest outcome rather than pointing it at a conv encoder.
+        // `CausalDiffusionVAE`, so it is the one that classifies as `diffusion_video_vae`.
+        //
+        // A source file that resolves as the DiffVAE component but carries no diffusion decoder is a
+        // hard error, not a silent skip: `embedded_config.json` has already gained its
+        // `diffusion_vae` section three lines up, so skipping would ship a tier that *declares* a
+        // diffusion VAE with no decoder file to load — a bundle that fails at render time, on a
+        // rehost, with nothing in the conversion having said a word. The classification is
+        // `crate::diff_vae`'s own, so the converter and the loader cannot drift apart on it.
         let decoder = sanitize_vae_decoder_component(&raw)?;
-        let has_stages = decoder.keys().any(|k| k.starts_with("det_stages."));
-        let has_blocks = decoder.keys().any(|k| k.starts_with("diff_blocks."));
-        if has_stages && has_blocks {
-            components.push(emit_component(
-                out,
-                Emit {
-                    name: crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
-                    weights: decoder,
-                    metadata: component_metadata(resolved, tier),
-                    exempt: None,
-                },
-                tier,
-                group_size,
-                is_diff_vae_decoder_quantizable,
-            )?);
+        if !crate::diff_vae::keys_look_like_diffusion_decoder(decoder.keys().map(String::as_str)) {
+            return Err(Error::Msg(format!(
+                "ltx tiers: {} resolved as the diffusion video VAE but carries no \
+                 `decoder.det_stages.*` / `decoder.diff_blocks.*` tensors — the tier's \
+                 {EMBEDDED_CONFIG_FILE} declares a `diffusion_vae` section, so emitting no \
+                 `{}.safetensors` beside it would ship a bundle whose declared decoder does not \
+                 exist",
+                resolved.path().display(),
+                crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
+            )));
         }
+        components.push(emit_component(
+            out,
+            Emit {
+                name: crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
+                weights: decoder,
+                metadata: component_metadata(resolved, tier),
+                exempt: None,
+            },
+            tier,
+            group_size,
+            is_diff_vae_decoder_quantizable,
+            DIFF_VAE_DECODER_EXPECTED_DENSE,
+        )?);
         drop(raw);
         mlx_rs::memory::clear_cache();
     }
@@ -1098,6 +1236,7 @@ pub fn convert_2_5_tier(
                 tier,
                 group_size,
                 |_| false,
+                &[],
             )?);
         }
         drop(raw);
@@ -1139,6 +1278,7 @@ pub fn convert_2_5_tier(
             tier,
             group_size,
             |_| false,
+            &[],
         )?);
         drop(raw);
         mlx_rs::memory::clear_cache();

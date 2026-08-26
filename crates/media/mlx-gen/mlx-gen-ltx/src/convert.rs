@@ -841,10 +841,11 @@ pub fn convert_vae_components(
             // `per_channel_statistics` remap is the same one the conv decoder wants.
             let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
             // `sanitize_vae_decoder` also sweeps in the two `per_channel_statistics` tensors, so
-            // "not empty" is not the same as "has a decoder": check for both stage families.
-            let has_stages = vae_decoder.keys().any(|k| k.starts_with("det_stages."));
-            let has_blocks = vae_decoder.keys().any(|k| k.starts_with("diff_blocks."));
-            if !(has_stages && has_blocks) {
+            // "not empty" is not the same as "has a decoder": classify through `crate::diff_vae`'s
+            // own predicate, the one the loader uses, rather than re-deriving it here.
+            if !crate::diff_vae::keys_look_like_diffusion_decoder(
+                vae_decoder.keys().map(String::as_str),
+            ) {
                 return Err(Error::Msg(format!(
                     "ltx: {} declares {class} but carries no `decoder.det_stages.*` / \
                      `decoder.diff_blocks.*` tensors",

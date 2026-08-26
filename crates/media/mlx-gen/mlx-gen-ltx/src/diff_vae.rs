@@ -2290,9 +2290,23 @@ pub fn expected_weight_keys(cfg: &NaDiffusionDecoderConfig) -> Vec<String> {
 /// Classify a `Weights` map as an `NADiffusionDecoder` — used by the converter and by loaders that
 /// must tell the two 2.5 video decoders apart from the tensors alone.
 pub fn looks_like_diffusion_decoder(w: &Weights) -> bool {
+    keys_look_like_diffusion_decoder(w.keys())
+}
+
+/// [`looks_like_diffusion_decoder`] over bare keys, for the converters that classify a tensor map
+/// they have not wrapped in a [`Weights`] yet (`crate::tiers`, `crate::convert`).
+///
+/// One predicate, two callers: a converter deciding whether to emit the component and a loader
+/// deciding whether to read it must never disagree about what a diffusion decoder is — the
+/// disagreement ships as a tier whose `embedded_config.json` declares a `diffusion_vae` section with
+/// no decoder file beside it.
+///
+/// "Not empty" is deliberately not the test: `sanitize_vae_decoder_component` also sweeps in the two
+/// `per_channel_statistics` tensors, so a file with no decoder at all still yields a non-empty map.
+pub fn keys_look_like_diffusion_decoder<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
     let mut det = false;
     let mut diff = false;
-    for key in w.keys() {
+    for key in keys {
         det |= key.starts_with("det_stages.");
         diff |= key.starts_with("diff_blocks.");
     }
