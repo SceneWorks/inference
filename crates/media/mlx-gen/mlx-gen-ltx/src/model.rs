@@ -67,7 +67,9 @@ use crate::pipeline::{
     generate_av_latents_iclora, preprocess_conditioning_clip, preprocess_conditioning_image,
     StageClip, StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
-use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
+use crate::positions::{
+    compute_audio_frames, create_audio_position_grid, create_position_grid_with, DEFAULT_FPS,
+};
 use crate::text_encoder::LtxTextEncoder;
 use crate::tokenizer::LtxTokenizer;
 use crate::transformer::{AvDiT, Precision};
@@ -637,8 +639,44 @@ impl Ltx {
     pub(crate) fn audio_frames(req: &GenerationRequest) -> usize {
         compute_audio_frames(
             req.frames.unwrap_or(1).max(1) as usize,
-            req.fps.unwrap_or(24) as f64,
+            Self::fps(req) as f64,
         )
+    }
+
+    /// Output cadence used by every time-based LTX input. The request owns this value: the video
+    /// RoPE grids, appended-clip RoPE grid, audio-frame count, and returned video all share it.
+    pub(crate) fn fps(req: &GenerationRequest) -> f32 {
+        req.fps.unwrap_or(DEFAULT_FPS as u32) as f32
+    }
+
+    /// Build the request-scoped video and audio position grids. Keeping these together makes the
+    /// shared `frames / fps` time base explicit and prevents a secondary grid from falling back to
+    /// LTX's 24-fps fixture default.
+    pub(crate) fn position_grids(req: &GenerationRequest) -> (Array, Array, Array) {
+        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
+        let fps = Self::fps(req);
+        let pos1 = create_position_grid_with(
+            1,
+            lf,
+            h1,
+            w1,
+            TEMPORAL_SCALE as i64,
+            SPATIAL_SCALE as i64,
+            fps,
+            true,
+        );
+        let pos2 = create_position_grid_with(
+            1,
+            lf,
+            h2,
+            w2,
+            TEMPORAL_SCALE as i64,
+            SPATIAL_SCALE as i64,
+            fps,
+            true,
+        );
+        let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
+        (pos1, pos2, audio_pos)
     }
 
     /// `--no-audio` toggle: `req.video_mode == "no_audio"` runs the full A/V denoise but skips the
@@ -739,10 +777,9 @@ impl Ltx {
         video_clips: &[StageClip],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
-        let pos1 = create_position_grid(1, lf, h1, w1);
-        let pos2 = create_position_grid(1, lf, h2, w2);
-        let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
+        let (lf, h1, w1, _h2, _w2) = Self::latent_dims(req);
+        let fps = Self::fps(req);
+        let (pos1, pos2, audio_pos) = Self::position_grids(req);
 
         // Curated unified solver (epic 7114, sc-7122): a curated solver name routes the joint two-stream
         // T2V+A denoise through `generate_av_latents`' `denoise_av_curated` branch (LTX keeps its baked
@@ -804,6 +841,7 @@ impl Ltx {
                 &self.latent_std,
                 video_clips,
                 (LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32),
+                fps,
                 &req.cancel,
                 &mut on_step,
             )?
@@ -862,7 +900,7 @@ impl Ltx {
         finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Decode, || Ok(()))?;
         Ok(GenerationOutput::Video {
             frames: images,
-            fps: req.fps.unwrap_or(24),
+            fps: Self::fps(req) as u32,
             audio,
         })
     }
@@ -1855,6 +1893,70 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Ltx::latent_dims(&req), (1, 8, 12, 16, 24));
+    }
+
+    #[test]
+    fn request_position_grids_share_the_candle_time_axis_at_public_fps() {
+        // Candle's LTX grids use the request `fps` for both video stages and derive audio frames
+        // as Python `round(frames / fps * 25)`. Exercise the MLX request seam at the non-default
+        // public rates so a fixed 24-fps secondary grid cannot pass unnoticed.
+        for fps in [25u32, 30] {
+            let req = GenerationRequest {
+                width: 256,
+                height: 256,
+                frames: Some(9),
+                fps: Some(fps),
+                ..Default::default()
+            };
+            let (stage1, stage2, audio) = Ltx::position_grids(&req);
+            let time_end = |grid: &Array| {
+                let tokens = grid.shape()[2] as usize;
+                grid.as_slice::<f32>()[2 * tokens - 1]
+            };
+            let expected_video_end = 9.0 / fps as f32;
+            assert!(
+                (time_end(&stage1) - expected_video_end).abs() < 1e-7,
+                "stage-1 {fps}-fps grid used the wrong clock"
+            );
+            assert!(
+                (time_end(&stage2) - expected_video_end).abs() < 1e-7,
+                "stage-2 {fps}-fps grid used the wrong clock"
+            );
+
+            let audio_frames = audio.shape()[2] as usize;
+            let expected_audio_frames = compute_audio_frames(9, fps as f64);
+            assert_eq!(
+                audio_frames, expected_audio_frames,
+                "audio {fps}-fps frame count"
+            );
+            let video_seconds = 9.0 / fps as f64;
+            let audio_seconds = audio_frames as f64 / crate::positions::AUDIO_LATENTS_PER_SECOND;
+            assert!(
+                (audio_seconds - video_seconds).abs()
+                    <= 0.5 / crate::positions::AUDIO_LATENTS_PER_SECOND,
+                "audio/video duration disagreement at {fps} fps: {audio_seconds} vs {video_seconds}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_request_position_grids_remain_the_24_fps_fixture() {
+        let req = GenerationRequest {
+            width: 256,
+            height: 256,
+            frames: Some(9),
+            ..Default::default()
+        };
+        let (stage1, stage2, _) = Ltx::position_grids(&req);
+        assert_eq!(Ltx::fps(&req), DEFAULT_FPS);
+        assert_eq!(
+            stage1.as_slice::<f32>(),
+            crate::positions::create_position_grid(1, 2, 4, 4).as_slice::<f32>()
+        );
+        assert_eq!(
+            stage2.as_slice::<f32>(),
+            crate::positions::create_position_grid(1, 2, 8, 8).as_slice::<f32>()
+        );
     }
 
     #[test]
