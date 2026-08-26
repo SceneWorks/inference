@@ -227,7 +227,11 @@ pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<Stri
         .map_err(|error| {
             Error::Msg(format!("safetensors header in {}: {error}", path.display()))
         })?;
-    let Some(block) = json.get("__metadata__") else {
+    // An explicit `"__metadata__": null` means the same thing as an absent key, and is what the
+    // SceneWorks-converted LTX-2.3 trees actually ship (their `upsampler.safetensors` writes the
+    // key with a null value). Erroring on it would refuse a file that declares nothing, which is a
+    // legitimate state — the null-is-absent convention this crate applies everywhere else.
+    let Some(block) = json.get("__metadata__").filter(|v| !v.is_null()) else {
         return Ok(BTreeMap::new());
     };
     let block = block.as_object().ok_or_else(|| {
@@ -1521,6 +1525,18 @@ mod tests {
             r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
         );
         assert!(safetensors_file_metadata(&without).unwrap().is_empty());
+
+        // An explicit `"__metadata__": null` is what the SceneWorks-converted LTX-2.3 trees ship
+        // (verified against `ltx-2.3-mlx/.../q8/upsampler.safetensors`). It declares nothing, which
+        // is a legal state — refusing it would break every 2.3 load that reads a header.
+        let null = guard.path().join("null.safetensors");
+        write_header(
+            &null,
+            r#"{"__metadata__":null,"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        assert!(safetensors_file_metadata(&null)
+            .expect("a null __metadata__ is absent, not malformed")
+            .is_empty());
     }
 
     #[test]

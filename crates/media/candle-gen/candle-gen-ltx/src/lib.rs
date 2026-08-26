@@ -226,8 +226,7 @@ impl Pipeline {
         let ltx_files = [ltx_file];
         let vb_bf16 = candle_gen::mmap_var_builder(&ltx_files, DIT_DTYPE, &self.device)?;
         let vb_f32 = candle_gen::mmap_var_builder(&ltx_files, VAE_DTYPE, &self.device)?;
-        let upsampler_vb =
-            candle_gen::mmap_var_builder(&[self.upsampler_file()?], VAE_DTYPE, &self.device)?;
+        let upsampler_file = self.upsampler_file()?;
         let gemma_vb = candle_gen::mmap_var_builder(&gemma_files, DIT_DTYPE, &self.device)?
             .pp("language_model.model");
 
@@ -252,7 +251,10 @@ impl Pipeline {
         } else {
             LtxVideoVae::new(vb_f32.pp("vae"), config::LATENT_CHANNELS, 4)?
         };
-        let upsampler = LatentUpsampler::load(upsampler_vb)?;
+        // Loaded through the path constructor, so a stamped checkpoint's declared config is
+        // cross-checked against the structure the weights imply instead of the rank silently
+        // winning.
+        let upsampler = LatentUpsampler::from_checkpoint(&upsampler_file, VAE_DTYPE, &self.device)?;
         // The audio VAE decoder + vocoder run f32 (post-sampling quality islands).
         let audio_decoder = AudioDecoder::load(&vb_f32.pp("audio_vae"), &self.audio_vae_cfg)?;
         let vocoder = LtxVocoder::load(vb_f32, &self.device, &self.vocoder_cfg)?;
@@ -299,10 +301,10 @@ impl Pipeline {
         let vae_vb = paths.vae_vb(VAE_DTYPE, &self.device)?;
         // Explicit component sources take precedence even for a split tier;
         // otherwise the canonical co-located tier file is used.
-        let upsampler_vb = if self.upsampler_override.is_some() {
-            candle_gen::mmap_var_builder(&[self.upsampler_file()?], VAE_DTYPE, &self.device)?
+        let upsampler_file = if self.upsampler_override.is_some() {
+            self.upsampler_file()?
         } else {
-            paths.upsampler_vb(VAE_DTYPE, &self.device)?
+            paths.upsampler_file()?
         };
         let gemma_vb = paths.gemma_vb(DIT_DTYPE, &self.device)?;
 
@@ -331,7 +333,8 @@ impl Pipeline {
         } else {
             LtxVideoVae::new(vae_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
         };
-        let upsampler = LatentUpsampler::load(upsampler_vb)?;
+        // Path constructor, same reason as the unified route above.
+        let upsampler = LatentUpsampler::from_checkpoint(&upsampler_file, VAE_DTYPE, &self.device)?;
 
         let tok_path = paths.tokenizer_path();
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
