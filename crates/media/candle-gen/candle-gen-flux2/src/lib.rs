@@ -44,6 +44,7 @@ pub mod convert;
 pub mod edit_provider;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 pub mod memory_strategy;
+pub mod nvfp4_roles;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
@@ -69,7 +70,7 @@ pub use transformer::{
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "flux2-cuda-residency-caption-upsample-v2";
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -259,12 +260,14 @@ pub(crate) struct Pipeline {
     /// The text encoder / VAE / tokenizer still come from the resident klein snapshot `root`.
     /// `None` on every other path.
     pub(crate) klein_dit: Option<PinnedWeightsFile>,
-    /// The klein single-file import's three correlated checkpoint facts (sc-21484 / epic E8), bound
-    /// to the verified source pin and filled once by [`Self::load_klein_planned_dit`]. Shared
-    /// (`Arc`) so a `Pipeline` clone observes the same cell, and empty on every non-klein-file
-    /// route — a directory load has no single source to bind facts to. Read through
-    /// [`Flux2Generator::checkpoint_weight_facts`].
-    pub(crate) klein_facts: Arc<OnceLock<gen_core::checkpoint_facts::CheckpointWeightFacts>>,
+    /// The klein single-file import's three correlated checkpoint facts (sc-21484 / epic E8),
+    /// bound to the verified source pin and published by [`Self::load_klein_planned_dit`] through
+    /// the shared provider-neutral [`gen_core::CheckpointFactsSink`] (sc-11045 fix round — one
+    /// pattern across providers, replacing a bespoke `Arc<OnceLock>`). The sink clones share one
+    /// cell, and it stays empty on every non-klein-file route — a directory load has no single
+    /// source to bind facts to. Read through the
+    /// [`gen_core::Generator::checkpoint_weight_facts`] trait surface on [`Flux2Generator`].
+    pub(crate) klein_facts: gen_core::CheckpointFactsSink,
     pub(crate) adapters: Vec<gen_core::AdapterSpec>,
 }
 
@@ -293,7 +296,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: None,
-            klein_facts: Arc::new(OnceLock::new()),
+            klein_facts: gen_core::CheckpointFactsSink::new(),
             adapters,
         }
     }
@@ -318,7 +321,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: None,
-            klein_facts: Arc::new(OnceLock::new()),
+            klein_facts: gen_core::CheckpointFactsSink::new(),
             adapters,
         }
     }
@@ -354,7 +357,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: Some(comfyui_dit),
             klein_dit: None,
-            klein_facts: Arc::new(OnceLock::new()),
+            klein_facts: gen_core::CheckpointFactsSink::new(),
             adapters,
         })
     }
@@ -389,7 +392,7 @@ impl Pipeline {
             pid_spec,
             comfyui_dit: None,
             klein_dit: Some(klein_dit),
-            klein_facts: Arc::new(OnceLock::new()),
+            klein_facts: gen_core::CheckpointFactsSink::new(),
             adapters,
         })
     }
@@ -776,7 +779,9 @@ impl Pipeline {
     fn load_klein_planned_dit(&self, dit_file: &PinnedWeightsFile) -> CResult<Flux2Transformer> {
         dit_file.read_unchanged(|dit_path| {
             let mapping = single_file::Flux2BflToDiffusersMapping::new(&self.cfg);
-            let residency = candle_gen::logical_weights::CandleCodecResidency::probe(&self.device);
+            // The one shared policy the fit gate prices under too (MAJOR 10: fp8 leg masked —
+            // this provider has no packed-fp8 consumer, so fp8 rows take the dense decode).
+            let residency = single_file::klein_import_residency(&self.device);
             let plan =
                 candle_gen::logical_weights::plan_logical_weights(dit_path, &mapping, &residency)?;
             let reader = candle_gen::logical_weights::LogicalWeightReader::open_with_capability(
@@ -786,8 +791,13 @@ impl Pipeline {
                 residency.native_execution_capability(),
             )?;
             let ctx = candle_gen::quant::Nvfp4Context::new(&self.device)?;
-            let src =
-                single_file::PlannedDitWeights::new(reader, self.device.clone(), self.dtype, ctx);
+            let src = single_file::PlannedDitWeights::new(
+                reader,
+                self.device.clone(),
+                self.dtype,
+                ctx,
+                crate::nvfp4_roles::KleinRoleTable::new(&self.cfg),
+            );
             let dit = Flux2Transformer::new_planned(&self.cfg, &src)?;
             // The three correlated source/capability/receipt facts (sc-21484, epic E8): computed
             // off the shared reader after the full materialization, so a contradiction between the
@@ -800,9 +810,9 @@ impl Pipeline {
                 .checkpoint_weight_facts()?
                 .with_verified_source(dit_file)
                 .map_err(|error| CandleError::Msg(error.to_string()))?;
-            // Infallible in practice (one load per pipeline); a second load simply keeps the first
-            // set rather than racing.
-            let _ = self.klein_facts.set(facts);
+            // Last-write-wins through the shared sink (sc-11045 fix round): a staged provider that
+            // re-materializes reports the read that just finished, never a stale first one.
+            self.klein_facts.publish(facts);
             self.device.synchronize()?;
             Ok(dit)
         })
@@ -1265,28 +1275,28 @@ pub struct Flux2Generator {
     memory_admission: memory_strategy::Flux2AdmissionRegistry,
 }
 
-impl Flux2Generator {
+impl Generator for Flux2Generator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
     /// The **three correlated facts** about a klein universal single-file import (sc-21484, epic
     /// E8), tied to the verified source binding: what the source stores (per-codec tensor counts
     /// and source bytes), what this host can execute natively, and what actually materialized —
     /// split per execution representation and measured off the shared reader, never copied from the
     /// plan.
     ///
-    /// This is the surface a consumer reads to distinguish a source stored `nvfp4-v1` from a run
-    /// that executed it as packed W4A4 or as dense F32. `None` on every route with no single
-    /// planned source file: the resident-directory load, the dev ComfyUI single file (a
-    /// provider-local converter, not the plan seam), and a klein pipeline whose DiT has not been
-    /// materialized yet.
-    pub fn checkpoint_weight_facts(
-        &self,
-    ) -> Option<&gen_core::checkpoint_facts::CheckpointWeightFacts> {
-        self.pipe.klein_facts.get()
-    }
-}
-
-impl Generator for Flux2Generator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
+    /// **This is the trait surface a worker holds** (sc-11045 fix round, BLOCKER 1): the previous
+    /// revision defined an *inherent* method of the same name and never overrode the trait, so a
+    /// `Box<dyn Generator>` got the default `None` while the inherent method shadowed the trait
+    /// for concrete-type calls — hiding the gap from naive tests. The inherent method is gone;
+    /// there is exactly one accessor, and the UFCS-pinned test calls it through the trait.
+    ///
+    /// `None` on every route with no single planned source file: the resident-directory load, the
+    /// dev ComfyUI single file (a provider-local converter, not the plan seam), and a klein
+    /// pipeline whose DiT has not been materialized yet.
+    fn checkpoint_weight_facts(&self) -> Option<gen_core::CheckpointWeightFacts> {
+        self.pipe.klein_facts.facts()
     }
 
     fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
@@ -1593,6 +1603,18 @@ fn generator_from_pipeline(
 /// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
 /// fixture-only there — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    // sc-11045 fix round (MAJOR 7, the krea `build()` precedent): refuse an adapter-bearing load
+    // against a descriptor that does not advertise adapter support — the shape an imported-model
+    // route takes when its binding declares `inherit_adapters = false` and the registry withdraws
+    // `supports_lora`/`supports_lokr`. A typed refusal here is the difference between a capability
+    // error and a silently un-adapted render, and it runs before the weights are touched because
+    // the answer does not depend on them.
+    let route_descriptor = descriptor(variant);
+    gen_core::reject_unsupported_adapters(
+        route_descriptor.id,
+        &route_descriptor.capabilities,
+        spec.adapters.len(),
+    )?;
     Ok(Box::new(load_variant_concrete(variant, spec)?))
 }
 
@@ -1890,6 +1912,74 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
         spec.quantize = quant;
         spec
+    }
+
+    /// **sc-11045 fix round, BLOCKER 1: the klein facts cross the worker boundary.**
+    ///
+    /// The pre-fix code defined an *inherent* `Flux2Generator::checkpoint_weight_facts` and never
+    /// overrode the trait method, so a `Box<dyn Generator>` — the only handle a worker holds —
+    /// got the default `None` while the inherent method shadowed the trait for concrete-type
+    /// calls, hiding the gap from naive tests. This test therefore calls **through the trait,
+    /// UFCS** (the krea pattern): re-introducing the shadowing inherent method cannot satisfy it.
+    ///
+    /// # Mutation
+    ///
+    /// Make the trait impl return `None`, or re-add the inherent method and delete the trait
+    /// override: the `expect` below goes red.
+    #[test]
+    fn a_loaded_generator_exposes_the_klein_facts_through_the_trait_surface() {
+        use std::collections::HashMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Flux2Variant::Klein9b.config();
+        // The smallest planned klein source: the dense image-ingest embedder alone.
+        let path = tmp.path().join("klein-facts-fixture.safetensors");
+        candle_gen::candle_core::safetensors::save(
+            &HashMap::from([(
+                "img_in.weight".to_owned(),
+                Tensor::zeros(
+                    (cfg.inner_dim(), cfg.in_channels),
+                    candle_gen::candle_core::DType::BF16,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )]),
+            &path,
+        )
+        .unwrap();
+        let mapping = single_file::Flux2BflToDiffusersMapping::new(&cfg);
+        let plan = candle_gen::logical_weights::plan_logical_weights(
+            &path,
+            &mapping,
+            &candle_gen::logical_weights::CandleCodecResidency::DENSE,
+        )
+        .expect("plan");
+        let reader =
+            candle_gen::logical_weights::LogicalWeightReader::open(&path, plan, &Device::Cpu)
+                .expect("open");
+        reader.read("x_embedder.weight").expect("materialize");
+        let facts = reader.checkpoint_weight_facts().expect("facts");
+
+        let pipe = Pipeline::load(
+            Flux2Variant::Klein9b,
+            None,
+            tmp.path(),
+            &Device::Cpu,
+            None,
+            Vec::new(),
+        );
+        let generator = generator_from_pipeline(pipe, None).expect("generator");
+        assert!(
+            Generator::checkpoint_weight_facts(&generator).is_none(),
+            "before anything publishes there is no measured receipt to report"
+        );
+        generator.pipe.klein_facts.publish(facts);
+        let seen = Generator::checkpoint_weight_facts(&generator)
+            .expect("the trait surface exposes what the klein load published");
+        assert!(seen
+            .source()
+            .declares(candle_gen::gen_core::checkpoint_codec::DENSE_BF16_CODEC.codec_id));
+        assert!(seen.is_complete());
     }
 
     #[test]

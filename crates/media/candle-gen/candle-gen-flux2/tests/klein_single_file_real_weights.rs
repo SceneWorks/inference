@@ -21,8 +21,13 @@
 //!   NVFP4-packed rows: a synthetic LoRA targeting packed projections loads through the same route,
 //!   changes the fixed-seed output, and never silently no-ops.
 
+// The whole module is cuda-gated (sc-11045 fix round, MAJOR 8): every test needs a CUDA device,
+// and the CPU `--all-targets` lane must not even compile the render harness.
+#![cfg(feature = "cuda")]
+
 use std::path::{Path, PathBuf};
 
+use candle_gen::gen_core::checkpoint_codec::NVFP4_CODEC;
 use candle_gen::gen_core::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
     WeightsSource, BASE_SNAPSHOT_COMPONENT,
@@ -45,19 +50,22 @@ fn managed_nvfp4_file() -> PathBuf {
     ))
 }
 
-/// Stage a "linked" copy of the managed artifact: a hardlink beside it when the volume allows
-/// (byte-identical by construction, no 5.6 GB duplication), else a copy into the stage dir.
-fn stage_linked_copy(managed: &Path) -> PathBuf {
-    let stage = std::env::var("CANDLE_FLUX2_LINKED_STAGE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    std::fs::create_dir_all(&stage).expect("stage dir");
-    let linked = stage.join("sc21485-linked-Flux2-Klein-9B-True-v2-nvfp4mixed.safetensors");
-    let _ = std::fs::remove_file(&linked);
+/// Stage a "linked" copy of the managed artifact under a **TempDir guard** (sc-11045 fix round,
+/// MAJOR 8 — no raw `temp_dir` litter, and cleanup survives a panicking assertion): a hardlink in
+/// a temp dir beside the managed copy (same volume — byte-identical by construction, no 5.6 GB
+/// duplication; and NOT a junction/symlink, which candle refuses, os error 448), else a copy.
+fn stage_linked_copy(managed: &Path) -> (tempfile::TempDir, PathBuf) {
+    let stage = tempfile::Builder::new()
+        .prefix("sc21485-linked-")
+        .tempdir_in(managed.parent().expect("the managed artifact has a parent"))
+        .expect("temp dir beside the managed copy");
+    let linked = stage
+        .path()
+        .join("sc21485-linked-Flux2-Klein-9B-True-v2-nvfp4mixed.safetensors");
     if std::fs::hard_link(managed, &linked).is_err() {
         std::fs::copy(managed, &linked).expect("copy the linked stand-in");
     }
-    linked
+    (stage, linked)
 }
 
 fn spec_for(file: &Path, adapters: Vec<AdapterSpec>) -> LoadSpec {
@@ -92,6 +100,39 @@ fn render(file: &Path, adapters: Vec<AdapterSpec>) -> Vec<u8> {
         }
     };
     let output = gen.generate(&req, &mut on_progress).expect("render");
+
+    // sc-11045 fix round (MAJOR 8c / BLOCKER 1): the facts cross the worker boundary — read off
+    // the SAME `Box<dyn Generator>` a worker holds, i.e. through the trait surface, after the DiT
+    // materialized. This is the assertion the shadowed inherent method used to defeat.
+    let facts = gen
+        .checkpoint_weight_facts()
+        .expect("a klein single-file load publishes its checkpoint facts to the trait surface");
+    assert!(
+        facts.source().declares(NVFP4_CODEC.codec_id),
+        "the pinned artifact stores nvfp4-v1"
+    );
+    assert!(
+        facts.is_complete(),
+        "the render materialized the whole DiT, so the receipt must cover the plan"
+    );
+    assert!(facts.resident_bytes() > 0);
+    let device = candle_gen::default_device().expect("device");
+    if CandleCodecResidency::probe(&device).nvfp4_native {
+        assert!(
+            facts.executes_natively(NVFP4_CODEC.codec_id),
+            "on sm_120 the mixed policy must keep the compute bulk genuinely packed"
+        );
+        assert!(
+            !facts.receipt().demotions.is_empty(),
+            "the W4A16 outlier class must be demoted in the receipt, never labelled native"
+        );
+    } else {
+        assert!(
+            !facts.executes_natively(NVFP4_CODEC.codec_id),
+            "below the sm_120 floor nothing may be labelled native"
+        );
+    }
+
     let GenerationOutput::Images(images) = output else {
         panic!("expected images");
     };
@@ -103,28 +144,39 @@ fn render(file: &Path, adapters: Vec<AdapterSpec>) -> Vec<u8> {
 #[ignore = "needs the pinned NVFP4 klein single file + base snapshot + CUDA (env-driven)"]
 fn linked_and_managed_copies_share_one_plan_and_one_render() {
     let managed = managed_nvfp4_file();
-    let linked = stage_linked_copy(&managed);
+    let (_stage, linked) = stage_linked_copy(&managed);
 
     // Same SEMANTIC plan, independent of which path the bytes load from: mapping id plus the
-    // (codec, residency) → logical-key rows, compiled under the device's real residency policy.
+    // (codec, residency) → logical-key rows, compiled under the same policy the provider loads
+    // with (the probed floors, fp8 leg masked — MAJOR 10).
     let device = candle_gen::default_device().expect("device");
-    let residency = CandleCodecResidency::probe(&device);
+    let residency = CandleCodecResidency::probe(&device).with_dense_fp8();
     let cfg = Flux2Variant::Klein9b.config();
     let mapping = Flux2BflToDiffusersMapping::new(&cfg);
     let plan_managed = plan_logical_weights(&managed, &mapping, &residency).expect("managed plan");
     let plan_linked = plan_logical_weights(&linked, &mapping, &residency).expect("linked plan");
     let summary = plan_semantic_summary(&plan_managed);
     assert_eq!(summary, plan_semantic_summary(&plan_linked));
-    // The pinned artifact really exercises the packed lane: it must plan NVFP4 rows.
+    let rows: Vec<(&str, &str, usize)> = summary
+        .1
+        .iter()
+        .map(|(codec, mode, keys)| (codec.as_str(), mode.as_str(), keys.len()))
+        .collect();
+    // The pinned artifact really exercises the packed lane: it must plan NVFP4 rows…
     assert!(
-        summary.1.iter().any(|(codec, _, _)| codec == "nvfp4-v1"),
-        "the pinned artifact must plan nvfp4-v1 rows; got {:?}",
-        summary
-            .1
-            .iter()
-            .map(|(codec, mode, keys)| (codec.as_str(), mode.as_str(), keys.len()))
-            .collect::<Vec<_>>()
+        rows.iter().any(|(codec, _, _)| *codec == "nvfp4-v1"),
+        "the pinned artifact must plan nvfp4-v1 rows; got {rows:?}"
     );
+    // …and on this box's sm_120 device those rows must be priced **Packed** (sc-11045 fix round,
+    // MAJOR 8c: the residency MODE, not merely the codec's presence — a dense-only pricing of the
+    // same artifact would satisfy the weaker check while proving nothing about the packed lane).
+    if CandleCodecResidency::probe(&device).nvfp4_native {
+        assert!(
+            rows.iter()
+                .any(|(codec, mode, keys)| *codec == "nvfp4-v1" && *mode == "Packed" && *keys > 0),
+            "on sm_120 the pinned artifact must price packed nvfp4-v1 rows; got {rows:?}"
+        );
+    }
 
     let a = render(&managed, Vec::new());
     let b = render(&linked, Vec::new());
@@ -132,7 +184,6 @@ fn linked_and_managed_copies_share_one_plan_and_one_render() {
         a, b,
         "linked vs managed fixed-seed renders must be byte-identical"
     );
-    let _ = std::fs::remove_file(&linked);
 }
 
 /// Deterministic tiny LoRA over two NVFP4-packed projections (a double-block `to_q` and the fused

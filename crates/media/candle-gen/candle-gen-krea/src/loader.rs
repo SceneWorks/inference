@@ -343,7 +343,13 @@ impl Weights {
         // The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the
         // packed rows packed, everything else prices the dense fallback. Passing the real device
         // (rather than a fixed policy) keeps the plan's pricing the pricing of *this* load.
-        let residency = CandleCodecResidency::probe(device);
+        //
+        // The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
+        // `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal —
+        // so pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a
+        // plan this loader itself priced. Masked, an fp8 row takes the exact dense decode
+        // (`weight_scale` applied) through the shared reader on every host.
+        let residency = CandleCodecResidency::probe(device).with_dense_fp8();
         Self::from_pinned_native_file_with_residency(
             pinned_source,
             device,
@@ -480,6 +486,27 @@ impl Weights {
                 .unwrap_or_default();
             Error::Msg(format!("{error}{hint}"))
         })
+    }
+
+    /// Record that a `Packed`-priced logical row was constructed as a **dense BF16** weight
+    /// holding `resident_bytes` on-device (sc-11045 fix round, epic E5) — the W4A16 role-table
+    /// override and the transparent construction-time fallbacks. Delegates to the shared reader's
+    /// [`LogicalWeightReader::demote_to_dense_fallback`], so the receipt (and the facts built from
+    /// it) reports the dense truth with a typed `RegimeDemotion` instead of labelling the row
+    /// native at packed byte counts.
+    pub(crate) fn demote_packed_row_to_dense(
+        &self,
+        logical_key: &str,
+        resident_bytes: u64,
+    ) -> Result<()> {
+        let reader = self.logical.as_ref().ok_or_else(|| {
+            Error::Msg(format!(
+                "krea: `{logical_key}` cannot be demoted; this source has no logical-weight plan"
+            ))
+        })?;
+        reader
+            .demote_to_dense_fallback(logical_key, resident_bytes)
+            .map_err(|error| Error::Msg(error.to_string()))
     }
 
     /// The NVFP4 capability facts this import carries for one **logical** weight key (sc-12121).
@@ -758,11 +785,15 @@ impl Weights {
     /// Load `name` at the component dtype — from the `overlay` if present
     /// (adapter-merged weight), else the mmap (native-key-resolved for a ConvRot checkpoint).
     ///
-    /// On a native NVFP4 checkpoint every read goes through the **shared logical reader**
-    /// (sc-21482): a dense row is the byte-preserving codec read it always was, while a
+    /// On **any planned single-file native checkpoint** every read of a planned key goes through
+    /// the **shared logical reader** (sc-21482; widened from the NVFP4-only gate by the sc-11045
+    /// fix round): a dense row is the byte-preserving codec read it always was, while a
     /// descriptor-quantized row asked for densely (e.g. a `full_precision_matrix_mult` projection
     /// through [`linear`]) comes back as the codec's exact dense decode instead of raw stored
-    /// bytes reinterpreted at the component dtype.
+    /// bytes reinterpreted at the component dtype. Gating on the plan rather than on
+    /// `is_native_nvfp4` is load-bearing for a native file whose quantized rows are **fp8** with
+    /// no NVFP4 row at all: the old gate let such a read fall through to the raw mmap and cast
+    /// stored E4M3 codes to the component dtype without their `weight_scale`.
     ///
     /// # A row the plan priced `Packed` refuses here (sc-21482 review)
     ///
@@ -800,7 +831,7 @@ impl Weights {
                 return self.dequant_plain_int8(&resolved, self.dtype);
             }
         }
-        if self.native_nvfp4 && self.planned(name).is_some() {
+        if self.planned(name).is_some() {
             return match self.read_planned(name)? {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(self.dtype),
                 LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
@@ -850,7 +881,7 @@ impl Weights {
                 return self.dequant_plain_int8(&resolved, DType::F32);
             }
         }
-        if self.native_nvfp4 && self.planned(name).is_some() {
+        if self.planned(name).is_some() {
             return match self.read_planned(name)? {
                 LogicalTensor::Dense(tensor) => tensor.to_dtype(DType::F32),
                 LogicalTensor::PackedNvfp4 { .. } | LogicalTensor::PackedFp8E4M3 { .. } => {
@@ -1606,6 +1637,15 @@ pub fn linear_detect_planned(
                     lin.regime() == Nvfp4Regime::Fp4W4A4,
                     lin.fallback_cause(),
                 )?;
+                // sc-11045 fix round (epic E5): a Packed-priced row the role table (or a
+                // transparent fallback) resolved to the dequant-bf16 regime holds a dense bf16
+                // weight, not the packed container the plan priced. Tell the reader, so the
+                // receipt/facts report DenseFallback at the measured dense bytes instead of
+                // labelling the row native.
+                if lin.regime() == Nvfp4Regime::DequantBf16 {
+                    let resident = lin.resident_weight_bytes()? as u64;
+                    w.demote_packed_row_to_dense(&weight_key, resident)?;
+                }
                 Ok(QLinear::Nvfp4(Nvfp4Proj::new(lin, base, plan, act)))
             }
             LogicalTensor::Dense(weight) => {
@@ -2972,10 +3012,21 @@ mod tests {
         let packed_facts = packed
             .checkpoint_weight_facts()?
             .expect("a single-file native import has a plan");
-        assert!(packed_facts.executes_natively(NVFP4_CODEC.codec_id));
+        // The *capability* (fact 1) licenses native execution — but this process still runs on a
+        // CPU, so `Nvfp4Linear` construction resolved every packed-priced row to the dequant-bf16
+        // regime and the loader DEMOTED it (sc-11045 fix round). The facts therefore answer the
+        // product question honestly: capability yes, execution no.
         assert!(packed_facts
             .capability()
             .executes_natively(NVFP4_CODEC.codec_id));
+        assert!(
+            !packed_facts.executes_natively(NVFP4_CODEC.codec_id),
+            "a packed-priced row this host constructed dense must never be labelled native"
+        );
+        assert!(
+            !packed_facts.receipt().demotions.is_empty(),
+            "the demotion is the typed accounting that reconciles receipt and plan"
+        );
         // Fact 2 is the same file on both hosts; only fact 3 moved.
         assert_eq!(
             packed_facts
@@ -2989,7 +3040,11 @@ mod tests {
                 .unwrap()
                 .tensor_count
         );
-        assert!(packed_facts.resident_bytes() < facts.resident_bytes());
+        // Both hosts end up holding the SAME dense bf16 bytes for the NVFP4 rows — the CPU host by
+        // plan-priced dense fallback, the forced-packed host by construction-time demotion. Equal
+        // residency is the honest answer; the old `<` assertion trusted packed pricing a dense
+        // construction never held.
+        assert_eq!(packed_facts.resident_bytes(), facts.resident_bytes());
         Ok(())
     }
 
@@ -2997,7 +3052,9 @@ mod tests {
     /// on (the container is host-side; only the GEMM is hardware-gated), the SAME fixture's plan
     /// prices the projection `Packed`, the shared reader hands back the canonical repacked
     /// container (Kitchen's hi-first nibbles swapped), `linear_detect_planned` constructs an NVFP4
-    /// projection from it, and the measured receipt equals the plan's packed pricing.
+    /// projection from it — and, this being a CPU, the construction resolves dense, so the receipt
+    /// reports the row **demoted** to `DenseFallback` at the dense bf16 bytes it actually holds
+    /// (sc-11045 fix round) rather than echoing the plan's packed pricing.
     #[test]
     fn kitchen_nvfp4_native_file_packs_when_the_plan_prices_packed() -> Result<()> {
         let dev = Device::Cpu;
@@ -3067,36 +3124,47 @@ mod tests {
             report.footprint_ratio()
         );
 
-        // …and the receipt row measured off the container equals the plan's packed pricing
-        // (stored nibbles + retained scale companions).
+        // …and the receipt reports what construction actually left resident (sc-11045 fix round):
+        // the CPU host held the packed-priced row as a dequantized dense bf16 weight, so the row is
+        // DEMOTED — reported `DenseFallback` at the dense bf16 bytes, with a typed `RegimeDemotion`
+        // reconciling it against the plan's packed pricing. A `NativePacked` row here would be
+        // dense BF16 execution labelled native, the exact E5 lie.
         let receipt = w
             .logical_weight_receipt()
             .expect("the plan yields a receipt");
+        assert!(
+            !receipt
+                .residency
+                .iter()
+                .any(|row| row.representation == ExecutionRepresentation::NativePacked),
+            "a dense construction must not surface a native-packed row"
+        );
         let nvfp4_row = receipt
             .residency
             .iter()
-            // The packed arm, named explicitly: `codec_id` alone would pass on a dense-fallback
-            // row and this test's whole point is that the forced-packed route produced a
-            // *native* one.
             .find(|row| {
                 row.codec_id == NVFP4_CODEC.codec_id
-                    && row.representation == ExecutionRepresentation::NativePacked
+                    && row.representation == ExecutionRepresentation::DenseFallback
             })
-            .expect("the materialized NVFP4 row is reported as native-packed");
+            .expect("the demoted NVFP4 row is reported as dense-fallback");
         assert_eq!(nvfp4_row.tensor_count, 1);
-        let companions: u64 = w
-            .logical_plan()
-            .unwrap()
-            .companions
-            .iter()
-            .filter(|companion| companion.owner_physical_key == planned.physical_key)
-            .map(|companion| companion.resident_bytes)
-            .sum();
+        let dense_bf16_bytes: u64 = planned.shape.iter().product::<usize>() as u64 * 2;
         assert_eq!(
-            nvfp4_row.resident_bytes,
-            planned.residency.resident_bytes + companions,
-            "the measured packed residency must equal the plan's packed pricing"
+            nvfp4_row.resident_bytes, dense_bf16_bytes,
+            "the demoted row carries the dense bf16 bytes the layer actually holds"
         );
+        assert_eq!(receipt.demotions.len(), 1);
+        assert_eq!(
+            receipt.demotions[0].logical_key,
+            "transformer_blocks.0.attn.to_q.weight"
+        );
+        assert_eq!(receipt.demotions[0].resident_bytes, dense_bf16_bytes);
+        // The facts assemble: the demotion is the accounting that lets the measured dense row
+        // reconcile against a plan that priced this row packed.
+        let facts = w
+            .checkpoint_weight_facts()?
+            .expect("a single-file native import has a plan");
+        assert!(!facts.executes_natively(NVFP4_CODEC.codec_id));
         Ok(())
     }
 

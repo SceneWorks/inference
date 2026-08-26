@@ -821,8 +821,19 @@ impl AdaptLinear {
     /// `[rank, out]` (= `upᵀ` with `alpha/rank` folded in), `scale` the caller's per-adapter strength.
     /// Multiple pushes stack. Valid on **any** base — the base weight is untouched, so a packed q4/q8
     /// tier keeps its footprint.
-    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+    ///
+    /// **On an NVFP4 base this delegates to [`Self::push_lora_checked`]** (sc-11045 fix round,
+    /// MAJOR 7): an NVFP4 host has no fallback — it can neither fold a mismatched delta nor
+    /// dequantize to make one fit — so the unchecked bypass is structurally closed and a
+    /// mis-shaped factor is a typed refusal at admission, never a first-forward shape panic.
+    /// Dense/MLX-packed bases keep the historical unchecked behaviour (their installers carry
+    /// their own shape screening) and always return `Ok`.
+    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
+        if matches!(self.base, Base::Nvfp4(_)) {
+            return self.push_lora_checked(a, b, scale);
+        }
         self.adapters.push(Adapter::Lora { a, b, scale });
+        Ok(())
     }
 
     /// [`Self::push_lora`] with **admission validation** (sc-21483): the factor pair must match the
@@ -942,8 +953,15 @@ impl AdaptLinear {
     /// `(alpha/rank)·strength` scale is already baked into `factors.w2`, so `[out,in]` is never
     /// materialized. Valid on **any** base — the base weight is untouched, so a packed q4/q8 tier keeps
     /// its footprint. Multiple pushes stack, and it mixes freely with LoRA residuals (push order).
-    pub fn push_lokr_structured(&mut self, factors: LokrFactors) {
+    ///
+    /// **On an NVFP4 base this delegates to [`Self::push_lokr_structured_checked`]** — same
+    /// structural closure as [`Self::push_lora`] (sc-11045 fix round, MAJOR 7).
+    pub fn push_lokr_structured(&mut self, factors: LokrFactors) -> Result<()> {
+        if matches!(self.base, Base::Nvfp4(_)) {
+            return self.push_lokr_structured_checked(factors);
+        }
         self.adapters.push(Adapter::LokrStructured { factors });
+        Ok(())
     }
 
     /// Drop **every** attached forward-time residual, reverting the projection to its bare base — so the
@@ -1228,7 +1246,7 @@ mod tests {
             out_dim,
         );
         let (a, b) = poison_lora(in_dim, out_dim);
-        zero_forward_host.push_lora(a, b, 0.0);
+        zero_forward_host.push_lora(a, b, 0.0).unwrap();
         let zero_forward = zero_forward_host.forward(&x_f32).unwrap();
         assert_tensor_exact(&zero_forward, &bare_forward, "dense f32 forward scale=0");
 
@@ -1252,7 +1270,7 @@ mod tests {
             in_dim,
             out_dim,
         );
-        zero_lokr_host.push_lokr_structured(factors);
+        zero_lokr_host.push_lokr_structured(factors).unwrap();
         assert_tensor_exact(
             &zero_lokr_host.forward(&x_f32).unwrap(),
             &bare_forward,
@@ -1263,7 +1281,7 @@ mod tests {
         let bare_upcast = bare_bf16.forward_upcast(&x_f32).unwrap();
         let mut zero_bf16 = dense_bf16_adapt(out_dim, in_dim);
         let (a, b) = poison_lora(in_dim, out_dim);
-        zero_bf16.push_lora(a, b, 0.0);
+        zero_bf16.push_lora(a, b, 0.0).unwrap();
         let zero_upcast = zero_bf16.forward_upcast(&x_f32).unwrap();
         assert_tensor_exact(
             &zero_upcast,
@@ -1306,7 +1324,7 @@ mod tests {
 
             let mut zero = int8_fast_adapt(quant, out_dim, in_dim);
             let (poison_a, poison_b) = poison_lora(in_dim, out_dim);
-            zero.push_lora(poison_a, poison_b, 0.0);
+            zero.push_lora(poison_a, poison_b, 0.0).unwrap();
             assert_tensor_exact(
                 &zero.forward(&x).unwrap(),
                 &bare_forward,
@@ -1319,7 +1337,7 @@ mod tests {
             );
 
             let mut live = int8_fast_adapt(quant, out_dim, in_dim);
-            live.push_lora(a.clone(), b.clone(), 0.5);
+            live.push_lora(a.clone(), b.clone(), 0.5).unwrap();
             let expected = (&bare_forward + &residual).unwrap();
             let got = live.forward(&x).unwrap();
             assert_tensor_exact(&got, &expected, "quantized forward live adapter");
@@ -1362,7 +1380,9 @@ mod tests {
             AdaptLinear::from_dense(Linear::new(dense_weight, None), in_dim, out_dim);
         let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
         let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
-        zero_dense.push_lora(poison_a, poison_b, 0.0);
+        zero_dense
+            .push_lora(poison_a, poison_b, 0.0)
+            .expect("scale=0 poison factors are admitted on a dense bf16 host");
         assert_tensor_exact(
             &zero_dense.forward(&x).unwrap(),
             &bare_dense_y,
@@ -1393,7 +1413,9 @@ mod tests {
             in_dim,
             out_dim,
         );
-        live_dense.push_lora(a.clone(), b.clone(), 0.5);
+        live_dense
+            .push_lora(a.clone(), b.clone(), 0.5)
+            .expect("rank-2 factors are admitted on a dense bf16 host");
         let dense_expected = (&bare_dense_y + &residual_bf16).unwrap();
         assert_tensor_exact(
             &live_dense.forward(&x).unwrap(),
@@ -1423,7 +1445,8 @@ mod tests {
             let mut zero = build();
             let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
             let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
-            zero.push_lora(poison_a, poison_b, 0.0);
+            zero.push_lora(poison_a, poison_b, 0.0)
+                .expect("scale=0 poison factors are admitted on a packed host");
             assert_tensor_exact(
                 &zero.forward(&x).unwrap(),
                 &base_y,
@@ -1436,7 +1459,8 @@ mod tests {
             );
 
             let mut live = build();
-            live.push_lora(a.clone(), b.clone(), 0.5);
+            live.push_lora(a.clone(), b.clone(), 0.5)
+                .expect("rank-2 factors are admitted on a packed host");
             let expected = (&base_y + residual_bf16.to_dtype(DType::F32).unwrap()).unwrap();
             assert_tensor_exact(
                 &live.forward(&x).unwrap(),
@@ -1535,7 +1559,7 @@ mod tests {
         let a = down.t().unwrap().contiguous().unwrap();
         let b = (up.t().unwrap().contiguous().unwrap() * ratio).unwrap();
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a, b, user_scale);
+        lin.push_lora(a, b, user_scale).unwrap();
         assert!(lin.is_adapted());
 
         // Folded reference: δ = ratio·user_scale·(up·down); W_merged = W + δ.
@@ -1568,7 +1592,7 @@ mod tests {
         let (mut adapted, _) = packed_adapt(&tmp, out_dim, in_dim);
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
-        adapted.push_lora(a.clone(), b.clone(), 1.0);
+        adapted.push_lora(a.clone(), b.clone(), 1.0).unwrap();
         assert!(adapted.is_packed(), "adapter must not un-pack the base");
 
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
@@ -1599,7 +1623,7 @@ mod tests {
 
         // scale 0 ⇒ exact no-op vs the un-adapted packed base.
         let (mut zero, _) = packed_adapt(&tmp, out_dim, in_dim);
-        zero.push_lora(a, b, 0.0);
+        zero.push_lora(a, b, 0.0).unwrap();
         let zero_dev = (zero.forward(&x).unwrap().sub(&base_y).unwrap())
             .abs()
             .unwrap()
@@ -1632,7 +1656,7 @@ mod tests {
         let base_y = base.forward(&x).unwrap();
 
         let mut lin = AdaptLinear::from_dense(Linear::new(w, None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), 0.7);
+        lin.push_lora(a.clone(), b.clone(), 0.7).unwrap();
         assert!(lin.is_adapted());
         let adapted_shift = (lin.forward(&x).unwrap() - &base_y)
             .unwrap()
@@ -1661,7 +1685,7 @@ mod tests {
         );
 
         // Re-push a fresh (different-scale) residual — the phase's set is authoritative after a clear.
-        lin.push_lora(a, b, 0.3);
+        lin.push_lora(a, b, 0.3).unwrap();
         assert!(lin.is_adapted());
         let repush_shift = (lin.forward(&x).unwrap() - &base_y)
             .unwrap()
@@ -1692,7 +1716,7 @@ mod tests {
         let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap() * 0.1).unwrap();
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
         let scale = 0.7f64;
-        adapted.push_lora(a.clone(), b.clone(), scale);
+        adapted.push_lora(a.clone(), b.clone(), scale).unwrap();
         assert!(adapted.is_packed(), "base stays packed under the residual");
 
         let x = Tensor::randn(0f32, 1f32, (4usize, in_dim), &dev).unwrap();
@@ -1727,7 +1751,7 @@ mod tests {
         let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap() * 0.1).unwrap();
 
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), 0.7);
+        lin.push_lora(a.clone(), b.clone(), 0.7).unwrap();
         assert!(!lin.is_packed());
         lin.quantize(Quant::Q8).unwrap();
         assert!(lin.is_packed(), "dense base must fold to packed");
@@ -1964,7 +1988,7 @@ mod tests {
         .unwrap()
         .expect("deferrable");
         assert!(factors.w1.elem_count() + factors.w2.elem_count() < out_dim * in_dim);
-        adapted.push_lokr_structured(factors);
+        adapted.push_lokr_structured(factors).unwrap();
         assert!(
             adapted.is_packed(),
             "structured LoKr must not un-pack the base"
@@ -2010,7 +2034,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        zero.push_lokr_structured(f0);
+        zero.push_lokr_structured(f0).unwrap();
         let zero_dev = max_abs(&(zero.forward(&x).unwrap() - base.forward(&x).unwrap()).unwrap());
         assert_eq!(
             zero_dev, 0.0,
@@ -2081,7 +2105,7 @@ mod tests {
         let a = Tensor::randn(0f32, 1f32, (in_dim, rank), &dev).unwrap(); // [in, rank]
         let b = Tensor::randn(0f32, 1f32, (rank, out_dim), &dev).unwrap(); // [rank, out]
         let mut lin = AdaptLinear::from_dense(Linear::new(w.clone(), None), in_dim, out_dim);
-        lin.push_lora(a.clone(), b.clone(), scale);
+        lin.push_lora(a.clone(), b.clone(), scale).unwrap();
 
         // `[N, S, in]`: N is a BATCH of token stacks (the layerwise-block shape), S the stack length.
         let (n, s) = (5usize, 3usize);
@@ -2274,6 +2298,61 @@ mod tests {
 
         host.clear_adapters();
         assert_eq!(flat(&host.forward(&x).unwrap()), flat(&bare));
+    }
+
+    /// **sc-11045 fix round (MAJOR 7, minor): the unchecked pushes delegate to the checked forms
+    /// on an NVFP4 base**, so the bypass is structurally closed — no caller can attach an
+    /// unvalidated factor to a base that has no fallback. Dense/MLX-packed bases keep the
+    /// historical unchecked behaviour.
+    ///
+    /// # Mutation
+    ///
+    /// Remove the `Base::Nvfp4` delegation from `push_lora`/`push_lokr_structured` (restore the
+    /// plain `self.adapters.push(...)`): both `unwrap_err`s below go red.
+    #[test]
+    fn the_unchecked_pushes_delegate_to_the_checked_forms_on_an_nvfp4_base() {
+        let (out_dim, in_dim) = (32, 64);
+        let mut host = nvfp4_host(out_dim, in_dim);
+        // A mis-shaped LoRA through the UNCHECKED entry point refuses on the NVFP4 base.
+        let (bad_a, bad_b) = lora_pair(16, 4, out_dim);
+        let error = host.push_lora(bad_a, bad_b, 1.0).unwrap_err().to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(!host.is_adapted());
+        // A mis-reconstructing LoKr likewise: factors built for a [16, 64] base.
+        let dev = Device::Cpu;
+        let w1 = Tensor::ones((2, 8), DType::F32, &dev).unwrap();
+        let w2 = Tensor::ones((8, 8), DType::F32, &dev).unwrap();
+        let wrong = LokrFactors::build(
+            1.0,
+            (16, 64),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a plain linear LoKr is deferrable");
+        let error = host.push_lokr_structured(wrong).unwrap_err().to_string();
+        assert!(error.contains("NVFP4 base"), "{error}");
+        assert!(!host.is_adapted());
+        // Well-shaped factors still install through the same unchecked names.
+        let (a, b) = lora_pair(in_dim, 4, out_dim);
+        host.push_lora(a, b, 1.0).unwrap();
+        assert!(host.is_adapted());
+        // And a dense base keeps the historical unchecked semantics: no validation, always Ok.
+        let mut dense = AdaptLinear::from_dense(
+            Linear::new(
+                Tensor::zeros((out_dim, in_dim), DType::F32, &dev).unwrap(),
+                None,
+            ),
+            in_dim,
+            out_dim,
+        );
+        let (bad_a, bad_b) = lora_pair(16, 4, out_dim);
+        dense.push_lora(bad_a, bad_b, 1.0).unwrap();
     }
 
     /// AC#2, shape half — a factor that does not compose against the base is refused at ADMISSION,

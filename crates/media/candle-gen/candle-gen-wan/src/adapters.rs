@@ -656,7 +656,8 @@ pub fn install_additive(
                     report.skipped_keys += 1; // shape-mismatched factor for this projection
                     continue;
                 }
-                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
                 report.applied += 1;
                 applied_sources.insert(p.source);
             }

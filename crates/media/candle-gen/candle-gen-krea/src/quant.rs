@@ -511,7 +511,11 @@ impl QLinear {
 
     pub(crate) fn push_additive_lora(&mut self, a: Tensor, b: Tensor, scale: f64) -> Result<()> {
         match self {
-            Self::Adapt(host) => host.push_lora(a, b, scale),
+            Self::Adapt(host) => {
+                return host
+                    .push_lora(a, b, scale)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
             // NVFP4 admits through the shared CHECKED push: a shape/dtype/device mismatch is a typed
             // error here — at install, before the first sampler step — and the packed base is never
             // converted to another regime to make the factor fit.
@@ -534,7 +538,11 @@ impl QLinear {
         factors: candle_gen::quant::LokrFactors,
     ) -> Result<()> {
         match self {
-            Self::Adapt(host) => host.push_lokr_structured(factors),
+            Self::Adapt(host) => {
+                return host
+                    .push_lokr_structured(factors)
+                    .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+            }
             Self::Nvfp4(host) => {
                 return host
                     .adapt_mut()

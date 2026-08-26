@@ -3094,13 +3094,17 @@ mod tests {
             entry.planned_native_packed_tensors, 0,
             "nothing is packed here"
         );
-        // Fact 3 is empty, and honestly so: a dense native trunk reads its tensors straight off the
-        // mmap rather than through the logical reader, so nothing has been *measured* through the
-        // receipt. That asymmetry is the shared reader's (sc-21482), not this seam's — the receipt
-        // half of the contract is asserted on the Kitchen NVFP4 fixture in `lib`'s
-        // `a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import`. What this
-        // test pins is that a *real* load reaches `publish` at all.
-        assert!(facts.materialized().is_empty());
+        // Fact 3 is measured: since the sc-11045 fix round widened the reader gate from
+        // NVFP4-only to every planned single-file native load, a dense native trunk's reads go
+        // through the shared logical reader too, so the receipt carries measured dense rows —
+        // and, this being a dense file on a dense-only host, nothing native and no demotions.
+        assert!(
+            !facts.materialized().is_empty(),
+            "a planned dense native load measures its reads through the shared reader"
+        );
+        assert!(facts.materialized().iter().all(|row| row.representation
+            == gen_core::checkpoint_facts::ExecutionRepresentation::DenseFallback));
+        assert!(facts.receipt().demotions.is_empty());
     }
 
     #[test]

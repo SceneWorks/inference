@@ -231,7 +231,9 @@ pub fn read_logical_weights(
     };
     let residency = match materialization {
         LogicalReadMaterialization::Materialized => measure_residency(plan, &logical)?,
-        LogicalReadMaterialization::Deferred => Vec::new(),
+        // MLX reads are all-or-nothing at this seam: `Partial` (a candle block-streamed state,
+        // sc-11045 fix round) is never produced here, and would carry no measured rows if it were.
+        LogicalReadMaterialization::Partial | LogicalReadMaterialization::Deferred => Vec::new(),
     };
     Ok(LogicalWeights {
         weights: logical,
@@ -241,6 +243,9 @@ pub fn read_logical_weights(
             source_bytes: plan.source_bytes,
             materialization,
             residency,
+            // MLX serves every quantized row through its dense-side decode as *planned* (the
+            // residency policy is dense-only there), so there is never a packed pricing to demote.
+            demotions: Vec::new(),
         },
     })
 }
