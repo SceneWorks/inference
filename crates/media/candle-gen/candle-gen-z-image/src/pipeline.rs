@@ -74,14 +74,13 @@ use candle_transformers::models::z_image::scheduler::{
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
 use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZImageTextEncoder};
-use candle_transformers::models::z_image::transformer::{
-    Config as DitConfig, ZImageTransformer2DModel,
-};
+use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
 use candle_gen::gen_core::tokenizer::TextTokenizer;
 
 use crate::common::{self, ResizePolicy};
+use crate::dit::ZImageTransformer2DModel as DenseDit;
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
 
@@ -119,14 +118,14 @@ pub(crate) fn packed_config_at(
 pub(crate) enum DiT {
     // Boxed to keep the two arms comparably sized (`large_enum_variant`) — both models are heavy and
     // the enum lives behind an `Arc` regardless.
-    Dense(Box<ZImageTransformer2DModel>),
+    Dense(Box<DenseDit>),
     Packed(Box<PackedDit>),
 }
 
 /// Per-request geometry conditioning. Dense stock models retain their compatibility path; every
 /// vendored packed DiT receives the explicit handle that removes repeated RoPE construction.
 pub(crate) enum PreparedDiT {
-    Dense,
+    Dense(crate::dit::PreparedConditioning),
     Packed(crate::packed_dit::PreparedConditioning),
 }
 
@@ -139,7 +138,9 @@ impl DiT {
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<PreparedDiT> {
         match self {
-            Self::Dense(_) => Ok(PreparedDiT::Dense),
+            Self::Dense(m) => Ok(PreparedDiT::Dense(
+                m.prepare_conditioning(x, cap_feats, cap_mask)?,
+            )),
             Self::Packed(m) => Ok(PreparedDiT::Packed(m.prepare_conditioning(
                 x,
                 cap_feats,
@@ -154,14 +155,16 @@ impl DiT {
         &self,
         x: &Tensor,
         t: &Tensor,
-        cap_feats: &Tensor,
-        cap_mask: &Tensor,
+        _cap_feats: &Tensor,
+        _cap_mask: &Tensor,
         prepared: &PreparedDiT,
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
         match (self, prepared) {
-            (Self::Dense(m), PreparedDiT::Dense) => Ok(m.forward(x, t, cap_feats, cap_mask)?),
+            (Self::Dense(m), PreparedDiT::Dense(prepared)) => {
+                Ok(m.forward_prepared(x, t, prepared)?)
+            }
             (Self::Packed(m), PreparedDiT::Packed(prepared)) => {
                 m.forward_prepared_with_memory(x, t, prepared, attention_plan, transformer_window)
             }
@@ -170,6 +173,7 @@ impl DiT {
             )),
         }
     }
+    #[allow(dead_code)]
     pub(crate) fn forward(
         &self,
         x: &Tensor,
@@ -793,7 +797,7 @@ impl Pipeline {
             DiT::Packed(Box::new(dit))
         } else {
             // Dense tier, no adapters: the stock candle-transformers model (byte-identical fast path).
-            DiT::Dense(Box::new(ZImageTransformer2DModel::new(
+            DiT::Dense(Box::new(DenseDit::new(
                 &dit_cfg,
                 self.component_vb("transformer")?,
             )?))
@@ -1362,6 +1366,7 @@ impl Pipeline {
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
             let image_seq_len =
                 ((lat_h as u32 / PATCH_SIZE) * (lat_w as u32 / PATCH_SIZE)) as usize;
@@ -1453,6 +1458,7 @@ impl Pipeline {
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
             let mut scheduler = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
             scheduler.set_timesteps(steps, None);
@@ -1567,6 +1573,16 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1587,6 +1603,7 @@ impl Pipeline {
         )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -1644,6 +1661,12 @@ impl Pipeline {
             let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
+            let dit_prepared = components.transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
 
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The driver owns the counter,
@@ -1665,7 +1688,15 @@ impl Pipeline {
                     let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                     let velocity = components
                         .transformer
-                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .forward_prepared_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            &dit_prepared,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
+                        )?
                         .neg()?;
                     Ok(velocity)
                 },
@@ -1711,6 +1742,16 @@ impl Pipeline {
         start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let memory = req.memory.unwrap_or_default();
+        let attention_budget = if memory.chunk_attention {
+            CONSTRAINED_ATTN_SCORES_BUDGET
+        } else {
+            candle_gen::ATTN_SCORES_BUDGET
+        };
+        let transformer_window = memory
+            .transformer_window_size
+            .map(|value| value as usize)
+            .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -1743,6 +1784,7 @@ impl Pipeline {
         )?;
 
         candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            candle_gen::check_cancel(&req.cancel)?;
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -1794,6 +1836,21 @@ impl Pipeline {
                 }
                 None => None,
             };
+            let dit_prepared = components.transformer.prepare_conditioning(
+                &prepared.latents,
+                &cap_feats,
+                &cap_mask,
+                request_attention_plan(req, attention_budget),
+            )?;
+            let uncond_prepared = match uncond.as_ref() {
+                Some((features, mask)) => Some(components.transformer.prepare_conditioning(
+                    &prepared.latents,
+                    features,
+                    mask,
+                    request_attention_plan(req, attention_budget),
+                )?),
+                None => None,
+            };
 
             // Per-step latent preview (epic 16948, sc-16957). Built per image: each seed is its own
             // driver call and must start a fresh trajectory at frame 1. The CFG blend happens inside
@@ -1815,19 +1872,40 @@ impl Pipeline {
                     // linear so the result is identical to combining-then-negating.
                     let v_cond = components
                         .transformer
-                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .forward_prepared_with_memory(
+                            latents,
+                            &t_tensor,
+                            &cap_feats,
+                            &cap_mask,
+                            &dit_prepared,
+                            request_attention_plan(req, attention_budget),
+                            transformer_window,
+                        )?
                         .neg()?;
-                    let velocity = match uncond.as_ref() {
-                        Some((neg_feats, neg_mask)) => {
+                    let velocity = match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                        (Some((neg_feats, neg_mask)), Some(neg_prepared)) => {
                             let v_uncond = components
                                 .transformer
-                                .forward(latents, &t_tensor, neg_feats, neg_mask)?
+                                .forward_prepared_with_memory(
+                                    latents,
+                                    &t_tensor,
+                                    neg_feats,
+                                    neg_mask,
+                                    neg_prepared,
+                                    request_attention_plan(req, attention_budget),
+                                    transformer_window,
+                                )?
                                 .neg()?;
                             // v = v_uncond + guidance·(v_cond − v_uncond)
                             let delta = (&v_cond - &v_uncond)?;
                             (v_uncond + (delta * guidance as f64)?)?
                         }
-                        None => v_cond,
+                        (None, None) => v_cond,
+                        _ => {
+                            return Err(CandleError::Msg(
+                                "z-image: CFG conditioning preparation mismatch".into(),
+                            ))
+                        }
                     };
                     Ok(velocity)
                 },

@@ -45,13 +45,12 @@ use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
 };
-use candle_transformers::models::z_image::transformer::{
-    Config as DitConfig, ZImageTransformer2DModel,
-};
+use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
 // Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
 use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
+use crate::dit::ZImageTransformer2DModel;
 use crate::pipeline::{Pipeline, TextEnc};
 
 /// The transformer + latents run bf16 (Z-Image native, the validated candle txt2img dtype); the VAE
@@ -267,10 +266,14 @@ impl ZImageEdit {
         let x_t = ((clean * (1.0 - sigma_start))? + (noise * sigma_start)?)?;
 
         // prepare_inputs pads cap_feats (+ mask) and adds the frame axis → latents (1,16,1,lat_h,lat_w).
+        candle_gen::check_cancel(&req.cancel)?;
         let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
         let cap_feats = prepared.cap_feats;
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
+        let dit_prepared = self
+            .transformer
+            .prepare_conditioning(&latents, &cap_feats, &cap_mask)?;
 
         // Reduced schedule: run steps `start..steps`. Reading scheduler.sigmas/timesteps directly (both
         // pub) and doing the Euler step inline is byte-identical to the txt2img loop's
@@ -300,7 +303,7 @@ impl ZImageEdit {
             // The Z-Image DiT velocity is negated before the flow-match Euler step (the sign convention).
             let velocity = self
                 .transformer
-                .forward(&latents, &t, &cap_feats, &cap_mask)?
+                .forward_prepared(&latents, &t, &dit_prepared)?
                 .neg()?;
             // Euler step: x_{i+1} = x_i + (σ_{i+1} − σ_i)·velocity (= scheduler.step).
             let dt = scheduler.sigmas[step_i + 1] - scheduler.sigmas[step_i];

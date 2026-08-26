@@ -686,6 +686,8 @@ pub struct ZImageTransformer2DModel {
     /// mutex-backed so parallel tests never share recorder state.
     #[cfg(test)]
     streamed_window_trace: std::sync::Mutex<Vec<(usize, usize)>>,
+    #[cfg(test)]
+    prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Request-owned geometry conditioning. RoPE tables and the refined caption stream are independent of
@@ -693,6 +695,7 @@ pub struct ZImageTransformer2DModel {
 pub(crate) struct PreparedConditioning {
     geometry: (usize, usize, usize, usize, usize),
     dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
     orig_size: (usize, usize, usize),
     img_seq_len: usize,
     x_cos: Tensor,
@@ -834,6 +837,8 @@ impl ZImageTransformer2DModel {
             cfg: cfg.clone(),
             #[cfg(test)]
             streamed_window_trace: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            prepare_calls: Default::default(),
         })
     }
 
@@ -1106,6 +1111,9 @@ impl ZImageTransformer2DModel {
         cap_mask: &Tensor,
         attention_plan: AttentionPlan<'_>,
     ) -> candle_gen::Result<PreparedConditioning> {
+        #[cfg(test)]
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
@@ -1148,6 +1156,7 @@ impl ZImageTransformer2DModel {
         Ok(PreparedConditioning {
             geometry: (b, x.dim(1)?, f, h, w),
             dtype: x.dtype(),
+            device: x.device().location(),
             orig_size,
             img_seq_len,
             x_cos,
@@ -1160,6 +1169,12 @@ impl ZImageTransformer2DModel {
         })
     }
 
+    #[cfg(test)]
+    fn prepare_calls(&self) -> usize {
+        self.prepare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn forward_prepared_with_memory(
         &self,
         x: &Tensor,
@@ -1169,7 +1184,10 @@ impl ZImageTransformer2DModel {
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
         let (b, c, f, h, w) = x.dims5()?;
-        if (b, c, f, h, w) != prepared.geometry || x.dtype() != prepared.dtype {
+        if (b, c, f, h, w) != prepared.geometry
+            || x.dtype() != prepared.dtype
+            || x.device().location() != prepared.device
+        {
             return Err(candle_gen::CandleError::Msg(
                 "z-image: prepared conditioning geometry, dtype, or device does not match latent"
                     .into(),
@@ -1525,9 +1543,10 @@ mod parity_tests {
         let mask = Tensor::ones((1, 3), DType::U8, &dev).unwrap();
         let t = Tensor::from_vec(vec![0.5f32], 1, &dev).unwrap();
         let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(1 << 20, false));
-        let prepared = model
+        let mut prepared = model
             .prepare_conditioning(&latent, &cap, &mask, plan)
             .unwrap();
+        assert_eq!(model.prepare_calls(), 1);
         let a = model
             .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
             .unwrap();
@@ -1543,9 +1562,22 @@ mod parity_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff <= f32::EPSILON, "prepared forwards diverged by {diff}");
+        assert_eq!(
+            model.prepare_calls(),
+            1,
+            "actual packed forwards must not reconstruct request conditioning"
+        );
         let stale = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 6, 4), &dev).unwrap();
         assert!(model
             .forward_prepared_with_memory(&stale, &t, &prepared, plan, cfg.n_layers)
+            .is_err());
+        let wrong_dtype = latent.to_dtype(DType::F64).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(&wrong_dtype, &t, &prepared, plan, cfg.n_layers)
+            .is_err());
+        prepared.device = candle_gen::candle_core::DeviceLocation::Cuda { gpu_id: 9 };
+        assert!(model
+            .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
             .is_err());
     }
 

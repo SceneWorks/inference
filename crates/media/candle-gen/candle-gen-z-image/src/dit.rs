@@ -406,6 +406,8 @@ pub struct ZImageTransformer2DModel {
     pub(crate) layers: Vec<ZImageTransformerBlock>,
     pub(crate) rope_embedder: RopeEmbedder,
     pub(crate) cfg: Config,
+    #[cfg(test)]
+    prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The constant side tensors the **main** transformer layers and the final layer consume, produced
@@ -423,6 +425,22 @@ pub struct MainContext {
     unified_attn_mask: Tensor,
     img_seq_len: usize,
     orig_size: (usize, usize, usize),
+}
+
+/// Request-owned geometry and caption conditioning for dense/vendored Z-Image inference.
+pub(crate) struct PreparedConditioning {
+    geometry: (usize, usize, usize, usize, usize),
+    dtype: DType,
+    device: candle_core::DeviceLocation,
+    orig_size: (usize, usize, usize),
+    img_seq_len: usize,
+    x_cos: Tensor,
+    x_sin: Tensor,
+    x_attn_mask: Tensor,
+    cap: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
 }
 
 impl ZImageTransformer2DModel {
@@ -505,7 +523,114 @@ impl ZImageTransformer2DModel {
             layers,
             rope_embedder,
             cfg: cfg.clone(),
+            #[cfg(test)]
+            prepare_calls: Default::default(),
         })
+    }
+
+    pub(crate) fn prepare_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> Result<PreparedConditioning> {
+        #[cfg(test)]
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let device = x.device();
+        let (b, c, f, h, w) = x.dims5()?;
+        let patch_size = self.cfg.all_patch_size[0];
+        let f_patch_size = self.cfg.all_f_patch_size[0];
+        let (_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let img_seq_len = (f / f_patch_size) * (h / patch_size) * (w / patch_size);
+        let text_len = cap_feats.dim(1)?;
+        let x_pos_ids = create_coordinate_grid(
+            (f / f_patch_size, h / patch_size, w / patch_size),
+            (text_len + 1, 0, 0),
+            device,
+        )?;
+        let (x_cos, x_sin) = self.rope_embedder.forward(&x_pos_ids)?;
+        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let (cap_cos, cap_sin) = self.rope_embedder.forward(&cap_pos_ids)?;
+        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
+        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+        let cap_normed = self.cap_embedder_norm.forward_diff(cap_feats)?;
+        let mut cap = cap_normed.apply(&self.cap_embedder_linear)?;
+        for layer in &self.context_refiner {
+            cap = layer.forward(&cap, Some(&cap_attn_mask), &cap_cos, &cap_sin, None)?;
+        }
+        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
+        let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
+        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        Ok(PreparedConditioning {
+            geometry: (b, c, f, h, w),
+            dtype: x.dtype(),
+            device: device.location(),
+            orig_size,
+            img_seq_len,
+            x_cos,
+            x_sin,
+            x_attn_mask,
+            cap,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
+        })
+    }
+
+    pub(crate) fn forward_prepared(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+    ) -> Result<Tensor> {
+        let geometry = x.dims5()?;
+        if geometry != prepared.geometry
+            || x.dtype() != prepared.dtype
+            || x.device().location() != prepared.device
+        {
+            candle_core::bail!(
+                "z-image: prepared conditioning geometry, dtype, or device does not match latent"
+            )
+        }
+        let t_scaled = (t * self.cfg.t_scale)?;
+        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+        let (x_patches, _) = patchify(x, self.cfg.all_patch_size[0], self.cfg.all_f_patch_size[0])?;
+        let mut x = x_patches.apply(&self.x_embedder)?;
+        for layer in &self.noise_refiner {
+            x = layer.forward(
+                &x,
+                Some(&prepared.x_attn_mask),
+                &prepared.x_cos,
+                &prepared.x_sin,
+                Some(&adaln_input),
+            )?;
+        }
+        let mut unified = Tensor::cat(&[&x, &prepared.cap], 1)?;
+        for layer in &self.layers {
+            unified = layer.forward(
+                &unified,
+                Some(&prepared.unified_attn_mask),
+                &prepared.unified_cos,
+                &prepared.unified_sin,
+                Some(&adaln_input),
+            )?;
+        }
+        let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
+        let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
+        unpatchify(
+            &x_out,
+            prepared.orig_size,
+            self.cfg.all_patch_size[0],
+            self.cfg.all_f_patch_size[0],
+            self.cfg.in_channels,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_calls(&self) -> usize {
+        self.prepare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Forward pass — returns the **raw** DiT velocity `(B, C, F, H, W)` (no sign flip; the inference
@@ -753,6 +878,47 @@ mod parity_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-5, "vendored DiT diverged from stock by {diff}");
+    }
+
+    #[test]
+    fn prepared_dense_conditioning_is_reused_by_actual_forwards_and_rejects_stale_keys() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let model =
+            ZImageTransformer2DModel::new(&cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))
+                .unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let inputs = prepare_inputs(&latent, std::slice::from_ref(&cap), &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let mut prepared = model
+            .prepare_conditioning(&inputs.latents, &inputs.cap_feats, &inputs.cap_mask)
+            .unwrap();
+        assert_eq!(model.prepare_calls(), 1);
+        let first = model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .unwrap();
+        let second = model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .unwrap();
+        assert_eq!(
+            first.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            model.prepare_calls(),
+            1,
+            "actual forwards must not reconstruct request conditioning"
+        );
+        let stale = Tensor::zeros((1, cfg.in_channels, 1, 6, 4), DType::F32, &dev).unwrap();
+        assert!(model.forward_prepared(&stale, &t, &prepared).is_err());
+        let wrong_dtype = inputs.latents.to_dtype(DType::F64).unwrap();
+        assert!(model.forward_prepared(&wrong_dtype, &t, &prepared).is_err());
+        prepared.device = candle_core::DeviceLocation::Metal { gpu_id: 5 };
+        assert!(model
+            .forward_prepared(&inputs.latents, &t, &prepared)
+            .is_err());
     }
 
     /// The [`LoraHost`] walk reaches exactly `4 × (n_refiner·2 + n_layers)` projections — the four

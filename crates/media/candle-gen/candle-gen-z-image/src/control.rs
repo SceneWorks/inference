@@ -229,6 +229,24 @@ struct ZImageControlTransformer {
     control_x_embedder: Linear,
     control_layers: ControlLayers,
     control_noise_refiner: Vec<ZImageControlBlock>,
+    #[cfg(test)]
+    prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PreparedControlConditioning {
+    geometry: (usize, usize, usize, usize, usize),
+    dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
+    orig_size: (usize, usize, usize),
+    img_seq_len: usize,
+    x_cos: Tensor,
+    x_sin: Tensor,
+    x_attn_mask: Tensor,
+    control: Tensor,
+    cap: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
 }
 
 enum ControlLayers {
@@ -285,6 +303,8 @@ impl ZImageControlTransformer {
             control_x_embedder,
             control_layers,
             control_noise_refiner,
+            #[cfg(test)]
+            prepare_calls: Default::default(),
         })
     }
 
@@ -398,12 +418,80 @@ impl ZImageControlTransformer {
         Ok((hints, c))
     }
 
-    /// Dual-injection control forward — re-walks the base DiT's embed → refiner → main phases (the
-    /// vendored [`ZImageTransformer2DModel`] internals) while interleaving the parallel control stack
-    /// and adding its scaled hints. Returns the **raw** velocity `(B, C, F, H, W)` (the caller negates,
-    /// the Z-Image sign convention). `control_context`: the `(B, 33, F, H/8, W/8)` VAE-encoded control;
-    /// `scale`: `control_scale`.
     #[allow(clippy::too_many_arguments)]
+    fn prepare_control_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        control_context: &Tensor,
+        memory: GenerationMemory,
+        cancel: &CancelFlag,
+    ) -> Result<PreparedControlConditioning> {
+        #[cfg(test)]
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        candle_gen::check_cancel(cancel)?;
+        let cfg = self.base.control_config();
+        let device = x.device();
+        let (b, c, f, h, w) = x.dims5()?;
+        let patch_size = cfg.all_patch_size[0];
+        let f_patch_size = cfg.all_f_patch_size[0];
+        let attention_budget = if memory.chunk_attention {
+            crate::memory_strategy::ATTENTION_CHUNK_SIZE as u64
+        } else {
+            u64::MAX
+        };
+        let attention_plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(
+            attention_budget,
+            false,
+        ))
+        .with_cancel(cancel);
+        let (_x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let img_seq_len = (f / f_patch_size) * (h / patch_size) * (w / patch_size);
+        let text_len = cap_feats.dim(1)?;
+        let x_pos_ids = create_coordinate_grid(
+            (f / f_patch_size, h / patch_size, w / patch_size),
+            (text_len + 1, 0, 0),
+            device,
+        )?;
+        let (x_cos, x_sin) = self.base.control_rope(&x_pos_ids)?;
+        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
+        let (c_patches, _) = patchify(control_context, patch_size, f_patch_size)?;
+        let control = c_patches.apply(&self.control_x_embedder)?;
+        let mut cap = self.base.control_embed_caption(cap_feats)?;
+        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
+        let (cap_cos, cap_sin) = self.base.control_rope(&cap_pos_ids)?;
+        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
+        cap = self.base.control_refine_context(
+            cap,
+            &cap_attn_mask,
+            &cap_cos,
+            &cap_sin,
+            attention_plan,
+        )?;
+        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
+        let (unified_cos, unified_sin) = self.base.control_rope(&unified_pos_ids)?;
+        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        Ok(PreparedControlConditioning {
+            geometry: (b, c, f, h, w),
+            dtype: x.dtype(),
+            device: device.location(),
+            orig_size,
+            img_seq_len,
+            x_cos,
+            x_sin,
+            x_attn_mask,
+            control,
+            cap,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn forward_control(
         &self,
         x: &Tensor,
@@ -415,10 +503,44 @@ impl ZImageControlTransformer {
         memory: GenerationMemory,
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
+        let prepared = self.prepare_control_conditioning(
+            x,
+            cap_feats,
+            cap_mask,
+            control_context,
+            memory,
+            cancel,
+        )?;
+        self.forward_control_prepared(x, t, &prepared, scale, memory, cancel)
+    }
+
+    /// Dual-injection control forward — re-walks the base DiT's embed → refiner → main phases (the
+    /// vendored [`ZImageTransformer2DModel`] internals) while interleaving the parallel control stack
+    /// and adding its scaled hints. Returns the **raw** velocity `(B, C, F, H, W)` (the caller negates,
+    /// the Z-Image sign convention). `control_context`: the `(B, 33, F, H/8, W/8)` VAE-encoded control;
+    /// `scale`: `control_scale`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_control_prepared(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedControlConditioning,
+        scale: f64,
+        memory: GenerationMemory,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
         let base = &self.base;
         let cfg = base.control_config();
-        let device = x.device();
-        let (b, _c, f, h, w) = x.dims5()?;
+        let geometry = x.dims5()?;
+        if geometry != prepared.geometry
+            || x.dtype() != prepared.dtype
+            || x.device().location() != prepared.device
+        {
+            return Err(CandleError::Msg(
+                "z-image control: prepared conditioning geometry, dtype, or device does not match latent"
+                    .into(),
+            ));
+        }
         let patch_size = cfg.all_patch_size[0];
         let f_patch_size = cfg.all_f_patch_size[0];
         let attention_budget = if memory.chunk_attention {
@@ -441,32 +563,17 @@ impl ZImageControlTransformer {
         let adaln = base.control_timestep_embedding(&t_scaled)?;
 
         // 2. Patchify + embed the image latent.
-        let (x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let (x_patches, _) = patchify(x, patch_size, f_patch_size)?;
         let mut x_emb = base.control_embed_image(&x_patches)?;
-        let img_seq_len = x_emb.dim(1)?;
-
-        // 3. Image position ids (offset past the caption block) + RoPE + an all-valid image mask.
-        let f_tokens = f / f_patch_size;
-        let h_tokens = h / patch_size;
-        let w_tokens = w / patch_size;
-        let text_len = cap_feats.dim(1)?;
-        let x_pos_ids =
-            create_coordinate_grid((f_tokens, h_tokens, w_tokens), (text_len + 1, 0, 0), device)?;
-        let (x_cos, x_sin) = base.control_rope(&x_pos_ids)?;
-        let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
-
-        // 4. Embed the control context (same patchify geometry as the image → aligns 1:1).
-        let (c_patches, _) = patchify(control_context, patch_size, f_patch_size)?;
-        let c_emb = c_patches.apply(&self.control_x_embedder)?;
 
         // 5. Control refiner: seed + thread through the 2 control refiner blocks (image-length stage).
         let (refiner_hints, threaded) = self.run_control_blocks(
             &self.control_noise_refiner,
-            c_emb,
+            prepared.control.clone(),
             &x_emb,
-            &x_attn_mask,
-            &x_cos,
-            &x_sin,
+            &prepared.x_attn_mask,
+            &prepared.x_cos,
+            &prepared.x_sin,
             &adaln,
             attention_plan,
         )?;
@@ -474,9 +581,9 @@ impl ZImageControlTransformer {
         // 6. Base noise refiner, injecting the control refiner hints.
         x_emb = base.control_refine_noise(
             x_emb,
-            &x_attn_mask,
-            &x_cos,
-            &x_sin,
+            &prepared.x_attn_mask,
+            &prepared.x_cos,
+            &prepared.x_sin,
             &adaln,
             attention_plan,
             |i, hidden| match hint_index(&CONTROL_REFINER_PLACES, i) {
@@ -485,34 +592,18 @@ impl ZImageControlTransformer {
             },
         )?;
 
-        // 7. Caption stream: RMSNorm → linear → context refiner.
-        let mut cap_emb = base.control_embed_caption(cap_feats)?;
-        let cap_pos_ids = create_coordinate_grid((text_len, 1, 1), (1, 0, 0), device)?;
-        let (cap_cos, cap_sin) = base.control_rope(&cap_pos_ids)?;
-        let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-        cap_emb = base.control_refine_context(
-            cap_emb,
-            &cap_attn_mask,
-            &cap_cos,
-            &cap_sin,
-            attention_plan,
-        )?;
-
         // 8. Unify [image, caption].
-        let mut unified = Tensor::cat(&[&x_emb, &cap_emb], 1)?;
-        let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
-        let (unified_cos, unified_sin) = base.control_rope(&unified_pos_ids)?;
-        let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
+        let mut unified = Tensor::cat(&[&x_emb, &prepared.cap], 1)?;
 
         // 9. Main control pass: thread the (refined) control state + caption through the 15 control
         // layers → the per-block hints for the unified main loop.
-        let control_unified = Tensor::cat(&[&threaded, &cap_emb], 1)?;
+        let control_unified = Tensor::cat(&[&threaded, &prepared.cap], 1)?;
         let (main_hints, _) = self.run_control_main(
             control_unified,
             &unified,
-            &unified_attn_mask,
-            &unified_cos,
-            &unified_sin,
+            &prepared.unified_attn_mask,
+            &prepared.unified_cos,
+            &prepared.unified_sin,
             &adaln,
             attention_plan,
             transformer_window,
@@ -522,9 +613,9 @@ impl ZImageControlTransformer {
         // 10. Base main layers, injecting the control hints at CONTROL_LAYERS_PLACES.
         unified = base.control_run_layers(
             unified,
-            &unified_attn_mask,
-            &unified_cos,
-            &unified_sin,
+            &prepared.unified_attn_mask,
+            &prepared.unified_cos,
+            &prepared.unified_sin,
             &adaln,
             attention_plan,
             transformer_window,
@@ -535,15 +626,21 @@ impl ZImageControlTransformer {
         )?;
 
         // 11. Head: image tokens → final AdaLN layer → unpatchify to the raw velocity.
-        let x_out = unified.narrow(1, 0, img_seq_len)?;
+        let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
         let x_out = base.control_finish(&x_out, &adaln)?;
         Ok(unpatchify(
             &x_out,
-            orig_size,
+            prepared.orig_size,
             patch_size,
             f_patch_size,
             cfg.in_channels,
         )?)
+    }
+
+    #[cfg(test)]
+    fn prepare_calls(&self) -> usize {
+        self.prepare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -867,6 +964,14 @@ impl ZImageControl {
         scheduler.set_timesteps(steps, Some(mu));
         let prepared = prepare_inputs(&noise, std::slice::from_ref(cap), &self.device)?;
         let mut latents = prepared.latents;
+        let dit_prepared = transformer.prepare_control_conditioning(
+            &latents,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+            control_context,
+            req.memory,
+            &req.cancel,
+        )?;
         // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
         // against the shared step-keyed counter — over the same `steps` it reports as `Progress::Step
         // { total }`, so the preview and the progress bar cannot disagree. Emitted at the TOP of the
@@ -884,12 +989,10 @@ impl ZImageControl {
                 &self.device,
             )?;
             let velocity = transformer
-                .forward_control(
+                .forward_control_prepared(
                     &latents,
                     &t,
-                    &prepared.cap_feats,
-                    &prepared.cap_mask,
-                    control_context,
+                    &dit_prepared,
                     req.control_scale as f64,
                     req.memory,
                     &req.cancel,
@@ -934,6 +1037,25 @@ impl ZImageControl {
             }
             None => None,
         };
+        let dit_prepared = transformer.prepare_control_conditioning(
+            &prepared.latents,
+            &prepared.cap_feats,
+            &prepared.cap_mask,
+            control_context,
+            req.memory,
+            &req.cancel,
+        )?;
+        let uncond_prepared = match uncond.as_ref() {
+            Some((features, mask)) => Some(transformer.prepare_control_conditioning(
+                &prepared.latents,
+                features,
+                mask,
+                control_context,
+                req.memory,
+                &req.cancel,
+            )?),
+            None => None,
+        };
         let guidance = req.guidance.unwrap_or(BASE_DEFAULT_GUIDANCE);
         // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant control
         // context both live inside the predict closure below, so the hook only ever sees the single
@@ -951,26 +1073,22 @@ impl ZImageControl {
             |latents, timestep| {
                 let t = Tensor::from_vec(vec![timestep], (1,), &self.device)?;
                 let conditional = transformer
-                    .forward_control(
+                    .forward_control_prepared(
                         latents,
                         &t,
-                        &prepared.cap_feats,
-                        &prepared.cap_mask,
-                        control_context,
+                        &dit_prepared,
                         req.control_scale as f64,
                         req.memory,
                         &req.cancel,
                     )?
                     .neg()?;
-                match uncond.as_ref() {
-                    Some((features, mask)) => {
+                match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                    (Some((_features, _mask)), Some(uncond_prepared)) => {
                         let unconditional = transformer
-                            .forward_control(
+                            .forward_control_prepared(
                                 latents,
                                 &t,
-                                features,
-                                mask,
-                                control_context,
+                                uncond_prepared,
                                 req.control_scale as f64,
                                 req.memory,
                                 &req.cancel,
@@ -979,7 +1097,10 @@ impl ZImageControl {
                         let delta = (&conditional - &unconditional)?;
                         Ok((unconditional + (delta * guidance as f64)?)?)
                     }
-                    None => Ok(conditional),
+                    (None, None) => Ok(conditional),
+                    _ => Err(CandleError::Msg(
+                        "z-image control: CFG conditioning preparation mismatch".into(),
+                    )),
                 }
             },
         )
@@ -1150,6 +1271,15 @@ impl ZImageControl {
         let cap_mask = prepared.cap_mask;
         let mut latents = prepared.latents;
         let scale = req.control_scale as f64;
+        let transformer = self.resident_transformer()?;
+        let dit_prepared = transformer.prepare_control_conditioning(
+            &latents,
+            &cap_feats,
+            &cap_mask,
+            &control_context,
+            req.memory,
+            &req.cancel,
+        )?;
 
         // Per-step latent preview (epic 16948, sc-16957). A bespoke loop, so it numbers its own frames
         // against the shared step-keyed counter — over the same `steps` it reports as `Progress::Step
@@ -1167,14 +1297,11 @@ impl ZImageControl {
             let t_norm = scheduler.current_timestep_normalized();
             let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
             // Dual-injection control forward; the velocity is negated (Z-Image sign convention).
-            let velocity = self
-                .resident_transformer()?
-                .forward_control(
+            let velocity = transformer
+                .forward_control_prepared(
                     &latents,
                     &t,
-                    &cap_feats,
-                    &cap_mask,
-                    &control_context,
+                    &dit_prepared,
                     scale,
                     req.memory,
                     &req.cancel,
@@ -1265,6 +1392,26 @@ impl ZImageControl {
             }
             None => None,
         };
+        let transformer = self.resident_transformer()?;
+        let dit_prepared = transformer.prepare_control_conditioning(
+            &prepared.latents,
+            &cap_feats,
+            &cap_mask,
+            &control_context,
+            req.memory,
+            &req.cancel,
+        )?;
+        let uncond_prepared = match uncond.as_ref() {
+            Some((features, mask)) => Some(transformer.prepare_control_conditioning(
+                &prepared.latents,
+                features,
+                mask,
+                &control_context,
+                req.memory,
+                &req.cancel,
+            )?),
+            None => None,
+        };
 
         // Per-step latent preview (epic 16948, sc-16957). The CFG blend and the constant 33-channel
         // control context both live inside the predict closure below, so the hook only ever sees the
@@ -1283,31 +1430,25 @@ impl ZImageControl {
                 let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
                 // Conditional velocity (Z-Image sign convention: the DiT output is negated before the
                 // flow-match step). The control context + scale thread through this forward.
-                let v_cond = self
-                    .resident_transformer()?
-                    .forward_control(
+                let v_cond = transformer
+                    .forward_control_prepared(
                         latents,
                         &t_tensor,
-                        &cap_feats,
-                        &cap_mask,
-                        &control_context,
+                        &dit_prepared,
                         scale,
                         req.memory,
                         &req.cancel,
                     )?
                     .neg()?;
-                let velocity = match uncond.as_ref() {
-                    Some((neg_feats, neg_mask)) => {
+                let velocity = match (uncond.as_ref(), uncond_prepared.as_ref()) {
+                    (Some((_neg_feats, _neg_mask)), Some(uncond_prepared)) => {
                         // The uncond branch threads the SAME constant control context + scale (residuals
                         // inject identically on both passes — the MLX base control loop's behaviour).
-                        let v_uncond = self
-                            .resident_transformer()?
-                            .forward_control(
+                        let v_uncond = transformer
+                            .forward_control_prepared(
                                 latents,
                                 &t_tensor,
-                                neg_feats,
-                                neg_mask,
-                                &control_context,
+                                uncond_prepared,
                                 scale,
                                 req.memory,
                                 &req.cancel,
@@ -1318,7 +1459,12 @@ impl ZImageControl {
                         let delta = (&v_cond - &v_uncond)?;
                         (v_uncond + (delta * guidance as f64)?)?
                     }
-                    None => v_cond,
+                    (None, None) => v_cond,
+                    _ => {
+                        return Err(CandleError::Msg(
+                            "z-image control: CFG conditioning preparation mismatch".into(),
+                        ))
+                    }
                 };
                 Ok(velocity)
             },
@@ -1544,6 +1690,67 @@ fn control_file_score(path: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_control_conditioning_is_reused_by_actual_cfg_capable_forward() {
+        use candle_gen::candle_nn::VarMap;
+
+        let dev = Device::Cpu;
+        let mut cfg = DitConfig::z_image_turbo();
+        cfg.dim = 128;
+        cfg.n_heads = 1;
+        cfg.n_kv_heads = 1;
+        cfg.n_layers = 2;
+        cfg.n_refiner_layers = 2;
+        cfg.cap_feat_dim = 64;
+        cfg.use_accelerated_attn = false;
+        let base_vars = VarMap::new();
+        let base =
+            PackedTransformer::new(&cfg, VarBuilder::from_varmap(&base_vars, DType::F32, &dev))
+                .unwrap();
+        let control_vars = VarMap::new();
+        let transformer = ZImageControlTransformer::from_weights(
+            base,
+            &cfg,
+            VarBuilder::from_varmap(&control_vars, DType::F32, &dev),
+            false,
+        )
+        .unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 4, 4), &dev).unwrap();
+        let control = Tensor::randn(0f32, 1f32, (1, CONTROL_IN_DIM, 1, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (1, 3, cfg.cap_feat_dim), &dev).unwrap();
+        let mask = Tensor::ones((1, 3), DType::U8, &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], (1,), &dev).unwrap();
+        let memory = GenerationMemory::default();
+        let cancel = CancelFlag::default();
+        let mut prepared = transformer
+            .prepare_control_conditioning(&latent, &cap, &mask, &control, memory, &cancel)
+            .unwrap();
+        assert_eq!(transformer.prepare_calls(), 1);
+        let first = transformer
+            .forward_control_prepared(&latent, &t, &prepared, 0.7, memory, &cancel)
+            .unwrap();
+        let second = transformer
+            .forward_control_prepared(&latent, &t, &prepared, 0.7, memory, &cancel)
+            .unwrap();
+        assert_eq!(
+            first.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            second.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        assert_eq!(
+            transformer.prepare_calls(),
+            1,
+            "control forwards must not reconstruct request conditioning"
+        );
+        let stale = Tensor::zeros((1, cfg.in_channels, 1, 6, 4), DType::F32, &dev).unwrap();
+        assert!(transformer
+            .forward_control_prepared(&stale, &t, &prepared, 0.7, memory, &cancel)
+            .is_err());
+        prepared.device = candle_gen::candle_core::DeviceLocation::Metal { gpu_id: 2 };
+        assert!(transformer
+            .forward_control_prepared(&latent, &t, &prepared, 0.7, memory, &cancel)
+            .is_err());
+    }
 
     fn valid_encoder() -> tempfile::TempDir {
         let encoder = tempfile::tempdir().unwrap();
