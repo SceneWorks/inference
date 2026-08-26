@@ -141,6 +141,12 @@ pub const AUDIO_LATENTS_PER_SECOND: f64 = 25.0;
 
 /// Python `round()` (round-half-to-even) — matches `compute_audio_frames`'s `round(...)`.
 fn py_round(x: f64) -> i64 {
+    // Request validation rejects zero fps before the render path derives duration. Keep this helper
+    // fail-closed for direct/internal callers too: casting an infinite or NaN duration to an integer
+    // would otherwise produce a platform-dependent saturated frame count.
+    if !x.is_finite() {
+        return 0;
+    }
     let f = x.floor();
     let diff = x - f;
     if diff < 0.5 {
@@ -286,5 +292,12 @@ mod tests {
         assert_eq!(compute_audio_frames(1, 24.0), 1);
         // 121f@24fps: 121/24·25 = 126.04 → 126.
         assert_eq!(compute_audio_frames(121, 24.0), 126);
+    }
+
+    #[test]
+    fn compute_audio_frames_rejects_non_finite_duration_mutations() {
+        for fps in [0.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(compute_audio_frames(33, fps), 0, "fps={fps:?}");
+        }
     }
 }

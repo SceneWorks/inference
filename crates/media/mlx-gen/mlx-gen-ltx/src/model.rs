@@ -2004,6 +2004,18 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &base).is_ok());
+        let zero_fps = validate_request(
+            &caps,
+            &GenerationRequest {
+                fps: Some(0),
+                ..base.clone()
+            },
+        )
+        .expect_err("plain MLX LTX validation must reject zero fps before position/audio math");
+        assert!(matches!(zero_fps, Error::Msg(_)), "got: {zero_fps:?}");
+        assert!(zero_fps
+            .to_string()
+            .contains("fps must be greater than zero"));
         assert!(validate_request(
             &caps,
             &GenerationRequest {

@@ -1966,6 +1966,21 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&ok).is_ok());
+        let zero_fps = g
+            .validate(&GenerationRequest {
+                fps: Some(0),
+                ..ok.clone()
+            })
+            .expect_err(
+                "plain Candle LTX validation must reject zero fps before position/audio math",
+            );
+        assert!(
+            matches!(zero_fps, gen_core::Error::Msg(_)),
+            "got: {zero_fps:?}"
+        );
+        assert!(zero_fps
+            .to_string()
+            .contains("fps must be greater than zero"));
         for bad in [
             GenerationRequest::default(),
             GenerationRequest {
