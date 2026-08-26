@@ -24,6 +24,9 @@ use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::quant::Nvfp4Context;
 use candle_gen::BlockPlan;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::Krea2Config;
 use crate::loader::{linear_detect, linear_detect_planned, Weights};
 use crate::nvfp4_dit::{DitPlan, Nvfp4Report};
@@ -64,6 +67,40 @@ pub struct Krea2Transformer {
     /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
     /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
     rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
+}
+
+/// Request-owned conditioning that is invariant throughout a Krea denoise trajectory.  The text
+/// fusion/projection and joint RoPE only depend on the admitted context and target geometry; keeping
+/// them here prevents every Euler step (and every image in a batched request) from rebuilding them.
+///
+/// The latent itself deliberately remains outside this value: its image tokens and timestep modulation
+/// change at every step.  `forward_prepared*` validates that those changing inputs still match the
+/// request geometry that admitted this state before doing any denoise work.
+pub(crate) struct PreparedConditioning {
+    context: Tensor,
+    cap_len: usize,
+    ht: usize,
+    wt: usize,
+    img_len: usize,
+    latent_ch: usize,
+    dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
+    rcos: Tensor,
+    rsin: Tensor,
+    refs: Vec<Tensor>,
+}
+
+#[cfg(test)]
+static PREPARED_CONDITIONING_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn prepared_conditioning_builds() -> usize {
+    PREPARED_CONDITIONING_BUILDS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prepared_conditioning_builds() {
+    PREPARED_CONDITIONING_BUILDS.store(0, Ordering::Relaxed);
 }
 
 /// Trunk-block residency. The normal path keeps every block resident. The constrained-card path
@@ -556,14 +593,109 @@ impl Krea2Transformer {
         )?)
     }
 
-    /// The shared timestep + text front-end (sc-10877): the sinusoidal timestep embed `t`, the shared
-    /// modulation `tvec = time_mod_proj(GELU(t))`, and the projected text context `ctx`
-    /// `[b, cap, hidden]`. Both [`forward`](Self::forward) (t2i) and [`forward_edit`](Self::forward_edit)
-    /// call this, so the t2i front-end stays byte-identical.
-    fn front_end(&self, timestep: &Tensor, context: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    /// Build request-owned t2i conditioning. This is intentionally separate from the denoise forward:
+    /// text fusion and RoPE are invariant for every step and seed at one request geometry.
+    pub(crate) fn prepare_conditioning(
+        &self,
+        context: &Tensor,
+        width: u32,
+        height: u32,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        self.prepare_conditioning_with_refs(context, &[], width, height)
+    }
+
+    /// Edit twin of [`Self::prepare_conditioning`]. Reference image tokens are patch-embedded once and
+    /// retained alongside the text prep; each reference must already be encoded at the target geometry.
+    pub(crate) fn prepare_edit_conditioning(
+        &self,
+        context: &Tensor,
+        refs: &[Tensor],
+        width: u32,
+        height: u32,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        self.prepare_conditioning_with_refs(context, refs, width, height)
+    }
+
+    fn prepare_conditioning_with_refs(
+        &self,
+        context: &Tensor,
+        refs: &[Tensor],
+        width: u32,
+        height: u32,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        if width == 0
+            || height == 0
+            || !(width as usize).is_multiple_of(self.cfg.patch_size * 8)
+            || !(height as usize).is_multiple_of(self.cfg.patch_size * 8)
+        {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "krea: prepared conditioning requires a {}-aligned non-zero render geometry, got {width}x{height}",
+                self.cfg.patch_size * 8
+            )));
+        }
+        let ht = height as usize / (self.cfg.patch_size * 8);
+        let wt = width as usize / (self.cfg.patch_size * 8);
+        let cap_len = context.dim(1)?;
+        let context = context.to_dtype(self.dtype)?;
+        let context = self.text_fusion.forward(&context)?;
+        let context = self.txt_in_norm.forward(&context)?;
+        let context = self
+            .txt_in_l2
+            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)?;
+        let mut ref_tokens = Vec::with_capacity(refs.len());
+        for (index, reference) in refs.iter().enumerate() {
+            let (_, _, h, w) = reference.dims4()?;
+            if (h, w) != (ht * self.cfg.patch_size, wt * self.cfg.patch_size) {
+                return Err(candle_gen::CandleError::Msg(format!(
+                    "krea: prepared edit reference {index} is {h}x{w} latent cells, expected {}x{}",
+                    ht * self.cfg.patch_size,
+                    wt * self.cfg.patch_size,
+                )));
+            }
+            ref_tokens.push(self.embed_image(reference)?);
+        }
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, refs.len())?;
+        #[cfg(test)]
+        PREPARED_CONDITIONING_BUILDS.fetch_add(1, Ordering::Relaxed);
+        Ok(PreparedConditioning {
+            context,
+            cap_len,
+            ht,
+            wt,
+            img_len: ht * wt,
+            latent_ch: self.cfg.in_channels / (self.cfg.patch_size * self.cfg.patch_size),
+            dtype: self.dtype,
+            device: self.device.location(),
+            rcos,
+            rsin,
+            refs: ref_tokens,
+        })
+    }
+
+    fn validate_prepared(
+        &self,
+        latent: &Tensor,
+        prepared: &PreparedConditioning,
+    ) -> candle_gen::Result<()> {
+        let (_, channels, h, w) = latent.dims4()?;
+        let matches = channels == prepared.latent_ch
+            && (h / self.cfg.patch_size, w / self.cfg.patch_size) == (prepared.ht, prepared.wt)
+            && h % self.cfg.patch_size == 0
+            && w % self.cfg.patch_size == 0
+            && latent.dtype() == prepared.dtype
+            && latent.device().location() == prepared.device;
+        if !matches {
+            return Err(candle_gen::CandleError::Msg(
+                "krea: prepared conditioning request identity, geometry, dtype, or device does not match latent".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The changing timestep front-end. The text side was already prepared once for this request.
+    fn prepared_time_front_end(&self, timestep: &Tensor) -> Result<(Tensor, Tensor)> {
         let cfg = &self.cfg;
         let dt = self.dtype;
-        let context = context.to_dtype(dt)?;
 
         // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
         let t_sin = temb(timestep, cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?; // [b, 1, tdim]
@@ -571,14 +703,7 @@ impl Krea2Transformer {
             .time_embed_l2
             .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?; // [b, 1, hidden]
         let tvec = self.time_mod_proj.forward(&t.gelu()?)?; // [b, 1, 6·hidden]
-
-        // Text fusion (12 layers → 1) then the text input projection.
-        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
-        let ctx = self.txt_in_norm.forward(&ctx)?;
-        let ctx = self
-            .txt_in_l2
-            .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?; // [b, cap, hidden]
-        Ok((t, tvec, ctx))
+        Ok((t, tvec))
     }
 
     /// Velocity prediction.
@@ -621,24 +746,40 @@ impl Krea2Transformer {
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        let (_, _, h, w) = latent.dims4()?;
+        let prepared = self.prepare_conditioning(context, (w * 8) as u32, (h * 8) as u32)?;
+        self.forward_prepared_with_memory(
+            latent,
+            timestep,
+            &prepared,
+            attention_scores_budget,
+            transformer_window,
+            cancel,
+        )
+    }
+
+    /// Denoise from request-owned text conditioning. This is the production count/step-loop seam;
+    /// callers build [`PreparedConditioning`] once and reuse it for every seed and Euler step.
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedConditioning,
+        attention_scores_budget: usize,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.validate_prepared(latent, prepared)?;
         let cfg = &self.cfg;
         let p = cfg.patch_size;
-        let (_, _, h, w) = latent.dims4()?;
-        let (ht, wt) = (h / p, w / p);
-        let img_len = ht * wt;
-        let latent_ch = cfg.in_channels / (p * p);
-        let cap_len = context.dim(1)?;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
 
-        // Image patch embed + shared timestep/text front-end.
+        // Image patch embed + changing timestep front-end; text projection/RoPE are request-owned.
         let img = self.embed_image(latent)?; // [b, img_len, hidden]
-        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+        let (t, tvec) = self.prepared_time_front_end(timestep)?;
 
         // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
-        let mut combined = Tensor::cat(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
-
-        // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
-        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, 0)?;
+        let mut combined = Tensor::cat(&[&prepared.context, &img], 1)?; // [b, cap+img_len, hidden]
         match &self.blocks {
             TransformerBlocks::Resident(blocks) => {
                 for blk in blocks {
@@ -646,8 +787,8 @@ impl Krea2Transformer {
                     combined = blk.forward_with_attention_plan(
                         &combined,
                         &tvec,
-                        &rcos,
-                        &rsin,
+                        &prepared.rcos,
+                        &prepared.rsin,
                         attention_plan,
                     )?;
                 }
@@ -688,8 +829,8 @@ impl Krea2Transformer {
                             state = block.forward_with_attention_plan(
                                 &state,
                                 &tvec,
-                                &rcos,
-                                &rsin,
+                                &prepared.rcos,
+                                &prepared.rsin,
                                 attention_plan,
                             )?;
                         }
@@ -701,8 +842,14 @@ impl Krea2Transformer {
 
         // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
         let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
-        let img_out = out.narrow(1, cap_len, img_len)?;
-        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
+        let img_out = out.narrow(1, prepared.cap_len, prepared.img_len)?;
+        Ok(unpatchify(
+            &img_out,
+            prepared.ht,
+            prepared.wt,
+            p,
+            prepared.latent_ch,
+        )?)
     }
 
     /// **Kontext-style edit velocity prediction** (epic 10871 / sc-10877). Identical to
@@ -760,55 +907,74 @@ impl Krea2Transformer {
         attention_scores_budget: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Tensor> {
+        let prepared = self.prepare_edit_conditioning(
+            context,
+            refs,
+            // The prepared state takes pixel geometry; derive it from the target latent.
+            (latent.dim(3)? * 8) as u32,
+            (latent.dim(2)? * 8) as u32,
+        )?;
+        self.forward_edit_prepared_with_memory(
+            latent,
+            timestep,
+            &prepared,
+            attention_scores_budget,
+            cancel,
+        )
+    }
+
+    /// Edit denoise from prepared text/reference conditioning. References are embedded exactly once
+    /// by [`Self::prepare_edit_conditioning`], then retained across the complete seed/step loop.
+    pub(crate) fn forward_edit_prepared_with_memory(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedConditioning,
+        attention_scores_budget: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.validate_prepared(latent, prepared)?;
         let cfg = &self.cfg;
         let p = cfg.patch_size;
-        let (_, _, h, w) = latent.dims4()?;
-        let (ht, wt) = (h / p, w / p);
-        let img_len = ht * wt;
-        let latent_ch = cfg.in_channels / (p * p);
-        let n_refs = refs.len();
-        let cap_len = context.dim(1)?;
         let attention_plan = request_attention_plan(attention_scores_budget, cancel);
 
-        // Target + reference image tokens (references must share the target grid — VAE-encoded at the
-        // target resolution). All go through the identical `img_in` projection.
+        // Target image tokens change per denoise step; text/reference tokens were prepared once.
         let img = self.embed_image(latent)?;
-        let mut ref_toks = Vec::with_capacity(n_refs);
-        for (i, r) in refs.iter().enumerate() {
-            let (_, _, rh, rw) = r.dims4()?;
-            if rh != h || rw != w {
-                return Err(candle_gen::CandleError::Msg(format!(
-                    "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
-                     references must be VAE-encoded at the target resolution"
-                )));
-            }
-            ref_toks.push(self.embed_image(r)?);
-        }
-
-        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+        let (t, tvec) = self.prepared_time_front_end(timestep)?;
 
         // Joint sequence `[ctx, refs…, target]` (references BEFORE the noise — the Krea2Edit contract).
-        let mut parts: Vec<&Tensor> = Vec::with_capacity(2 + n_refs);
-        parts.push(&ctx);
-        parts.extend(ref_toks.iter());
+        let mut parts: Vec<&Tensor> = Vec::with_capacity(2 + prepared.refs.len());
+        parts.push(&prepared.context);
+        parts.extend(prepared.refs.iter());
         parts.push(&img);
         let mut combined = Tensor::cat(&parts, 1)?;
 
-        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
         let TransformerBlocks::Resident(blocks) = &self.blocks else {
             return Err(candle_gen::CandleError::Msg(
                 "Krea block streaming is supported only for ordinary text-to-image denoise".into(),
             ));
         };
         combined = fold_block_sequence(blocks.len(), cancel, combined, |i, combined| {
-            blocks[i].forward_with_attention_plan(&combined, &tvec, &rcos, &rsin, attention_plan)
+            blocks[i].forward_with_attention_plan(
+                &combined,
+                &tvec,
+                &prepared.rcos,
+                &prepared.rsin,
+                attention_plan,
+            )
         })?;
 
         // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
         let out = self.final_layer(&combined, &t)?;
-        let target_offset = cap_len + n_refs * img_len;
-        let img_out = out.narrow(1, target_offset, img_len)?;
-        Ok(unpatchify(&img_out, ht, wt, p, latent_ch)?)
+        let target_offset = prepared.cap_len + prepared.refs.len() * prepared.img_len;
+        let img_out = out.narrow(1, target_offset, prepared.img_len)?;
+        Ok(unpatchify(
+            &img_out,
+            prepared.ht,
+            prepared.wt,
+            p,
+            prepared.latent_ch,
+        )?)
     }
 
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
@@ -1187,6 +1353,143 @@ mod tests {
             delta, 0.0,
             "materializing windows from a worker thread must not change the output"
         );
+    }
+
+    /// The prepared seam owns text fusion + RoPE once for a complete request, while each seeded
+    /// denoise step retains byte-identical output. The tiny CPU fixture covers the resident and the
+    /// streamed storage variants without model weights or accelerator hardware.
+    #[test]
+    fn prepared_conditioning_is_once_per_request_and_matches_unprepared_for_every_storage_variant()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let (resident, streamed, latent, _timestep, context) = streamed_pair(&tmp);
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        for (name, dit) in [("resident", &resident), ("streamed", &streamed)] {
+            reset_prepared_conditioning_builds();
+            let prepared = dit
+                .prepare_conditioning(&context, 32, 32)
+                .unwrap_or_else(|error| panic!("{name}: prepare: {error}"));
+            assert_eq!(
+                prepared_conditioning_builds(),
+                1,
+                "{name}: one request plan"
+            );
+            for time in [0.1_f32, 0.7] {
+                let t = Tensor::from_vec(vec![time], 1, &Device::Cpu).unwrap();
+                let expected = dit
+                    .forward_with_memory(
+                        &latent,
+                        &t,
+                        &context,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        DEFAULT_TRANSFORMER_WINDOW,
+                        &cancel,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: baseline: {error}"));
+                // The baseline convenience wrapper constructs its own one-shot plan; reset the test
+                // counter before asserting the production reused-plan path does no new prep work.
+                reset_prepared_conditioning_builds();
+                let got = dit
+                    .forward_prepared_with_memory(
+                        &latent,
+                        &t,
+                        &prepared,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        DEFAULT_TRANSFORMER_WINDOW,
+                        &cancel,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: prepared: {error}"));
+                assert_eq!(
+                    prepared_conditioning_builds(),
+                    0,
+                    "{name}: step reused plan"
+                );
+                let max = (&got - &expected)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_vec0::<f32>()
+                    .unwrap();
+                assert_eq!(max, 0.0, "{name}: prepared output parity at t={time}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_conditioning_rejects_a_mismatched_geometry_before_denoising() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let prepared = dit.prepare_conditioning(&context, 32, 32).unwrap();
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let wrong = crate::testfix::rnd(&[1, latent_ch, 8, 4]);
+        let t = Tensor::from_vec(vec![0.5_f32], 1, &Device::Cpu).unwrap();
+        let error = dit
+            .forward_prepared_with_memory(
+                &wrong,
+                &t,
+                &prepared,
+                candle_gen::ATTN_SCORES_BUDGET,
+                DEFAULT_TRANSFORMER_WINDOW,
+                &candle_gen::gen_core::CancelFlag::default(),
+            )
+            .expect_err("stale prepared geometry must be rejected before a block runs");
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
+            "expected typed prepared-state rejection, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_edit_conditioning_reuses_reference_tokens_with_output_parity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg) = crate::testfix::tiny_transformer(&tmp);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let reference = crate::testfix::rnd(&[1, latent_ch, 4, 4]);
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+
+        reset_prepared_conditioning_builds();
+        let prepared = dit
+            .prepare_edit_conditioning(&context, std::slice::from_ref(&reference), 32, 32)
+            .unwrap();
+        assert_eq!(prepared_conditioning_builds(), 1, "one edit request plan");
+        for sigma in [0.2_f32, 0.8] {
+            let t = Tensor::from_vec(vec![sigma], 1, &Device::Cpu).unwrap();
+            let expected = dit
+                .forward_edit_with_memory(
+                    &latent,
+                    &t,
+                    &context,
+                    std::slice::from_ref(&reference),
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    &cancel,
+                )
+                .unwrap();
+            reset_prepared_conditioning_builds();
+            let got = dit
+                .forward_edit_prepared_with_memory(
+                    &latent,
+                    &t,
+                    &prepared,
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(prepared_conditioning_builds(), 0, "edit step reused plan");
+            let max = (&got - &expected)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_vec0::<f32>()
+                .unwrap();
+            assert_eq!(max, 0.0, "prepared edit parity at sigma={sigma}");
+        }
     }
 
     #[test]

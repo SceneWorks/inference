@@ -36,7 +36,7 @@ use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::Krea2Config;
-use crate::control::{forward_with_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
+use crate::control::{forward_with_prepared_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
 use crate::loader::Weights;
 use crate::pipeline::maybe_apply_style_gain;
 use crate::pipeline::to_image;
@@ -552,8 +552,12 @@ impl Krea2ControlHeavy {
         context: Tensor,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        candle_gen::check_cancel(&req.cancel)?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
+        let prepared = self
+            .dit
+            .prepare_control_conditioning(&context, &ctrl_latent)?;
         let scale = req.control_scale as f64;
 
         let (lat_h, lat_w) = (
@@ -581,13 +585,12 @@ impl Krea2ControlHeavy {
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = forward_with_control(
+                let v = forward_with_prepared_control(
                     &self.dit,
                     &self.branch,
                     x,
                     &t,
-                    &context,
-                    &ctrl_latent,
+                    &prepared,
                     scale,
                 )?;
                 Ok(v.to_dtype(DType::F32)?)
