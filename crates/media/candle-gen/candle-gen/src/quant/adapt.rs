@@ -1380,7 +1380,9 @@ mod tests {
             AdaptLinear::from_dense(Linear::new(dense_weight, None), in_dim, out_dim);
         let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
         let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
-        zero_dense.push_lora(poison_a, poison_b, 0.0);
+        zero_dense
+            .push_lora(poison_a, poison_b, 0.0)
+            .expect("scale=0 poison factors are admitted on a dense bf16 host");
         assert_tensor_exact(
             &zero_dense.forward(&x).unwrap(),
             &bare_dense_y,
@@ -1411,7 +1413,9 @@ mod tests {
             in_dim,
             out_dim,
         );
-        live_dense.push_lora(a.clone(), b.clone(), 0.5);
+        live_dense
+            .push_lora(a.clone(), b.clone(), 0.5)
+            .expect("rank-2 factors are admitted on a dense bf16 host");
         let dense_expected = (&bare_dense_y + &residual_bf16).unwrap();
         assert_tensor_exact(
             &live_dense.forward(&x).unwrap(),
@@ -1441,7 +1445,8 @@ mod tests {
             let mut zero = build();
             let poison_a = Tensor::full(f32::INFINITY, (in_dim, rank), &dev).unwrap();
             let poison_b = Tensor::ones((rank, out_dim), DType::F32, &dev).unwrap();
-            zero.push_lora(poison_a, poison_b, 0.0);
+            zero.push_lora(poison_a, poison_b, 0.0)
+                .expect("scale=0 poison factors are admitted on a packed host");
             assert_tensor_exact(
                 &zero.forward(&x).unwrap(),
                 &base_y,
@@ -1454,7 +1459,8 @@ mod tests {
             );
 
             let mut live = build();
-            live.push_lora(a.clone(), b.clone(), 0.5);
+            live.push_lora(a.clone(), b.clone(), 0.5)
+                .expect("rank-2 factors are admitted on a packed host");
             let expected = (&base_y + residual_bf16.to_dtype(DType::F32).unwrap()).unwrap();
             assert_tensor_exact(
                 &live.forward(&x).unwrap(),
