@@ -6,7 +6,7 @@
 //! the standard 8-step CFG-free Turbo denoise conditioned on a rendered OpenPose skeleton.
 //!
 //! **How it conditions:** the pose skeleton is VAE-encoded (Qwen-Image VAE) into a control latent, then
-//! [`forward_with_control`] — a drop-in for the base
+//! `forward_with_prepared_control` — a drop-in for the base
 //! `dit.forward` — adds the branch residual into the frozen main stream after each of the first N
 //! single-stream blocks, scaled by `control_scale` and RMS-clamped at τ (the S0 recipe: τ = 0.15,
 //! applied identically train/infer). `control_scale = 0` is engine-proven **byte-identical** to the
