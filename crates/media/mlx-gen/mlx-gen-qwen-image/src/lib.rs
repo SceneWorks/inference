@@ -214,6 +214,14 @@ pub fn register_providers(
                 memory_strategy::weights_free_memory_strategy_contract(model::MODEL_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: model::MODEL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(model::MODEL_ID, surface)
+                },
+            },
+        )
         .register_memory_behavior(model::MEMORY_BEHAVIOR_REGISTRATION)
         .register_memory_strategy(model_control::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
@@ -235,6 +243,17 @@ pub fn register_providers(
                 memory_strategy::weights_free_memory_strategy_contract(model_edit::MODEL_ID, spec)
             },
         })
+        .register_memory_contract_surface_resolver(
+            mlx_gen::gen_core::MemoryContractSurfaceResolverRegistration {
+                provider_id: model_edit::MODEL_ID,
+                contract: |surface| {
+                    memory_strategy::weights_free_memory_surface_contract(
+                        model_edit::MODEL_ID,
+                        surface,
+                    )
+                },
+            },
+        )
         .register_memory_behavior(model_edit::MEMORY_BEHAVIOR_REGISTRATION)
 }
 
@@ -245,6 +264,79 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    /// One line per selector: the whole ladder's per-surface disposition, in rung order 0..4.
+    /// `I` = Implemented, `S` = StructurallyNotApplicable, `-` = Missing.
+    fn ladder_lines(provider_id: &str) -> Vec<String> {
+        use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport};
+
+        let registry = super::provider_registry().unwrap();
+        registry
+            .memory_contract_surfaces()
+            .unwrap()
+            .iter()
+            .filter(|surface| surface.contract.provider_id == provider_id)
+            .map(|surface| {
+                let ladder: String = MemoryStrategy::ALL
+                    .iter()
+                    .map(
+                        |strategy| match surface.contract.capability(*strategy).unwrap().support {
+                            MemoryStrategySupport::Implemented => 'I',
+                            MemoryStrategySupport::StructurallyNotApplicable { .. } => 'S',
+                            MemoryStrategySupport::Missing => '-',
+                        },
+                    )
+                    .collect();
+                format!("{} {ladder}", surface.selector.id())
+            })
+            .collect()
+    }
+
+    /// sc-21510: rung 4 is tier-agnostic on the base and edit routes. The selector names an
+    /// already-resolved artifact tier, so Q4/Q8 deferred-materialization surfaces stream exactly as
+    /// BF16 does. Every other (surface, rung) disposition is unchanged, and Control stays excluded
+    /// from rungs 3 and 4 at every tier because its five-block branch is unbounded.
+    #[test]
+    fn published_ladder_surface_is_pinned_per_selector() {
+        assert_eq!(
+            ladder_lines(super::model::MODEL_ID),
+            [
+                "bf16:resident:eager I-II-",
+                "bf16:resident:deferred I-II-",
+                "bf16:sequential:eager IIII-",
+                "bf16:sequential:deferred IIIII",
+                "q4:resident:eager I-II-",
+                "q4:resident:deferred I-II-",
+                "q4:sequential:eager IIII-",
+                "q4:sequential:deferred IIIII",
+                "q8:resident:eager I-II-",
+                "q8:resident:deferred I-II-",
+                "q8:sequential:eager IIII-",
+                "q8:sequential:deferred IIIII",
+            ]
+        );
+        assert_eq!(
+            ladder_lines(super::model_edit::MODEL_ID),
+            ladder_lines(super::model::MODEL_ID)
+        );
+        assert_eq!(
+            ladder_lines(super::model_control::MODEL_ID),
+            [
+                "bf16:resident:eager I-I--",
+                "bf16:resident:deferred I-I--",
+                "bf16:sequential:eager III--",
+                "bf16:sequential:deferred III--",
+                "q4:resident:eager I-I--",
+                "q4:resident:deferred I-I--",
+                "q4:sequential:eager III--",
+                "q4:sequential:deferred III--",
+                "q8:resident:eager I-I--",
+                "q8:resident:deferred I-I--",
+                "q8:sequential:eager III--",
+                "q8:sequential:deferred III--",
+            ]
+        );
+    }
+
     #[test]
     fn qwen_authored_attention_bias_must_match_the_biasful_runtime() {
         let tmp = tempfile::tempdir().unwrap();
