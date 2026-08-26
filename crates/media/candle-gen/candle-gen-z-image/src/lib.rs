@@ -1631,9 +1631,15 @@ mod tests {
 
         std::fs::write(&text, b"replacement text encoder bytes").unwrap();
         let error = validate_load_spec(&spec)
-            .expect_err("provider must reject a changed prepared component")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("provider must reject a changed prepared component");
+        assert!(
+            matches!(
+                error,
+                gen_core::Error::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// The accel-attn runtime toggle defaults on and round-trips (what the worker/UI drive).

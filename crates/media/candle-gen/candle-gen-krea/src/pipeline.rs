@@ -3311,9 +3311,15 @@ mod tests {
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result
             .err()
-            .expect("mid-load replacement must invalidate the production native-file entrypoint")
-            .to_string();
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+            .expect("mid-load replacement must invalidate the production native-file entrypoint");
+        assert!(
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected: {error:?}"
+        );
     }
 
     #[test]
