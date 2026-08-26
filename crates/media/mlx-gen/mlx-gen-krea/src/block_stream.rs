@@ -322,8 +322,8 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(
-            error.contains("pinned weights") && error.contains("changed after load"),
-            "got: {error}"
+            error.contains("artifact seal mismatch after load"),
+            "MLX window reopen must expose the shared seal grammar: {error}"
         );
     }
 }

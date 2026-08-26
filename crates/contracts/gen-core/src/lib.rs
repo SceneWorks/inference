@@ -192,12 +192,13 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
-    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
-    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactSeal, CancelFlag, FileStatFingerprint,
+    IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert,
+    OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame,
+    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

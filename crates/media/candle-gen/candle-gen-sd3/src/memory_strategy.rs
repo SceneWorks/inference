@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -134,7 +133,6 @@ impl Sd35Route {
 pub struct FileReceipt {
     lexical_path: PathBuf,
     canonical_path: PathBuf,
-    sha256: [u8; 32],
     projected_resident_bytes: u64,
     pin: gen_core::PinnedWeightsFile,
 }
@@ -152,11 +150,9 @@ impl FileReceipt {
             )));
         }
         let pin = prepared_or_current_pin(spec, path)?;
-        let sha256 = pin.read_unchanged(sha256_file)?;
         let receipt = Self {
             lexical_path: pin.loader_path().to_path_buf(),
             canonical_path: pin.canonical_target_path().to_path_buf(),
-            sha256,
             projected_resident_bytes,
             pin,
         };
@@ -165,14 +161,7 @@ impl FileReceipt {
     }
 
     fn ensure_unchanged(&self) -> gen_core::Result<()> {
-        self.pin.ensure_unchanged()?;
-        if self.pin.read_unchanged(sha256_file)? != self.sha256 {
-            return Err(gen_core::Error::Unsupported(format!(
-                "SD3.5 file changed after admission: {}",
-                self.lexical_path.display()
-            )));
-        }
-        Ok(())
+        self.pin.verify_unchanged()
     }
 }
 
@@ -191,9 +180,8 @@ pub struct Sd35LoadReceipt {
     pub tier: Option<Quant>,
     pub group_size: Option<usize>,
     root: PathBuf,
-    inventory: Vec<(PathBuf, gen_core::PinnedWeightsFile, [u8; 32])>,
+    inventory: Vec<(PathBuf, gen_core::PinnedWeightsFile)>,
     transformer_config: gen_core::PinnedWeightsFile,
-    transformer_config_sha256: [u8; 32],
     pub components: gen_core::PerComponentBytes,
     pub adapters: Vec<AdapterReceipt>,
     physical_identity: String,
@@ -211,11 +199,9 @@ impl Sd35LoadReceipt {
         let mut inventory = Vec::with_capacity(inventory_paths.len());
         for path in inventory_paths {
             let pin = prepared_or_current_pin(spec, &path)?;
-            let digest = pin.read_unchanged(sha256_file)?;
-            inventory.push((path, pin, digest));
+            inventory.push((path, pin));
         }
         let config = prepared_or_current_pin(spec, &root.join("transformer/config.json"))?;
-        let transformer_config_sha256 = config.read_unchanged(sha256_file)?;
         let transformer_paths = direct_safetensors(&root.join("transformer"))?;
         let (tier, group_size, transformer_bytes) =
             inspect_transformer(&transformer_paths, &config)?;
@@ -251,7 +237,6 @@ impl Sd35LoadReceipt {
             root,
             inventory,
             transformer_config: config,
-            transformer_config_sha256,
             components,
             adapters,
             physical_identity,
@@ -265,7 +250,7 @@ impl Sd35LoadReceipt {
         let expected = self
             .inventory
             .iter()
-            .map(|(path, _, _)| path.clone())
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         if current != expected {
             return Err(gen_core::Error::Unsupported(format!(
@@ -273,21 +258,10 @@ impl Sd35LoadReceipt {
                 self.route.provider_id()
             )));
         }
-        for (_, pin, digest) in &self.inventory {
-            pin.ensure_unchanged()?;
-            if pin.read_unchanged(sha256_file)? != *digest {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: immutable tier contents changed after admission",
-                    self.route.provider_id()
-                )));
-            }
+        for (_, pin) in &self.inventory {
+            pin.verify_unchanged()?;
         }
-        self.transformer_config.ensure_unchanged()?;
-        if self.transformer_config.read_unchanged(sha256_file)? != self.transformer_config_sha256 {
-            return Err(gen_core::Error::Unsupported(
-                "SD3.5 transformer config changed after admission".into(),
-            ));
-        }
+        self.transformer_config.verify_unchanged()?;
         let physical = inspect_transformer(
             &direct_safetensors(&self.root.join("transformer"))?,
             &self.transformer_config,
@@ -334,7 +308,7 @@ impl Sd35LoadReceipt {
                 &mut digest,
                 adapter.file.canonical_path.as_os_str().as_encoded_bytes(),
             );
-            update_framed(&mut digest, &adapter.file.sha256);
+            update_framed(&mut digest, adapter.file.pin.content_sha256());
         }
         Some(format_digest(ADAPTER_RECEIPT_PREFIX, digest.finalize()))
     }
@@ -785,20 +759,6 @@ fn capture_adapters(spec: &LoadSpec) -> gen_core::Result<Vec<AdapterReceipt>> {
         .collect()
 }
 
-fn sha256_file(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(digest.finalize().into())
-}
-
 fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_le_bytes());
     digest.update(bytes);
@@ -815,7 +775,7 @@ fn format_digest(prefix: &str, bytes: impl IntoIterator<Item = u8>) -> String {
 fn physical_identity(
     route: Sd35Route,
     tier: Option<Quant>,
-    inventory: &[(PathBuf, gen_core::PinnedWeightsFile, [u8; 32])],
+    inventory: &[(PathBuf, gen_core::PinnedWeightsFile)],
     adapters: &[AdapterReceipt],
 ) -> String {
     let mut digest = Sha256::new();
@@ -823,13 +783,13 @@ fn physical_identity(
     update_framed(&mut digest, route.repository().as_bytes());
     update_framed(&mut digest, route.revision().as_bytes());
     update_framed(&mut digest, format!("{tier:?}").as_bytes());
-    for (path, pin, sha) in inventory {
+    for (path, pin) in inventory {
         update_framed(&mut digest, path.as_os_str().as_encoded_bytes());
         update_framed(
             &mut digest,
             pin.canonical_target_path().as_os_str().as_encoded_bytes(),
         );
-        update_framed(&mut digest, sha);
+        update_framed(&mut digest, pin.content_sha256());
     }
     for adapter in adapters {
         update_framed(&mut digest, &(adapter.order as u64).to_le_bytes());

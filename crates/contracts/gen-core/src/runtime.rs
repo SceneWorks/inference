@@ -3,10 +3,36 @@
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SealHashWork(AtomicUsize);
+
+#[cfg(test)]
+impl PartialEq for SealHashWork {
+    fn eq(&self, _other: &Self) -> bool {
+        // Work probes are test instrumentation, never artifact identity.
+        true
+    }
+}
+
+#[cfg(test)]
+impl Eq for SealHashWork {}
+
+#[cfg(test)]
+impl std::hash::Hash for SealHashWork {
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
+}
 
 use crate::memory_strategy::{
     MemoryBackend, MemoryDecodeGeometryPolicy, MemoryDecodeQualityRuntimeIdentity,
@@ -259,13 +285,23 @@ fn path_component_fingerprints(path: &Path) -> std::io::Result<Vec<PathComponent
 /// for cache/provenance identity without hashing a multi-gigabyte checkpoint on each request. This
 /// remains a path-token model; see [`read_unchanged`](Self::read_unchanged) for its active-swap bound.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PinnedWeightsFile {
+pub struct ArtifactSeal {
     loader_path: PathBuf,
     canonical_target_path: PathBuf,
     path_component_fingerprints: Vec<PathComponentFingerprint>,
     entry_fingerprint: FileStatFingerprint,
     target_fingerprint: FileStatFingerprint,
+    sha256: [u8; 32],
+    #[cfg(test)]
+    hash_work: Arc<SealHashWork>,
 }
+
+/// Backwards-compatible name for the shared artifact seal.
+///
+/// Keep this alias while providers migrate their local terminology. Every existing file-pin
+/// consumer therefore retains the canonical target, no-follow entry pin, and acquisition-time
+/// content identity supplied by [`ArtifactSeal`].
+pub type PinnedWeightsFile = ArtifactSeal;
 
 /// Read-only collection of caller-prepared File identities carried by a [`LoadSpec`].
 ///
@@ -316,7 +352,7 @@ impl PreparedFilePins {
     }
 }
 
-impl PinnedWeightsFile {
+impl ArtifactSeal {
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
         let loader_path = std::path::absolute(path.as_ref())?;
         let canonical_target_path = std::fs::canonicalize(&loader_path)?;
@@ -335,11 +371,17 @@ impl PinnedWeightsFile {
             path_component_fingerprints,
             entry_fingerprint,
             target_fingerprint,
+            sha256: [0; 32],
+            #[cfg(test)]
+            hash_work: Arc::new(SealHashWork(AtomicUsize::new(0))),
         };
         // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
-        Ok(pinned)
+        #[cfg(test)]
+        pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
+        let sha256 = pinned.read_unchanged(hash_file_sha256)?;
+        Ok(Self { sha256, ..pinned })
     }
 
     pub fn loader_path(&self) -> &Path {
@@ -360,6 +402,23 @@ impl PinnedWeightsFile {
 
     pub fn target_fingerprint(&self) -> &FileStatFingerprint {
         &self.target_fingerprint
+    }
+
+    /// Full-content digest captured exactly once when this seal was acquired.
+    pub fn content_sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+
+    /// Number of full-content reads performed by this sealed artifact in test builds.
+    #[cfg(test)]
+    pub fn full_hash_work_count(&self) -> usize {
+        self.hash_work.0.load(Ordering::Relaxed)
+    }
+
+    fn hash_content(&self, path: &Path) -> crate::Result<[u8; 32]> {
+        #[cfg(test)]
+        self.hash_work.0.fetch_add(1, Ordering::Relaxed);
+        hash_file_sha256(path)
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {
@@ -394,6 +453,38 @@ impl PinnedWeightsFile {
         Ok(())
     }
 
+    /// Confirm this seal without re-reading stable artifact content.
+    ///
+    /// Metadata and no-follow identity pins are cheap to check on each reopen. If either pin
+    /// changes, this deliberately performs one full-content audit before rejecting the source;
+    /// callers therefore never continue after a same-size replacement, including one that preserves
+    /// an ordinary mtime. The error grammar is shared by Candle and MLX consumers.
+    pub fn verify_unchanged(&self) -> crate::Result<()> {
+        if self.ensure_unchanged().is_ok() {
+            return Ok(());
+        }
+
+        // A mismatch must force a complete verification attempt before it is rejected. The result
+        // cannot re-authorize the path: an identity change alone is fail-closed.
+        let _ = self.hash_content(&self.loader_path);
+        Err(crate::Error::Unsupported(format!(
+            "artifact seal mismatch after load: {}",
+            self.loader_path.display()
+        )))
+    }
+
+    /// Explicit, operator-requested full-content audit of an otherwise stable seal.
+    pub fn audit_content(&self) -> crate::Result<()> {
+        self.ensure_unchanged()?;
+        if self.hash_content(&self.loader_path)? != self.sha256 {
+            return Err(crate::Error::Unsupported(format!(
+                "artifact seal content mismatch after load: {}",
+                self.loader_path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Run one source read against the retained loader path, validating the pin both immediately
     /// before the path is opened and immediately after the read completes.
     ///
@@ -412,11 +503,25 @@ impl PinnedWeightsFile {
     where
         E: From<crate::Error>,
     {
-        self.ensure_unchanged().map_err(E::from)?;
+        self.verify_unchanged().map_err(E::from)?;
         let result = read(&self.loader_path);
-        self.ensure_unchanged().map_err(E::from)?;
+        self.verify_unchanged().map_err(E::from)?;
         result
     }
+}
+
+fn hash_file_sha256(path: &Path) -> crate::Result<[u8; 32]> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
 }
 
 /// Quantization tier a load may request. [`Q4`](Self::Q4)/[`Q8`](Self::Q8) are the group-wise
@@ -950,7 +1055,7 @@ impl LoadSpec {
     ) -> crate::Result<()> {
         let mut pins = BTreeMap::new();
         for pin in prepared {
-            pin.ensure_unchanged()?;
+            pin.verify_unchanged()?;
             let path = pin.loader_path().to_path_buf();
             if pins.insert(path.clone(), pin).is_some() {
                 return Err(crate::Error::Unsupported(format!(
@@ -990,7 +1095,7 @@ impl LoadSpec {
     ) -> crate::Result<()> {
         let mut pins = BTreeMap::new();
         for pin in prepared {
-            pin.ensure_unchanged()?;
+            pin.verify_unchanged()?;
             let path = pin.loader_path().to_path_buf();
             if let Some(existing) = pins.insert(path.clone(), pin) {
                 if existing != pins[&path] {
@@ -1149,7 +1254,7 @@ impl LoadSpec {
                 prepared.loader_path().display()
             )));
         }
-        prepared.ensure_unchanged()?;
+        prepared.verify_unchanged()?;
         if let Some(existing) = self.prepared_file_pins.get(&expected) {
             if existing != &prepared {
                 return Err(crate::Error::Unsupported(format!(
@@ -1196,7 +1301,7 @@ impl LoadSpec {
                         prepared.loader_path().display()
                     )));
                 }
-                prepared.ensure_unchanged()?;
+                prepared.verify_unchanged()?;
             } else {
                 let prepared = PinnedWeightsFile::pin(&path)?;
                 self.set_prepared_file_pin(&path, prepared)?;
@@ -1286,7 +1391,7 @@ impl LoadSpec {
                     prepared.loader_path().display()
                 )));
             }
-            prepared.ensure_unchanged()?;
+            prepared.verify_unchanged()?;
         }
         Ok(())
     }
@@ -1332,7 +1437,7 @@ impl LoadSpec {
                 prepared.loader_path().display()
             )));
         }
-        prepared.ensure_unchanged()?;
+        prepared.verify_unchanged()?;
         Ok(Some(prepared))
     }
 
@@ -1394,11 +1499,11 @@ impl LoadSpec {
             .map(|path| self.file_pin_for(path).map_err(E::from))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for pin in &pins {
-            pin.ensure_unchanged().map_err(E::from)?;
+            pin.verify_unchanged().map_err(E::from)?;
         }
         let result = read();
         for pin in &pins {
-            pin.ensure_unchanged().map_err(E::from)?;
+            pin.verify_unchanged().map_err(E::from)?;
         }
         result
     }
@@ -1429,11 +1534,11 @@ impl LoadSpec {
             .map(|(_, pin)| pin)
             .collect::<Vec<_>>();
         for pin in &pins {
-            pin.ensure_unchanged().map_err(E::from)?;
+            pin.verify_unchanged().map_err(E::from)?;
         }
         let result = read();
         for pin in &pins {
-            pin.ensure_unchanged().map_err(E::from)?;
+            pin.verify_unchanged().map_err(E::from)?;
         }
         result
     }
@@ -1998,6 +2103,43 @@ mod tests {
             .expect_err("mutation must invalidate the pin")
             .to_string();
         assert!(error.contains("changed after load"), "got: {error}");
+    }
+
+    #[test]
+    fn artifact_seal_skips_stable_full_hashes_and_audits_same_size_replacement() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("model.safetensors");
+        std::fs::write(&file, b"same-size-a").expect("write fixture");
+        let seal = ArtifactSeal::pin(&file).expect("seal regular file");
+
+        let after_acquisition = seal.full_hash_work_count();
+        seal.verify_unchanged().expect("first stable verification");
+        seal.verify_unchanged().expect("second stable verification");
+        assert_eq!(
+            seal.full_hash_work_count(),
+            after_acquisition,
+            "stable request checks must consume only identity pins, not full content hashes"
+        );
+
+        std::fs::write(&file, b"same-size-b").expect("replace fixture with same-size bytes");
+        let forced_stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123);
+        std::fs::File::open(&file)
+            .expect("open fixture")
+            .set_modified(forced_stamp)
+            .expect("advance replacement stamp");
+        let error = seal
+            .verify_unchanged()
+            .expect_err("same-size replacement must fail closed")
+            .to_string();
+        assert!(
+            error.contains("artifact seal mismatch after load"),
+            "all backends must receive the shared seal grammar: {error}"
+        );
+        assert_eq!(
+            seal.full_hash_work_count(),
+            after_acquisition + 1,
+            "identity mismatch must trigger exactly one full-content audit before rejection"
+        );
     }
 
     #[test]
