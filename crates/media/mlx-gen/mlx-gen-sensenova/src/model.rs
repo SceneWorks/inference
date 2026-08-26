@@ -58,6 +58,9 @@ pub const CELL: u32 = 32;
 /// Source-image preprocessing bounds (the reference `it2i_generate` `load_image_native`).
 const REF_MIN_PIXELS: i64 = 512 * 512;
 const REF_MAX_PIXELS: i64 = 2048 * 2048;
+/// Tokenizer-level sentinels owned by the internal image-prefix builder. Letting user text inject
+/// one would corrupt the token/grid relationship that the understanding path derives.
+const RESERVED_IMAGE_MARKERS: [&str; 3] = ["<IMG_CONTEXT>", "<img>", "</img>"];
 
 /// Resolve the request's image-guidance scale for the reference-conditioned it2i path. Keeping this
 /// seam explicit prevents `true_cfg` from being advertised while accidentally dropping it before
@@ -570,6 +573,7 @@ impl Generator for SenseNova {
         // right model (F-143).
         let id = self.descriptor.id;
         self.descriptor.capabilities.validate_request(id, req)?;
+        validate_reserved_image_markers(id, req).map_err(gen_core::Error::from)?;
         validate_dims_and_steps(id, req).map_err(Into::into)
     }
 
@@ -661,6 +665,20 @@ impl SenseNova {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Reject internal image-prefix sentinels before the prompt reaches the token/grid expansion
+/// path. `<image>` remains the public placeholder and is deliberately not included here.
+fn validate_reserved_image_markers(id: &str, req: &GenerationRequest) -> Result<()> {
+    if let Some(marker) = RESERVED_IMAGE_MARKERS
+        .iter()
+        .find(|marker| req.prompt.contains(**marker))
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: prompt contains reserved internal image marker {marker}"
+        )));
+    }
+    Ok(())
 }
 
 /// Request-boundary checks beyond the capability surface: reference-only image guidance, 32-pixel
@@ -1149,6 +1167,51 @@ mod tests {
             },
         )
         .is_ok());
+    }
+
+    #[test]
+    fn reserved_image_markers_are_typed_refusals_for_text_and_image_requests() {
+        for conditioning in [
+            vec![],
+            vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+        ] {
+            for marker in RESERVED_IMAGE_MARKERS {
+                let request = GenerationRequest {
+                    prompt: format!("preserve the literal {marker} label"),
+                    width: 512,
+                    height: 512,
+                    conditioning: conditioning.clone(),
+                    ..Default::default()
+                };
+                let err: gen_core::Error = validate_reserved_image_markers(MODEL_ID, &request)
+                    .expect_err("reserved tokenizer markers must never reach the position builder")
+                    .into();
+                assert!(matches!(err, gen_core::Error::Unsupported(_)));
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "unsupported: {MODEL_ID}: prompt contains reserved internal image marker {marker}"
+                    )
+                );
+            }
+        }
+
+        // `<image>` is the public interleave placeholder. It must survive admission so the
+        // existing synthetic it2i/VQA parity fixtures can expand it to the matching vision spans.
+        let public_marker = GenerationRequest {
+            prompt: "compare this <image> with the description".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_reserved_image_markers(MODEL_ID, &public_marker).is_ok());
     }
 
     #[test]
