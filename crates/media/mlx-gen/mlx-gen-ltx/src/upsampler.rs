@@ -1,6 +1,24 @@
-//! S4 — the LTX-2.3 **spatial latent upsampler** (2× spatial). Port of the `mlx_video` reference
-//! `models/ltx/upsampler.py` (`LatentUpsampler` + `upsample_latents`), gated against it
-//! (`tests/upsampler_parity.rs`, real `upsampler.safetensors`).
+//! S4 — the LTX **latent upsamplers**. Port of the `mlx_video` reference `models/ltx/upsampler.py`
+//! (`LatentUpsampler` + `upsample_latents`) — and, for LTX-2.5, of upstream
+//! `ltx_core/model/upsampler/model.py` at `Lightricks/LTX-2` @ `d1511477` (v1.2.0) — gated against
+//! both (`tests/upsampler_parity.rs`, real checkpoints).
+//!
+//! Two shipped variants, distinguished by [`LatentUpsamplerMode`] (sc-18773):
+//!
+//! * **spatial ×2** — LTX-2.3 `upsampler.safetensors` and LTX-2.5
+//!   `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` (`mid_channels` 1024). `H,W → 2H,2W`;
+//!   the frame count is untouched. The 2.5 file is a drop-in for the 2.3 architecture.
+//! * **temporal ×2** — LTX-2.5 `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`
+//!   (`mid_channels` 512). `Conv3d(mid, 2·mid) + PixelShuffleND(1)` on the frame axis, then the
+//!   **leading frame is dropped**, so `F → 2F−1`; `H,W` untouched. Dropping is not an off-by-one
+//!   trim: latent frame 0 encodes a single pixel frame, and `2·(8k+1) − 1 = 16k+1` is what keeps
+//!   LTX's `n % 8 == 1` latent-frame invariant.
+//!
+//! Which variant a checkpoint is comes from the **rank of `upsampler.0.weight`** (4 → Conv2d
+//! spatial, 5 → Conv3d temporal), not from a file name and not from a config: SceneWorks-converted
+//! 2.3 trees carry no `__metadata__` at all. `gen_core::ltx_checkpoint::LatentUpsamplerConfig` reads
+//! the declared config where one exists, and
+//! [`LatentUpsampler::assert_matches_config`] cross-checks the two.
 //!
 //! Sits between the two-stage distilled denoise (S5): stage-1 runs at half resolution, its latents
 //! are upsampled 2× spatially here, then stage-2 refines at full resolution. The reference loads the
@@ -9,10 +27,12 @@
 //! rather than the VAE's f32 (which is its own gated choice). The one f32 island is `GroupNorm3d`,
 //! which the reference upcasts to f32 internally and casts back — replicated here verbatim.
 //!
-//! Architecture (`num_blocks_per_stage = 4`, `mid_channels = 1024`, structure-from-weights):
-//!   `initial_conv 128→1024` → `initial_norm` → SiLU → 4× pre-`ResBlock3D` → `SpatialRationalResampler`
-//!   (frame-by-frame `Conv2d 1024→4096` + `PixelShuffle2D(2)`) → 4× post-`ResBlock3D` → `final_conv
-//!   1024→128`. I/O is channels-first `NCFHW`, transposed to `NFHWC` only for the conv ops.
+//! Architecture (`num_blocks_per_stage = 4`, structure-from-weights):
+//!   `initial_conv 128→mid` → `initial_norm` → SiLU → 4× pre-`ResBlock3D` → resampler → 4×
+//!   post-`ResBlock3D` → `final_conv mid→128`. I/O is channels-first `NCFHW`, transposed to `NFHWC`
+//!   only for the conv ops. The resampler is the frame-by-frame `Conv2d mid→4·mid` +
+//!   `PixelShuffle2D(2)` (spatial) or the `Conv3d mid→2·mid` + frame-axis `PixelShuffle1D(2)` +
+//!   leading-frame drop (temporal).
 //!
 //! Reference quirks carried over verbatim:
 //!  - Conv weights are on-disk **PyTorch** layout (Conv3d `[O,I,D,H,W]`, Conv2d `[O,I,H,W]`) — unlike
@@ -30,9 +50,12 @@
 use mlx_rs::ops::{add, divide, mean_axes, multiply, subtract, var_axes};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::ltx_checkpoint::{
+    upsampled_latent_frames, LatentUpsamplerConfig, LatentUpsamplerMode,
+};
 use mlx_gen::nn::{conv2d, conv3d, silu};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// `GroupNorm3d` group count (`GroupNorm3d(32, …)` throughout the reference).
 const GROUPS: i32 = 32;
@@ -121,27 +144,92 @@ fn pixel_shuffle_2d(x: &Array, r: i32) -> Result<Array> {
     Ok(x.reshape(&[n, h * r, wd * r, out_c])?)
 }
 
-/// `SpatialRationalResampler` — frame-by-frame 2× spatial upsample: fold frames into the batch, one
-/// `Conv2d 1024→4096`, `PixelShuffle2D(2)`, unfold.
-struct SpatialResampler {
-    conv: Conv,
+/// `PixelShuffleND(1)` — channels-last `(N, F, H, W, C·r) → (N, F·r, H, W, C)`.
+///
+/// Upstream is `rearrange(x, "b (c p1) f h w -> b c (f p1) h w")`: the channel axis decomposes
+/// `c`-major / `p1`-minor, and the shuffled frame index is `f·r + p1`. Channels-last that is a
+/// `(…, C, r)` split of the last axis moved in front of `H`/`W` and folded into `F` — the `r` sub-axis
+/// stays *minor* to `F`, which is what makes the two consecutive output frames come from the same
+/// input frame.
+fn pixel_shuffle_1d_frames(x: &Array, r: i32) -> Result<Array> {
+    let sh = x.shape(); // (n, f, h, w, c)
+    let (n, f, h, wd, c) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
+    let out_c = c / r;
+    let x = x.reshape(&[n, f, h, wd, out_c, r])?;
+    let x = x.transpose_axes(&[0, 1, 5, 2, 3, 4])?;
+    Ok(x.reshape(&[n, f * r, h, wd, out_c])?)
 }
 
-impl SpatialResampler {
+/// Drop frame 0 of an `NFHWC` tensor (`x[:, 1:]`).
+fn drop_leading_frame(x: &Array) -> Result<Array> {
+    let frames = x.shape()[1];
+    if frames < 2 {
+        return Err(Error::Msg(format!(
+            "ltx latent upsampler: temporal resampler produced {frames} frame(s); the leading-frame \
+             drop needs at least 2"
+        )));
+    }
+    let idx: Vec<i32> = (1..frames).collect();
+    Ok(x.take_axis(Array::from_slice(&idx, &[frames - 1]), 1)?)
+}
+
+/// The resampler stage — the one place the two shipped checkpoints differ.
+enum Resampler {
+    /// Frame-by-frame 2× spatial upsample: fold frames into the batch, one `Conv2d mid→4·mid`,
+    /// `PixelShuffle2D(2)`, unfold. Frame count unchanged.
+    Spatial2x { conv: Conv },
+    /// 2× temporal upsample: one `Conv3d mid→2·mid`, frame-axis `PixelShuffle1D(2)`, then drop the
+    /// leading frame. `F → 2F−1`.
+    Temporal2x { conv: Conv },
+}
+
+impl Resampler {
+    /// Structure-from-weights: `{prefix}.0.weight` is rank 4 for the spatial Conv2d and rank 5 for
+    /// the temporal Conv3d. (On disk the conv is `{prefix}.0.*` — the `torch.nn.Sequential` index —
+    /// which the `mlx_video` reference renames `{prefix}.conv.*`.)
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        // On disk the Conv2d is `{prefix}.0.*` (the reference renames it `{prefix}.conv.*`).
-        Ok(Self {
-            conv: Conv::load(w, &format!("{prefix}.0"), false)?,
-        })
+        let key = format!("{prefix}.0");
+        let raw = w.require(&format!("{key}.weight"))?;
+        match raw.ndim() {
+            4 => Ok(Resampler::Spatial2x {
+                conv: Conv::load(w, &key, false)?,
+            }),
+            5 => Ok(Resampler::Temporal2x {
+                conv: Conv::load(w, &key, true)?,
+            }),
+            n => Err(mlx_gen::Error::Msg(format!(
+                "ltx latent upsampler: {key}.weight has rank {n}, expected 4 (spatial Conv2d) or \
+                 5 (temporal Conv3d)"
+            ))),
+        }
     }
 
+    fn mode(&self) -> LatentUpsamplerMode {
+        match self {
+            Resampler::Spatial2x { .. } => LatentUpsamplerMode::Spatial2x,
+            Resampler::Temporal2x { .. } => LatentUpsamplerMode::Temporal2x,
+        }
+    }
+
+    /// `NFHWC → NFHWC`.
     fn forward(&self, x: &Array) -> Result<Array> {
         let sh = x.shape(); // (n, f, h, w, c)
         let (n, f, h, wd, c) = (sh[0], sh[1], sh[2], sh[3], sh[4]);
-        let x = x.reshape(&[n * f, h, wd, c])?;
-        let x = self.conv.forward(&x)?;
-        let x = pixel_shuffle_2d(&x, 2)?;
-        Ok(x.reshape(&[n, f, h * 2, wd * 2, c])?)
+        match self {
+            Resampler::Spatial2x { conv } => {
+                let x = x.reshape(&[n * f, h, wd, c])?;
+                let x = conv.forward(&x)?;
+                let x = pixel_shuffle_2d(&x, 2)?;
+                Ok(x.reshape(&[n, f, h * 2, wd * 2, c])?)
+            }
+            Resampler::Temporal2x { conv } => {
+                let x = conv.forward(x)?; // (n, f, h, w, 2c)
+                let x = pixel_shuffle_1d_frames(&x, 2)?; // (n, 2f, h, w, c)
+                                                         // Drop the leading frame: latent frame 0 encodes ONE pixel frame, so its shuffled
+                                                         // pair would duplicate it. `2f − 1` is also what preserves `n % 8 == 1`.
+                drop_leading_frame(&x)
+            }
+        }
     }
 }
 
@@ -174,19 +262,21 @@ impl ResBlock {
     }
 }
 
-/// The LTX-2.3 spatial latent upsampler. `num_blocks_per_stage` is read from the checkpoint (count of
-/// `res_blocks.{i}`), `mid_channels` follows from the conv weights.
+/// An LTX latent upsampler — spatial ×2 or temporal ×2, selected by the loaded weights.
+/// `num_blocks_per_stage` is read from the checkpoint (count of `res_blocks.{i}`), `mid_channels`
+/// follows from the conv weights.
 pub struct LatentUpsampler {
     initial_conv: Conv,
     initial_norm: GroupNorm,
     res_blocks: Vec<ResBlock>,
-    upsampler: SpatialResampler,
+    upsampler: Resampler,
     post_upsample_res_blocks: Vec<ResBlock>,
     final_conv: Conv,
 }
 
 impl LatentUpsampler {
-    /// Build from a loaded `upsampler.safetensors` (or `spatial_upscaler_x2_v1_1.safetensors`).
+    /// Build from a loaded latent-upsampler checkpoint — LTX-2.3 `upsampler.safetensors`, LTX-2.5
+    /// `…latent-spatial-upscaler-x2…`, or LTX-2.5 `…latent-temporal-upscaler-x2…`.
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let load_stage = |stem: &str| -> Result<Vec<ResBlock>> {
             let mut blocks = Vec::new();
@@ -201,14 +291,46 @@ impl LatentUpsampler {
             initial_conv: Conv::load(w, "initial_conv", true)?,
             initial_norm: GroupNorm::load(w, "initial_norm")?,
             res_blocks: load_stage("res_blocks")?,
-            upsampler: SpatialResampler::load(w, "upsampler")?,
+            upsampler: Resampler::load(w, "upsampler")?,
             post_upsample_res_blocks: load_stage("post_upsample_res_blocks")?,
             final_conv: Conv::load(w, "final_conv", true)?,
         })
     }
 
-    /// Upsample a channels-first `NCFHW` latent → `NCF(H·2)(W·2)`.
+    /// Which axis this checkpoint rescales, as read from its weights.
+    pub fn mode(&self) -> LatentUpsamplerMode {
+        self.upsampler.mode()
+    }
+
+    /// Latent frame count this upsampler produces from `frames` input frames.
+    pub fn output_frames(&self, frames: usize) -> Result<usize> {
+        Ok(upsampled_latent_frames(frames, self.mode())?)
+    }
+
+    /// Assert the structure read from the weights agrees with the config the checkpoint declares.
+    ///
+    /// Both are authorities on the same fact and they are read independently, so a disagreement
+    /// means one of them is being misread — never something to paper over by preferring one.
+    /// Checkpoints that carry no `__metadata__` (SceneWorks-converted LTX-2.3 trees) simply never
+    /// reach this.
+    pub fn assert_matches_config(&self, config: &LatentUpsamplerConfig) -> Result<()> {
+        let declared = config.mode()?;
+        if declared != self.mode() {
+            return Err(Error::Msg(format!(
+                "ltx latent upsampler: config declares {declared:?} but the weights are {:?}",
+                self.mode()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Upsample a channels-first `NCFHW` latent.
+    ///
+    /// [`LatentUpsamplerMode::Spatial2x`] → `NCF(2H)(2W)`; [`LatentUpsamplerMode::Temporal2x`] →
+    /// `NC(2F−1)HW`.
     pub fn forward(&self, latent_ncfhw: &Array) -> Result<Array> {
+        let frames_in = latent_ncfhw.shape()[2] as usize;
+        let frames_out = self.output_frames(frames_in)?;
         // NCFHW → NFHWC for the channels-last conv ops.
         let mut x = latent_ncfhw.transpose_axes(&[0, 2, 3, 4, 1])?;
         x = self.initial_conv.forward(&x)?;
@@ -218,6 +340,16 @@ impl LatentUpsampler {
             x = b.forward(&x)?;
         }
         x = self.upsampler.forward(&x)?;
+        // Checked here, on the resampler's own output, rather than on the returned tensor: this is
+        // the only stage that moves the frame axis, so a wrong count localises to it.
+        let produced = x.shape()[1] as usize;
+        if produced != frames_out {
+            return Err(Error::Msg(format!(
+                "ltx latent upsampler: {:?} resampler turned {frames_in} latent frames into \
+                 {produced}, expected {frames_out}",
+                self.mode()
+            )));
+        }
         for b in &self.post_upsample_res_blocks {
             x = b.forward(&x)?;
         }
@@ -227,7 +359,8 @@ impl LatentUpsampler {
     }
 }
 
-/// `upsample_latents` — un-normalize (`latent·std + mean`), upsample 2×, re-normalize
+/// `upsample_latents` / upstream `upsample_video` — un-normalize (`latent·std + mean`), upsample
+/// (spatially or temporally, per the checkpoint), re-normalize
 /// (`(latent − mean)/std`). `latent_mean`/`latent_std` are the VAE `per_channel_statistics` (bf16,
 /// shape `[C]`), reshaped to broadcast over `NCFHW`.
 pub fn upsample_latents(

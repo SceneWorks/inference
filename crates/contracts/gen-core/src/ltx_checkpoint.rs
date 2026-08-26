@@ -468,6 +468,216 @@ fn string_field(v: &Value, key: &str) -> Option<String> {
 }
 
 // =================================================================================================
+// Latent upsampler config (bare root) — shared by both backends
+// =================================================================================================
+
+/// Which axis a `LatentUpsampler` checkpoint rescales.
+///
+/// Upstream `LatentUpsampler.__init__` (`Lightricks/LTX-2` @ `d1511477`, v1.2.0,
+/// `ltx_core/model/upsampler/model.py`) branches on `spatial_upsample` / `temporal_upsample` in a
+/// fixed order; this enum names the two branches the shipped LTX-2.x checkpoints select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatentUpsamplerMode {
+    /// `spatial_upsample=true, temporal_upsample=false, rational_resampler=false` —
+    /// `Conv2d(mid, 4·mid) + PixelShuffleND(2)` applied frame-by-frame. `H,W → 2H,2W`; the frame
+    /// count is untouched. Both the LTX-2.3 `upsampler.safetensors` and the LTX-2.5
+    /// `latent-spatial-upscaler-x2` checkpoint select this branch.
+    Spatial2x,
+    /// `spatial_upsample=false, temporal_upsample=true` — `Conv3d(mid, 2·mid) + PixelShuffleND(1)`,
+    /// then **the leading frame is dropped**. `F → 2F−1`; `H,W` untouched. The LTX-2.5
+    /// `latent-temporal-upscaler-x2` checkpoint selects this branch.
+    Temporal2x,
+}
+
+/// The `dims` value both shipped LTX-2.x latent upsamplers declare (3-D convolutions).
+pub const LATENT_UPSAMPLER_DIMS_3D: u64 = 3;
+/// The `spatial_scale` the shipped spatial upsampler declares.
+pub const LATENT_UPSAMPLER_SPATIAL_SCALE_2X: f64 = 2.0;
+
+/// A `LatentUpsampler`'s **bare-root** config — the whole `__metadata__["config"]` object, with no
+/// wrapper section (see [`LtxConfigRoot::BareConfig`]).
+///
+/// Field defaults are upstream `LatentUpsamplerConfigurator.from_metadata`'s defaults verbatim, so
+/// an under-stamped checkpoint resolves exactly the way upstream would resolve it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatentUpsamplerConfig {
+    /// Latent channel count in and out (`128` for every shipped checkpoint).
+    pub in_channels: u64,
+    /// Working width: `1024` spatial, `512` temporal.
+    pub mid_channels: u64,
+    /// `ResBlock`s before *and* after the resampler (`4` for every shipped checkpoint).
+    pub num_blocks_per_stage: u64,
+    /// `2` → Conv2d stack, `3` → Conv3d stack.
+    pub dims: u64,
+    /// Rescale `H`/`W`.
+    pub spatial_upsample: bool,
+    /// Rescale the frame axis.
+    pub temporal_upsample: bool,
+    /// Spatial scale factor (`2.0` for the shipped spatial upsampler).
+    pub spatial_scale: f64,
+    /// Selects upstream's `SpatialRationalResampler` — **only** on the spatial-only branch.
+    ///
+    /// The shipped temporal upsampler declares `rational_resampler: true`, but upstream's
+    /// constructor reaches the flag only inside `elif spatial_upsample:`, so on the temporal branch
+    /// it is **inert**: the module built is `Conv3d + PixelShuffleND(1)` regardless. Carrying the
+    /// declared value rather than a normalized one keeps that fact auditable instead of erasing it;
+    /// [`LatentUpsamplerConfig::mode`] is where the inertness is applied.
+    pub rational_resampler: bool,
+}
+
+impl Default for LatentUpsamplerConfig {
+    fn default() -> Self {
+        LatentUpsamplerConfig {
+            in_channels: 128,
+            mid_channels: 512,
+            num_blocks_per_stage: 4,
+            dims: LATENT_UPSAMPLER_DIMS_3D,
+            spatial_upsample: true,
+            temporal_upsample: false,
+            spatial_scale: LATENT_UPSAMPLER_SPATIAL_SCALE_2X,
+            rational_resampler: false,
+        }
+    }
+}
+
+impl LatentUpsamplerConfig {
+    /// Parse a bare `config` object. The `_class_name`, when present, must be
+    /// [`LATENT_UPSAMPLER_CLASS`] — a differently-classed bare config is a different model and is
+    /// refused rather than silently read with upsampler defaults.
+    pub fn from_value(source: &str, config: &Value) -> Result<Self> {
+        if let Some(class) = string_field(config, "_class_name") {
+            if class != LATENT_UPSAMPLER_CLASS {
+                return Err(Error::Msg(format!(
+                    "ltx: {source} declares _class_name {class:?}, expected \
+                     {LATENT_UPSAMPLER_CLASS:?}"
+                )));
+            }
+        }
+        let d = LatentUpsamplerConfig::default();
+        let u64_field = |key: &str, fallback: u64| -> u64 {
+            config.get(key).and_then(Value::as_u64).unwrap_or(fallback)
+        };
+        let bool_field = |key: &str, fallback: bool| -> bool {
+            config.get(key).and_then(Value::as_bool).unwrap_or(fallback)
+        };
+        Ok(LatentUpsamplerConfig {
+            in_channels: u64_field("in_channels", d.in_channels),
+            mid_channels: u64_field("mid_channels", d.mid_channels),
+            num_blocks_per_stage: u64_field("num_blocks_per_stage", d.num_blocks_per_stage),
+            dims: u64_field("dims", d.dims),
+            spatial_upsample: bool_field("spatial_upsample", d.spatial_upsample),
+            temporal_upsample: bool_field("temporal_upsample", d.temporal_upsample),
+            spatial_scale: config
+                .get("spatial_scale")
+                .and_then(Value::as_f64)
+                .unwrap_or(d.spatial_scale),
+            rational_resampler: bool_field("rational_resampler", d.rational_resampler),
+        })
+    }
+
+    /// Parse the bare config out of one checkpoint file's `__metadata__` (header read only).
+    ///
+    /// A file with **no** `config` at all is an error here: SceneWorks-converted trees strip
+    /// `__metadata__`, so callers that must tolerate that read the structure from the weights
+    /// instead of asking for a config that is known not to exist.
+    pub fn from_metadata(source: &Path, meta: &LtxCheckpointMetadata) -> Result<Self> {
+        let config = meta.config().ok_or_else(|| {
+            Error::Msg(format!(
+                "ltx: {} carries no __metadata__[\"config\"] — not a stamped LatentUpsampler",
+                source.display()
+            ))
+        })?;
+        Self::from_value(&source.display().to_string(), config)
+    }
+
+    /// Read one `.safetensors` file's bare upsampler config (header only).
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let meta = LtxCheckpointMetadata::from_file(path)?;
+        Self::from_metadata(path, &meta)
+    }
+
+    /// The upstream constructor branch this config selects.
+    ///
+    /// Mirrors `LatentUpsampler.__init__`'s branch order exactly, and refuses — rather than
+    /// approximating — every combination no shipped LTX-2.x checkpoint declares:
+    ///
+    /// * `spatial && temporal` builds upstream's `Conv3d(mid, 8·mid) + PixelShuffleND(3)`;
+    /// * `spatial && rational_resampler` builds `SpatialRationalResampler` (learned pixel-shuffle up
+    ///   by `num` then a fixed-blur stride-`den` downsample);
+    /// * `dims == 2` builds the frame-folded Conv2d stack;
+    /// * neither flag set is upstream's own `ValueError`.
+    ///
+    /// Each of those would need weights that no released checkpoint provides, so a typed error is
+    /// the honest answer; silently picking the nearest implemented branch would run the wrong
+    /// network against real weights.
+    pub fn mode(&self) -> Result<LatentUpsamplerMode> {
+        let unsupported = |why: &str| -> Error {
+            Error::Msg(format!(
+                "ltx latent upsampler: {why} (in_channels={}, mid_channels={}, dims={}, \
+                 spatial_upsample={}, temporal_upsample={}, spatial_scale={}, \
+                 rational_resampler={})",
+                self.in_channels,
+                self.mid_channels,
+                self.dims,
+                self.spatial_upsample,
+                self.temporal_upsample,
+                self.spatial_scale,
+                self.rational_resampler,
+            ))
+        };
+        if self.dims != LATENT_UPSAMPLER_DIMS_3D {
+            return Err(unsupported("only the dims=3 Conv3d stack is implemented"));
+        }
+        // Upstream branch order: spatial+temporal, then spatial, then temporal, then ValueError.
+        if self.spatial_upsample && self.temporal_upsample {
+            return Err(unsupported(
+                "the combined spatiotemporal branch (Conv3d + PixelShuffleND(3)) ships in no \
+                 released LTX-2.x checkpoint",
+            ));
+        }
+        if self.spatial_upsample {
+            if self.rational_resampler {
+                return Err(unsupported(
+                    "SpatialRationalResampler ships in no released LTX-2.x checkpoint",
+                ));
+            }
+            if (self.spatial_scale - LATENT_UPSAMPLER_SPATIAL_SCALE_2X).abs() > f64::EPSILON {
+                return Err(unsupported("only spatial_scale=2.0 is implemented"));
+            }
+            return Ok(LatentUpsamplerMode::Spatial2x);
+        }
+        if self.temporal_upsample {
+            // `rational_resampler` is deliberately NOT consulted: upstream reaches it only on the
+            // spatial-only branch, and the shipped temporal checkpoint declares it `true` while
+            // carrying `upsampler.0.weight` of rank 5 — a Conv3d, i.e. the plain temporal branch.
+            return Ok(LatentUpsamplerMode::Temporal2x);
+        }
+        Err(unsupported(
+            "neither spatial_upsample nor temporal_upsample is set",
+        ))
+    }
+}
+
+/// Latent frame count after a `LatentUpsampler` in `mode` consumes `frames` latent frames.
+///
+/// [`LatentUpsamplerMode::Temporal2x`] is `2·frames − 1`, not `2·frames`: upstream shuffles the
+/// frame axis by 2 and then drops the leading frame, because latent frame 0 encodes a **single**
+/// pixel frame while every later latent frame encodes a temporally-downscaled group. That is also
+/// what keeps LTX's `n % 8 == 1` latent-frame invariant: `2·(8k+1) − 1 = 16k + 1`.
+pub fn upsampled_latent_frames(frames: usize, mode: LatentUpsamplerMode) -> Result<usize> {
+    if frames == 0 {
+        return Err(Error::Msg(
+            "ltx latent upsampler: latent frame count must be >= 1".into(),
+        ));
+    }
+    Ok(match mode {
+        LatentUpsamplerMode::Spatial2x => frames,
+        LatentUpsamplerMode::Temporal2x => 2 * frames - 1,
+    })
+}
+
+// =================================================================================================
 // Caption feature-extractor selection (config-driven)
 // =================================================================================================
 
@@ -2478,6 +2688,131 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Latent upsampler config (sc-18773)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_real_upsampler_configs_select_the_two_shipped_branches() {
+        let spatial = LatentUpsamplerConfig::from_metadata(
+            Path::new("spatial"),
+            &captured_metadata(
+                "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors.json",
+            ),
+        )
+        .expect("spatial upsampler config");
+        assert_eq!(
+            spatial,
+            LatentUpsamplerConfig {
+                in_channels: 128,
+                mid_channels: 1024,
+                num_blocks_per_stage: 4,
+                dims: 3,
+                spatial_upsample: true,
+                temporal_upsample: false,
+                spatial_scale: 2.0,
+                rational_resampler: false,
+            }
+        );
+        assert_eq!(spatial.mode().unwrap(), LatentUpsamplerMode::Spatial2x);
+
+        let temporal = LatentUpsamplerConfig::from_metadata(
+            Path::new("temporal"),
+            &captured_metadata(
+             "latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors.json",
+            ),
+        )
+        .expect("temporal upsampler config");
+        assert_eq!(
+            temporal,
+            LatentUpsamplerConfig {
+                in_channels: 128,
+                mid_channels: 512,
+                num_blocks_per_stage: 4,
+                dims: 3,
+                spatial_upsample: false,
+                temporal_upsample: true,
+                spatial_scale: 1.0,
+                rational_resampler: true,
+            }
+        );
+        // The shipped temporal checkpoint declares `rational_resampler: true`, and upstream's
+        // constructor never reads it on this branch — flipping it must not move the answer.
+        assert_eq!(temporal.mode().unwrap(), LatentUpsamplerMode::Temporal2x);
+        assert_eq!(
+            LatentUpsamplerConfig {
+                rational_resampler: false,
+                ..temporal
+            }
+            .mode()
+            .unwrap(),
+            LatentUpsamplerMode::Temporal2x,
+        );
+    }
+
+    #[test]
+    fn unshipped_upsampler_branches_are_refused_not_approximated() {
+        let base = LatentUpsamplerConfig::default();
+        for (why, config) in [
+            (
+                "spatiotemporal",
+                LatentUpsamplerConfig {
+                    temporal_upsample: true,
+                    ..base
+                },
+            ),
+            (
+                "rational",
+                LatentUpsamplerConfig {
+                    rational_resampler: true,
+                    ..base
+                },
+            ),
+            (
+                "scale 1.5",
+                LatentUpsamplerConfig {
+                    spatial_scale: 1.5,
+                    ..base
+                },
+            ),
+            ("dims 2", LatentUpsamplerConfig { dims: 2, ..base }),
+            (
+                "neither axis",
+                LatentUpsamplerConfig {
+                    spatial_upsample: false,
+                    ..base
+                },
+            ),
+        ] {
+            assert!(config.mode().is_err(), "{why} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_bare_config_of_another_class_is_refused() {
+        let value: Value = serde_json::from_str(r#"{"_class_name":"DurationHead"}"#).unwrap();
+        assert!(LatentUpsamplerConfig::from_value("f", &value).is_err());
+    }
+
+    #[test]
+    fn temporal_upsampling_preserves_the_frame_count_invariant() {
+        for latent_frames in [1usize, 9, 17, 25, 121] {
+            assert_eq!(latent_frames % 8, 1, "test input {latent_frames}");
+            let up =
+                upsampled_latent_frames(latent_frames, LatentUpsamplerMode::Temporal2x).unwrap();
+            assert_eq!(up, 2 * latent_frames - 1, "{latent_frames}");
+            assert_eq!(up % 8, 1, "{latent_frames} -> {up} breaks n % 8 == 1");
+        }
+        // The spatial branch is frame-preserving.
+        for latent_frames in [1usize, 9, 17] {
+            assert_eq!(
+                upsampled_latent_frames(latent_frames, LatentUpsamplerMode::Spatial2x).unwrap(),
+                latent_frames
+            );
+        }
+        assert!(upsampled_latent_frames(0, LatentUpsamplerMode::Temporal2x).is_err());
     }
 
     #[test]
