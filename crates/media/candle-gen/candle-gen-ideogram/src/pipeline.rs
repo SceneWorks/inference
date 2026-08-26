@@ -823,17 +823,29 @@ fn denoise(
 
     // ── Packed positions / segments / role indicators (host-built) ──
     let pack = Packing::build(num_text, grid_h, grid_w);
-    let position_ids = Tensor::from_vec(pack.position_ids, (1, seq, 3), device)?;
-    let segment_ids = Tensor::from_vec(pack.segment_ids, (1, seq), device)?;
-    let indicator = Tensor::from_vec(pack.indicator, (1, seq), device)?;
+    let position_ids = Tensor::from_vec(pack.position_ids.clone(), (1, seq, 3), device)?;
+    let prepared = cond.prepare_from_host(
+        &llm_features,
+        &pack.indicator,
+        &pack.segment_ids,
+        &position_ids,
+        1,
+        seq,
+    )?;
     let neg = match uncond {
-        Some(uncond) => Some((
-            uncond,
-            Tensor::from_vec(pack.neg_position_ids, (1, num_img, 3), device)?,
-            Tensor::from_vec(pack.neg_segment_ids, (1, num_img), device)?,
-            Tensor::from_vec(pack.neg_indicator, (1, num_img), device)?,
-            Tensor::zeros((1, num_img, llm_dim), ENC_DTYPE, device)?,
-        )),
+        Some(uncond) => {
+            let neg_position_ids =
+                Tensor::from_vec(pack.neg_position_ids.clone(), (1, num_img, 3), device)?;
+            let neg_llm = Tensor::zeros((1, num_img, llm_dim), ENC_DTYPE, device)?;
+            Some(uncond.prepare_from_host(
+                &neg_llm,
+                &pack.neg_indicator,
+                &pack.neg_segment_ids,
+                &neg_position_ids,
+                1,
+                num_img,
+            )?)
+        }
         None => None,
     };
 
@@ -912,30 +924,15 @@ fn denoise(
         let t = Tensor::from_vec(vec![t_val], 1, device)?;
 
         let pos_z = Tensor::cat(&[&text_z_padding, &z], 1)?; // [1, seq, ch]
-        let pos_out = cond.forward(
-            &llm_features,
-            &pos_z,
-            &t,
-            &position_ids,
-            &segment_ids,
-            &indicator,
-            attention_budget,
-            &req.cancel,
-        )?;
+        let pos_out =
+            cond.forward_prepared(&pos_z, &t, &prepared, attention_budget, &req.cancel)?;
         let pos_v = pos_out.narrow(1, num_text, num_img)?; // image-token velocities [1, num_img, ch]
 
         let v = match &neg {
-            Some((uncond, neg_pos, neg_seg, neg_ind, neg_llm)) => {
-                let neg_v = uncond.forward(
-                    neg_llm,
-                    &z,
-                    &t,
-                    neg_pos,
-                    neg_seg,
-                    neg_ind,
-                    attention_budget,
-                    &req.cancel,
-                )?;
+            Some(neg_prepared) => {
+                let neg_v = uncond
+                    .expect("unconditional prepared conditioning has an unconditional DiT")
+                    .forward_prepared(&z, &t, neg_prepared, attention_budget, &req.cancel)?;
                 // Per-step asymmetric CFG: the loop runs i = steps-1 → 0, so the final POLISH_STEPS
                 // are i ∈ {0,1,2}.
                 let gw = if i < POLISH_STEPS {

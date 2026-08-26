@@ -42,14 +42,6 @@ pub struct Ideogram4Transformer {
     /// Sinusoidal frequencies for the `t` embedding (`[1, emb_dim/2]`, f32).
     t_freqs: Tensor,
     dtype: DType,
-    /// Per-render step-invariant-tensor cache (sc-8992 / F-012). The role masks (from `indicator`), the
-    /// segment attention mask (from `segment_ids`), and the MRoPE `(cos, sin)` tables (from
-    /// `position_ids`) depend only on the fixed packing geometry — not on σ / `t` / the current latent —
-    /// so they are identical across every denoise step (×2 under CFG). This crate previously rebuilt the
-    /// `[B,1,L,L]` mask in a host loop and round-tripped `indicator` device→host **every** forward.
-    /// Cache them keyed on the (loop-invariant) inputs' host contents. `Mutex` (not `RefCell`): the DiT
-    /// is used behind a shared cache and must stay `Send + Sync`.
-    cond_cache: std::sync::Mutex<Option<PreparedCond>>,
 }
 
 enum TransformerLayers {
@@ -78,21 +70,16 @@ impl Drop for MaterializedWindow {
     }
 }
 
-/// The step-invariant conditioning tensors prepared once per render (sc-8992). `seg_mask = None` when
+/// The step-invariant conditioning tensors prepared once per render (sc-11280). `seg_mask = None` when
 /// every token shares a segment id — the additive mask is provably all-zeros, so the per-block add is
 /// skipped entirely (softmax over `scores + 0` == softmax over `scores`, so the step is byte-identical).
-struct PreparedCond {
-    b: usize,
-    l: usize,
-    indicator: Vec<i64>,
-    segment_ids: Vec<i64>,
-    position_ids: Vec<f32>,
-    llm_mask: Tensor,
+pub(crate) struct PreparedConditioning {
     img_mask: Tensor,
-    img_idx: Tensor,
     cos: Tensor,
     sin: Tensor,
     seg_mask: Option<Tensor>,
+    llm: Tensor,
+    indicator_emb: Tensor,
 }
 
 impl Ideogram4Transformer {
@@ -137,7 +124,6 @@ impl Ideogram4Transformer {
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
-            cond_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -203,7 +189,6 @@ impl Ideogram4Transformer {
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
-            cond_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -312,27 +297,87 @@ impl Ideogram4Transformer {
         cancel: &CancelFlag,
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
-        // The role masks, MRoPE tables, and segment mask are step-invariant (fixed packing geometry),
-        // so build them once per render and reuse across every step / CFG pass (sc-8992). `seg_mask`
-        // is `None` for the always-uniform-segment path this pipeline drives — the mask is all-zeros,
-        // so the per-block add is skipped (byte-identical after softmax).
-        let (llm_mask, img_mask, img_idx, cos, sin, seg_mask) =
-            self.prepared_cond(indicator, segment_ids, position_ids, b, l)?;
+        let prepared = self.prepare(llm_features, indicator, segment_ids, position_ids, b, l)?;
+        self.forward_prepared(x, t, &prepared, attention_budget, cancel)
+    }
 
+    /// Materialize request-scoped geometry conditioning. The caller owns the handle, rather than the
+    /// model retaining a mutable cache, so repeated forwards never need a device-to-host key readback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_from_host(
+        &self,
+        llm_features: &Tensor,
+        indicator: &[i64],
+        segment_ids: &[i64],
+        position_ids: &Tensor,
+        b: usize,
+        l: usize,
+    ) -> Result<PreparedConditioning> {
+        let (llm_mask, img_mask, img_idx) =
+            role_tensors(indicator, b, l, self.dtype, position_ids.device())?;
+        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
+        let seg_mask = segment_mask(segment_ids, b, l, position_ids.device())?;
         let llm_features = llm_features
             .to_dtype(self.dtype)?
             .broadcast_mul(&llm_mask)?;
-        let x = x.to_dtype(self.dtype)?.broadcast_mul(&img_mask)?;
-        let x = self.input_proj.forward(&x)?.broadcast_mul(&img_mask)?;
+        let llm = rmsnorm(&llm_features, &self.llm_cond_norm, COND_NORM_EPS)?;
+        let llm = self.llm_cond_proj.forward(&llm)?.broadcast_mul(&llm_mask)?;
+        let indicator_emb = self.embed_image_indicator.forward(&img_idx)?;
+        Ok(PreparedConditioning {
+            img_mask,
+            cos,
+            sin,
+            seg_mask,
+            llm,
+            indicator_emb,
+        })
+    }
+
+    /// Compatibility preparation entry for one-off callers. Render loops must use
+    /// [`prepare_from_host`](Self::prepare_from_host) while the packing is still host-owned.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &self,
+        llm_features: &Tensor,
+        indicator: &Tensor,
+        segment_ids: &Tensor,
+        position_ids: &Tensor,
+        b: usize,
+        l: usize,
+    ) -> Result<PreparedConditioning> {
+        let ind = indicator
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let seg = segment_ids
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        self.prepare_from_host(llm_features, &ind, &seg, position_ids, b, l)
+    }
+
+    /// Run one denoise forward against request-scoped prepared conditioning.
+    pub(crate) fn forward_prepared(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+        attention_budget: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Tensor> {
+        let img_mask = &prepared.img_mask;
+        let cos = &prepared.cos;
+        let sin = &prepared.sin;
+        let seg_mask = &prepared.seg_mask;
+
+        let x = x.to_dtype(self.dtype)?.broadcast_mul(img_mask)?;
+        let x = self.input_proj.forward(&x)?.broadcast_mul(img_mask)?;
 
         let t_cond = self.t_embedding(t)?.unsqueeze(1)?; // [B,1,emb]
         let adaln_input = self.adaln_proj.forward(&t_cond)?.silu()?; // [B,1,adaln]
 
-        let llm = rmsnorm(&llm_features, &self.llm_cond_norm, COND_NORM_EPS)?;
-        let llm = self.llm_cond_proj.forward(&llm)?.broadcast_mul(&llm_mask)?;
-
-        let mut h = (&x + &llm)?;
-        h = (h + self.embed_image_indicator.forward(&img_idx)?)?;
+        let mut h = (&x + &prepared.llm)?;
+        h = (h + &prepared.indicator_emb)?;
 
         match &self.layers {
             TransformerLayers::Resident(layers) => {
@@ -344,8 +389,8 @@ impl Ideogram4Transformer {
                     }
                     h = layer.forward(
                         &h,
-                        &cos,
-                        &sin,
+                        cos,
+                        sin,
                         seg_mask.as_ref(),
                         &adaln_input,
                         attention_budget,
@@ -380,8 +425,8 @@ impl Ideogram4Transformer {
                     for (_, layer) in &window.layers {
                         h = layer.forward(
                             &h,
-                            &cos,
-                            &sin,
+                            cos,
+                            sin,
                             seg_mask.as_ref(),
                             &adaln_input,
                             attention_budget,
@@ -398,74 +443,6 @@ impl Ideogram4Transformer {
         let normed = layer_norm_no_affine(&h, FINAL_NORM_EPS)?;
         let out = self.final_linear.forward(&normed.broadcast_mul(&scale)?)?;
         out.to_dtype(DType::F32)
-    }
-
-    /// Build (or reuse) the step-invariant conditioning tensors for this render (sc-8992): the role
-    /// masks (`indicator`), the MRoPE `(cos, sin)` (`position_ids`), and the segment attention mask
-    /// (`segment_ids`; `None` when all segment ids are equal → the mask is all-zeros and the per-block
-    /// add is skipped). Recomputed only when the loop-invariant inputs change; otherwise the Arc-backed
-    /// handles are cloned. The construction is identical to computing it inline, so every step is
-    /// byte-identical.
-    #[allow(clippy::type_complexity)]
-    fn prepared_cond(
-        &self,
-        indicator: &Tensor,
-        segment_ids: &Tensor,
-        position_ids: &Tensor,
-        b: usize,
-        l: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Option<Tensor>)> {
-        let ind: Vec<i64> = indicator
-            .to_dtype(DType::I64)?
-            .flatten_all()?
-            .to_vec1::<i64>()?;
-        let seg: Vec<i64> = segment_ids
-            .to_dtype(DType::I64)?
-            .flatten_all()?
-            .to_vec1::<i64>()?;
-        let pos: Vec<f32> = position_ids
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-
-        let mut guard = candle_gen::lock_recover(&self.cond_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.b == b
-                && c.l == l
-                && c.indicator == ind
-                && c.segment_ids == seg
-                && c.position_ids == pos
-            {
-                return Ok((
-                    c.llm_mask.clone(),
-                    c.img_mask.clone(),
-                    c.img_idx.clone(),
-                    c.cos.clone(),
-                    c.sin.clone(),
-                    c.seg_mask.clone(),
-                ));
-            }
-        }
-
-        let (llm_mask, img_mask, img_idx) =
-            role_tensors(&ind, b, l, self.dtype, indicator.device())?;
-        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
-        let seg_mask = segment_mask(&seg, b, l, indicator.device())?;
-
-        *guard = Some(PreparedCond {
-            b,
-            l,
-            indicator: ind,
-            segment_ids: seg,
-            position_ids: pos,
-            llm_mask: llm_mask.clone(),
-            img_mask: img_mask.clone(),
-            img_idx: img_idx.clone(),
-            cos: cos.clone(),
-            sin: sin.clone(),
-            seg_mask: seg_mask.clone(),
-        });
-        Ok((llm_mask, img_mask, img_idx, cos, sin, seg_mask))
     }
 }
 

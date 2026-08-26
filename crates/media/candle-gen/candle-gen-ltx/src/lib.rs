@@ -608,6 +608,7 @@ impl Pipeline {
                 audio,
             )
         } else {
+            let stage1_rope = comps.avdit.prepare_rope(&video_grid, &audio_grid)?;
             let out = run_av_curated_sampler(
                 req.sampler.as_deref(),
                 &STAGE1_SIGMAS[..],
@@ -621,14 +622,13 @@ impl Pipeline {
                 |av, sigma| -> CResult<AvLatents> {
                     let vflat = pipeline::flatten_latent(&av.video)?;
                     let aflat = pipeline::flatten_audio_latent(&av.audio)?;
-                    let (vvel, avel) = comps.avdit.forward(
+                    let (vvel, avel) = comps.avdit.forward_prepared(
                         &vflat,
                         &aflat,
                         sigma as f64,
                         &video_ctx,
                         &audio_ctx,
-                        &video_grid,
-                        &audio_grid,
+                        &stage1_rope,
                     )?;
                     Ok(AvLatents {
                         video: pipeline::unflatten_latent(
@@ -688,6 +688,7 @@ impl Pipeline {
             }
         };
         let stage2 = if stage2_keyframes.is_empty() {
+            let stage2_rope = comps.avdit.prepare_rope(&stage2_grid, &audio_grid)?;
             run_av_curated_sampler(
                 req.sampler.as_deref(),
                 &STAGE2_SIGMAS,
@@ -699,14 +700,13 @@ impl Pipeline {
                     orchestration.stage2_forward(|| {
                         let vflat = pipeline::flatten_latent(&av.video)?;
                         let aflat = pipeline::flatten_audio_latent(&av.audio)?;
-                        let (vvel, avel) = comps.avdit.forward(
+                        let (vvel, avel) = comps.avdit.forward_prepared(
                             &vflat,
                             &aflat,
                             sigma as f64,
                             &video_ctx,
                             &audio_ctx,
-                            &stage2_grid,
-                            &audio_grid,
+                            &stage2_rope,
                         )?;
                         Ok(AvLatents {
                             video: pipeline::unflatten_latent(

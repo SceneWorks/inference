@@ -22,6 +22,7 @@
 //! engine (epic 7153, sc-7265). It contains no model-specific code.
 
 use crate::caption::{CaptionCapabilities, CaptionOptions};
+use crate::gen_core;
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
 pub const JOY_CAPTION_FAMILY: &str = "joycaption";
@@ -189,21 +190,9 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
         .replace("{word_count}", caption_length)
 }
 
-pub fn apply_trigger_words(caption: &str, trigger_words: &[String]) -> String {
-    let cleaned = caption.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower_caption = cleaned.to_lowercase();
-    let mut parts: Vec<String> = trigger_words
-        .iter()
-        .map(|word| word.trim())
-        .filter(|word| !word.is_empty())
-        .filter(|word| !lower_caption.contains(&word.to_lowercase()))
-        .map(ToOwned::to_owned)
-        .collect();
-    if !cleaned.is_empty() {
-        parts.push(cleaned);
-    }
-    parts.join(", ")
-}
+/// Compatibility export for backend callers. The policy itself is backend-neutral and lives in
+/// `gen-core`, shared with the SceneWorks worker.
+pub use gen_core::apply_caption_trigger_words as apply_trigger_words;
 
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES

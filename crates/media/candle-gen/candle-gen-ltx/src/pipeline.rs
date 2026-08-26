@@ -336,6 +336,9 @@ pub fn denoise_av_conditioned(
 ) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
     let mut state = video.clone();
     let mut alat = audio.clone();
+    // The conditioned state owns its final geometry (including appended clip tokens), so prepare
+    // RoPE only after that state is complete and retain it for every denoise step.
+    let prepared_rope = dit.prepare_rope(&state.positions, audio_grid)?;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
     for (step, window) in sigmas.windows(2).enumerate() {
         if cancel.is_cancelled() {
@@ -345,15 +348,14 @@ pub fn denoise_av_conditioned(
         let (sigma, sigma_next) = (window[0], window[1]);
         let aflat = flatten_audio_latent(&alat)?;
         let timesteps = state.token_timesteps(sigma)?;
-        let (vvel, avel) = dit.forward_conditioned(
+        let (vvel, avel) = dit.forward_conditioned_prepared(
             &state.latent,
             &aflat,
             &timesteps,
             sigma as f64,
             video_ctx,
             audio_ctx,
-            &state.positions,
-            audio_grid,
+            &prepared_rope,
         )?;
         let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
         let vden = conditioning::apply_denoise_mask(

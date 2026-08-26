@@ -14,14 +14,5 @@
 #[path = "conformance.rs"]
 mod conformance;
 
-#[path = "descriptor_conformance.rs"]
-mod descriptor_conformance;
-
-#[path = "generate_real_weights.rs"]
-mod generate_real_weights;
-
-#[path = "registry.rs"]
-mod registry;
-
 #[path = "trigger_words.rs"]
 mod trigger_words;

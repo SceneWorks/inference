@@ -24,6 +24,8 @@
 //! With **no** adapter attached the forward is byte-identical to the bare base, so swapping this in for
 //! a projection leaves the plain-model / dense-fold paths unchanged.
 
+use std::sync::{Arc, Mutex};
+
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
@@ -119,7 +121,14 @@ enum Adapter {
     /// LoRA residual `scale·((x·a)·b)`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with
     /// the `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form — never
     /// the `[out,in]` product — so it stays memory-free on any quant.
-    Lora { a: Tensor, b: Tensor, scale: f64 },
+    Lora {
+        a: Tensor,
+        b: Tensor,
+        scale: f64,
+        /// Frozen adapter factors have no live `Var` leaves. Prepare their compute-dtype casts once
+        /// per installed adapter/dtype instead of rebuilding them for every denoise step.
+        prepared: PreparedLora,
+    },
     /// Training LoRA keeps the canonical `down [rank,in]` / `up [out,rank]` variable leaves and
     /// transposes them inside every forward. Holding a precomputed transpose here would retain an
     /// eager graph node from adapter installation rather than make the owning `Var`s leaves of each
@@ -141,6 +150,48 @@ enum Adapter {
     /// baked into [`LokrFactors::w2`], so a LoKr applies WITHOUT ever forming the `[out,in]` delta (the
     /// packed-capable path the whole hoist adds over Wan's old dense-only delta).
     LokrStructured { factors: LokrFactors },
+}
+
+/// Compute-dtype views of a frozen LoRA's already-oriented factors. This is deliberately absent from
+/// `TrainableLora`: caching an eager transpose/cast graph there would detach the next loss from its
+/// `Var` leaves and silently hide optimizer updates.
+#[derive(Clone, Default)]
+struct PreparedLora {
+    by_dtype: Arc<Mutex<Vec<(DType, Tensor, Tensor)>>>,
+}
+
+impl PreparedLora {
+    fn factors(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        dtype: DType,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        let mut prepared = self.by_dtype.lock().map_err(|_| {
+            candle_core::Error::Msg("frozen LoRA preparation cache lock poisoned".into())
+        })?;
+        if let Some((_, a, b)) = prepared.iter().find(|(cached, _, _)| *cached == dtype) {
+            return Ok((a.clone(), b.clone()));
+        }
+        let a = a.to_dtype(dtype)?;
+        let b = b.to_dtype(dtype)?;
+        prepared.push((dtype, a.clone(), b.clone()));
+        Ok((a, b))
+    }
+
+    fn count(&self) -> usize {
+        self.by_dtype.lock().map_or(0, |prepared| prepared.len())
+    }
+
+    fn clear(&self) -> candle_core::Result<()> {
+        self.by_dtype
+            .lock()
+            .map_err(|_| {
+                candle_core::Error::Msg("frozen LoRA preparation cache lock poisoned".into())
+            })?
+            .clear();
+        Ok(())
+    }
 }
 
 /// Apply a **2-D** factor `w` `[in, out]` to an activation `x` whose last dim is `in`, folding every
@@ -190,9 +241,15 @@ impl Adapter {
     /// The residual this adapter contributes, in the activation dtype of `x`.
     fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
-            Adapter::Lora { a, b, scale } => {
+            Adapter::Lora {
+                a,
+                b,
+                scale,
+                prepared,
+            } => {
                 let xd = x.dtype();
-                let r = apply_factor(&apply_factor(x, &a.to_dtype(xd)?)?, &b.to_dtype(xd)?)?;
+                let (a, b) = prepared.factors(a, b, xd)?;
+                let r = apply_factor(&apply_factor(x, &a)?, &b)?;
                 r * *scale
             }
             Adapter::TrainableLora { down, up, scale } => {
@@ -229,9 +286,10 @@ impl Adapter {
     /// Move this residual's factors onto `device`, in place (the dense-leaf migration seam, sc-11105).
     fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
         match self {
-            Adapter::Lora { a, b, .. } => {
+            Adapter::Lora { a, b, prepared, .. } => {
                 *a = a.to_device(device)?;
                 *b = b.to_device(device)?;
+                prepared.clear()?;
             }
             Adapter::TrainableLora { down, up, .. } => {
                 *down = down.to_device(device)?;
@@ -241,10 +299,8 @@ impl Adapter {
                 *w1 = w1.to_device(device)?;
                 *w2 = w2.to_device(device)?;
             }
-            // `LokrFactors` fields are same-module-private; move `w1`/`w2` directly (candle_core::Result).
             Adapter::LokrStructured { factors } => {
-                factors.w1 = factors.w1.to_device(device)?;
-                factors.w2 = factors.w2.to_device(device)?;
+                factors.migrate_to(device)?;
             }
         }
         Ok(())
@@ -286,6 +342,10 @@ pub struct LokrFactors {
     /// Pre-bake scale retained solely so a disabled structured LoKr can be skipped before reading
     /// factors. The residual math continues to use the scale already baked into `w2`.
     pub(crate) scale: f64,
+    /// Frozen factors are immutable, so their activation-dtype casts/transposed right leg can be
+    /// retained once per compute dtype. Unlike the trainable LoKr variant this cache has no eager
+    /// graph connected to `Var` leaves.
+    prepared: Arc<Mutex<Vec<(DType, Tensor, Tensor)>>>,
 }
 
 impl LokrFactors {
@@ -445,6 +505,7 @@ impl LokrFactors {
             d,
             output_slice,
             scale,
+            prepared: Arc::default(),
         }))
     }
 
@@ -460,7 +521,39 @@ impl LokrFactors {
             d: self.d,
             output_slice: self.output_slice,
             scale: self.scale,
+            // Migration installs a new frozen adapter payload; retain only factors on the target
+            // device and lazily prepare its target-dtype views there.
+            prepared: Arc::default(),
         })
+    }
+
+    fn prepared_factors(&self, dtype: DType) -> candle_core::Result<(Tensor, Tensor)> {
+        let mut prepared = self.prepared.lock().map_err(|_| {
+            candle_core::Error::Msg("frozen LoKr preparation cache lock poisoned".into())
+        })?;
+        if let Some((_, w1, w2t)) = prepared.iter().find(|(cached, _, _)| *cached == dtype) {
+            return Ok((w1.clone(), w2t.clone()));
+        }
+        let w1 = self.w1.to_dtype(dtype)?;
+        let w2t = self.w2.to_dtype(dtype)?.t()?.contiguous()?;
+        prepared.push((dtype, w1.clone(), w2t.clone()));
+        Ok((w1, w2t))
+    }
+
+    fn preparation_count(&self) -> usize {
+        self.prepared.lock().map_or(0, |prepared| prepared.len())
+    }
+
+    fn migrate_to(&mut self, device: &Device) -> candle_core::Result<()> {
+        self.w1 = self.w1.to_device(device)?;
+        self.w2 = self.w2.to_device(device)?;
+        self.prepared
+            .lock()
+            .map_err(|_| {
+                candle_core::Error::Msg("frozen LoKr preparation cache lock poisoned".into())
+            })?
+            .clear();
+        Ok(())
     }
 
     /// The deferred, allocation-free LoKr residual via the Kronecker–vector identity (`scale` already
@@ -474,8 +567,7 @@ impl LokrFactors {
     /// channel, sc-11103) applies it without reaching through an [`AdaptLinear`].
     pub fn residual(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let xd = x.dtype();
-        let w1 = self.w1.to_dtype(xd)?;
-        let w2t = self.w2.to_dtype(xd)?.t()?.contiguous()?; // [d, b]
+        let (w1, w2t) = self.prepared_factors(xd)?; // [d, b]
         let dims = x.dims();
         let lead = &dims[..dims.len() - 1];
         let n: usize = lead.iter().product::<usize>().max(1);
@@ -839,7 +931,12 @@ impl AdaptLinear {
         if matches!(self.base, Base::Nvfp4(_)) {
             return self.push_lora_checked(a, b, scale);
         }
-        self.adapters.push(Adapter::Lora { a, b, scale });
+        self.adapters.push(Adapter::Lora {
+            a,
+            b,
+            scale,
+            prepared: PreparedLora::default(),
+        });
         Ok(())
     }
 
@@ -870,7 +967,12 @@ impl AdaptLinear {
         }
         self.check_factor_admissible("LoRA `a`", &a)?;
         self.check_factor_admissible("LoRA `b`", &b)?;
-        self.adapters.push(Adapter::Lora { a, b, scale });
+        self.adapters.push(Adapter::Lora {
+            a,
+            b,
+            scale,
+            prepared: PreparedLora::default(),
+        });
         Ok(())
     }
 
@@ -935,6 +1037,20 @@ impl AdaptLinear {
             }
         }
         Ok(())
+    }
+
+    /// Number of frozen LoRA/LoKr factor preparations retained by this projection. There is at most
+    /// one preparation per installed frozen adapter and compute dtype; trainable adapters contribute
+    /// zero because their factors must remain live in every eager loss graph.
+    pub fn frozen_adapter_preparation_count(&self) -> usize {
+        self.adapters
+            .iter()
+            .map(|adapter| match adapter {
+                Adapter::Lora { prepared, .. } => prepared.count(),
+                Adapter::LokrStructured { factors } => factors.preparation_count(),
+                Adapter::TrainableLora { .. } | Adapter::TrainableLokr { .. } => 0,
+            })
+            .sum()
     }
 
     /// Attach a trainable LoRA residual whose canonical factors are `Var`-backed. Unlike
@@ -1961,6 +2077,86 @@ mod tests {
             dev_max < 1e-4,
             "decomposed structured LoKr != materialized delta ({dev_max})"
         );
+    }
+
+    /// Frozen factors prepare one compute-dtype view per installed residual and reuse it across
+    /// forwards. The trainable residual deliberately contributes no cached preparation: its live
+    /// leaves still transpose inside every eager graph.
+    #[test]
+    fn frozen_adapter_factors_prepare_once_per_compute_dtype() {
+        let dev = Device::Cpu;
+        let mut linear = AdaptLinear::from_dense(
+            Linear::new(Tensor::zeros((4, 4), DType::F32, &dev).unwrap(), None),
+            4,
+            4,
+        );
+        linear
+            .push_lora(
+                Tensor::ones((4, 2), DType::F32, &dev).unwrap(),
+                Tensor::ones((2, 4), DType::F32, &dev).unwrap(),
+                0.5,
+            )
+            .unwrap();
+        let factors = LokrFactors::build(
+            0.25,
+            (4, 4),
+            Some(&Tensor::eye(2, DType::F32, &dev).unwrap()),
+            None,
+            None,
+            Some(&Tensor::eye(2, DType::F32, &dev).unwrap()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("2x2 Kronecker factors fit the 4x4 base");
+        linear.push_lokr_structured(factors).unwrap();
+        linear.push_trainable_lora(
+            Tensor::ones((2, 4), DType::F32, &dev).unwrap(),
+            Tensor::ones((4, 2), DType::F32, &dev).unwrap(),
+            0.25,
+        );
+
+        let f32 = Tensor::ones((1, 4), DType::F32, &dev).unwrap();
+        linear.forward(&f32).unwrap();
+        linear.forward(&f32).unwrap();
+        assert_eq!(
+            linear.frozen_adapter_preparation_count(),
+            2,
+            "one f32 preparation for each frozen LoRA/LoKr, none for trainable LoRA"
+        );
+
+        // CPU matmul only supports f32, but these are the exact frozen prepare helpers used by a
+        // bf16/metal or CUDA forward. Probe a second compute dtype without constructing an unsupported
+        // CPU matmul, then verify it is cached rather than recreated.
+        match &linear.adapters[0] {
+            Adapter::Lora { a, b, prepared, .. } => {
+                prepared.factors(a, b, DType::BF16).unwrap();
+                prepared.factors(a, b, DType::BF16).unwrap();
+            }
+            _ => panic!("first residual must be frozen LoRA"),
+        }
+        match &linear.adapters[1] {
+            Adapter::LokrStructured { factors } => {
+                factors.prepared_factors(DType::BF16).unwrap();
+                factors.prepared_factors(DType::BF16).unwrap();
+            }
+            _ => panic!("second residual must be frozen LoKr"),
+        }
+        assert_eq!(
+            linear.frozen_adapter_preparation_count(),
+            4,
+            "the bf16 views are added once, then reused on the second preparation"
+        );
+
+        linear.to_device(&dev).unwrap();
+        assert_eq!(
+            linear.frozen_adapter_preparation_count(),
+            0,
+            "migration must discard stale device-specific frozen views"
+        );
+        linear.forward(&f32).unwrap();
+        assert_eq!(linear.frozen_adapter_preparation_count(), 2);
     }
 
     /// **Acceptance parity on a PACKED base.** The structured LoKr installs on a packed q4 base, the

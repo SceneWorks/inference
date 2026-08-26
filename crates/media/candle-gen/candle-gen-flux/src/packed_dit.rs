@@ -37,7 +37,7 @@ use std::sync::Arc;
 use crate::ip_adapter::FluxIpInjector;
 use crate::ip_dit::{
     apply_rope, control_residual_interval, scaled_dot_product_attention_planned,
-    timestep_embedding, Config, DitImageInjector, EmbedNd,
+    timestep_embedding, Config, DitImageInjector, EmbedNd, PreparedConditioning,
 };
 use crate::quant::QLinear;
 
@@ -774,6 +774,29 @@ enum PackedFluxBlocks {
 }
 
 impl PackedFluxDit {
+    pub(crate) fn prepare_conditioning(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+        let pe = ids.apply(&self.pe_embedder)?;
+        Ok(PreparedConditioning {
+            img_shape: img.dims().to_vec(),
+            img_ids_shape: img_ids.dims().to_vec(),
+            txt_shape: txt.dims().to_vec(),
+            txt_ids_shape: txt_ids.dims().to_vec(),
+            dtype: img.dtype(),
+            img_ids_dtype: img_ids.dtype(),
+            txt_dtype: txt.dtype(),
+            txt_ids_dtype: txt_ids.dtype(),
+            device: img.device().location(),
+            pe,
+        })
+    }
+
     fn num_double_blocks(&self) -> usize {
         match &self.blocks {
             PackedFluxBlocks::Resident { double, .. } => double.len(),
@@ -981,6 +1004,7 @@ impl PackedFluxDit {
             )),
             usize::MAX,
             &candle_gen::gen_core::CancelFlag::default(),
+            None,
         )
         .map_err(|error| match error {
             candle_gen::CandleError::Candle(error) => error,
@@ -1017,6 +1041,7 @@ impl PackedFluxDit {
             attention_plan,
             transformer_window,
             cancel,
+            None,
         )
     }
 
@@ -1052,6 +1077,7 @@ impl PackedFluxDit {
             attention_plan,
             transformer_window,
             cancel,
+            None,
         )
     }
 
@@ -1087,10 +1113,12 @@ impl PackedFluxDit {
             attention_plan,
             transformer_window,
             cancel,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn forward_with_memory(
         &self,
         img: &Tensor,
@@ -1118,6 +1146,43 @@ impl PackedFluxDit {
             attention_plan,
             transformer_window,
             cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector<'_>>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Tensor> {
+        self.forward_core(
+            img,
+            img_ids,
+            txt,
+            txt_ids,
+            timesteps,
+            pooled,
+            guidance,
+            ip,
+            injector,
+            control,
+            attention_plan,
+            transformer_window,
+            cancel,
+            Some(prepared),
         )
     }
 
@@ -1137,11 +1202,18 @@ impl PackedFluxDit {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &candle_gen::gen_core::CancelFlag,
+        prepared: Option<&PreparedConditioning>,
     ) -> candle_gen::Result<Tensor> {
         let mut hidden = self.x_embedder.forward(img)?;
         let mut encoder = self.context_embedder.forward(txt)?;
         let emb = self.time_text_embed.forward(timesteps, guidance, pooled)?;
-        let pe = Tensor::cat(&[txt_ids, img_ids], 1)?.apply(&self.pe_embedder)?;
+        let pe = match prepared {
+            Some(prepared) => {
+                prepared.validate(img, img_ids, txt, txt_ids)?;
+                prepared.pe.clone()
+            }
+            None => Tensor::cat(&[txt_ids, img_ids], 1)?.apply(&self.pe_embedder)?,
+        };
         let control = control.filter(|(residuals, _)| !residuals.is_empty());
         let scaled_control = match control {
             Some((residuals, scale)) => {
@@ -1361,6 +1433,114 @@ mod tests {
         assert_eq!(out.dims(), &[b, img_seq, 64]);
         let max = out.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(max.is_finite(), "DiT output must be finite, got max {max}");
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_packed_conditioning_is_reused_by_base_and_control_forwards() -> Result<()> {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg(true);
+        let vm = VarMap::new();
+        let dit = PackedFluxDit::new(&cfg, 2, 2, VarBuilder::from_varmap(&vm, DType::F32, &dev))?;
+        let (b, img_seq, txt_seq) = (1usize, 4usize, 3usize);
+        let img = Tensor::randn(0f32, 1f32, (b, img_seq, 64), &dev)?;
+        let txt = Tensor::randn(0f32, 1f32, (b, txt_seq, 4096), &dev)?;
+        let pooled = Tensor::randn(0f32, 1f32, (b, 768), &dev)?;
+        let img_ids = Tensor::zeros((b, img_seq, 3), DType::F32, &dev)?;
+        let txt_ids = Tensor::zeros((b, txt_seq, 3), DType::F32, &dev)?;
+        let ts = Tensor::full(0.5f32, b, &dev)?;
+        let guidance = Tensor::full(3.5f32, b, &dev)?;
+        let mut prepared = dit
+            .prepare_conditioning(&img, &img_ids, &txt, &txt_ids)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(dit.pe_embedder.forward_calls(), 1);
+        let plan =
+            || AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let base = dit
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &ts,
+                &pooled,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        let residual = Tensor::zeros((b, img_seq, cfg.hidden_size), DType::F32, &dev)?;
+        let control = dit
+            .forward_prepared_with_memory(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &ts,
+                &pooled,
+                Some(&guidance),
+                None,
+                None,
+                Some((std::slice::from_ref(&residual), 0.7)),
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(base.to_vec3::<f32>()?, control.to_vec3::<f32>()?);
+        assert_eq!(
+            dit.pe_embedder.forward_calls(),
+            1,
+            "packed base/control forwards must not reconstruct PE"
+        );
+        let stale = Tensor::zeros((b, img_seq + 1, 64), DType::F32, &dev)?;
+        let stale_ids = Tensor::zeros((b, img_seq + 1, 3), DType::F32, &dev)?;
+        assert!(dit
+            .forward_prepared_with_memory(
+                &stale,
+                &stale_ids,
+                &txt,
+                &txt_ids,
+                &ts,
+                &pooled,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        let wrong_dtype = img.to_dtype(DType::F64)?;
+        assert!(dit
+            .forward_prepared_with_memory(
+                &wrong_dtype,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &ts,
+                &pooled,
+                Some(&guidance),
+                None,
+                None,
+                None,
+                &prepared,
+                plan(),
+                usize::MAX,
+                &cancel,
+            )
+            .is_err());
+        prepared.device = candle_gen::candle_core::DeviceLocation::Metal { gpu_id: 3 };
+        assert!(prepared.validate(&img, &img_ids, &txt, &txt_ids).is_err());
         Ok(())
     }
 
