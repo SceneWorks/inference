@@ -341,6 +341,7 @@ impl IpAdapterFlux {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        candle_gen::check_cancel(cancel)?;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
         // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
@@ -349,6 +350,13 @@ impl IpAdapterFlux {
         let mu = flow_mu(self.variant, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        let prepared = self.backbone.prepare_conditioning(
+            heavy,
+            &state.img,
+            &state.img_ids,
+            &state.txt,
+            &state.txt_ids,
+        )?;
         candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -362,7 +370,7 @@ impl IpAdapterFlux {
                 // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
                 // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                self.backbone.forward_ip_with_memory(
+                self.backbone.forward_ip_prepared_with_memory(
                     heavy,
                     img,
                     &state.img_ids,
@@ -372,6 +380,7 @@ impl IpAdapterFlux {
                     &state.vec,
                     Some(&guidance_t),
                     injector,
+                    &prepared,
                     cancel,
                 )
             },

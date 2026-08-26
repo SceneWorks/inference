@@ -827,7 +827,15 @@ pub fn load_components_native(
     let pinned = gen_core::PinnedWeightsFile::pin(native_dit)?;
     let selected = resolve_components_text_encoder(root, None)?;
     load_components_native_with_encoder(
-        root, &selected, &pinned, device, adapters, None, None, false,
+        root,
+        &selected,
+        &pinned,
+        device,
+        adapters,
+        None,
+        None,
+        false,
+        &gen_core::CheckpointFactsSink::new(),
     )
 }
 
@@ -841,6 +849,7 @@ pub(crate) fn load_components_native_with_encoder(
     native_quant: Option<gen_core::Quant>,
     text_load_quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Components> {
     let text = match text_load_quant {
         Some(quant) => {
@@ -856,6 +865,7 @@ pub(crate) fn load_components_native_with_encoder(
         adapters,
         native_quant,
         stream_blocks,
+        facts,
     )?;
     Ok(Components { text, heavy })
 }
@@ -870,6 +880,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
     native_quant: Option<gen_core::Quant>,
     text_load_quant: Option<gen_core::Quant>,
     pid_spec: Option<&PidWeights>,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Components> {
     let mut components = load_components_native_with_encoder(
         root,
@@ -880,6 +891,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
         native_quant,
         text_load_quant,
         false,
+        facts,
     )?;
     components.heavy.pid = pid_spec
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
@@ -892,6 +904,7 @@ pub(crate) fn load_components_native_registry_with_encoder(
 /// single-file entrypoint accepts job-local LoRA/LoKr/diff-patch adapters through the shared Krea
 /// installer ([`load_native_dit`]). PiD remains absent; the registered dense, packed, and ConvRot
 /// routes attach it through their dedicated component loaders.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_heavy_native_with(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -899,8 +912,17 @@ pub(crate) fn load_heavy_native_with(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<KreaHeavy> {
-    let dit = load_native_dit(root, native_dit, device, adapters, quant, stream_blocks)?;
+    let dit = load_native_dit(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        facts,
+    )?;
     let vae = load_vae(root, device)?;
 
     Ok(KreaHeavy {
@@ -910,6 +932,7 @@ pub(crate) fn load_heavy_native_with(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_native_dit(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -917,6 +940,7 @@ fn load_native_dit(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Krea2Transformer> {
     load_native_dit_at_dtype(
         root,
@@ -926,9 +950,53 @@ fn load_native_dit(
         quant,
         stream_blocks,
         DIT_DTYPE,
+        facts,
     )
 }
 
+/// Adapter admission for a **Kitchen NVFP4** import (sc-21483, epic 11037).
+///
+/// Low-rank **LoRA/LoKr** adapters are supported: they ride as forward-time additive residuals over
+/// the packed base through the shared [`candle_gen::quant::AdaptLinear`], so no NVFP4 row is
+/// dequantized, re-packed, or converted to host them. (Before sc-21483 the NVFP4 arm was outside
+/// adapter routing entirely and this whole class was refused.)
+///
+/// A **diff-patch** is refused, and that is not a "not yet": a `.diff`/`.diff_b` delta folds
+/// `W += δ` into the DENSE base weight before the trunk is assembled
+/// ([`crate::adapters::fold_diff_patch`]), and an NVFP4-planned row has no dense form to fold into —
+/// the shared reader deliberately refuses a dense read of a packed-planned row rather than
+/// reinterpret the packed nibbles at the component dtype (sc-21482). Folding it would require
+/// dequantizing the base, which is exactly the silent regime change E2 forbids.
+///
+/// Factored as a free fn over `(is_nvfp4, adapters)` so the reject is unit-testable without a
+/// loaded model, mirroring `ensure_multiphase_allowed_for`. A no-op on a non-NVFP4 import.
+fn ensure_nvfp4_adapters_supported(native_nvfp4: bool, adapters: &[AdapterSpec]) -> Result<()> {
+    if native_nvfp4 && crate::adapters::any_diff_patch(adapters) {
+        return Err(CandleError::Msg(
+            "Krea Kitchen NVFP4 imports cannot apply a diff-patch (.diff/.diff_b) adapter: a \
+             diff-patch folds into the dense base weight at load, and an NVFP4-planned row has no \
+             dense form to fold into. Low-rank LoRA/LoKr adapters are supported — they ride as \
+             additive residuals over the packed base."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the DiT out of a **single-file native import** and, on the way past, publish that read's
+/// [`gen_core::CheckpointWeightFacts`] into `facts` (sc-21484 follow-up).
+///
+/// This is the provider-build seam: it is the one place in the Krea build that holds the
+/// [`Weights`] the shared logical-weight reader compiled a plan for, and the generator handle a
+/// consumer holds is built long before this runs (Krea residency is lazy). A clone of the sink
+/// therefore travels down here while its sibling stays on `KreaGenerator`, which republishes
+/// nothing and simply reads it back through
+/// [`gen_core::Generator::checkpoint_weight_facts`].
+///
+/// Publication is deliberately the **last** thing before the DiT is returned, so the receipt
+/// measures what actually materialized rather than what was about to. A source with no plan (the
+/// directory route never reaches this function at all) publishes nothing and the sink stays empty.
+#[allow(clippy::too_many_arguments)]
 fn load_native_dit_at_dtype(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -937,6 +1005,7 @@ fn load_native_dit_at_dtype(
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
     dit_dtype: DType,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Krea2Transformer> {
     native_dit.read_unchanged(|_| {
         let cfg = Krea2Config::from_snapshot(root)?;
@@ -957,12 +1026,7 @@ fn load_native_dit_at_dtype(
             crate::native_mapping::DeclaredLogicalShapes::FromConfig(&cfg),
         )?;
         let native_nvfp4 = dit_w.is_native_nvfp4();
-        if native_nvfp4 && !adapters.is_empty() {
-            return Err(CandleError::Msg(
-                "Krea Kitchen NVFP4 imports do not yet support LoRA/LoKr or diff-patch adapters"
-                    .into(),
-            ));
-        }
+        ensure_nvfp4_adapters_supported(native_nvfp4, adapters)?;
         if native_nvfp4 && stream_blocks {
             return Err(CandleError::Msg(
                 "Krea Kitchen NVFP4 imports require resident transformer loading".into(),
@@ -982,8 +1046,12 @@ fn load_native_dit_at_dtype(
                 "Krea native block streaming requires an adapter-free, non-quantizing load".into(),
             ));
         }
+        // Shared before the branch only so the facts below can be read off the SAME reader both
+        // paths consumed — the streamed form hands its `Arc` to the transformer and would otherwise
+        // move it out of reach.
+        let dit_w = Arc::new(dit_w);
         let mut dit = if stream_blocks {
-            Krea2Transformer::load_block_streamed(Arc::new(dit_w), &cfg)?
+            Krea2Transformer::load_block_streamed(Arc::clone(&dit_w), &cfg)?
         } else {
             Krea2Transformer::load(&dit_w, &cfg)?
         };
@@ -1000,6 +1068,10 @@ fn load_native_dit_at_dtype(
         // Individual streamed block windows use the same guarded synchronization when opened.
         device.synchronize()?;
 
+        // The handoff (sc-21484): everything this read materialized, measured, and tied to the
+        // verified pin — published after the synchronize so the receipt is not a prediction.
+        facts.publish_optional(dit_w.checkpoint_weight_facts()?);
+
         Ok(dit)
     })
 }
@@ -1007,6 +1079,7 @@ fn load_native_dit_at_dtype(
 /// Sequential imported-file heavy phase: native DiT + VAE + img2img/edit encoder, loaded only after
 /// the text encoder was released. The transformer stays file-backed and window-materialized when the
 /// source is adapter-free.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_residency_heavy_native(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -1014,13 +1087,23 @@ pub(crate) fn load_residency_heavy_native(
     adapters: &[AdapterSpec],
     quant: Option<gen_core::Quant>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<ResidencyHeavy> {
     Ok(ResidencyHeavy {
-        heavy: load_heavy_native_with(root, native_dit, device, adapters, quant, stream_blocks)?,
+        heavy: load_heavy_native_with(
+            root,
+            native_dit,
+            device,
+            adapters,
+            quant,
+            stream_blocks,
+            facts,
+        )?,
         vae_encoder: load_vae_encoder(root, device)?,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_residency_heavy_native_registry(
     root: &Path,
     native_dit: &gen_core::PinnedWeightsFile,
@@ -1029,9 +1112,17 @@ pub(crate) fn load_residency_heavy_native_registry(
     quant: Option<gen_core::Quant>,
     pid: PidLoad<'_>,
     stream_blocks: bool,
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<ResidencyHeavy> {
-    let mut result =
-        load_residency_heavy_native(root, native_dit, device, adapters, quant, stream_blocks)?;
+    let mut result = load_residency_heavy_native(
+        root,
+        native_dit,
+        device,
+        adapters,
+        quant,
+        stream_blocks,
+        facts,
+    )?;
     result.heavy.pid = pid_to_load(pid.spec, pid.enabled)
         .map(|spec| PidEngine::from_spec(spec, PID_BACKBONE, device).map(Arc::new))
         .transpose()?;
@@ -1126,6 +1217,7 @@ pub(crate) fn render_three_stage_with_native(
     quantization: NativeFileQuantization,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
+    facts: &gen_core::CheckpointFactsSink,
 ) -> Result<Vec<Image>> {
     let memory = req.memory.unwrap_or_default();
     candle_gen::check_cancel(&req.cancel)?;
@@ -1173,6 +1265,7 @@ pub(crate) fn render_three_stage_with_native(
                 adapters,
                 quantization.transformer,
                 memory.stream_transformer_blocks,
+                facts,
             )?;
             candle_gen::check_cancel(&req.cancel)?;
             dit
@@ -1825,7 +1918,21 @@ fn load_dit_base_at_dtype(
             crate::convert::validate_transformer(&dit_w, &cfg)?;
             Ok(Krea2Transformer::load(&dit_w, &cfg)?)
         },
-        |source| load_native_dit_at_dtype(root, source, device, &[], quant, false, dit_dtype),
+        // A **detached** sink: this is the job-local multi-phase base DiT, not the generator's own
+        // load, so its facts must not overwrite what the generator published about the model the
+        // consumer asked for.
+        |source| {
+            load_native_dit_at_dtype(
+                root,
+                source,
+                device,
+                &[],
+                quant,
+                false,
+                dit_dtype,
+                &gen_core::CheckpointFactsSink::new(),
+            )
+        },
     )
 }
 
@@ -2712,6 +2819,70 @@ mod tests {
 
     use super::*;
 
+    /// sc-21483: a Kitchen NVFP4 import admits low-rank **LoRA/LoKr** adapters (they ride as
+    /// additive residuals over the packed base) and still refuses a **diff-patch**, which would
+    /// have to fold into a dense base weight an NVFP4-planned row does not have.
+    ///
+    /// Before sc-21483 this guard refused *every* adapter form on an NVFP4 import, so the real
+    /// Krea NVFP4 + LoRA render failed at load with "do not yet support LoRA/LoKr or diff-patch
+    /// adapters" — which is how the real-weight test caught it.
+    #[test]
+    fn nvfp4_import_admits_low_rank_adapters_and_still_refuses_a_diff_patch() {
+        use candle_gen::candle_core::safetensors::save as save_tensors;
+        use candle_gen::candle_core::{Device, Tensor};
+        use candle_gen::gen_core::AdapterKind;
+        use std::collections::HashMap;
+
+        let dev = Device::Cpu;
+        let dir = tempfile::tempdir().unwrap();
+
+        let lora_path = dir.path().join("lowrank.safetensors");
+        let mut lora: HashMap<String, Tensor> = HashMap::new();
+        lora.insert(
+            "transformer_blocks.0.attn.to_q.lora_A.weight".to_owned(),
+            Tensor::zeros((2, 8), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        lora.insert(
+            "transformer_blocks.0.attn.to_q.lora_B.weight".to_owned(),
+            Tensor::zeros((8, 2), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        save_tensors(&lora, &lora_path).unwrap();
+
+        let diff_path = dir.path().join("patch.safetensors");
+        let mut diff: HashMap<String, Tensor> = HashMap::new();
+        diff.insert(
+            "transformer_blocks.0.attn.to_q.diff".to_owned(),
+            Tensor::zeros((8, 8), candle_gen::candle_core::DType::F32, &dev).unwrap(),
+        );
+        save_tensors(&diff, &diff_path).unwrap();
+
+        let lora_spec = vec![AdapterSpec::new(lora_path, 1.0, AdapterKind::Lora)];
+        let diff_spec = vec![AdapterSpec::new(diff_path, 1.0, AdapterKind::Lora)];
+
+        // The low-rank adapter is admitted on an NVFP4 import…
+        ensure_nvfp4_adapters_supported(true, &lora_spec)
+            .expect("a low-rank LoRA rides additively over the packed NVFP4 base");
+        // …the diff-patch is not.
+        let error = ensure_nvfp4_adapters_supported(true, &diff_spec)
+            .expect_err("a diff-patch has no dense base weight to fold into on an NVFP4 import")
+            .to_string();
+        assert!(error.contains("diff-patch"), "{error}");
+        assert!(
+            error.contains("no dense form to fold into"),
+            "the refusal must say WHY, not just that it is unsupported: {error}"
+        );
+        assert!(
+            error.contains("LoRA/LoKr adapters are supported"),
+            "the refusal must not read as a blanket adapter ban: {error}"
+        );
+
+        // A non-NVFP4 import is unaffected by this gate in either direction (a dense/int8 import
+        // folds diff-patches normally).
+        ensure_nvfp4_adapters_supported(false, &diff_spec)
+            .expect("a dense import still folds diff-patches");
+        ensure_nvfp4_adapters_supported(true, &[]).expect("an adapter-free NVFP4 import loads");
+    }
+
     #[test]
     fn language_only_snapshot_is_admitted_until_the_edit_only_vision_read() {
         let fixture = tempfile::tempdir().unwrap();
@@ -2857,6 +3028,85 @@ mod tests {
         assert_eq!(pid.calls.get(), 1);
     }
 
+    /// **sc-21484 follow-up: the production single-file load is what publishes the facts.**
+    ///
+    /// `lib`'s `a_loaded_generator_exposes_the_checkpoint_facts_of_a_native_nvfp4_import` asserts
+    /// the consumer end (sink → `Generator::checkpoint_weight_facts`) on the Kitchen NVFP4 fixture.
+    /// This is the other end: the real provider-build seam, driven end to end on a whole tiny DiT,
+    /// proving the sink a `KreaGenerator` holds is actually written to by a load rather than only
+    /// by a test. The tiny fixture is dense, so its inventory is the dense codec — the codec-neutral
+    /// half of the same contract.
+    ///
+    /// # Mutation
+    ///
+    /// Delete the `facts.publish_optional(...)` line at the end of `load_native_dit_at_dtype`: the
+    /// sink stays empty and the `expect` below goes red.
+    #[test]
+    fn the_native_file_load_publishes_its_checkpoint_facts_into_the_generators_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, source, _) = crate::testfix::tiny_native_transformer_fixture(&tmp);
+        let pinned = gen_core::PinnedWeightsFile::pin(&source).unwrap();
+
+        // The generator's end of the seam, cloned BEFORE the load — exactly as `build()` mints it.
+        let generator_side = gen_core::CheckpointFactsSink::new();
+        let load_side = generator_side.clone();
+        assert!(generator_side.is_empty(), "nothing has been read yet");
+
+        load_native_dit_at_dtype(
+            &root,
+            &pinned,
+            &Device::Cpu,
+            &[],
+            None,
+            false,
+            DType::F32,
+            &load_side,
+        )
+        .expect("the tiny native fixture loads");
+
+        let facts = generator_side
+            .facts()
+            .expect("the production load path publishes into the sink the generator holds");
+        assert_eq!(
+            facts
+                .source_binding()
+                .expect("the pin travels with them")
+                .stable_token(),
+            format!(
+                "tiny-native.safetensors@{}",
+                std::fs::metadata(&source).unwrap().len()
+            ),
+        );
+        assert!(
+            facts.capability().is_dense_only(),
+            "a CPU host executes nothing in its stored packing"
+        );
+        // Fact 2 is the whole file, compiled by the shared reader: every dense projection of the
+        // tiny DiT, in the dense codec, with the file's real byte total.
+        let entry = facts
+            .source()
+            .entries
+            .first()
+            .expect("the plan compiled a codec inventory");
+        assert_eq!(facts.source().tensor_count, entry.tensor_count);
+        assert!(entry.tensor_count > 0 && entry.source_bytes > 0);
+        assert_eq!(
+            entry.planned_native_packed_tensors, 0,
+            "nothing is packed here"
+        );
+        // Fact 3 is measured: since the sc-11045 fix round widened the reader gate from
+        // NVFP4-only to every planned single-file native load, a dense native trunk's reads go
+        // through the shared logical reader too, so the receipt carries measured dense rows —
+        // and, this being a dense file on a dense-only host, nothing native and no demotions.
+        assert!(
+            !facts.materialized().is_empty(),
+            "a planned dense native load measures its reads through the shared reader"
+        );
+        assert!(facts.materialized().iter().all(|row| row.representation
+            == gen_core::checkpoint_facts::ExecutionRepresentation::DenseFallback));
+        assert!(facts.receipt().demotions.is_empty());
+    }
+
     #[test]
     fn native_file_entrypoint_postchecks_after_provider_payload_consumption() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2910,8 +3160,16 @@ mod tests {
             }));
         });
 
-        let result =
-            load_native_dit_at_dtype(&root, &pinned, &Device::Cpu, &[], None, false, DType::F32);
+        let result = load_native_dit_at_dtype(
+            &root,
+            &pinned,
+            &Device::Cpu,
+            &[],
+            None,
+            false,
+            DType::F32,
+            &gen_core::CheckpointFactsSink::new(),
+        );
         NATIVE_DIT_LOAD_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
         writer
             .join()

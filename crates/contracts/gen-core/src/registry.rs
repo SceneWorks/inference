@@ -647,15 +647,50 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
     adapter_id: "flux2-comfyui-v1",
     family: "flux2",
     compatibility_projection: ImportedModelCompatibilityProjectionRegistration { family: "flux2" },
-    signatures: &[CheckpointSignatureRegistration {
-        id: "flux2-comfyui-v1",
-        dialect: "comfyui",
-        required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
-    }],
-    dialects: &[CheckpointDialectRegistration {
-        id: "comfyui",
-        source: ImportedModelSource::ComfyUiTree,
-    }],
+    signatures: &[
+        CheckpointSignatureRegistration {
+            id: "flux2-comfyui-v1",
+            dialect: "comfyui",
+            required_tensor_names: &["model.diffusion_model.double_blocks.0.img_attn.qkv.weight"],
+        },
+        // The bare-keyed FLUX.2 Klein transformer single file (sc-21485).
+        //
+        // A signature is an ALL-PRESENT name list, so it can only assert what a file *has* — it
+        // cannot express "and no `guidance_in.*`". The discrimination therefore has to come from a
+        // name only klein spells: the community klein export writes its per-head norms as
+        // `...norm.query_norm.weight`, while the BFL-official FLUX.2-**dev** export spells the same
+        // tensor `...norm.query_norm.scale` (see `candle-gen-flux2::single_file`, whose mapping
+        // refuses the `.scale` spelling). The first two names alone match a bare-keyed dev file
+        // too, which would import a 32B dev checkpoint as `flux2_klein_9b` and only fail later, at
+        // plan time.
+        //
+        // So: the qkv name pins the fused-attention topology, the AdaLN name pins the final-layer
+        // topology the half-swap transform is declared for, and the per-head-norm name is what
+        // makes this klein rather than dev.
+        CheckpointSignatureRegistration {
+            id: "flux2-klein-bfl-v1",
+            dialect: "bfl",
+            required_tensor_names: &[
+                "double_blocks.0.img_attn.qkv.weight",
+                "double_blocks.0.img_attn.norm.query_norm.weight",
+                "final_layer.adaLN_modulation.1.weight",
+            ],
+        },
+    ],
+    dialects: &[
+        CheckpointDialectRegistration {
+            id: "comfyui",
+            source: ImportedModelSource::ComfyUiTree,
+        },
+        // A standalone transformer-only `.safetensors` in the original (ComfyUI/BFL) key
+        // convention — the shape `wikeeyang/Flux2-Klein-9B-True-V2` ships (sc-21485). Distinct
+        // from `comfyui`: that source is a file inside a ComfyUI folder tree and binds to the
+        // 32B dev provider; this one is the 9B klein community single file.
+        CheckpointDialectRegistration {
+            id: "bfl",
+            source: ImportedModelSource::TransformerFile,
+        },
+    ],
     component_topology: &[
         CheckpointComponentRegistration {
             role: "transformer",
@@ -672,12 +707,22 @@ pub const FLUX2_CHECKPOINT_ADAPTER: CheckpointAdapterRegistration = CheckpointAd
         component_role: "base-snapshot",
         compatible_families: &["flux2"],
     }],
-    canonical_mappings: &[CheckpointCanonicalMappingRegistration {
-        dialect: "comfyui",
-        mapping_id: "flux2-comfyui-to-diffusers-v1",
-        // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
-        plan_driven_backends: &[],
-    }],
+    canonical_mappings: &[
+        CheckpointCanonicalMappingRegistration {
+            dialect: "comfyui",
+            mapping_id: "flux2-comfyui-to-diffusers-v1",
+            // Loader-native (see `SDXL_CHECKPOINT_ADAPTER`).
+            plan_driven_backends: &[],
+        },
+        // Plan-driven on Candle (sc-21485): `candle_gen_flux2::single_file` ships the
+        // `LogicalKeyMapping` with this id — renames plus the declarative fused-QKV row slices
+        // and the AdaLN half swap — and the klein single-file loader plans through it.
+        CheckpointCanonicalMappingRegistration {
+            dialect: "bfl",
+            mapping_id: "flux2-bfl-to-diffusers-v1",
+            plan_driven_backends: &[CheckpointBackend::Candle],
+        },
+    ],
     config_recovery: &[CheckpointConfigRecoveryRegistration {
         field: "architecture",
         recovery_id: "flux2-signature-v1",
@@ -2450,6 +2495,17 @@ impl ProviderRegistry {
 
     /// Resolve an exact imported source shape and operation to the descriptor of the generator that
     /// will actually load it. Missing is an explicit unsupported answer.
+    ///
+    /// A route whose binding declares `inherit_adapters = false` has `supports_lora`/`supports_lokr`
+    /// **withdrawn** from the descriptor returned here. That withdrawal is *advertisement only* —
+    /// this function admits nothing and refuses nothing. Turning it into a typed refusal is the job
+    /// of the **provider-build seam gate**: every provider's `build(spec, descriptor)` calls
+    /// [`crate::reject_unsupported_adapters`] with the descriptor it was handed (see
+    /// `candle_gen_krea`'s `build`), which is the single gate for the sc-21483 / epic-11037-E6
+    /// silent-un-adapted-render class. There is deliberately no second, registry-side wrapper: a
+    /// guard that no load route calls is indistinguishable from no guard at all, so a consumer that
+    /// resolves a descriptor here is responsible for passing *that* descriptor — not the provider's
+    /// own — into the build seam.
     pub fn imported_model_descriptor(
         &self,
         family: &str,
@@ -3351,8 +3407,8 @@ mod tests {
         CaptionCapabilities, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
     };
     use crate::generator::{
-        ActivationMemoryAnchor, Capabilities, GenerationOutput, GenerationRequest, Modality,
-        ModelDescriptor, SizeFloor,
+        reject_unsupported_adapters, ActivationMemoryAnchor, Capabilities, GenerationOutput,
+        GenerationRequest, Modality, ModelDescriptor, SizeFloor,
     };
     use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
     use crate::media::{AudioTrack, Image};
@@ -4634,23 +4690,46 @@ mod tests {
             }))
         }
 
-        const RESTRICTED_BINDING: &[CheckpointBackendBindingRegistration] =
-            &[CheckpointBackendBindingRegistration {
+        // TWO routes on the same fixture: `Generate` withholds adapter inheritance, `Edit` grants it.
+        // The contrast is what proves the gate keys off the binding rather than blanket-refusing.
+        const NON_INHERITING: CheckpointBackendBindingRegistration =
+            CheckpointBackendBindingRegistration {
                 backend: CheckpointBackend::Mlx,
                 source: ImportedModelSource::TransformerFile,
                 operation: ImportedModelOperation::Generate,
                 provider_id: "dummy_adapter_model",
                 required_components: None,
                 inherit_adapters: false,
-            }];
-        const RESTRICTED_CAPABILITIES: &[CheckpointAdapterCapabilityRegistration] =
-            &[CheckpointAdapterCapabilityRegistration {
+            };
+        const RESTRICTED_BINDING: &[CheckpointBackendBindingRegistration] = &[
+            NON_INHERITING,
+            CheckpointBackendBindingRegistration {
+                operation: ImportedModelOperation::Edit,
+                inherit_adapters: true,
+                ..NON_INHERITING
+            },
+        ];
+        const WITHHELD: CheckpointAdapterCapabilityRegistration =
+            CheckpointAdapterCapabilityRegistration {
                 operation: ImportedModelOperation::Generate,
                 inherit_provider_capabilities: true,
                 supports_adapter_inheritance: false,
-            }];
+            };
+        const RESTRICTED_CAPABILITIES: &[CheckpointAdapterCapabilityRegistration] = &[
+            WITHHELD,
+            CheckpointAdapterCapabilityRegistration {
+                operation: ImportedModelOperation::Edit,
+                supports_adapter_inheritance: true,
+                ..WITHHELD
+            },
+        ];
+        const RESTRICTED_OPERATIONS: &[ImportedModelOperation] = &[
+            ImportedModelOperation::Generate,
+            ImportedModelOperation::Edit,
+        ];
         let mut adapter = fixture_adapter(RESTRICTED_BINDING);
         adapter.capabilities = RESTRICTED_CAPABILITIES;
+        adapter.operations = RESTRICTED_OPERATIONS;
 
         let registry = ProviderRegistryBuilder::new()
             .register_generator(ModelRegistration {
@@ -4674,6 +4753,66 @@ mod tests {
             .unwrap();
         assert!(!imported.capabilities.supports_lora);
         assert!(!imported.capabilities.supports_lokr);
+
+        // sc-21483 (epic 11037 E6): the withdrawn capability must be *observable*. An adapter-bearing
+        // request against this route is a typed capability refusal, never a silently dropped adapter.
+        let mut spec = LoadSpec::new(WeightsSource::Dir(std::path::PathBuf::from("weights")));
+        spec.adapters = vec![crate::runtime::AdapterSpec::new(
+            std::path::PathBuf::from("adapter.safetensors"),
+            1.0,
+            crate::runtime::AdapterKind::Lora,
+        )];
+        // The refusal is exercised through the *production* shape: resolve the route's descriptor,
+        // then hand it to the provider-build seam gate (`reject_unsupported_adapters`, the same call
+        // `candle-gen-krea`'s `build` makes). There is deliberately no registry-side wrapper — a
+        // second gate that no load route calls would be indistinguishable from no gate at all.
+        let error =
+            reject_unsupported_adapters(imported.id, &imported.capabilities, spec.adapters.len())
+                .expect_err("an adapter-bearing request on a non-inheriting route is refused");
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "the refusal must be a typed capability error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("does not inherit adapters"),
+            "{error}"
+        );
+
+        // The same route with no adapter selected loads normally…
+        reject_unsupported_adapters(imported.id, &imported.capabilities, 0)
+            .expect("an adapter-free request is unaffected");
+
+        // …and so does an adapter-bearing request against a route that DOES inherit adapters, so the
+        // gate keys off the binding rather than blanket-refusing adapters. This second route is
+        // registered on the SAME fixture below, and it must resolve — otherwise the assertion would
+        // be vacuous.
+        let inheriting = registry
+            .imported_model_descriptor(
+                "test",
+                ImportedModelSource::TransformerFile,
+                ImportedModelOperation::Edit,
+            )
+            .expect("the inheriting route must resolve, or this assertion proves nothing");
+        assert!(inheriting.capabilities.supports_lora);
+        reject_unsupported_adapters(inheriting.id, &inheriting.capabilities, spec.adapters.len())
+            .expect("an inheriting route admits adapters");
+    }
+
+    /// sc-21483: the shared refusal is capability-shaped, not route-shaped — a descriptor that
+    /// advertises either adapter form admits, one that advertises neither refuses.
+    #[test]
+    fn adapter_refusal_keys_off_the_advertised_capability() {
+        let mut capabilities = dummy_descriptor().capabilities;
+        capabilities.supports_lora = false;
+        capabilities.supports_lokr = false;
+        assert!(reject_unsupported_adapters("m", &capabilities, 0).is_ok());
+        assert!(reject_unsupported_adapters("m", &capabilities, 1).is_err());
+
+        capabilities.supports_lokr = true;
+        assert!(reject_unsupported_adapters("m", &capabilities, 2).is_ok());
+        capabilities.supports_lokr = false;
+        capabilities.supports_lora = true;
+        assert!(reject_unsupported_adapters("m", &capabilities, 2).is_ok());
     }
 
     const FIXTURE_DIALECTS: &[CheckpointDialectRegistration] = &[CheckpointDialectRegistration {
@@ -5456,7 +5595,16 @@ mod tests {
             ),
             (
                 FLUX2_CHECKPOINT_ADAPTER.adapter_id,
-                &[("comfyui", "flux2-comfyui-to-diffusers-v1", &[])],
+                &[
+                    ("comfyui", "flux2-comfyui-to-diffusers-v1", &[]),
+                    // sc-21485: the klein universal single file plans through the Candle
+                    // `Flux2BflToDiffusersMapping`.
+                    (
+                        "bfl",
+                        "flux2-bfl-to-diffusers-v1",
+                        &[CheckpointBackend::Candle],
+                    ),
+                ],
             ),
             (
                 WAN_CHECKPOINT_ADAPTER.adapter_id,
@@ -5508,6 +5656,71 @@ mod tests {
                  undescribed fp8 at unit scale — silently wrong rather than refused"
             );
         }
+    }
+
+    /// sc-21485 review. A signature is an all-present name list, so `flux2-klein-bfl-v1` must be
+    /// discriminated by a name only the klein community export carries. A bare-keyed
+    /// FLUX.2-**dev** BFL file shares the fused-qkv and AdaLN names; it differs by spelling the
+    /// per-head norms `.scale` (and by carrying `guidance_in.*`, which no all-present list can
+    /// assert the absence of).
+    ///
+    /// Mutation witness: drop `double_blocks.0.img_attn.norm.query_norm.weight` from the
+    /// registration and the dev key set below starts claiming the klein signature — the
+    /// misrouting this test forbids.
+    #[test]
+    fn the_klein_bfl_signature_does_not_claim_a_bare_keyed_dev_file() {
+        /// The rule a signature declares: every required name is present in the file's key set.
+        fn claims(signature: &CheckpointSignatureRegistration, keys: &[&str]) -> bool {
+            signature
+                .required_tensor_names
+                .iter()
+                .all(|name| keys.contains(name))
+        }
+        let klein_signature = FLUX2_CHECKPOINT_ADAPTER
+            .signatures
+            .iter()
+            .find(|signature| signature.id == "flux2-klein-bfl-v1")
+            .expect("the klein bfl signature is registered");
+
+        // The klein community export (`wikeeyang/Flux2-Klein-9B-True-V2`): bare BFL keys, `.weight`
+        // per-head norms, no guidance embedder.
+        let klein: &[&str] = &[
+            "img_in.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+            "double_blocks.0.img_attn.norm.query_norm.weight",
+            "double_blocks.0.img_attn.norm.key_norm.weight",
+            "single_blocks.0.linear1.weight",
+            "final_layer.adaLN_modulation.1.weight",
+            "final_layer.linear.weight",
+        ];
+        assert!(claims(klein_signature, klein), "klein must be claimed");
+
+        // The BFL-official FLUX.2-dev export: the SAME fused-qkv and AdaLN names, the `.scale`
+        // per-head-norm spelling, and the guidance embedder klein does not have.
+        let dev: &[&str] = &[
+            "img_in.weight",
+            "guidance_in.in_layer.weight",
+            "guidance_in.out_layer.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+            "double_blocks.0.img_attn.norm.query_norm.scale",
+            "double_blocks.0.img_attn.norm.key_norm.scale",
+            "single_blocks.0.linear1.weight",
+            "final_layer.adaLN_modulation.1.weight",
+            "final_layer.linear.weight",
+        ];
+        assert!(
+            !claims(klein_signature, dev),
+            "a bare-keyed FLUX.2-dev file must NOT claim the klein signature (it would import a \
+             32B dev checkpoint as flux2_klein_9b and fail only at plan time)"
+        );
+
+        // The comment on the registration must not claim a discrimination the names cannot make.
+        assert!(
+            klein_signature
+                .required_tensor_names
+                .contains(&"double_blocks.0.img_attn.norm.query_norm.weight"),
+            "the klein-only per-head-norm spelling is what carries the discrimination"
+        );
     }
 
     #[test]

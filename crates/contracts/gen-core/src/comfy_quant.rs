@@ -122,13 +122,20 @@ impl fmt::Display for ComfyQuantFormat {
 }
 
 /// A validated `.comfy_quant` descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComfyQuantDescriptor {
     pub format: ComfyQuantFormat,
     /// ComfyUI's per-layer "dequantize and multiply in full precision" flag: the layer keeps its
     /// packed storage but never takes a quantized matmul. A codec plan treats it as "dense fallback
     /// residency, even where a native path exists".
     pub full_precision_matrix_mult: bool,
+    /// The Kitchen exporter's declared **pre-quantization** shape, retained (block-scaled formats
+    /// only — see [`partial_descriptor_from_json`]). Not an authority: the plan compiler checks it
+    /// against the logical shape it derived from the stored geometry + the adapter's declaration
+    /// and refuses a mismatch by name
+    /// (`LogicalWeightPlanError::DescriptorOrigShape`), so a declaration that agrees is free
+    /// corroboration of the packed geometry and one that differs cannot be ignored.
+    pub orig_shape: Option<Vec<usize>>,
 }
 
 /// Why a `.comfy_quant` blob is not a descriptor this workspace accepts. Every variant is a
@@ -155,11 +162,28 @@ pub enum ComfyQuantDescriptorError {
     NonBooleanField {
         field: &'static str,
     },
-    /// A key this workspace does not model. ComfyUI writes exactly `format`,
-    /// `full_precision_matrix_mult`, and (int8) `per_row`; anything else could redefine the layout
-    /// (`group_size`, a future `layout`) and is refused rather than ignored.
+    /// A key this workspace does not model. ComfyUI writes `format`,
+    /// `full_precision_matrix_mult`, (int8) `per_row`, and — on the block-scaled formats — the
+    /// provenance trio `group_size` / `orig_dtype` / `orig_shape` (validated separately); anything
+    /// else could redefine the layout (a future `layout`) and is refused rather than ignored.
     UnknownField {
         field: String,
+    },
+    /// `group_size` declared with a value other than the format's own fixed block length, or on a
+    /// format with no block axis at all (sc-21485). The block length is a property of the FORMAT
+    /// (`nvfp4` = 16, `mxfp8` = 32) — a differing declaration is a layout this workspace does not
+    /// model, so it refuses rather than being read as informational.
+    GroupSizeMismatch {
+        declared: String,
+        format: ComfyQuantFormat,
+        expected: Option<usize>,
+    },
+    /// `orig_dtype` present but not a JSON string, or `orig_shape` present but not an array of
+    /// non-negative integers (sc-21485). Both are producer provenance this workspace validates by
+    /// type and does not consume — but a malformed value means the descriptor dialect is not the
+    /// one modelled here, and that fails closed.
+    MalformedProvenanceField {
+        field: &'static str,
     },
 }
 
@@ -191,6 +215,27 @@ impl fmt::Display for ComfyQuantDescriptorError {
                 f,
                 "descriptor field {field:?} is not part of the ComfyUI `.comfy_quant` convention \
                  this workspace models; refusing rather than guessing the layout"
+            ),
+            Self::GroupSizeMismatch {
+                declared,
+                format,
+                expected,
+            } => match expected {
+                Some(expected) => write!(
+                    f,
+                    "descriptor declares `group_size` {declared} but format `{format}` has the \
+                     fixed block length {expected}; refusing rather than guessing the layout"
+                ),
+                None => write!(
+                    f,
+                    "descriptor declares `group_size` {declared} on format `{format}`, which has \
+                     no block axis; refusing rather than guessing the layout"
+                ),
+            },
+            Self::MalformedProvenanceField { field } => write!(
+                f,
+                "descriptor field `{field}` is malformed (expected the ComfyUI provenance shape); \
+                 refusing rather than guessing the layout"
             ),
         }
     }
@@ -233,13 +278,17 @@ pub fn parse_comfy_quant_descriptor(
 /// * blob absent ⇒ this entry is the only declaration, so it must stand on its own and goes through
 ///   [`Self::into_complete`] — which is exactly the pre-sc-20651 behaviour for a metadata-only file
 ///   (the ComfyUI Kitchen NVFP4 converters' form, sc-20641).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialComfyQuantDescriptor {
     pub format: ComfyQuantFormat,
     pub full_precision_matrix_mult: Option<bool>,
     /// Only meaningful for `int8_tensorwise`; `None` everywhere else (the key is refused as an
     /// unknown field on any other format).
     pub per_row: Option<bool>,
+    /// Only meaningful for the block-scaled formats (`nvfp4`/`mxfp8`); `None` everywhere else (the
+    /// key is refused as an unknown field on any other format). See
+    /// [`ComfyQuantDescriptor::orig_shape`] for what the plan compiler does with it.
+    pub orig_shape: Option<Vec<usize>>,
 }
 
 impl PartialComfyQuantDescriptor {
@@ -253,6 +302,7 @@ impl PartialComfyQuantDescriptor {
         Ok(ComfyQuantDescriptor {
             format: self.format,
             full_precision_matrix_mult: self.full_precision_matrix_mult.unwrap_or(false),
+            orig_shape: self.orig_shape,
         })
     }
 
@@ -277,6 +327,16 @@ impl PartialComfyQuantDescriptor {
         if self.per_row == Some(false) && tensor.format == ComfyQuantFormat::Int8TensorwisePerRow {
             disagreement.push("per_row");
         }
+        // Two block-scaled declarations of the same layer that name different pre-quantization
+        // shapes cannot both be corroboration; the blob stays authoritative and the table refuses.
+        if self
+            .orig_shape
+            .as_deref()
+            .zip(tensor.orig_shape.as_deref())
+            .is_some_and(|(declared, blob)| declared != blob)
+        {
+            disagreement.push("orig_shape");
+        }
         disagreement
     }
 }
@@ -292,6 +352,9 @@ impl fmt::Display for PartialComfyQuantDescriptor {
         }
         if let Some(flag) = self.per_row {
             declared.push(format!("per_row={flag}"));
+        }
+        if let Some(shape) = self.orig_shape.as_deref() {
+            declared.push(format!("orig_shape={shape:?}"));
         }
         if declared.is_empty() {
             f.write_str(" (no other field declared)")
@@ -348,9 +411,65 @@ pub fn partial_descriptor_from_json(
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
         Some(_) => return Err(ComfyQuantDescriptorError::NonBooleanField { field: "per_row" }),
     };
+    // The block-scaled formats' provenance trio (sc-21485): real ComfyUI Kitchen exports (e.g. the
+    // pinned `wikeeyang/Flux2-Klein-9B-True-V2` NVFP4-mixed file) write `group_size`, `orig_dtype`
+    // and `orig_shape` alongside `format`. None of them may *redefine* the layout — the block
+    // length is a property of the format — so `group_size` is validated against the one layout this
+    // workspace models and then dropped, `orig_dtype` is type-checked and dropped (nothing here
+    // decodes from it; the stored dtype is the authority), and `orig_shape` is RETAINED for the
+    // plan compiler to check against the logical shape it derives from the stored geometry plus the
+    // adapter's declaration. Geometry authority therefore still stays with the stored shapes,
+    // exactly as for a file that omits the trio — the declaration is corroboration that must agree,
+    // never an input.
+    //
+    // Scope: `orig_dtype`/`orig_shape` are accepted **only** on the block-scaled formats, the
+    // documented scope. On any other format they refuse as unknown fields, the same fail-closed
+    // treatment `per_row` gets outside int8.
+    let block_scaled = matches!(format, ComfyQuantFormat::Nvfp4 | ComfyQuantFormat::Mxfp8);
+    if let Some(group_size) = object.get("group_size") {
+        let expected = match format {
+            ComfyQuantFormat::Nvfp4 => Some(NVFP4_BLOCK),
+            ComfyQuantFormat::Mxfp8 => Some(MXFP8_BLOCK),
+            _ => None,
+        };
+        let declared = group_size.as_u64().map(|value| value as usize);
+        if expected.is_none() || declared != expected {
+            return Err(ComfyQuantDescriptorError::GroupSizeMismatch {
+                declared: group_size.to_string(),
+                format,
+                expected,
+            });
+        }
+    }
+    if block_scaled {
+        if let Some(orig_dtype) = object.get("orig_dtype") {
+            if !orig_dtype.is_string() {
+                return Err(ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_dtype",
+                });
+            }
+        }
+    }
+    let orig_shape = match object.get("orig_shape").filter(|_| block_scaled) {
+        None => None,
+        Some(orig_shape) => {
+            let dims: Option<Vec<usize>> = orig_shape.as_array().and_then(|dims| {
+                dims.iter()
+                    .map(|dim| dim.as_u64().map(|dim| dim as usize))
+                    .collect()
+            });
+            Some(
+                dims.ok_or(ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_shape",
+                })?,
+            )
+        }
+    };
     for key in object.keys() {
         let known = matches!(key.as_str(), "format" | "full_precision_matrix_mult")
-            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow);
+            || (key == "per_row" && format == ComfyQuantFormat::Int8TensorwisePerRow)
+            || key == "group_size"
+            || (matches!(key.as_str(), "orig_dtype" | "orig_shape") && block_scaled);
         if !known {
             return Err(ComfyQuantDescriptorError::UnknownField { field: key.clone() });
         }
@@ -359,6 +478,7 @@ pub fn partial_descriptor_from_json(
         format,
         full_precision_matrix_mult,
         per_row,
+        orig_shape,
     })
 }
 
@@ -374,9 +494,13 @@ pub enum QuantizationMetadataError {
         detail: String,
     },
     NotAnObject,
-    /// `format_version` absent or not the `"1.0"` this workspace models.
+    /// `format_version` present but not the `"1.0"` this workspace models. An absent key is
+    /// accepted as v1 (sc-21482): the real pinned `Comfy-Org/Krea-2` NVFP4 export writes no
+    /// version key at all — so "absent" never reaches this variant, and `found` is always a value
+    /// that WAS on disk, already rendered so a JSON string is distinguishable from a JSON number
+    /// that stringifies the same way (`"1.0"` vs `non-string 1.0`).
     FormatVersion {
-        found: Option<String>,
+        found: String,
     },
     /// `layers` absent or not a JSON object.
     Layers,
@@ -403,7 +527,7 @@ impl fmt::Display for QuantizationMetadataError {
             ),
             Self::FormatVersion { found } => write!(
                 f,
-                "`_quantization_metadata.format_version` must be the string \"1.0\", got {found:?}"
+                "`_quantization_metadata.format_version` must be the string \"1.0\", got {found}"
             ),
             Self::Layers => write!(
                 f,
@@ -444,11 +568,23 @@ pub fn parse_quantization_metadata(
     let object = json
         .as_object()
         .ok_or(QuantizationMetadataError::NotAnObject)?;
-    let version = object.get("format_version").and_then(|v| v.as_str());
-    if version != Some("1.0") {
-        return Err(QuantizationMetadataError::FormatVersion {
-            found: version.map(str::to_owned),
-        });
+    // `format_version` is refused when PRESENT and not the "1.0" this workspace models. An absent
+    // key is accepted as v1: the real pinned `Comfy-Org/Krea-2` NVFP4 export (sc-21482) writes
+    // `{"layers": {…}}` with no version key at all, and ComfyUI's own reader
+    // (`comfy.sd.load_diffusion_model_state_dict`) never consults one — so "absent" is the
+    // format's ground truth, not a producer defect.
+    if let Some(version) = object.get("format_version") {
+        if version.as_str() != Some("1.0") {
+            // A JSON *number* `1.0` stringifies to the same characters as the string `"1.0"`, so
+            // rendering it bare would produce the self-contradictory `must be the string "1.0",
+            // got "1.0"`. Quote the string case and label the non-string case as what it is.
+            return Err(QuantizationMetadataError::FormatVersion {
+                found: match version.as_str() {
+                    Some(text) => format!("{text:?}"),
+                    None => format!("non-string {version}"),
+                },
+            });
+        }
     }
     let layers = object
         .get("layers")
@@ -836,6 +972,11 @@ pub enum Nvfp4GeometryError {
     /// block scales to 448, so this is corruption, and multiplying through it would quietly poison
     /// 16 weights instead of failing.
     BlockScaleNaN { row: usize, block: usize },
+    /// A block scale that governs real (non-padding) elements carries the E4M3 sign bit. ComfyUI's
+    /// quantizer clamps block scales to `[0, 448]`, so a negative scale is corruption; multiplying
+    /// through it would silently negate 16 weights instead of failing (sc-21482 — the check the
+    /// provider-owned Krea payload scan used to make, now owned by the codec).
+    BlockScaleNegative { row: usize, block: usize },
     /// A padding element (row ≥ logical rows, or column ≥ logical cols) is not the E2M1 zero code
     /// ComfyUI's `F.pad` writes. A non-zero pad means the shapes are being read wrong — the values
     /// would be dropped silently otherwise.
@@ -882,6 +1023,11 @@ impl fmt::Display for Nvfp4GeometryError {
             Self::BlockScaleNaN { row, block } => write!(
                 f,
                 "nvfp4 block scale at (row {row}, block {block}) is the E4M3 NaN code 0x7F"
+            ),
+            Self::BlockScaleNegative { row, block } => write!(
+                f,
+                "nvfp4 block scale at (row {row}, block {block}) carries the E4M3 sign bit; block \
+                 scales are clamped to [0, 448] at quantization, so a negative scale is corruption"
             ),
             Self::PaddingNotZero { row, col, code } => write!(
                 f,
@@ -945,6 +1091,72 @@ pub fn validate_nvfp4_geometry(
     }
 }
 
+/// Validate the NVFP4 block-scale **payload** for one layer: every scale byte that governs a real
+/// (non-padding) element of the `logical` matrix must be a valid non-negative, non-NaN UE4M3
+/// magnitude. `scales` is the `to_blocked` swizzled buffer for the `stored` grid, `logical` the
+/// shape the layer decodes/unpads to.
+///
+/// This is a value check the plan compiler's header-level geometry checks cannot make (it never
+/// touches payload bytes), and it is codec-owned rather than provider-owned (sc-21482): both the
+/// dense decode ([`decode_nvfp4`] calls it) and a backend's packed-native repack must refuse the
+/// same corrupted scale surface the same way, before the bad multiplier reaches any weight or any
+/// GEMM.
+///
+/// # Grid self-checks (sc-21482 review)
+///
+/// The function is `pub` and callable standalone, so it validates the grid it was handed rather
+/// than trusting the caller: a `stored` whose axes are not 16-aligned would make `stored[1] /
+/// `[`NVFP4_BLOCK`] truncate and silently skip the trailing block, and a `logical` wider or taller
+/// than `stored` would silently narrow the swept region. Both refuse as
+/// [`Nvfp4GeometryError::LogicalDoesNotPadToStored`].
+///
+/// It deliberately does **not** require `stored == `[`nvfp4_padded_shape`]`(logical)`: an
+/// *over*-padded stored grid is decodable (blocks past the logical width are pure padding, which
+/// the sweep skips), and refusing exact-pad drift is [`validate_nvfp4_geometry`]'s job at plan
+/// time, where the header is the thing being judged.
+pub fn validate_nvfp4_block_scale_payload(
+    scales: &[u8],
+    stored: [usize; 2],
+    logical: [usize; 2],
+) -> Result<(), Nvfp4GeometryError> {
+    if !stored[0].is_multiple_of(NVFP4_PAD)
+        || !stored[1].is_multiple_of(NVFP4_PAD)
+        || logical[0] > stored[0]
+        || logical[1] > stored[1]
+    {
+        return Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+            logical,
+            stored,
+            expected_stored: nvfp4_padded_shape(logical),
+        });
+    }
+    let scale_shape = nvfp4_scale_shape(stored);
+    let expected_scales = scale_shape[0] * scale_shape[1];
+    if scales.len() != expected_scales {
+        return Err(Nvfp4GeometryError::PayloadLength {
+            what: "weight_scale",
+            expected: expected_scales,
+            actual: scales.len(),
+        });
+    }
+    let blocks = stored[1] / NVFP4_BLOCK;
+    for row in 0..logical[0].min(stored[0]) {
+        for block in 0..blocks {
+            if block * NVFP4_BLOCK >= logical[1] {
+                break;
+            }
+            let scale_byte = scales[nvfp4_swizzled_scale_index(stored, row, block)];
+            if scale_byte & 0x7F == 0x7F {
+                return Err(Nvfp4GeometryError::BlockScaleNaN { row, block });
+            }
+            if scale_byte & 0x80 != 0 {
+                return Err(Nvfp4GeometryError::BlockScaleNegative { row, block });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reference NVFP4 dequantization — the two-level decode, in plain f32.
 ///
 /// `packed` is the stored `[rows, cols/2]` byte payload (row-major, **even column in the high
@@ -974,15 +1186,6 @@ pub fn decode_nvfp4(
             actual: packed.len(),
         });
     }
-    let scale_shape = nvfp4_scale_shape(stored);
-    let expected_scales = scale_shape[0] * scale_shape[1];
-    if scales.len() != expected_scales {
-        return Err(Nvfp4GeometryError::PayloadLength {
-            what: "weight_scale",
-            expected: expected_scales,
-            actual: scales.len(),
-        });
-    }
     if !global_scale.is_finite() || global_scale < 0.0 {
         return Err(Nvfp4GeometryError::GlobalScale {
             bits: global_scale.to_bits(),
@@ -995,6 +1198,7 @@ pub fn decode_nvfp4(
             expected_stored: nvfp4_padded_shape(logical),
         });
     }
+    validate_nvfp4_block_scale_payload(scales, stored, logical)?;
 
     let code_at = |row: usize, col: usize| -> u8 {
         let byte = packed[row * row_bytes + col / 2];
@@ -1025,10 +1229,8 @@ pub fn decode_nvfp4(
             if block_start >= logical[1] {
                 break;
             }
+            // NaN/negative scale bytes were refused by `validate_nvfp4_block_scale_payload` above.
             let scale_byte = scales[nvfp4_swizzled_scale_index(stored, row, block)];
-            if scale_byte & 0x7F == 0x7F {
-                return Err(Nvfp4GeometryError::BlockScaleNaN { row, block });
-            }
             let element_scale = fp8_e4m3fn_to_f32(scale_byte) * global_scale;
             let block_end = (block_start + NVFP4_BLOCK).min(logical[1]);
             for col in block_start..block_end {
@@ -1194,7 +1396,8 @@ mod tests {
             parse_comfy_quant_descriptor(br#"{"format": "float8_e4m3fn"}"#),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Float8E4M3Fn,
-                full_precision_matrix_mult: false
+                full_precision_matrix_mult: false,
+                orig_shape: None,
             })
         );
         assert_eq!(
@@ -1203,7 +1406,8 @@ mod tests {
             ),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Float8E5M2,
-                full_precision_matrix_mult: true
+                full_precision_matrix_mult: true,
+                orig_shape: None,
             })
         );
         assert_eq!(
@@ -1257,9 +1461,13 @@ mod tests {
                 },
             ),
             (
+                // Scalar fp8 has no block axis at all: a declared `group_size` is a layout this
+                // workspace does not model (sc-21485 refined the refusal from UnknownField).
                 br#"{"format": "float8_e4m3fn", "group_size": 32}"#,
-                ComfyQuantDescriptorError::UnknownField {
-                    field: "group_size".to_owned(),
+                ComfyQuantDescriptorError::GroupSizeMismatch {
+                    declared: "32".to_owned(),
+                    format: ComfyQuantFormat::Float8E4M3Fn,
+                    expected: None,
                 },
             ),
             (
@@ -1502,6 +1710,14 @@ mod tests {
             decode_nvfp4(&packed, &nan_scales, global, stored, logical, &mut out),
             Err(Nvfp4GeometryError::BlockScaleNaN { row: 3, block: 1 })
         );
+        // …and a SIGN-BIT block scale (E4M3 −1.0) refuses as its own variant rather than silently
+        // negating 16 weights: an NVFP4 block scale is a magnitude (sc-21482).
+        let mut negative_scales = scales.clone();
+        negative_scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0xB8;
+        assert_eq!(
+            decode_nvfp4(&packed, &negative_scales, global, stored, logical, &mut out),
+            Err(Nvfp4GeometryError::BlockScaleNegative { row: 3, block: 1 })
+        );
         // A non-zero padding element refuses rather than being trimmed away.
         let mut padded = packed.clone();
         // Row 0, column 41 — an odd column, so the low nibble of byte 20.
@@ -1526,6 +1742,76 @@ mod tests {
         );
     }
 
+    /// [`validate_nvfp4_block_scale_payload`] is `pub` and documented as callable directly by a
+    /// backend's packed repack (Candle's `Packed` arm calls it exactly that way, sc-21482), so it
+    /// is tested directly rather than only through [`decode_nvfp4`]: a truncated buffer, a grid
+    /// whose axes are not 16-aligned, and an over-wide `logical` must all refuse instead of
+    /// sweeping a silently narrowed region and returning `Ok`.
+    #[test]
+    fn nvfp4_block_scale_payload_validates_its_own_grid() {
+        let stored = [16_usize, 64];
+        let logical = [10_usize, 40];
+        let scale_shape = nvfp4_scale_shape(stored);
+        let mut scales = vec![0x38_u8; scale_shape[0] * scale_shape[1]]; // E4M3 1.0 everywhere.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Ok(())
+        );
+
+        // A truncated companion is a payload-length refusal, named for the tensor it governs.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales[..10], stored, logical),
+            Err(Nvfp4GeometryError::PayloadLength {
+                what: "weight_scale",
+                expected: scale_shape[0] * scale_shape[1],
+                actual: 10,
+            })
+        );
+
+        // A stored width that is not 16-aligned would make `stored[1] / NVFP4_BLOCK` truncate and
+        // skip the trailing block; refuse rather than validate a prefix of the grid.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, [16, 40], logical),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                logical,
+                stored: [16, 40],
+                expected_stored: [16, 48],
+            })
+        );
+        // …same for a non-16-aligned row count, and for a `logical` that overruns storage.
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, [10, 64], logical),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored {
+                logical,
+                stored: [10, 64],
+                expected_stored: [16, 48],
+            })
+        );
+        assert!(matches!(
+            validate_nvfp4_block_scale_payload(&scales, stored, [10, 65]),
+            Err(Nvfp4GeometryError::LogicalDoesNotPadToStored { .. })
+        ));
+
+        // The value sweep itself: sign bit and NaN, each named by (row, block).
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0xB8;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Err(Nvfp4GeometryError::BlockScaleNegative { row: 3, block: 1 })
+        );
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0x7F;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Err(Nvfp4GeometryError::BlockScaleNaN { row: 3, block: 1 })
+        );
+        // A corrupt scale governing only PADDING is not a defect — nothing reads it.
+        scales[nvfp4_swizzled_scale_index(stored, 3, 1)] = 0x38;
+        scales[nvfp4_swizzled_scale_index(stored, 3, 3)] = 0xFF;
+        assert_eq!(
+            validate_nvfp4_block_scale_payload(&scales, stored, logical),
+            Ok(())
+        );
+    }
+
     #[test]
     fn quantization_metadata_parses_the_layer_table_and_refuses_every_defect() {
         let table = parse_quantization_metadata(
@@ -1542,6 +1828,7 @@ mod tests {
                 format: ComfyQuantFormat::Nvfp4,
                 full_precision_matrix_mult: None,
                 per_row: None,
+                orig_shape: None,
             }
         );
         assert_eq!(
@@ -1550,10 +1837,11 @@ mod tests {
         );
         // Completing a standalone entry fills the ComfyUI defaults.
         assert_eq!(
-            table["blocks.0.attn.wq"].into_complete(),
+            table["blocks.0.attn.wq"].clone().into_complete(),
             Ok(ComfyQuantDescriptor {
                 format: ComfyQuantFormat::Nvfp4,
-                full_precision_matrix_mult: false
+                full_precision_matrix_mult: false,
+                orig_shape: None,
             })
         );
         // …and a bare int8 entry, which every real ComfyUI file writes, is only refusable as a
@@ -1568,10 +1856,11 @@ mod tests {
                 format: ComfyQuantFormat::Int8TensorwisePerRow,
                 full_precision_matrix_mult: None,
                 per_row: None,
+                orig_shape: None,
             }
         );
         assert_eq!(
-            int8["q"].into_complete(),
+            int8["q"].clone().into_complete(),
             Err(ComfyQuantDescriptorError::Int8NotPerRow)
         );
 
@@ -1583,18 +1872,36 @@ mod tests {
             parse_quantization_metadata("[1]"),
             Err(QuantizationMetadataError::NotAnObject)
         );
+        // An ABSENT `format_version` is accepted as v1 (sc-21482): the real pinned
+        // `Comfy-Org/Krea-2` NVFP4 export writes `{"layers": {…}}` with no version key, and
+        // ComfyUI's own reader never consults one. Only a present-but-different version refuses.
+        assert!(parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#).is_ok());
+        // A JSON NUMBER `1.0` is not the string `"1.0"` — and the message must say so instead of
+        // reading `must be the string "1.0", got "1.0"`.
+        let numeric = parse_quantization_metadata(r#"{"format_version": 1.0, "layers": {}}"#);
         assert_eq!(
-            parse_quantization_metadata(r#"{"layers": {"a": {"format": "nvfp4"}}}"#),
-            Err(QuantizationMetadataError::FormatVersion { found: None })
-        );
-        assert_eq!(
-            parse_quantization_metadata(
-                r#"{"format_version": "2.0", "layers": {"a": {"format": "nvfp4"}}}"#
-            ),
+            numeric,
             Err(QuantizationMetadataError::FormatVersion {
-                found: Some("2.0".to_owned())
+                found: "non-string 1.0".to_owned()
             })
         );
+        assert!(
+            numeric
+                .unwrap_err()
+                .to_string()
+                .contains("got non-string 1.0"),
+            "a non-string version must not render as the string it would stringify to"
+        );
+        let wrong = parse_quantization_metadata(
+            r#"{"format_version": "2.0", "layers": {"a": {"format": "nvfp4"}}}"#,
+        );
+        assert_eq!(
+            wrong,
+            Err(QuantizationMetadataError::FormatVersion {
+                found: "\"2.0\"".to_owned()
+            })
+        );
+        assert!(wrong.unwrap_err().to_string().contains("got \"2.0\""));
         assert_eq!(
             parse_quantization_metadata(r#"{"format_version": "1.0"}"#),
             Err(QuantizationMetadataError::Layers)
@@ -1621,16 +1928,77 @@ mod tests {
             ),
             Err(QuantizationMetadataError::Layer {
                 layer: "blocks.3.attn.wq".to_owned(),
-                defect: ComfyQuantDescriptorError::UnknownField {
-                    field: "group_size".to_owned()
+                // 32 is MXFP8's block, not NVFP4's fixed 16 — a layout redefinition, refused by
+                // name (sc-21485).
+                defect: ComfyQuantDescriptorError::GroupSizeMismatch {
+                    declared: "32".to_owned(),
+                    format: ComfyQuantFormat::Nvfp4,
+                    expected: Some(NVFP4_BLOCK),
                 }
             })
         );
+        // The real Kitchen provenance trio is accepted, with the pinned sc-21485 artifact's exact
+        // per-layer shape. `group_size` and `orig_dtype` are validated here and dropped;
+        // `orig_shape` is RETAINED, because the plan compiler checks it against the logical shape it
+        // derives independently (see `checkpoint_codec`'s
+        // `a_declared_orig_shape_must_equal_the_derived_logical_shape`).
+        let trio = parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"double_blocks.0.img_attn.qkv": {"format": "nvfp4", "group_size": 16, "orig_dtype": "torch.bfloat16", "orig_shape": [12288, 4096]}}}"#
+        )
+        .expect("the real Kitchen trio parses");
+        assert_eq!(
+            trio["double_blocks.0.img_attn.qkv"].orig_shape.as_deref(),
+            Some(&[12288usize, 4096][..]),
+            "orig_shape must survive the parse — a dropped one cannot be checked downstream"
+        );
+        assert_eq!(
+            parse_quantization_metadata(
+                r#"{"format_version": "1.0", "layers": {"q": {"format": "nvfp4", "group_size": 16, "orig_shape": "big"}}}"#
+            ),
+            Err(QuantizationMetadataError::Layer {
+                layer: "q".to_owned(),
+                defect: ComfyQuantDescriptorError::MalformedProvenanceField {
+                    field: "orig_shape"
+                }
+            })
+        );
+        // Scope (sc-21485 review): the provenance pair belongs to the BLOCK-SCALED formats only.
+        // On any other format the keys refuse as unknown, the same fail-closed treatment `per_row`
+        // gets outside int8 — admitting them everywhere would loosen the parser past its documented
+        // scope.
+        assert!(parse_quantization_metadata(
+            r#"{"format_version": "1.0", "layers": {"q": {"format": "mxfp8", "orig_dtype": "torch.bfloat16", "orig_shape": [8, 16]}}}"#
+        )
+        .is_ok());
+        for (format, field) in [
+            ("float8_e4m3fn", "orig_dtype"),
+            ("float8_e5m2", "orig_shape"),
+            ("int8_tensorwise", "orig_shape"),
+        ] {
+            let declaration = match field {
+                "orig_dtype" => r#""orig_dtype": "torch.bfloat16""#,
+                _ => r#""orig_shape": [8, 16]"#,
+            };
+            assert_eq!(
+                parse_quantization_metadata(&format!(
+                    r#"{{"format_version": "1.0", "layers": {{"q": {{"format": "{format}", {declaration}}}}}}}"#
+                )),
+                Err(QuantizationMetadataError::Layer {
+                    layer: "q".to_owned(),
+                    defect: ComfyQuantDescriptorError::UnknownField {
+                        field: field.to_owned()
+                    }
+                }),
+                "{format} must not admit {field}"
+            );
+        }
         for error in [
             QuantizationMetadataError::NotAnObject,
             QuantizationMetadataError::Layers,
             QuantizationMetadataError::NoLayers,
-            QuantizationMetadataError::FormatVersion { found: None },
+            QuantizationMetadataError::FormatVersion {
+                found: "\"2.0\"".to_owned(),
+            },
         ] {
             assert!(!error.to_string().is_empty());
         }

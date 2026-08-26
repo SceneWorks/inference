@@ -198,6 +198,38 @@ pub(crate) enum DitRef<'a> {
     Packed(&'a PackedFluxDit),
 }
 
+pub(crate) enum PreparedDit {
+    Stock(crate::ip_dit::PreparedConditioning),
+    Packed(crate::ip_dit::PreparedConditioning),
+}
+
+impl PreparedDit {
+    pub(crate) fn conditioning(&self) -> &crate::ip_dit::PreparedConditioning {
+        match self {
+            Self::Stock(prepared) | Self::Packed(prepared) => prepared,
+        }
+    }
+}
+
+impl DitRef<'_> {
+    pub(crate) fn prepare_conditioning(
+        self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> Result<PreparedDit> {
+        match self {
+            Self::Stock(model) => Ok(PreparedDit::Stock(
+                model.prepare_conditioning(img, img_ids, txt, txt_ids)?,
+            )),
+            Self::Packed(model) => Ok(PreparedDit::Packed(
+                model.prepare_conditioning(img, img_ids, txt, txt_ids)?,
+            )),
+        }
+    }
+}
+
 /// A just-loaded DiT owned by the sequential path (epic 10765 Phase 1, sc-10769) — not `Arc`-cached,
 /// because sequential residency deliberately drops each component after its phase rather than keeping
 /// the cross-request cache.
@@ -680,6 +712,7 @@ impl Pipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        candle_gen::check_cancel(&req.cancel)?;
         let b_sz = state.img.dim(0)?;
         let dev = &self.device;
         let guidance_t = Tensor::full(guidance as f32, b_sz, dev)?;
@@ -697,6 +730,8 @@ impl Pipeline {
         } else {
             None
         };
+        let prepared =
+            dit.prepare_conditioning(&state.img, &state.img_ids, &state.txt, &state.txt_ids)?;
         candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -716,34 +751,48 @@ impl Pipeline {
                     .and_then(|memory| memory.transformer_window_size)
                     .map(|value| value as usize)
                     .unwrap_or(crate::memory_strategy::DEFAULT_TRANSFORMER_WINDOW);
-                let out = match dit {
+                let out = match (dit, &prepared) {
                     // `IpFlux::forward` with `ip = None` is byte-identical to the stock
                     // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
-                    DitRef::Stock(transformer) => transformer.forward_with_memory(
-                        img,
-                        &state.img_ids,
-                        &state.txt,
-                        &state.txt_ids,
-                        &t_vec,
-                        &state.vec,
-                        Some(&guidance_t),
-                        None,
-                        attention_plan,
-                        transformer_window,
-                        &req.cancel,
-                    )?,
-                    DitRef::Packed(transformer) => transformer.forward_with_memory(
-                        img,
-                        &state.img_ids,
-                        &state.txt,
-                        &state.txt_ids,
-                        &t_vec,
-                        &state.vec,
-                        packed_guidance,
-                        attention_plan,
-                        transformer_window,
-                        &req.cancel,
-                    )?,
+                    (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
+                        .forward_prepared_with_memory(
+                            img,
+                            &state.img_ids,
+                            &state.txt,
+                            &state.txt_ids,
+                            &t_vec,
+                            &state.vec,
+                            Some(&guidance_t),
+                            None,
+                            None,
+                            None,
+                            prepared,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                        )?,
+                    (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
+                        .forward_prepared_with_memory(
+                            img,
+                            &state.img_ids,
+                            &state.txt,
+                            &state.txt_ids,
+                            &t_vec,
+                            &state.vec,
+                            packed_guidance,
+                            None,
+                            None,
+                            None,
+                            prepared,
+                            attention_plan,
+                            transformer_window,
+                            &req.cancel,
+                        )?,
+                    _ => {
+                        return Err(CandleError::Msg(
+                            "flux: prepared conditioning belongs to another DiT variant".into(),
+                        ))
+                    }
                 };
                 Ok(out)
             },
@@ -873,6 +922,20 @@ impl Pipeline {
         }
     }
 
+    pub(crate) fn prepare_ref_conditioning(
+        &self,
+        heavy: &SeqHeavy,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+    ) -> Result<PreparedDit> {
+        heavy
+            .dit
+            .as_ref()
+            .prepare_conditioning(img, img_ids, txt, txt_ids)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_ip_residency(
         &self,
@@ -885,37 +948,49 @@ impl Pipeline {
         pooled: &Tensor,
         guidance: Option<&Tensor>,
         injector: &FluxIpInjector<'_>,
+        prepared: &PreparedDit,
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &gen_core::CancelFlag,
     ) -> Result<Tensor> {
-        match heavy.dit.as_ref() {
-            DitRef::Stock(transformer) => transformer.forward_with_memory(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                Some(injector),
-                attention_plan,
-                transformer_window,
-                cancel,
-            ),
-            DitRef::Packed(transformer) => transformer.forward_ip_with_memory(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                attention_plan,
-                transformer_window,
-                cancel,
-            ),
+        match (heavy.dit.as_ref(), prepared) {
+            (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
+                .forward_prepared_with_memory(
+                    img,
+                    img_ids,
+                    txt,
+                    txt_ids,
+                    timesteps,
+                    pooled,
+                    guidance,
+                    Some(injector),
+                    None,
+                    None,
+                    prepared,
+                    attention_plan,
+                    transformer_window,
+                    cancel,
+                ),
+            (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
+                .forward_prepared_with_memory(
+                    img,
+                    img_ids,
+                    txt,
+                    txt_ids,
+                    timesteps,
+                    pooled,
+                    guidance,
+                    Some(injector),
+                    None,
+                    None,
+                    prepared,
+                    attention_plan,
+                    transformer_window,
+                    cancel,
+                ),
+            _ => Err(CandleError::Msg(
+                "flux: prepared conditioning belongs to another DiT variant".into(),
+            )),
         }
     }
 
@@ -932,39 +1007,49 @@ impl Pipeline {
         guidance: Option<&Tensor>,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Tensor], f64)>,
+        prepared: &PreparedDit,
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
         cancel: &gen_core::CancelFlag,
     ) -> Result<Tensor> {
-        match heavy.dit.as_ref() {
-            DitRef::Stock(transformer) => transformer.forward_control_with_memory(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                control,
-                attention_plan,
-                transformer_window,
-                cancel,
-            ),
-            DitRef::Packed(transformer) => transformer.forward_control_with_memory(
-                img,
-                img_ids,
-                txt,
-                txt_ids,
-                timesteps,
-                pooled,
-                guidance,
-                injector,
-                control,
-                attention_plan,
-                transformer_window,
-                cancel,
-            ),
+        match (heavy.dit.as_ref(), prepared) {
+            (DitRef::Stock(transformer), PreparedDit::Stock(prepared)) => transformer
+                .forward_prepared_with_memory(
+                    img,
+                    img_ids,
+                    txt,
+                    txt_ids,
+                    timesteps,
+                    pooled,
+                    guidance,
+                    None,
+                    injector,
+                    control,
+                    prepared,
+                    attention_plan,
+                    transformer_window,
+                    cancel,
+                ),
+            (DitRef::Packed(transformer), PreparedDit::Packed(prepared)) => transformer
+                .forward_prepared_with_memory(
+                    img,
+                    img_ids,
+                    txt,
+                    txt_ids,
+                    timesteps,
+                    pooled,
+                    guidance,
+                    None,
+                    injector,
+                    control,
+                    prepared,
+                    attention_plan,
+                    transformer_window,
+                    cancel,
+                ),
+            _ => Err(CandleError::Msg(
+                "flux: prepared conditioning belongs to another DiT variant".into(),
+            )),
         }
     }
 

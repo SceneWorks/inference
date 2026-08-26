@@ -680,6 +680,40 @@ pub(crate) fn weights_free_memory_strategy_contract(
     contract_with_asset_facts(provider_id, spec, 0, 0, 0)
 }
 
+/// Whether the registry surface this selector names leaves the U-Net blocks lazy.
+///
+/// [`load_leaves_blocks_lazy`] answers that by probing the packed-quant marker under the snapshot
+/// root, which a weights-free witness has no directory to read. The selector already names the
+/// *resolved* artifact tier, so a packed snapshot at that tier is exactly the shape it denotes and
+/// re-quantizes nothing. A witness carries no adapters, so [`adapters_are_replayable`] is vacuous.
+fn surface_streamable(surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec) -> bool {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    matches!(
+        surface.resolved_artifact_tier(),
+        MemoryContractSurfaceTier::Bf16
+            | MemoryContractSurfaceTier::Q4
+            | MemoryContractSurfaceTier::Q8
+    ) && matches!(surface.spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(surface.spec.weights, WeightsSource::Dir(_))
+        && adapters_are_replayable(&surface.spec)
+}
+
+/// Declaration-equivalent contract resolved from the explicit surface selector.
+pub(crate) fn weights_free_memory_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        &surface.spec,
+        surface_streamable(surface),
+        0,
+        0,
+        0,
+    )
+}
+
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -687,7 +721,24 @@ fn contract_with_asset_facts(
     transformer_bytes: u64,
     decoder_bytes: u64,
 ) -> CoreResult<MemoryProviderContract> {
-    let streamable = streamable(spec);
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        spec,
+        streamable(spec),
+        conditioning_bytes,
+        transformer_bytes,
+        decoder_bytes,
+    )
+}
+
+fn contract_with_asset_facts_and_streamability(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    conditioning_bytes: u64,
+    transformer_bytes: u64,
+    decoder_bytes: u64,
+) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
         loaded_tier(spec),
