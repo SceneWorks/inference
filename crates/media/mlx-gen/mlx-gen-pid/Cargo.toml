@@ -13,8 +13,6 @@ autotests = false
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
-# Parse the PiD checkpoint's sidecar config (channels / latent-norm / scale) at load time.
-serde_json = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-krea / mlx-gen-z-image).
 image = { workspace = true }
 
