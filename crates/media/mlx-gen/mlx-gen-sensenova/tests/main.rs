@@ -9,6 +9,7 @@
 //! `cargo test -p <crate> --test integration -- <name>::`.
 
 // --- shared modules (hand-maintained; preserved by regen) ---
+mod compact_fixture;
 // --- generated modules (do not edit) ---
 
 #[path = "backbone_parity.rs"]
