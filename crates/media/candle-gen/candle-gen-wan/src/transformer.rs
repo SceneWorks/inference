@@ -186,7 +186,7 @@ static CROSS_KV_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn lock_cross_kv_probe() -> std::sync::MutexGuard<'static, ()> {
-    CROSS_KV_PROBE_LOCK.lock().expect("cross K/V probe lock")
+    candle_gen::lock_recover(&CROSS_KV_PROBE_LOCK)
 }
 
 #[cfg(test)]
