@@ -20,6 +20,9 @@ mod connector_parity;
 #[path = "duration_head_golden.rs"]
 mod duration_head_golden;
 
+#[path = "ltx_2_5_te_connector_inputs.rs"]
+mod ltx_2_5_te_connector_inputs;
+
 #[path = "ltx_2_5_vae_conformance.rs"]
 mod ltx_2_5_vae_conformance;
 

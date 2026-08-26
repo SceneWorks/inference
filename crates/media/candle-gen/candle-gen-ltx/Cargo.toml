@@ -11,6 +11,12 @@ autotests = false
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
+# sc-18770: the candle twin of `mlx-gen-ltx → mlx-llm`. LTX-2.5's text encoder is a Gemma 4 unified
+# decoder, which lives in `candle-llm` alongside every other decoder architecture rather than being
+# duplicated inside a media crate. Only `gemma4_te.rs` uses it; LTX-2.3's Gemma 3 path (`gemma.rs`)
+# is untouched. Both crates take `candle-core`/`candle-nn` from `[workspace.dependencies]` at one
+# pinned git rev, so the graph resolves a single candle and both halves share one `Tensor` type.
+candle-llm = { path = "../../../llm/candle-llm" }
 # LTX-2.3 has NO candle-transformers reference: the AVTransformer3DModel video DiT, the
 # CausalVideoAutoencoder temporal VAE, the Gemma-3-12B text encoder + per-token-RMS aggregation +
 # 8-layer learnable-register connector, and the rectified-flow distilled scheduler are all written
@@ -29,8 +35,10 @@ image = { workspace = true }
 
 [features]
 default = []
-metal = ["candle-gen/metal"]
-cuda = ["candle-gen/cuda"]
+# The LLM crate's backend features must move in lock-step with candle-gen's, or the Gemma 4 decoder
+# would be built for a different device than the rest of the pipeline.
+metal = ["candle-gen/metal", "candle-llm/metal"]
+cuda = ["candle-gen/cuda", "candle-llm/cuda"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

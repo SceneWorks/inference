@@ -74,6 +74,9 @@ mod lora_real_weights;
 #[path = "ltx_2_5_diffvae_parity.rs"]
 mod ltx_2_5_diffvae_parity;
 
+#[path = "ltx_2_5_te_connector_inputs.rs"]
+mod ltx_2_5_te_connector_inputs;
+
 #[path = "ltx_2_5_tiers_real_weights.rs"]
 mod ltx_2_5_tiers_real_weights;
 

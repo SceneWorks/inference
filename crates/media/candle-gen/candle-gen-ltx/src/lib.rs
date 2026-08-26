@@ -41,6 +41,7 @@ pub mod conv3d;
 pub mod dit_train;
 pub mod duration_head;
 pub mod gemma;
+pub mod gemma4_te;
 pub mod image_crf;
 pub mod memory_strategy;
 pub mod params;
