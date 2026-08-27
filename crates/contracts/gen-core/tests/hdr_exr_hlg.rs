@@ -564,3 +564,74 @@ fn hlg_master_is_tagged_bt2020_hlg_to_ffprobe() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -------------------------------------------------------------------------------------------
+// SDR is the default, and HDR cannot be entered by accident
+// -------------------------------------------------------------------------------------------
+
+/// SDR is the default and HDR is refused unless the model advertises it.
+///
+/// This is the story's "SDR output is unchanged when HDR is off" invariant expressed at the only
+/// place it can be *decided*: the request surface. An engine cannot render HDR pixels for a
+/// request that never asked, because `hdr` defaults to `None`; and it cannot be handed an HDR
+/// request it does not implement, because the shared floor refuses one against a model whose
+/// `supports_hdr` is false. Both halves matter — a silently-ignored HDR flag would return SDR
+/// pixels the caller believes are HDR, which is the same washed-out-playback failure from the
+/// other direction.
+#[test]
+fn hdr_is_opt_in_and_gated_on_the_advertised_capability() {
+    use gen_core::{Capabilities, Error, GenerationRequest, HdrRequest};
+
+    let base_caps = || Capabilities {
+        max_count: 1,
+        min_size: 64,
+        max_size: 4096,
+        ..Default::default()
+    };
+
+    let sdr = GenerationRequest {
+        prompt: "a test".to_owned(),
+        width: 256,
+        height: 256,
+        count: 1,
+        ..Default::default()
+    };
+    assert!(
+        sdr.hdr.is_none(),
+        "GenerationRequest::default() must be SDR — HDR has to be opt-in"
+    );
+    assert!(
+        !base_caps().supports_hdr,
+        "Capabilities::default() must not advertise HDR"
+    );
+    base_caps()
+        .validate_request("m", &sdr)
+        .expect("an SDR request must validate against a non-HDR model");
+
+    let hdr = GenerationRequest {
+        hdr: Some(HdrRequest::new(
+            HdrColorSpace::SrgbLinear,
+            gen_core::HdrFrameSink::default(),
+        )),
+        ..sdr.clone()
+    };
+    let err = base_caps()
+        .validate_request("m", &hdr)
+        .expect_err("a non-HDR model must refuse an HDR request");
+    assert!(
+        matches!(err, Error::Unsupported(_)),
+        "an unimplemented HDR request is a capability gap (Unsupported), got {err:?}"
+    );
+
+    let hdr_model = Capabilities {
+        supports_hdr: true,
+        ..base_caps()
+    };
+    hdr_model
+        .validate_request("m", &hdr)
+        .expect("a model that advertises HDR must accept an HDR request");
+    // ...and the same model still takes SDR, so advertising HDR does not force it on.
+    hdr_model
+        .validate_request("m", &sdr)
+        .expect("advertising HDR must not make SDR requests invalid");
+}
