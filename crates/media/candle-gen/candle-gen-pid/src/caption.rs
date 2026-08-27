@@ -122,10 +122,11 @@ impl CaptionEncoder {
         // reference inference (`_encode_text_raw`) appends `chi_prompt_str + cap` unmodified; the
         // authors' own demo manifest uses mixed-case prompts; and there is no `.lower()` on captions
         // anywhere in the PiD repo. This deliberately differs from SANA, whose reference is the
-        // diffusers `SanaPipeline` (`_text_preprocessing` lowercases) — so `mlx-gen-sana` applies its
-        // own `preprocess()` before this shared encoder (sc-9927). Lowercasing here would feed PiD
-        // OOD-cased captions. (The effect is also small — an A/B moved a PiD SR decode 0.034%, weak
-        // LQ-dominated conditioning — but the reason to keep raw is correctness, not impact.)
+        // diffusers `SanaPipeline` (`_text_preprocessing` lowercases) — so the Candle and MLX SANA
+        // wrappers each apply matching `preprocess()` before this shared encoder (sc-9927).
+        // Lowercasing here would feed PiD OOD-cased captions. (The effect is also small — an A/B
+        // moved a PiD SR decode 0.034%, weak LQ-dominated conditioning — but the reason to keep raw
+        // is correctness, not impact.)
         let mut ids = self
             .tok
             .encode_ids(&format!("{}{caption}", self.chi_prompt), true)?;

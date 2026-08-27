@@ -1672,6 +1672,22 @@ mod tests {
         Ok(())
     }
 
+    fn check_transformer_mask_propagation(source: &str) -> std::result::Result<(), String> {
+        let forward = compact(braced_item_nth(
+            source,
+            "pub fn forward_with_guidance_mask_memory(",
+            0,
+        ));
+        let masked_block_call =
+            "block.forward(&hidden,&caption,caption_mask,&temb,ph,pw,attention_budget,)?";
+        if forward.matches(masked_block_call).count() != 2 {
+            return Err(
+                "resident and streamed Candle block routes must both preserve caption_mask".into(),
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn registered_base_and_sprint_routes_are_mask_bound_and_mutation_sensitive() {
         let shipped = include_str!("pipeline.rs");
@@ -1745,6 +1761,30 @@ mod tests {
             check_registered_mask_routes(&unmasked).is_err(),
             "dropping the mask at the real transformer call must fail"
         );
+
+        let transformer = include_str!("transformer.rs");
+        check_transformer_mask_propagation(transformer).unwrap();
+        for mutated in [
+            replace_in_item_nth(
+                transformer,
+                "pub fn forward_with_guidance_mask_memory(",
+                0,
+                "                        caption_mask,\n                        &temb,",
+                "                        None,\n                        &temb,",
+            ),
+            replace_in_item_nth(
+                transformer,
+                "pub fn forward_with_guidance_mask_memory(",
+                0,
+                "                    caption_mask,\n                    &temb,",
+                "                    None,\n                    &temb,",
+            ),
+        ] {
+            assert!(
+                check_transformer_mask_propagation(&mutated).is_err(),
+                "dropping caption_mask from streamed/resident Candle blocks must fail"
+            );
+        }
     }
 
     #[test]

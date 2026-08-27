@@ -26,8 +26,8 @@
 //! ## Mask handling
 //! `_get_gemma_prompt_embeds` returns `(prompt_embeds, prompt_attention_mask)` and `encode_prompt`
 //! gathers the **same** `select_index` from both. [`SanaTextEncoder::encode_with_mask`] returns both
-//! gathered arrays; the pipeline threads `caption_mask` through
-//! [`crate::transformer::SanaTransformer::forward`] into every block's `attn2` cross-attention.
+//! gathered arrays; the pipeline threads `caption_mask` through the internal
+//! `SanaTransformer::forward_with_memory` path into every block's `attn2` cross-attention.
 //! This is required for correctness: short captions leave most of the 300 positions padded, and
 //! attending to those padding embeddings would swamp the real conditioning.
 
