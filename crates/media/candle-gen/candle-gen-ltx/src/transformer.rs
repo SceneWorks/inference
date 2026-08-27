@@ -1652,17 +1652,48 @@ impl AvDiT {
             cross_ss_ts: &v_ts.cross_ss_ts,
             cross_gate_ts: &v_ts.cross_gate_ts,
         };
-        for block in &self.blocks {
-            vx = block.self_and_text(
-                &vx,
-                &block.attn1,
-                &block.attn2,
-                &block.v_sst,
-                &block.v_pst,
-                &va,
-            )?;
-            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
-        }
+        vx = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    vx = block.self_and_text(
+                        &vx,
+                        &block.attn1,
+                        &block.attn2,
+                        &block.v_sst,
+                        &block.v_pst,
+                        &va,
+                    )?;
+                    vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+                }
+                vx
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = *candle_gen::lock_recover(&self.block_plan);
+                candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &plan,
+                    &self.cancel,
+                    vx,
+                    || stream.open(),
+                    |mut vx, view: &mut VarBuilder<'static>, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            vx = block.self_and_text(
+                                &vx,
+                                &block.attn1,
+                                &block.attn2,
+                                &block.v_sst,
+                                &block.v_pst,
+                                &va,
+                            )?;
+                            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+                        }
+                        Ok(vx)
+                    },
+                )
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
+            }
+        };
         self.video.output_head(&vx, &v_ts.emb_ts)
     }
 }

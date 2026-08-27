@@ -285,8 +285,14 @@ fn run(dit: &AvDiT, i: &Inputs) -> (Array, Array) {
         None,
         &i.a_pos,
         None,
+        None,
     )
     .expect("joint forward")
+}
+
+fn run_video_only(dit: &AvDiT, i: &Inputs) -> Array {
+    dit.forward_video_only(&i.v_latent, &i.v_ts, &i.v_ctx, None, &i.v_pos, None, None)
+        .expect("video-only forward")
 }
 
 fn resident(f: &Fixture) -> AvDiT {
@@ -423,6 +429,28 @@ fn windowed_output_is_bit_identical_to_unwindowed() {
         assert!(
             array_eq(&sa, &ra, None).unwrap().item::<bool>(),
             "window {window}: audio velocity is not bit-identical to the resident stack"
+        );
+    }
+}
+
+/// DFR temporal rounds use the video-only reduction, so rung 4 must stream that path too rather
+/// than accepting the memory contract and then iterating only a resident block vector.
+#[test]
+fn windowed_video_only_output_is_bit_identical_to_unwindowed() {
+    let f = fixture();
+    let i = inputs(&f.cfg);
+    let resident = run_video_only(&resident(&f), &i);
+    let resident_bits = bits(&resident);
+    assert!(
+        resident_bits.iter().any(|v| v.is_finite() && *v != 0.0),
+        "premise: the resident video-only velocity must be non-degenerate"
+    );
+
+    for window in [1usize, 2, 3, 4] {
+        let streamed = run_video_only(&streamed(&f, window), &i);
+        assert!(
+            array_eq(&streamed, &resident, None).unwrap().item::<bool>(),
+            "window {window}: video-only velocity is not bit-identical to the resident stack"
         );
     }
 }

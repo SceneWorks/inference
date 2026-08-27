@@ -336,6 +336,7 @@ enum TextAssets {
     Gemma4 {
         bundle: LtxBundle,
         connector: PathBuf,
+        offload_policy: mlx_gen::gen_core::OffloadPolicy,
     },
 }
 
@@ -978,7 +979,11 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
         config,
         dit_prec,
         adapters: Vec::new(),
-        text_assets: TextAssets::Gemma4 { bundle, connector },
+        text_assets: TextAssets::Gemma4 {
+            bundle,
+            connector,
+            offload_policy: spec.offload_policy,
+        },
         execution: LtxExecution::Ltx25(Box::new(Ltx25Execution {
             duration_head,
             temporal_upsampler,
@@ -1024,7 +1029,11 @@ impl Ltx {
                     )?,
                 )))
             }
-            TextAssets::Gemma4 { bundle, connector } => {
+            TextAssets::Gemma4 {
+                bundle,
+                connector,
+                offload_policy,
+            } => {
                 let connector_w = Weights::from_file(connector)?;
                 Ok(StagedTextEncoder::Gemma4(Box::new(
                     Ltx25TextEncoder::from_bundle_av(
@@ -1032,6 +1041,7 @@ impl Ltx {
                         &connector_w,
                         &self.config,
                         self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
+                        *offload_policy,
                     )?,
                 )))
             }

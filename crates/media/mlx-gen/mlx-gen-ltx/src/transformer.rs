@@ -2610,11 +2610,33 @@ impl AvDiT {
             video_keyframes_mask,
             rope_epoch,
         )?;
-        let mut vx = vp.x.clone();
         let va = vp.args(video_mask);
-        for block in &self.blocks {
-            vx = block.forward_video_only(&vx, &va)?;
-        }
+        let vx = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let mut vx = vp.x.clone();
+                for block in blocks {
+                    vx = block.forward_video_only(&vx, &va)?;
+                }
+                vx
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    vp.x.clone(),
+                    || stream.open(),
+                    |mut vx, view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            vx = block.forward_video_only(&vx, &va)?;
+                        }
+                        Ok(vx)
+                    },
+                    |vx: &Array| mlx_rs::transforms::eval([vx]).map_err(Error::from),
+                )?
+            }
+        };
         self.video.output_head(&vx, &vp.emb_ts)
     }
 }
