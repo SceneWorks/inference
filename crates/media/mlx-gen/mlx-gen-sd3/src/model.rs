@@ -114,6 +114,29 @@ pub(crate) struct Sd3Heavy {
     vae: Vae,
 }
 
+impl Sd3Variant {
+    /// Tensor-free request scheduler shared by the production Large, Turbo, and Medium generator
+    /// path. `prepare` owns the one seed-independent reference encode/materialization; `output` owns
+    /// each seed-specific noise, denoise, and decode. Keeping this seam on the route itself makes the
+    /// production call injectable without constructing MLX arrays in its mutation-sensitive tests.
+    fn map_seeded_outputs<R, P, O, E>(
+        self,
+        reference: Option<&R>,
+        base_seed: u64,
+        count: u32,
+        prepare: impl FnOnce(Self, &R) -> std::result::Result<P, E>,
+        mut output: impl FnMut(Self, u64, Option<&P>) -> std::result::Result<O, E>,
+    ) -> std::result::Result<Vec<O>, E> {
+        mlx_gen::gen_core::map_sd3_seeded_outputs(
+            reference,
+            base_seed,
+            count,
+            |reference| prepare(self, reference),
+            |seed, prepared| output(self, seed, prepared),
+        )
+    }
+}
+
 /// Construct a SD3.5-**Large** generator from a [`LoadSpec`]. See [`load_variant`] for the shared body.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, Sd3Variant::Large)
@@ -404,11 +427,11 @@ impl Sd3Large {
                 let attention = crate::memory_strategy::attention_plan(req);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
-                let images = mlx_gen::gen_core::map_sd3_seeded_outputs(
+                let images = self.variant.map_seeded_outputs(
                     reference.map(|(image, _)| image),
                     base_seed,
                     req.count,
-                    |init| {
+                    |_route, init| {
                         let clean =
                             pipeline::encode_reference(&heavy.vae, init, req.width, req.height)?;
                         // MLX is lazy: force the clean latent while the one reference-encode graph is
@@ -416,7 +439,7 @@ impl Sd3Large {
                         mlx_rs::transforms::eval([&clean])?;
                         Ok(clean)
                     },
-                    |seed, clean| {
+                    |_route, seed, clean| {
                         let latents = if let Some(clean) = clean {
                             pipeline::denoise_img2img_from_clean_cfg_with_memory(
                                 &heavy.transformer,
@@ -598,6 +621,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::{ConditioningKind, Modality};
+    use std::cell::Cell;
 
     fn tiny_image() -> Image {
         Image {
@@ -619,6 +643,95 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn every_variant_schedules_one_request_local_reference_encode_and_distinct_seeds() {
+        for route in [
+            Sd3Variant::Large,
+            Sd3Variant::LargeTurbo,
+            Sd3Variant::Medium,
+        ] {
+            let encode_count = Cell::new(0_u32);
+            let eval_count = Cell::new(0_u32);
+            let reference = 17_u8;
+
+            let run_request = |request_id: u32, base_seed: u64, count: u32| {
+                route
+                    .map_seeded_outputs(
+                        Some(&reference),
+                        base_seed,
+                        count,
+                        |prepared_route, source| {
+                            assert_eq!(prepared_route, route);
+                            assert_eq!(*source, reference);
+                            encode_count.set(encode_count.get() + 1);
+                            // The production closure evaluates the lazy VAE result immediately after
+                            // encoding. Keep a separate counter so moving either operation back into
+                            // the output loop fails this route table.
+                            eval_count.set(eval_count.get() + 1);
+                            Ok::<_, ()>(Box::new(request_id))
+                        },
+                        |output_route, seed, clean| {
+                            assert_eq!(output_route, route);
+                            let clean = clean.expect("reference request carries a clean latent");
+                            Ok::<_, ()>((
+                                seed,
+                                **clean,
+                                std::ptr::from_ref(clean.as_ref()) as usize,
+                            ))
+                        },
+                    )
+                    .unwrap()
+            };
+
+            let first = run_request(1, u64::MAX - 1, 3);
+            assert_eq!(
+                first.iter().map(|(seed, _, _)| *seed).collect::<Vec<_>>(),
+                [u64::MAX - 1, u64::MAX, 0]
+            );
+            assert!(first.iter().all(|(_, request_id, _)| *request_id == 1));
+            assert!(
+                first.windows(2).all(|pair| pair[0].2 == pair[1].2),
+                "every output must borrow the same prepared clean latent"
+            );
+            assert_eq!(encode_count.get(), 1);
+            assert_eq!(eval_count.get(), 1);
+
+            let second = run_request(2, 41, 2);
+            assert_eq!(
+                second.iter().map(|(seed, _, _)| *seed).collect::<Vec<_>>(),
+                [41, 42]
+            );
+            assert!(second.iter().all(|(_, request_id, _)| *request_id == 2));
+            assert_eq!(encode_count.get(), 2, "a second request must encode afresh");
+            assert_eq!(eval_count.get(), 2, "a second request must evaluate afresh");
+        }
+    }
+
+    #[test]
+    fn production_generate_impl_cannot_bypass_the_variant_scheduler() {
+        let source = include_str!("model.rs");
+        let (_, tail) = source
+            .split_once("    fn generate_impl(")
+            .expect("production generate_impl must remain discoverable");
+        let (body, _) = tail
+            .split_once("\n/// Required divisor for requested image dims")
+            .expect("production generate_impl boundary must remain discoverable");
+        assert_eq!(
+            body.matches("self.variant.map_seeded_outputs(").count(),
+            1,
+            "all MLX SD3 routes must execute the tested request scheduler"
+        );
+        assert_eq!(
+            body.matches("pipeline::encode_reference(").count(),
+            1,
+            "reference encoding must remain the scheduler's one preparation operation"
+        );
+        assert!(
+            !body.contains("for i in 0..req.count") && !body.contains("for index in 0..req.count"),
+            "generate_impl must not restore a per-output reference-encode loop"
+        );
     }
 
     #[test]
