@@ -288,37 +288,28 @@ fn connector_inputs_match_the_2_5_reference_golden() {
     );
 }
 
-/// The same gate one stage further on — and **it is RED today**, on a defect this golden found.
+/// The same gate one stage further on — GREEN since sc-21663 fixed the `crate::connector` defects
+/// this golden surfaced.
 ///
-/// Measured on the bf16 (dense) tier, so tier quantization is not in play — the q8 tier gives the
-/// same numbers to three digits:
+/// The defect this test found (it was committed RED at `video 1.275e0 / audio 1.771e0`): the
+/// connector — code **shared with LTX-2.3** — had only ever been pinned against `mlx_video`'s
+/// `Embeddings1DConnector`, which disagrees with the canonical `ltx_core` (the training stack) in
+/// two semantics (the per-head gate is `2·sigmoid`, not `sigmoid`; the FFN GELU is
+/// tanh-approximate, not erf) plus the RoPE table's f32 index quantization. This golden was the
+/// first comparison against upstream's own implementation. sc-21663 fixed all three (both
+/// backends), re-derived the 2.3 golden from the correct authority, and moved the connector's
+/// activations to f32 — the connector's closing per-row RMS-norm rescales rows whose magnitudes
+/// span >100x, so bf16 activation rounding alone reached `6.094e-2` against this bar on the same
+/// run (see `connector.rs`'s dtype doc for both measured comparisons and the mechanism).
+///
+/// Measured after the fix on the bf16 (dense) tier:
 ///
 /// ```text
-/// video_embeddings  1.275e0  (valid rows 4.877e-1)     bar 6e-2
-/// audio_embeddings  1.771e0  (valid rows 4.363e-2)     bar 6e-2
+/// video_embeddings  9.107e-3  (valid rows 2.224e-3)     bar 6e-2
+/// audio_embeddings  1.141e-2  (valid rows 2.178e-3)     bar 6e-2
 /// ```
-///
-/// What that rules out. The connector *inputs* reproduce the reference to `2.282e-3` on the same
-/// run, so the Gemma 4 backbone, the padding mask, the V2 extractor and both aggregate projections
-/// are correct. The 2.5 checkpoint's connector config is byte-identical in shape to 2.3's (32 × 128
-/// video / 32 × 64 audio, 8 layers, 128 registers, `max_pos [4096]`, theta 10000, gated,
-/// `connector_ff_bias` absent ⇒ true), so this is not a 2.5-specific config the loader mis-reads.
-/// The register-block ordering matches: upstream sorts the features right-padded *outside* the
-/// connector and replaces pads in place, `crate::connector` does both inside, and both land valid
-/// tokens at rows `0..num_valid` with `registers[num_valid..seq]` after.
-///
-/// What it leaves. The defect is in `crate::connector` — code **shared with LTX-2.3** and pinned
-/// only against `tools/dump_ltx_connector_golden.py`, whose oracle is `mlx_video`'s
-/// `Embeddings1DConnector`, *not* `ltx_core`'s. This is the first time the connector has been
-/// compared against upstream's own implementation, and the two disagree. Diagnosing that is
-/// **sc-21663**, not this text-encoder adapter: nothing in `gemma4_te.rs` can affect it, as the
-/// input-side gate above demonstrates. (sc-18757, which owns the connector, is already Done.)
-///
-/// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
-/// own.
 #[test]
-#[ignore = "sc-18770: RED — records a crate::connector defect the 2.5 golden surfaced; see the doc \
-            comment. Needs the bf16 tier (LTX25_TIER_DIR)."]
+#[ignore = "sc-18770: needs the built LTX-2.5 bf16 tier (LTX25_TIER_DIR); one ~24 GB encoder load"]
 fn connector_outputs_match_the_2_5_reference_golden() {
     let (g, nv, _, _, ve, ae) = against_the_golden();
     let want_ve = g.require("video_embeddings").expect("video_embeddings");

@@ -8,8 +8,11 @@
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
+use crate::hdr::HdrColorSpace;
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
+use crate::runtime::{
+    CancelFlag, HdrFrameSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
+};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
@@ -293,6 +296,32 @@ pub enum GenerationOutput {
     Audio(AudioTrack),
 }
 
+/// The HDR opt-in block ([`GenerationRequest::hdr`], sc-18790).
+///
+/// One field, not two: a colour space without a sink would render HDR and discard it, and a sink
+/// without a colour space would leave the engine guessing how to interpret the samples. Bundling
+/// them makes both of those unrepresentable, and makes `Option::is_some()` the single unambiguous
+/// "is this an HDR render?" test.
+#[derive(Clone, Debug)]
+pub struct HdrRequest {
+    /// The source **and** output colour space (upstream's single `--hdr` flag covers both): how
+    /// to interpret EXR conditioning input, and which primaries / `colorSpace` tag the emitted
+    /// EXR frames carry.
+    pub color_space: HdrColorSpace,
+    /// Where decoded HDR frames are delivered, streaming, as the render produces them. An inert
+    /// sink is legal and means "render HDR but discard the frames" — useful for a caller that
+    /// only wants the HDR *decode path* (float32 VAE, no 8-bit quantization) and reads the SDR
+    /// proxy from [`GenerationOutput::Video`].
+    pub sink: HdrFrameSink,
+}
+
+impl HdrRequest {
+    /// The common case: stream frames in `color_space` to `sink`.
+    pub fn new(color_space: HdrColorSpace, sink: HdrFrameSink) -> Self {
+        Self { color_space, sink }
+    }
+}
+
 /// The request union (lifted from the SceneWorks worker's `ImageRequest`/`VideoRequest`). Most
 /// fields are optional; a model reads what it supports and `validate()` rejects the rest. A
 /// single `Default`-able struct (no builder): `GenerationRequest { prompt, ..Default::default() }`.
@@ -378,6 +407,26 @@ pub struct GenerationRequest {
     /// (the default). Consumed by Wan video models (`generate_wan.py`'s `trim_first_frames`); video
     /// models that don't support it ignore it.
     pub trim_first_frames: Option<u32>,
+
+    // --- LTX-2.5 DFR (sc-18789; the `--num-generated-keyframes` / `--temporal-upsample-rounds`
+    //     CLI equivalents) ---
+    /// Number of extra **generated keyframe slots** placed at evenly spaced interior frame
+    /// positions (reference `--num-generated-keyframes`; `ltx_dfr::evenly_spaced_keyframe_positions`).
+    /// Each slot relaxes the effective temporal compression at its position at the cost of one
+    /// latent frame's worth of tokens for one pixel frame. Requires a checkpoint whose transformer
+    /// sets `use_keyframes_abs_pos_embedding` (LTX ≥ 2.5) — an engine whose checkpoint lacks the
+    /// learned marker (`ltx_2_3`) **refuses** the request with a typed `Unsupported` rather than
+    /// denoising unmarked slots as wasted compute (the reference validates the same way, up
+    /// front). `None`/0 = off. Non-LTX models ignore it. **Until sc-18778 lands the `ltx_2_5`
+    /// engine, this knob is refusal-only** — no shipped engine consumes a positive value; the DFR
+    /// machinery it will drive is in place behind `ltx_dfr::evenly_spaced_keyframe_positions`.
+    pub num_generated_keyframes: Option<u32>,
+    /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
+    /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
+    /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
+    /// generated-keyframe-capable checkpoint (LTX ≥ 2.5); `ltx_2_3` refuses a non-zero value with
+    /// a typed `Unsupported`. `None`/0 = off. Non-LTX models ignore it.
+    pub temporal_upsample_rounds: Option<u32>,
 
     // --- SVD image→video micro-conditioning (sc-3523; ignored by other models) ---
     /// SVD `motion_bucket_id` — the motion-strength bucket baked into the `added_time_ids`
@@ -522,6 +571,20 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_preview`]; the sink callback alone cannot distinguish those states.
     /// See [`PreviewSink`] for the frame contract.
     pub preview: PreviewSink,
+
+    // --- HDR (sc-18790; consumed by LTX-2.5 today) ---
+    /// Opt in to the HDR lane: scene-linear EXR conditioning in, scene-linear EXR frames plus a
+    /// BT.2020/HLG master out.
+    ///
+    /// **`None` is SDR and is the default.** That is not a stylistic preference — an HDR signal
+    /// delivered where SDR is expected is displayed with the wrong transfer and washes out on
+    /// every player, so the HDR path must never be reachable by accident. A request that leaves
+    /// this `None` takes byte-for-byte the same decode and quantization it took before sc-18790.
+    ///
+    /// Gated by [`Capabilities::supports_hdr`]: a model that does not advertise HDR rejects a
+    /// `Some` here as [`Error::Unsupported`] at the contract boundary rather than silently
+    /// rendering SDR and leaving the caller to discover it from the pixels.
+    pub hdr: Option<HdrRequest>,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -838,6 +901,8 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             trim_first_frames: None,
+            num_generated_keyframes: None,
+            temporal_upsample_rounds: None,
             motion_bucket_id: None,
             noise_aug_strength: None,
             decode_chunk_size: None,
@@ -856,6 +921,8 @@ impl Default for GenerationRequest {
             phases: None,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
+            // SDR. The one default that must never drift — see `GenerationRequest::hdr`.
+            hdr: None,
         }
     }
 }
@@ -1078,6 +1145,9 @@ impl GenerationRequest {
             fps: _,
             video_mode: _,
             trim_first_frames: _,
+            // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
+            num_generated_keyframes: _,
+            temporal_upsample_rounds: _,
             decode_chunk_size: _,
             conditioning_fps: _,
             enhance_prompt: _,
@@ -1093,6 +1163,10 @@ impl GenerationRequest {
             approximation: _,
             cancel: _,
             preview: _,
+            // Float-free by construction: an enum colour space plus a callback handle. A
+            // float-bearing HDR knob (a diffuse-white signal or roll-off rate on the request,
+            // say) must join the floor, and this named-not-`..` binding forces that decision.
+            hdr: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -2404,6 +2478,16 @@ pub struct Capabilities {
     /// including before the first denoise step). This is advisory discoverability: it does not gate
     /// [`GenerationRequest::preview`] and [`PreviewSink`] itself does not report support.
     pub supports_preview: bool,
+    /// Whether this model can render the **HDR** lane through [`GenerationRequest::hdr`] —
+    /// scene-linear EXR conditioning in, scene-linear EXR frames plus a BT.2020/HLG master out
+    /// (sc-18790).
+    ///
+    /// `Default` is `false`, so every existing provider is unsupported and the shared floor
+    /// rejects an `hdr` request against it as [`Error::Unsupported`]. That rejection is the
+    /// point: HDR is not a knob a model can partially honor. A model that quietly ignored it
+    /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
+    /// playback failure the opt-in exists to prevent.
+    pub supports_hdr: bool,
     /// Whether [`GenerationRequest::enhance_prompt`] changes the prompt consumed by this provider.
     ///
     /// This is weights-free discoverability for an optional semantic path, not a routing promise:
@@ -2734,6 +2818,16 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
+        // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
+        // one here means the request renders SDR while the caller believes it asked for HDR — a
+        // silently wrong render rather than a loud rejection. `None` (SDR) validates vacuously, so
+        // this is inert for every request that has not opted in.
+        if req.hdr.is_some() && !self.supports_hdr {
+            return Err(Error::Unsupported(format!(
+                "{id}: HDR output is not supported by this model"
+            )));
+        }
         if let Some(memory) = req.memory {
             match (
                 memory.calibration_fault_harness_authorized,

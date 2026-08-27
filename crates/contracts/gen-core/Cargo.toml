@@ -30,6 +30,9 @@ sha2 = { workspace = true }
 # `gen_core::core_llm` so the gen-ai side consumes the unified `core_llm::TextLlm` engine. core-llm is
 # itself tensor-free, so depending on it keeps gen-core's zero-tensor invariant intact.
 core-llm = { workspace = true }
+# OpenEXR read/write for the HDR lane (sc-18790). Pure Rust and tensor-free: it moves `f32` sample
+# buffers and header attributes only, so gen-core's zero-tensor invariant is intact.
+exr = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Stable std does not expose durable Windows file IDs/change time. Prepared File identities use the
@@ -39,3 +42,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
+# Already a normal dependency; integration tests are separate crates and need it declared here
+# too, to AUTHOR the odd channel layouts the reader must cope with (a luminance-only `Y` plate).
+exr = { workspace = true }
