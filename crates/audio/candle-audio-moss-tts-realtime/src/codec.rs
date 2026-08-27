@@ -51,8 +51,8 @@
 //!   `w = g · v / ‖v‖`, norm over the non-output dims), matching the pinned checkpoint's key layout.
 //!
 //! The whole decode graph is **causal** (transformers causal, projections/patching pointwise-in-
-//! time), so decoding a growing prefix reproduces the earlier samples byte-for-byte — the property
-//! [`crate::model`]'s streaming path relies on for the `AudioChunk` reassembly law.
+//! time), so the streaming path can retain each stage's bounded KV history and decode only newly
+//! appended frames. The concatenated block outputs are the request's one canonical waveform path.
 
 use candle_audio::candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_audio::{AudioError, Result};
@@ -361,10 +361,25 @@ fn rope_tables(
     head_dim: usize,
     max_period: f64,
 ) -> CandleResult<(Tensor, Tensor)> {
+    rope_tables_range(device, 0, len, head_dim, max_period)
+}
+
+/// Interleaved-RoPE cos/sin rows for exactly the absolute positions `start..start+len`. Streaming
+/// requests use this range form so appending one block does not rebuild tables for the full prefix.
+fn rope_tables_range(
+    device: &Device,
+    start: usize,
+    len: usize,
+    head_dim: usize,
+    max_period: f64,
+) -> CandleResult<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(len * half);
     let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
+    let end = start.checked_add(len).ok_or_else(|| {
+        candle_audio::candle_core::Error::Msg("codec RoPE position overflow".to_owned())
+    })?;
+    for pos in start..end {
         for j in 0..half {
             let inv = max_period.powf(-(2.0 * j as f64) / head_dim as f64);
             let angle = pos as f64 * inv;
@@ -554,39 +569,32 @@ impl CodecLayer {
         self.out_proj.forward(&out)
     }
 
-    /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions starting
-    /// at absolute `pos` (`x` = `[1, c, d_model]`). `cos`/`sin` are the stage's **full** RoPE tables
-    /// (`[T, head_dim/2]`, sliced here to `[pos, pos+c)`); `cache` carries this layer's post-RoPE K/V
-    /// for the preceding positions. Every op outside attention is pointwise in time, and the attention
-    /// attends exactly the sliding window [`banded_causal_mask`] would admit, so the returned chunk is
-    /// byte-identical to the corresponding rows of `forward` over the whole sequence.
+    /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions (`x` =
+    /// `[1, c, d_model]`). `cos`/`sin` are exactly those `c` positions' absolute RoPE rows; `cache`
+    /// carries this layer's post-RoPE K/V for the preceding positions. Every op outside attention is
+    /// pointwise in time, and the attention admits exactly the window [`banded_causal_mask`] would.
     fn forward_streaming(
         &self,
         x: &Tensor,
-        pos: usize,
         cos: &Tensor,
         sin: &Tensor,
         context: usize,
         cache: &mut KvCache,
     ) -> CandleResult<Tensor> {
-        let attn =
-            self.attention_streaming(&self.norm1.forward(x)?, pos, cos, sin, context, cache)?;
+        let attn = self.attention_streaming(&self.norm1.forward(x)?, cos, sin, context, cache)?;
         let x = (x + attn.broadcast_mul(&self.layer_scale_1)?)?;
         let h = self.linear1.forward(&self.norm2.forward(&x)?)?;
         let h = self.linear2.forward(&h.gelu_erf()?)?;
         x.broadcast_add(&h.broadcast_mul(&self.layer_scale_2)?)
     }
 
-    /// The sliding-window self-attention of one streaming chunk (`x` = normed `[1, c, d_model]` at
-    /// absolute `pos`): fused-qkv, interleaved RoPE at the chunk's absolute positions, then attend the
-    /// new queries against `[cache | new]` K/V under [`streaming_band_mask`], and retain the last
-    /// `context − 1` positions for the next chunk. The finite `q·k` scores are computed per key over
-    /// `head_dim` (independent of the matrix width), and the mask admits exactly the single-shot
-    /// window, so the result matches [`attention`](Self::attention) row-for-row.
+    /// The sliding-window self-attention of one streaming chunk (`x` = normed `[1, c, d_model]`):
+    /// fused-qkv, interleaved RoPE using the supplied absolute-position rows, then attend the new
+    /// queries against `[cache | new]` K/V under [`streaming_band_mask`], retaining the last
+    /// `context − 1` positions for the next chunk.
     fn attention_streaming(
         &self,
         x: &Tensor,
-        pos: usize,
         cos: &Tensor,
         sin: &Tensor,
         context: usize,
@@ -599,11 +607,8 @@ impl CodecLayer {
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?; // [b, h, c, d]
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
-        // RoPE at the chunk's absolute positions [pos, pos+c) — the slice of the stage's full tables.
-        let cos_c = cos.narrow(0, pos, c)?;
-        let sin_c = sin.narrow(0, pos, c)?;
-        let q = candle_nn::rotary_emb::rope_i(&q, &cos_c, &sin_c)?;
-        let k = candle_nn::rotary_emb::rope_i(&k, &cos_c, &sin_c)?;
+        let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
         // Attend the new queries against [cached | new] post-RoPE K/V.
         let (k_all, v_all, cache_len) = cache.append(&k, &v)?;
         let scale = 1.0 / (d as f64).sqrt();
@@ -627,6 +632,14 @@ struct CodecStage {
     head_dim: usize,
     /// Sliding-window context (positions) for this stage's causal attention.
     context: usize,
+}
+
+/// Request-local state for one decoder stage: one bounded KV cache per layer plus the absolute
+/// position of the next input. No decoded activations or request-length prefix is retained.
+#[derive(Default)]
+struct CodecStageState {
+    position: usize,
+    layers: Vec<KvCache>,
 }
 
 impl CodecStage {
@@ -711,11 +724,12 @@ impl CodecStage {
             while p < t {
                 let c = chunk_len.min(t - p);
                 let chunk = h.narrow(1, p, c)?; // [1, c, d_model]
+                let cos_c = cos.narrow(0, p, c)?;
+                let sin_c = sin.narrow(0, p, c)?;
                 outs.push(layer.forward_streaming(
                     &chunk,
-                    p,
-                    &cos,
-                    &sin,
+                    &cos_c,
+                    &sin_c,
                     self.context,
                     &mut cache,
                 )?);
@@ -727,6 +741,48 @@ impl CodecStage {
             h = p.forward(&h)?;
         }
         // (B, T, D) -> (B, D, T)
+        h.transpose(1, 2)?.contiguous()
+    }
+
+    /// Process only newly appended positions while retaining this request's bounded per-layer KV
+    /// history. Unlike [`forward_chunked`](Self::forward_chunked), this method does not replay earlier
+    /// chunks or rebuild their RoPE rows on later calls.
+    fn forward_incremental(&self, x: &Tensor, state: &mut CodecStageState) -> CandleResult<Tensor> {
+        let t = x.dim(2)?;
+        if state.layers.is_empty() {
+            state.layers = (0..self.layers.len()).map(|_| KvCache::default()).collect();
+        }
+        if state.layers.len() != self.layers.len() {
+            candle_audio::candle_core::bail!(
+                "codec stage state has {} layer caches; expected {}",
+                state.layers.len(),
+                self.layers.len()
+            );
+        }
+
+        let next_position = state.position.checked_add(t).ok_or_else(|| {
+            candle_audio::candle_core::Error::Msg(
+                "codec stage absolute position overflow".to_owned(),
+            )
+        })?;
+        let mut h = x.transpose(1, 2)?.contiguous()?;
+        if let Some(p) = &self.input_proj {
+            h = p.forward(&h)?;
+        }
+        let (cos, sin) = rope_tables_range(
+            h.device(),
+            state.position,
+            t,
+            self.head_dim,
+            ROPE_MAX_PERIOD,
+        )?;
+        for (layer, cache) in self.layers.iter().zip(&mut state.layers) {
+            h = layer.forward_streaming(&h, &cos, &sin, self.context, cache)?;
+        }
+        if let Some(p) = &self.output_proj {
+            h = p.forward(&h)?;
+        }
+        state.position = next_position;
         h.transpose(1, 2)?.contiguous()
     }
 
@@ -942,6 +998,14 @@ pub struct MossAudioCodec {
     encoder: std::sync::OnceLock<EncoderHalf>,
 }
 
+/// Bounded causal decoder state for one MOSS synthesis request. A fresh value is created by the
+/// streaming chunker; it is never stored on the shared [`MossAudioCodec`] itself, so concurrent
+/// requests cannot contaminate each other's positions or KV history.
+pub struct MossAudioDecodeState {
+    stages: Vec<CodecStageState>,
+    decoded_frames: usize,
+}
+
 impl MossAudioCodec {
     /// Load the codec decoder for `num_code_quantizers` (the AR side's `rvq`, 16) from a snapshot
     /// directory holding `config.json` + the sharded `model*.safetensors`.
@@ -1012,6 +1076,89 @@ impl MossAudioCodec {
     /// The number of quantizer codebooks consumed per frame (the AR side's `rvq`).
     pub fn num_code_quantizers(&self) -> usize {
         self.num_code_quantizers
+    }
+
+    /// Create empty, request-local incremental decoder state.
+    pub fn new_decode_state(&self) -> MossAudioDecodeState {
+        MossAudioDecodeState {
+            stages: (0..self.stages.len())
+                .map(|_| CodecStageState::default())
+                .collect(),
+            decoded_frames: 0,
+        }
+    }
+
+    /// Decode only a newly appended block of RVQ frames, retaining bounded causal state across calls.
+    /// Work and transient tensors scale with `frames` plus each stage's fixed context; prior request
+    /// frames and activations are never replayed. Returns only this block's new PCM samples.
+    pub fn decode_incremental(
+        &self,
+        state: &mut MossAudioDecodeState,
+        frames: &[Vec<u32>],
+        cancel: &dyn Fn() -> bool,
+    ) -> CandleResult<Option<Vec<f32>>> {
+        if frames.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if cancel() {
+            return Ok(None);
+        }
+        if state.stages.len() != self.stages.len() {
+            candle_audio::candle_core::bail!(
+                "codec decode state has {} stages; expected {}",
+                state.stages.len(),
+                self.stages.len()
+            );
+        }
+
+        let nq = self.num_code_quantizers;
+        let mut rows: Vec<Vec<u32>> = vec![Vec::with_capacity(frames.len()); nq];
+        for frame in frames {
+            for (q, row) in rows.iter_mut().enumerate() {
+                row.push(frame.get(q).copied().unwrap_or(0));
+            }
+        }
+        let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
+        let mut x = self.quantizer.decode(&rows, &self.device)?;
+        if debug {
+            eprintln!(
+                "[codec] incremental block at frame {} after quantizer: {:?} rms={:.5}",
+                state.decoded_frames,
+                x.dims(),
+                rms(&x)
+            );
+        }
+        for (si, ((stage, stage_state), patch)) in self
+            .stages
+            .iter()
+            .zip(&mut state.stages)
+            .zip(PATCH_SIZES)
+            .enumerate()
+        {
+            if cancel() {
+                return Ok(None);
+            }
+            x = stage.forward_incremental(&x, stage_state)?;
+            if debug {
+                eprintln!(
+                    "[codec] incremental block after stage {si} (before unpatch): {:?} rms={:.5}",
+                    x.dims(),
+                    rms(&x)
+                );
+            }
+            x = patched_unpatch(&x, patch)?;
+        }
+        state.decoded_frames = state
+            .decoded_frames
+            .checked_add(frames.len())
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "codec decoded frame count overflow".to_owned(),
+                )
+            })?;
+        let wav = x.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        debug_assert_eq!(wav.len(), frames.len() * self.config.downsample_rate);
+        Ok(Some(wav))
     }
 
     /// Decode a block of RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into an
@@ -1190,7 +1337,9 @@ impl MossAudioCodec {
     }
 }
 
-impl crate::chunk::PrefixDecoder for MossAudioCodec {
+impl crate::chunk::IncrementalDecoder for MossAudioCodec {
+    type State = MossAudioDecodeState;
+
     fn sample_rate(&self) -> u32 {
         self.config.sample_rate
     }
@@ -1199,15 +1348,17 @@ impl crate::chunk::PrefixDecoder for MossAudioCodec {
         self.config.downsample_rate
     }
 
-    /// Decode a growing RVQ-frame prefix into its full mono PCM (the causal decode the streaming
-    /// chunker relies on). Delegates to [`MossAudioCodec::decode_frames`], so a prefix decode is
-    /// byte-identical to the head of any longer decode.
-    fn decode_prefix(
+    fn new_state(&self) -> Self::State {
+        self.new_decode_state()
+    }
+
+    fn decode_next(
         &self,
+        state: &mut Self::State,
         frames: &[Vec<u32>],
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>> {
-        self.decode_frames(frames, cancel)
+        self.decode_incremental(state, frames, cancel)
     }
 }
 
@@ -1653,6 +1804,61 @@ mod tests {
         );
     }
 
+    /// Retaining stage state across request blocks must reproduce the existing one-shot chunked
+    /// execution with the same block partition. Exact equality here is stronger than the tolerated
+    /// chunked-vs-single-shot FP gap: both sides run identical kernel shapes, absolute RoPE rows, and
+    /// cache windows; only the lifetime of the state differs.
+    #[test]
+    fn retained_decoder_state_matches_one_shot_chunked_blocks() {
+        let dev = Device::Cpu;
+        let spec = StageSpec {
+            index: 0,
+            input_dim: 8,
+            d_model: 16,
+            output_dim: 8,
+            num_heads: 4,
+            num_layers: 3,
+            dim_feedforward: 32,
+        };
+        let context = 5;
+        let stage = synthetic_stage(&spec, "decoder", context, &dev);
+        let t = 23;
+        let block = 4;
+        let x = lcg_tensor(&[1, spec.input_dim, t], 0x21686, 1.0, &dev);
+        let expected = stage.forward_chunked(&x, block).unwrap();
+
+        let mut state = CodecStageState::default();
+        let mut actual_blocks = Vec::new();
+        for start in (0..t).step_by(block) {
+            let len = block.min(t - start);
+            let input = x.narrow(2, start, len).unwrap();
+            actual_blocks.push(stage.forward_incremental(&input, &mut state).unwrap());
+        }
+        let actual = Tensor::cat(&actual_blocks, 2).unwrap();
+        assert_eq!(
+            state.position, t,
+            "absolute position advances only by new work"
+        );
+        assert!(
+            state.layers.iter().all(|cache| {
+                cache
+                    .k
+                    .as_ref()
+                    .is_some_and(|k| k.dim(2).unwrap() <= context.saturating_sub(1))
+                    && cache
+                        .v
+                        .as_ref()
+                        .is_some_and(|v| v.dim(2).unwrap() <= context.saturating_sub(1))
+            }),
+            "each layer retains only its fixed causal history"
+        );
+        assert_eq!(
+            actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "multi-block retained-state output must match one-shot chunked decode"
+        );
+    }
+
     /// The model advertises a 40-minute (30,000-frame) realtime surface. Every decoder stage must
     /// choose its fixed context window beyond that duration, so score/mask work is bounded by
     /// `context * (2 * context - 1)` per head rather than the stage's full sequence square. This is
@@ -1723,7 +1929,7 @@ mod tests {
                 let (cos, sin) = rope_tables(&dev, c, stage.head_dim, ROPE_MAX_PERIOD).unwrap();
                 outs.push(
                     layer
-                        .forward_streaming(&chunk_x, 0, &cos, &sin, context, &mut cache)
+                        .forward_streaming(&chunk_x, &cos, &sin, context, &mut cache)
                         .unwrap(),
                 );
                 p += c;

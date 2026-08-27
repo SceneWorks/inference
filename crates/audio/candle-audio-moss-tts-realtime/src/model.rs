@@ -553,16 +553,15 @@ impl MossTtsRealtimeGenerator {
 
     /// The single deterministic synthesis path shared by [`generate`](Self::generate) and
     /// [`generate_streaming`](Self::generate_streaming): drive the AR brain and, **from inside the AR
-    /// loop**, decode the codec block-wise over the growing RVQ-frame prefix — emitting one
-    /// [`AudioChunk`] per newly-revealed PCM block *while later frames are still being generated*
+    /// loop**, decode each newly available RVQ-frame block with request-local bounded codec state —
+    /// emitting one [`AudioChunk`] per new PCM block *while later frames are still being generated*
     /// ([`crate::chunk::StreamingChunker`]).
     ///
-    /// Because the codec decode graph is fully causal, decoding a growing prefix reproduces the
-    /// earlier samples byte-for-byte — so the concatenated chunks equal the returned track exactly
-    /// (the reassembly law), and the two entry points return byte-identical audio for the same
-    /// request+seed (they call this one function). The first chunk is emitted after the first block
-    /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
-    /// block of AR frames, not the full synthesis time.
+    /// Because the codec decode graph is fully causal, each stage can carry its absolute position and
+    /// fixed-window KV history without replaying earlier frames. The concatenated chunks equal the
+    /// returned track exactly (the reassembly law), and the two entry points return byte-identical
+    /// audio for the same request+seed because they call this one function. The first chunk is emitted
+    /// after the first block of AR frames rather than after the whole track.
     ///
     /// The AR backbone runs a KV cache (sc-13417): the prompt is prefilled once and each emitted
     /// frame is a single-token step, so per-frame cost is O(1) amortized rather than O(seq). This is
