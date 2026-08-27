@@ -140,6 +140,13 @@ impl QLinear {
         debug_assert_eq!(self.0.path(), path);
         self.0
     }
+
+    /// Expose the same trainable residual seam used by the standalone training DiT.  Keeping this
+    /// on the packed-aware wrapper is what makes full AV QLoRA train the actual loaded projection
+    /// instead of rebuilding a dense video-only shadow model.
+    pub(crate) fn lora_mut(&mut self) -> &mut LoraLinear {
+        &mut self.0
+    }
 }
 
 impl Module for QLinear {

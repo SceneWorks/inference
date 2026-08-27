@@ -1214,6 +1214,7 @@ mod tests {
             image_path: "/img.png".into(),
             caption: "x".into(),
             control_image_path: None,
+            model_options: Default::default(),
         };
         let base = TrainingRequest {
             items: vec![item.clone()],

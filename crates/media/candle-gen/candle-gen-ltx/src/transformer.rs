@@ -19,6 +19,7 @@ use candle_gen::gen_core::CancelFlag;
 use crate::config::AvConfig;
 use crate::quant::{qlinear, QLinear};
 use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
+use candle_gen::train::lora::{LoraHost, LoraLinear};
 
 static NEXT_AVDIT_LOAD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -166,6 +167,19 @@ impl Attention {
         Ok(())
     }
 
+    fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()> {
+        for linear in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.gate,
+        ] {
+            f(linear.lora_mut())?;
+        }
+        Ok(())
+    }
+
     fn set_adapter_pass(&self, pass: usize) {
         for linear in [&self.to_q, &self.to_k, &self.to_v, &self.to_out, &self.gate] {
             linear.set_additive_pass(pass);
@@ -275,6 +289,13 @@ impl FeedForward {
         for linear in [&mut self.proj_in, &mut self.proj_out] {
             let path = linear.path().to_string();
             f(&path, linear)?;
+        }
+        Ok(())
+    }
+
+    fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()> {
+        for linear in [&mut self.proj_in, &mut self.proj_out] {
+            f(linear.lora_mut())?;
         }
         Ok(())
     }
@@ -626,7 +647,7 @@ mod tests {
 
     #[test]
     fn dev_attention_controls_skip_only_the_declared_attention_calls() {
-        let stg = AvPerturbation::stg(&[28]);
+        let stg = AvPerturbation::stg([28]);
         assert_eq!(
             stg.attention_plan(27),
             AvAttentionPlan {
@@ -649,13 +670,14 @@ mod tests {
             }
         );
 
-        // Structural mutation witness: the ordinary block loops must derive the control from the
-        // materialized block index in both residency modes, never skip a whole block by name.
+        // Structural mutation witness: both joint and single-video Dev block loops must derive
+        // the control from the materialized block index in both residency modes, never skip a
+        // whole block by name.
         let source = include_str!("transformer.rs");
         assert_eq!(
             source.matches("perturbation.attention_plan(index)").count(),
-            3,
-            "two production loops plus this assertion must retain index-specific controls"
+            5,
+            "four production loops plus this assertion must retain index-specific controls"
         );
         assert!(source.contains("if control.run_cross_modal"));
         assert!(source.contains("let x = if run_self"));
@@ -686,49 +708,40 @@ fn av_ca_ada(
 /// STG bypasses only the self-attention calls at selected blocks.  Text cross-attention and both
 /// feed-forward paths remain live.  Modality isolation is complementary: it bypasses A2V and V2A
 /// calls at every block while retaining self/text/FF processing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AvPerturbation {
-    skip_self_blocks: &'static [usize],
+    skip_self_blocks: Vec<usize>,
     isolate_modalities: bool,
 }
 
 impl AvPerturbation {
-    pub(crate) const NONE: Self = Self {
-        skip_self_blocks: &[],
-        isolate_modalities: false,
-    };
-
-    pub(crate) const fn stg(skip_self_blocks: &'static [usize]) -> Self {
+    pub(crate) fn none() -> Self {
         Self {
-            skip_self_blocks,
+            skip_self_blocks: Vec::new(),
             isolate_modalities: false,
         }
     }
 
-    pub(crate) const fn modality_isolated() -> Self {
+    pub(crate) fn stg(skip_self_blocks: impl AsRef<[usize]>) -> Self {
         Self {
-            skip_self_blocks: &[],
+            skip_self_blocks: skip_self_blocks.as_ref().to_vec(),
+            isolate_modalities: false,
+        }
+    }
+
+    pub(crate) fn modality_isolated() -> Self {
+        Self {
+            skip_self_blocks: Vec::new(),
             isolate_modalities: true,
         }
     }
 
-    const fn attention_plan(self, block_index: usize) -> AvAttentionPlan {
+    fn attention_plan(&self, block_index: usize) -> AvAttentionPlan {
         AvAttentionPlan {
-            run_self: !contains_block(self.skip_self_blocks, block_index),
+            run_self: !self.skip_self_blocks.contains(&block_index),
             run_cross_modal: !self.isolate_modalities,
         }
     }
-}
-
-const fn contains_block(blocks: &[usize], needle: usize) -> bool {
-    let mut index = 0;
-    while index < blocks.len() {
-        if blocks[index] == needle {
-            return true;
-        }
-        index += 1;
-    }
-    false
 }
 
 /// The two attention families the dev path is allowed to bypass.  Text cross-attention and
@@ -809,6 +822,17 @@ impl AvBlock {
         self.a_ff.visit_adaptable_mut(f)?;
         self.a2v.visit_adaptable_mut(f)?;
         self.v2a.visit_adaptable_mut(f)
+    }
+
+    fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()> {
+        self.attn1.visit_lora_mut(f)?;
+        self.attn2.visit_lora_mut(f)?;
+        self.ff.visit_lora_mut(f)?;
+        self.a_attn1.visit_lora_mut(f)?;
+        self.a_attn2.visit_lora_mut(f)?;
+        self.a_ff.visit_lora_mut(f)?;
+        self.a2v.visit_lora_mut(f)?;
+        self.v2a.visit_lora_mut(f)
     }
 
     fn set_adapter_pass(&self, pass: usize) {
@@ -1428,6 +1452,89 @@ impl AvDiT {
         )
     }
 
+    /// Joint training forward with independently masked per-token timesteps for both streams.
+    /// Intrinsic, frozen, and appended-reference tokens pass timestep zero; generated target
+    /// tokens receive the sampled sigma.  Keeping the two tables separate is required for
+    /// video-conditioned-audio and audio-conditioned-video workflows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_timed(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_timesteps: &Tensor,
+        audio_timesteps: &Tensor,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let prepared = self.prepare_rope(video_latent, audio_latent, video_grid, audio_grid)?;
+        self.forward_token_timed_prepared(
+            video_latent,
+            audio_latent,
+            video_timesteps,
+            audio_timesteps,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            &prepared,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_token_timed_prepared(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_timesteps: &Tensor,
+        audio_timesteps: &Tensor,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+        prepared: &PreparedAvRope,
+    ) -> Result<(Tensor, Tensor)> {
+        prepared.request.validate(
+            self.load_id,
+            video_latent,
+            audio_latent,
+            video_grid,
+            audio_grid,
+        )?;
+        let b = video_latent.dim(0)?;
+        for (name, timesteps, latent) in [
+            ("video", video_timesteps, video_latent),
+            ("audio", audio_timesteps, audio_latent),
+        ] {
+            if timesteps.dims2()? != (b, latent.dim(1)?) {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "ltx: {name} timestep shape {:?} must be [batch={b}, tokens={}]",
+                    timesteps.dims(),
+                    latent.dim(1)?
+                )));
+            }
+        }
+        let ts_mult = self.cfg.video.timestep_scale_multiplier;
+        let v_ts = self
+            .video
+            .ts_embeds_tokens(video_timesteps, ts_mult, &self.device)?;
+        let a_ts = self
+            .audio
+            .ts_embeds_tokens(audio_timesteps, ts_mult, &self.device)?;
+        self.forward_with_ts(
+            video_latent,
+            audio_latent,
+            video_context,
+            audio_context,
+            None,
+            prepared,
+            &v_ts,
+            &a_ts,
+            &AvPerturbation::none(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_prepared(
         &self,
@@ -1463,7 +1570,7 @@ impl AvDiT {
             prepared,
             &v_ts,
             &a_ts,
-            AvPerturbation::NONE,
+            &AvPerturbation::none(),
         )
     }
 
@@ -1543,7 +1650,7 @@ impl AvDiT {
             prepared,
             &v_ts,
             &a_ts,
-            AvPerturbation::NONE,
+            &AvPerturbation::none(),
         )
     }
 
@@ -1562,7 +1669,7 @@ impl AvDiT {
         audio_grid: &Tensor,
         video_keyframes_mask: Option<&Tensor>,
         prepared: &PreparedAvRope,
-        perturbation: AvPerturbation,
+        perturbation: &AvPerturbation,
     ) -> Result<(Tensor, Tensor)> {
         prepared.request.validate(
             self.load_id,
@@ -1611,7 +1718,7 @@ impl AvDiT {
         prepared: &PreparedAvRope,
         v_ts: &AvTs,
         a_ts: &AvTs,
-        perturbation: AvPerturbation,
+        perturbation: &AvPerturbation,
     ) -> Result<(Tensor, Tensor)> {
         let mut vx = self
             .video
@@ -1777,6 +1884,153 @@ impl AvDiT {
         self.video.output_head(&vx, &v_ts.emb_ts)
     }
 
+    /// Video-only training forward with a per-token timestep table.  This is the single-active
+    /// LTX-2.5 workflow path; unlike the scalar legacy helper it keeps intrinsic and frozen
+    /// target tokens at sigma zero.
+    pub(crate) fn forward_video_only_token_timed(
+        &self,
+        video_latent: &Tensor,
+        video_timesteps: &Tensor,
+        video_context: &Tensor,
+        video_grid: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_video_only_conditioned(
+            video_latent,
+            video_timesteps,
+            video_context,
+            video_grid,
+            None,
+        )
+    }
+
+    /// Audio-only AV-DiT reduction for the upstream audio-only LoRA workflows.  This is not a
+    /// fabricated zero-video joint call: the absent video stream is never patchified, noised, or
+    /// forwarded, while audio self/text/FF branches remain identical to the joint architecture.
+    pub fn forward_audio_only(
+        &self,
+        audio_latent: &Tensor,
+        sigma: f64,
+        audio_context: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<Tensor> {
+        let b = audio_latent.dim(0)?;
+        let a_ts = self.audio.ts_embeds(
+            sigma,
+            self.cfg.video.timestep_scale_multiplier,
+            b,
+            &self.device,
+        )?;
+        let (a_cos, a_sin) = precompute_split_freqs_nd(
+            audio_grid,
+            self.cfg.audio_inner(),
+            self.cfg.video.rope_theta,
+            &[self.cfg.audio_max_pos],
+            self.cfg.audio_heads,
+            &self.device,
+        )?;
+        let mut ax = self
+            .audio
+            .patchify
+            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+        let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
+        let aa = AvStreamArgs {
+            ts_emb: &a_ts.ts_emb,
+            prompt_ts: &a_ts.prompt_ts,
+            context: &a_ctx,
+            cos: &a_cos,
+            sin: &a_sin,
+            cross_cos: &a_cos,
+            cross_sin: &a_sin,
+            cross_ss_ts: &a_ts.cross_ss_ts,
+            cross_gate_ts: &a_ts.cross_gate_ts,
+        };
+        let AvBlocks::Resident(blocks) = &self.blocks else {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ltx: the audio-only training forward requires a resident block stack".into(),
+            ));
+        };
+        for block in blocks {
+            ax = block.self_and_text(
+                &ax,
+                &block.a_attn1,
+                &block.a_attn2,
+                &block.a_sst,
+                &block.a_pst,
+                &aa,
+                true,
+            )?;
+            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &a_ts.ts_emb)?;
+        }
+        self.audio.output_head(&ax, &a_ts.emb_ts)
+    }
+
+    /// Audio-only training forward with a per-token timestep table.  Audio-only and
+    /// audio-conditioned workflows must not collapse their clean/frozen token mask to a scalar
+    /// sigma merely because the video stream is absent.
+    pub(crate) fn forward_audio_only_token_timed(
+        &self,
+        audio_latent: &Tensor,
+        audio_timesteps: &Tensor,
+        audio_context: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<Tensor> {
+        let b = audio_latent.dim(0)?;
+        if audio_timesteps.dims2()? != (b, audio_latent.dim(1)?) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx: audio timestep shape {:?} must be [batch={b}, tokens={}]",
+                audio_timesteps.dims(),
+                audio_latent.dim(1)?
+            )));
+        }
+        let a_ts = self.audio.ts_embeds_tokens(
+            audio_timesteps,
+            self.cfg.video.timestep_scale_multiplier,
+            &self.device,
+        )?;
+        let (a_cos, a_sin) = precompute_split_freqs_nd(
+            audio_grid,
+            self.cfg.audio_inner(),
+            self.cfg.video.rope_theta,
+            &[self.cfg.audio_max_pos],
+            self.cfg.audio_heads,
+            &self.device,
+        )?;
+        let mut ax = self
+            .audio
+            .patchify
+            .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
+        let a_ctx = audio_context.to_dtype(self.audio.dtype)?;
+        let aa = AvStreamArgs {
+            ts_emb: &a_ts.ts_emb,
+            prompt_ts: &a_ts.prompt_ts,
+            context: &a_ctx,
+            cos: &a_cos,
+            sin: &a_sin,
+            cross_cos: &a_cos,
+            cross_sin: &a_sin,
+            cross_ss_ts: &a_ts.cross_ss_ts,
+            cross_gate_ts: &a_ts.cross_gate_ts,
+        };
+        let AvBlocks::Resident(blocks) = &self.blocks else {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ltx: the audio-only training forward requires a resident block stack".into(),
+            ));
+        };
+        for block in blocks {
+            ax = block.self_and_text(
+                &ax,
+                &block.a_attn1,
+                &block.a_attn2,
+                &block.a_sst,
+                &block.a_pst,
+                &aa,
+                true,
+            )?;
+            ax = block.feed_forward(&ax, &block.a_ff, &block.a_sst, &a_ts.ts_emb)?;
+        }
+        self.audio.output_head(&ax, &a_ts.emb_ts)
+    }
+
     /// **Video-only** forward with per-token video timesteps and the DFR keyframes mask — the
     /// reference `LTXModel` called with `audio=None` on a conditioned token state (the DFR
     /// temporal-round tile denoise): the audio stream is skipped and the cross-modal attentions do
@@ -1789,6 +2043,28 @@ impl AvDiT {
         video_context: &Tensor,
         video_grid: &Tensor,
         video_keyframes_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_video_only_conditioned_controlled(
+            video_latent,
+            video_timesteps,
+            video_context,
+            video_grid,
+            video_keyframes_mask,
+            &AvPerturbation::none(),
+        )
+    }
+
+    /// Controlled single-video-stream forward for the Dev validation route.  This retains the
+    /// ordinary video-only topology while letting STG suppress self-attention at the selected
+    /// block indices; text cross-attention and FF remain active at every block.
+    pub(crate) fn forward_video_only_conditioned_controlled(
+        &self,
+        video_latent: &Tensor,
+        video_timesteps: &Tensor,
+        video_context: &Tensor,
+        video_grid: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
+        perturbation: &AvPerturbation,
     ) -> Result<Tensor> {
         let b = video_latent.dim(0)?;
         if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
@@ -1836,7 +2112,7 @@ impl AvDiT {
         };
         vx = match &self.blocks {
             AvBlocks::Resident(blocks) => {
-                for block in blocks {
+                for (index, block) in blocks.iter().enumerate() {
                     vx = block.self_and_text(
                         &vx,
                         &block.attn1,
@@ -1844,7 +2120,7 @@ impl AvDiT {
                         &block.v_sst,
                         &block.v_pst,
                         &va,
-                        true,
+                        perturbation.attention_plan(index).run_self,
                     )?;
                     vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
                 }
@@ -1868,7 +2144,7 @@ impl AvDiT {
                                 &block.v_sst,
                                 &block.v_pst,
                                 &va,
-                                true,
+                                perturbation.attention_plan(index).run_self,
                             )?;
                             vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
                         }
@@ -1879,5 +2155,30 @@ impl AvDiT {
             }
         };
         self.video.output_head(&vx, &v_ts.emb_ts)
+    }
+}
+
+impl LoraHost for AvDiT {
+    /// The trainer owns the same resident AV trunk inference uses.  This is deliberately full
+    /// modality enumeration: each block contributes video/audio self and text attention, both
+    /// cross-modal directions, and the optional config-shaped FF paths.
+    fn visit_lora_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut LoraLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.visit_lora_mut(&mut |linear| {
+                        f(linear)
+                            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+                    })?;
+                }
+                Ok(())
+            }
+            AvBlocks::Streamed(_) => Err(candle_gen::CandleError::Msg(
+                "ltx training refuses a streamed transformer: trainable adapters must remain attached to the resident AV blocks".into(),
+            )),
+        }
     }
 }

@@ -116,6 +116,7 @@ fn train_tiny_adapter(
             image_path: img_path,
             caption: "a vivid abstract color swatch".into(),
             control_image_path: None,
+            model_options: Default::default(),
         }],
         config: TrainingConfig {
             rank: 4,
@@ -242,6 +243,7 @@ fn train_concept_lora(
                 image_path: p.clone(),
                 caption: caption.to_string(),
                 control_image_path: None,
+                model_options: Default::default(),
             })
             .collect(),
         config: TrainingConfig {

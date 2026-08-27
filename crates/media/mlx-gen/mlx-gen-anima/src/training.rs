@@ -1124,6 +1124,7 @@ mod tests {
                     image_path: PathBuf::from(format!("img{i}.png")),
                     caption: "1girl, silver hair".into(),
                     control_image_path: None,
+                    model_options: Default::default(),
                 })
                 .collect(),
             config: TrainingConfig {

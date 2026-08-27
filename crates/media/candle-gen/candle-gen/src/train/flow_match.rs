@@ -1154,6 +1154,7 @@ mod tests {
                         image_path,
                         caption: "x".into(),
                         control_image_path: None,
+                        model_options: Default::default(),
                     }
                 })
                 .collect(),
