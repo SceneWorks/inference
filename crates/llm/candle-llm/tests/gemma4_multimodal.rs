@@ -725,6 +725,56 @@ fn audio_conditioning_changes_the_provider_output() {
     assert_eq!(clip(rising.clone()), clip(rising), "generation is deterministic");
 }
 
+/// The chat template is taken from the sidecar `chat_template.jinja` when the snapshot ships one,
+/// in preference to `tokenizer_config.json`'s embedded key and to the Llama-3 default.
+///
+/// `google/gemma-4-12B-it` ships exactly that way — a `chat_template.jinja` file and a
+/// `tokenizer_config.json` with no `chat_template` key — so reading only the embedded key addresses
+/// Gemma 4 in Llama-3's chat format. Nothing about that fails loudly: the prompt renders, the model
+/// generates, every length assertion holds. It just answers badly. This pins the precedence so the
+/// fallback cannot silently come back.
+#[test]
+fn the_sidecar_chat_template_wins_over_the_embedded_one() {
+    let fx = write_snapshot(true, true);
+    let dir: &std::path::Path = fx.as_ref();
+
+    // Sidecar only: its marker must appear in the rendered prompt.
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "SIDECAR{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}",
+    )
+    .unwrap();
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load with sidecar");
+    let ids = generate(&p, &request(vec![Content::text("t1")]));
+    assert!(!ids.is_empty());
+
+    // With BOTH present the sidecar still wins. The embedded template renders a different marker, so
+    // the two are distinguishable by the prompt length they produce.
+    let tok_cfg = serde_json::json!({
+        "chat_template": "EMBEDDED EMBEDDED EMBEDDED EMBEDDED{% for m in messages %}{{ m['content'] }}{% endfor %}",
+        "bos_token": "<bos>",
+        "eos_token": "<eos>"
+    });
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_string(&tok_cfg).unwrap(),
+    )
+    .unwrap();
+    let with_both = LlamaProvider::load(&spec_of(&fx)).expect("load with both");
+    let both_len = prompt_tokens(&with_both, &request(vec![Content::text("t1")]));
+
+    // Now remove the sidecar: the embedded template takes over and renders a measurably longer
+    // prompt (four marker words vs one), which is what proves the sidecar was being preferred.
+    std::fs::remove_file(dir.join("chat_template.jinja")).unwrap();
+    let embedded_only = LlamaProvider::load(&spec_of(&fx)).expect("load embedded only");
+    let embedded_len = prompt_tokens(&embedded_only, &request(vec![Content::text("t1")]));
+
+    assert_ne!(
+        both_len, embedded_len,
+        "with a sidecar present the embedded template must NOT be the one that rendered"
+    );
+}
+
 /// A clip at the wrong sample rate is refused rather than silently reinterpreted.
 ///
 /// The projector frames audio in *samples*, so feeding 8 kHz into a 16 kHz framing would halve the

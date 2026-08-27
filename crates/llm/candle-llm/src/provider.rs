@@ -945,7 +945,53 @@ impl ConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (its source mentions `tool_call`), so it has a
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
+/// The modern HF layout ships the chat template as a **separate `chat_template.jinja`** beside
+/// `tokenizer_config.json` rather than inside it (transformers writes it that way for newer
+/// releases — `google/gemma-4-12B-it` is one, and its `tokenizer_config.json` carries no
+/// `chat_template` key at all).
+///
+/// Reading only the embedded key means such a snapshot silently falls back to the typed Llama-3
+/// default: the prompt still renders, the model still generates, and every assertion about shapes
+/// and lengths still passes — it just answers badly, because it is being addressed in a chat format
+/// it was never trained on. Prefer the sidecar file, then the embedded key, then the default.
+///
+/// BOS/EOS still come from `tokenizer_config.json`; the sidecar carries only the template body.
+fn sidecar_chat_template(dir: &Path) -> Option<JinjaChatTemplate> {
+    let source = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+    if source.trim().is_empty() {
+        return None;
+    }
+    let (bos, eos) = tokenizer_special_tokens(dir);
+    Some(JinjaChatTemplate::with_tokens(source, bos, eos))
+}
+
+/// `(bos_token, eos_token)` strings from `tokenizer_config.json`, empty when absent. Each may be a
+/// bare string or an `AddedToken` object carrying `content`.
+fn tokenizer_special_tokens(dir: &Path) -> (String, String) {
+    let Some(v) = read_json(dir, "tokenizer_config.json") else {
+        return (String::new(), String::new());
+    };
+    let token = |key: &str| -> String {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Object(o)) => o
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        }
+    };
+    (token("bos_token"), token("eos_token"))
+}
+
 fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+    // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
+    if let Some(t) = sidecar_chat_template(dir) {
+        let supports_thinking = t.source().contains("enable_thinking");
+        let supports_tools = t.source().contains("tool_call");
+        return (Box::new(t), supports_thinking, supports_tools);
+    }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");

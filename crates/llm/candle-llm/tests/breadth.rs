@@ -9,8 +9,11 @@
 //!   cargo test --features cuda --test breadth -- --ignored --nocapture
 //! ```
 
-use candle_llm::load_for_model;
-use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlmRequest};
+use candle_llm::{load_for_model, provider::LlamaProvider};
+use core_llm::{
+    AudioRef, Content, ImageRef, LoadSpec, Message, Quantize, Role, Sampling, StreamEvent, TextLlm,
+    TextLlmRequest,
+};
 
 /// Load the snapshot at `$env` **by model** (story 7406: `load_for_model`, naming no provider id /
 /// family / backend), check its reported family tag, and assert it streams coherent, word-bearing
@@ -118,4 +121,200 @@ fn deepseek_v2_streams_coherent_text() {
 #[ignore = "needs a Gemma 4 unified snapshot via CANDLE_LLM_GEMMA4_MODEL"]
 fn gemma4_unified_streams_coherent_text() {
     assert_streams_coherent("CANDLE_LLM_GEMMA4_MODEL", "gemma4_unified");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gemma 4 as a general-purpose LLM (sc-18772)
+// ---------------------------------------------------------------------------------------------
+//
+// These are the real-weight legs of the story's acceptance: the synthetic suite
+// (`gemma4_multimodal.rs`) proves the wiring on CPU in milliseconds, but only a trained checkpoint
+// can show that Gemma 4 *answers* — and, for vision, that the tiling and positional resampling this
+// crate had to choose without a reference implementation are actually right.
+//
+// Point `CANDLE_LLM_GEMMA4_MODEL` at a `google/gemma-4-12B-it` snapshot and run:
+//
+// ```text
+// CANDLE_LLM_GEMMA4_MODEL=/path/to/gemma-4-12B-it \
+//   cargo test -p candle-llm --test breadth -- --ignored --nocapture gemma4
+// ```
+
+/// Load the Gemma 4 snapshot at the story's env var with an explicit quantization tier, or print a
+/// loud skip and return `None`. Never silently passes.
+fn gemma4_provider(quantize: Option<Quantize>) -> Option<LlamaProvider> {
+    let Some(dir) = std::env::var("CANDLE_LLM_GEMMA4_MODEL")
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        eprintln!("skip: set CANDLE_LLM_GEMMA4_MODEL to a google/gemma-4-12B-it snapshot");
+        return None;
+    };
+    let spec = LoadSpec {
+        source: dir,
+        quantize,
+    };
+    Some(LlamaProvider::load(&spec).expect("load gemma 4"))
+}
+
+fn ask(p: &LlamaProvider, content: Vec<Content>, max_new_tokens: u32) -> String {
+    let req = TextLlmRequest {
+        messages: vec![Message {
+            role: Role::User,
+            content,
+            thinking: None,
+            tool_calls: Vec::new(),
+        }],
+        sampling: Sampling::greedy(),
+        max_new_tokens,
+        seed: Some(0),
+        ..Default::default()
+    };
+    p.generate(&req, &mut |_| {}).expect("generate").text
+}
+
+/// A `w x h` image split left/right into two flat colours.
+fn split_image(w: u32, h: u32, left: [u8; 3], right: [u8; 3]) -> ImageRef {
+    let mut px = Vec::with_capacity(w as usize * h as usize * 3);
+    for _y in 0..h {
+        for x in 0..w {
+            px.extend_from_slice(if x < w / 2 { &left } else { &right });
+        }
+    }
+    ImageRef::new(w, h, px).unwrap()
+}
+
+/// Gemma 4 answers a prompt at a **quantized tier** through the ordinary provider surface.
+///
+/// The dense leg is `gemma4_unified_streams_coherent_text` above; this is the other half of the
+/// story's "bf16 and a quantized tier" requirement. Q4 rather than Q8 because it is the tier that
+/// stresses the per-layer-type table hardest: the full-attention layers' 512-wide heads and shared
+/// K/V quantize on a different shape from the sliding layers' 256-wide ones.
+#[test]
+#[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
+fn gemma4_answers_at_a_quantized_tier() {
+    let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        return;
+    };
+    assert!(p.is_quantized(), "the Q4 tier must actually be applied");
+    let out = ask(&p, vec![Content::text("The capital of France is")], 12);
+    println!("[gemma4 q4] {}", out.replace('\n', " "));
+    assert!(!out.trim().is_empty(), "produced no text");
+    assert!(
+        out.chars().any(|c| c.is_alphabetic()),
+        "output should contain words"
+    );
+    assert!(
+        out.to_lowercase().contains("paris"),
+        "a coherent Q4 Gemma 4 should name Paris; got {out:?}"
+    );
+}
+
+/// **Image conditioning, demonstrated.** The model must answer a question whose only possible source
+/// is the image, and must answer the mirrored image differently.
+///
+/// This is the leg that validates the two choices this crate had to make without a reference
+/// implementation: the patch-grid tiling and the resampling of the 1120-entry positional table onto
+/// that grid. A wrong tiling scrambles the patch order; a wrong (or dropped) positional resampling
+/// makes left and right indistinguishable. Either one survives every shape assertion and shows up
+/// only here, as the model getting the side wrong.
+///
+/// If this leg cannot be made to pass, the honest outcome is `supports_vision = false` in the
+/// descriptor — advertising a vision path that answers at chance is exactly the failure the story
+/// forbids.
+#[test]
+#[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
+fn gemma4_answers_about_an_image() {
+    let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        return;
+    };
+    assert!(
+        p.descriptor().capabilities.supports_vision,
+        "the checkpoint must advertise vision for this leg to mean anything"
+    );
+
+    let question = "What colour is the left half of this image? Answer with one word.";
+    let red_left = ask(
+        &p,
+        vec![
+            Content::Image(split_image(896, 448, [220, 20, 20], [20, 20, 220])),
+            Content::text(question),
+        ],
+        8,
+    );
+    let blue_left = ask(
+        &p,
+        vec![
+            Content::Image(split_image(896, 448, [20, 20, 220], [220, 20, 20])),
+            Content::text(question),
+        ],
+        8,
+    );
+    println!("[gemma4 image] red-left={red_left:?} blue-left={blue_left:?}");
+
+    let (rl, bl) = (red_left.to_lowercase(), blue_left.to_lowercase());
+    assert!(
+        rl.contains("red") && !rl.contains("blue"),
+        "a red left half must be answered 'red'; got {red_left:?}"
+    );
+    assert!(
+        bl.contains("blue") && !bl.contains("red"),
+        "a blue left half must be answered 'blue'; got {blue_left:?}"
+    );
+}
+
+/// **Audio conditioning, demonstrated.** A clip measurably reaches the decoder: generation succeeds
+/// with audio attached, and two clearly different waveforms produce different continuations.
+///
+/// Deliberately a *sensitivity* claim, not a transcription one. Gemma 4's audio front-end is a
+/// single linear map over raw 640-sample frames with no encoder, so what this crate can honestly
+/// demonstrate is that the samples reach the decoder and change what it says — not that the model
+/// transcribes. Asserting a transcription would be asserting a capability of the checkpoint rather
+/// than of this integration.
+#[test]
+#[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
+fn gemma4_accepts_audio_conditioning() {
+    let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
+        return;
+    };
+    assert!(
+        p.descriptor().capabilities.supports_audio,
+        "the checkpoint must advertise audio for this leg to mean anything"
+    );
+
+    // One second at 16 kHz: a 440 Hz tone, and silence.
+    let rate = 16_000usize;
+    let tone: Vec<f32> = (0..rate)
+        .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5)
+        .collect();
+    let silence = vec![0.0f32; rate];
+
+    let question = "Describe what you hear in a few words.";
+    let a = ask(
+        &p,
+        vec![
+            Content::Audio(AudioRef::new(16_000, tone).unwrap()),
+            Content::text(question),
+        ],
+        16,
+    );
+    let b = ask(
+        &p,
+        vec![
+            Content::Audio(AudioRef::new(16_000, silence).unwrap()),
+            Content::text(question),
+        ],
+        16,
+    );
+    println!("[gemma4 audio] tone={a:?} silence={b:?}");
+
+    assert!(!a.trim().is_empty(), "audio-conditioned generation produced no text");
+    assert!(
+        a.chars().any(|c| c.is_alphabetic()),
+        "output should contain words"
+    );
+    assert_ne!(
+        a, b,
+        "a tone and silence must not produce identical continuations — identical output means the \
+         audio never reached the decoder"
+    );
 }
