@@ -7,10 +7,10 @@
 //!
 //! ```text
 //! MLX_LLM_BPE_GGUF=/tmp/SmolLM2-135M-Instruct-F16.gguf MLX_LLM_TEST_MODEL=/tmp/smollm2-135m \
-//!   cargo test --test gguf_tokenizer -- --ignored --nocapture
+//!   cargo test --test integration -- gguf_tokenizer:: --ignored --nocapture
 //! # or a SentencePiece model:
 //! MLX_LLM_BPE_GGUF=/tmp/tinyllama-q4km.gguf MLX_LLM_TEST_MODEL=/tmp/tinyllama-hf \
-//!   cargo test --test gguf_tokenizer -- --ignored --nocapture
+//!   cargo test --test integration -- gguf_tokenizer:: --ignored --nocapture
 //! ```
 //!
 //! The converter reconstructs `tokenizer.json` from the GGUF metadata with no external files; the

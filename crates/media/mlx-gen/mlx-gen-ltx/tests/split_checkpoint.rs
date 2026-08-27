@@ -596,7 +596,7 @@ fn the_ltx_2_3_engine_refuses_a_2_5_bundle_by_version() {
 ///
 /// ```text
 /// LTX_2_5_SNAPSHOT=/path/to/ltx-2.5-snapshot \
-///   cargo test -p mlx-gen-ltx --test split_checkpoint -- --ignored real_
+///   cargo test -p mlx-gen-ltx --test integration -- split_checkpoint::real_ --ignored
 /// ```
 #[test]
 #[ignore = "needs the gated Lightricks/LTX-2.5 snapshot (set LTX_2_5_SNAPSHOT)"]

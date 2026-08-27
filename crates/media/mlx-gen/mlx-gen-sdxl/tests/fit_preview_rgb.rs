@@ -7,7 +7,7 @@
 //!
 //! ```sh
 //! SDXL_SNAPSHOT=/path/to/sdxl cargo test -p mlx-gen-sdxl --release \
-//!   --test fit_preview_rgb -- --ignored --nocapture
+//!   --test integration -- fit_preview_rgb:: --ignored --nocapture
 //! ```
 //!
 //! Set `SDXL_PREVIEW_ARTIFACT_DIR` to retain decoded corpus images, latent-resolution fitted
