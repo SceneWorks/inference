@@ -2819,17 +2819,6 @@ mod tests {
         (spec, text, multimodal)
     }
 
-    fn production_multimodal_snapshot_spec(root: &Path) -> LoadSpec {
-        gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::config::DEV_ENCODER_CONTRACT,
-            crate::config::DEV_VISION_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
-            .with_offload_policy(OffloadPolicy::Sequential)
-    }
-
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
