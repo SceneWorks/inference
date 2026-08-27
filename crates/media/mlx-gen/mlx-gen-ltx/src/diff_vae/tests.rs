@@ -1458,7 +1458,7 @@ fn eager() -> ResolvedDiffVaeMode {
 fn the_four_upstream_modes_declare_their_own_coefficients_and_withholds() {
     // Upstream `_MEM_COEF_BY_MODE` / `_BUDGET_SAFETY_BYTES_*`, verbatim. These are the mode's own
     // numbers, before any host resolve — the ladder reasons about all four even where only two run.
-    let declared: Vec<(&str, f64, u64)> = DiffVaeMode::ALL
+    let declared: Vec<(&str, f64, u64)> = DiffVaeMode::ALL_MODES
         .iter()
         .map(|m| {
             (
@@ -1478,7 +1478,7 @@ fn the_four_upstream_modes_declare_their_own_coefficients_and_withholds() {
         ]
     );
     // Every spelling round-trips, and an unknown one is a typed error rather than a silent default.
-    for mode in DiffVaeMode::ALL {
+    for mode in DiffVaeMode::ALL_MODES {
         assert_eq!(DiffVaeMode::parse(mode.as_str()).unwrap(), mode);
     }
     let err = DiffVaeMode::parse("combined_eager")
