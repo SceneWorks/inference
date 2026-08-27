@@ -80,7 +80,7 @@ enum Stack {
     /// Every layer built at load time and held for the model's lifetime.
     Resident(Vec<LlamaLayer>),
     /// Layers materialized one at a time from a re-openable source, then dropped.
-    Sequential(crate::residency::SequentialStack),
+    Sequential(Box<crate::residency::SequentialStack>),
 }
 
 /// A loaded causal decoder.
@@ -289,9 +289,9 @@ impl CausalLm {
             }
             // No layer is built here — that is the whole point. The plan travels to the stream and
             // each layer is materialized, run and dropped inside the forward.
-            Some(path) => {
-                Stack::Sequential(crate::residency::SequentialStack::new(path, plan, quant))
-            }
+            Some(path) => Stack::Sequential(Box::new(crate::residency::SequentialStack::new(
+                path, plan, quant,
+            ))),
         };
 
         // Gemma 4 resolves its RoPE per layer type; every uniform architecture builds one table and
@@ -1631,20 +1631,6 @@ fn join(prefix: &str, suffix: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn join_handles_empty_prefix() {
-        assert_eq!(join("", "model.norm.weight"), "model.norm.weight");
-        assert_eq!(
-            join("language_model", "model.norm.weight"),
-            "language_model.model.norm.weight"
-        );
-    }
-}
-
 /// Everything `CausalLm::from_weights_with` derives from the config *before* it reads any layer —
 /// i.e. every input to building decoder layer `i` other than the weights themselves.
 ///
@@ -1783,7 +1769,7 @@ impl LayerPlan {
                 Ok(t)
             }
         };
-        let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
+        let lp = |suffix: &str| join(decoder_root, &format!("layers.{i}.{suffix}"));
         // The per-layer attention shape. Uniform architectures resolve every layer to the same
         // descriptor (the model's scalar `head_dim` / `num_kv_heads`, no window, no `k_eq_v`),
         // so this is the pre-Gemma-4 behaviour verbatim; Gemma 4 resolves two.
@@ -1808,7 +1794,7 @@ impl LayerPlan {
 
         // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention.
         let attn = if cfg.architecture.is_mla() {
-            Attention::Mla(MlaAttention::load(w, &lp, &cfg, &load_proj, &req_bf16)?)
+            Attention::Mla(MlaAttention::load(w, &lp, cfg, &load_proj, &req_bf16)?)
         } else {
             // A KV-sharing tail layer (Gemma 4's `num_kv_shared_layers`) projects no keys or
             // values of its own — upstream builds no `k_proj` / `v_proj` / `k_norm` / `v_norm`
@@ -1978,5 +1964,19 @@ impl LayerPlan {
             layer_scalar,
             rope_slot,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_handles_empty_prefix() {
+        assert_eq!(join("", "model.norm.weight"), "model.norm.weight");
+        assert_eq!(
+            join("language_model", "model.norm.weight"),
+            "language_model.model.norm.weight"
+        );
     }
 }

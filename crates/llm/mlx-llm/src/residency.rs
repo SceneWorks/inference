@@ -11,7 +11,7 @@
 //! LTX-2.5's text encoder is a Gemma 4 decoder, and on LTX the **text phase binds the peak** — the
 //! encoder is 26.3 GB against a q4 DiT's ~10.6 GiB, so bounding the DiT harder cannot move it.
 //! Every other consumer of this crate's decoder has the same lever available for the same reason,
-//! which is why the stream is a property of [`CausalLm`] rather than a loader inside
+//! which is why the stream is a property of [`CausalLm`](crate::CausalLm) rather than a loader inside
 //! `mlx-gen-ltx`. Epic 18755 R9 names the provider-local streamed loader as the trap to avoid
 //! (sc-15958); this is the shared-primitive side of that rule.
 //!
@@ -19,7 +19,7 @@
 //!
 //! 1. **Evaluate before dropping.** MLX is lazy. Dropping a layer whose output is still an
 //!    unevaluated graph frees nothing — the graph holds the weights alive — so the stream would
-//!    cost a re-open per layer and bound nothing. [`SequentialStack::run_layer`] evaluates the
+//!    cost a re-open per layer and bound nothing. `SequentialStack::run_layer` evaluates the
 //!    carry before the layer goes out of scope. This is the same rule Z-Image's encoder stream
 //!    documents on its `EncoderCarry`.
 //! 2. **Drain the view.** `Array` is refcounted and the [`Weights`] map keeps its own handle on
@@ -50,7 +50,8 @@
 //!
 //! # Loader identity
 //!
-//! [`CausalLm::stream_observation`] returns `Some` only when this stack is engaged, and counts what
+//! [`CausalLm::stream_observation`](crate::CausalLm::stream_observation) returns `Some` only when
+//! this stack is engaged, and counts what
 //! the stream actually did. That is the observation AC1 asks for: comparing outputs cannot
 //! distinguish a streamed pass from a resident one — they are numerically identical by
 //! construction, which is the point — so the claim "the streamed loader ran" has to be observed on

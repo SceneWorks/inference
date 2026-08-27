@@ -35,7 +35,7 @@
 //!    the whole file into one buffer and trips the watchdog. Under
 //!    [`OffloadPolicy::Resident`] [`materialize_in_batches`] forces the tensors resident in bounded
 //!    submissions before anything builds a graph over them. Under [`OffloadPolicy::Sequential`] it
-//!    is deliberately **not** called — see [`load_backbone`].
+//!    is deliberately **not** called — see `load_backbone`.
 //! 3. **The padding mask.** The tokenizer *left-pads* to `max_length`, and `CausalLm`'s default
 //!    masking is causal only — no padding component — so every valid token would attend the pad
 //!    run and all 49 hidden states, hence the video and audio features, would be wrong. Wrong but
