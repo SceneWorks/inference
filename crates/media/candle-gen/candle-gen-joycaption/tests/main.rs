@@ -11,23 +11,8 @@
 // --- shared modules (hand-maintained; preserved by regen) ---
 // --- generated modules (do not edit) ---
 
-#[path = "comfyui_fold_probe.rs"]
-mod comfyui_fold_probe;
-
 #[path = "conformance.rs"]
 mod conformance;
 
-#[path = "control_parity.rs"]
-mod control_parity;
-
-#[path = "convert_real_weights.rs"]
-mod convert_real_weights;
-
-#[path = "klein_single_file_real_weights.rs"]
-mod klein_single_file_real_weights;
-
-#[path = "preview_real_weights.rs"]
-mod preview_real_weights;
-
-#[path = "vae_encode_parity.rs"]
-mod vae_encode_parity;
+#[path = "trigger_words.rs"]
+mod trigger_words;

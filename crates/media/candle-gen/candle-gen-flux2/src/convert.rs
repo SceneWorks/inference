@@ -200,7 +200,7 @@ fn swap_halves(t: &Tensor) -> Result<Tensor> {
 /// twin of the fork's `build_target_state_dict`). Pure remapping — renames + qkv row-split + the adaLN
 /// half-swap. The produced keys are exactly the base diffusers transformer's keys. Source tensors are
 /// loaded lazily from the mmap (and dropped after each op) so only the produced map is held resident.
-fn build_target_state_dict(src: &MmapedSafetensors) -> Result<HashMap<String, Tensor>> {
+pub(crate) fn build_target_state_dict(src: &MmapedSafetensors) -> Result<HashMap<String, Tensor>> {
     let cpu = Device::Cpu;
     let names: Vec<String> = src.tensors().into_iter().map(|(name, _)| name).collect();
     let load = |name: &str| -> Result<Tensor> {

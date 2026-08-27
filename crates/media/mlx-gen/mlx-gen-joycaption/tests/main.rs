@@ -22,3 +22,6 @@ mod generate_real_weights;
 
 #[path = "registry.rs"]
 mod registry;
+
+#[path = "trigger_words.rs"]
+mod trigger_words;
