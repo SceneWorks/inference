@@ -189,10 +189,11 @@ pub fn run_temporal_rounds(
     seed: u64,
     rounds: u32,
     upsample: &mut dyn FnMut(&Tensor) -> Result<Tensor>,
-    denoise_tile: &mut dyn FnMut(&DfrTileJob) -> Result<DfrTileResult>,
-) -> Result<TemporalRoundsOutput> {
+    denoise_tile: &mut dyn FnMut(&DfrTileJob) -> candle_gen::Result<DfrTileResult>,
+) -> candle_gen::Result<TemporalRoundsOutput> {
+    use candle_gen::CandleError;
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
-        return Err(Error::Msg(format!(
+        return Err(CandleError::Msg(format!(
             "ltx dfr: temporal_upsample_rounds must be 0..={}, got {rounds}",
             gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS
         )));
@@ -206,7 +207,7 @@ pub fn run_temporal_rounds(
 
     for round in 1..=rounds {
         if carry_positions.is_empty() {
-            return Err(Error::Msg(format!(
+            return Err(CandleError::Msg(format!(
                 "ltx dfr: temporal round {round}: missing carry-forward keyframes"
             )));
         }
@@ -215,7 +216,7 @@ pub fn run_temporal_rounds(
         fps *= 2.0;
         let expected_t = (num_frames - 1) / temporal_scale + 1;
         if video.dim(2)? as i64 != expected_t {
-            return Err(Error::Msg(format!(
+            return Err(CandleError::Msg(format!(
                 "ltx dfr: temporal upsampler produced T={} for round {round}, expected \
                  {expected_t}",
                 video.dim(2)?
@@ -236,7 +237,7 @@ pub fn run_temporal_rounds(
             temporal_scale,
             gen_core_dfr::TILE_LEAD_SEGMENTS,
         )
-        .map_err(|e| Error::Msg(e.to_string()))?;
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
 
         let mut tile_latents: Vec<Tensor> = Vec::with_capacity(tiles.len());
         let mut slot_positions: Vec<i64> = Vec::new();
@@ -255,7 +256,7 @@ pub fn run_temporal_rounds(
                     .filter(|p| !seam_to_index.contains_key(p))
                     .collect();
                 if !missing.is_empty() {
-                    return Err(Error::Msg(format!(
+                    return Err(CandleError::Msg(format!(
                         "ltx dfr: anchor seams {missing:?} missing from the carry-forward bag"
                     )));
                 }
@@ -296,13 +297,13 @@ pub fn run_temporal_rounds(
 
             if has_slots {
                 let Some(generated) = result.generated_keyframes else {
-                    return Err(Error::Msg(format!(
+                    return Err(CandleError::Msg(format!(
                         "ltx dfr: temporal round {round}: tile {tile_index} produced no keyframe \
                          slots"
                     )));
                 };
                 if generated.dim(2)? != slot_global.len() {
-                    return Err(Error::Msg(format!(
+                    return Err(CandleError::Msg(format!(
                         "ltx dfr: tile {tile_index} returned {} slot keyframes for {} slots",
                         generated.dim(2)?,
                         slot_global.len()
@@ -315,7 +316,7 @@ pub fn run_temporal_rounds(
 
         let stitched = stitch_tile_latents(&tile_latents, &tiles)?;
         if stitched.dim(2)? as i64 != expected_t {
-            return Err(Error::Msg(format!(
+            return Err(CandleError::Msg(format!(
                 "ltx dfr: stitched latent T={} != expected {expected_t}",
                 stitched.dim(2)?
             )));
@@ -487,6 +488,280 @@ pub fn denoise_dfr_tile(
     })
 }
 
+/// A replace-latent keyframe VAE-encoded at both stage resolutions (twin of the MLX
+/// `StageKeyframe`, owned because the candle engine materializes stage latents up front).
+pub struct DfrStageKeyframe {
+    pub stage1: Tensor,
+    pub stage2: Tensor,
+    pub frame_idx: usize,
+    pub strength: f32,
+}
+
+/// Everything [`generate_dfr_av_latents`] needs beyond the request-shaped parameters.
+pub struct DfrComponents<'a> {
+    pub dit: &'a AvDiT,
+    /// Latent normalize/denormalize around the learned upsamplers (the candle upsampler runs in
+    /// VAE space; see the two-stage renderer's `learned_upsample`).
+    pub vae: &'a crate::vae::LtxVideoVae,
+    pub spatial_upsampler: &'a crate::upsampler::LatentUpsampler,
+    /// Required when `temporal_upsample_rounds > 0`.
+    pub temporal_upsampler: Option<&'a crate::upsampler::LatentUpsampler>,
+    pub video_ctx: &'a Tensor,
+    pub audio_ctx: &'a Tensor,
+    pub audio_grid: &'a Tensor,
+    pub audio_frames: usize,
+}
+
+/// The DFR request shape (twin of the MLX `DfrRequest`; `canvas_frames` / `keyframe_positions`
+/// come from [`gen_core_dfr::resolve_canvas`] over the pre-padding `requested_frames`).
+pub struct DfrRequest<'a> {
+    pub canvas_frames: i64,
+    pub requested_frames: i64,
+    pub keyframe_positions: &'a [i64],
+    pub geometry: crate::pipeline::TwoStageGeometry,
+    pub fps: f32,
+    pub seed: u64,
+    pub temporal_upsample_rounds: u32,
+    /// `Some(downscale)` appends the reserved half-res stage-1 video as the detailing IC-LoRA
+    /// reference in stage 2; the detailing LoRA weights themselves are installed by the engine's
+    /// adapter layer, scoped to the stage-2 pass.
+    pub detailing_downscale: Option<i64>,
+    /// Replace-latent image conditioning (I2V / first-last-frame), empty for T2V.
+    pub video_keyframes: &'a [DfrStageKeyframe],
+}
+
+/// The DFR pipeline output (video latent, the **stage-1** audio latent — the shipped audio — the
+/// final pixel-frame count and the playback fps).
+pub struct DfrOutput {
+    pub video_latent: Tensor,
+    pub audio_latent: Tensor,
+    pub num_frames: i64,
+    pub playback_fps: f32,
+}
+
+/// The full DFR latent pipeline — candle twin of the MLX `generate_dfr_av_latents`; see that doc
+/// comment for stage semantics (deterministic distilled stages, ancestral tiles, stage-1 audio
+/// shipped, pass 0 for stage 1 + tiles, pass 1 for the detailing stage 2).
+pub fn generate_dfr_av_latents(
+    parts: &DfrComponents<'_>,
+    req: &DfrRequest<'_>,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<DfrOutput> {
+    use crate::config::{STAGE1_SIGMAS, STAGE2_SIGMAS};
+    use crate::pipeline::{
+        create_audio_noise, create_noise, denoise_av_conditioned, renoise, unflatten_latent,
+    };
+
+    let rounds = req.temporal_upsample_rounds;
+    if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx dfr: temporal_upsample_rounds must be 0..={}, got {rounds}",
+            gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS
+        )));
+    }
+    if rounds > 0 && parts.temporal_upsampler.is_none() {
+        return Err(candle_gen::CandleError::Msg(
+            "ltx dfr: temporal_upsample_rounds > 0 requires the temporal latent upsampler \
+             component"
+                .into(),
+        ));
+    }
+    if req.keyframe_positions.is_empty() {
+        return Err(candle_gen::CandleError::Msg(
+            "ltx dfr: the DFR canvas resolved no keyframe positions".into(),
+        ));
+    }
+    let temporal_scale = TEMPORAL_SCALE as i64;
+    let g = req.geometry;
+    let expected_lf = ((req.canvas_frames - 1) / temporal_scale + 1) as usize;
+    if g.t != expected_lf {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx dfr: geometry t={} must match the canvas' {expected_lf} latent frames",
+            g.t
+        )));
+    }
+    let device = parts.video_ctx.device().clone();
+    let normalize_upsample = |up: &crate::upsampler::LatentUpsampler,
+                              x: &Tensor|
+     -> Result<Tensor> {
+        parts
+            .vae
+            .normalize_latents(&up.forward(&parts.vae.denormalize_latents(x)?)?)
+    };
+
+    // --- Stage 1: half-res base + keyframe slots -------------------------------------------------
+    let vnoise1 = create_noise(req.seed, g.t, g.h1, g.w1, &device)?;
+    let anoise1 = create_audio_noise(req.seed.wrapping_add(2), parts.audio_frames, &device)?;
+    let grid1 = crate::rope::create_position_grid(g.t, g.h1, g.w1, req.fps, &device)?;
+    let mut state = if req.video_keyframes.is_empty() {
+        VideoTokenState::base(&vnoise1, &grid1)?
+    } else {
+        let zeros = Tensor::zeros_like(&vnoise1)?;
+        let borrowed: Vec<crate::conditioning::Keyframe> = req
+            .video_keyframes
+            .iter()
+            .map(|k| crate::conditioning::Keyframe {
+                latent: &k.stage1,
+                frame_idx: k.frame_idx,
+                strength: k.strength,
+            })
+            .collect();
+        let i2v = crate::conditioning::apply_keyframes(&zeros, &borrowed)?
+            .noised(&vnoise1, STAGE1_SIGMAS[0])?;
+        VideoTokenState::from_i2v(&i2v, &grid1)?
+    };
+    state = append_generated_keyframe_slots(
+        &state,
+        req.keyframe_positions,
+        None,
+        req.canvas_frames,
+        g.h1,
+        g.w1,
+        SPATIAL_SCALE as i64,
+        req.fps,
+    )?;
+    state.latent = noise_slot_tokens(&state, STAGE1_SIGMAS[0], req.seed.wrapping_add(11))?;
+
+    parts.dit.set_adapter_pass(0);
+    let mut on_forward = || Ok(());
+    let (state, audio_s1) = denoise_av_conditioned(
+        parts.dit,
+        &state,
+        &anoise1,
+        parts.video_ctx,
+        parts.audio_ctx,
+        parts.audio_frames,
+        parts.audio_grid,
+        &STAGE1_SIGMAS,
+        cancel,
+        &mut on_forward,
+        on_progress,
+    )?;
+    let stage1_audio_latent = audio_s1.clone();
+    let grid_tokens = state.latent.narrow(1, 0, state.target_tokens)?;
+    let reserved_half_res = unflatten_latent(&grid_tokens, g.t, g.h1, g.w1)?;
+    let slot_keyframes = crate::conditioning::take_generated_keyframes(&state, g.h1, g.w1)?;
+
+    // Spatial x2 of video and slots (slots' K rides the frame axis, untouched by the spatial
+    // checkpoint).
+    let upscaled_video = normalize_upsample(parts.spatial_upsampler, &reserved_half_res)?;
+    let upscaled_slots = normalize_upsample(parts.spatial_upsampler, &slot_keyframes)?;
+
+    // --- Stage 2: full-res detailing -------------------------------------------------------------
+    let s2_entry = STAGE2_SIGMAS[0];
+    let vnoise2 = create_noise(req.seed.wrapping_add(1), g.t, g.h2, g.w2, &device)?;
+    let anoise2 = create_audio_noise(req.seed.wrapping_add(3), parts.audio_frames, &device)?;
+    let grid2 = crate::rope::create_position_grid(g.t, g.h2, g.w2, req.fps, &device)?;
+    let mut state2 = if req.video_keyframes.is_empty() {
+        let renoised = renoise(&upscaled_video, &vnoise2, s2_entry)?;
+        VideoTokenState::base(&renoised, &grid2)?
+    } else {
+        let borrowed: Vec<crate::conditioning::Keyframe> = req
+            .video_keyframes
+            .iter()
+            .map(|k| crate::conditioning::Keyframe {
+                latent: &k.stage2,
+                frame_idx: k.frame_idx,
+                strength: k.strength,
+            })
+            .collect();
+        let i2v = crate::conditioning::apply_keyframes(&upscaled_video, &borrowed)?
+            .noised(&vnoise2, s2_entry)?;
+        VideoTokenState::from_i2v(&i2v, &grid2)?
+    };
+    state2 = append_generated_keyframe_slots(
+        &state2,
+        req.keyframe_positions,
+        Some(&upscaled_slots),
+        req.canvas_frames,
+        g.h2,
+        g.w2,
+        SPATIAL_SCALE as i64,
+        req.fps,
+    )?;
+    state2.latent = noise_slot_tokens(&state2, s2_entry, req.seed.wrapping_add(13))?;
+    if let Some(downscale) = req.detailing_downscale {
+        state2 = crate::conditioning::append_reference_latent(
+            &state2,
+            &reserved_half_res,
+            downscale,
+            1.0,
+            req.fps,
+        )?;
+    }
+    let audio2 = renoise(&stage1_audio_latent, &anoise2, s2_entry)?;
+
+    parts.dit.set_adapter_pass(1);
+    let mut on_forward = || Ok(());
+    let (state2, _audio2) = denoise_av_conditioned(
+        parts.dit,
+        &state2,
+        &audio2,
+        parts.video_ctx,
+        parts.audio_ctx,
+        parts.audio_frames,
+        parts.audio_grid,
+        &STAGE2_SIGMAS,
+        cancel,
+        &mut on_forward,
+        on_progress,
+    )?;
+    let grid_tokens2 = state2.latent.narrow(1, 0, state2.target_tokens)?;
+    let mut video = unflatten_latent(&grid_tokens2, g.t, g.h2, g.w2)?;
+    let carry_keyframes = crate::conditioning::take_generated_keyframes(&state2, g.h2, g.w2)?;
+
+    // --- Temporal rounds -------------------------------------------------------------------------
+    let mut num_frames = req.canvas_frames;
+    let mut playback_fps = req.fps;
+    if rounds > 0 {
+        let upsampler = parts.temporal_upsampler.expect("validated above");
+        // Temporal tiles run the base (stage-1) adapter pass, like the reference's non-detailing
+        // stage.
+        parts.dit.set_adapter_pass(0);
+        let mut upsample = |v: &Tensor| normalize_upsample(upsampler, v);
+        let mut denoise_tile = |job: &DfrTileJob| -> candle_gen::Result<DfrTileResult> {
+            let t_tile = job.tile.latent_frames();
+            let positions =
+                crate::rope::create_position_grid(t_tile, g.h2, g.w2, job.cond_fps, &device)?;
+            let mut on_forward = || Ok(());
+            let mut tile_progress = |_p: Progress| {};
+            denoise_dfr_tile(
+                parts.dit,
+                job,
+                parts.video_ctx,
+                &positions,
+                cancel,
+                &mut on_forward,
+                &mut tile_progress,
+            )
+        };
+        let out = run_temporal_rounds(
+            &video,
+            req.keyframe_positions,
+            &carry_keyframes,
+            num_frames,
+            req.fps,
+            req.seed,
+            rounds,
+            &mut upsample,
+            &mut denoise_tile,
+        )?;
+        video = out.video_latent;
+        num_frames = out.num_frames;
+        playback_fps = out.fps;
+    }
+
+    let (video, num_frames) =
+        trim_to_target_frames(&video, num_frames, req.requested_frames, rounds)?;
+    Ok(DfrOutput {
+        video_latent: video,
+        audio_latent: stage1_audio_latent,
+        num_frames,
+        playback_fps,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,7 +818,7 @@ mod tests {
 
     fn recording_denoiser(
         calls: &RefCell<Vec<Call>>,
-    ) -> impl FnMut(&DfrTileJob) -> Result<DfrTileResult> + '_ {
+    ) -> impl FnMut(&DfrTileJob) -> candle_gen::Result<DfrTileResult> + '_ {
         move |job| {
             let (_b, c, t, _h, _w) = job.tile_video.dims5()?;
             calls.borrow_mut().push(Call {
@@ -729,7 +1004,7 @@ mod tests {
     fn missing_slot_keyframes_is_a_hard_error() {
         let video = ramp_latent(1, 16, 0.0);
         let (carry_pos, carry_kf) = stage2_carry(1);
-        let mut no_slots = |job: &DfrTileJob| {
+        let mut no_slots = |job: &DfrTileJob| -> candle_gen::Result<DfrTileResult> {
             let (_b, c, t, _h, _w) = job.tile_video.dims5()?;
             Ok(DfrTileResult {
                 latent: const_latent(c, t, 1.0),
