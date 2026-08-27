@@ -1012,6 +1012,13 @@ pub fn denoise_av_tokens(
 }
 
 /// The audio side of an ancestral token denoise, when the audio modality is present.
+///
+/// Deliberately mask-free: the reference loop post-processes BOTH modalities after noise
+/// injection, but the audio `LatentState` it does that with always carries an all-ones
+/// `denoise_mask` (audio is never conditioned on this engine's surface), so its re-pin is the
+/// identity `x·1 + clean·0`. Carrying no mask here is that identity by construction — if audio
+/// conditioning ever lands, this struct must grow the `clean`/`mask` pair and the loop must
+/// re-pin audio exactly like video (sc-18789 review note).
 pub struct AncestralAudio<'a> {
     /// `(B, 8, T, 16)` audio latent grid.
     pub latent: &'a Array,

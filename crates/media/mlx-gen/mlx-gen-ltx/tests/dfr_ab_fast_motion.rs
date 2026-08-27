@@ -82,27 +82,47 @@ fn seeded_noise(shape: &[i32], seed: u64) -> Array {
     mlx_rs::random::normal::<f32>(shape, None, None, Some(&key)).unwrap()
 }
 
-/// Mean absolute discrete-Laplacian response over the luma plane — the detail-retention metric.
-/// Higher = more retained high-frequency content. Computed on the CPU from uint8 frames.
-fn hf_energy(frame: &[u8], h: usize, w: usize) -> f64 {
-    let luma = |y: usize, x: usize| -> f64 {
-        let p = (y * w + x) * 3;
-        0.299 * frame[p] as f64 + 0.587 * frame[p + 1] as f64 + 0.114 * frame[p + 2] as f64
-    };
+/// Luma at (y, x) of an RGB8 frame.
+fn luma_at(frame: &[u8], w: usize, y: usize, x: usize) -> f64 {
+    let p = (y * w + x) * 3;
+    0.299 * frame[p] as f64 + 0.587 * frame[p + 1] as f64 + 0.114 * frame[p + 2] as f64
+}
+
+/// Motion-mask luma threshold: a pixel belongs to the moving region when its luma changed by more
+/// than this between the sample frame and its predecessor (out of 255).
+const MOTION_LUMA_THRESHOLD: f64 = 8.0;
+
+/// Mean absolute discrete-Laplacian response over the luma plane, **restricted to the moving
+/// region** — the pixels whose luma changed by more than [`MOTION_LUMA_THRESHOLD`] versus `prev`
+/// (frame-difference gate). Detail retention under fast motion is what DFR exists for, so the
+/// static background must not dilute the number. Returns `(masked_hf_energy, mask_coverage)`;
+/// a frame with no moving pixels reports 0 energy at 0 coverage rather than a NaN.
+fn motion_masked_hf_energy(frame: &[u8], prev: &[u8], h: usize, w: usize) -> (f64, f64) {
     let mut acc = 0.0;
     let mut n = 0usize;
+    let mut total = 0usize;
     for y in 1..h - 1 {
         for x in 1..w - 1 {
-            let lap = 4.0 * luma(y, x)
-                - luma(y - 1, x)
-                - luma(y + 1, x)
-                - luma(y, x - 1)
-                - luma(y, x + 1);
+            total += 1;
+            let moved =
+                (luma_at(frame, w, y, x) - luma_at(prev, w, y, x)).abs() > MOTION_LUMA_THRESHOLD;
+            if !moved {
+                continue;
+            }
+            let lap = 4.0 * luma_at(frame, w, y, x)
+                - luma_at(frame, w, y - 1, x)
+                - luma_at(frame, w, y + 1, x)
+                - luma_at(frame, w, y, x - 1)
+                - luma_at(frame, w, y, x + 1);
             acc += lap.abs();
             n += 1;
         }
     }
-    acc / n as f64
+    if n == 0 {
+        (0.0, 0.0)
+    } else {
+        (acc / n as f64, n as f64 / total as f64)
+    }
 }
 
 fn write_ppm(path: &PathBuf, frame: &[u8], h: usize, w: usize) {
@@ -301,16 +321,25 @@ fn dfr_ab_fast_motion_records_detail_retention() {
     assert_eq!(base_frames.len(), FRAMES as usize);
     assert_eq!(dfr_frames.len(), dfr.num_frames as usize);
 
-    // Time-matched samples: baseline frame t vs DFR frame t·2^rounds.
+    // Time-matched samples: baseline frame t vs DFR frame t·2^rounds, each frame's motion mask
+    // gated against its own predecessor on the same timeline (t ≥ 1 so a predecessor exists).
     let stride = 1usize << rounds;
-    let samples: Vec<usize> = (0..8).map(|i| i * (FRAMES as usize - 1) / 7).collect();
+    let samples: Vec<usize> = (1..=8)
+        .map(|i| 1 + (i - 1) * (FRAMES as usize - 2) / 7)
+        .collect();
     let mut base_hf = 0.0;
     let mut dfr_hf = 0.0;
+    let mut base_cov = 0.0;
+    let mut dfr_cov = 0.0;
     for (i, &t) in samples.iter().enumerate() {
         let b = &base_frames[t];
         let d = &dfr_frames[t * stride];
-        base_hf += hf_energy(b, bh, bw);
-        dfr_hf += hf_energy(d, dh, dw);
+        let (bhf, bc) = motion_masked_hf_energy(b, &base_frames[t - 1], bh, bw);
+        let (dhf, dc) = motion_masked_hf_energy(d, &dfr_frames[t * stride - stride], dh, dw);
+        base_hf += bhf;
+        dfr_hf += dhf;
+        base_cov += bc;
+        dfr_cov += dc;
         write_ppm(&out_dir.join(format!("base_f{t:03}_{i}.ppm")), b, bh, bw);
         write_ppm(
             &out_dir.join(format!("dfr_f{:03}_{i}.ppm", t * stride)),
@@ -321,20 +350,24 @@ fn dfr_ab_fast_motion_records_detail_retention() {
     }
     base_hf /= samples.len() as f64;
     dfr_hf /= samples.len() as f64;
+    base_cov /= samples.len() as f64;
+    dfr_cov /= samples.len() as f64;
     assert!(
         base_hf.is_finite() && base_hf > 0.0,
-        "baseline decoded to a degenerate clip"
+        "baseline has no moving detail at all"
     );
     assert!(
         dfr_hf.is_finite() && dfr_hf > 0.0,
-        "dfr decoded to a degenerate clip"
+        "dfr has no moving detail at all"
     );
 
     let summary = format!(
         "{{\"prompt\":{PROMPT:?},\"seed\":{SEED},\"size\":\"{WIDTH}x{HEIGHT}\",\
          \"frames_base\":{FRAMES},\"frames_dfr\":{},\"rounds\":{rounds},\
-         \"hf_energy_base\":{base_hf:.4},\"hf_energy_dfr\":{dfr_hf:.4},\
-         \"hf_ratio_dfr_over_base\":{:.4}}}",
+         \"metric\":\"motion-masked luma Laplacian (|dL|>{MOTION_LUMA_THRESHOLD} gate)\",\
+         \"motion_hf_base\":{base_hf:.4},\"motion_hf_dfr\":{dfr_hf:.4},\
+         \"motion_hf_ratio_dfr_over_base\":{:.4},\
+         \"motion_coverage_base\":{base_cov:.4},\"motion_coverage_dfr\":{dfr_cov:.4}}}",
         dfr.num_frames,
         dfr_hf / base_hf
     );

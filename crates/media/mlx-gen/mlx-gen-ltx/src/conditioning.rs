@@ -701,11 +701,14 @@ pub fn append_single_frame_keyframes(
             sh[2]
         )));
     }
-    if pixel_frame_indices.iter().any(|&p| p <= 0) {
-        // Position 0 never carries an anchor (frame 0 is not a keyframe on the DFR canvas), and a
-        // zero offset would need the causal-fix path this single-frame builder deliberately omits.
+    if pixel_frame_indices.iter().any(|&p| p < 0) {
+        // Position 0 IS legal: every non-first temporal tile anchors the seam it shares with the
+        // previous tile at local frame 0 (reference: "Every seam in the window is a hard keyframe,
+        // including the one at local frame 0"). `VideoConditionByKeyframeIndex` at
+        // `frame_idx == 0` / `num_pixel_frames == 1` produces exactly the `[0, 1)/fps` span
+        // [`single_frame_positions`] emits — the causal fix collapses to the same values there.
         return Err(Error::Msg(format!(
-            "ltx dfr: single-frame keyframe positions must be > 0, got {pixel_frame_indices:?}"
+            "ltx dfr: single-frame keyframe positions must be >= 0, got {pixel_frame_indices:?}"
         )));
     }
     let dt = state.latent.dtype();
@@ -1218,7 +1221,15 @@ mod tests {
             "given keyframes must not mark"
         );
         assert!(out.generated_keyframe_layout.is_none());
-        assert!(append_single_frame_keyframes(&st, &kf, &[0, 11], 0.95, 32, 24.0).is_err());
+        // Position 0 is ACCEPTED — the non-first-tile seam anchor sits at local frame 0, and its
+        // span is the causal-fixed `[0, 1)/fps` the reference produces at `frame_idx == 0`.
+        let at_zero = append_single_frame_keyframes(&st, &kf, &[0, 11], 0.95, 32, 24.0)
+            .expect("position 0 is the shared-seam anchor, not an error");
+        let pos = at_zero.positions.as_slice::<f32>();
+        // positions (1, 3, 4, 2): appended token 2 (the position-0 keyframe) frame axis.
+        assert_eq!((pos[2 * 2], pos[2 * 2 + 1]), (0.0, 1.0 / 24.0));
+        // A genuinely negative position stays refused.
+        assert!(append_single_frame_keyframes(&st, &kf, &[-1, 11], 0.95, 32, 24.0).is_err());
     }
 
     /// The detailing reference latent rides along clean at strength with spatial positions scaled

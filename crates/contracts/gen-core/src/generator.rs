@@ -388,7 +388,9 @@ pub struct GenerationRequest {
     /// sets `use_keyframes_abs_pos_embedding` (LTX ≥ 2.5) — an engine whose checkpoint lacks the
     /// learned marker (`ltx_2_3`) **refuses** the request with a typed `Unsupported` rather than
     /// denoising unmarked slots as wasted compute (the reference validates the same way, up
-    /// front). `None`/0 = off. Non-LTX models ignore it.
+    /// front). `None`/0 = off. Non-LTX models ignore it. **Until sc-18778 lands the `ltx_2_5`
+    /// engine, this knob is refusal-only** — no shipped engine consumes a positive value; the DFR
+    /// machinery it will drive is in place behind `ltx_dfr::evenly_spaced_keyframe_positions`.
     pub num_generated_keyframes: Option<u32>,
     /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
     /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and

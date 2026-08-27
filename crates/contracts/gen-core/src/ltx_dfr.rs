@@ -283,6 +283,12 @@ pub fn remap_positions_to_local(positions: &[i64], pixel_start: i64) -> Vec<i64>
 /// Evenly spaced interior keyframe positions for a `--num-generated-keyframes` count request:
 /// `linspace(0, num_frames − 1, k + 2)` rounded **half-to-even** (torch semantics), interior points
 /// only (`helpers.evenly_spaced_keyframe_positions`).
+///
+/// **Consumer status (sc-18789):** the count knob is refusal-only until sc-18778 — the `ltx_2_3`
+/// engines reject `GenerationRequest::num_generated_keyframes` (no slot marker in the 2.3
+/// weights), and the `ltx_2_5` engine that maps the count through this resolver onto the plain
+/// two-stage path (the reference `DistilledPipeline` behavior) is that story's binding. The DFR
+/// pipeline itself derives positions from [`resolve_canvas`], never from a count.
 pub fn evenly_spaced_keyframe_positions(num_keyframes: u32, num_frames: i64) -> Vec<i64> {
     if num_keyframes == 0 || num_frames < 2 {
         return Vec::new();
@@ -295,7 +301,9 @@ pub fn evenly_spaced_keyframe_positions(num_keyframes: u32, num_frames: i64) -> 
 }
 
 /// Validate + normalize explicit generated-keyframe pixel positions: sorted, deduped, all in
-/// `[0, num_frames)` (`helpers.resolve_generated_keyframes`, sequence arm).
+/// `[0, num_frames)` (`helpers.resolve_generated_keyframes`, sequence arm). Like
+/// [`evenly_spaced_keyframe_positions`], its positive-path consumer is the sc-18778 engine
+/// binding; see that doc's consumer-status note.
 pub fn resolve_generated_keyframe_positions(
     positions: &[i64],
     num_frames: i64,
@@ -579,37 +587,62 @@ mod tests {
         assert!(resolve_generated_keyframe_positions(&[49], 49).is_err());
     }
 
-    /// RF-ancestral coefficients against hand-computed reference values
-    /// (`EulerAncestralDiffusionStep.step` math evaluated in f64).
+    /// RF-ancestral coefficients against **literal goldens extracted from the reference
+    /// stepper** — `EulerAncestralDiffusionStep.step` executed at f64 (2026-08-27, `d1511477`),
+    /// its affine coefficients on `(x, x0, noise)` recovered with unit probes. Deliberately not a
+    /// recomputation of this module's own formula: a transcription error in `RfAncestralCoeffs`
+    /// cannot also be present in these numbers.
     #[test]
-    fn rf_ancestral_coeffs_match_reference_math() {
-        // σ=0.975 → σn=0.909375 at η=0.5 (the temporal-round configuration).
-        let c = RfAncestralCoeffs::new(0.975, 0.909375, 0.5, 1.0).unwrap();
-        let (s, sn) = (0.975f64, 0.909375f64);
-        let dsr = 1.0 + (sn / s - 1.0) * 0.5;
-        let sd = sn * dsr;
-        let ar = (1.0 - sn) / (1.0 - sd);
-        let rn = (sn * sn - sd * sd * ar * ar).max(0.0).sqrt();
-        assert!((c.sigma_down_ratio as f64 - sd / s).abs() < 1e-7);
-        assert!((c.alpha_ratio as f64 - ar).abs() < 1e-7);
-        assert!((c.renoise_coeff as f64 - rn).abs() < 1e-7);
-        assert!(c.renoise_coeff > 0.0, "η>0 must inject fresh noise");
-
-        // η=0 reduces to the deterministic Euler interpolation: ratio σn/σ, no rescale, no noise.
-        let c0 = RfAncestralCoeffs::new(0.975, 0.909375, 0.0, 1.0).unwrap();
-        assert!((c0.sigma_down_ratio as f64 - sn / s).abs() < 1e-7);
-        assert_eq!(c0.alpha_ratio, 1.0);
-        assert_eq!(c0.renoise_coeff, 0.0);
-
-        // s_noise scales only the injected-noise term.
-        let c2 = RfAncestralCoeffs::new(0.975, 0.909375, 0.5, 2.0).unwrap();
-        assert!((c2.renoise_coeff - 2.0 * c.renoise_coeff).abs() < 1e-6);
-        assert_eq!(c2.sigma_down_ratio, c.sigma_down_ratio);
-
-        // Full ancestral η=1 (the 2.5 stage-1 configuration): σ_down = σn²/σ.
-        let c1 = RfAncestralCoeffs::new(0.99375, 0.9875, 1.0, 1.0).unwrap();
-        let (s, sn) = (0.99375f64, 0.9875f64);
-        assert!((c1.sigma_down_ratio as f64 - (sn * sn / s) / s).abs() < 1e-7);
+    fn rf_ancestral_coeffs_match_reference_goldens() {
+        // (sigma, sigma_next, eta, s_noise) -> (sigma_down_ratio, alpha_ratio, renoise_coeff)
+        for (config, want) in [
+            // The temporal-round configuration (eta 0.5).
+            (
+                (0.975, 0.909_375, 0.5, 1.0),
+                (0.901_303_589, 0.747_552_089, 0.628_816_068),
+            ),
+            // eta 0 reduces to the deterministic Euler interpolation.
+            ((0.975, 0.909_375, 0.0, 1.0), (0.932_692_289, 1.0, 0.0)),
+            // s_noise scales only the injected-noise term.
+            (
+                (0.975, 0.909_375, 0.5, 2.0),
+                (0.901_303_589, 0.747_552_089, 1.257_632_136),
+            ),
+            // Full ancestral eta 1 (the 2.5 stage-1 configuration), two schedule points.
+            (
+                (0.993_75, 0.987_5, 1.0, 1.0),
+                (0.987_461_031, 0.668_069_428, 0.738_501_847),
+            ),
+            (
+                (0.725, 0.421_875, 1.0, 1.0),
+                (0.338_603_592, 0.766_223_311, 0.377_620_906),
+            ),
+        ] {
+            let (sigma, sigma_next, eta, s_noise): (f64, f64, f64, f64) = config;
+            let c =
+                RfAncestralCoeffs::new(sigma as f32, sigma_next as f32, eta as f32, s_noise as f32)
+                    .unwrap();
+            let (want_sdr, want_ar, want_rn): (f64, f64, f64) = want;
+            // The struct returns f32 while the reference goldens are f64: near sigma → 1 the
+            // catastrophic cancellation in (1 − sigma) costs a few ulps, so the bar is 1e-5 —
+            // still far below any transcription-error signature (the formulas differ at 1e-2+).
+            const TOL: f64 = 1e-5;
+            assert!(
+                (c.sigma_down_ratio as f64 - want_sdr).abs() < TOL,
+                "{config:?}: sigma_down_ratio {} vs reference {want_sdr}",
+                c.sigma_down_ratio
+            );
+            assert!(
+                (c.alpha_ratio as f64 - want_ar).abs() < TOL,
+                "{config:?}: alpha_ratio {} vs reference {want_ar}",
+                c.alpha_ratio
+            );
+            assert!(
+                (c.renoise_coeff as f64 - want_rn).abs() < TOL,
+                "{config:?}: renoise_coeff {} vs reference {want_rn}",
+                c.renoise_coeff
+            );
+        }
     }
 
     #[test]

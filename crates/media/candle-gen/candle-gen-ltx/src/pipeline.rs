@@ -390,6 +390,8 @@ pub fn denoise_av_conditioned(
 }
 
 /// The audio side of an ancestral token denoise, when the audio modality is present.
+/// Deliberately mask-free — see the mlx twin's note: the reference's post-noise audio re-pin is
+/// the identity because audio always carries an all-ones denoise mask on this engine's surface.
 pub struct AncestralAudio<'a> {
     /// `(B, 8, T, 16)` audio latent grid.
     pub latent: &'a Tensor,

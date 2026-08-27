@@ -538,9 +538,12 @@ pub fn append_single_frame_keyframes(
             pixel_frame_indices.len()
         )));
     }
-    if pixel_frame_indices.iter().any(|&p| p <= 0) {
+    if pixel_frame_indices.iter().any(|&p| p < 0) {
+        // Position 0 IS legal — the non-first-tile seam anchor at local frame 0; the reference's
+        // causal-fixed span at frame_idx 0 equals `single_frame_positions`' `[0, 1)/fps` (see the
+        // mlx twin's note).
         return Err(Error::Msg(format!(
-            "ltx dfr: single-frame keyframe positions must be > 0, got {pixel_frame_indices:?}"
+            "ltx dfr: single-frame keyframe positions must be >= 0, got {pixel_frame_indices:?}"
         )));
     }
     let dt = state.latent.dtype();

@@ -142,6 +142,23 @@ pub fn merge_carry_forward_keyframes(
     Ok((ordered, Tensor::cat(&frames.iter().collect::<Vec<_>>(), 2)?))
 }
 
+/// A replace-latent image anchor carried into the temporal rounds (twin of the MLX
+/// `DfrRoundImage`; see that doc for the window-filter projection note): the conditioning latent
+/// at stage-2 resolution (`(B, C, 1, H, W)`), its **pre-round** x8-aligned pixel position, and
+/// its strength.
+pub struct DfrRoundImage {
+    pub pixel_position: i64,
+    pub latent: Tensor,
+    pub strength: f32,
+}
+
+/// One image re-attached to a tile, in tile-local latent coordinates.
+pub struct DfrTileImage {
+    pub local_latent_index: usize,
+    pub latent: Tensor,
+    pub strength: f32,
+}
+
 /// One tile's denoise inputs, in tile-local coordinates (twin of the MLX `DfrTileJob`).
 pub struct DfrTileJob<'a> {
     pub round: u32,
@@ -149,10 +166,15 @@ pub struct DfrTileJob<'a> {
     pub tile: &'a DfrTileRange,
     /// `(B, C, T_tile, H, W)` window slice of the temporally upsampled video latent.
     pub tile_video: Tensor,
+    /// Tile-local anchor positions; every non-first tile's first anchor is exactly `0` (the
+    /// shared seam).
     pub anchor_positions_local: Vec<i64>,
     pub anchor_latents: Option<Tensor>,
     pub slot_positions_local: Vec<i64>,
     pub slot_initials: Option<Tensor>,
+    /// Replace-latent image anchors whose (round-scaled) pixel position falls inside this window,
+    /// remapped tile-locally.
+    pub image_keyframes: Vec<DfrTileImage>,
     pub local_frames: i64,
     pub cond_fps: f32,
     /// `seed + 1000·round + tile_index` — tiles are positionally identical, so a shared ancestral
@@ -181,6 +203,7 @@ pub fn run_temporal_rounds(
     video_latent: &Tensor,
     carry_positions: &[i64],
     carry_keyframes: &Tensor,
+    images: &[DfrRoundImage],
     num_frames: i64,
     fps: f32,
     seed: u64,
@@ -189,6 +212,15 @@ pub fn run_temporal_rounds(
     denoise_tile: &mut dyn FnMut(&DfrTileJob) -> candle_gen::Result<DfrTileResult>,
 ) -> candle_gen::Result<TemporalRoundsOutput> {
     use candle_gen::CandleError;
+    for image in images {
+        if image.pixel_position < 0 || image.pixel_position % (TEMPORAL_SCALE as i64) != 0 {
+            return Err(CandleError::Msg(format!(
+                "ltx dfr: image anchor pixel position {} is not on the x{TEMPORAL_SCALE} latent \
+                 border",
+                image.pixel_position
+            )));
+        }
+    }
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
         return Err(CandleError::Msg(format!(
             "ltx dfr: temporal_upsample_rounds must be 0..={}, got {rounds}",
@@ -273,6 +305,24 @@ pub fn run_temporal_rounds(
                 (local, Some(initials))
             };
 
+            // Image conditioning is tile-local (reference: only in-window images re-attach,
+            // remapped by −pixel_start; re-applying an outside image would pin the wrong frame
+            // onto the seam).
+            let image_keyframes: Vec<DfrTileImage> = images
+                .iter()
+                .filter_map(|image| {
+                    let pos_r = image.pixel_position << round;
+                    if pos_r < tile.pixel_start || pos_r > tile.pixel_end {
+                        return None;
+                    }
+                    Some(DfrTileImage {
+                        local_latent_index: ((pos_r - tile.pixel_start) / temporal_scale) as usize,
+                        latent: image.latent.clone(),
+                        strength: image.strength,
+                    })
+                })
+                .collect();
+
             let job = DfrTileJob {
                 round,
                 tile_index,
@@ -283,6 +333,7 @@ pub fn run_temporal_rounds(
                 anchor_latents,
                 slot_positions_local,
                 slot_initials,
+                image_keyframes,
                 cond_fps,
                 noise_seed: seed
                     .wrapping_add(gen_core_dfr::TEMPORAL_TILE_SEED_STRIDE * u64::from(round))
@@ -429,9 +480,32 @@ pub fn denoise_dfr_tile(
         job.tile_video.device(),
     )?
     .to_dtype(job.tile_video.dtype())?;
-    let renoised = crate::pipeline::renoise(&job.tile_video, &noise, TEMPORAL_SIGMAS[0])?;
-
-    let mut state = VideoTokenState::base(&renoised, positions)?;
+    let mut state = if job.image_keyframes.is_empty() {
+        let renoised = crate::pipeline::renoise(&job.tile_video, &noise, TEMPORAL_SIGMAS[0])?;
+        VideoTokenState::base(&renoised, positions)?
+    } else {
+        // Window-local image anchors: the replace-latent state pins the image frames instead of
+        // re-noising them (the reference's per-tile image conditionings + the stage noiser).
+        let dt = job.tile_video.dtype();
+        let cast: Vec<Tensor> = job
+            .image_keyframes
+            .iter()
+            .map(|image| image.latent.to_dtype(dt))
+            .collect::<Result<_>>()?;
+        let keyframes: Vec<crate::conditioning::Keyframe> = job
+            .image_keyframes
+            .iter()
+            .zip(&cast)
+            .map(|(image, latent)| crate::conditioning::Keyframe {
+                latent,
+                frame_idx: image.local_latent_index,
+                strength: image.strength,
+            })
+            .collect();
+        let i2v = crate::conditioning::apply_keyframes(&job.tile_video, &keyframes)?
+            .noised(&noise, TEMPORAL_SIGMAS[0])?;
+        VideoTokenState::from_i2v(&i2v, positions)?
+    };
     if let (false, Some(anchors)) = (
         job.anchor_positions_local.is_empty(),
         job.anchor_latents.as_ref(),
@@ -719,6 +793,27 @@ pub fn generate_dfr_av_latents(
         // Temporal tiles run the base (stage-1) adapter pass, like the reference's non-detailing
         // stage.
         parts.dit.set_adapter_pass(0);
+        // Replace-latent image anchors ride into every round, re-attached tile-locally; a
+        // multi-latent-frame conditioning has no per-tile replace-latent projection — typed
+        // refusal, never a silent drop (twin of the mlx arm).
+        let round_images: Vec<DfrRoundImage> = req
+            .video_keyframes
+            .iter()
+            .map(|keyframe| {
+                let cf = keyframe.stage2.dim(2)?;
+                if cf != 1 {
+                    return Err(candle_gen::CandleError::Msg(format!(
+                        "ltx dfr: a {cf}-latent-frame replace-latent conditioning cannot ride \
+                         temporal_upsample_rounds > 0 (single-frame image anchors only)"
+                    )));
+                }
+                Ok(DfrRoundImage {
+                    pixel_position: keyframe.frame_idx as i64 * TEMPORAL_SCALE as i64,
+                    latent: keyframe.stage2.clone(),
+                    strength: keyframe.strength,
+                })
+            })
+            .collect::<candle_gen::Result<_>>()?;
         let mut upsample = |v: &Tensor| normalize_upsample(upsampler, v);
         let mut denoise_tile = |job: &DfrTileJob| -> candle_gen::Result<DfrTileResult> {
             let t_tile = job.tile.latent_frames();
@@ -740,6 +835,7 @@ pub fn generate_dfr_av_latents(
             &video,
             req.keyframe_positions,
             &carry_keyframes,
+            &round_images,
             num_frames,
             req.fps,
             req.seed,
@@ -811,6 +907,7 @@ mod tests {
         cond_fps: f32,
         anchors_global: Vec<i64>,
         anchor_first_value: Option<f32>,
+        images_local: Vec<(usize, f32)>,
     }
 
     fn recording_denoiser(
@@ -829,6 +926,11 @@ mod tests {
                     .map(|p| p + job.tile.pixel_start)
                     .collect(),
                 anchor_first_value: job.anchor_latents.as_ref().map(|a| frame_value(a, 0)),
+                images_local: job
+                    .image_keyframes
+                    .iter()
+                    .map(|image| (image.local_latent_index, frame_value(&image.latent, 0)))
+                    .collect(),
             });
             let generated_keyframes = if job.slot_positions_local.is_empty() {
                 None
@@ -873,6 +975,7 @@ mod tests {
                 &video,
                 &carry_pos,
                 &carry_kf,
+                &[],
                 121,
                 24.0,
                 77,
@@ -915,6 +1018,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
@@ -943,6 +1047,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
@@ -976,6 +1081,57 @@ mod tests {
             v == 1000.0 || v == 1001.0,
             "round-2 anchor at seam 48 must carry round-1 slot content, got {v}"
         );
+    }
+
+    /// Twin of the MLX image re-attachment test: image anchors land only on the tiles whose
+    /// window contains their round-scaled position, remapped tile-locally.
+    #[test]
+    fn images_reattach_tile_locally_per_round() {
+        let video = ramp_latent(1, 16, 0.0);
+        let (carry_pos, carry_kf) = stage2_carry(1);
+        let images = [
+            DfrRoundImage {
+                pixel_position: 0,
+                latent: const_latent(1, 1, 41.0),
+                strength: 1.0,
+            },
+            DfrRoundImage {
+                pixel_position: 120,
+                latent: const_latent(1, 1, 42.0),
+                strength: 0.8,
+            },
+        ];
+        for rounds in [1u32, 2] {
+            let calls = RefCell::new(Vec::new());
+            run_temporal_rounds(
+                &video,
+                &carry_pos,
+                &carry_kf,
+                &images,
+                121,
+                24.0,
+                7,
+                rounds,
+                &mut fake_upsample,
+                &mut recording_denoiser(&calls),
+            )
+            .unwrap();
+            let calls = calls.borrow();
+            let last: Vec<&Call> = calls.iter().filter(|c| c.round == rounds).collect();
+            for (index, call) in last.iter().enumerate() {
+                let want: Vec<(usize, f32)> = if index == 0 {
+                    vec![(0, 41.0)]
+                } else if index == last.len() - 1 {
+                    vec![(18, 42.0)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    call.images_local, want,
+                    "rounds={rounds} tile {index}: window-local image re-attachment"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1017,6 +1173,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
@@ -1096,5 +1253,108 @@ mod tests {
         let with_ref =
             crate::conditioning::append_reference_latent(&st, &refl, 2, 1.0, 24.0).unwrap();
         assert!(with_ref.keyframes_mask.is_none());
+
+        // --- Numeric parity with the mlx twins (sc-18789 review) --------------------------------
+        // 1. Slot RoPE positions span exactly one pixel frame — `[t, t+1)/fps`.
+        let slot_pos = crate::conditioning::single_frame_positions(1, 1, 9, 32, 24.0, &dev())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(
+            slot_pos,
+            vec![9.0 / 24.0, 10.0 / 24.0, 0.0, 32.0, 0.0, 32.0],
+            "single-pixel-frame span on the frame axis; x32 spatial spans"
+        );
+        // 2. Slot initials seed the NOISY latent while clean stays zero.
+        let lat = seeded
+            .latent
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Token layout is (B, S, C): slot 0 = (c0=3, c1=5), slot 1 = (c0=4, c1=6).
+        assert_eq!(
+            &lat[4..8],
+            &[3.0, 5.0, 4.0, 6.0],
+            "initials seed the latent"
+        );
+        let clean = seeded
+            .clean_latent
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(&clean[4..8], &[0.0, 0.0, 0.0, 0.0], "slot clean stays zero");
+        // 3. Reference latent: strength 1.0 pins fully (mask 0) and its spatial positions ride the
+        // x(32·d) grid — the appended token's height span is [0, 64) at d = 2.
+        let dm = with_ref
+            .denoise_mask
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(dm[2], 0.0, "strength 1.0 pins the reference fully");
+        let rp = with_ref
+            .positions
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // positions (1, 3, 3, 2): height axis starts at index 3·2; appended token is index 2.
+        assert_eq!((rp[3 * 2 + 2 * 2], rp[3 * 2 + 2 * 2 + 1]), (0.0, 64.0));
+    }
+
+    /// Candle twin of the mlx real-anchor-list test: the non-first tile's anchor list (first
+    /// element exactly 0, the shared seam) must flow through `append_single_frame_keyframes` —
+    /// the production `denoise_dfr_tile` path that the position-0 guard broke pre-review.
+    #[test]
+    fn real_tile_anchor_list_flows_through_the_keyframe_append() {
+        let (n, _, pos) = gen_core_dfr::resolve_canvas(121, 8).unwrap();
+        let seams: Vec<i64> = pos.iter().map(|p| 2 * p).collect();
+        let n1 = gen_core_dfr::temporal_upsampled_frames(n);
+        let tiles =
+            gen_core_dfr::tile_ranges(&seams, n1, 2, 8, gen_core_dfr::TILE_LEAD_SEGMENTS).unwrap();
+        let tile1 = &tiles[1];
+        let local =
+            gen_core_dfr::remap_positions_to_local(&tile1.anchor_kf_global, tile1.pixel_start);
+        assert_eq!(local[0], 0, "the non-first tile anchors its window start");
+
+        let noise = Tensor::ones(
+            (1usize, 2, tile1.latent_frames(), 1, 1),
+            candle_gen::candle_core::DType::F32,
+            &dev(),
+        )
+        .unwrap();
+        let positions = Tensor::zeros(
+            (1usize, 3, tile1.latent_frames(), 2),
+            candle_gen::candle_core::DType::F32,
+            &dev(),
+        )
+        .unwrap();
+        let st = VideoTokenState::base(&noise, &positions).unwrap();
+        let anchors = Tensor::ones(
+            (1usize, 2, local.len(), 1, 1),
+            candle_gen::candle_core::DType::F32,
+            &dev(),
+        )
+        .unwrap();
+        let out = append_single_frame_keyframes(
+            &st,
+            &anchors,
+            &local,
+            gen_core_dfr::ANCHOR_KEYFRAME_STRENGTH,
+            32,
+            48.0,
+        )
+        .expect("the real tile-1 anchor list must be appendable");
+        let dm = out
+            .denoise_mask
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!((dm[tile1.latent_frames()] - 0.05).abs() < 1e-6);
     }
 }

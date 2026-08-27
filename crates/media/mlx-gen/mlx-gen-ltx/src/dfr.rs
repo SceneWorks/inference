@@ -162,6 +162,31 @@ pub fn merge_carry_forward_keyframes(
     ))
 }
 
+/// A replace-latent image anchor carried into the temporal rounds: the conditioning latent at
+/// stage-2 resolution (`(B, C, 1, H, W)` — one latent frame), its **pre-round** pixel position on
+/// the stage-2 canvas (x8-aligned), and its strength. Each round doubles the position with the
+/// canvas; [`run_temporal_rounds`] re-attaches the image to exactly the tiles whose window
+/// contains it (the reference re-attaches window-local images per tile — re-applying the opening
+/// image on a non-first tile would pin the wrong frame onto the seam).
+///
+/// Projection note: the reference re-encodes images per tile and appends them as tokens, so an
+/// out-of-window image on tile 0 is representable there; this engine's image conditioning is
+/// replace-latent on the grid, which has no out-of-window representation — the window filter
+/// applies to every tile. The two agree for every in-window image, which is every image (the tile
+/// windows are gapless).
+pub struct DfrRoundImage {
+    pub pixel_position: i64,
+    pub latent: Array,
+    pub strength: f32,
+}
+
+/// One image re-attached to a tile, in tile-local latent coordinates.
+pub struct DfrTileImage {
+    pub local_latent_index: i32,
+    pub latent: Array,
+    pub strength: f32,
+}
+
 /// One tile's denoise inputs, in tile-local coordinates.
 pub struct DfrTileJob<'a> {
     /// 1-based temporal round.
@@ -171,7 +196,8 @@ pub struct DfrTileJob<'a> {
     pub tile: &'a DfrTileRange,
     /// `(B, C, T_tile, H, W)` — the window's slice of the temporally upsampled video latent.
     pub tile_video: Array,
-    /// Hard-keyframe anchors inside the window, tile-local pixel positions (all `> 0`).
+    /// Hard-keyframe anchors inside the window, tile-local pixel positions. Every non-first
+    /// tile's first anchor is exactly `0` — the seam shared with the previous tile.
     pub anchor_positions_local: Vec<i64>,
     /// `(B, C, Ka, H, W)` anchor latents, ordered like `anchor_positions_local` (`None` iff empty).
     pub anchor_latents: Option<Array>,
@@ -179,6 +205,9 @@ pub struct DfrTileJob<'a> {
     pub slot_positions_local: Vec<i64>,
     /// `(B, C, Ks, H, W)` slot seeds from the nearest video latents (`None` iff no slots).
     pub slot_initials: Option<Array>,
+    /// Replace-latent image anchors whose (round-scaled) pixel position falls inside this window,
+    /// remapped tile-locally.
+    pub image_keyframes: Vec<DfrTileImage>,
     /// Pixel-frame count of the window.
     pub local_frames: i64,
     /// Conditioning fps for RoPE time (playback fps capped at
@@ -222,6 +251,7 @@ pub fn run_temporal_rounds(
     video_latent: &Array,
     carry_positions: &[i64],
     carry_keyframes: &Array,
+    images: &[DfrRoundImage],
     num_frames: i64,
     fps: f32,
     seed: u64,
@@ -229,6 +259,15 @@ pub fn run_temporal_rounds(
     upsample: &mut dyn FnMut(&Array) -> Result<Array>,
     denoise_tile: &mut dyn FnMut(&DfrTileJob) -> Result<DfrTileResult>,
 ) -> Result<TemporalRoundsOutput> {
+    for image in images {
+        if image.pixel_position < 0 || image.pixel_position % TEMPORAL_SCALE != 0 {
+            return Err(Error::Msg(format!(
+                "ltx dfr: image anchor pixel position {} is not on the x{TEMPORAL_SCALE} latent \
+                 border",
+                image.pixel_position
+            )));
+        }
+    }
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
         return Err(Error::Msg(format!(
             "ltx dfr: temporal_upsample_rounds must be 0..={}, got {rounds}",
@@ -315,6 +354,24 @@ pub fn run_temporal_rounds(
                 (local, Some(initials))
             };
 
+            // Image conditioning is tile-local: only images whose round-scaled position falls
+            // inside the window are re-attached, at `global − pixel_start` (the reference's
+            // remap; re-applying an outside image would pin the wrong frame onto the seam).
+            let image_keyframes: Vec<DfrTileImage> = images
+                .iter()
+                .filter_map(|image| {
+                    let pos_r = image.pixel_position << round;
+                    if pos_r < tile.pixel_start || pos_r > tile.pixel_end {
+                        return None;
+                    }
+                    Some(DfrTileImage {
+                        local_latent_index: ((pos_r - tile.pixel_start) / temporal_scale) as i32,
+                        latent: image.latent.clone(),
+                        strength: image.strength,
+                    })
+                })
+                .collect();
+
             let job = DfrTileJob {
                 round,
                 tile_index,
@@ -325,6 +382,7 @@ pub fn run_temporal_rounds(
                 anchor_latents,
                 slot_positions_local,
                 slot_initials,
+                image_keyframes,
                 cond_fps,
                 noise_seed: seed
                     .wrapping_add(gen_core_dfr::TEMPORAL_TILE_SEED_STRIDE * u64::from(round))
@@ -447,13 +505,36 @@ pub fn denoise_dfr_tile(
     let (h, w) = (sh[3] as usize, sh[4] as usize);
     let spatial_scale = SPATIAL_SCALE;
 
-    // Tile-entry re-noise: noise·σ₀ + latent·(1 − σ₀), seeded per tile.
+    // Tile-entry re-noise: noise·σ₀ + latent·(1 − σ₀), seeded per tile. With window-local image
+    // anchors, the replace-latent state pins the image frames instead of re-noising them (the
+    // reference's per-tile image conditionings + the stage noiser).
     let key = mlx_rs::random::key(job.noise_seed)?;
     let noise = mlx_rs::random::normal::<f32>(sh, None, None, Some(&key))?
         .as_dtype(job.tile_video.dtype())?;
-    let renoised = crate::pipeline::renoise(&job.tile_video, &noise, TEMPORAL_SIGMAS[0])?;
-
-    let mut state = VideoTokenState::base(&renoised, positions)?;
+    let mut state = if job.image_keyframes.is_empty() {
+        let renoised = crate::pipeline::renoise(&job.tile_video, &noise, TEMPORAL_SIGMAS[0])?;
+        VideoTokenState::base(&renoised, positions)?
+    } else {
+        let dt = job.tile_video.dtype();
+        let cast: Vec<Array> = job
+            .image_keyframes
+            .iter()
+            .map(|image| Ok(image.latent.as_dtype(dt)?))
+            .collect::<Result<_>>()?;
+        let keyframes: Vec<crate::conditioning::Keyframe> = job
+            .image_keyframes
+            .iter()
+            .zip(&cast)
+            .map(|(image, latent)| crate::conditioning::Keyframe {
+                latent,
+                frame_idx: image.local_latent_index,
+                strength: image.strength,
+            })
+            .collect();
+        let i2v = crate::conditioning::apply_keyframes(&job.tile_video, &keyframes)?
+            .noised(&noise, TEMPORAL_SIGMAS[0])?;
+        VideoTokenState::from_i2v(&i2v, positions)?
+    };
     if let (false, Some(anchors)) = (
         job.anchor_positions_local.is_empty(),
         job.anchor_latents.as_ref(),
@@ -786,6 +867,27 @@ pub fn generate_dfr_av_latents(
         // Temporal tiles run the base (stage-1) LoRA pass, like the reference's non-detailing
         // stage.
         parts.dit.set_lora_pass(0);
+        // Replace-latent image anchors ride into every round, re-attached tile-locally (the
+        // reference's per-tile image conditionings). A multi-latent-frame conditioning clip has
+        // no per-tile replace-latent projection — typed refusal, never a silent drop.
+        let round_images: Vec<DfrRoundImage> = req
+            .video_keyframes
+            .iter()
+            .map(|keyframe| {
+                let cf = keyframe.stage2.shape()[2];
+                if cf != 1 {
+                    return Err(Error::Msg(format!(
+                        "ltx dfr: a {cf}-latent-frame replace-latent conditioning cannot ride \
+                         temporal_upsample_rounds > 0 (single-frame image anchors only)"
+                    )));
+                }
+                Ok(DfrRoundImage {
+                    pixel_position: i64::from(keyframe.frame_idx) * temporal_scale,
+                    latent: keyframe.stage2.clone(),
+                    strength: keyframe.strength,
+                })
+            })
+            .collect::<Result<_>>()?;
         let mut upsample = |v: &Array| {
             crate::upsampler::upsample_latents(v, upsampler, parts.latent_mean, parts.latent_std)
         };
@@ -807,6 +909,7 @@ pub fn generate_dfr_av_latents(
             &video,
             req.keyframe_positions,
             &carry_keyframes,
+            &round_images,
             num_frames,
             req.fps,
             req.seed,
@@ -895,6 +998,7 @@ mod tests {
         cond_fps: f32,
         anchors_global: Vec<i64>,
         anchor_first_value: Option<f32>,
+        images_local: Vec<(i32, f32)>,
     }
 
     /// Recording fake denoiser: returns the window filled with the constant
@@ -915,6 +1019,11 @@ mod tests {
                     .map(|p| p + job.tile.pixel_start)
                     .collect(),
                 anchor_first_value: job.anchor_latents.as_ref().map(|a| frame_value(a, 0)),
+                images_local: job
+                    .image_keyframes
+                    .iter()
+                    .map(|image| (image.local_latent_index, frame_value(&image.latent, 0)))
+                    .collect(),
             });
             let generated_keyframes = if job.slot_positions_local.is_empty() {
                 None
@@ -962,6 +1071,7 @@ mod tests {
                 &video,
                 &carry_pos,
                 &carry_kf,
+                &[],
                 121,
                 24.0,
                 77,
@@ -1010,6 +1120,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
@@ -1046,6 +1157,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
@@ -1088,6 +1200,106 @@ mod tests {
             v == 1000.0 || v == 1001.0,
             "round-2 anchor at seam 48 must carry round-1 slot content, got {v}"
         );
+    }
+
+    /// The REAL anchor list a non-first tile produces — first element exactly 0 (the shared
+    /// seam) — must flow through `append_single_frame_keyframes` (the production
+    /// `denoise_dfr_tile` path). Before the sc-18789 review fix the append refused position 0 and
+    /// every rounds>=1 render died on tile 1.
+    #[test]
+    fn real_tile_anchor_list_flows_through_the_keyframe_append() {
+        let _cpu = CpuGuard::new();
+        let (n, _, pos) = mlx_gen::gen_core::ltx_dfr::resolve_canvas(121, 8).unwrap();
+        let seams: Vec<i64> = pos.iter().map(|p| 2 * p).collect();
+        let n1 = mlx_gen::gen_core::ltx_dfr::temporal_upsampled_frames(n);
+        let tiles = mlx_gen::gen_core::ltx_dfr::tile_ranges(
+            &seams,
+            n1,
+            2,
+            8,
+            mlx_gen::gen_core::ltx_dfr::TILE_LEAD_SEGMENTS,
+        )
+        .unwrap();
+        let tile1 = &tiles[1];
+        let local = mlx_gen::gen_core::ltx_dfr::remap_positions_to_local(
+            &tile1.anchor_kf_global,
+            tile1.pixel_start,
+        );
+        assert_eq!(local[0], 0, "the non-first tile anchors its window start");
+
+        let noise = Array::ones::<f32>(&[1, 2, tile1.latent_frames() as i32, 1, 1]).unwrap();
+        let positions = Array::zeros::<f32>(&[1, 3, tile1.latent_frames() as i32, 2]).unwrap();
+        let st = VideoTokenState::base(&noise, &positions).unwrap();
+        let anchors = Array::ones::<f32>(&[1, 2, local.len() as i32, 1, 1]).unwrap();
+        let out = append_single_frame_keyframes(
+            &st,
+            &anchors,
+            &local,
+            gen_core_dfr::ANCHOR_KEYFRAME_STRENGTH,
+            32,
+            48.0,
+        )
+        .expect("the real tile-1 anchor list must be appendable");
+        // The seam anchor's tokens pin at 1 - 0.95 like every other anchor.
+        let dm = out.denoise_mask.as_slice::<f32>();
+        let first_anchor_token = tile1.latent_frames();
+        assert!((dm[first_anchor_token] - 0.05).abs() < 1e-6);
+    }
+
+    /// Replace-latent image anchors are re-attached to exactly the tiles whose window contains
+    /// their round-scaled position, remapped tile-locally — an I2V clip keeps its image anchor
+    /// through every round instead of silently losing it (the sc-18789 review major).
+    #[test]
+    fn images_reattach_tile_locally_per_round() {
+        let _cpu = CpuGuard::new();
+        let video = ramp_latent(1, 16, 0.0);
+        let (carry_pos, carry_kf) = stage2_carry(1);
+        let images = [
+            DfrRoundImage {
+                pixel_position: 0,
+                latent: const_latent(1, 1, 41.0),
+                strength: 1.0,
+            },
+            DfrRoundImage {
+                pixel_position: 120,
+                latent: const_latent(1, 1, 42.0),
+                strength: 0.8,
+            },
+        ];
+        for rounds in [1u32, 2] {
+            let calls = RefCell::new(Vec::new());
+            run_temporal_rounds(
+                &video,
+                &carry_pos,
+                &carry_kf,
+                &images,
+                121,
+                24.0,
+                7,
+                rounds,
+                &mut fake_upsample,
+                &mut recording_denoiser(&calls),
+            )
+            .unwrap();
+            let calls = calls.borrow();
+            let last: Vec<&Call> = calls.iter().filter(|c| c.round == rounds).collect();
+            // The opening image lands ONLY on the first tile of every round, at local latent 0;
+            // the pixel-120 image lands ONLY on the last tile, at local latent 18
+            // (rounds=1: 240 in [96, 240] → (240−96)/8; rounds=2: 480 in [336, 480] → (480−336)/8).
+            for (index, call) in last.iter().enumerate() {
+                let want: Vec<(i32, f32)> = if index == 0 {
+                    vec![(0, 41.0)]
+                } else if index == last.len() - 1 {
+                    vec![(18, 42.0)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    call.images_local, want,
+                    "rounds={rounds} tile {index}: window-local image re-attachment"
+                );
+            }
+        }
     }
 
     /// Slot seeds pick the nearest latent frame of the window, tile-locally.
@@ -1135,6 +1347,7 @@ mod tests {
             &video,
             &carry_pos,
             &carry_kf,
+            &[],
             121,
             24.0,
             5,
