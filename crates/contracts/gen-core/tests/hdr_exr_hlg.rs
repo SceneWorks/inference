@@ -45,11 +45,7 @@ fn gradient_frame(width: u32, height: u32) -> HdrFrame {
             rgb.push(0.0001 + (u * v) * 3.0);
         }
     }
-    HdrFrame {
-        width,
-        height,
-        rgb,
-    }
+    HdrFrame { width, height, rgb }
 }
 
 fn ffmpeg_program() -> String {
@@ -132,7 +128,10 @@ fn primaries_round_trip_is_identity() {
     let mut rgb = vec![0.18, 0.5, 1.0, 4.0, 0.0, 12.0];
     let original = rgb.clone();
     Primaries::Rec709.convert_rgb_in_place(Primaries::AcesCg, &mut rgb);
-    assert_ne!(rgb, original, "the rotation did nothing — matrix is identity?");
+    assert_ne!(
+        rgb, original,
+        "the rotation did nothing — matrix is identity?"
+    );
     Primaries::AcesCg.convert_rgb_in_place(Primaries::Rec709, &mut rgb);
     for (got, want) in rgb.iter().zip(&original) {
         assert!(
@@ -240,7 +239,10 @@ fn exr_float_round_trips_exactly_with_tags() {
     assert_eq!(decoded.color_space_tag.as_deref(), Some("sRGB"));
     let chroma = decoded.chromaticities.expect("chromaticities written");
     for (got, want) in chroma.iter().zip(&Primaries::Rec709.exr_chromaticities()) {
-        assert!((got - want).abs() < 1e-6, "chromaticities drifted: {chroma:?}");
+        assert!(
+            (got - want).abs() < 1e-6,
+            "chromaticities drifted: {chroma:?}"
+        );
     }
 }
 
@@ -262,12 +264,7 @@ fn exr_half_round_trips_within_f16_precision() {
         );
     }
     // Highlights above 1.0 must survive — this is the whole reason for EXR over PNG.
-    let peak = decoded
-        .frame
-        .rgb
-        .iter()
-        .copied()
-        .fold(f32::MIN, f32::max);
+    let peak = decoded.frame.rgb.iter().copied().fold(f32::MIN, f32::max);
     assert!(
         peak > 60.0,
         "half EXR clipped the highlights: peak {peak} (expected ~64)"
@@ -405,10 +402,7 @@ fn acescct_conditioning_skips_the_transfer() {
     // assertion above would be vacuous.
     let linear = exr_conditioning_to_vae_range(&frame, HdrColorSpace::SrgbLinear).expect("linear");
     assert!(
-        linear
-            .iter()
-            .zip(&vae)
-            .any(|(a, b)| (a - b).abs() > 1e-3),
+        linear.iter().zip(&vae).any(|(a, b)| (a - b).abs() > 1e-3),
         "scene-linear and log conditioning produced identical output — the transfer is inert"
     );
 }
@@ -434,7 +428,10 @@ fn hlg_yuv420p10_packing_is_in_range_and_neutral() {
     assert_eq!(planes.v.len(), 4);
     for &y in &planes.y {
         assert!(y <= 1023, "luma escaped the 10-bit container: {y}");
-        assert!(y >= 64, "neutral 0.5 luma below the limited-range floor: {y}");
+        assert!(
+            y >= 64,
+            "neutral 0.5 luma below the limited-range floor: {y}"
+        );
     }
     for (&u, &v) in planes.u.iter().zip(&planes.v) {
         assert!(

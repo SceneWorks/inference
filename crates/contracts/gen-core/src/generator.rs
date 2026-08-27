@@ -8,8 +8,8 @@
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
-use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::hdr::HdrColorSpace;
+use crate::media::{AudioChunk, AudioTrack, Image};
 use crate::runtime::{
     CancelFlag, HdrFrameSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
 };

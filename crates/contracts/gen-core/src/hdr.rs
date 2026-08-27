@@ -35,6 +35,11 @@ use crate::Error;
 // ---------------------------------------------------------------------------------------------
 
 /// ACEScg (AP1, D60-adapted) linear → linear sRGB / Rec.709 (D65) primaries.
+// Transcribed from the reference at full precision on purpose: the extra digits carry no f32
+// information, but they keep each entry diff-able against the upstream Python source, which is
+// how a transposed or mistyped coefficient gets caught by eye. Truncating them to f32's actual
+// resolution would break that audit for no numerical gain.
+#[allow(clippy::excessive_precision)]
 const ACESCG_TO_SRGB: [[f32; 3]; 3] = [
     [1.705_05, -0.621_79, -0.083_26],
     [-0.130_26, 1.140_8, -0.010_55],
@@ -43,6 +48,7 @@ const ACESCG_TO_SRGB: [[f32; 3]; 3] = [
 
 /// Exact inverse of [`ACESCG_TO_SRGB`], inverted in `f64` then rounded to `f32` so the
 /// round-trip is clean (upstream computes this at import time with `torch.linalg.inv`).
+#[allow(clippy::excessive_precision)] // full-precision transcription — see ACESCG_TO_SRGB
 const SRGB_TO_ACESCG: [[f32; 3]; 3] = [
     [0.613_098_5, 0.339_524_18, 0.047_380_731],
     [0.070_196_077, 0.916_359_01, 0.013_454_048],
@@ -50,6 +56,7 @@ const SRGB_TO_ACESCG: [[f32; 3]; 3] = [
 ];
 
 /// Rec.709 (D65) → Rec.2020 (D65), ITU-R BT.2087.
+#[allow(clippy::excessive_precision)] // full-precision transcription — see ACESCG_TO_SRGB
 const REC709_TO_2020: [[f32; 3]; 3] = [
     [0.627_403_89, 0.329_283_04, 0.043_313_07],
     [0.069_097_29, 0.919_540_4, 0.011_362_32],
@@ -57,6 +64,7 @@ const REC709_TO_2020: [[f32; 3]; 3] = [
 ];
 
 /// ACEScg (AP1, D60) → Rec.2020 (D65), Bradford CAT.
+#[allow(clippy::excessive_precision)] // full-precision transcription — see ACESCG_TO_SRGB
 const ACESCG_TO_2020: [[f32; 3]; 3] = [
     [1.025_824_75, -0.020_053_19, -0.005_771_56],
     [-0.002_234_37, 1.004_586_5, -0.002_352_13],
@@ -363,6 +371,7 @@ pub const HLG_A: f32 = 0.178_832_77;
 /// ARIB STD-B67 (HLG) OETF constant `b`.
 pub const HLG_B: f32 = 0.284_668_92;
 /// ARIB STD-B67 (HLG) OETF constant `c`.
+#[allow(clippy::excessive_precision)] // full-precision transcription — see ACESCG_TO_SRGB
 pub const HLG_C: f32 = 0.559_910_73;
 
 /// The HLG signal value diffuse white maps to, when the caller does not choose one. Upstream's
@@ -639,7 +648,9 @@ pub fn working_frame_to_hlg_linear(
 ) -> crate::Result<HdrFrame> {
     working.validate()?;
     let mut rgb = working.rgb.clone();
-    color_space.transfer().to_linear(&mut rgb, Primaries::Rec709);
+    color_space
+        .transfer()
+        .to_linear(&mut rgb, Primaries::Rec709);
     Ok(HdrFrame {
         width: working.width,
         height: working.height,
@@ -649,7 +660,7 @@ pub fn working_frame_to_hlg_linear(
 
 /// An EXR conditioning frame → the VAE's `[-1, 1]` input range, for `color_space`.
 ///
-/// The load-side counterpart of [`vae_frame_to_exr_payload`], and the round-trip partner the
+/// The load-side counterpart of [`working_frame_to_exr_payload`], and the round-trip partner the
 /// story's "an EXR conditioning input round-trips" acceptance rests on. A log working space is
 /// only clamped (the codes are already the VAE signal); a scene-linear space is compressed
 /// through the transfer first.

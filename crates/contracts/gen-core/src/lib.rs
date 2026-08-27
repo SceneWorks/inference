@@ -120,6 +120,7 @@ pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
     GraphEvalCadence,
 };
+pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
@@ -127,9 +128,13 @@ pub use generator::{
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
     Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
-    PrecisionFloorComponent,
-    ReplacementMode, SizeFloor, SpeechSegment, StagedResidencyAvailability, StepSupport,
-    TimeRegion, VideoClipRef,
+    PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
+    StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+};
+pub use hdr::{
+    from_vae_range, hlg_inverse_oetf, hlg_oetf, to_vae_range, working_frame_to_exr_payload,
+    working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
+    Primaries, Yuv420p10, HLG_MASTER_TAGS,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
@@ -149,12 +154,6 @@ pub use license::{
     component_licenses_manifest_json, decoder_license_conformance_errors,
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
-};
-pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
-pub use hdr::{
-    from_vae_range, hlg_inverse_oetf, hlg_oetf, to_vae_range, working_frame_to_exr_payload,
-    working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
-    Primaries, Yuv420p10, HLG_MASTER_TAGS,
 };
 pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
 pub use memory_strategy::{
@@ -205,12 +204,12 @@ pub use registry::{
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, HdrFrameSink,
-    HdrOutputFrame, IdentityWeights,
-    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
-    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec,
+    MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins,
+    PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};

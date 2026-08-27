@@ -253,7 +253,7 @@ pub fn resize_lanczos_u8(
 /// PIL `Image.LANCZOS` resize of an **unbounded f32** RGB HWC image — the HDR counterpart of
 /// [`resize_lanczos_u8`] (sc-18790).
 ///
-/// Shares [`precompute_coeffs`] with the uint8 path, so the sampling geometry is identical, but
+/// Shares the uint8 path's filter-coefficient precomputation, so the sampling geometry is identical, but
 /// accumulates in `f64` and **never quantizes or clips**. That difference is the whole point: the
 /// uint8 path's fixed-point accumulator and `clip8` saturate at 255, which would crush every
 /// scene-linear highlight above diffuse white to the same value. HDR conditioning must preserve
