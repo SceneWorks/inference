@@ -604,7 +604,18 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
     let mut refs: Vec<&Image> = Vec::new();
     for c in &req.conditioning {
         match c {
-            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::Reference { image, strength } => {
+                // Edit does not define the Base/Turbo denoise-start semantics carried by this field.
+                // Reject it with a typed capability failure rather than silently discarding it.
+                if strength.is_some() {
+                    return Err(Error::Unsupported(
+                        "boogu_image_edit: per-reference strength is not supported for instruction \
+                         edit; omit conditioning.reference.strength"
+                            .into(),
+                    ));
+                }
+                refs.push(image);
+            }
             Conditioning::MultiReference { images } => refs.extend(images.iter()),
             _ => {}
         }
@@ -621,7 +632,54 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
             refs.len()
         )));
     }
+    for (index, image) in refs.iter().enumerate() {
+        validate_edit_reference(index, image)?;
+    }
     Ok(refs)
+}
+
+/// Validate one Edit source at the public generator boundary, before the request can enter either
+/// the vision encoder or the raw-resolution VAE/DiT spatial path. References retain their own
+/// geometry but must fit the advertised Boogu envelope, the patch/VAE stride, and the RGB8 carrier
+/// contract.
+fn validate_edit_reference(index: usize, image: &Image) -> Result<()> {
+    if image.width == 0 || image.height == 0 {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} must have non-zero dimensions (got {}x{})",
+            image.width, image.height
+        )));
+    }
+    if image.width > RES_MAX || image.height > RES_MAX {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} {}x{} exceeds the {RES_MAX}x{RES_MAX} reference envelope",
+            image.width, image.height
+        )));
+    }
+    if !image.width.is_multiple_of(RES_MULTIPLE) || !image.height.is_multiple_of(RES_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} dimensions must be multiples of {RES_MULTIPLE} (got {}x{})",
+            image.width, image.height
+        )));
+    }
+    let expected = mlx_gen::gen_core::imageops::checked_image_buffer_len(
+        image.width as usize,
+        image.height as usize,
+        3,
+    )
+    .ok_or_else(|| {
+        Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 dimensions overflow host size"
+        ))
+    })?;
+    if image.pixels.len() != expected {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 buffer has {} bytes; expected {expected} for {}x{}x3",
+            image.pixels.len(),
+            image.width,
+            image.height
+        )));
+    }
+    Ok(())
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -645,28 +703,11 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    // The Edit variant needs 1..=MAX_EDIT_REFS source references (Reference and/or MultiReference);
-    // the floor already rejects any reference conditioning on Base/Turbo (their surface is empty).
+    // The Edit variant needs 1..=MAX_EDIT_REFS bounded RGB8 source references. Resolve the same
+    // production boundary generate uses so validate cannot accept a request that later fails only
+    // after vision/VAE allocation, and so edit-only per-reference strength is never discarded.
     if id == BOOGU_IMAGE_EDIT_ID {
-        let refs: usize = req
-            .conditioning
-            .iter()
-            .map(|c| match c {
-                Conditioning::Reference { .. } => 1,
-                Conditioning::MultiReference { images } => images.len(),
-                _ => 0,
-            })
-            .sum();
-        if refs == 0 {
-            return Err(Error::Msg(format!(
-                "{id}: instruction edit requires at least one source reference image"
-            )));
-        }
-        if refs > MAX_EDIT_REFS {
-            return Err(Error::Msg(format!(
-                "{id}: at most {MAX_EDIT_REFS} source reference images are supported (got {refs})"
-            )));
-        }
+        resolve_edit_references(req)?;
     }
     Ok(())
 }
@@ -1017,6 +1058,102 @@ mod tests {
             ..req(512, 512)
         };
         assert!(validate_request(&descriptor_edit(), &multi_over).is_err());
+    }
+
+    #[test]
+    fn edit_reference_geometry_and_rgb8_are_rejected_at_validation_boundary() {
+        let edit_request = |image| GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: None,
+            }],
+            ..req(512, 512)
+        };
+
+        // Small-but-aligned sources remain supported; the output minimum is not imposed on source
+        // geometry. This guards against accidentally narrowing Edit while adding the upper bound.
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(16, 16))).is_ok());
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(RES_MAX, 16))).is_ok());
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(16, RES_MAX))).is_ok());
+
+        let cases = [
+            (
+                Image {
+                    width: 0,
+                    height: 16,
+                    pixels: vec![],
+                },
+                "non-zero",
+            ),
+            (img(RES_MAX + RES_MULTIPLE, 16), "reference envelope"),
+            (img(RES_MAX - 1, 512), "multiples of 16"),
+            (
+                Image {
+                    width: 512,
+                    height: 512,
+                    pixels: vec![0; 512 * 512 * 3 - 1],
+                },
+                "RGB8 buffer",
+            ),
+        ];
+        for (image, expected) in cases {
+            let error = validate_request(&descriptor_edit(), &edit_request(image))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} from early edit validation, got: {error}"
+            );
+        }
+
+        // Every ordered member is validated, including images carried by MultiReference. Checking
+        // only the first item would let this malformed second source reach the vision/VAE path.
+        let malformed_second = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![
+                    img(512, 512),
+                    Image {
+                        width: 512,
+                        height: 512,
+                        pixels: vec![0; 12],
+                    },
+                ],
+            }],
+            ..req(512, 512)
+        };
+        let error = validate_request(&descriptor_edit(), &malformed_second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reference 1 RGB8 buffer"), "{error}");
+    }
+
+    #[test]
+    fn edit_rejects_per_reference_strength_as_typed_unsupported_only_on_edit() {
+        let request = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: Some(0.6),
+            }],
+            ..req(512, 512)
+        };
+        let error = validate_request(&descriptor_edit(), &request).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert!(
+            error.to_string().contains("per-reference strength"),
+            "{error}"
+        );
+
+        // Base/Turbo consume this field as img2img start strength; the edit-only guard must not
+        // narrow either supported route.
+        assert!(validate_request(&descriptor(), &request).is_ok());
+        assert!(validate_request(&descriptor_turbo(), &request).is_ok());
+        assert_eq!(
+            resolve_reference(&request, BOOGU_IMAGE_ID)
+                .unwrap()
+                .unwrap()
+                .1,
+            0.6
+        );
     }
 
     #[test]

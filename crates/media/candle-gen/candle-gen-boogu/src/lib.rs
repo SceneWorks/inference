@@ -66,6 +66,9 @@ pub const BOOGU_IMAGE_EDIT_ID: &str = "boogu_image_edit";
 /// drift from the check.
 pub const SIZE_MULTIPLE: u32 = 16;
 
+/// Maximum width or height accepted for both output and raw Edit reference geometry.
+const RES_MAX: u32 = 2048;
+
 /// Maximum reference images the Edit lane accepts — the DiT's `image_index_embedding` row count (the
 /// OmniGen2-lineage `[5, hidden]` parameter supports up to 5 distinct reference index slots).
 const MAX_EDIT_REFERENCES: usize = 5;
@@ -509,7 +512,18 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
     let mut refs: Vec<&Image> = Vec::new();
     for c in &req.conditioning {
         match c {
-            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::Reference { image, strength } => {
+                // Edit does not define the Base/Turbo denoise-start semantics carried by this field.
+                // Reject it with a typed capability failure rather than silently discarding it.
+                if strength.is_some() {
+                    return Err(gen_core::Error::Unsupported(
+                        "boogu_image_edit: per-reference strength is not supported for instruction \
+                         edit; omit conditioning.reference.strength"
+                            .into(),
+                    ));
+                }
+                refs.push(image);
+            }
             Conditioning::MultiReference { images } => refs.extend(images.iter()),
             _ => {} // the capability floor already rejects other conditioning kinds.
         }
@@ -526,7 +540,54 @@ fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Ima
             refs.len()
         )));
     }
+    for (index, image) in refs.iter().enumerate() {
+        validate_edit_reference(index, image)?;
+    }
     Ok(refs)
+}
+
+/// Validate one Edit source at the public generator boundary, before the request can enter either
+/// the vision encoder or the raw-resolution VAE/DiT spatial path. References retain their own
+/// geometry but must fit the advertised Boogu envelope, the patch/VAE stride, and the RGB8 carrier
+/// contract.
+fn validate_edit_reference(index: usize, image: &Image) -> gen_core::Result<()> {
+    if image.width == 0 || image.height == 0 {
+        return Err(gen_core::Error::Msg(format!(
+            "boogu_image_edit: reference {index} must have non-zero dimensions (got {}x{})",
+            image.width, image.height
+        )));
+    }
+    if image.width > RES_MAX || image.height > RES_MAX {
+        return Err(gen_core::Error::Msg(format!(
+            "boogu_image_edit: reference {index} {}x{} exceeds the {RES_MAX}x{RES_MAX} reference envelope",
+            image.width, image.height
+        )));
+    }
+    if !image.width.is_multiple_of(SIZE_MULTIPLE) || !image.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(gen_core::Error::Msg(format!(
+            "boogu_image_edit: reference {index} dimensions must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            image.width, image.height
+        )));
+    }
+    let expected = gen_core::imageops::checked_image_buffer_len(
+        image.width as usize,
+        image.height as usize,
+        3,
+    )
+    .ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 dimensions overflow host size"
+        ))
+    })?;
+    if image.pixels.len() != expected {
+        return Err(gen_core::Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 buffer has {} bytes; expected {expected} for {}x{}x3",
+            image.pixels.len(),
+            image.width,
+            image.height
+        )));
+    }
+    Ok(())
 }
 
 /// Boogu Base descriptor — true-CFG text-to-image; no user negative prompt (the CFG-negative is the
@@ -558,7 +619,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
             min_size: 256,
-            max_size: 2048,
+            max_size: RES_MAX,
             max_count: 8,
             // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
             // The resolved `base/`-`-q4/`-`-bf16/` turnkey subdir self-describes its tier
@@ -819,20 +880,30 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
 
-    fn weights_free_generator() -> BooguGenerator {
+    fn weights_free_generator_for(variant: Variant) -> BooguGenerator {
+        let descriptor = match variant {
+            Variant::Base => descriptor(),
+            Variant::Turbo => descriptor_turbo(),
+            Variant::Edit => descriptor_edit(),
+        };
+        let provider_id = descriptor.id;
         BooguGenerator {
-            descriptor: descriptor(),
+            descriptor,
             root: PathBuf::from("/nonexistent"),
-            variant: Variant::Base,
+            variant,
             device: Device::Cpu,
             pid_spec: None,
             components: Mutex::new(None),
             edit_components: Mutex::new(None),
             img2img_encoder: Mutex::new(None),
             memory_strategy: None,
-            memory_admission: memory_strategy::AdmissionRegistry::new(BOOGU_IMAGE_ID),
+            memory_admission: memory_strategy::AdmissionRegistry::new(provider_id),
             request_lock: Mutex::new(()),
         }
+    }
+
+    fn weights_free_generator() -> BooguGenerator {
+        weights_free_generator_for(Variant::Base)
     }
 
     #[test]
@@ -1014,6 +1085,123 @@ mod tests {
             ..base
         };
         assert!(g.validate(&six).is_err());
+    }
+
+    #[test]
+    fn edit_reference_geometry_and_rgb8_are_rejected_at_validation_boundary() {
+        let generator = weights_free_generator_for(Variant::Edit);
+        let img = |w: u32, h: u32| Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        };
+        let request = |image| GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: None,
+            }],
+            ..Default::default()
+        };
+
+        // Source geometry may be below the output minimum as long as it is non-zero and aligned.
+        assert!(generator.validate(&request(img(16, 16))).is_ok());
+        assert!(generator.validate(&request(img(RES_MAX, 16))).is_ok());
+        assert!(generator.validate(&request(img(16, RES_MAX))).is_ok());
+        let cases = [
+            (
+                Image {
+                    width: 0,
+                    height: 16,
+                    pixels: vec![],
+                },
+                "non-zero",
+            ),
+            (img(RES_MAX + SIZE_MULTIPLE, 16), "reference envelope"),
+            (img(RES_MAX - 1, 512), "multiples of 16"),
+            (
+                Image {
+                    width: 512,
+                    height: 512,
+                    pixels: vec![0; 512 * 512 * 3 - 1],
+                },
+                "RGB8 buffer",
+            ),
+        ];
+        for (image, expected) in cases {
+            let error = generator.validate(&request(image)).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} from early edit validation, got: {error}"
+            );
+        }
+
+        // Mutation guard: every ordered MultiReference member is validated, not just the first.
+        let malformed_second = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![
+                    img(512, 512),
+                    Image {
+                        width: 512,
+                        height: 512,
+                        pixels: vec![0; 12],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let error = generator
+            .validate(&malformed_second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reference 1 RGB8 buffer"), "{error}");
+    }
+
+    #[test]
+    fn edit_rejects_per_reference_strength_as_typed_unsupported_only_on_edit() {
+        let image = Image {
+            width: 512,
+            height: 512,
+            pixels: vec![0u8; 512 * 512 * 3],
+        };
+        let request = GenerationRequest {
+            prompt: "make it autumn".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        let edit = weights_free_generator_for(Variant::Edit);
+        let error = edit.validate(&request).unwrap_err();
+        assert!(matches!(error, gen_core::Error::Unsupported(_)));
+        assert!(
+            error.to_string().contains("per-reference strength"),
+            "{error}"
+        );
+
+        // Base/Turbo consume the field as img2img start strength; the edit-only rejection must not
+        // narrow those supported routes.
+        assert!(weights_free_generator_for(Variant::Base)
+            .validate(&request)
+            .is_ok());
+        assert!(weights_free_generator_for(Variant::Turbo)
+            .validate(&request)
+            .is_ok());
+        assert_eq!(
+            pipeline::resolve_reference(&request, BOOGU_IMAGE_ID)
+                .unwrap()
+                .unwrap()
+                .1,
+            0.6
+        );
     }
 
     #[test]
