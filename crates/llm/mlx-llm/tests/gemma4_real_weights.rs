@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_GEMMA4_TE=/path/to/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
-//!   cargo test -p mlx-llm --test gemma4_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-llm --test integration -- gemma4_real_weights:: --ignored --nocapture
 //! ```
 //!
 //! The path is supplied by the caller and never written down here — this crate does not name model

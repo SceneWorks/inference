@@ -14,7 +14,7 @@
 //! ```text
 //! LTX25_VAE_DIR=/path/to/Lightricks--LTX-2.5/vae \
 //! LTX25_SPLIT_DIR=/tmp/ltx25-split \
-//!   cargo test -p mlx-gen-ltx --release --test ltx_2_5_vae_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration -- ltx_2_5_vae_real_weights:: --ignored --nocapture
 //! ```
 //!
 //! `LTX25_SPLIT_DIR` is optional and only caches the converted components between runs; with it

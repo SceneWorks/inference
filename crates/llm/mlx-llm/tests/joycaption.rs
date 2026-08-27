@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MLX_LLM_JOYCAPTION_SNAPSHOT=/path/to/snapshot \
-//!   cargo test --release --test joycaption -- --ignored --nocapture
+//!   cargo test --release --test integration -- joycaption:: --ignored --nocapture
 //! ```
 //!
 //! ## Parity

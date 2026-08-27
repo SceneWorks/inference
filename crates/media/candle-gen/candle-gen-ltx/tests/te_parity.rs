@@ -16,8 +16,8 @@
 //! either backend's gate.
 //!
 //! Run:
-//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test te_parity --
-//! --ignored --nocapture`
+//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test integration --
+//! te_parity:: --ignored --nocapture`
 
 #![cfg(feature = "cuda")]
 
