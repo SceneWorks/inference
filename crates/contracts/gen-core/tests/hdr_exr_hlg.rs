@@ -12,7 +12,6 @@
 //! When ffmpeg is not reachable those checks **print a loud skip and pass**; the pure-Rust checks
 //! around them still run. A skip is legitimate on a runner with no ffmpeg, but it is never silent.
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use gen_core::hdr::{
@@ -73,10 +72,13 @@ fn skip(check: &str, program: &str) {
     );
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sc18790-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A self-removing fixture root. The returned `TempDir` **is** the cleanup, so callers must keep
+/// it bound for the whole test — dropping it early would delete the files mid-assertion.
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("sc18790-{tag}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 // -------------------------------------------------------------------------------------------
@@ -282,8 +284,8 @@ fn exr_is_valid_to_an_external_decoder() {
         return;
     }
     let dir = temp_dir("exr-external");
-    let exr_path = dir.join("frame.exr");
-    let raw_path = dir.join("frame.raw");
+    let exr_path = dir.path().join("frame.exr");
+    let raw_path = dir.path().join("frame.raw");
 
     let frame = gradient_frame(8, 4);
     let bytes = write_rgb_exr(&frame, Primaries::Rec709, "sRGB", false).expect("write EXR");
@@ -331,7 +333,6 @@ fn exr_is_valid_to_an_external_decoder() {
             "ffmpeg read pixel {i} as {got:?}, we wrote {want:?} (tol {tol})"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -480,8 +481,8 @@ fn hlg_master_is_tagged_bt2020_hlg_to_ffprobe() {
         return;
     }
     let dir = temp_dir("hlg-external");
-    let raw_path = dir.join("frames.yuv");
-    let mp4_path = dir.join("master.mp4");
+    let raw_path = dir.path().join("frames.yuv");
+    let mp4_path = dir.path().join("master.mp4");
 
     let (w, h) = (64u32, 64u32);
     let converter = HlgConverter::new(Primaries::Rec709);
@@ -562,7 +563,6 @@ fn hlg_master_is_tagged_bt2020_hlg_to_ffprobe() {
              full report:\n{report}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // -------------------------------------------------------------------------------------------
