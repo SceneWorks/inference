@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "story": "sc-15505",
-  "implementation_base": "39a11d363663924869ea51c7cc4a8a3a6d68a2e1",
+  "implementation_base": "8b1f1bdb37e449778d3a2110425dbe1ec5cb0c8b",
   "reference": {
     "repository": "https://github.com/michaeltrefry/mflux.git",
     "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
@@ -51,21 +51,21 @@
     },
     "fork_parity": {
       "z_image_lora": {
-        "samples_gt8": 17919,
-        "base_floor": 15324,
-        "cap": 34580,
-        "residual_samples_gt8": 15692,
+        "samples_gt8": 15499,
+        "base_floor": 13568,
+        "cap": 31068,
+        "residual_samples_gt8": 12940,
         "zero_residual_samples_gt8": 26587,
-        "residual_cap": 21139,
+        "residual_cap": 19763,
         "rgb_samples": 786432
       },
       "z_image_lokr": {
-        "samples_gt8": 13582,
-        "base_floor": 15324,
-        "cap": 34580,
-        "residual_samples_gt8": 15476,
+        "samples_gt8": 12371,
+        "base_floor": 13568,
+        "cap": 31068,
+        "residual_samples_gt8": 14028,
         "zero_residual_samples_gt8": 40120,
-        "residual_cap": 27798,
+        "residual_cap": 27074,
         "rgb_samples": 786432
       },
       "qwen_lora": {
@@ -103,22 +103,22 @@
       "status": "verified",
       "transcript": {
         "local_path": "${TOOLS}/golden/sc-15505-real-weight-transcript.json",
-        "bytes": 22053,
-        "sha256": "4aceed6adb6439e2a8053f44bfdfcd455a3b0412bb3ed7e85476f812751a165d"
+        "bytes": 21178,
+        "sha256": "373e9af4c13bb8a05c12169e496e4597820d7b315cf3767b217d561ec2c70f95"
       },
       "receipt": {
         "local_path": "${TOOLS}/adapter_parity_receipt.json",
-        "bytes": 22524,
-        "sha256": "a7e284f7972bc0a5cc3439e79dd45d50866799be97f5056334882fff60decc04"
+        "bytes": 21621,
+        "sha256": "f418504272a146888d24a445fe0d0bb311333e04923755747b017ffdb0416cab"
       },
       "artifact_sha256": {
         "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
         "flux_hyper_golden": "e24dc881bfc93f9f9465debacfcf3ef48435fe0115145ce75f1735cdcb6dece7",
-        "z_image_base_golden": "b850c9e4e3023575257b7a60d0de58b5eee62aac26d0f712ac3049c681f51537",
-        "z_image_lora_adapter": "ee8008a36fd5b4a7962e2b612f59a303c57cc1bb3a581058b97b7ee9ed37cb52",
-        "z_image_lora_golden": "8fedc026546cbfb75f0e9f29e76beac848e4f197a8480c9771bfce5f884426d0",
-        "z_image_lokr_adapter": "7d3342f81bdde685204f59bda1c43452b56d936671446a7e84e7925718c08e84",
-        "z_image_lokr_golden": "a5f17d16fca0e49fb9004c5e5ab5c4d824eb9146b06caec942f5fd0867f407e2",
+        "z_image_base_golden": "b4169c698a34772248a1211280fdedc8755cac55b1196f4263208776a737c213",
+        "z_image_lora_adapter": "ff3712ae5ad2b3a319e9a4fd48aa199e9b03a8ba30023f793b5242bb5b7349bc",
+        "z_image_lora_golden": "b72d8c9b8714aa8f5fc26cc31c1c679a9e9e3de94efc7709968c378e4380f766",
+        "z_image_lokr_adapter": "a70b07001c05012bbd283d340f62202a857fccdcb5330bf8dbece9aa298ffc1c",
+        "z_image_lokr_golden": "38c8cc5c676e5a3636d1119fe48a23c2cbfab8cec593449295467b0c84b9c1e0",
         "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
         "qwen_lora_adapter": "af9ea08c4f98f273d7dcaeca1b75eb730a49da0efe345b3eaf80916ba87553f7",
         "qwen_lora_golden": "8d70dbf738da177e015cfe92dc07ab47ad20b31ac809ec5c30bba850288de6f2",
@@ -132,10 +132,10 @@
     "dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
     "dump_qwen_adapter_golden.py": "01dcc25673e4c491d617ccd07b7ae9b13f634de047fed4d85753b97b0704f5ba",
     "dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
-    "dump_z_image_adapter_golden.py": "b8eae6ae0759129f9529e0d9f6d0da0cbfcc169fc41e4f7035dfa9a6aa0d6dc0",
-    "dump_z_image_golden.py": "8dce2bc4696abb54d4e6d6f81ce974b5b66df7971f7c19d2dba8fbd683d60060",
-    "record_adapter_parity_transcript.py": "f6a8e8149f18f8b9b5c34fcc7465f1a1e81bf9aa24bddfc3d549e32580fac930",
-    "verify_adapter_parity_artifacts.py": "b8add2ccf74e90aa7d88c6fa59987b29576fad282648ebd829e7698b97cdfc8b"
+    "dump_z_image_adapter_golden.py": "df8e24798dbf09335a5edad92ef3b4de7d328a61e7dd13d7b77208c7c2d0bbc8",
+    "dump_z_image_golden.py": "f7b4b872e282dfe97e4a8b1f3d5884cc3329a81f7689a8cc9550b194c0cb63b1",
+    "record_adapter_parity_transcript.py": "0643e35630cd03e18edb4faf2820677516f4b5d6f05932c7244fa808dd375fee",
+    "verify_adapter_parity_artifacts.py": "6b0715b24121eeb2ad1a89b4fab0dd5a86cc9e8e4420357a24e37bd883d5acf1"
   },
   "artifacts": {
     "hyper_flux_lora": {
@@ -174,8 +174,8 @@
     },
     "z_image_base_golden": {
       "committed": false,
-      "bytes": 4040526,
-      "sha256": "b850c9e4e3023575257b7a60d0de58b5eee62aac26d0f712ac3049c681f51537",
+      "bytes": 4040542,
+      "sha256": "b4169c698a34772248a1211280fdedc8755cac55b1196f4263208776a737c213",
       "license": "Apache-2.0",
       "local_path": "${TOOLS}/golden/z_image_golden.safetensors",
       "source": {
@@ -183,19 +183,19 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_z_image_golden.py",
-        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_golden.py",
-        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
-        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16 ZIMAGE_REFERENCE_REPOSITORY=SceneWorks/z-image-turbo-mlx ZIMAGE_REFERENCE_REVISION=bb2bc9893b3c49ae96c813350775f791a2e8bc80 ZIMAGE_REFERENCE_SUBDIRECTORY=bf16 ZIMAGE_REFERENCE_REF=main ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_golden.py",
+        "model_repository": "SceneWorks/z-image-turbo-mlx",
+        "model_revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
         "model_reference": "main",
-        "model_subdirectory": ".",
-        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
-        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "model_inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e"
       }
     },
     "z_image_lora_adapter": {
       "committed": false,
-      "bytes": 2954397,
-      "sha256": "ee8008a36fd5b4a7962e2b612f59a303c57cc1bb3a581058b97b7ee9ed37cb52",
+      "bytes": 2954413,
+      "sha256": "ff3712ae5ad2b3a319e9a4fd48aa199e9b03a8ba30023f793b5242bb5b7349bc",
       "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
       "local_path": "${TOOLS}/golden/z_image_lora_adapter.safetensors",
       "source": {
@@ -203,19 +203,19 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_z_image_adapter_golden.py",
-        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
-        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
-        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16 ZIMAGE_REFERENCE_REPOSITORY=SceneWorks/z-image-turbo-mlx ZIMAGE_REFERENCE_REVISION=bb2bc9893b3c49ae96c813350775f791a2e8bc80 ZIMAGE_REFERENCE_SUBDIRECTORY=bf16 ZIMAGE_REFERENCE_REF=main BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "SceneWorks/z-image-turbo-mlx",
+        "model_revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
         "model_reference": "main",
-        "model_subdirectory": ".",
-        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
-        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "model_inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e"
       }
     },
     "z_image_lora_golden": {
       "committed": false,
-      "bytes": 3147070,
-      "sha256": "8fedc026546cbfb75f0e9f29e76beac848e4f197a8480c9771bfce5f884426d0",
+      "bytes": 3147086,
+      "sha256": "b72d8c9b8714aa8f5fc26cc31c1c679a9e9e3de94efc7709968c378e4380f766",
       "license": "Apache-2.0",
       "local_path": "${TOOLS}/golden/z_image_lora_golden.safetensors",
       "source": {
@@ -223,19 +223,19 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_z_image_adapter_golden.py",
-        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
-        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
-        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16 ZIMAGE_REFERENCE_REPOSITORY=SceneWorks/z-image-turbo-mlx ZIMAGE_REFERENCE_REVISION=bb2bc9893b3c49ae96c813350775f791a2e8bc80 ZIMAGE_REFERENCE_SUBDIRECTORY=bf16 ZIMAGE_REFERENCE_REF=main ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "SceneWorks/z-image-turbo-mlx",
+        "model_revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
         "model_reference": "main",
-        "model_subdirectory": ".",
-        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
-        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "model_inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e"
       }
     },
     "z_image_lokr_adapter": {
       "committed": false,
-      "bytes": 372928,
-      "sha256": "7d3342f81bdde685204f59bda1c43452b56d936671446a7e84e7925718c08e84",
+      "bytes": 372944,
+      "sha256": "a70b07001c05012bbd283d340f62202a857fccdcb5330bf8dbece9aa298ffc1c",
       "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
       "local_path": "${TOOLS}/golden/z_image_lokr_adapter.safetensors",
       "source": {
@@ -243,19 +243,19 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_z_image_adapter_golden.py",
-        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
-        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
-        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16 ZIMAGE_REFERENCE_REPOSITORY=SceneWorks/z-image-turbo-mlx ZIMAGE_REFERENCE_REVISION=bb2bc9893b3c49ae96c813350775f791a2e8bc80 ZIMAGE_REFERENCE_SUBDIRECTORY=bf16 ZIMAGE_REFERENCE_REF=main BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "SceneWorks/z-image-turbo-mlx",
+        "model_revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
         "model_reference": "main",
-        "model_subdirectory": ".",
-        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
-        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "model_inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e"
       }
     },
     "z_image_lokr_golden": {
       "committed": false,
-      "bytes": 3147070,
-      "sha256": "a5f17d16fca0e49fb9004c5e5ab5c4d824eb9146b06caec942f5fd0867f407e2",
+      "bytes": 3147086,
+      "sha256": "38c8cc5c676e5a3636d1119fe48a23c2cbfab8cec593449295467b0c84b9c1e0",
       "license": "Apache-2.0",
       "local_path": "${TOOLS}/golden/z_image_lokr_golden.safetensors",
       "source": {
@@ -263,13 +263,13 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_z_image_adapter_golden.py",
-        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_REFERENCE_REVISION=f332072aa78be7aecdf3ee76d5c247082da564a6 ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
-        "model_repository": "Tongyi-MAI/Z-Image-Turbo",
-        "model_revision": "f332072aa78be7aecdf3ee76d5c247082da564a6",
+        "command": "ZIMAGE_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16 ZIMAGE_REFERENCE_REPOSITORY=SceneWorks/z-image-turbo-mlx ZIMAGE_REFERENCE_REVISION=bb2bc9893b3c49ae96c813350775f791a2e8bc80 ZIMAGE_REFERENCE_SUBDIRECTORY=bf16 ZIMAGE_REFERENCE_REF=main ZIMAGE_W=512 ZIMAGE_H=512 $REF_PY $TOOLS/dump_z_image_adapter_golden.py",
+        "model_repository": "SceneWorks/z-image-turbo-mlx",
+        "model_revision": "bb2bc9893b3c49ae96c813350775f791a2e8bc80",
         "model_reference": "main",
-        "model_subdirectory": ".",
-        "model_path": "/Users/michael/.cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6",
-        "model_inventory_sha256": "a116ca28d12e37e9a16b486948656a1b63e862223c2de18e0c808eb139b83d3e"
+        "model_subdirectory": "bf16",
+        "model_path": "/Users/michael/.cache/huggingface/hub/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16",
+        "model_inventory_sha256": "21c5a5a566300d42dcd2295065dc74cef3862880638e027e74f7921bfa3e0f3e"
       }
     },
     "qwen_base_golden": {

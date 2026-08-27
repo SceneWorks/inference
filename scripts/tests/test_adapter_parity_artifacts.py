@@ -368,7 +368,12 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         expected_base = RECORDER.proof_environment()
         for run in runs:
             self.assertIn("--exact", run["argv"])
-            self.assertIn("residual_mutation_diagnostic", run["argv"])
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertIn(
+                "adapter_real_weights::residual_mutation_diagnostic",
+                run["argv"],
+            )
             self.assertEqual(
                 {key: run["env"][key] for key in expected_base},
                 expected_base,
@@ -377,11 +382,34 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         effect_runs = RECORDER.qwen_effect_diagnostic_runs(self.valid_manifest())
         self.assertEqual([run["name"] for run in effect_runs], ["qwen_effect_diagnostic"])
         self.assertIn("--exact", effect_runs[0]["argv"])
-        self.assertIn("adapter_effect_diagnostic", effect_runs[0]["argv"])
+        target_index = effect_runs[0]["argv"].index("--test")
+        self.assertEqual(effect_runs[0]["argv"][target_index + 1], "integration")
+        self.assertIn(
+            "adapter_real_weights::adapter_effect_diagnostic",
+            effect_runs[0]["argv"],
+        )
         self.assertEqual(
             {key: effect_runs[0]["env"][key] for key in expected_base},
             expected_base,
         )
+
+    def test_acceptance_uses_integration_targets_with_module_qualified_exact_filters(self):
+        runs = RECORDER.expected_runs(self.valid_manifest())
+        expected_filters = {
+            "hyper_flux_scale_zero": (
+                "hyper_flux_real_weights::hyper_flux_scale_zero_is_bit_exact_noop"
+            ),
+            "z_image_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "z_image_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+            "qwen_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "qwen_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+        }
+        self.assertEqual({run["name"] for run in runs}, set(expected_filters))
+        for run in runs:
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertEqual(run["argv"][target_index + 2], expected_filters[run["name"]])
+            self.assertIn("--exact", run["argv"])
 
     def test_diagnostics_refuse_reserved_output_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
