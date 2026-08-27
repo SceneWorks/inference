@@ -227,10 +227,8 @@ fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
 /// `use_keyframes_abs_pos_embedding`, matching `LTXModel._keyframes_embedding()`); `keyframes_mask`
 /// is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either `None` makes this
 /// an exact no-op — as does an embedding that is still zero-initialized (the loaded-but-untrained
-/// state). The DFR keyframe-slot conditioning pipeline that would supply a real, non-`None` mask is a
-/// Phase 7 story (epic 18755); every current call site passes `None`, so this is presently inert in
-/// the full generate path — the parameter load + apply mechanism is landed here because the flag is
-/// `true` and the weight ships in the real LTX-2.5 checkpoint.
+/// state). The DFR token loops (sc-18789, [`crate::dfr`] / the token-native pipeline paths) thread
+/// a real mask marking generated-keyframe slot tokens; grid paths with no slots pass `None`.
 fn apply_keyframes_embedding(
     x: &Array,
     embedding: Option<&Array>,
@@ -1393,9 +1391,9 @@ impl LtxDiT {
         let coeff = self.cfg.adaln_embedding_coefficient;
 
         let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
-        // sc-18758: the DFR keyframe-slot marker (a Phase 7 pipeline story supplies the real mask; no
-        // call site threads one yet, so this is presently an exact no-op — see
-        // `apply_keyframes_embedding`).
+        // sc-18758/sc-18789: the DFR keyframe-slot marker. This video-only (2.3) preprocess never
+        // carries generated slots, so no mask — the AV token loops are the mask-threading path
+        // (see `apply_keyframes_embedding`).
         let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
 
         // adaLN-single timestep projection. The `× timestep_scale_multiplier` runs in the **input
@@ -3004,8 +3002,8 @@ mod tests {
         mlx_rs::transforms::eval([&got, &x]).unwrap();
         assert!(array_eq(&got, &x, None).unwrap().item::<bool>());
 
-        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
-        // wiring is out of this story's scope) → exact passthrough.
+        // Embedding configured but no mask supplied (a grid path with no generated slots) → exact
+        // passthrough.
         let got2 = apply_keyframes_embedding(&x, Some(&embedding), None).unwrap();
         mlx_rs::transforms::eval([&got2]).unwrap();
         assert!(array_eq(&got2, &x, None).unwrap().item::<bool>());

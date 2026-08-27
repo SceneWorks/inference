@@ -48,8 +48,9 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
 /// stream's `(1, inner)` `keyframes_abs_pos_embedding` (`None` for a model built without
 /// `use_keyframes_abs_pos_embedding`, or for the audio stream, which never carries one);
 /// `keyframes_mask` is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either
-/// `None` makes this an exact no-op. The DFR keyframe-slot pipeline that would supply a real mask is a
-/// Phase 7 story (epic 18755); every current call site passes `None`.
+/// `None` makes this an exact no-op. The DFR token loops (sc-18789, [`crate::dfr`] / the
+/// conditioned forwards) thread a real mask marking generated-keyframe slot tokens; paths with no
+/// slots pass `None`.
 fn apply_keyframes_embedding(
     x: &Tensor,
     embedding: Option<&Tensor>,
@@ -538,8 +539,7 @@ mod tests {
             x.flatten_all()?.to_vec1::<f32>()?
         );
 
-        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
-        // wiring is out of this story's scope) → passthrough.
+        // Embedding configured but no mask supplied (a path with no generated slots) → passthrough.
         let got2 = apply_keyframes_embedding(&x, Some(&embedding), None)?;
         assert_eq!(
             got2.flatten_all()?.to_vec1::<f32>()?,
