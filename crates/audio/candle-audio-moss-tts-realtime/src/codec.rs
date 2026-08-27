@@ -1945,9 +1945,11 @@ mod tests {
     }
 
     /// Retaining stage state across request blocks must reproduce the existing one-shot chunked
-    /// execution with the same block schedule. Exact equality here is stronger than the tolerated
-    /// chunked-vs-single-shot FP gap: both sides run identical kernel shapes, absolute RoPE rows, and
-    /// cache windows; only the lifetime of the state differs.
+    /// execution with the same block schedule. The offline helper is layer-major (it concatenates a
+    /// layer's blocks before advancing) while the retained-state path is block-major, so CPU kernel
+    /// packing can introduce platform-specific reduction-order noise even though both paths use the
+    /// same RoPE rows and causal windows. The production one-shot/streaming tests below still require
+    /// exact bytes because those routes deliberately share the same block-major state machine.
     #[test]
     fn retained_decoder_state_matches_one_shot_chunked_blocks() {
         let dev = Device::Cpu;
@@ -1992,10 +1994,31 @@ mod tests {
             }),
             "each layer retains only its fixed causal history"
         );
-        assert_eq!(
-            actual.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            "multi-block retained-state output must match one-shot chunked decode"
+        let diff = max_abs_diff(&actual, &expected);
+        assert!(
+            diff < 1e-4,
+            "multi-block retained-state output diverged from one-shot chunked decode by {diff:.3e}"
+        );
+
+        // Mutation guard: the tolerance must still reject an implementation that resets bounded
+        // causal state between request blocks. Such a regression changes the signal, not merely the
+        // floating-point reduction order.
+        let reset_blocks = (0..t)
+            .step_by(block)
+            .map(|start| {
+                let len = block.min(t - start);
+                let input = x.narrow(2, start, len).unwrap();
+                stage
+                    .forward_incremental(&input, &mut CodecStageState::default())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let reset = Tensor::cat(&reset_blocks, 2).unwrap();
+        let reset_diff = max_abs_diff(&reset, &expected);
+        assert!(
+            reset_diff > 1e-3,
+            "resetting causal state changed output by only {reset_diff:.3e}; equivalence tolerance \
+             would not discriminate the missing-state mutation"
         );
     }
 
