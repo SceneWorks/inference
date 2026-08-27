@@ -692,6 +692,44 @@ pub fn forward_with_control(
     Ok(dit.velocity_out(&x, &ctx)?)
 }
 
+/// Prepared-state twin of [`forward_with_control`]. The provider creates the plan once per request,
+/// so text fusion, joint RoPE, and pose-token embedding never repeat in the denoise loop.
+pub(crate) fn forward_with_prepared_control(
+    dit: &KreaTrainDit,
+    branch: &ControlBranch,
+    latent: &Tensor,
+    timestep: &Tensor,
+    prepared: &crate::train_dit::PreparedControlConditioning,
+    control_scale: f64,
+) -> Result<Tensor> {
+    if control_scale == 0.0 {
+        let (mut x, ctx) = dit.forward_pre_main_prepared(latent, timestep, prepared)?;
+        for blk in dit.blocks() {
+            x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+        }
+        return Ok(dit.velocity_out(&x, &ctx)?);
+    }
+    let (combined, ctx) = dit.forward_pre_main_prepared(latent, timestep, prepared)?;
+    let residuals = branch.residuals(&combined, &prepared.ctrl_tokens, &ctx)?;
+
+    let mut x = combined;
+    for (j, blk) in dit.blocks().iter().enumerate() {
+        if let Some(r) = branch
+            .residual_index_for_main_block(j)
+            .and_then(|k| residuals.get(k))
+        {
+            let txt = x.narrow(1, 0, ctx.cap_len)?;
+            let img = x.narrow(1, ctx.cap_len, ctx.img_len)?;
+            let scaled = (r * control_scale)?.to_dtype(x.dtype())?;
+            let scaled = branch.apply_clamp(&scaled, &img)?;
+            let img = (img + scaled)?;
+            x = Tensor::cat(&[&txt, &img], 1)?;
+        }
+        x = blk.forward(&x, &ctx.tvec, &ctx.rcos, &ctx.rsin)?;
+    }
+    Ok(dit.velocity_out(&x, &ctx)?)
+}
+
 /// DIAGNOSTIC + TELEMETRY (sc-8460): the branched forward with per-injection-point norms. For each
 /// branch block `i` (injecting into main block `i + offset`) reports
 /// `(‖res_i‖₂ pre-clamp, ‖res_i‖₂ post-clamp, ‖main_img‖₂)` — the residual the branch WANTED to
@@ -902,6 +940,55 @@ mod tests {
         let a = base.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let b = with.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(a, b, "zero-init projections must be a step-0 identity");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The control request plan is produced once from the prompt and pose latent, then every denoise
+    /// step reuses it. This CPU fixture pins parity with the historical unprepared forward and the
+    /// fail-closed geometry check without a model download or CUDA device.
+    #[test]
+    fn prepared_control_conditioning_matches_the_unprepared_forward_and_rejects_stale_geometry() {
+        let dev = Device::Cpu;
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, c, path) = tiny_dit(&tmp);
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+        let (x0, cap, _) = tiny_batch(&c);
+        let ctrl = Tensor::randn(0f32, 1f32, x0.dims(), &dev).unwrap();
+        let context = cap.unsqueeze(0).unwrap();
+        let prepared = dit.prepare_control_conditioning(&context, &ctrl).unwrap();
+
+        for sigma in [0.2_f32, 0.7] {
+            let t = Tensor::from_vec(vec![sigma], (1,), &dev).unwrap();
+            let expected =
+                forward_with_control(&dit, &branch, &x0, &t, &context, &ctrl, 0.6).unwrap();
+            let got =
+                forward_with_prepared_control(&dit, &branch, &x0, &t, &prepared, 0.6).unwrap();
+            assert_eq!(
+                expected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "prepared control parity at sigma={sigma}"
+            );
+        }
+
+        let stale = Tensor::zeros(
+            (
+                1,
+                x0.dim(1).unwrap(),
+                x0.dim(2).unwrap() * 2,
+                x0.dim(3).unwrap(),
+            ),
+            DType::F32,
+            &dev,
+        )
+        .unwrap();
+        let t = Tensor::from_vec(vec![0.5_f32], (1,), &dev).unwrap();
+        let error = forward_with_prepared_control(&dit, &branch, &stale, &t, &prepared, 0.6)
+            .expect_err("stale control geometry must be refused before branch execution");
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
+            "expected a typed prepared-state error, got {error:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
-use crate::primitives::nn::{gelu, linear};
+use crate::primitives::nn::{gelu, gelu_tanh, linear};
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{input_ids, Weights};
 
@@ -88,17 +88,56 @@ pub fn build_chat_text_with_system(
     text
 }
 
-/// The LLaVA multimodal projector: `linear_2(gelu(linear_1(x)))`, both layers with bias.
+/// The GELU variant a LLaVA checkpoint configures for its multimodal projector.
+///
+/// Keep this closed rather than accepting approximate aliases: these alternatives are numerically
+/// different, and an unrecognized checkpoint must not silently load with the wrong projector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectorActivation {
+    /// HF `gelu`: exact erf-GELU.
+    GeluErf,
+    /// HF `gelu_pytorch_tanh`: tanh-approximate GELU.
+    GeluTanh,
+}
+
+impl ProjectorActivation {
+    fn from_config(v: &Value) -> Result<Self> {
+        match v.get("projector_hidden_act").and_then(Value::as_str) {
+            Some("gelu") => Ok(Self::GeluErf),
+            Some("gelu_pytorch_tanh") => Ok(Self::GeluTanh),
+            Some(value) => Err(Error::Config(format!(
+                "joycaption: unsupported projector_hidden_act {value:?}; expected \"gelu\" or \"gelu_pytorch_tanh\""
+            ))),
+            None => Err(Error::Config(
+                "joycaption: config.json has no string projector_hidden_act".into(),
+            )),
+        }
+    }
+
+    fn apply(self, x: &Array) -> Result<Array> {
+        match self {
+            Self::GeluErf => gelu(x),
+            Self::GeluTanh => gelu_tanh(x),
+        }
+    }
+}
+
+/// The LLaVA multimodal projector: `linear_2(act(linear_1(x)))`, both layers with bias.
 pub struct LlavaProjector {
     linear1_w: Array,
     linear1_b: Array,
     linear2_w: Array,
     linear2_b: Array,
+    activation: ProjectorActivation,
 }
 
 impl LlavaProjector {
     /// Load HF `multi_modal_projector.{linear_1,linear_2}.{weight,bias}` (cast to bf16).
-    pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub fn from_weights(
+        w: &Weights,
+        prefix: &str,
+        activation: ProjectorActivation,
+    ) -> Result<Self> {
         let bf16 =
             |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
         Ok(Self {
@@ -106,13 +145,16 @@ impl LlavaProjector {
             linear1_b: bf16(format!("{prefix}.linear_1.bias"))?,
             linear2_w: bf16(format!("{prefix}.linear_2.weight"))?,
             linear2_b: bf16(format!("{prefix}.linear_2.bias"))?,
+            activation,
         })
     }
 
     /// Project SigLIP features `[b, seq, 1152]` to language features `[b, seq, hidden]`. The f32
     /// input promotes the bf16 weights to f32, matching the reference.
     pub fn forward(&self, features: &Array) -> Result<Array> {
-        let h = gelu(&linear(features, &self.linear1_w, Some(&self.linear1_b))?)?;
+        let h =
+            self.activation
+                .apply(&linear(features, &self.linear1_w, Some(&self.linear1_b))?)?;
         linear(&h, &self.linear2_w, Some(&self.linear2_b))
     }
 }
@@ -212,6 +254,7 @@ impl JoyCaptionModel {
             .get("text_config")
             .ok_or_else(|| Error::Config("joycaption: config.json has no text_config".into()))?;
         let llama_cfg = ModelConfig::from_json(tc)?;
+        let projector_activation = ProjectorActivation::from_config(&v)?;
 
         let w = Weights::from_dir(dir)?;
         let language = CausalLm::from_weights(&w, "language_model", llama_cfg)?;
@@ -220,7 +263,8 @@ impl JoyCaptionModel {
             "vision_tower.vision_model",
             SiglipVisionConfig::default(),
         )?;
-        let projector = LlavaProjector::from_weights(&w, "multi_modal_projector")?;
+        let projector =
+            LlavaProjector::from_weights(&w, "multi_modal_projector", projector_activation)?;
         Ok(Self {
             vision,
             projector,
@@ -581,6 +625,8 @@ pub(crate) fn can_load_value(v: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use serde_json::json;
 
@@ -662,5 +708,70 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.id, PROVIDER_ID);
         assert!(d.capabilities.supports_vision);
+    }
+
+    #[test]
+    fn projector_activation_metadata_selects_distinct_gelu_functions() {
+        let erf = ProjectorActivation::from_config(&json!({
+            "projector_hidden_act": "gelu"
+        }))
+        .unwrap();
+        let tanh = ProjectorActivation::from_config(&json!({
+            "projector_hidden_act": "gelu_pytorch_tanh"
+        }))
+        .unwrap();
+        assert_eq!(erf, ProjectorActivation::GeluErf);
+        assert_eq!(tanh, ProjectorActivation::GeluTanh);
+
+        // Identity projections make the output exactly the configured activation. These two GELU
+        // definitions are deliberately close, so assert their known f32 values at x=1 rather than
+        // merely checking the parsed enum variants.
+        let projector = |activation| {
+            let weights = Weights::from_map(HashMap::from([
+                (
+                    "multi_modal_projector.linear_1.weight".into(),
+                    Array::from_slice(&[1.0f32], &[1, 1]),
+                ),
+                (
+                    "multi_modal_projector.linear_1.bias".into(),
+                    Array::from_slice(&[0.0f32], &[1]),
+                ),
+                (
+                    "multi_modal_projector.linear_2.weight".into(),
+                    Array::from_slice(&[1.0f32], &[1, 1]),
+                ),
+                (
+                    "multi_modal_projector.linear_2.bias".into(),
+                    Array::from_slice(&[0.0f32], &[1]),
+                ),
+            ]));
+            LlavaProjector::from_weights(&weights, "multi_modal_projector", activation).unwrap()
+        };
+        let features = Array::from_slice(&[1.0f32], &[1, 1, 1]);
+        let erf_out = projector(erf).forward(&features).unwrap().as_slice::<f32>()[0];
+        let tanh_out = projector(tanh)
+            .forward(&features)
+            .unwrap()
+            .as_slice::<f32>()[0];
+        assert!((erf_out - 0.841_344_7).abs() < 1e-5, "erf GELU: {erf_out}");
+        assert!((tanh_out - 0.841_192).abs() < 1e-5, "tanh GELU: {tanh_out}");
+        assert!(
+            (erf_out - tanh_out).abs() > 1e-4,
+            "projector metadata must select distinct GELU functions"
+        );
+    }
+
+    #[test]
+    fn projector_activation_metadata_rejects_unknown_or_missing_values() {
+        for config in [
+            json!({ "projector_hidden_act": "gelu_new" }),
+            json!({ "projector_hidden_act": "silu" }),
+            json!({}),
+        ] {
+            assert!(matches!(
+                ProjectorActivation::from_config(&config),
+                Err(Error::Config(_))
+            ));
+        }
     }
 }

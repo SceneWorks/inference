@@ -240,7 +240,7 @@ pub(crate) fn load_control_residency(
     } else {
         None
     };
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
         .quant
         .map(Quant::bits);
@@ -267,28 +267,6 @@ pub(crate) fn load_control_residency(
 
 /// Request-scoped builder shared by both Z-Image control variants. Construction touches no component
 /// weights. The pose branch carries no PiD overlay, so the seam's `use_pid` argument is unused.
-#[cfg(test)]
-pub(crate) fn build_control_residency(
-    spec: &LoadSpec,
-    model_id: &'static str,
-    precision_msg: &'static str,
-) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
-    let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
-        .quant
-        .map(Quant::bits);
-    let text_encoder_quant_bits =
-        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
-    build_control_residency_with_source(
-        spec,
-        model_id,
-        precision_msg,
-        text_encoder_source,
-        text_encoder_quant_bits,
-    )
-}
-
 fn build_control_residency_with_source(
     spec: &LoadSpec,
     model_id: &'static str,
@@ -318,7 +296,7 @@ fn build_control_residency_with_source(
 
 /// The per-id precision-override rejection message for the turbo control variant, shared by
 /// [`load_control_residency`]'s eager guard and its `Sequential` per-phase loaders.
-const PRECISION_MSG: &str =
+const PRECISION_ERROR: &str =
     "z_image_turbo_control: only dense bf16 is wired (the text encoder runs \
      f32 internally); drop the precision override";
 
@@ -334,7 +312,7 @@ const PRECISION_MSG: &str =
 /// `Sequential` re-loads per generate in phase order to bound peak memory — routed through the shared
 /// `load_control_residency` builder.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
+    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_ERROR)?;
     let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageTurboControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
@@ -643,9 +621,9 @@ mod tests {
         let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
         gen_core_testkit::write_encoder_contract_fixture(
             &snapshot.path().join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+            crate::bounded_encoder_contract(),
         )
-        .expect("validation-complete encoder and tokenizer fixture");
+        .expect("bounded validation-complete encoder and tokenizer fixture");
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
             .with_control(WeightsSource::File(
                 snapshot.path().join("control.safetensors"),
@@ -664,11 +642,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let root = loader::packed_snapshot_fixture(&tmp, "control-load", 8);
-            gen_core_testkit::write_encoder_contract_fixture(
-                &root.join("text_encoder"),
-                crate::ENCODER_CONTRACT,
-            )
-            .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_control(WeightsSource::File(
                     "/nonexistent/z-image-control-overlay.safetensors".into(),
@@ -711,13 +684,14 @@ mod tests {
 
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let (snapshot, spec) = incomplete_control_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
             assert!(!snapshot.path().join("control.safetensors").exists());
-            let res =
-                build_control_residency(&spec, MODEL_ID, PRECISION_MSG).unwrap_or_else(|error| {
+            let (_tokenizer, res) = load_control_residency(&spec, MODEL_ID, PRECISION_ERROR)
+                .unwrap_or_else(|error| {
                     panic!("{policy:?} must defer absent heavy components: {error}")
                 });
             assert!(

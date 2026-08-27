@@ -16,7 +16,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel};
 use mlx_rs::Array;
 
-const FIXTURE: &str = concat!(
+const CASE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/interleave_golden.safetensors"
 );
@@ -70,13 +70,13 @@ fn argmax(v: &[f32]) -> i32 {
 
 #[test]
 fn append_generated_image_matches_reference() {
-    let w = Weights::from_file(FIXTURE).expect("load fixture");
-    let cfg = config_from_meta(&w);
-    let img_context_id: i32 = w.metadata("img_context_id").unwrap().parse().unwrap();
-    let img_start_id: i32 = w.metadata("img_start_id").unwrap().parse().unwrap();
-    let token_h: i32 = w.metadata("token_h").unwrap().parse().unwrap();
-    let token_w: i32 = w.metadata("token_w").unwrap().parse().unwrap();
-    let want_token: i32 = w.metadata("next_token").unwrap().parse().unwrap();
+    let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
+    let cfg = config_from_meta(&case);
+    let img_context_id: i32 = case.metadata("img_context_id").unwrap().parse().unwrap();
+    let img_start_id: i32 = case.metadata("img_start_id").unwrap().parse().unwrap();
+    let token_h: i32 = case.metadata("token_h").unwrap().parse().unwrap();
+    let token_w: i32 = case.metadata("token_w").unwrap().parse().unwrap();
+    let want_token: i32 = case.metadata("next_token").unwrap().parse().unwrap();
     let model = T2iModel::from_weights(&w, &cfg)
         .expect("build")
         .with_image_token_ids(img_context_id, img_start_id, 12);

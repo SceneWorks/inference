@@ -52,6 +52,8 @@ pub(crate) const DEFAULT_GUIDANCE: f32 = 4.0;
 /// Turbo default steps (DMD student few-step) + the lowest sigma in the DMD schedule.
 pub(crate) const DEFAULT_TURBO_STEPS: usize = 4;
 pub(crate) const DEFAULT_TURBO_SIGMA: f32 = 0.001;
+/// Shared img2img default: a supplied reference without either strength field is an active edit.
+pub(crate) const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
 
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count.
 const SPATIAL_SCALE: u32 = 8;
@@ -258,7 +260,7 @@ pub(crate) fn stage_encode_base(
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_ID)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(default_steps);
     let start_step = reference
-        .map(|(_, strength)| init_time_step(steps, strength))
+        .map(|(_, strength)| init_time_step(steps, Some(strength)))
         .unwrap_or(0);
     let clean = match (reference, start_step) {
         (Some((image, _)), start) if start > 0 => Some(encode_reference(
@@ -296,7 +298,7 @@ pub(crate) fn stage_encode_turbo(
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_TURBO_ID)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let start_step = reference
-        .map(|(_, strength)| init_time_step(steps, strength))
+        .map(|(_, strength)| init_time_step(steps, Some(strength)))
         .unwrap_or(0);
     let clean = match (reference, start_step) {
         (Some((image, _)), start) if start > 0 => Some(encode_reference(
@@ -422,18 +424,18 @@ pub(crate) fn stage_denoise_turbo(
     };
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    let is_img2img = clean.is_some() && start_step > 0;
-    if is_img2img || req.sampler.is_some() || req.scheduler.is_some() {
+    if turbo_uses_curated(req.sampler.as_deref(), req.scheduler.as_deref()) {
         let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
         let start = start_step.min(sigmas.len().saturating_sub(1));
+        let sampler = turbo_curated_sampler(req.sampler.as_deref());
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
             let x_t = blend_reference(clean.as_ref(), noise, sigmas[start])?;
             let preview_hook = crate::preview::hook(&req.preview);
             candle_gen::run_flow_sampler(
-                req.sampler.as_deref(),
+                Some(sampler),
                 TimestepConvention::OneMinusSigma,
                 &sigmas[start..],
                 x_t,
@@ -453,11 +455,14 @@ pub(crate) fn stage_denoise_turbo(
         });
     }
     let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let total = (steps - start) as u32;
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
+        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let mut lat = blend_reference(clean.as_ref(), noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
-        for i in 0..steps {
+        for (current, i) in (start..steps).enumerate() {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
@@ -479,8 +484,8 @@ pub(crate) fn stage_denoise_turbo(
                 lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
             }
             on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total: steps as u32,
+                current: (current + 1) as u32,
+                total,
             });
         }
         Ok(lat)
@@ -671,12 +676,10 @@ fn blend_reference(clean: Option<&Tensor>, noise: Tensor, sigma_start: f32) -> R
 
 /// Render the **Turbo** (DMD student few-step, CFG-free) text-to-image path for `req`.
 ///
-/// **img2img / `Reference` (sc-11786).** When `clean` is `Some` (a VAE-encoded reference) and
-/// `start_step > 0`, the denoise routes through the curated [`run_flow_sampler`] over the DMD grid's
-/// noise-fraction view ([`turbo_native_sigmas`], regardless of `req.sampler`) so the img2img blend
-/// (`x_t = (1 − σ)·clean + σ·noise`) is applied on the same schedule the Base path uses, then denoises
-/// the reduced `start..` tail. `clean` is `None` (`start_step == 0`) keeps the pre-sc-11786 routing
-/// exactly: the native byte-exact DMD student loop unless a curated sampler/scheduler is selected.
+/// **img2img / `Reference` (sc-11786).** `clean` seeds the native DMD loop at its strength-derived
+/// `start_step`, preserving Turbo's byte-exact default route for both t2i and img2img. A selected
+/// sampler or scheduler instead takes the curated path over the same DMD grid; scheduler-only requests
+/// receive the DMD-safe `lcm` sampler rather than the curated runner's excluded Euler fallback.
 /// Mirrors `mlx-gen-boogu`'s `generate_turbo_img2img_with_progress` (sc-10191).
 pub(crate) fn render_turbo(
     comps: &Components,
@@ -689,10 +692,6 @@ pub(crate) fn render_turbo(
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
-    // img2img seeds from a mid-schedule blended latent, which the native manual DMD loop below can't
-    // express — so an img2img request always takes the curated framework path (over the same DMD grid).
-    let is_img2img = clean.is_some() && start_step > 0;
-
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
     // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
@@ -709,7 +708,7 @@ pub(crate) fn render_turbo(
     // with the velocity negated); only the renoise convention differs (the curated solver re-noises,
     // the native loop flow-blends). Unset (the default) is the native DMD student loop, byte-exact
     // below.
-    if is_img2img || req.sampler.is_some() || req.scheduler.is_some() {
+    if turbo_uses_curated(req.sampler.as_deref(), req.scheduler.as_deref()) {
         let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
         // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
         // scheduler re-shape over the same σ span.
@@ -719,12 +718,13 @@ pub(crate) fn render_turbo(
         // `None` (start 0) for pure txt2img ⇒ full schedule from pure noise (byte-identical curated path).
         let start = start_step.min(sigmas.len().saturating_sub(1));
         let run_sigmas = &sigmas[start..];
+        let sampler = turbo_curated_sampler(req.sampler.as_deref());
         return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
             let x_t = blend_reference(clean, noise, sigmas[start])?;
             let preview_hook = crate::preview::hook(&req.preview);
             let lat = candle_gen::run_flow_sampler(
-                req.sampler.as_deref(),
+                Some(sampler),
                 TimestepConvention::OneMinusSigma,
                 run_sigmas,
                 x_t,
@@ -744,12 +744,15 @@ pub(crate) fn render_turbo(
     }
 
     let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+    let start = start_step.min(sigmas.len().saturating_sub(1));
+    let total = (steps - start) as u32;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
-        let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
+        let noise = init_noise(req.height, req.width, seed, 0, device)?;
+        let mut lat = blend_reference(clean, noise, 1.0 - sigmas[start])?;
         let preview_hook = crate::preview::hook(&req.preview);
         let preview_counter = crate::preview::native_counter(steps);
-        for i in 0..steps {
+        for (current, i) in (start..steps).enumerate() {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
@@ -782,8 +785,8 @@ pub(crate) fn render_turbo(
                 lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
             }
             on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total: steps as u32,
+                current: (current + 1) as u32,
+                total,
             });
         }
         on_progress(Progress::Decoding);
@@ -1020,13 +1023,14 @@ pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
 
 /// The single img2img reference for the Base/Turbo t2i path (sc-11786): at most one
 /// [`Conditioning::Reference`] — multiple is an error (Boogu's multi-image path is the Edit
-/// checkpoint's `resolve_edit_references`, not img2img) — with its per-reference `strength` falling
-/// back to `req.strength`. `None` ⇒ pure txt2img. Mirrors `mlx-gen-boogu`'s `resolve_reference` and
-/// Z-Image's. `id` names the engine in the multi-reference error.
+/// checkpoint's `resolve_edit_references`, not img2img) — with strength precedence per-reference →
+/// request → [`DEFAULT_IMG2IMG_STRENGTH`]. An explicit zero remains a deliberate no-op/txt2img
+/// selection. `None` ⇒ pure txt2img. Mirrors `mlx-gen-boogu`'s `resolve_reference` and Z-Image's.
+/// `id` names the engine in the multi-reference error.
 pub(crate) fn resolve_reference<'a>(
     req: &'a GenerationRequest,
     id: &str,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
+) -> Result<Option<(&'a Image, f32)>> {
     let mut reference = None;
     for c in &req.conditioning {
         if let Conditioning::Reference { image, strength } = c {
@@ -1036,7 +1040,12 @@ pub(crate) fn resolve_reference<'a>(
                      init only; the Edit checkpoint handles multi-image edits)"
                 )));
             }
-            reference = Some((image, strength.or(req.strength)));
+            reference = Some((
+                image,
+                strength
+                    .or(req.strength)
+                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
+            ));
         }
     }
     Ok(reference)
@@ -1241,6 +1250,23 @@ fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     s
 }
 
+/// Whether a Turbo request selects the curated unified-sampler framework. An unset sampler and
+/// scheduler remains the byte-exact native DMD loop for both t2i and img2img, so a default img2img
+/// request cannot fall through to the curated runner's `None → Euler` default.
+pub(crate) fn turbo_uses_curated(sampler: Option<&str>, scheduler: Option<&str>) -> bool {
+    sampler.is_some() || scheduler.is_some()
+}
+
+/// The curated sampler for an already-selected Turbo curated path. Scheduler-only requests must use
+/// the same DMD-safe default as the MLX backend rather than passing `None` to `run_flow_sampler`,
+/// whose default solver is excluded Euler.
+pub(crate) fn turbo_curated_sampler(sampler: Option<&str>) -> &str {
+    sampler.unwrap_or(TURBO_CURATED_DEFAULT_SAMPLER)
+}
+
+/// The curated few-step default sampler for the Turbo DMD student.
+pub(crate) const TURBO_CURATED_DEFAULT_SAMPLER: &str = "lcm";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,6 +1380,22 @@ mod tests {
         let curated = candle_gen::resolve_flow_schedule(Some("sgm_uniform"), 0.0, steps, &native);
         assert_ne!(curated, native);
         assert!(curated.len() >= 2 && curated.last().copied() == Some(0.0));
+    }
+
+    #[test]
+    fn turbo_default_img2img_and_scheduler_only_never_resolve_to_euler() {
+        // This predicate drives both t2i and img2img denoise branches: the default stays on native
+        // DMD even with a reference, so it never enters `run_flow_sampler(None)` (None → Euler).
+        assert!(!turbo_uses_curated(None, None));
+        assert!(turbo_uses_curated(None, Some("sgm_uniform")));
+        assert!(turbo_uses_curated(Some("lcm"), None));
+
+        // A scheduler-only request does enter the curated branch, but it is always supplied the
+        // advertised DMD-safe LCM sampler instead of the runner's excluded Euler fallback.
+        assert_eq!(TURBO_CURATED_DEFAULT_SAMPLER, "lcm");
+        assert_eq!(turbo_curated_sampler(None), "lcm");
+        assert_ne!(turbo_curated_sampler(None), "euler");
+        assert_eq!(turbo_curated_sampler(Some("dpmpp_sde")), "dpmpp_sde");
     }
 
     /// F-117 (sc-11210): the salted DMD renoise stream must not collide with any sibling image's

@@ -401,6 +401,36 @@ fn resolve_reference<'a>(req: &'a GenerationRequest, id: &str) -> Result<Option<
     Ok(reference)
 }
 
+/// SANA's true-CFG scale is the effective base-path guidance knob.  `guidance` remains the
+/// backwards-compatible spelling, but an explicit `true_cfg` wins just as it does on Candle.
+fn resolve_base_guidance(req: &GenerationRequest) -> Option<f32> {
+    req.true_cfg.or(req.guidance)
+}
+
+/// The base SANA adapter's complete request projection. Keeping the true-CFG precedence here makes
+/// the text-conditioning decision and the denoise request consume the same public knobs.
+fn base_sana_request<'a>(
+    req: &'a GenerationRequest,
+    seed: u64,
+    init_image: Option<&'a Image>,
+    strength: Option<f32>,
+    guidance_scale: Option<f32>,
+) -> SanaGenerateRequest<'a> {
+    SanaGenerateRequest {
+        prompt: &req.prompt,
+        negative_prompt: req.negative_prompt.as_deref(),
+        height: req.height,
+        width: req.width,
+        steps: req.steps.map(|steps| steps as usize),
+        guidance_scale,
+        seed: Some(seed),
+        sampler: req.sampler.as_deref(),
+        scheduler: req.scheduler.as_deref(),
+        init_image,
+        strength,
+    }
+}
+
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Delegates the shared size/count/guidance/negative/conditioning checks to the descriptor
 /// (`Capabilities::validate_request`) and adds SANA's `RES_MULTIPLE` (32×, DC-AE) divisor rule.
@@ -410,6 +440,16 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    if req.strength.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: img2img strength requires Reference conditioning"
+        )));
+    }
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -502,10 +542,10 @@ impl Sana {
         };
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.map(|s| s as usize);
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
-        let guidance = req.guidance.unwrap_or(if self.sprint {
+        let guidance_scale = resolve_base_guidance(req);
+        let guidance = guidance_scale.unwrap_or(if self.sprint {
             SPRINT_DEFAULT_GUIDANCE
         } else {
             DEFAULT_GUIDANCE
@@ -554,19 +594,8 @@ impl Sana {
                 let mut latents = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let seed = base_seed.wrapping_add(n as u64);
-                    let sana_req = SanaGenerateRequest {
-                        prompt: &req.prompt,
-                        negative_prompt: req.negative_prompt.as_deref(),
-                        height: req.height,
-                        width: req.width,
-                        steps,
-                        guidance_scale: req.guidance,
-                        seed: Some(seed),
-                        sampler: req.sampler.as_deref(),
-                        scheduler: req.scheduler.as_deref(),
-                        init_image,
-                        strength,
-                    };
+                    let sana_req =
+                        base_sana_request(req, seed, init_image, strength, guidance_scale);
                     latents.push(heavy.denoise_one_with_preview(
                         &cond,
                         &sana_req,
@@ -766,6 +795,52 @@ mod tests {
             mlx_gen::img2img::init_time_step(20, Some(resolve(Some(0.0), None))),
             0
         );
+    }
+
+    #[test]
+    fn base_conditioning_fixture_matches_candle_semantics() {
+        // This is the same discriminating base fixture as Candle's adapter test: true_cfg must win
+        // over the legacy guidance spelling, and request strength must feed the sole Reference.
+        let mut r = req(1024, 1024);
+        r.negative_prompt = Some("uncond".into());
+        r.guidance = Some(1.0);
+        r.true_cfg = Some(4.5);
+        r.strength = Some(0.6);
+        r.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: None,
+        }];
+
+        assert!(validate_request(&descriptor(), &r).is_ok());
+        let (reference, strength) = resolve_reference(&r, MODEL_ID).unwrap().unwrap();
+        let sana_req = base_sana_request(
+            &r,
+            7,
+            Some(reference),
+            Some(strength),
+            resolve_base_guidance(&r),
+        );
+        assert_eq!(
+            sana_req.prompt,
+            "a red panda on a mossy log in a misty forest"
+        );
+        assert_eq!(sana_req.negative_prompt, Some("uncond"));
+        assert_eq!(sana_req.guidance_scale, Some(4.5));
+        assert!(sana_req.init_image.is_some());
+        assert_eq!(sana_req.strength, Some(0.6));
+    }
+
+    #[test]
+    fn refree_strength_is_a_typed_unsupported_knob() {
+        let mut r = req(1024, 1024);
+        r.strength = Some(0.6);
+        let error = validate_request(&descriptor(), &r).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert!(error.to_string().contains("requires Reference"));
+
+        // Omitted reference and omitted strength remain the existing text-to-image request.
+        r.strength = None;
+        assert!(validate_request(&descriptor(), &r).is_ok());
     }
 
     #[test]

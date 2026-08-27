@@ -1000,12 +1000,18 @@ mod tests {
             Err(gen_core::Error::Unsupported(_))
         ));
 
-        // Duration above the advertised cap rejected.
+        // Duration above the advertised cap is a typed range error before any model/codec load or
+        // duration-sized allocation can occur.
         let bad = audio_req(AudioParams {
             target_duration: Some(MAX_DURATION_SECS + 1.0),
             ..Default::default()
         });
-        assert!(validate_request(&d, &bad).is_err());
+        assert!(matches!(
+            validate_request(&d, &bad),
+            Err(gen_core::Error::Msg(message))
+                if message.contains("audio.target_duration")
+                    && message.contains("supported maximum")
+        ));
 
         // A multi-speaker script → typed Unsupported (we do not advertise multi-speaker).
         let bad = audio_req(AudioParams {

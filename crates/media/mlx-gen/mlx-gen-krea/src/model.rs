@@ -168,6 +168,87 @@ pub const VISION_ENCODER_CONTRACT: mlx_gen::gen_core::VisionEncoderContract =
         full_attention_block_indexes: &[],
     };
 
+/// Compact Qwen3-VL text geometry for unit tests that must exercise the real source validator and
+/// [`mlx_gen::ArtifactSeal`] without hashing the production checkpoint's multi-gigabyte sparse
+/// payload. Token IDs, vocabulary, multimodal RoPE, prompt/tokenizer policy, packing, and every
+/// other behavior-bearing field remain production-exact.
+#[cfg(test)]
+pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        // The production multimodal RoPE partition sums to half this width.
+        head_dim: 128,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        max_position_embeddings: 512,
+        selected_hidden_layers: &[1],
+        ..ENCODER_CONTRACT
+    }
+}
+
+/// Compact Qwen3-VL vision geometry paired with [`bounded_encoder_contract`]. The deep-stack index
+/// is geometry-dependent, so the bounded contract retains the feature with its only valid layer.
+#[cfg(test)]
+pub(crate) fn bounded_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    mlx_gen::gen_core::VisionEncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        output_width: 64,
+        num_position_embeddings: Some(16),
+        deepstack_visual_indexes: &[0],
+        ..VISION_ENCODER_CONTRACT
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static USE_BOUNDED_ENCODER_CONTRACTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opt the current unit-test thread into compact real-validator fixtures. Rust's test harness runs
+/// each test on its own thread, so the selection cannot leak into explicitly run ignored real-weight
+/// tests; those keep the production contract by default.
+#[cfg(test)]
+pub(crate) fn test_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    USE_BOUNDED_ENCODER_CONTRACTS.with(|enabled| enabled.set(true));
+    bounded_encoder_contract()
+}
+
+#[cfg(test)]
+pub(crate) fn test_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    USE_BOUNDED_ENCODER_CONTRACTS.with(|enabled| enabled.set(true));
+    bounded_vision_encoder_contract()
+}
+
+/// Contract used by the runtime path. Production and real-weight tests use the public production
+/// descriptor. Default unit tests opt into behavior-equivalent bounded geometry only when they
+/// deliberately create one of the compact fixtures above.
+pub(crate) fn runtime_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    #[cfg(test)]
+    {
+        if USE_BOUNDED_ENCODER_CONTRACTS.with(std::cell::Cell::get) {
+            return bounded_encoder_contract();
+        }
+    }
+    ENCODER_CONTRACT
+}
+
+pub(crate) fn runtime_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    #[cfg(test)]
+    {
+        if USE_BOUNDED_ENCODER_CONTRACTS.with(std::cell::Cell::get) {
+            return bounded_vision_encoder_contract();
+        }
+    }
+    VISION_ENCODER_CONTRACT
+}
+
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
 /// Resolution bounds (W/H). Turbo renders up to 2048²; the catalog/worker gate the UI options tighter.
@@ -608,7 +689,7 @@ fn build_native_krea_from_spec(spec: &LoadSpec, descriptor: ModelDescriptor) -> 
         .map_err(Error::from)
     })?;
     let text_base = base.to_path_buf();
-    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let text_encoder_source = runtime_encoder_contract().source_for_load(spec, base)?;
     let expected_text_encoder_bits = native_text_encoder_expected_quant_bits(base)?;
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(expected_text_encoder_bits, descriptor.id)?;
@@ -811,7 +892,7 @@ pub(crate) fn build_residency(
 ) -> Result<Residency<KreaText, KreaHeavyOwned>> {
     // Up-front fail-fast for both policies (precision override + single-file rejection).
     let root = resolve_root(spec, id)?;
-    let text_encoder_source = ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = runtime_encoder_contract().source_for_load(spec, root)?;
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(load_plan.effective_quant.map(Quant::bits), id)?;
     let text_root = root.to_path_buf();
@@ -968,7 +1049,7 @@ pub(crate) fn selected_language_resident_bytes(
     provider_id: &str,
 ) -> mlx_gen::gen_core::Result<u64> {
     let load_time_quant_bits = source.load_time_quant_bits(expected_bits, provider_id)?;
-    let headers = source.materialized_language_tensor_headers(&ENCODER_CONTRACT)?;
+    let headers = source.materialized_language_tensor_headers(&runtime_encoder_contract())?;
     mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
         if let Some(bits) = load_time_quant_bits
             .filter(|_| crate::convert::is_text_encoder_quant_target(&tensor.name))
@@ -1001,7 +1082,7 @@ pub(crate) fn native_text_encoder_expected_quant_bits(
 /// the VAE/vision), so the `Resident` and `Sequential` paths build byte-identical text phases.
 pub(crate) fn load_krea_text(spec: &LoadSpec, root: &Path, id: &str) -> Result<KreaText> {
     let plan = resolve_load_plan(spec, root, id)?;
-    let source = ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let source = runtime_encoder_contract().source_for_load(spec, root)?;
     let bits = source.load_time_quant_bits(plan.effective_quant.map(Quant::bits), id)?;
     load_krea_text_resolved(root, &source, bits)
 }
@@ -1772,15 +1853,18 @@ pub(crate) fn component_footprint_for(
             native_text_encoder_expected_quant_bits(base)?
         }
     };
-    let selected = ENCODER_CONTRACT.source_for_load(spec, base)?;
+    let selected = runtime_encoder_contract().source_for_load(spec, base)?;
     let language_bytes =
         selected_language_resident_bytes(&selected, expected_language_bits, provider_id)?;
     let mut vision_bytes = 0;
     if provider_id == KREA_2_EDIT_ID || provider_id == KREA_2_TURBO_EDIT_ID {
-        let builtin = ENCODER_CONTRACT
+        let language_contract = runtime_encoder_contract();
+        let builtin = language_contract
             .validate_source_against_base(&WeightsSource::Dir(base.join("text_encoder")), base)?;
-        let vision = builtin
-            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)?;
+        let vision = builtin.materialized_vision_tensor_headers(
+            &runtime_vision_encoder_contract(),
+            &language_contract,
+        )?;
         vision_bytes = mlx_gen::asset_facts::projected_tensor_headers_bytes(&vision, |_| {
             mlx_gen::asset_facts::ResidentProjection::Stored
         })?;
@@ -1941,6 +2025,128 @@ mod tests {
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
     use std::path::PathBuf;
 
+    #[test]
+    fn bounded_encoder_contracts_retain_production_policy_and_production_headers_stay_exact() {
+        let bounded = bounded_encoder_contract();
+        let production = ENCODER_CONTRACT;
+        assert_eq!(
+            runtime_encoder_contract().hidden_size,
+            production.hidden_size
+        );
+        assert_eq!(
+            runtime_vision_encoder_contract().hidden_size,
+            VISION_ENCODER_CONTRACT.hidden_size
+        );
+        for (actual, expected) in [
+            (bounded.architecture, production.architecture),
+            (bounded.hidden_activation, production.hidden_activation),
+        ] {
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(bounded.requires_final_norm, production.requires_final_norm);
+        assert_eq!(bounded.requires_lm_head, production.requires_lm_head);
+        assert_eq!(bounded.attention_dropout, production.attention_dropout);
+        assert_eq!(bounded.rms_norm_eps, production.rms_norm_eps);
+        assert_eq!(bounded.qk_norm_eps, production.qk_norm_eps);
+        assert_eq!(bounded.rope_theta, production.rope_theta);
+        assert_eq!(bounded.attention_bias, production.attention_bias);
+        assert_eq!(bounded.tie_word_embeddings, production.tie_word_embeddings);
+        assert_eq!(bounded.tokenizer, production.tokenizer);
+        assert_eq!(bounded.prompt_executions, production.prompt_executions);
+        assert_eq!(bounded.bos_token_id, production.bos_token_id);
+        assert_eq!(bounded.eos_token_id, production.eos_token_id);
+        assert_eq!(bounded.image_token_id, production.image_token_id);
+        assert_eq!(
+            bounded.vision_start_token_id,
+            production.vision_start_token_id
+        );
+        assert_eq!(bounded.vision_end_token_id, production.vision_end_token_id);
+        assert_eq!(bounded.mrope_section, production.mrope_section);
+        assert_eq!(bounded.mrope_interleaved, production.mrope_interleaved);
+        assert_eq!(bounded.packing, production.packing);
+        assert_eq!(
+            bounded.dense_storage_dtype_probe,
+            production.dense_storage_dtype_probe
+        );
+        // Vocabulary and head width cannot be reduced without changing authored token/RoPE policy.
+        assert_eq!(bounded.vocab_size, production.vocab_size);
+        assert_eq!(bounded.head_dim, production.head_dim);
+        bounded.validate_definition().unwrap();
+
+        let bounded_vision = bounded_vision_encoder_contract();
+        let production_vision = VISION_ENCODER_CONTRACT;
+        assert_eq!(bounded_vision.architecture, production_vision.architecture);
+        assert_eq!(
+            bounded_vision.hidden_activation,
+            production_vision.hidden_activation
+        );
+        assert_eq!(bounded_vision.rope_theta, production_vision.rope_theta);
+        assert_eq!(
+            bounded_vision.normalization_eps,
+            production_vision.normalization_eps
+        );
+        assert_eq!(bounded_vision.patch_size, production_vision.patch_size);
+        assert_eq!(
+            bounded_vision.temporal_patch_size,
+            production_vision.temporal_patch_size
+        );
+        assert_eq!(
+            bounded_vision.spatial_merge_size,
+            production_vision.spatial_merge_size
+        );
+        assert_eq!(bounded_vision.in_channels, production_vision.in_channels);
+        assert_eq!(bounded_vision.window_size, production_vision.window_size);
+        assert_eq!(
+            bounded_vision.full_attention_block_indexes,
+            production_vision.full_attention_block_indexes
+        );
+        bounded_vision.validate_definition(&bounded).unwrap();
+
+        // Pure headers keep the actual checkpoint geometry under assertion without creating an
+        // 8.7 GB sparse file only to SHA every logical zero byte.
+        assert_eq!(production.hidden_size, 2560);
+        assert_eq!(production.intermediate_size, 9728);
+        assert_eq!(production.num_hidden_layers, 36);
+        assert_eq!(production.loaded_hidden_layers, 35);
+        assert_eq!(
+            production.selected_hidden_layers,
+            &[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35]
+        );
+        let language_headers =
+            gen_core_testkit::encoder_contract_fixture_tensor_headers(production, None).unwrap();
+        assert_eq!(
+            language_headers
+                .iter()
+                .map(|header| header.data_bytes)
+                .sum::<u64>(),
+            7_843_069_440
+        );
+        let production_q4_bytes =
+            mlx_gen::asset_facts::projected_tensor_headers_bytes(&language_headers, |tensor| {
+                if crate::convert::is_text_encoder_quant_target(&tensor.name) {
+                    mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                        bits: 4,
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    }
+                } else {
+                    mlx_gen::asset_facts::ResidentProjection::Stored
+                }
+            })
+            .unwrap();
+        assert_eq!(production_q4_bytes, 2_765_258_240);
+        assert_eq!(production_vision.hidden_size, 1024);
+        assert_eq!(production_vision.intermediate_size, 4096);
+        assert_eq!(production_vision.num_hidden_layers, 24);
+        assert_eq!(production_vision.deepstack_visual_indexes, &[5, 11, 17]);
+        let vision_bytes = production_vision
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(_, shape)| shape.into_iter().product::<usize>() as u64 * 2)
+            .sum::<u64>();
+        assert_eq!(vision_bytes, 830_695_424);
+    }
+
     fn write_minimal_safetensors(path: &Path) {
         // A real native DiT key: since sc-20385 imported-file pricing and loading compile the
         // logical-weight plan, so a foreign probe key would refuse where these fixtures expect a
@@ -1970,8 +2176,8 @@ mod tests {
         }
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
-            ENCODER_CONTRACT,
-            VISION_ENCODER_CONTRACT,
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
         )
         .unwrap();
         root
@@ -1996,12 +2202,13 @@ mod tests {
         assert!(edit > t2i);
 
         let language_only = tmp.path().join("alternate-language");
-        gen_core_testkit::write_encoder_contract_fixture(&language_only, ENCODER_CONTRACT).unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(&language_only, test_encoder_contract())
+            .unwrap();
         let complete = tmp.path().join("alternate-complete");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &complete.join("text_encoder"),
-            ENCODER_CONTRACT,
-            VISION_ENCODER_CONTRACT,
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
         )
         .unwrap();
         let language_spec = base_spec
@@ -2051,7 +2258,7 @@ mod tests {
             FootprintEncoderSelection::ComponentDir => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    ENCODER_CONTRACT,
+                    test_encoder_contract(),
                     packed_bits,
                 )
                 .unwrap();
@@ -2060,7 +2267,7 @@ mod tests {
             FootprintEncoderSelection::ComponentFile => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    ENCODER_CONTRACT,
+                    test_encoder_contract(),
                     packed_bits,
                 )
                 .unwrap();
@@ -2069,7 +2276,7 @@ mod tests {
             FootprintEncoderSelection::CompleteSnapshot => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected.join("text_encoder"),
-                    ENCODER_CONTRACT,
+                    test_encoder_contract(),
                     packed_bits,
                 )
                 .unwrap();
@@ -2081,10 +2288,11 @@ mod tests {
 
     fn expected_language_bytes(spec: &LoadSpec, bits: Option<i32>, provider_id: &str) -> u64 {
         let base = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
-        let selected = ENCODER_CONTRACT.source_for_load(spec, base).unwrap();
+        let contract = test_encoder_contract();
+        let selected = contract.source_for_load(spec, base).unwrap();
         let action = selected.load_time_quant_bits(bits, provider_id).unwrap();
         let headers = selected
-            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .materialized_language_tensor_headers(&contract)
             .unwrap();
         mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
             if let Some(bits) =
@@ -2102,11 +2310,12 @@ mod tests {
     }
 
     fn expected_builtin_vision_bytes(root: &Path) -> u64 {
-        let builtin = ENCODER_CONTRACT
+        let language_contract = test_encoder_contract();
+        let builtin = language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
             .unwrap();
         let headers = builtin
-            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .materialized_vision_tensor_headers(&test_vision_encoder_contract(), &language_contract)
             .unwrap();
         mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
             mlx_gen::asset_facts::ResidentProjection::Stored
@@ -2310,8 +2519,8 @@ mod tests {
         }
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &base.join("text_encoder"),
-            ENCODER_CONTRACT,
-            VISION_ENCODER_CONTRACT,
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("imported-krea.safetensors");
@@ -2335,8 +2544,8 @@ mod tests {
                 let base = mlx_gen::require_base_snapshot(&base_spec, KREA_2_TURBO_ID).unwrap();
                 gen_core_testkit::write_multimodal_encoder_contract_fixture_with_quant(
                     &base.join("text_encoder"),
-                    ENCODER_CONTRACT,
-                    VISION_ENCODER_CONTRACT,
+                    test_encoder_contract(),
+                    test_vision_encoder_contract(),
                     Some(bits),
                 )
                 .unwrap();
@@ -2477,8 +2686,8 @@ mod tests {
             .expect("write parseable transformer config");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &base.join("text_encoder"),
-            ENCODER_CONTRACT,
-            VISION_ENCODER_CONTRACT,
+            test_encoder_contract(),
+            test_vision_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");
@@ -2888,9 +3097,13 @@ mod tests {
 
         std::fs::write(&adapter, b"replacement adapter bytes").unwrap();
         let error = adapters_have_diff_patch_for_spec(&spec)
-            .expect_err("header classification must consume the prepared adapter token")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("header classification must consume the prepared adapter token");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -3301,7 +3514,7 @@ mod tests {
     fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
         gen_core_testkit::write_encoder_contract_fixture(
             &root.join("text_encoder"),
-            ENCODER_CONTRACT,
+            test_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)

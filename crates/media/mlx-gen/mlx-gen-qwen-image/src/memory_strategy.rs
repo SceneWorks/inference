@@ -5,9 +5,7 @@
 //! planner through every one of the 60 joint-attention blocks; rung 4 uses the shared block-window
 //! primitive from SC-16353. The provider contract is the only selector surface.
 
-use mlx_gen::asset_facts::{
-    projected_safetensors_bytes, projected_tensor_headers_bytes, ResidentProjection,
-};
+use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 #[cfg(test)]
 use mlx_gen::gen_core::GenerationMemory;
 use mlx_gen::gen_core::{
@@ -146,38 +144,23 @@ pub fn memory_strategy_contract(
             "qwen-image memory facts require a snapshot directory".to_owned(),
         ));
     };
-    let project = |path: &std::path::Path, quant: Option<mlx_gen::Quant>| -> CoreResult<u64> {
-        projected_safetensors_bytes(path, |_| match quant {
-            Some(quant) => ResidentProjection::GroupQuantized {
-                bits: quant.bits(),
-                group_size: crate::quant::GROUP_SIZE as usize,
-            },
-            None => ResidentProjection::Stored,
-        })
-    };
-    let selected_text_encoder = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let selected_language_bytes = projected_tensor_headers_bytes(
-        &selected_text_encoder.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?,
-        |_| ResidentProjection::Stored,
-    )?;
-    let conditioning_bytes = if provider_id == crate::model_edit::MODEL_ID {
-        let vision_source = crate::ENCODER_CONTRACT
+    let encoder_contract = crate::active_encoder_contract();
+    let selected_text_encoder = encoder_contract.source_for_load(spec, root)?;
+    let language = selected_text_encoder.materialized_language_tensor_headers(&encoder_contract)?;
+    let vision = if provider_id == crate::model_edit::MODEL_ID {
+        let vision_source = encoder_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        let vision_bytes = projected_tensor_headers_bytes(
-            &vision_source.materialized_vision_tensor_headers(
-                &crate::VISION_ENCODER_CONTRACT,
-                &crate::ENCODER_CONTRACT,
-            )?,
-            |_| ResidentProjection::Stored,
-        )?;
-        selected_language_bytes
-            .checked_add(vision_bytes)
-            .ok_or_else(|| CoreError::Msg("qwen-image conditioning byte sum overflow".into()))?
+        Some(vision_source.materialized_vision_tensor_headers(
+            &crate::active_vision_encoder_contract(),
+            &encoder_contract,
+        )?)
     } else {
-        selected_language_bytes
+        None
     };
-    let transformer_bytes = project(&root.join("transformer"), spec.quantize)?;
-    let native_decoder_bytes = project(&root.join("vae"), None)?;
+    let conditioning_bytes =
+        crate::model::projected_conditioning_headers(&language, vision.as_deref())?;
+    let transformer_bytes = projected_component_bytes(&root.join("transformer"), spec.quantize)?;
+    let native_decoder_bytes = projected_component_bytes(&root.join("vae"), None)?;
     // The alternate lane keeps the native VAE loaded (reference/img2img encoding still uses it) and
     // adds the standalone Wan decoder for the terminal decode. Price the composition, never substitute
     // donor bytes for the native decoder or borrow the native route's measured peak unchanged.
@@ -211,6 +194,19 @@ pub fn memory_strategy_contract(
         decoder_bytes,
         overlay_bytes,
     )
+}
+
+fn projected_component_bytes(
+    path: &std::path::Path,
+    quant: Option<mlx_gen::Quant>,
+) -> CoreResult<u64> {
+    projected_safetensors_bytes(path, |_| match quant {
+        Some(quant) => ResidentProjection::GroupQuantized {
+            bits: quant.bits(),
+            group_size: crate::quant::GROUP_SIZE as usize,
+        },
+        None => ResidentProjection::Stored,
+    })
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
@@ -608,23 +604,35 @@ mod tests {
         MemoryNumericTier, MemorySelection, MemoryStrategyParameters, MemoryStrategySupport,
     };
 
-    fn write_snapshot(root: &std::path::Path) {
-        for component in ["text_encoder", "transformer", "vae"] {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_control(&dir.join("model.safetensors"));
-        }
-        gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::ENCODER_CONTRACT,
-            crate::VISION_ENCODER_CONTRACT,
-        )
-        .expect("validation-complete text encoder fixture");
+    fn exact_language_headers() -> Vec<mlx_gen::gen_core::SafetensorsTensorHeader> {
+        gen_core_testkit::encoder_contract_fixture_tensor_headers(crate::ENCODER_CONTRACT, None)
+            .unwrap()
+    }
+
+    fn exact_vision_headers() -> Vec<mlx_gen::gen_core::SafetensorsTensorHeader> {
+        crate::VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                name,
+                data_bytes: shape
+                    .iter()
+                    .try_fold(2_u64, |bytes, &dimension| {
+                        bytes.checked_mul(dimension as u64)
+                    })
+                    .unwrap(),
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect()
     }
 
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("qwen-memory-spec");
-        write_snapshot(&root);
+        for component in ["text_encoder", "transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -647,17 +655,18 @@ mod tests {
     fn empty_required_component_directory_cannot_be_reported_as_zero() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
-        write_snapshot(&root);
-        std::fs::remove_file(root.join("transformer/model.safetensors")).unwrap();
+        for component in ["text_encoder", "transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-        assert!(memory_strategy_contract("qwen_image", &spec).is_err());
+        assert!(projected_component_bytes(&root.join("transformer"), spec.quantize).is_err());
         assert!(weights_free_memory_strategy_contract("qwen_image", &spec).is_ok());
     }
 
     #[test]
     fn sequential_deferred_directory_declares_the_exact_dit_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         assert!(contract.conformance_errors().is_empty());
         let decode = contract.capability(MemoryStrategy::BoundedDecode).unwrap();
         assert_eq!(decode.support, MemoryStrategySupport::Implemented);
@@ -704,87 +713,57 @@ mod tests {
 
     #[test]
     fn selected_encoder_pricing_ignores_nested_safetensors_not_loaded_as_shards() {
-        let tmp = tempfile::tempdir().unwrap();
-        let spec = spec(&tmp);
-        let before = memory_strategy_contract("qwen_image", &spec)
-            .unwrap()
-            .asset_facts
-            .conditioning_bytes;
-        let WeightsSource::Dir(root) = &spec.weights else {
-            unreachable!()
-        };
-        let nested = root.join("text_encoder/archive");
-        std::fs::create_dir_all(&nested).unwrap();
-        write_control(&nested.join("ignored.safetensors"));
-
-        let after = memory_strategy_contract("qwen_image", &spec)
-            .unwrap()
-            .asset_facts
-            .conditioning_bytes;
+        let language = exact_language_headers();
+        let before = crate::model::projected_conditioning_headers(&language, None).unwrap();
+        let mut authored = language.clone();
+        authored.push(mlx_gen::gen_core::SafetensorsTensorHeader {
+            name: "archive.ignored.weight".into(),
+            dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+            shape: vec![2, 64],
+            data_bytes: 256,
+        });
+        let materialized = crate::ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&authored)
+            .unwrap();
+        let after = crate::model::projected_conditioning_headers(&materialized, None).unwrap();
         assert_eq!(after, before);
     }
 
     #[test]
     fn edit_prices_selected_language_plus_base_vision_while_base_and_control_exclude_visual() {
-        let tmp = tempfile::tempdir().unwrap();
-        let spec = spec(&tmp);
-        let base = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
-        let control = memory_strategy_contract(crate::model_control::MODEL_ID, &spec).unwrap();
-        let edit = memory_strategy_contract(crate::model_edit::MODEL_ID, &spec).unwrap();
+        let language = exact_language_headers();
+        let vision = exact_vision_headers();
+        let base = crate::model::projected_conditioning_headers(&language, None).unwrap();
+        let control = crate::model::projected_conditioning_headers(&language, None).unwrap();
+        let edit = crate::model::projected_conditioning_headers(&language, Some(&vision)).unwrap();
         assert_eq!(
-            control.asset_facts.conditioning_bytes, base.asset_facts.conditioning_bytes,
+            control, base,
             "control must not price visual.* from a multimodal source"
         );
         assert!(
-            edit.asset_facts.conditioning_bytes > base.asset_facts.conditioning_bytes,
+            edit > base,
             "edit must add its separately loaded vision tower"
         );
+        let vision_bytes = mlx_gen::asset_facts::projected_tensor_headers_bytes(&vision, |_| {
+            ResidentProjection::Stored
+        })
+        .unwrap();
+        assert_eq!(edit, base.checked_add(vision_bytes).unwrap());
 
-        let WeightsSource::Dir(root) = &spec.weights else {
-            unreachable!()
-        };
-        let vision_source = crate::ENCODER_CONTRACT
-            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
-            .unwrap();
-        let vision_bytes = projected_tensor_headers_bytes(
-            &vision_source
-                .materialized_vision_tensor_headers(
-                    &crate::VISION_ENCODER_CONTRACT,
-                    &crate::ENCODER_CONTRACT,
-                )
-                .unwrap(),
-            |_| ResidentProjection::Stored,
+        let alternate = gen_core_testkit::encoder_contract_fixture_tensor_headers(
+            crate::ENCODER_CONTRACT,
+            None,
         )
         .unwrap();
-        assert_eq!(
-            edit.asset_facts.conditioning_bytes,
-            base.asset_facts
-                .conditioning_bytes
-                .checked_add(vision_bytes)
-                .unwrap()
-        );
-
-        let alternate = tmp.path().join("alternate-language-only");
-        gen_core_testkit::write_encoder_contract_fixture(&alternate, crate::ENCODER_CONTRACT)
-            .unwrap();
-        let mut selected = spec.clone();
-        selected.text_encoder = Some(WeightsSource::Dir(alternate));
-        let selected_base = memory_strategy_contract(crate::model::MODEL_ID, &selected).unwrap();
+        let selected_base = crate::model::projected_conditioning_headers(&alternate, None).unwrap();
         let selected_control =
-            memory_strategy_contract(crate::model_control::MODEL_ID, &selected).unwrap();
+            crate::model::projected_conditioning_headers(&alternate, None).unwrap();
         let selected_edit =
-            memory_strategy_contract(crate::model_edit::MODEL_ID, &selected).unwrap();
+            crate::model::projected_conditioning_headers(&alternate, Some(&vision)).unwrap();
+        assert_eq!(selected_control, selected_base);
         assert_eq!(
-            selected_control.asset_facts.conditioning_bytes,
-            selected_base.asset_facts.conditioning_bytes
-        );
-        assert_eq!(
-            selected_edit.asset_facts.conditioning_bytes,
-            selected_base
-                .asset_facts
-                .conditioning_bytes
-                .checked_add(vision_bytes)
-                .unwrap(),
+            selected_edit,
+            selected_base.checked_add(vision_bytes).unwrap(),
             "the language-only alternate must compose with base vision rather than replace it"
         );
     }
@@ -838,7 +817,8 @@ mod tests {
     #[test]
     fn control_route_does_not_overstate_its_unbounded_side_branch() {
         let tmp = tempfile::tempdir().unwrap();
-        let contract = memory_strategy_contract("qwen_image_control", &spec(&tmp)).unwrap();
+        let contract =
+            weights_free_memory_strategy_contract("qwen_image_control", &spec(&tmp)).unwrap();
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedDecode)
@@ -864,13 +844,41 @@ mod tests {
     fn control_overlay_is_quant_projected_typed_and_excluded_from_base() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
-        write_snapshot(&root);
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_control(&root.join(component).join("model.safetensors"));
+        }
         let control = root.join("control.safetensors");
         write_control(&control);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_quant(mlx_gen::Quant::Q4)
-            .with_control(WeightsSource::File(control));
-        let contract = memory_strategy_contract("qwen_image_control", &spec).unwrap();
+            .with_control(WeightsSource::File(control.clone()));
+        let conditioning =
+            crate::model::projected_conditioning_headers(&exact_language_headers(), None).unwrap();
+        let transformer = projected_safetensors_bytes(root.join("transformer"), |_| {
+            ResidentProjection::GroupQuantized {
+                bits: 4,
+                group_size: crate::quant::GROUP_SIZE as usize,
+            }
+        })
+        .unwrap();
+        let decoder =
+            projected_safetensors_bytes(root.join("vae"), |_| ResidentProjection::Stored).unwrap();
+        let overlay =
+            projected_safetensors_bytes(&control, |_| ResidentProjection::GroupQuantized {
+                bits: 4,
+                group_size: crate::quant::GROUP_SIZE as usize,
+            })
+            .unwrap();
+        let contract = memory_strategy_contract_with_asset_facts(
+            "qwen_image_control",
+            &spec,
+            conditioning,
+            transformer,
+            decoder,
+            overlay,
+        )
+        .unwrap();
         assert_eq!(contract.asset_facts.conditioning_bytes, 14_141_238_272);
         assert_eq!(contract.asset_facts.transformer_bytes, 72);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
@@ -887,12 +895,35 @@ mod tests {
     #[test]
     fn alternate_decoder_is_additive_to_native_decoder_asset_facts() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut base_spec = spec(&tmp);
-        let native = memory_strategy_contract("qwen_image", &base_spec).unwrap();
+        let root = tmp.path().join("qwen-alternate-decoder");
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            write_control(&root.join(component).join("model.safetensors"));
+        }
+        let mut base_spec = LoadSpec::new(WeightsSource::Dir(root));
+        let conditioning =
+            crate::model::projected_conditioning_headers(&exact_language_headers(), None).unwrap();
+        let native = memory_strategy_contract_with_asset_facts(
+            "qwen_image",
+            &base_spec,
+            conditioning,
+            256,
+            256,
+            0,
+        )
+        .unwrap();
         let donor = tmp.path().join("wan-vae.safetensors");
         write_control(&donor);
         base_spec = base_spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor));
-        let composite = memory_strategy_contract("qwen_image", &base_spec).unwrap();
+        let composite = memory_strategy_contract_with_asset_facts(
+            "qwen_image",
+            &base_spec,
+            conditioning,
+            256,
+            512,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             composite.asset_facts.decoder_bytes,
             native.asset_facts.decoder_bytes + 256,
@@ -948,7 +979,7 @@ mod tests {
     #[test]
     fn selections_translate_to_the_shared_cumulative_request_contract() {
         let tmp = tempfile::tempdir().unwrap();
-        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let resident = qwen_generation_memory(&contract, &selection(MemoryStrategy::Resident));
         assert_eq!(resident, None);
 
@@ -995,7 +1026,7 @@ mod tests {
     #[test]
     fn unpublished_parameters_are_rejected_instead_of_silently_coerced() {
         let tmp = tempfile::tempdir().unwrap();
-        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let mut decode = selection(MemoryStrategy::BoundedDecode);
         assert!(
             contract.validate_selection(&decode).is_ok(),
@@ -1018,10 +1049,11 @@ mod tests {
     #[test]
     fn eager_and_resident_loads_do_not_advertise_rung_four() {
         let tmp = tempfile::tempdir().unwrap();
-        let deferred_contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let deferred_contract =
+            weights_free_memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let mut eager = spec(&tmp);
         eager.load_shape = LoadShape::EagerMaterialization;
-        let eager_contract = memory_strategy_contract("qwen_image", &eager).unwrap();
+        let eager_contract = weights_free_memory_strategy_contract("qwen_image", &eager).unwrap();
         assert_eq!(
             deferred_contract.calibration.as_ref().unwrap().fingerprint,
             eager_contract.calibration.as_ref().unwrap().fingerprint
@@ -1033,7 +1065,7 @@ mod tests {
         let mut resident = spec(&tmp);
         resident.offload_policy = OffloadPolicy::Resident;
         for spec in [eager, resident] {
-            let contract = memory_strategy_contract("qwen_image", &spec).unwrap();
+            let contract = weights_free_memory_strategy_contract("qwen_image", &spec).unwrap();
             assert!(matches!(
                 contract
                     .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1048,7 +1080,7 @@ mod tests {
     fn dense_load_time_quantization_does_not_advertise_rung_four() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
-        write_snapshot(&root);
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"dtype":"bfloat16"}"#,
@@ -1058,7 +1090,7 @@ mod tests {
             .with_quant(mlx_gen::Quant::Q8)
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
-        let contract = memory_strategy_contract("qwen_image", &dense_q8).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &dense_q8).unwrap();
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1073,7 +1105,7 @@ mod tests {
             r#"{"quantization":{"bits":8}}"#,
         )
         .unwrap();
-        let contract = memory_strategy_contract("qwen_image", &dense_q8).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &dense_q8).unwrap();
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1094,7 +1126,7 @@ mod tests {
     #[test]
     fn rung_four_rejects_an_unpublished_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let contract = memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
+        let contract = weights_free_memory_strategy_contract("qwen_image", &spec(&tmp)).unwrap();
         let mut selection = selection(MemoryStrategy::BoundedTransformerResidency);
         assert!(
             contract.validate_selection(&selection).is_ok(),

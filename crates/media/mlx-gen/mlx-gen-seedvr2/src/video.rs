@@ -127,29 +127,48 @@ fn blend_frames(a: &Image, b: &Image, w: f32) -> Image {
     }
 }
 
+/// Number of decoded frames in a chunk that correspond to real source frames. The model still sees
+/// a full valid temporal window, but its final last-frame padding must not incur host color-correct
+/// work because assembly will discard it (F-165 / sc-21704).
+pub(crate) fn real_frame_count(start: i32, len: i32, n: i32) -> i32 {
+    len.max(0).min(n.saturating_sub(start).max(0))
+}
+
+/// Cross-fade one chunk's decoded frames into the running assembly `out`, **consuming** `frames`.
+/// This preserves only the assembled output plus the current chunk, instead of retaining all
+/// overlap-duplicated decoded chunks until the end of the video.
+pub fn assemble_overlap_chunk(
+    out: &mut Vec<Image>,
+    start: i32,
+    frames: Vec<Image>,
+    n: i32,
+    ov: i32,
+) {
+    for (j, f) in frames.into_iter().enumerate() {
+        let i = start + j as i32;
+        if i >= n {
+            break;
+        }
+        if (i as usize) < out.len() {
+            let w = (i - start + 1) as f32 / (ov + 1) as f32;
+            out[i as usize] = blend_frames(&out[i as usize], &f, w);
+        } else {
+            out.push(f);
+        }
+    }
+}
+
 /// Cross-fade-assemble per-chunk frame lists into exactly `n` output frames. `chunks[k]` holds the
 /// decoded (and color-corrected) frames for `plan[k]`, covering pixel-frames
 /// `[plan[k].start, plan[k].start + len)`. In each chunk's leading `ov`-frame overlap with the
 /// already-assembled region the frames are linearly cross-faded (weight ramps `1/(ov+1) … ov/(ov+1)`,
 /// the spike `chunk_test.py` schedule); the rest pass through. Trailing padding past frame `n` is dropped.
+/// This retained batch helper delegates to the incremental core for parity tests; production calls
+/// [`assemble_overlap_chunk`] as each chunk arrives.
 pub fn assemble_overlap(plan: &[Chunk], chunks: &[Vec<Image>], n: i32, ov: i32) -> Vec<Image> {
     let mut out: Vec<Image> = Vec::with_capacity(n.max(0) as usize);
     for (k, frames) in chunks.iter().enumerate() {
-        let start = plan[k].start;
-        for (j, f) in frames.iter().enumerate() {
-            let i = start + j as i32;
-            if i >= n {
-                break;
-            }
-            if (i as usize) < out.len() {
-                // overlap with the previous chunk — cross-fade toward this chunk.
-                let w = (i - start + 1) as f32 / (ov + 1) as f32;
-                out[i as usize] = blend_frames(&out[i as usize], f, w);
-            } else {
-                // new, contiguous frame.
-                out.push(f.clone());
-            }
-        }
+        assemble_overlap_chunk(&mut out, plan[k].start, frames.clone(), n, ov);
     }
     out
 }
@@ -373,6 +392,54 @@ mod tests {
         let out = assemble_overlap(&plan, &[frames], 5, 4);
         assert_eq!(out.len(), 5);
         assert_eq!(out[4].pixels[0], 4);
+    }
+
+    #[test]
+    fn incremental_assembly_matches_candle_overlap_fixture_byte_for_byte() {
+        // This is the shared Candle/MLX overlap fixture: a 28-frame clip split into [0:16] and
+        // [12:28], with chunk values 0 and 200. The literal schedule is the Candle assertion too,
+        // so the two backend assembly paths stay byte-identical without requiring accelerator work.
+        let n = 28;
+        let plan = plan_chunks(n, 16, 4);
+        let chunks: Vec<Vec<Image>> = [0u8, 200]
+            .into_iter()
+            .map(|value| (0..16).map(|_| img(2, 2, value)).collect())
+            .collect();
+        let batch = assemble_overlap(&plan, &chunks, n, 4);
+
+        let mut streamed = Vec::with_capacity(n as usize);
+        for (chunk, frames) in plan.iter().zip(chunks) {
+            assemble_overlap_chunk(&mut streamed, chunk.start, frames, n, 4);
+        }
+
+        assert_eq!(streamed.len(), batch.len(), "streamed output frame count");
+        for (streamed_frame, batch_frame) in streamed.iter().zip(&batch) {
+            assert_eq!(
+                streamed_frame.pixels, batch_frame.pixels,
+                "streamed MLX output must match the Candle fixture"
+            );
+        }
+        for (frame, image) in streamed.iter().enumerate() {
+            let expected = if frame < 12 {
+                0
+            } else if frame < 16 {
+                (((frame - 12 + 1) as f32 / 5.0) * 200.0).round() as u8
+            } else {
+                200
+            };
+            assert!(
+                image.pixels.iter().all(|&pixel| pixel == expected),
+                "frame {frame} differs from the Candle overlap fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn real_frame_count_excludes_trailing_padding_work() {
+        // The final [24:40] chunk of a 29-frame clip has five real frames and eleven padded ones.
+        assert_eq!(real_frame_count(24, 16, 29), 5);
+        assert_eq!(real_frame_count(0, 16, 29), 16);
+        assert_eq!(real_frame_count(29, 16, 29), 0);
     }
 
     #[test]

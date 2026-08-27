@@ -248,6 +248,16 @@ pub(crate) fn validate_request(
         )));
     }
     desc.capabilities.validate_request(id, req)?;
+    if req.strength.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: img2img strength requires Reference conditioning"
+        )));
+    }
     if req.steps == Some(0) {
         return Err(gen_core::Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -784,9 +794,17 @@ mod tests {
         crate::preview::base_hook(sink)
     }
 
+    #[derive(Clone, Debug, PartialEq)]
+    struct RenderedInputs {
+        has_reference: bool,
+        strength: Option<f32>,
+        guidance_scale: Option<f32>,
+    }
+
     struct BaseFixturePipeline {
         encoder_calls: Cell<usize>,
         rendered_seeds: RefCell<Vec<u64>>,
+        rendered_inputs: RefCell<Vec<RenderedInputs>>,
     }
 
     impl BaseBatchPipeline for BaseFixturePipeline {
@@ -818,6 +836,11 @@ mod tests {
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
+            self.rendered_inputs.borrow_mut().push(RenderedInputs {
+                has_reference: req.init_image.is_some(),
+                strength: req.strength,
+                guidance_scale: req.guidance_scale,
+            });
             Ok(fixture_image(conditioning, seed))
         }
     }
@@ -856,12 +879,18 @@ mod tests {
         let pipeline = BaseFixturePipeline {
             encoder_calls: Cell::new(0),
             rendered_seeds: RefCell::new(Vec::new()),
+            rendered_inputs: RefCell::new(Vec::new()),
         };
         let request = GenerationRequest {
             prompt: "cond".into(),
             negative_prompt: Some("uncond".into()),
             guidance: Some(1.0),
             true_cfg: Some(4.5),
+            strength: Some(0.6),
+            conditioning: vec![Conditioning::Reference {
+                image: reference_image(),
+                strength: None,
+            }],
             seed: Some(u64::MAX - 1),
             count: 4,
             ..req(256, 256)
@@ -886,6 +915,18 @@ mod tests {
             *pipeline.rendered_seeds.borrow(),
             vec![u64::MAX - 1, u64::MAX, 0, 1]
         );
+        assert_eq!(
+            *pipeline.rendered_inputs.borrow(),
+            vec![
+                RenderedInputs {
+                    has_reference: true,
+                    strength: Some(0.6),
+                    guidance_scale: Some(4.5),
+                };
+                4
+            ],
+            "the base adapter must carry the Reference strength and true_cfg precedence into each render"
+        );
         assert_eq!(actual, expected);
     }
 
@@ -894,6 +935,7 @@ mod tests {
         let pipeline = BaseFixturePipeline {
             encoder_calls: Cell::new(0),
             rendered_seeds: RefCell::new(Vec::new()),
+            rendered_inputs: RefCell::new(Vec::new()),
         };
         let request = GenerationRequest {
             guidance: Some(1.0),
@@ -914,6 +956,18 @@ mod tests {
 
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![7, 8, 9]);
+        assert_eq!(
+            *pipeline.rendered_inputs.borrow(),
+            vec![
+                RenderedInputs {
+                    has_reference: false,
+                    strength: None,
+                    guidance_scale: Some(1.0),
+                };
+                3
+            ],
+            "the reference-free request must retain the existing text-to-image inputs"
+        );
         assert_eq!(images.len(), 3);
     }
 
@@ -1008,6 +1062,19 @@ mod tests {
         assert!(resolve_reference(&r, SPRINT_MODEL_ID).is_err());
         assert!(validate_request(&descriptor(), &r).is_ok());
         assert!(validate_request(&sprint_descriptor(), &r).is_ok());
+    }
+
+    #[test]
+    fn refree_strength_is_a_typed_unsupported_knob() {
+        let mut r = req(256, 256);
+        r.strength = Some(0.6);
+        let error = validate_request(&descriptor(), &r).unwrap_err();
+        assert!(matches!(error, gen_core::Error::Unsupported(_)));
+        assert!(error.to_string().contains("requires Reference"));
+
+        // Omitted reference and omitted strength remain the existing text-to-image request.
+        r.strength = None;
+        assert!(validate_request(&descriptor(), &r).is_ok());
     }
 
     /// The seam under test: this provider's explicit family registry resolves our Candle generator.

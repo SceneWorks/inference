@@ -729,6 +729,25 @@ impl CodecStage {
         // (B, T, D) -> (B, D, T)
         h.transpose(1, 2)?.contiguous()
     }
+
+    /// Decode with a bounded attention working set. Short inputs retain the historical single-shot
+    /// path exactly; longer inputs use the stage's causal-context window as the chunk size. That
+    /// keeps each attention score/mask allocation bounded by the model's fixed context instead of
+    /// the request's (potentially 40-minute) duration.
+    fn forward_decode_bounded(&self, x: &Tensor) -> CandleResult<Tensor> {
+        let t = x.dim(2)?;
+        match bounded_decode_chunk_len(t, self.context) {
+            Some(chunk_len) => self.forward_chunked(x, chunk_len),
+            None => self.forward(x),
+        }
+    }
+}
+
+/// Select the bounded decoder path only once a sequence exceeds the stage's fixed causal context.
+/// Keeping this decision separate makes the advertised-duration work bound directly testable without
+/// loading codec weights or constructing a large tensor.
+fn bounded_decode_chunk_len(sequence_len: usize, context: usize) -> Option<usize> {
+    (sequence_len > context).then_some(context.max(1))
 }
 
 /// `PatchedPretransform.decode`: `[b, d·h, l] → [b, d, l·h]` (channels→time upsample by `h`).
@@ -996,9 +1015,11 @@ impl MossAudioCodec {
     }
 
     /// Decode a block of RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into an
-    /// interleaved mono PCM `Vec<f32>` of `frames.len() * downsample_rate` samples. `cancel` is
-    /// polled once up front (each stage is a bounded matmul; the AR loop is where cancellation
-    /// primarily lands).
+    /// interleaved mono PCM `Vec<f32>` of `frames.len() * downsample_rate` samples. Each decoder
+    /// stage keeps its historical single-shot path through one causal-context window, then streams
+    /// longer inputs through bounded windows; consequently no stage materializes a duration-sized
+    /// quadratic attention mask or score tensor. `cancel` is polled once up front (each stage is a
+    /// bounded matmul; the AR loop is where cancellation primarily lands).
     pub fn decode_frames(
         &self,
         frames: &[Vec<u32>],
@@ -1029,7 +1050,7 @@ impl MossAudioCodec {
             if cancel() {
                 return Ok(None);
             }
-            x = stage.forward(&x)?;
+            x = stage.forward_decode_bounded(&x)?;
             if debug {
                 eprintln!(
                     "[codec] after stage {si} (before unpatch): {:?} rms={:.5}",
@@ -1596,6 +1617,71 @@ mod tests {
             var > 1e-4,
             "degenerate stage output (var {var:.3e}) — test would be vacuous"
         );
+    }
+
+    /// A one-window fixture exercises the chunked attention implementation without changing its
+    /// reduction shape. This is the compatibility boundary for ordinary short realtime utterances:
+    /// chunked decode must retain the prior single-shot bytes exactly, not merely within tolerance.
+    #[test]
+    fn chunked_decoder_fixture_is_byte_identical_to_single_shot() {
+        let dev = Device::Cpu;
+        let spec = StageSpec {
+            index: 0,
+            input_dim: 8,
+            d_model: 16,
+            output_dim: 8,
+            num_heads: 4,
+            num_layers: 2,
+            dim_feedforward: 32,
+        };
+        let context = 5;
+        let stage = synthetic_stage(&spec, "decoder", context, &dev);
+        let x = lcg_tensor(&[1, spec.input_dim, context], 0x21681, 1.0, &dev);
+
+        let single = stage.forward(&x).unwrap();
+        let chunked = stage.forward_chunked(&x, context).unwrap();
+        let bounded = stage.forward_decode_bounded(&x).unwrap();
+        assert_eq!(
+            chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "a one-window chunk must preserve the prior single-shot bytes"
+        );
+        assert_eq!(
+            bounded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "the bounded decode entrypoint must preserve short-fixture bytes"
+        );
+    }
+
+    /// The model advertises a 40-minute (30,000-frame) realtime surface. Every decoder stage must
+    /// choose its fixed context window beyond that duration, so score/mask work is bounded by
+    /// `context * (2 * context - 1)` per head rather than the stage's full sequence square. This is
+    /// a structural allocation seam: it proves the dispatch decision without allocating the
+    /// advertised-duration tensors in a host-only test.
+    #[test]
+    fn advertised_duration_decode_selects_bounded_attention_work() {
+        let advertised_frames =
+            (crate::model::MAX_DURATION_SECS * crate::model::FRAME_RATE_HZ).ceil() as usize;
+        assert_eq!(
+            advertised_frames, 30_000,
+            "fixture tracks the advertised surface"
+        );
+
+        let mut sequence_len = advertised_frames;
+        let mut frame_rate = SAMPLE_RATE as f64 / DOWNSAMPLE_RATE as f64;
+        for (stage_index, patch) in PATCH_SIZES.into_iter().enumerate() {
+            let context = (frame_rate * CONTEXT_DURATION_SECS).floor() as usize;
+            let chunk_len = bounded_decode_chunk_len(sequence_len, context)
+                .expect("advertised-duration stage must not use single-shot attention");
+            assert_eq!(chunk_len, context);
+            let max_scores_per_head = chunk_len * (chunk_len + context - 1);
+            assert!(
+                max_scores_per_head < sequence_len * sequence_len,
+                "stage {stage_index}: bounded score work must be sub-quadratic in advertised length"
+            );
+            sequence_len *= patch;
+            frame_rate *= patch as f64;
+        }
     }
 
     /// Discrimination guard (mutation check): confirm the equivalence is not a tautology by proving a

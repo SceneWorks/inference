@@ -32,11 +32,14 @@ use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::image::{decoded_to_image, validate_multiple_of};
-use mlx_gen::img2img::{add_noise_by_interpolation, preprocess_init_image};
+use mlx_gen::img2img::{
+    add_noise_by_interpolation, preprocess_init_image,
+    resolve_reference as resolve_single_reference, resolve_strength,
+};
 use mlx_gen::media::Image;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Conditioning, Error, GenerationRequest,
-    LatentDecoder, Progress, Result, TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, GenerationRequest, LatentDecoder,
+    Progress, Result, TimestepConvention,
 };
 
 use std::cell::RefCell;
@@ -1003,31 +1006,14 @@ fn image_to_pixels(img: &Image) -> Result<Array> {
     Ok(nhwc.transpose_axes(&[0, 3, 1, 2])?)
 }
 
-/// The single img2img reference for the Base/Turbo t2i path (epic 8588 A4.3, sc-10191): at most one
-/// [`Conditioning::Reference`] — multiple is an error (Boogu's multi-image path is the Edit
-/// checkpoint's `resolve_edit_references`, not img2img) — with strength precedence per-reference →
-/// request → [`mlx_gen::img2img::DEFAULT_IMG2IMG_STRENGTH`]. An explicit zero remains a deliberate
-/// no-op/txt2img selection. Mirrors Z-Image's `resolve_reference`.
+/// The single img2img reference for the Base/Turbo t2i path. The shared resolver owns counting and
+/// per-reference/request precedence; Boogu alone applies its positive default strength.
 pub(crate) fn resolve_reference<'a>(
     req: &'a GenerationRequest,
     id: &str,
 ) -> Result<Option<(&'a Image, f32)>> {
-    let mut reference = None;
-    for c in &req.conditioning {
-        if let Conditioning::Reference { image, strength } = c {
-            if reference.is_some() {
-                return Err(Error::Msg(format!(
-                    "{id}: multiple reference images are not supported on the t2i path (single img2img \
-                     init only; the Edit checkpoint handles multi-image edits)"
-                )));
-            }
-            reference = Some((
-                image,
-                mlx_gen::img2img::resolve_strength(*strength, req.strength),
-            ));
-        }
-    }
-    Ok(reference)
+    Ok(resolve_single_reference(req, id)?
+        .map(|(image, strength)| (image, resolve_strength(strength, None))))
 }
 
 /// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values

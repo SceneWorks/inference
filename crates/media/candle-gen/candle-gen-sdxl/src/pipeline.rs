@@ -62,6 +62,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::diffusion_schedule::{SDXL_BETA_END, SDXL_BETA_START, SDXL_TRAIN_STEPS};
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, LightningPolicy, SamplerPolicy,
     Scheduler,
@@ -138,13 +139,6 @@ pub(crate) const LIGHTNING_SAMPLER: &str = "lightning";
 /// `accel_defaults("lightning")` (4 steps, CFG off). The worker typically sends an explicit count
 /// (the AC eyeballs ~5).
 const LIGHTNING_DEFAULT_STEPS: usize = 4;
-/// SDXL's `scaled_linear` β endpoints + train-step count (the diffusers SDXL scheduler defaults — the
-/// same values `DDIMSchedulerConfig::default()` and `sampler::EulerAncestralSampler` carry). The
-/// Lightning policy's σ table is built from these.
-const SDXL_BETA_START: f32 = 0.00085;
-const SDXL_BETA_END: f32 = 0.012;
-const SDXL_TRAIN_STEPS: usize = 1000;
-
 /// Build SDXL's ε-prediction α-cumprod schedule (`scaled_linear` β over 1000 train steps) — the
 /// [`DiscreteModelSampling`] source the curated unified-sampler path integrates over. Shared by the
 /// txt2img [`Pipeline::denoise_curated`] (sc-7124), the Lightning policy, and the conditioned
@@ -1456,6 +1450,13 @@ mod tests {
         fn same(output: Tensor) -> Self {
             Self::new(output.clone(), output)
         }
+    }
+
+    #[test]
+    fn sdxl_schedule_constants_match_the_canonical_candle_grid() {
+        let shared = sdxl_alpha_schedule().unwrap();
+        let direct = AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END);
+        assert_eq!(shared.alphas_cumprod, direct.alphas_cumprod);
     }
 
     impl LatentDecoder for SdxlDecodeSpy {

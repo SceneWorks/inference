@@ -1867,11 +1867,14 @@ mod tests {
         let error = model
             .with_pid(&admitted_pid)
             .err()
-            .expect("mutated PiD must fail before its materializer")
-            .to_string();
+            .expect("mutated PiD must fail before its materializer");
         assert!(
-            error.contains("receipt changed") || error.contains("pinned weights"),
-            "unexpected mutation error: {error}"
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected mutation error: {error:?}"
         );
     }
 

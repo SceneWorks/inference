@@ -554,6 +554,13 @@ impl Pipeline {
     ) -> CResult<Tensor> {
         let steps = knobs.steps;
         let shift = knobs.shift;
+        // Text K/V is invariant for the full request. Keep the cache local to this denoise call so it
+        // cannot outlive the request, while both CFG branches reuse their own payload exactly once.
+        check_cancel(cancel)?;
+        let pos_kv = dit.prepare_cross_kv(ctx_pos)?;
+        let neg_kv = ctx_neg
+            .map(|context| dit.prepare_cross_kv(context))
+            .transpose()?;
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
             if ti2v.is_some() {
@@ -575,10 +582,10 @@ impl Pipeline {
                 None,
                 |latents, t| -> CResult<Tensor> {
                     let ts = t as f64 * n_train;
-                    let v_pos = dit.forward(latents, ctx_pos, ts, cos, sin)?;
-                    let v = match ctx_neg {
-                        Some(neg) => {
-                            let v_neg = dit.forward(latents, neg, ts, cos, sin)?;
+                    let v_pos = dit.forward_prepared(latents, ts, &pos_kv, cos, sin)?;
+                    let v = match &neg_kv {
+                        Some(neg_kv) => {
+                            let v_neg = dit.forward_prepared(latents, ts, neg_kv, cos, sin)?;
                             pipeline::cfg(&v_pos, &v_neg, guidance)?
                         }
                         None => v_pos,
@@ -597,16 +604,18 @@ impl Pipeline {
                 let timestep_tokens = ti2v
                     .map(|conditioning| conditioning.mask_tokens.affine(t, 0.0))
                     .transpose()?;
-                let predict = |context: &Tensor| -> CResult<Tensor> {
+                let predict = |cross_kv: &transformer::PreparedWanCrossKv| -> CResult<Tensor> {
                     Ok(match &timestep_tokens {
-                        Some(tokens) => dit.forward_tokens(&latents, tokens, context, cos, sin)?,
-                        None => dit.forward(&latents, context, t, cos, sin)?,
+                        Some(tokens) => {
+                            dit.forward_tokens_prepared(&latents, tokens, cross_kv, cos, sin)?
+                        }
+                        None => dit.forward_prepared(&latents, t, cross_kv, cos, sin)?,
                     })
                 };
-                let v_pos = predict(ctx_pos)?;
-                let v = match ctx_neg {
-                    Some(neg) => {
-                        let v_neg = predict(neg)?;
+                let v_pos = predict(&pos_kv)?;
+                let v = match &neg_kv {
+                    Some(neg_kv) => {
+                        let v_neg = predict(neg_kv)?;
                         pipeline::cfg(&v_pos, &v_neg, guidance)?
                     }
                     None => v_pos,

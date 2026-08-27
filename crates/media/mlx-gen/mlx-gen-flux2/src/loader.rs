@@ -184,12 +184,21 @@ pub(crate) fn load_text_encoder_dev_from(
 pub fn load_dev_text_encoder_group(
     root: &Path,
 ) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
-    let selected = crate::config::DEV_ENCODER_CONTRACT
+    load_dev_text_encoder_group_with_contracts(
+        root,
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+pub(crate) fn load_dev_text_encoder_group_with_contracts(
+    root: &Path,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
+) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
+    let selected = language_contract
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-    selected.validate_vision(
-        &crate::config::DEV_VISION_ENCODER_CONTRACT,
-        &crate::config::DEV_ENCODER_CONTRACT,
-    )?;
+    selected.validate_vision(&vision_contract, &language_contract)?;
     selected.read_unchanged(load_dev_text_encoder_group_from_source)
 }
 
@@ -342,12 +351,21 @@ pub fn load_control_transformer_dev(
 /// (only the MMDiT + Mistral language tower quantize), so it loads dense regardless of the
 /// pre-quantized-snapshot manifest.
 pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
-    let selected = crate::config::DEV_ENCODER_CONTRACT
+    load_vision_tower_dev_with_contracts(
+        root,
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+pub(crate) fn load_vision_tower_dev_with_contracts(
+    root: &Path,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
+) -> Result<PixtralVisionTower> {
+    let selected = language_contract
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-    selected.validate_vision(
-        &crate::config::DEV_VISION_ENCODER_CONTRACT,
-        &crate::config::DEV_ENCODER_CONTRACT,
-    )?;
+    selected.validate_vision(&vision_contract, &language_contract)?;
     selected.read_unchanged(|source| {
         let w = weights_from_source(source)?;
         let tower = load_vision_tower_dev_from(&w)?;
@@ -366,12 +384,21 @@ pub(crate) fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTow
 /// uses the Mistral **text** `rms_norm_eps` (1e-5), per the reference. Full precision, like the
 /// vision tower.
 pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
-    let selected = crate::config::DEV_ENCODER_CONTRACT
+    load_multimodal_projector_dev_with_contracts(
+        root,
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+pub(crate) fn load_multimodal_projector_dev_with_contracts(
+    root: &Path,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
+) -> Result<Mistral3Projector> {
+    let selected = language_contract
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-    selected.validate_vision(
-        &crate::config::DEV_VISION_ENCODER_CONTRACT,
-        &crate::config::DEV_ENCODER_CONTRACT,
-    )?;
+    selected.validate_vision(&vision_contract, &language_contract)?;
     selected.read_unchanged(|source| {
         let w = weights_from_source(source)?;
         let projector = load_multimodal_projector_dev_from(&w)?;

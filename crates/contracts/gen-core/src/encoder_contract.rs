@@ -391,7 +391,7 @@ impl ValidatedEncoderSource {
         provider_id: &str,
     ) -> Result<Option<i32>> {
         self.ensure_unchanged()?;
-        resolve_load_time_quant_bits(self.packed_quant_bits, expected_bits, provider_id)
+        resolve_encoder_load_time_quant_bits(self.packed_quant_bits, expected_bits, provider_id)
     }
 
     /// Exact bytes in the direct shard inventory accepted by both backends. Nested files are not
@@ -793,10 +793,17 @@ fn text_encoder_load_time_quant_bits(
     provider_id: &str,
 ) -> Result<Option<i32>> {
     let packed_bits = text_encoder_packed_quant_bits(source)?;
-    resolve_load_time_quant_bits(packed_bits, expected_bits, provider_id)
+    resolve_encoder_load_time_quant_bits(packed_bits, expected_bits, provider_id)
 }
 
-fn resolve_load_time_quant_bits(
+/// Resolve the pure packed-source versus provider-tier policy used by
+/// [`ValidatedEncoderSource::load_time_quant_bits`].
+///
+/// Keeping this independent of filesystem receipts lets memory projection and catalog tests cover
+/// the complete policy matrix from already validated header facts. Production source admission
+/// still owns artifact sealing and calls the same resolver only after validation has established
+/// `packed_bits` from the selected source.
+pub fn resolve_encoder_load_time_quant_bits(
     packed_bits: Option<i32>,
     expected_bits: Option<i32>,
     provider_id: &str,

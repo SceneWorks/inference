@@ -1,7 +1,6 @@
 //! Exact, request-scoped Candle/CUDA memory contract for the three public Boogu routes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -104,7 +103,11 @@ impl ArtifactReceipt {
             } else {
                 gen_core::PinnedWeightsFile::pin(&path)?
             };
-            let digest = pin.read_unchanged(sha256_file)?;
+            let digest = pin
+                .content_sha256()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
             inventory.push((path, pin, digest));
         }
         let receipt = Self {
@@ -132,35 +135,15 @@ impl ArtifactReceipt {
             ));
         }
         for (_, pin, digest) in &self.inventory {
-            let current_digest = pin.read_unchanged(sha256_file)?;
             if digest.len() != 64 {
                 return Err(gen_core::Error::Unsupported(
                     "boogu: immutable artifact receipt contains an invalid digest".into(),
                 ));
             }
-            if current_digest != *digest {
-                return Err(gen_core::Error::Unsupported(
-                    "boogu: artifact contents changed after the immutable load receipt was sealed"
-                        .into(),
-                ));
-            }
+            pin.verify_unchanged()?;
         }
         Ok(())
     }
-}
-
-fn sha256_file(path: &Path) -> gen_core::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn validate_load_spec(provider: &str, spec: &LoadSpec) -> gen_core::Result<()> {
@@ -1156,9 +1139,12 @@ impl MemoryRequestScope for BooguRequestScope {
                     .conditioning
                     .iter()
                     .find_map(|conditioning| match conditioning {
-                        gen_core::Conditioning::Reference { strength, .. } => {
-                            Some(strength.or(request.strength).unwrap_or_default() > 0.0)
-                        }
+                        gen_core::Conditioning::Reference { strength, .. } => Some(
+                            strength
+                                .or(request.strength)
+                                .unwrap_or(crate::pipeline::DEFAULT_IMG2IMG_STRENGTH)
+                                > 0.0,
+                        ),
                         _ => None,
                     })
                     .unwrap_or(false);

@@ -175,7 +175,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
     let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageEdit {
@@ -198,28 +198,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// byte-identical to the pre-seam one. The deferral is weight-free-testable: under `Sequential` this
 /// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and fail
 /// the "Sequential defers" unit test.
-#[cfg(test)]
-fn build_residency(
-    spec: &LoadSpec,
-) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
-    let root = resolve_root(spec)?;
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
-    build_residency_with_source(spec, text_encoder_source)
-}
-
 fn build_residency_with_source(
     spec: &LoadSpec,
     text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
     let root = resolve_root(spec)?;
-    let vision_encoder_source = crate::ENCODER_CONTRACT
+    let encoder_contract = crate::active_encoder_contract();
+    let vision_encoder_source = encoder_contract
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     vision_encoder_source
-        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
+        .validate_vision(&crate::active_vision_encoder_contract(), &encoder_contract)?;
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
+    crate::model::residency_from_spec(
+        spec,
         move || load_vl_encoder_only(&text_encoder_source, &vision_encoder_source),
         move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
     )
@@ -797,47 +788,48 @@ mod tests {
         assert_eq!(got.last().unwrap().width, 24);
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Edit's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the up-front
-    // precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL vision-language encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
+    fn sealed_then_mutated_language_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let contract = crate::active_encoder_contract();
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::ENCODER_CONTRACT,
-            crate::VISION_ENCODER_CONTRACT,
+            &fixture.path().join("text_encoder"),
+            contract,
+            crate::active_vision_encoder_contract(),
         )
-        .expect("validation-complete text encoder fixture");
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
+        .unwrap();
+        let alternate = fixture.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&alternate, contract).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_text_encoder(WeightsSource::Dir(alternate.clone()))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(alternate.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let fixture = tempfile::tempdir().expect("snapshot fixture");
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
-        let res = build_residency(&spec)
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) =
+            sealed_then_mutated_language_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
+        assert!(residency.is_sequential());
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let fixture = tempfile::tempdir().expect("snapshot fixture");
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
-        let err = build_residency(&spec)
+    fn build_residency_resident_eagerly_invokes_the_text_loader() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_language_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
             .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+            .expect("Resident must eagerly invoke the production edit text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

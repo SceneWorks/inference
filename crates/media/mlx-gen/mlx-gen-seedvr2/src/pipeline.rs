@@ -459,8 +459,9 @@ impl Seedvr2Pipeline {
     }
 
     /// Per-frame color-correct a decoded clip `(1,3,T,Hc,Wc)` against its preprocessed `style`
-    /// `(1,3,Ts,Hc,Wc)` → `count` RGB8 frames. Frame `t` matches style frame `min(t, Ts-1)` (the
-    /// reference `to_uint8_frames`).
+    /// `(1,3,Ts,Hc,Wc)` → `count` RGB8 frames. `count` includes only real frames needed by
+    /// assembly, never trailing last-frame padding. Frame `t` matches style frame `min(t, Ts-1)`
+    /// (the reference `to_uint8_frames`).
     fn frames_from_decoded(
         &self,
         decoded: &Array,
@@ -593,7 +594,10 @@ impl Seedvr2Pipeline {
             .clone();
         let ts = Array::from_f32(TIMESTEP);
         let total_chunks = plan.len() as u32;
-        let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(plan.len());
+        // Stream decoded chunks directly into the assembled output. Retaining every chunk would
+        // duplicate the full clip (plus overlap frames) in host RAM; only `out` and one current
+        // chunk are live here, and the output order/cross-fade schedule are unchanged (F-165).
+        let mut out = Vec::with_capacity(n as usize);
         for (chunk_idx, Chunk { start, len }) in plan.iter().enumerate() {
             // F-099: per-chunk progress — a minutes-long N-chunk run used to report a single
             // Step{1,1}. Emitted before the chunk's compute, mirroring the image path's
@@ -618,14 +622,19 @@ impl Seedvr2Pipeline {
             let cond = Self::condition(&latent)?;
             let latents = self.denoise(&noise, &cond, &neg, &ts)?;
             let decoded = self.decode_crop_5d(&latents, height, width)?;
-            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len, cancel)?);
+            // The final chunk is temporally padded to a VAE-valid length. Its padding would be
+            // dropped by assembly, so skip its expensive host color correction entirely.
+            let real_count = video::real_frame_count(*start, *len, n);
+            let chunk_frames = self.frames_from_decoded(&decoded, &clip, real_count, cancel)?;
+            video::assemble_overlap_chunk(
+                &mut out,
+                *start,
+                chunk_frames,
+                n,
+                video::DEFAULT_OVERLAP,
+            );
         }
-        Ok(video::assemble_overlap(
-            &plan,
-            &chunk_frames,
-            n,
-            video::DEFAULT_OVERLAP,
-        ))
+        Ok(out)
     }
 
     /// Per-frame (`T=1`) video fallback: each frame through the still path with a fixed (anchored)

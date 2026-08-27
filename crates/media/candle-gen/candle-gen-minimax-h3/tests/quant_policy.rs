@@ -267,6 +267,22 @@ fn the_token_table_loads_through_a_packed_path() {
         ),
         "a packed table must stay quantized, not be rebuilt densely"
     );
+    let storage = loaded
+        .embedding
+        .resident_storage()
+        .expect("packed table exposes its retained storage");
+    assert!(
+        storage.host_packed_bytes > 0,
+        "the packed table retains its compact rows on the host"
+    );
+    assert_eq!(
+        storage.device_table_bytes, 0,
+        "sc-21684: a packed table must not retain a redundant full-vocabulary device QTensor"
+    );
+    assert_eq!(
+        loaded.base_bytes, storage.device_table_bytes,
+        "MiniMax device accounting must follow QEmbedding's host-only packed representation"
+    );
 }
 
 /// **Every dense-by-policy tensor is REFUSED if it ever arrives packed** — the sc-14980 class.

@@ -407,7 +407,7 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         None => 0,
     };
     let selected_text_encoder =
-        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+        crate::model::runtime_encoder_contract().source_for_load(spec, base_snapshot_dir)?;
     let expected_language_bits =
         crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
     let conditioning_bytes = crate::model::selected_language_resident_bytes(
@@ -545,7 +545,8 @@ fn asset_facts(
             }
         })
     };
-    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let selected_text_encoder =
+        crate::model::runtime_encoder_contract().source_for_load(spec, root)?;
     let expected_language_bits = crate::model::effective_base_quant_bits(spec, root, provider_id)?;
     let conditioning_bytes = crate::model::selected_language_resident_bytes(
         &selected_text_encoder,
@@ -815,7 +816,7 @@ mod tests {
         }
         gen_core_testkit::write_encoder_contract_fixture(
             &root.join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
     }
@@ -1122,12 +1123,30 @@ mod tests {
         let contract = memory_strategy_contract("krea_2_turbo_control", &spec).unwrap();
         // Q8: 128 code bytes + two 2x1 bf16 tables (8 bytes). A uniform Q4 projection would be 72.
         assert_eq!(contract.asset_facts.overlay_bytes, 136);
-        // The runtime retains exactly 35 language layers (the authored 36th layer is never loaded),
-        // with projection matrices at Q4 and embeddings/norms dense.
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2_765_258_240);
+        // The bounded sealed-source receipt retains every compact loaded layer, with projection
+        // matrices at Q4 and embeddings/norms dense. The production 35-layer total is asserted from
+        // pure production headers in model::tests.
+        let headers = gen_core_testkit::encoder_contract_fixture_tensor_headers(
+            crate::model::test_encoder_contract(),
+            None,
+        )
+        .unwrap();
+        let conditioning_bytes =
+            mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
+                if crate::convert::is_text_encoder_quant_target(&tensor.name) {
+                    ResidentProjection::GroupQuantized {
+                        bits: 4,
+                        group_size: crate::quant::GROUP_SIZE as usize,
+                    }
+                } else {
+                    ResidentProjection::Stored
+                }
+            })
+            .unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, conditioning_bytes);
         assert_eq!(contract.asset_facts.transformer_bytes, 256);
         assert_eq!(contract.asset_facts.decoder_bytes, 256);
-        assert_eq!(contract.asset_facts.base_bytes, 2_765_258_752);
+        assert_eq!(contract.asset_facts.base_bytes, conditioning_bytes + 512);
         assert_eq!(contract.auxiliary_resident_bytes(), 136);
         assert!(contract.conformance_errors().is_empty());
     }
@@ -1212,7 +1231,7 @@ mod tests {
         let external_text_encoder = root.join("external-text");
         gen_core_testkit::write_encoder_contract_fixture(
             &external_text_encoder,
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete selected text encoder fixture");
         text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));

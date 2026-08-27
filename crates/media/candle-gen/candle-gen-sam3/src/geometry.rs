@@ -18,9 +18,9 @@
 
 use std::f32::consts::PI;
 
-use candle_gen::candle_core::{Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::Quant;
-use candle_gen::Result;
+use candle_gen::{CandleError, Result};
 
 use crate::common::{join, layer_norm, Linear, Weights};
 use crate::config::Sam3GeometryConfig;
@@ -157,9 +157,12 @@ impl Sam3GeometryEncoder {
         vision: &Tensor,
         vision_pos: &Tensor,
     ) -> Result<Tensor> {
+        // Request-supplied prompts must be rejected before shape indexing or the host-built
+        // ROI-align matrix. In particular, an unchecked giant extent makes roi_align_matrix's
+        // adaptive grid loops unbounded.
+        let (n, boxes_host) = validate_box_prompts(boxes, box_labels)?;
         let (_, h, w, _) = vision.dims4()?;
         let c = self.cfg.hidden_size;
-        let n = boxes.dim(1)?;
         let device = vision.device();
         let eps = self.cfg.layer_norm_eps;
 
@@ -168,7 +171,6 @@ impl Sam3GeometryEncoder {
 
         // (2) ROI-align pooling of the channel-normalized 72² feature, then the 7×7 conv
         let norm_feat = layer_norm(vision, &self.vision_ln_w, &self.vision_ln_b, eps)?; // [1,H,W,C]
-        let boxes_host: Vec<f32> = boxes.flatten_all()?.to_vec1::<f32>()?; // N·4 cxcywh
         let pooled = self.roi_pool(&boxes_host, n, &norm_feat, h, w)?; // [1, N, C]
 
         // (3) sine position encoding of the box center (+ raw h/w), projected to C
@@ -238,6 +240,47 @@ impl Sam3GeometryEncoder {
             .broadcast_add(&self.boxes_pool_b)?
             .reshape((1, n, c))?)
     }
+}
+
+/// Validate request-supplied box prompts before any shape indexing or host ROI work. Boxes must be
+/// `[1, n, 4]` with `n >= 1`; labels must be one `{0, 1}` entry per box; and all normalized cxcywh
+/// coordinates must be finite and in `[0, 1]`. The coordinate bound caps ROI-align's host loops.
+fn validate_box_prompts(boxes: &Tensor, box_labels: &[i32]) -> Result<(usize, Vec<f32>)> {
+    let shape = boxes.dims();
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != 4 || shape[1] < 1 {
+        return Err(CandleError::Msg(format!(
+            "sam3 box prompts must be [1, n, 4] normalized cxcywh with n >= 1, got shape {shape:?}"
+        )));
+    }
+    let n = shape[1];
+    if box_labels.len() != n {
+        return Err(CandleError::Msg(format!(
+            "sam3 box prompts: {} label(s) for {n} box(es)",
+            box_labels.len()
+        )));
+    }
+    if let Some(&label) = box_labels.iter().find(|&&label| label != 0 && label != 1) {
+        return Err(CandleError::Msg(format!(
+            "sam3 box label {label} out of range (expected 0 = negative or 1 = positive)"
+        )));
+    }
+
+    let host = boxes
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    if let Some((index, &value)) = host
+        .iter()
+        .enumerate()
+        .find(|(_, &value)| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(CandleError::Msg(format!(
+            "sam3 box {} cxcywh component {} is {value} (must be finite and in [0, 1])",
+            index / 4,
+            index % 4
+        )));
+    }
+    Ok((n, host))
 }
 
 /// Sine position encoding of box centers (+ raw height/width), `[1, N, C+2]`. Mirrors
@@ -357,6 +400,13 @@ fn bilinear_acc(row: &mut [f32], h: i32, w: i32, y: f32, x: f32, weight: f32) {
 mod tests {
     use super::*;
 
+    mod box_prompt_cases {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../sam3_box_prompt_cases.rs"
+        ));
+    }
+
     #[test]
     fn roi_align_matrix_rows_are_normalized() {
         // A box covering the whole 4×4 feature → every output cell's weights sum to 1.
@@ -377,6 +427,38 @@ mod tests {
         assert!((row[2 * 4 + 1] - 1.0).abs() < 1e-6);
         let total: f32 = row.iter().sum();
         assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    /// Shared MLX/Candle table: malformed request prompts fail before any host ROI indexing, while
+    /// accepted values reach the geometry stages unchanged.
+    #[test]
+    fn validate_box_prompts_matches_backend_neutral_cases() {
+        for case in box_prompt_cases::BOX_PROMPT_CASES {
+            let boxes = Tensor::from_vec(case.values.to_vec(), case.shape, &Device::Cpu).unwrap();
+            match (&case.expected, validate_box_prompts(&boxes, case.labels)) {
+                (box_prompt_cases::ExpectedBoxPromptResult::Accept { n }, Ok((got_n, host))) => {
+                    assert_eq!(got_n, *n, "{}: box count", case.name);
+                    assert_eq!(host, case.values, "{}: valid values changed", case.name);
+                }
+                (
+                    box_prompt_cases::ExpectedBoxPromptResult::Reject { message },
+                    Err(CandleError::Msg(error)),
+                ) => assert!(
+                    error.contains(message),
+                    "{}: expected {message:?} in {error:?}",
+                    case.name
+                ),
+                (expected, result) => panic!(
+                    "{}: expected {} but got {result:?}",
+                    case.name,
+                    match expected {
+                        box_prompt_cases::ExpectedBoxPromptResult::Accept { .. } => "acceptance",
+                        box_prompt_cases::ExpectedBoxPromptResult::Reject { .. } =>
+                            "typed rejection",
+                    }
+                ),
+            }
+        }
     }
 
     #[test]
