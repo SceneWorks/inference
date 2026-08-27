@@ -544,10 +544,29 @@ pub fn install_dotted_adapters(
                     }
                 }
                 if a.dims()[0] != in_features || b.dims()[1] != out_features {
+                    // sc-11045 fix round (MAJOR 7): on an NVFP4 host a mis-shaped factor is a
+                    // typed refusal, never a silent skip — there is no fallback regime that could
+                    // have rendered it, so "skipped" would mean "silently un-adapted".
+                    if linear.is_nvfp4() {
+                        return Err(candle_core::Error::Msg(format!(
+                            "{family}: LoRA factors for `{}` reconstruct [in={}, out={}], which \
+                             does not compose against the NVFP4 base [out={out_features}, \
+                             in={in_features}]; an NVFP4 base refuses a mismatched factor rather \
+                             than skipping it",
+                            candidate.key,
+                            a.dims()[0],
+                            b.dims()[1],
+                        )));
+                    }
                     report.skipped_keys += 1;
                     continue;
                 }
-                linear.push_lora(a.to_device(device)?, b.to_device(device)?, item.scale);
+                // Routed through the checked push on an NVFP4 host (`push_lora` delegates to
+                // `push_lora_checked` there, sc-21483/sc-11045), so dtype/device admission is
+                // typed at install.
+                linear
+                    .push_lora(a.to_device(device)?, b.to_device(device)?, item.scale)
+                    .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
                 report.applied += 1;
                 applied_sources.insert(item.source);
             }
@@ -614,11 +633,16 @@ pub fn install_dotted_adapters(
                         candidate.key
                     )));
                 };
-                linear.push_lokr_structured(
-                    factors
-                        .to_device(device)
-                        .map_err(|error| candle_core::Error::Msg(error.to_string()))?,
-                );
+                // Routed through the checked push on an NVFP4 host (`push_lokr_structured`
+                // delegates to the checked form there, sc-21483/sc-11045): a factor set that does
+                // not reconstruct the base shape is a typed refusal at install.
+                linear
+                    .push_lokr_structured(
+                        factors
+                            .to_device(device)
+                            .map_err(|error| candle_core::Error::Msg(error.to_string()))?,
+                    )
+                    .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
                 report.applied += 1;
                 applied_sources.insert(item.source);
             }
@@ -752,6 +776,71 @@ mod tests {
         )
         .expect_err("one valid adapter must not hide a later zero-match adapter");
         assert!(error.to_string().contains(&partial.display().to_string()));
+    }
+
+    /// **sc-11045 fix round (MAJOR 7): a mis-shaped factor against an NVFP4 host is a typed
+    /// refusal at install, never a silent `skipped_keys` bump.** The scenario the silent skip
+    /// hides is exactly this one: an adapter whose file also carries a well-shaped factor for a
+    /// sibling projection "applies" (the whole-spec zero-match check passes) while the mis-shaped
+    /// key is dropped — a partially, silently un-adapted NVFP4 render (epic E6).
+    ///
+    /// # Mutation
+    ///
+    /// Remove the `linear.is_nvfp4()` refusal in the visitor's shape check (restore the plain
+    /// `skipped_keys += 1; continue`): the install below succeeds with one silently skipped key
+    /// and the `unwrap_err` goes red.
+    #[test]
+    fn a_mis_shaped_factor_against_an_nvfp4_host_refuses_instead_of_skipping() {
+        use super::super::{ActPrecision, Nvfp4Linear};
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = temp.path().join("nvfp4-mixed-shapes.safetensors");
+        // One well-shaped target ("layers.0.good": 64→32) and one mis-shaped ("layers.0.bad":
+        // written 16→32 against a 64→32 host) in the SAME file.
+        let device = Device::Cpu;
+        let mut tensors = HashMap::new();
+        for (target, in_dim) in [("layers.0.good", 64usize), ("layers.0.bad", 16usize)] {
+            tensors.insert(
+                format!("{target}.lora_A.weight"),
+                Tensor::ones((1, in_dim), DType::F32, &device).unwrap(),
+            );
+            tensors.insert(
+                format!("{target}.lora_B.weight"),
+                Tensor::ones((32, 1), DType::F32, &device).unwrap(),
+            );
+        }
+        safetensors::serialize_to_file(tensors.into_iter().collect::<Vec<_>>(), None, &adapter)
+            .unwrap();
+
+        let nvfp4_host = |out_dim: usize, in_dim: usize| {
+            let w: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| ((i % 17) as f32 - 8.0) / 11.0)
+                .collect();
+            let w = Tensor::from_vec(w, (out_dim, in_dim), &device).unwrap();
+            let lin = Nvfp4Linear::from_dense(&w, None, &device, ActPrecision::W4A16).unwrap();
+            AdaptLinear::from_nvfp4(lin)
+        };
+        let mut good = nvfp4_host(32, 64);
+        let mut bad = nvfp4_host(32, 64);
+        let error = install_dotted_adapters(
+            "fixture",
+            &[AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)],
+            &device,
+            |visitor| {
+                visitor("layers.0.good", &mut good)?;
+                visitor("layers.0.bad", &mut bad)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("NVFP4 base") && error.contains("layers.0.bad"),
+            "the refusal must name the NVFP4 base and the offending key: {error}"
+        );
+        assert!(
+            !bad.is_adapted(),
+            "nothing may be attached to the mis-matched host"
+        );
     }
 
     #[test]

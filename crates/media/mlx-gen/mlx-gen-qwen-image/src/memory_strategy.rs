@@ -221,6 +221,45 @@ pub(crate) fn weights_free_memory_strategy_contract(
     memory_strategy_contract_with_asset_facts(provider_id, spec, 0, 0, 0, 0)
 }
 
+/// Whether the registry surface this selector names ships a device-format transformer.
+///
+/// [`is_streamable_spec`] answers that by probing the packed-quant marker on disk, which a
+/// weights-free witness has no directory to read. The selector already names the *resolved*
+/// artifact tier, so an on-disk packed snapshot at that tier is exactly the shape it denotes and
+/// the marker probe is satisfied by construction. Every other axis still comes from the spec.
+fn surface_is_streamable(surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec) -> bool {
+    use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+    matches!(
+        surface.resolved_artifact_tier(),
+        MemoryContractSurfaceTier::Bf16
+            | MemoryContractSurfaceTier::Q4
+            | MemoryContractSurfaceTier::Q8
+    ) && matches!(surface.spec.offload_policy, OffloadPolicy::Sequential)
+        && matches!(surface.spec.load_shape, LoadShape::DeferredMaterialization)
+        && matches!(surface.spec.precision, Precision::Bf16)
+        && surface.spec.pid.is_none()
+}
+
+/// Declaration-equivalent contract resolved from the explicit surface selector.
+///
+/// Registered for the base and edit routes only. Control keeps the `LoadSpec` factory: its separate
+/// unbounded five-block branch excludes it from rungs 3 and 4 at every tier regardless of selector.
+pub(crate) fn weights_free_memory_surface_contract(
+    provider_id: &str,
+    surface: &mlx_gen::gen_core::MemoryContractSurfaceSpec,
+) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        &surface.spec,
+        surface_is_streamable(surface),
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
 fn memory_strategy_contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -229,8 +268,28 @@ fn memory_strategy_contract_with_asset_facts(
     decoder_bytes: u64,
     overlay_bytes: u64,
 ) -> CoreResult<MemoryProviderContract> {
+    contract_with_asset_facts_and_streamability(
+        provider_id,
+        spec,
+        is_streamable_spec(spec),
+        conditioning_bytes,
+        transformer_bytes,
+        decoder_bytes,
+        overlay_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn contract_with_asset_facts_and_streamability(
+    provider_id: &str,
+    spec: &LoadSpec,
+    streamable: bool,
+    conditioning_bytes: u64,
+    transformer_bytes: u64,
+    decoder_bytes: u64,
+    overlay_bytes: u64,
+) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
-    let streamable = is_streamable_spec(spec);
     // The optional control route owns a separate five-block attention branch which is not yet
     // windowed by the shared block loader.  It may use the native tiled VAE, but must not inherit
     // the base/edit route's rung-3 or rung-4 claims merely because those providers share a crate.

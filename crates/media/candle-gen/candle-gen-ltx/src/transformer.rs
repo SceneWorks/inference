@@ -9,12 +9,20 @@
 //! each adaLN-modulated (`x·(1+scale)+shift`) and gated (`x + out·gate`). Our checkpoint is dense
 //! bf16; the whole forward runs bf16, with attention/norms/layernorm computed in f32 for fidelity.
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use candle_gen::candle_core::{DType, Device, DeviceLocation, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, VarBuilder};
 
 use crate::config::AvConfig;
 use crate::quant::{qlinear, QLinear};
 use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
+
+static NEXT_AVDIT_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_avdit_load_id() -> u64 {
+    NEXT_AVDIT_LOAD_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Packed-detecting biased Linear (sc-9417): loads the MLX-packed AvDiT projection triple when a
 /// `{key}.scales` sibling is present (attn `to_{q,k,v,out}` + `ff.proj_in/out` are packed in the
@@ -556,6 +564,49 @@ mod tests {
         assert!((out[3] - 4.0).abs() < 1e-6);
         Ok(())
     }
+
+    #[test]
+    fn prepared_av_request_reuses_once_and_rejects_stale_identity() -> Result<()> {
+        let device = Device::Cpu;
+        let video = Tensor::zeros((1, 2, 128), DType::F32, &device)?;
+        let audio = Tensor::zeros((1, 3, 128), DType::F32, &device)?;
+        let video_grid = Tensor::zeros((1, 3, 2, 2), DType::F32, &device)?;
+        let audio_grid = Tensor::zeros((1, 1, 3, 2), DType::F32, &device)?;
+        let prepared = PreparedAvRequest::new(17, &video, &audio, &video_grid, &audio_grid)?;
+
+        // One preparation remains valid for every same-spec denoise latent in the request.
+        for _ in 0..2 {
+            let next_video = Tensor::ones((1, 2, 128), DType::F32, &device)?;
+            let next_audio = Tensor::ones((1, 3, 128), DType::F32, &device)?;
+            prepared.validate(17, &next_video, &next_audio, &video_grid, &audio_grid)?;
+        }
+
+        // A same-shape replacement grid can carry different positions and must be rebuilt.
+        let changed_grid = Tensor::ones((1, 3, 2, 2), DType::F32, &device)?;
+        assert!(prepared
+            .validate(17, &video, &audio, &changed_grid, &audio_grid)
+            .is_err());
+        let rebuilt = PreparedAvRequest::new(17, &video, &audio, &changed_grid, &audio_grid)?;
+        rebuilt.validate(17, &video, &audio, &changed_grid, &audio_grid)?;
+
+        let wrong_geometry = Tensor::zeros((1, 4, 128), DType::F32, &device)?;
+        assert!(prepared
+            .validate(17, &video, &wrong_geometry, &video_grid, &audio_grid)
+            .is_err());
+        let wrong_dtype = video.to_dtype(DType::F16)?;
+        assert!(prepared
+            .validate(17, &wrong_dtype, &audio, &video_grid, &audio_grid)
+            .is_err());
+        let mut wrong_device = prepared.clone();
+        wrong_device.video_latent.device = DeviceLocation::Metal { gpu_id: 7 };
+        assert!(wrong_device
+            .validate(17, &video, &audio, &video_grid, &audio_grid)
+            .is_err());
+        assert!(prepared
+            .validate(18, &video, &audio, &video_grid, &audio_grid)
+            .is_err());
+        Ok(())
+    }
 }
 
 /// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables → `(scale_a2v,
@@ -756,14 +807,109 @@ impl AvBlock {
     }
 }
 
-/// Per-render RoPE-table cache (sc-8992 / F-012). LTX builds **four** split-RoPE `(cos, sin)` tables
-/// per forward (video self, video↔time cross, audio self, audio↔time cross) — ~4.7M trig evals — all
-/// derived solely from the fixed `video_grid`/`audio_grid` position grids, not σ / the latents. So they
-/// are identical across every denoise step. Cache them keyed on the grids' host contents (a few hundred
-/// floats, negligible vs the trig) and rebuild only when the grids change. Byte-identical to recomputing.
-struct AvRopeCache {
-    video_grid: Vec<f32>,
-    audio_grid: Vec<f32>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSpec {
+    shape: Vec<usize>,
+    dtype: DType,
+    device: DeviceLocation,
+}
+
+impl TensorSpec {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            shape: tensor.dims().to_vec(),
+            dtype: tensor.dtype(),
+            device: tensor.device().location(),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.dims() == self.shape
+            && tensor.dtype() == self.dtype
+            && tensor.device().location() == self.device
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorIdentity {
+    id: TensorId,
+    spec: TensorSpec,
+}
+
+impl TensorIdentity {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            id: tensor.id(),
+            spec: TensorSpec::new(tensor),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.id() == self.id && self.spec.matches(tensor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedAvRequest {
+    model_load_id: u64,
+    video_latent: TensorSpec,
+    audio_latent: TensorSpec,
+    video_grid: TensorIdentity,
+    audio_grid: TensorIdentity,
+}
+
+impl PreparedAvRequest {
+    fn new(
+        model_load_id: u64,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<Self> {
+        let (_, video_tokens, _) = video_latent.dims3()?;
+        let (_, audio_tokens, _) = audio_latent.dims3()?;
+        let (_, _, video_grid_tokens, _) = video_grid.dims4()?;
+        let (_, _, audio_grid_tokens, _) = audio_grid.dims4()?;
+        if video_tokens != video_grid_tokens || audio_tokens != audio_grid_tokens {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx: latent token counts ({video_tokens}, {audio_tokens}) do not match position-grid token counts ({video_grid_tokens}, {audio_grid_tokens})"
+            )));
+        }
+        Ok(Self {
+            model_load_id,
+            video_latent: TensorSpec::new(video_latent),
+            audio_latent: TensorSpec::new(audio_latent),
+            video_grid: TensorIdentity::new(video_grid),
+            audio_grid: TensorIdentity::new(audio_grid),
+        })
+    }
+
+    fn validate(
+        &self,
+        model_load_id: u64,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<()> {
+        if model_load_id != self.model_load_id
+            || !self.video_latent.matches(video_latent)
+            || !self.audio_latent.matches(audio_latent)
+            || !self.video_grid.matches(video_grid)
+            || !self.audio_grid.matches(audio_grid)
+        {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ltx: prepared RoPE request identity does not match model, geometry, position grid, dtype, or device".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request-scoped split-RoPE tables bound to the exact model load, position grids, latent geometry,
+/// dtype, and device that created them. The denoise latent value may change while its spec stays fixed.
+pub(crate) struct PreparedAvRope {
+    request: PreparedAvRequest,
     v_cos: Tensor,
     v_sin: Tensor,
     vc_cos: Tensor,
@@ -782,8 +928,7 @@ pub struct AvDiT {
     blocks: Vec<AvBlock>,
     cfg: AvConfig,
     device: Device,
-    /// `Mutex` (not `RefCell`): the DiT is shared as `Arc<AvDiT>` and must stay `Send + Sync`.
-    rope_cache: std::sync::Mutex<Option<AvRopeCache>>,
+    load_id: u64,
 }
 
 impl AvDiT {
@@ -832,7 +977,7 @@ impl AvDiT {
             blocks,
             cfg: cfg.clone(),
             device,
-            rope_cache: std::sync::Mutex::new(None),
+            load_id: next_avdit_load_id(),
         })
     }
 
@@ -865,28 +1010,22 @@ impl AvDiT {
         }
     }
 
-    /// Build (or reuse) the four split-RoPE tables for this render's fixed position grids (sc-8992).
-    /// Recomputed only when `video_grid`/`audio_grid` change; otherwise the Arc-backed handles are
-    /// cloned. Construction is identical to computing it inline, so every step is byte-identical.
-    #[allow(clippy::type_complexity)]
-    fn rope_tables(
+    /// Build the four split-RoPE tables once for a request. This deliberately has no model-owned cache:
+    /// callers retain the prepared object for the render, avoiding host key extraction on each forward.
+    pub(crate) fn prepare_rope(
         &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
         video_grid: &Tensor,
         audio_grid: &Tensor,
-    ) -> Result<[(Tensor, Tensor); 4]> {
-        let vkey = video_grid.flatten_all()?.to_vec1::<f32>()?;
-        let akey = audio_grid.flatten_all()?.to_vec1::<f32>()?;
-        let mut guard = candle_gen::lock_recover(&self.rope_cache);
-        if let Some(c) = guard.as_ref() {
-            if c.video_grid == vkey && c.audio_grid == akey {
-                return Ok([
-                    (c.v_cos.clone(), c.v_sin.clone()),
-                    (c.vc_cos.clone(), c.vc_sin.clone()),
-                    (c.a_cos.clone(), c.a_sin.clone()),
-                    (c.ac_cos.clone(), c.ac_sin.clone()),
-                ]);
-            }
-        }
+    ) -> Result<PreparedAvRope> {
+        let request = PreparedAvRequest::new(
+            self.load_id,
+            video_latent,
+            audio_latent,
+            video_grid,
+            audio_grid,
+        )?;
         let device = &self.device;
         let theta = self.cfg.video.rope_theta;
         // Self RoPE (video 3-axis @4096, audio 1-axis @2048) + cross RoPE (time axis @2048 both).
@@ -922,9 +1061,8 @@ impl AvDiT {
             self.cfg.audio_heads,
             device,
         )?;
-        *guard = Some(AvRopeCache {
-            video_grid: vkey,
-            audio_grid: akey,
+        Ok(PreparedAvRope {
+            request,
             v_cos: v_cos.clone(),
             v_sin: v_sin.clone(),
             vc_cos: vc_cos.clone(),
@@ -933,13 +1071,7 @@ impl AvDiT {
             a_sin: a_sin.clone(),
             ac_cos: ac_cos.clone(),
             ac_sin: ac_sin.clone(),
-        });
-        Ok([
-            (v_cos, v_sin),
-            (vc_cos, vc_sin),
-            (a_cos, a_sin),
-            (ac_cos, ac_sin),
-        ])
+        })
     }
 
     /// Joint velocity forward.
@@ -959,6 +1091,38 @@ impl AvDiT {
         video_grid: &Tensor,
         audio_grid: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        let prepared = self.prepare_rope(video_latent, audio_latent, video_grid, audio_grid)?;
+        self.forward_prepared(
+            video_latent,
+            audio_latent,
+            sigma,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            &prepared,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+        prepared: &PreparedAvRope,
+    ) -> Result<(Tensor, Tensor)> {
+        prepared.request.validate(
+            self.load_id,
+            video_latent,
+            audio_latent,
+            video_grid,
+            audio_grid,
+        )?;
         let device = &self.device;
         let b = video_latent.dim(0)?;
         let ts_mult = self.cfg.video.timestep_scale_multiplier;
@@ -971,8 +1135,7 @@ impl AvDiT {
             audio_latent,
             video_context,
             audio_context,
-            video_grid,
-            audio_grid,
+            prepared,
             &v_ts,
             &a_ts,
         )
@@ -992,6 +1155,40 @@ impl AvDiT {
         video_grid: &Tensor,
         audio_grid: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        let prepared = self.prepare_rope(video_latent, audio_latent, video_grid, audio_grid)?;
+        self.forward_conditioned_prepared(
+            video_latent,
+            audio_latent,
+            video_timesteps,
+            audio_sigma,
+            video_context,
+            audio_context,
+            video_grid,
+            audio_grid,
+            &prepared,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_conditioned_prepared(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        video_timesteps: &Tensor,
+        audio_sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+        prepared: &PreparedAvRope,
+    ) -> Result<(Tensor, Tensor)> {
+        prepared.request.validate(
+            self.load_id,
+            video_latent,
+            audio_latent,
+            video_grid,
+            audio_grid,
+        )?;
         let b = video_latent.dim(0)?;
         if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
             return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -1013,8 +1210,7 @@ impl AvDiT {
             audio_latent,
             video_context,
             audio_context,
-            video_grid,
-            audio_grid,
+            prepared,
             &v_ts,
             &a_ts,
         )
@@ -1027,16 +1223,10 @@ impl AvDiT {
         audio_latent: &Tensor,
         video_context: &Tensor,
         audio_context: &Tensor,
-        video_grid: &Tensor,
-        audio_grid: &Tensor,
+        prepared: &PreparedAvRope,
         v_ts: &AvTs,
         a_ts: &AvTs,
     ) -> Result<(Tensor, Tensor)> {
-        // The four split-RoPE tables are step-invariant (fixed position grids), so cache them per
-        // render and reuse across every step (sc-8992).
-        let [(v_cos, v_sin), (vc_cos, vc_sin), (a_cos, a_sin), (ac_cos, ac_sin)] =
-            self.rope_tables(video_grid, audio_grid)?;
-
         let mut vx = self
             .video
             .patchify
@@ -1055,10 +1245,10 @@ impl AvDiT {
             ts_emb: &v_ts.ts_emb,
             prompt_ts: &v_ts.prompt_ts,
             context: &v_ctx,
-            cos: &v_cos,
-            sin: &v_sin,
-            cross_cos: &vc_cos,
-            cross_sin: &vc_sin,
+            cos: &prepared.v_cos,
+            sin: &prepared.v_sin,
+            cross_cos: &prepared.vc_cos,
+            cross_sin: &prepared.vc_sin,
             cross_ss_ts: &v_ts.cross_ss_ts,
             cross_gate_ts: &v_ts.cross_gate_ts,
         };
@@ -1066,10 +1256,10 @@ impl AvDiT {
             ts_emb: &a_ts.ts_emb,
             prompt_ts: &a_ts.prompt_ts,
             context: &a_ctx,
-            cos: &a_cos,
-            sin: &a_sin,
-            cross_cos: &ac_cos,
-            cross_sin: &ac_sin,
+            cos: &prepared.a_cos,
+            sin: &prepared.a_sin,
+            cross_cos: &prepared.ac_cos,
+            cross_sin: &prepared.ac_sin,
             cross_ss_ts: &a_ts.cross_ss_ts,
             cross_gate_ts: &a_ts.cross_gate_ts,
         };

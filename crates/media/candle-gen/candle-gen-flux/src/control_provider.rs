@@ -405,12 +405,20 @@ impl Flux1DevControl {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
+        candle_gen::check_cancel(cancel)?;
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
         let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
         let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        let prepared = self.backbone.prepare_conditioning(
+            heavy,
+            &state.img,
+            &state.img_ids,
+            &state.txt,
+            &state.txt_ids,
+        )?;
         candle_gen::run_flow_sampler(
             None,
             TimestepConvention::Sigma,
@@ -434,7 +442,7 @@ impl Flux1DevControl {
                 let plan =
                     AttentionPlan::budgeted(AttentionBudget::from_score_elements(budget, false))
                         .with_cancel(cancel);
-                let residuals = self.branch.forward_with_memory(
+                let residuals = self.branch.forward_prepared_with_memory(
                     img,
                     control_latent,
                     &state.txt,
@@ -443,10 +451,11 @@ impl Flux1DevControl {
                     &state.txt_ids,
                     &t_vec,
                     Some(&guidance_t),
+                    prepared.conditioning(),
                     plan,
                     cancel,
                 )?;
-                self.backbone.forward_control_with_memory(
+                self.backbone.forward_control_prepared_with_memory(
                     heavy,
                     img,
                     &state.img_ids,
@@ -457,6 +466,7 @@ impl Flux1DevControl {
                     Some(&guidance_t),
                     injector,
                     Some((&residuals, control_scale)),
+                    &prepared,
                     cancel,
                 )
             },

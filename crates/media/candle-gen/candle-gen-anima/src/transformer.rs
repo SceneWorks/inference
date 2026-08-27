@@ -11,7 +11,9 @@
 //! cross-attn projection, ControlNet hooks. Heads == kv_heads (MHA, no GQA repeat in the DiT — the
 //! GQA 16/8 lives only in the Qwen3 encoder).
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use candle_gen::candle_core::{DType, Device, DeviceLocation, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::Result;
 
@@ -26,6 +28,84 @@ const ATTN_QK_NORM_EPS: f64 = 1e-5;
 const NORM_EPS: f64 = 1e-6;
 /// Sinusoidal timestep-embedding `max_period` (`Timesteps` default).
 const TIME_MAX_PERIOD: f64 = 10000.0;
+
+static NEXT_COSMOS_DIT_LOAD_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_cosmos_dit_load_id() -> u64 {
+    NEXT_COSMOS_DIT_LOAD_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorSpec {
+    shape: Vec<usize>,
+    dtype: DType,
+    device: DeviceLocation,
+}
+
+impl TensorSpec {
+    fn new(tensor: &Tensor) -> Self {
+        Self {
+            shape: tensor.dims().to_vec(),
+            dtype: tensor.dtype(),
+            device: tensor.device().location(),
+        }
+    }
+
+    fn matches(&self, tensor: &Tensor) -> bool {
+        tensor.dims() == self.shape
+            && tensor.dtype() == self.dtype
+            && tensor.device().location() == self.device
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedRopeRequest {
+    model_load_id: u64,
+    latent: TensorSpec,
+    patch_geometry: (usize, usize, usize),
+}
+
+impl PreparedRopeRequest {
+    fn new(
+        model_load_id: u64,
+        latents: &Tensor,
+        patch_size: (usize, usize, usize),
+    ) -> Result<Self> {
+        let (_b, _c, t, h, w) = latents.dims5()?;
+        let (pt, ph, pw) = patch_size;
+        Ok(Self {
+            model_load_id,
+            latent: TensorSpec::new(latents),
+            patch_geometry: (t / pt, h / ph, w / pw),
+        })
+    }
+
+    fn validate(
+        &self,
+        model_load_id: u64,
+        latents: &Tensor,
+        patch_size: (usize, usize, usize),
+    ) -> Result<()> {
+        let (_b, _c, t, h, w) = latents.dims5()?;
+        let (pt, ph, pw) = patch_size;
+        if model_load_id != self.model_load_id
+            || !self.latent.matches(latents)
+            || (t / pt, h / ph, w / pw) != self.patch_geometry
+        {
+            return Err(candle_gen::CandleError::Msg(
+                "anima: prepared RoPE request identity does not match model, geometry, dtype, or device".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Model-load-, geometry-, dtype-, and device-scoped Cosmos RoPE tables for one render. Keeping this
+/// handle with the request prevents a model-global cache from leaking tables between renders.
+pub(crate) struct PreparedRope {
+    rope: crate::rope::CosmosRope,
+    request: PreparedRopeRequest,
+}
 
 // Every DiT projection is a bias-less, **packed-detecting** [`AdaptLinear`] (`crate::adapt`): dense
 // `{name}.weight`, or an MLX-packed `{name}.weight` u32 codes + `.scales` + `.biases` (auto-detected by
@@ -371,6 +451,7 @@ pub struct CosmosDiT {
     proj_out: AdaptLinear, // final_layer.linear
     cfg: DitConfig,
     device: Device,
+    load_id: u64,
 }
 
 impl CosmosDiT {
@@ -389,6 +470,7 @@ impl CosmosDiT {
             proj_out: AdaptLinear::detect(vb, "final_layer.linear")?,
             cfg,
             device: vb.device().clone(),
+            load_id: next_cosmos_dit_load_id(),
         })
     }
 
@@ -468,6 +550,32 @@ impl CosmosDiT {
         encoder: &Tensor,
         dtype: DType,
     ) -> Result<Tensor> {
+        let prepared = self.prepare_rope(latents)?;
+        self.forward_prepared(latents, sigma, encoder, dtype, &prepared)
+    }
+
+    /// Prepare the geometry-derived tables once before entering a denoise loop.
+    pub(crate) fn prepare_rope(&self, latents: &Tensor) -> Result<PreparedRope> {
+        let request = PreparedRopeRequest::new(self.load_id, latents, self.cfg.patch_size)?;
+        let (pe_t, pe_h, pe_w) = request.patch_geometry;
+        Ok(PreparedRope {
+            rope: cosmos_image_rope(&self.cfg, pe_t, pe_h, pe_w, &self.device)?,
+            request,
+        })
+    }
+
+    /// Run one denoise step against a request-scoped prepared RoPE handle.
+    pub(crate) fn forward_prepared(
+        &self,
+        latents: &Tensor,
+        sigma: &Tensor,
+        encoder: &Tensor,
+        dtype: DType,
+        prepared: &PreparedRope,
+    ) -> Result<Tensor> {
+        prepared
+            .request
+            .validate(self.load_id, latents, self.cfg.patch_size)?;
         let latents = latents.to_dtype(dtype)?;
         let (b, _c, t, hl, wl) = latents.dims5()?;
         let (pt, ph, pw) = self.cfg.patch_size;
@@ -481,22 +589,25 @@ impl CosmosDiT {
             latents
         };
 
-        // 2. RoPE for this latent grid (per-axis OOD-guarded).
-        let rope = cosmos_image_rope(&self.cfg, pe_t, pe_h, pe_w, &self.device)?;
-
-        // 3. patchify + patch-embed -> [B, seq, hidden].
+        // 2. Patchify + patch-embed -> [B, seq, hidden].
         let hidden = self.patch_embed.forward(&self.patchify(&hidden)?)?;
 
-        // 4. time embedding.
+        // 3. time embedding.
         let (temb, embedded) = self.time_embed.forward(sigma, dtype)?;
 
-        // 5. transformer blocks.
+        // 4. transformer blocks.
         let mut hidden = hidden;
         for block in &self.blocks {
-            hidden = block.forward(&hidden, encoder, &embedded, &temb, (&rope.cos, &rope.sin))?;
+            hidden = block.forward(
+                &hidden,
+                encoder,
+                &embedded,
+                &temb,
+                (&prepared.rope.cos, &prepared.rope.sin),
+            )?;
         }
 
-        // 6. output norm + projection + unpatchify.
+        // 5. output norm + projection + unpatchify.
         let hidden = self.norm_out.forward(&hidden, &embedded, &temb)?;
         let hidden = self.proj_out.forward(&hidden)?;
         self.unpatchify(&hidden, pe_t, pe_h, pe_w)
@@ -515,6 +626,32 @@ mod tests {
     use candle_gen::candle_nn::{Linear, Module};
     use candle_gen::quant::MLX_GROUP_SIZE;
     use std::collections::HashMap;
+
+    #[test]
+    fn prepared_rope_request_reuses_once_and_rejects_stale_identity() -> Result<()> {
+        let device = Device::Cpu;
+        let latent = Tensor::zeros((1, 16, 1, 8, 8), DType::F32, &device)?;
+        let prepared = PreparedRopeRequest::new(31, &latent, (1, 2, 2))?;
+
+        // A render may replace the latent value on every step without rebuilding its RoPE tables.
+        for _ in 0..2 {
+            let next = Tensor::ones((1, 16, 1, 8, 8), DType::F32, &device)?;
+            prepared.validate(31, &next, (1, 2, 2))?;
+        }
+
+        let changed_geometry = Tensor::zeros((1, 16, 1, 8, 12), DType::F32, &device)?;
+        assert!(prepared.validate(31, &changed_geometry, (1, 2, 2)).is_err());
+        let rebuilt = PreparedRopeRequest::new(31, &changed_geometry, (1, 2, 2))?;
+        rebuilt.validate(31, &changed_geometry, (1, 2, 2))?;
+
+        let wrong_dtype = latent.to_dtype(DType::F16)?;
+        assert!(prepared.validate(31, &wrong_dtype, (1, 2, 2)).is_err());
+        let mut wrong_device = prepared.clone();
+        wrong_device.latent.device = DeviceLocation::Metal { gpu_id: 4 };
+        assert!(wrong_device.validate(31, &latent, (1, 2, 2)).is_err());
+        assert!(prepared.validate(32, &latent, (1, 2, 2)).is_err());
+        Ok(())
+    }
 
     /// Test-side MLX Q4 packer (group `g`): per-element 4-bit codes → u32 words (LSB-first nibbles).
     /// Returns `(wq [out, in/8] u32, scales [out, in/g], biases [out, in/g], affine grid [out, in])` —

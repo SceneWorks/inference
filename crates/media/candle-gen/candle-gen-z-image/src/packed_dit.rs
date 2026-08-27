@@ -686,6 +686,25 @@ pub struct ZImageTransformer2DModel {
     /// mutex-backed so parallel tests never share recorder state.
     #[cfg(test)]
     streamed_window_trace: std::sync::Mutex<Vec<(usize, usize)>>,
+    #[cfg(test)]
+    prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Request-owned geometry conditioning. RoPE tables and the refined caption stream are independent of
+/// the current denoise latent and timestep, so the render creates this once per CFG branch.
+pub(crate) struct PreparedConditioning {
+    geometry: (usize, usize, usize, usize, usize),
+    dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
+    orig_size: (usize, usize, usize),
+    img_seq_len: usize,
+    x_cos: Tensor,
+    x_sin: Tensor,
+    x_attn_mask: Tensor,
+    cap: Tensor,
+    unified_cos: Tensor,
+    unified_sin: Tensor,
+    unified_attn_mask: Tensor,
 }
 
 /// Main-stack residency for ladder rung 4. The front-end, refiners, and final projection remain
@@ -818,6 +837,8 @@ impl ZImageTransformer2DModel {
             cfg: cfg.clone(),
             #[cfg(test)]
             streamed_window_trace: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            prepare_calls: Default::default(),
         })
     }
 
@@ -1076,17 +1097,30 @@ impl ZImageTransformer2DModel {
         attention_plan: AttentionPlan<'_>,
         transformer_window: usize,
     ) -> candle_gen::Result<Tensor> {
+        let prepared = self.prepare_conditioning(x, cap_feats, cap_mask, attention_plan)?;
+        self.forward_prepared_with_memory(x, t, &prepared, attention_plan, transformer_window)
+    }
+
+    /// Materialize every geometry/caption-only tensor for one request. This is deliberately an
+    /// explicit handle instead of a model cache: changing latent geometry, dtype, or device yields a
+    /// new handle and concurrent requests cannot exchange RoPE tables.
+    pub(crate) fn prepare_conditioning(
+        &self,
+        x: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+        attention_plan: AttentionPlan<'_>,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        #[cfg(test)]
+        self.prepare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let device = x.device();
         let (b, _c, f, h, w) = x.dims5()?;
         let patch_size = self.cfg.all_patch_size[0];
         let f_patch_size = self.cfg.all_f_patch_size[0];
 
-        let t_scaled = (t * self.cfg.t_scale)?;
-        let adaln_input = self.t_embedder.forward(&t_scaled)?;
-
-        let (x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
-        let mut x = self.x_embedder.forward(&x_patches)?;
-        let img_seq_len = x.dim(1)?;
+        let (_x_patches, orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let img_seq_len = (f / f_patch_size) * (h / patch_size) * (w / patch_size);
 
         let f_tokens = f / f_patch_size;
         let h_tokens = h / patch_size;
@@ -1104,17 +1138,6 @@ impl ZImageTransformer2DModel {
 
         let x_attn_mask = Tensor::ones((b, img_seq_len), DType::U8, device)?;
         let cap_attn_mask = cap_mask.to_dtype(DType::U8)?;
-
-        for layer in &self.noise_refiner {
-            x = layer.forward_with_attention_plan(
-                &x,
-                Some(&x_attn_mask),
-                &x_cos,
-                &x_sin,
-                Some(&adaln_input),
-                attention_plan,
-            )?;
-        }
         for layer in &self.context_refiner {
             cap = layer.forward_with_attention_plan(
                 &cap,
@@ -1126,20 +1149,75 @@ impl ZImageTransformer2DModel {
             )?;
         }
 
-        let unified = Tensor::cat(&[&x, &cap], 1)?;
         let unified_pos_ids = Tensor::cat(&[&x_pos_ids, &cap_pos_ids], 0)?;
         let (unified_cos, unified_sin) = self.rope_embedder.forward(&unified_pos_ids)?;
         let unified_attn_mask = Tensor::cat(&[&x_attn_mask, &cap_attn_mask], 1)?;
 
-        let mut unified = unified;
+        Ok(PreparedConditioning {
+            geometry: (b, x.dim(1)?, f, h, w),
+            dtype: x.dtype(),
+            device: x.device().location(),
+            orig_size,
+            img_seq_len,
+            x_cos,
+            x_sin,
+            x_attn_mask,
+            cap,
+            unified_cos,
+            unified_sin,
+            unified_attn_mask,
+        })
+    }
+
+    #[cfg(test)]
+    fn prepare_calls(&self) -> usize {
+        self.prepare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        transformer_window: usize,
+    ) -> candle_gen::Result<Tensor> {
+        let (b, c, f, h, w) = x.dims5()?;
+        if (b, c, f, h, w) != prepared.geometry
+            || x.dtype() != prepared.dtype
+            || x.device().location() != prepared.device
+        {
+            return Err(candle_gen::CandleError::Msg(
+                "z-image: prepared conditioning geometry, dtype, or device does not match latent"
+                    .into(),
+            ));
+        }
+        let patch_size = self.cfg.all_patch_size[0];
+        let f_patch_size = self.cfg.all_f_patch_size[0];
+        let t_scaled = (t * self.cfg.t_scale)?;
+        let adaln_input = self.t_embedder.forward(&t_scaled)?;
+        let (x_patches, _orig_size) = patchify(x, patch_size, f_patch_size)?;
+        let mut x = self.x_embedder.forward(&x_patches)?;
+        for layer in &self.noise_refiner {
+            x = layer.forward_with_attention_plan(
+                &x,
+                Some(&prepared.x_attn_mask),
+                &prepared.x_cos,
+                &prepared.x_sin,
+                Some(&adaln_input),
+                attention_plan,
+            )?;
+        }
+        let mut unified = Tensor::cat(&[&x, &prepared.cap], 1)?;
         match &self.layers {
             TransformerLayers::Resident(layers) => {
                 for layer in layers {
                     unified = layer.forward_with_attention_plan(
                         &unified,
-                        Some(&unified_attn_mask),
-                        &unified_cos,
-                        &unified_sin,
+                        Some(&prepared.unified_attn_mask),
+                        &prepared.unified_cos,
+                        &prepared.unified_sin,
                         Some(&adaln_input),
                         attention_plan,
                     )?;
@@ -1201,9 +1279,9 @@ impl ZImageTransformer2DModel {
                             candle_gen::check_cancel(cancel)?;
                             state = block.forward_with_attention_plan(
                                 &state,
-                                Some(&unified_attn_mask),
-                                &unified_cos,
-                                &unified_sin,
+                                Some(&prepared.unified_attn_mask),
+                                &prepared.unified_cos,
+                                &prepared.unified_sin,
                                 Some(&adaln_input),
                                 attention_plan,
                             )?;
@@ -1214,11 +1292,11 @@ impl ZImageTransformer2DModel {
             }
         }
 
-        let x_out = unified.narrow(1, 0, img_seq_len)?;
+        let x_out = unified.narrow(1, 0, prepared.img_seq_len)?;
         let x_out = self.final_layer.forward(&x_out, &adaln_input)?;
         Ok(unpatchify(
             &x_out,
-            orig_size,
+            prepared.orig_size,
             patch_size,
             f_patch_size,
             self.cfg.in_channels,
@@ -1450,6 +1528,57 @@ mod parity_tests {
             diff < 1e-5,
             "vendored dense DiT diverged from stock by {diff}"
         );
+    }
+
+    #[test]
+    fn prepared_conditioning_reuses_actual_forward_tables_and_rejects_stale_geometry() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let model =
+            ZImageTransformer2DModel::new(&cfg, VarBuilder::from_varmap(&vm, DType::F32, &dev))
+                .unwrap();
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 4, 4), &dev).unwrap();
+        let cap = Tensor::randn(0f32, 1f32, (1, 3usize, cfg.cap_feat_dim), &dev).unwrap();
+        let mask = Tensor::ones((1, 3), DType::U8, &dev).unwrap();
+        let t = Tensor::from_vec(vec![0.5f32], 1, &dev).unwrap();
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(1 << 20, false));
+        let mut prepared = model
+            .prepare_conditioning(&latent, &cap, &mask, plan)
+            .unwrap();
+        assert_eq!(model.prepare_calls(), 1);
+        let a = model
+            .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
+            .unwrap();
+        let b = model
+            .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
+            .unwrap();
+        let diff = (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff <= f32::EPSILON, "prepared forwards diverged by {diff}");
+        assert_eq!(
+            model.prepare_calls(),
+            1,
+            "actual packed forwards must not reconstruct request conditioning"
+        );
+        let stale = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 6, 4), &dev).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(&stale, &t, &prepared, plan, cfg.n_layers)
+            .is_err());
+        let wrong_dtype = latent.to_dtype(DType::F64).unwrap();
+        assert!(model
+            .forward_prepared_with_memory(&wrong_dtype, &t, &prepared, plan, cfg.n_layers)
+            .is_err());
+        prepared.device = candle_gen::candle_core::DeviceLocation::Cuda { gpu_id: 9 };
+        assert!(model
+            .forward_prepared_with_memory(&latent, &t, &prepared, plan, cfg.n_layers)
+            .is_err());
     }
 
     #[test]

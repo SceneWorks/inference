@@ -2410,7 +2410,16 @@ def _canonical_const_value(value: str, declarations: dict[str, set[str]], depth:
             return _canonical_const_value(single[name], declarations, depth + 1)
         return name
 
-    return "text:" + re.sub(r"\b[A-Z_][A-Z0-9_]+\b", resolve, normalized)
+    # Resolution is a claim about *code*, for the same reason `_normalize_const_value`'s rewrites
+    # are: an ALL-CAPS word inside a string literal is prose, not a reference to a crate-local
+    # constant that happens to share its spelling. flux2's `SYSTEM_MESSAGE_UPSAMPLING_T2I` says
+    # "Put ALL text in quotation marks"; once the candle crate gained a `pub const ALL`, running
+    # this substitution over the literal rewrote that word into the constant's value on one side
+    # only and reported two byte-identical constants as divergent (sc-11045).
+    return "text:" + "".join(
+        chunk if kind == "literal" else re.sub(r"\b[A-Z_][A-Z0-9_]+\b", resolve, chunk)
+        for kind, chunk in _rust_chunks(normalized)
+    )
 
 
 def _canonical_const_values(values: set[str], declarations: dict[str, set[str]]) -> set[str]:

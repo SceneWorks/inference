@@ -851,7 +851,7 @@ mod tests {
                     Tensor::ones((4, 1), DType::F32, &dev).unwrap(),
                     Tensor::ones((1, 4), DType::F32, &dev).unwrap(),
                     0.5,
-                );
+                )?;
                 visited += 1;
                 Ok(())
             })

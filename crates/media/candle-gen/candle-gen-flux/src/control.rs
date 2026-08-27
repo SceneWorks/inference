@@ -33,7 +33,7 @@ use candle_nn::{LayerNorm, Linear, Module, RmsNorm, VarBuilder};
 use crate::ip_dit::{
     apply_rope, control_residual_interval, scaled_dot_product_attention,
     scaled_dot_product_attention_planned, timestep_embedding, Config, DitImageInjector, EmbedNd,
-    IpFlux,
+    IpFlux, PreparedConditioning,
 };
 
 /// The diffusers LayerNorm / RMS epsilons (FLUX defaults).
@@ -513,6 +513,29 @@ pub struct FluxControlNet {
 }
 
 impl FluxControlNet {
+    pub(crate) fn prepare_conditioning(
+        &self,
+        hidden_states: &Tensor,
+        img_ids: &Tensor,
+        prompt_embeds: &Tensor,
+        txt_ids: &Tensor,
+    ) -> candle_gen::Result<PreparedConditioning> {
+        let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+        let pe = ids.apply(&self.pe_embedder)?;
+        Ok(PreparedConditioning {
+            img_shape: hidden_states.dims().to_vec(),
+            img_ids_shape: img_ids.dims().to_vec(),
+            txt_shape: prompt_embeds.dims().to_vec(),
+            txt_ids_shape: txt_ids.dims().to_vec(),
+            dtype: hidden_states.dtype(),
+            img_ids_dtype: img_ids.dtype(),
+            txt_dtype: prompt_embeds.dtype(),
+            txt_ids_dtype: txt_ids.dtype(),
+            device: hidden_states.device().location(),
+            pe,
+        })
+    }
+
     /// Load from the Shakker Union-Pro-2.0 checkpoint (standard diffusers layout — un-prefixed keys for
     /// the real single-file `diffusion_pytorch_model.safetensors`). `base_cfg` is the base FLUX [`Config`]
     /// the branch must share dims with (hidden / heads / RoPE axes / theta); `cfg` pins `num_layers` (= 6).
@@ -612,16 +635,48 @@ impl FluxControlNet {
         attention_plan: AttentionPlan<'_>,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Vec<Tensor>> {
+        let prepared = self.prepare_conditioning(hidden_states, img_ids, prompt_embeds, txt_ids)?;
+        self.forward_prepared_with_memory(
+            hidden_states,
+            control_cond,
+            prompt_embeds,
+            pooled,
+            img_ids,
+            txt_ids,
+            timesteps,
+            guidance,
+            &prepared,
+            attention_plan,
+            cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_prepared_with_memory(
+        &self,
+        hidden_states: &Tensor,
+        control_cond: &Tensor,
+        prompt_embeds: &Tensor,
+        pooled: &Tensor,
+        img_ids: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        guidance: Option<&Tensor>,
+        prepared: &PreparedConditioning,
+        attention_plan: AttentionPlan<'_>,
+        cancel: &candle_gen::gen_core::CancelFlag,
+    ) -> candle_gen::Result<Vec<Tensor>> {
         candle_gen::check_cancel(cancel)?;
+        prepared.validate(hidden_states, img_ids, prompt_embeds, txt_ids)?;
         let mut hidden = (hidden_states.apply(&self.x_embedder)?
             + control_cond.apply(&self.controlnet_x_embedder)?)?;
         let mut encoder = prompt_embeds.apply(&self.context_embedder)?;
         let emb = self.time_text_embed.forward(timesteps, guidance, pooled)?;
-        let pe = Tensor::cat(&[txt_ids, img_ids], 1)?.apply(&self.pe_embedder)?;
         let mut residuals = Vec::with_capacity(self.blocks.len());
         for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
             candle_gen::check_cancel(cancel)?;
-            let (e, h) = block.forward_with_memory(&hidden, &encoder, &emb, &pe, attention_plan)?;
+            let (e, h) =
+                block.forward_with_memory(&hidden, &encoder, &emb, &prepared.pe, attention_plan)?;
             encoder = e;
             hidden = h;
             residuals.push(hidden.apply(cn)?);
@@ -887,16 +942,53 @@ mod tests {
         let ts = Tensor::full(0.5f32, b, &dev)?;
         let g = Tensor::full(3.5f32, b, &dev)?;
 
-        let residuals = branch2.forward(
-            &hidden,
-            &control,
-            &txt,
-            &pooled,
-            &img_ids,
-            &txt_ids,
-            &ts,
-            Some(&g),
-        )?;
+        let prepared = branch2
+            .prepare_conditioning(&hidden, &img_ids, &txt, &txt_ids)
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(branch2.pe_embedder.forward_calls(), 1);
+        let plan = AttentionPlan::budgeted(AttentionBudget::from_score_elements(u64::MAX, false));
+        let cancel = candle_gen::gen_core::CancelFlag::default();
+        let residuals = branch2
+            .forward_prepared_with_memory(
+                &hidden,
+                &control,
+                &txt,
+                &pooled,
+                &img_ids,
+                &txt_ids,
+                &ts,
+                Some(&g),
+                &prepared,
+                plan,
+                &cancel,
+            )
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        let repeated = branch2
+            .forward_prepared_with_memory(
+                &hidden,
+                &control,
+                &txt,
+                &pooled,
+                &img_ids,
+                &txt_ids,
+                &ts,
+                Some(&g),
+                &prepared,
+                plan,
+                &cancel,
+            )
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+        assert_eq!(branch2.pe_embedder.forward_calls(), 1);
+        assert_eq!(
+            residuals
+                .iter()
+                .map(|tensor| tensor.to_vec3::<f32>().unwrap())
+                .collect::<Vec<_>>(),
+            repeated
+                .iter()
+                .map(|tensor| tensor.to_vec3::<f32>().unwrap())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(residuals.len(), 2, "one residual per control layer");
         for r in &residuals {
             assert_eq!(r.dims(), &[b, img_seq, base_cfg.hidden_size]);
