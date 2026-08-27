@@ -79,8 +79,8 @@ pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
 pub use diff_vae::{
-    DiffVaeTiling, ModelOutputType, NaDiffusionDecoder, NaDiffusionDecoderConfig,
-    DIFFUSION_DECODER_COMPONENT,
+    auto_diffvae_tiling_budgeted_ltx, DiffVaeMode, DiffVaeTiling, HostNaSupport, ModelOutputType,
+    NaDiffusionDecoder, NaDiffusionDecoderConfig, NaKind, DIFFUSION_DECODER_COMPONENT,
 };
 pub use duration_head::DurationHead;
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};

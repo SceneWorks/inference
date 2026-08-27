@@ -1436,3 +1436,290 @@ fn keys_outside_the_window_contribute_nothing() {
     );
     let _ = sum_axes(&out, &[-1], false).unwrap();
 }
+
+// ---------------------------------------------------------------------------------------------
+// sc-18799 — the budgeted DiffVAE selector
+// ---------------------------------------------------------------------------------------------
+
+use super::budget::{
+    auto_diffvae_tiling_budgeted_ltx, compute_cap_is_datacenter_blackwell,
+    estimated_diffvae_decode_peak_bytes, plan_diffvae_tiling, DecodeGeometry, DecodePlan,
+    DiffVaeMode, HostNaSupport, NaKind, ResolvedDiffVaeMode,
+};
+
+/// The resolved mode every plan on this host runs under.
+fn eager() -> ResolvedDiffVaeMode {
+    DiffVaeMode::ChunkedEager
+        .resolve_for_host(HostNaSupport::detect())
+        .expect("chunked_eager is the mode this backend serves")
+}
+
+#[test]
+fn the_four_upstream_modes_declare_their_own_coefficients_and_withholds() {
+    // Upstream `_MEM_COEF_BY_MODE` / `_BUDGET_SAFETY_BYTES_*`, verbatim. These are the mode's own
+    // numbers, before any host resolve — the ladder reasons about all four even where only two run.
+    let declared: Vec<(&str, f64, u64)> = DiffVaeMode::ALL
+        .iter()
+        .map(|m| {
+            (
+                m.as_str(),
+                m.declared_stage5_coef(),
+                m.declared_budget_safety_bytes(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declared,
+        vec![
+            ("chunked_eager", 5.0, 1 << 30),
+            ("chunked_compile", 7.0, 2 << 30),
+            ("combined_compile", 11.0, 2 << 30),
+            ("blackwell_dsl", 2.5, 2 << 30),
+        ]
+    );
+    // Every spelling round-trips, and an unknown one is a typed error rather than a silent default.
+    for mode in DiffVaeMode::ALL {
+        assert_eq!(DiffVaeMode::parse(mode.as_str()).unwrap(), mode);
+    }
+    let err = DiffVaeMode::parse("combined_eager")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("chunked_eager"), "{err}");
+}
+
+#[test]
+fn the_host_resolve_reproduces_upstreams_natten_and_blackwell_rules() {
+    // (a) A host WITH natten keeps every declared coefficient — this is the arithmetic of the two
+    // modes that cannot run here, exercised without pretending the kernel exists.
+    let natten = HostNaSupport::with(true, false, false);
+    for mode in [
+        DiffVaeMode::ChunkedEager,
+        DiffVaeMode::ChunkedCompile,
+        DiffVaeMode::CombinedCompile,
+    ] {
+        let r = mode.resolve_for_host(natten).unwrap();
+        assert_eq!(r.attention, NaKind::Natten);
+        assert_eq!(r.stage5_coef, mode.declared_stage5_coef());
+        assert_eq!(r.budget_safety_bytes, mode.declared_budget_safety_bytes());
+    }
+    // (b) A host WITHOUT natten remaps the chunked modes onto the fallback kernel, and upstream's
+    // own rule then takes the CHUNKED_EAGER coefficient AND the eager withhold — including for
+    // `chunked_compile`, whose declared 7 assumes natten.
+    let fallback = HostNaSupport::with(false, false, false);
+    for mode in [DiffVaeMode::ChunkedEager, DiffVaeMode::ChunkedCompile] {
+        let r = mode.resolve_for_host(fallback).unwrap();
+        assert_eq!(r.attention, NaKind::EagerSdpa);
+        assert_eq!(r.stage5_coef, 5.0, "{}", mode.as_str());
+        assert_eq!(r.budget_safety_bytes, 1 << 30, "{}", mode.as_str());
+    }
+    assert_eq!(
+        DiffVaeMode::ChunkedEager
+            .resolve_for_host(HostNaSupport::with(false, true, false))
+            .unwrap()
+            .attention,
+        NaKind::Triton,
+        "a host with Triton but no natten takes upstream's Triton remap"
+    );
+    // (c) combined_compile without natten is upstream's own refusal, not this port's.
+    let err = DiffVaeMode::CombinedCompile
+        .resolve_for_host(fallback)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("requires NATTEN"), "{err}");
+    // (d) blackwell_dsl needs the fused kernel; a host that has it keeps coefficient 2.5.
+    let b200 = HostNaSupport::with(false, false, true);
+    let r = DiffVaeMode::BlackwellDsl.resolve_for_host(b200).unwrap();
+    assert_eq!(r.attention, NaKind::BlackwellDsl);
+    assert_eq!(r.stage5_coef, 2.5);
+    assert_eq!(r.budget_safety_bytes, 2 << 30);
+}
+
+#[test]
+fn this_backend_refuses_blackwell_dsl_and_says_why() {
+    // The hardware gate, on the host that actually runs this test. MLX is Metal: no CUDA device at
+    // all, so the fused CuTe DSL kernel is absent by construction. A `blackwell_dsl` decode that
+    // *ran* here would be an eager-SDPA decode costed at coefficient 2.5 instead of 5 — a plan that
+    // under-predicts its own peak by 2x, which is the whole failure class this module prevents.
+    let host = HostNaSupport::detect();
+    assert!(!host.natten && !host.triton && !host.blackwell_dsl);
+    let err = DiffVaeMode::BlackwellDsl
+        .resolve_for_host(host)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("datacenter Blackwell"), "{err}");
+    assert!(
+        err.contains("Metal"),
+        "the refusal must name the real reason: {err}"
+    );
+    assert!(
+        err.contains("chunked_eager"),
+        "the refusal must offer a way out: {err}"
+    );
+    // And the production entry point refuses too, rather than silently falling back to a mode the
+    // caller did not ask for.
+    let cfg = released();
+    let err = auto_diffvae_tiling_budgeted_ltx(&cfg, 4, 22, 40, DiffVaeMode::BlackwellDsl)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("blackwell_dsl"), "{err}");
+}
+
+#[test]
+fn datacenter_blackwell_is_major_ten_and_consumer_sm_120_is_not() {
+    assert!(compute_cap_is_datacenter_blackwell((10, 0)), "B200 sm_100");
+    assert!(compute_cap_is_datacenter_blackwell((10, 3)), "B300 sm_103");
+    // The scar: consumer Blackwell is sm_120. Upstream documents the CuTe DSL path as "not used on
+    // consumer Blackwell", and a `>=` floor would happily accept 12.0 and run a kernel that is not
+    // validated there. This predicate is deliberately not a floor.
+    assert!(
+        !compute_cap_is_datacenter_blackwell((12, 0)),
+        "consumer Blackwell sm_120 must NOT satisfy the datacenter-Blackwell gate"
+    );
+    assert!(!compute_cap_is_datacenter_blackwell((9, 0)), "Hopper");
+    assert!(!compute_cap_is_datacenter_blackwell((8, 9)), "Ada");
+}
+
+#[test]
+fn a_single_pass_that_fits_selects_no_tiling_and_one_that_does_not_selects_a_tile() {
+    let cfg = released();
+    // 1280x704x25 → latent 4x22x40. The single-pass estimate is tens of GiB; the tiled one is not.
+    let generous = plan_diffvae_tiling(&cfg, 4, 22, 40, 96.0, &eager()).unwrap();
+    assert!(
+        generous.is_none(),
+        "a 96 GiB budget must take the single-pass decode, got {generous:?}"
+    );
+    let tight = plan_diffvae_tiling(&cfg, 4, 22, 40, 16.0, &eager())
+        .unwrap()
+        .expect("16 GiB must not fit the single-pass decode at this geometry");
+    let stage4 = cfg.stage4_shape(4, 22, 40);
+    assert!(
+        (0..3).any(|a| tight.tile[a] < stage4[a]),
+        "a tiling that splits nothing is not a tiling: {tight:?} vs stage-4 grid {stage4:?}"
+    );
+    assert_eq!(
+        tight.overlap,
+        cfg.tile_halo(),
+        "the selector must use the stage-4/5 halo as its overlap"
+    );
+}
+
+#[test]
+fn every_selected_tiling_is_one_decode_tiled_will_accept() {
+    // The selector must never hand `decode_tiled` a tiling it refuses — a plan that is rejected at
+    // decode time is a budgeted decode that fails anyway, one stack frame later.
+    let cfg = released();
+    let mut planned = 0usize;
+    for &(t, h, w) in &[(4, 22, 40), (7, 16, 24), (31, 22, 40), (4, 34, 60)] {
+        for &safe_gib in &[8.0_f64, 12.0, 16.0, 24.0, 32.0] {
+            let Ok(Some(tiling)) = plan_diffvae_tiling(&cfg, t, h, w, safe_gib, &eager()) else {
+                continue;
+            };
+            planned += 1;
+            tiling
+                .validated(&cfg)
+                .unwrap_or_else(|e| panic!("{t}x{h}x{w} @ {safe_gib} GiB → {tiling:?}: {e}"));
+            let geometry = DecodeGeometry::new(&cfg, t, h, w);
+            let bytes =
+                estimated_diffvae_decode_peak_bytes(&geometry, DecodePlan::Tiled(tiling), &eager());
+            let usable = (safe_gib * 1024.0 * 1024.0 * 1024.0) as u64 - eager().budget_safety_bytes;
+            assert!(
+                bytes <= usable,
+                "{t}x{h}x{w} @ {safe_gib} GiB: selected {tiling:?} costs {bytes} > usable {usable}"
+            );
+        }
+    }
+    assert!(
+        planned >= 8,
+        "only {planned} plans exercised — the sweep is not covering the tiled arm"
+    );
+}
+
+#[test]
+fn the_estimate_is_monotone_in_the_tile_and_in_the_coefficient() {
+    let cfg = released();
+    let geometry = DecodeGeometry::new(&cfg, 4, 22, 40);
+    let overlap = cfg.tile_halo();
+    let small = DecodePlan::Tiled(DiffVaeTiling {
+        tile: [13, 40, 40],
+        overlap,
+    });
+    let large = DecodePlan::Tiled(DiffVaeTiling {
+        tile: [13, 88, 160],
+        overlap,
+    });
+    let r = eager();
+    assert!(
+        estimated_diffvae_decode_peak_bytes(&geometry, small, &r)
+            < estimated_diffvae_decode_peak_bytes(&geometry, large, &r),
+        "a bigger tile must never cost less"
+    );
+    // A heavier stage-5 coefficient must cost more at the same tile — otherwise the mode is inert
+    // and `blackwell_dsl`'s 2.5 would be indistinguishable from `combined_compile`'s 11.
+    let natten = HostNaSupport::with(true, false, false);
+    let combined = DiffVaeMode::CombinedCompile
+        .resolve_for_host(natten)
+        .unwrap();
+    let dsl = DiffVaeMode::BlackwellDsl
+        .resolve_for_host(HostNaSupport::with(false, false, true))
+        .unwrap();
+    assert!(
+        estimated_diffvae_decode_peak_bytes(&geometry, large, &dsl)
+            < estimated_diffvae_decode_peak_bytes(&geometry, large, &r)
+            && estimated_diffvae_decode_peak_bytes(&geometry, large, &r)
+                < estimated_diffvae_decode_peak_bytes(&geometry, large, &combined),
+        "the per-mode coefficients must order the estimates 2.5 < 5 < 11"
+    );
+}
+
+#[test]
+fn a_tighter_budget_never_selects_a_larger_tile() {
+    let cfg = released();
+    let geometry = DecodeGeometry::new(&cfg, 31, 22, 40);
+    let mut previous: Option<u64> = None;
+    let mut steps = 0usize;
+    for &safe_gib in &[64.0_f64, 48.0, 40.0, 32.0, 24.0, 20.0, 16.0] {
+        // A budget below the accumulator floor is a legitimate refusal, not a selection — say so
+        // out loud rather than folding it into the monotone chain.
+        let tiling = match plan_diffvae_tiling(&cfg, 31, 22, 40, safe_gib, &eager()) {
+            Ok(Some(tiling)) => tiling,
+            Ok(None) => {
+                eprintln!("[budget] {safe_gib} GiB: single-pass fits, no tiling to compare");
+                continue;
+            }
+            Err(e) => {
+                eprintln!("[budget] {safe_gib} GiB: unplannable — {e}");
+                continue;
+            }
+        };
+        steps += 1;
+        let bytes =
+            estimated_diffvae_decode_peak_bytes(&geometry, DecodePlan::Tiled(tiling), &eager());
+        if let Some(prev) = previous {
+            assert!(
+                bytes <= prev,
+                "shrinking the budget to {safe_gib} GiB selected a costlier plan ({bytes} > {prev})"
+            );
+        }
+        previous = Some(bytes);
+    }
+    assert!(
+        steps >= 3,
+        "only {steps} budgets in the sweep selected a tiling — the monotonicity claim is untested"
+    );
+}
+
+#[test]
+fn an_unplannable_geometry_is_a_catchable_error_naming_the_budget() {
+    let cfg = released();
+    // 3840x2160x241 at 4 GiB: the accumulators alone dwarf the budget, so no tile can help. This
+    // must be an `Err` returned before any decode, never an OOM inside one.
+    let err = plan_diffvae_tiling(&cfg, 31, 68, 120, 4.0, &eager())
+        .expect_err("a 4K/241-frame clip cannot be planned at 4 GiB")
+        .to_string();
+    assert!(err.contains("ltx diffvae decode"), "{err}");
+    assert!(err.contains("safe budget"), "{err}");
+    assert!(
+        err.contains("chunked_eager"),
+        "the error must name the mode: {err}"
+    );
+}

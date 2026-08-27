@@ -1287,6 +1287,96 @@ mod tests {
         Array::from_slice(v, shape)
     }
 
+    /// This file's own source, for the route guards below.
+    const PIPELINE_SRC: &str = include_str!("pipeline.rs");
+
+    /// The body of one `fn` in [`PIPELINE_SRC`], from its signature to the next top-level `}`.
+    fn fn_body(name: &str) -> &'static str {
+        let start = PIPELINE_SRC
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("pipeline.rs no longer defines `fn {name}`"));
+        let open = PIPELINE_SRC[start..]
+            .find('{')
+            .expect("a fn signature is followed by its body");
+        let rest = &PIPELINE_SRC[start + open..];
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while slicing `fn {name}`");
+    }
+
+    /// sc-18799 AC1 — the **conv** decode must still route through [`auto_tiling_budgeted_ltx`],
+    /// unchanged by the DiffVAE getting a budgeted selector of its own.
+    ///
+    /// Asserted on the ROUTE, not on an output: an output-level check would look identical whether
+    /// the tiling came from the conv selector or from a "unified" one, because on a machine with
+    /// headroom both would answer `None` and both decodes would be the same picture. What must not
+    /// change is *which selector the call site names* — so this reads the call site.
+    #[test]
+    fn conv_decode_still_selects_its_tiling_through_auto_tiling_budgeted_ltx() {
+        let body = fn_body("decode_to_frames_with_tiling");
+        assert!(
+            body.contains("None => auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
+            "the conv decode's auto-tiling arm no longer calls `auto_tiling_budgeted_ltx` with the \
+             conv output dims — sc-18799 budgets the DiffVAE, it does not re-route the conv \
+             decoder:\n{body}"
+        );
+        for foreign in ["diff_vae", "DiffVae", "budget::", "auto_diffvae"] {
+            assert!(
+                !body.contains(foreign),
+                "the conv decode route now mentions `{foreign}` — the DiffVAE selector must not \
+                 reach the conv decoder:\n{body}"
+            );
+        }
+        // ...and `decode_to_frames` must still be the wrapper that reaches it, rather than having
+        // grown a selector of its own.
+        assert!(
+            fn_body("decode_to_frames")
+                .contains("decode_to_frames_with_tiling(vae, latents, cancel, None)"),
+            "`decode_to_frames` no longer delegates to `decode_to_frames_with_tiling`"
+        );
+    }
+
+    /// The other half of the same guard: the conv selector still answers with the **conv** candidate
+    /// grid. A rewrite that pointed it at the DiffVAE's three-axis stage-4 grid would keep the call
+    /// site's name and still be the regression this AC is about.
+    #[test]
+    fn the_conv_selector_still_answers_from_the_conv_candidate_grid() {
+        // 1920x1080x121 at 24 GiB: the accumulators fit but the single-pass decode does not, so a
+        // tiling is definitely required and definitely findable.
+        let plan = plan_ltx_tiling(1080, 1920, 121, 24.0)
+            .expect("1920x1080x121 must still be plannable at 24 GiB")
+            .expect("1920x1080x121 must not fit single-pass at 24 GiB");
+        let spatial = plan.spatial.expect("the conv plan tiles spatially");
+        assert!(
+            LTX_VAE_SPATIAL_PX.contains(&spatial.tile_px),
+            "conv spatial edge {} is not one of the conv candidates {LTX_VAE_SPATIAL_PX:?}",
+            spatial.tile_px
+        );
+        assert_eq!(
+            spatial.overlap_px, 64,
+            "the conv selector's spatial overlap is 64 px"
+        );
+        let temporal = plan.temporal.expect("241 frames must tile temporally");
+        assert!(
+            LTX_VAE_TEMPORAL_FR
+                .iter()
+                .any(|&(tile, _)| tile == temporal.tile_frames),
+            "conv temporal tile {} is not one of the conv candidates {LTX_VAE_TEMPORAL_FR:?}",
+            temporal.tile_frames
+        );
+    }
+
     #[test]
     fn preprocess_conditioning_image_layout_and_norm() {
         // 1×2 RGB image, white pixel then black pixel (HWC). No-op resize (target == source).
