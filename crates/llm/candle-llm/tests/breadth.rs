@@ -183,6 +183,21 @@ fn split_image(w: u32, h: u32, left: [u8; 3], right: [u8; 3]) -> ImageRef {
     ImageRef::new(w, h, px).unwrap()
 }
 
+/// Gemma 4's chat template opens a reasoning channel (`<|channel>thought ... <channel|>`) before the
+/// answer, and this provider does not advertise a thinking mode for it (the template gates reasoning
+/// with its own `<|think|>` token rather than the `enable_thinking` kwarg the segmenter keys on), so
+/// the markers arrive inline in the generated text.
+///
+/// Take everything after the final channel close as the answer. Without this the reasoning span is
+/// scored as if it were the answer — and it routinely mentions BOTH colours on its way to the right
+/// one, so a naive substring check would be both flaky and wrong.
+fn answer_channel(text: &str) -> String {
+    match text.rfind("<channel|>") {
+        Some(i) => text[i + "<channel|>".len()..].to_string(),
+        None => text.to_string(),
+    }
+}
+
 /// Gemma 4 answers a prompt at a **quantized tier** through the ordinary provider surface.
 ///
 /// The dense leg is `gemma4_unified_streams_coherent_text` above; this is the other half of the
@@ -239,7 +254,7 @@ fn gemma4_answers_about_an_image() {
             Content::Image(split_image(896, 448, [220, 20, 20], [20, 20, 220])),
             Content::text(question),
         ],
-        8,
+        64,
     );
     let blue_left = ask(
         &p,
@@ -247,11 +262,14 @@ fn gemma4_answers_about_an_image() {
             Content::Image(split_image(896, 448, [20, 20, 220], [220, 20, 20])),
             Content::text(question),
         ],
-        8,
+        64,
     );
     println!("[gemma4 image] red-left={red_left:?} blue-left={blue_left:?}");
 
-    let (rl, bl) = (red_left.to_lowercase(), blue_left.to_lowercase());
+    let (rl, bl) = (
+        answer_channel(&red_left).to_lowercase(),
+        answer_channel(&blue_left).to_lowercase(),
+    );
     assert!(
         rl.contains("red") && !rl.contains("blue"),
         "a red left half must be answered 'red'; got {red_left:?}"
