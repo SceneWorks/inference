@@ -898,7 +898,7 @@ pub struct StageKeyframe<'a> {
 
 /// Build the per-stage [`I2vConditioning`] for a stage's `keyframes` over `base` (zeros for stage 1,
 /// the upscaled latent for stage 2), casting each conditioning latent to the base dtype. Empty → T2V.
-fn stage_keyframe_state(
+pub(crate) fn stage_keyframe_state(
     base: &Array,
     keyframes: &[StageKeyframe],
     stage1: bool,

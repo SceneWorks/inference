@@ -474,7 +474,8 @@ pub fn denoise_dfr_tile(
         )?;
         // The appended slot latents seed from `initial_keyframes`; noise them to the tile's entry
         // σ like the stage noiser would (`denoise_mask = 1` ⇒ plain lerp toward noise).
-        state.latent = noise_slot_tokens(&state, job.noise_seed.wrapping_add(1))?;
+        state.latent =
+            noise_slot_tokens(&state, TEMPORAL_SIGMAS[0], job.noise_seed.wrapping_add(1))?;
     }
 
     let (state, _) = denoise_tokens_rf_ancestral(
@@ -514,11 +515,11 @@ pub fn denoise_dfr_tile(
     })
 }
 
-/// Stage-entry noising for appended generated-keyframe slot tokens: where `denoise_mask = 1` and
-/// the token is a slot (`keyframes_mask > 0`), lerp the slot's seeded latent toward fresh noise at
-/// `TEMPORAL_SIGMAS[0]` — the reference stage noiser applied to the appended run only (the grid
-/// window was already re-noised as a grid).
-fn noise_slot_tokens(state: &VideoTokenState, seed: u64) -> Result<Array> {
+/// Stage-entry noising for appended generated-keyframe slot tokens: where the token is a slot
+/// (`keyframes_mask > 0`, `denoise_mask = 1`), lerp the slot's seeded latent toward fresh noise at
+/// the stage-entry `sigma` — the reference stage noiser applied to the appended run only (the grid
+/// half of the state is noised as a grid by the caller).
+pub fn noise_slot_tokens(state: &VideoTokenState, sigma: f32, seed: u64) -> Result<Array> {
     let Some(mask) = state.keyframes_mask.as_ref() else {
         return Ok(state.latent.clone());
     };
@@ -526,8 +527,8 @@ fn noise_slot_tokens(state: &VideoTokenState, seed: u64) -> Result<Array> {
     let key = mlx_rs::random::key(seed)?;
     let noise = mlx_rs::random::normal::<f32>(state.latent.shape(), None, None, Some(&key))?
         .as_dtype(dt)?;
-    let sigma = Array::from_slice(&[TEMPORAL_SIGMAS[0]], &[1]).as_dtype(dt)?;
-    let gate = multiply(mask, &sigma)?; // (B, S, 1): σ₀ on slot tokens, 0 elsewhere
+    let sigma = Array::from_slice(&[sigma], &[1]).as_dtype(dt)?;
+    let gate = multiply(mask, &sigma)?; // (B, S, 1): σ on slot tokens, 0 elsewhere
     let gate = broadcast_to(&gate, state.latent.shape())?;
     let one = Array::from_slice(&[1.0f32], &[1]).as_dtype(dt)?;
     let keep = mlx_rs::ops::subtract(&one, &gate)?;
@@ -542,6 +543,297 @@ fn noise_slot_tokens(state: &VideoTokenState, seed: u64) -> Result<Array> {
 /// `σ·(1 − strength)`, slots at `σ`).
 pub fn tile_entry_timesteps(state: &VideoTokenState) -> Result<Array> {
     token_timesteps(&state.denoise_mask, state.latent.dtype(), TEMPORAL_SIGMAS[0])
+}
+
+/// Everything [`generate_dfr_av_latents`] needs beyond the request-shaped parameters: the loaded
+/// components and the encoded text contexts.
+pub struct DfrComponents<'a> {
+    pub dit: &'a AvDiT,
+    pub spatial_upsampler: &'a crate::upsampler::LatentUpsampler,
+    /// Required when `temporal_upsample_rounds > 0`; a rounds request without it is a typed error
+    /// (mirrors the reference's up-front `temporal_upsampler_path` validation).
+    pub temporal_upsampler: Option<&'a crate::upsampler::LatentUpsampler>,
+    pub latent_mean: &'a Array,
+    pub latent_std: &'a Array,
+    pub video_ctx: &'a Array,
+    pub audio_ctx: &'a Array,
+    pub audio_pos: &'a Array,
+}
+
+/// The DFR request shape. `canvas_frames` and `keyframe_positions` come from
+/// [`gen_core_dfr::resolve_canvas`] over the request's (auto-)resolved frame count —
+/// `requested_frames` is that pre-padding count, and the pipeline trims back to
+/// `(requested − 1)·2^rounds + 1` at the end.
+pub struct DfrRequest<'a> {
+    pub canvas_frames: i64,
+    pub requested_frames: i64,
+    pub keyframe_positions: &'a [i64],
+    pub fps: f32,
+    pub seed: u64,
+    pub temporal_upsample_rounds: u32,
+    /// `Some(downscale)` appends the reserved half-res stage-1 video as the detailing IC-LoRA
+    /// reference in stage 2 (reference `--detailing-lora` + `VideoConditionByReferenceLatent`).
+    /// The detailing LoRA weights themselves are installed on the DiT by the engine's adapter
+    /// layer, scoped to the stage-2 pass; this flag only controls the reference conditioning.
+    pub detailing_downscale: Option<i64>,
+    /// Replace-latent image conditioning (I2V / first-last-frame / multi-keyframe), VAE-encoded at
+    /// both stage resolutions — empty for T2V. Stage 2's state is built over the upscaled stage-1
+    /// video, exactly like [`crate::pipeline::generate_av_latents`].
+    pub video_keyframes: &'a [crate::pipeline::StageKeyframe<'a>],
+}
+
+/// The DFR pipeline output: the final video latent, the **stage-1** audio latent (the shipped
+/// audio — stage 2 re-noises audio only because video needs the cross-modal attention), the final
+/// pixel-frame count and the playback fps (`fps · 2^rounds`).
+pub struct DfrOutput {
+    pub video_latent: Array,
+    pub audio_latent: Array,
+    pub num_frames: i64,
+    pub playback_fps: f32,
+}
+
+/// The full DFR latent pipeline (`dfr_pipeline.DFRPipeline.__call__`): stage-1 half-res base with
+/// generated keyframe slots on the segment grid → spatial x2 upsample of video + slots → stage-2
+/// full-res re-denoise with slot warm starts and the optional detailing reference → up to two
+/// tiled temporal rounds ([`run_temporal_rounds`]) → trim to the caller's frame contract.
+///
+/// Stages run the deterministic distilled Euler ([`crate::pipeline::denoise_av_tokens`], per the
+/// reference's default stage loop); only the temporal-round tiles run the RF-ancestral loop.
+/// LoRA passes: stage 1 and the temporal tiles select pass 0, stage 2 selects pass 1 (where the
+/// engine scopes any detailing LoRA).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_dfr_av_latents(
+    parts: &DfrComponents<'_>,
+    req: &DfrRequest<'_>,
+    video_s1_noise: &Array,
+    video_pos1: &Array,
+    video_s2_noise: &Array,
+    video_pos2: &Array,
+    audio_s1_noise: &Array,
+    audio_s2_noise: &Array,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<DfrOutput> {
+    use crate::pipeline::{denoise_av_tokens, renoise, STAGE1_SIGMAS, STAGE2_SIGMAS};
+
+    let rounds = req.temporal_upsample_rounds;
+    if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
+        return Err(Error::Msg(format!(
+            "ltx dfr: temporal_upsample_rounds must be 0..={}, got {rounds}",
+            gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS
+        )));
+    }
+    if rounds > 0 && parts.temporal_upsampler.is_none() {
+        return Err(Error::Msg(
+            "ltx dfr: temporal_upsample_rounds > 0 requires the temporal latent upsampler \
+             component"
+                .into(),
+        ));
+    }
+    if req.keyframe_positions.is_empty() {
+        return Err(Error::Msg(
+            "ltx dfr: the DFR canvas resolved no keyframe positions".into(),
+        ));
+    }
+    let temporal_scale = TEMPORAL_SCALE;
+    let s1 = video_s1_noise.shape();
+    let (h1, w1) = (s1[3] as usize, s1[4] as usize);
+    let s2 = video_s2_noise.shape();
+    let (h2, w2) = (s2[3] as usize, s2[4] as usize);
+    let expected_lf = (req.canvas_frames - 1) / temporal_scale + 1;
+    if i64::from(s1[2]) != expected_lf || i64::from(s2[2]) != expected_lf {
+        return Err(Error::Msg(format!(
+            "ltx dfr: stage noise T ({} / {}) must match the canvas' {expected_lf} latent frames",
+            s1[2], s2[2]
+        )));
+    }
+
+    // --- Stage 1: half-res base + keyframe slots ------------------------------------------------
+    let zeros1 = Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
+    let mut state =
+        match crate::pipeline::stage_keyframe_state(&zeros1, req.video_keyframes, true)? {
+            Some(i2v) => {
+                let noised = i2v.noised(video_s1_noise, STAGE1_SIGMAS[0])?;
+                VideoTokenState::from_i2v(&noised, video_pos1)?
+            }
+            None => VideoTokenState::base(video_s1_noise, video_pos1)?,
+        };
+    state = append_generated_keyframe_slots(
+        &state,
+        req.keyframe_positions,
+        None,
+        req.canvas_frames,
+        h1,
+        w1,
+        SPATIAL_SCALE,
+        req.fps,
+    )?;
+    // Zero-seeded slots still enter at full noise: lerp them toward the stage-entry σ.
+    state.latent = noise_slot_tokens(&state, STAGE1_SIGMAS[0], req.seed.wrapping_add(11))?;
+
+    parts.dit.set_lora_pass(0);
+    let (state, audio_s1) = denoise_av_tokens(
+        parts.dit,
+        &state,
+        audio_s1_noise,
+        parts.video_ctx,
+        parts.audio_ctx,
+        parts.audio_pos,
+        &STAGE1_SIGMAS,
+        cancel,
+        on_step,
+    )?;
+    let stage1_audio_latent = audio_s1.clone();
+    let grid_tokens: Vec<i32> = (0..state.target_tokens).collect();
+    let grid = state
+        .latent
+        .take_axis(Array::from_slice(&grid_tokens, &[state.target_tokens]), 1)?;
+    let reserved_half_res = crate::conditioning::unpatchify_grid(
+        &grid,
+        state.latent.shape()[2],
+        s1[2],
+        s1[3],
+        s1[4],
+    )?;
+    let slot_keyframes = crate::conditioning::take_generated_keyframes(&state, s1[3], s1[4])?;
+
+    // Spatial x2: video and slots ride the same upsampler (slots' K sits on the frame axis, which
+    // the spatial checkpoint leaves untouched).
+    let upscaled_video = crate::upsampler::upsample_latents(
+        &reserved_half_res,
+        parts.spatial_upsampler,
+        parts.latent_mean,
+        parts.latent_std,
+    )?;
+    let upscaled_slots = crate::upsampler::upsample_latents(
+        &slot_keyframes,
+        parts.spatial_upsampler,
+        parts.latent_mean,
+        parts.latent_std,
+    )?;
+    mlx_rs::transforms::eval([&upscaled_video, &upscaled_slots, &stage1_audio_latent])?;
+
+    // --- Stage 2: full-res detailing --------------------------------------------------------------
+    let s2_entry = STAGE2_SIGMAS[0];
+    let mut state2 = match crate::pipeline::stage_keyframe_state(
+        &upscaled_video,
+        req.video_keyframes,
+        false,
+    )? {
+        Some(i2v) => {
+            // Replace-latent conditioning over the upscaled base, then the stage noiser.
+            let noised = i2v.noised(video_s2_noise, s2_entry)?;
+            VideoTokenState::from_i2v(&noised, video_pos2)?
+        }
+        None => {
+            let renoised = renoise(&upscaled_video, video_s2_noise, s2_entry)?;
+            VideoTokenState::base(&renoised, video_pos2)?
+        }
+    };
+    state2 = append_generated_keyframe_slots(
+        &state2,
+        req.keyframe_positions,
+        Some(&upscaled_slots),
+        req.canvas_frames,
+        h2,
+        w2,
+        SPATIAL_SCALE,
+        req.fps,
+    )?;
+    state2.latent = noise_slot_tokens(&state2, s2_entry, req.seed.wrapping_add(13))?;
+    if let Some(downscale) = req.detailing_downscale {
+        state2 = crate::conditioning::append_reference_latent(
+            &state2,
+            &reserved_half_res,
+            downscale,
+            1.0,
+            temporal_scale,
+            SPATIAL_SCALE,
+            req.fps,
+        )?;
+    }
+    let audio2 = renoise(&stage1_audio_latent, audio_s2_noise, s2_entry)?;
+
+    parts.dit.set_lora_pass(1);
+    let (state2, _audio2) = denoise_av_tokens(
+        parts.dit,
+        &state2,
+        &audio2,
+        parts.video_ctx,
+        parts.audio_ctx,
+        parts.audio_pos,
+        &STAGE2_SIGMAS,
+        cancel,
+        on_step,
+    )?;
+    let grid_tokens: Vec<i32> = (0..state2.target_tokens).collect();
+    let grid2 = state2
+        .latent
+        .take_axis(Array::from_slice(&grid_tokens, &[state2.target_tokens]), 1)?;
+    let mut video = crate::conditioning::unpatchify_grid(
+        &grid2,
+        state2.latent.shape()[2],
+        s2[2],
+        s2[3],
+        s2[4],
+    )?;
+    let carry_keyframes = crate::conditioning::take_generated_keyframes(&state2, s2[3], s2[4])?;
+    mlx_rs::transforms::eval([&video, &carry_keyframes])?;
+
+    // --- Temporal rounds --------------------------------------------------------------------------
+    let mut num_frames = req.canvas_frames;
+    let mut playback_fps = req.fps;
+    if rounds > 0 {
+        let upsampler = parts.temporal_upsampler.expect("validated above");
+        // Temporal tiles run the base (stage-1) LoRA pass, like the reference's non-detailing
+        // stage.
+        parts.dit.set_lora_pass(0);
+        let mut upsample = |v: &Array| {
+            crate::upsampler::upsample_latents(
+                v,
+                upsampler,
+                parts.latent_mean,
+                parts.latent_std,
+            )
+        };
+        let mut denoise_tile = |job: &DfrTileJob| {
+            let t_tile = job.tile.latent_frames();
+            let positions = crate::positions::create_position_grid_with(
+                1,
+                t_tile,
+                h2,
+                w2,
+                temporal_scale,
+                SPATIAL_SCALE,
+                job.cond_fps,
+                true,
+            );
+            denoise_dfr_tile(parts.dit, job, parts.video_ctx, &positions, cancel, on_step)
+        };
+        let out = run_temporal_rounds(
+            &video,
+            req.keyframe_positions,
+            &carry_keyframes,
+            num_frames,
+            req.fps,
+            req.seed,
+            rounds,
+            &mut upsample,
+            &mut denoise_tile,
+        )?;
+        video = out.video_latent;
+        num_frames = out.num_frames;
+        playback_fps = out.fps;
+    }
+
+    let (video, num_frames) =
+        trim_to_target_frames(&video, num_frames, req.requested_frames, rounds)?;
+    Ok(DfrOutput {
+        video_latent: video,
+        audio_latent: stage1_audio_latent,
+        num_frames,
+        playback_fps,
+    })
 }
 
 #[cfg(test)]
