@@ -2991,9 +2991,9 @@ mod tests {
 
     #[test]
     fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
-        // Structural mutation proof: both executable layouts must derive their
-        // per-block calls from the materialized/enumerated `index`, not a fixed
-        // STG layer or a mode that silently becomes a whole-block skip.
+        // Structural mutation proof: the resident and streamed loops for both AV and video-only
+        // execution must derive their per-block calls from the materialized/enumerated `index`,
+        // not a fixed STG layer or a mode that silently becomes a whole-block skip.
         let source = include_str!("transformer.rs");
         // The literal appears once in this assertion itself; subtract that self-reference so the
         // production count remains exact even though this file has multiple earlier test modules.
@@ -3002,8 +3002,8 @@ mod tests {
             .count()
             .saturating_sub(1);
         assert_eq!(
-            production_index_uses, 2,
-            "resident and streamed AV-DiT loops must both apply the actual block index"
+            production_index_uses, 4,
+            "resident and streamed AV/video-only loops must all apply the actual block index"
         );
         assert!(
             source.contains("if run_self {") && source.contains("if control.run_cross_modal {"),
