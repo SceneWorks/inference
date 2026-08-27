@@ -48,6 +48,7 @@ pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
+pub mod dev_sampler;
 pub mod dfr;
 pub mod diff_vae;
 pub mod dit_train;
@@ -93,6 +94,7 @@ use config::{
     DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, STAGE2_SIGMAS,
     TEXT_MAX_LENGTH,
 };
+use dev_sampler::{ExecutionPlan, TransformerVariant};
 use diff_vae::{NaDiffusionDecoder, NaDiffusionDecoderConfig};
 use duration_head::DurationHead;
 use gemma4_te::Ltx25TextEncoder;
@@ -204,6 +206,9 @@ struct Pipeline {
     upsampler_override: Option<PathBuf>,
     /// `Some` makes this the split LTX-2.5 route.  All config is read before weights are materialised.
     split_bundle: Option<LtxBundle>,
+    /// Exact transformer identity read from the split safetensors metadata.  Dense LTX-2.3 is
+    /// always the historical distilled route; split LTX-2.5 must provide this explicitly.
+    transformer_variant: TransformerVariant,
     use_diffusion_decoder: bool,
 }
 
@@ -226,6 +231,7 @@ impl Pipeline {
             gemma_override,
             upsampler_override,
             split_bundle: None,
+            transformer_variant: TransformerVariant::Distilled,
             use_diffusion_decoder: false,
         }
     }
@@ -235,6 +241,7 @@ impl Pipeline {
         device: &Device,
         use_diffusion_decoder: bool,
         quant_mode: Ltx25QuantMode,
+        transformer_variant: TransformerVariant,
     ) -> gen_core::Result<Self> {
         // Re-bind the selected precision when materialization begins. This is deliberately not just
         // a load-time descriptor check: replacing a staged component between construction and the
@@ -274,6 +281,7 @@ impl Pipeline {
             gemma_override: None,
             upsampler_override: None,
             split_bundle: Some(bundle),
+            transformer_variant,
             use_diffusion_decoder,
         })
     }
@@ -776,6 +784,7 @@ impl Pipeline {
         seed: u64,
         video_ctx: &Tensor,
         audio_ctx: &Tensor,
+        negative_context: Option<(&Tensor, &Tensor)>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
         let (canvas_frames, _, mut keyframe_positions) =
@@ -830,6 +839,9 @@ impl Pipeline {
             temporal_upsampler: Some(temporal),
             video_ctx,
             audio_ctx,
+            negative_video_ctx: negative_context.map(|(video, _)| video),
+            negative_audio_ctx: negative_context.map(|(_, audio)| audio),
+            transformer_variant: self.transformer_variant,
             audio_grid: &audio_grid,
             audio_frames,
         };
@@ -874,13 +886,22 @@ impl Pipeline {
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let mut orchestration = pipeline::TwoStageOrchestration::new(seed);
-        // Every render begins at the first distilled stage. The adapter overlay retains its complete
-        // per-pass vector, so a two-stage caller switches this selector before its stage-two denoise
-        // instead of collapsing Eros's `[1.0, 0.4]` at load time.
+        // Every render begins at stage one with adapter pass zero.  A dev transformer therefore
+        // runs raw stage one; the incoming distilled rank-450 adapter contract remains selected at
+        // pass one only when the shared stage-two refinement begins.
 
         // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
         let (video_ctx, audio_ctx) = comps.te.encode_both(&input_ids, &mask01)?;
+        let negative_context = if self.transformer_variant.is_dev() {
+            // Empty negative text is the official unconditional conditioning when a caller omits
+            // `negative_prompt`; it still takes a real Gemma pass, never aliases the positive stack.
+            let negative_prompt = req.negative_prompt.as_deref().unwrap_or("");
+            let (negative_ids, negative_mask) = self.tokenize(&comps.tokenizer, negative_prompt)?;
+            Some(comps.te.encode_both(&negative_ids, &negative_mask)?)
+        } else {
+            None
+        };
         let mut predict = || -> gen_core::Result<f32> {
             let head = comps.duration_head.as_ref().ok_or_else(|| {
                 gen_core::Error::Unsupported(
@@ -911,6 +932,9 @@ impl Pipeline {
                 seed,
                 &video_ctx,
                 &audio_ctx,
+                negative_context
+                    .as_ref()
+                    .map(|(video, audio)| (video, audio)),
                 on_progress,
             );
         }
@@ -956,13 +980,70 @@ impl Pipeline {
         // FLOW `x0 = x − σ·v` recombine + euler == the native scheduler), the N1 no-op. Both streams are
         // velocity-prediction (`Sigma` convention); the AvDiT couples them via cross-modal attention each
         // forward, so the per-step model eval (flatten → AvDiT → unflatten) lives inside the closure.
-        let mut stage1_fold = pipeline::StageProgressFold::new(0, NATIVE_STEPS, 11);
+        let stage1_plan = ExecutionPlan::for_variant(self.transformer_variant);
+        let stage1_steps = stage1_plan.transitions() as u32;
+        let total_steps = stage1_steps + STAGE2_SIGMAS.len() as u32 - 1;
+        let mut stage1_fold = pipeline::StageProgressFold::new(0, stage1_steps, total_steps);
         let mut stage1_progress = |event: Progress| {
             if let Some(event) = stage1_fold.fold(event) {
                 on_progress(event);
             }
         };
-        let (vlat, alat) = if conditioned {
+        let (vlat, alat) = if self.transformer_variant.is_dev() {
+            let mut state = if keyframes.is_empty() {
+                conditioning::VideoTokenState::base(&vnoise, &video_grid)?
+            } else {
+                let zeros = Tensor::zeros_like(&vnoise)?;
+                let borrowed = keyframes
+                    .iter()
+                    .map(|keyframe| conditioning::Keyframe {
+                        latent: &keyframe.latent,
+                        frame_idx: keyframe.frame_idx,
+                        strength: keyframe.strength,
+                    })
+                    .collect::<Vec<_>>();
+                let i2v = conditioning::apply_keyframes(&zeros, &borrowed)?
+                    .noised(&vnoise, stage1_plan.sigmas[0])?;
+                conditioning::VideoTokenState::from_i2v(&i2v, &video_grid)?
+            };
+            for clip in &clips {
+                state = conditioning::append_keyframe_clip(
+                    &state,
+                    &clip.latent,
+                    clip.frame_offset,
+                    clip.strength,
+                    fps as f32,
+                )?;
+            }
+            let (negative_video_ctx, negative_audio_ctx) =
+                negative_context.as_ref().ok_or_else(|| {
+                    CandleError::Msg(
+                        "ltx_2_5: dev transformer is missing its negative-text conditioning".into(),
+                    )
+                })?;
+            let mut stage1_forward = || Ok(());
+            let (state, audio) = pipeline::denoise_av_dev_conditioned(
+                &comps.avdit,
+                &state,
+                &anoise,
+                &video_ctx,
+                &audio_ctx,
+                negative_video_ctx,
+                negative_audio_ctx,
+                af,
+                &audio_grid,
+                &stage1_plan.sigmas,
+                stage1_plan.stg_blocks,
+                &req.cancel,
+                &mut stage1_forward,
+                &mut stage1_progress,
+            )?;
+            let generated = state.latent.narrow(1, 0, state.target_tokens)?;
+            (
+                pipeline::unflatten_latent(&generated, t_lat, h_lat, w_lat)?,
+                audio,
+            )
+        } else if conditioned {
             let mut state = if keyframes.is_empty() {
                 conditioning::VideoTokenState::base(&vnoise, &video_grid)?
             } else {
@@ -1090,7 +1171,7 @@ impl Pipeline {
             },
             |pass| comps.avdit.set_adapter_pass(pass),
         )?;
-        let mut stage2_fold = pipeline::StageProgressFold::new(NATIVE_STEPS, 3, 11);
+        let mut stage2_fold = pipeline::StageProgressFold::new(stage1_steps, 3, total_steps);
         let mut stage2_progress = |event: Progress| {
             if let Some(event) = stage2_fold.fold(event) {
                 on_progress(event);
@@ -1600,6 +1681,14 @@ pub fn descriptor() -> ModelDescriptor {
 /// The ordinary Candle provider descriptor for LTX-2.5's split Gemma-4 bundle.  Axes that are not
 /// materialised by this route stay explicitly closed; they are never accepted as inert metadata.
 pub fn descriptor_25() -> ModelDescriptor {
+    descriptor_25_for_variant(TransformerVariant::Distilled)
+}
+
+/// The descriptor returned by an ordinary split-provider load after the transformer's safetensors
+/// identity has been parsed.  Catalog discovery remains conservative (`descriptor_25` advertises
+/// distilled), while a loaded dev checkpoint cannot accept the distilled 8-step / no-negative
+/// request surface.
+fn descriptor_25_for_variant(transformer_variant: TransformerVariant) -> ModelDescriptor {
     let mut out = descriptor();
     out.id = MODEL_25_ID;
     out.capabilities.supports_lora = true;
@@ -1609,6 +1698,19 @@ pub fn descriptor_25() -> ModelDescriptor {
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds = 2;
     out.capabilities.supports_diffusion_decoder = true;
+    match transformer_variant {
+        TransformerVariant::Distilled => {
+            out.capabilities.supported_steps = StepSupport::Exact(vec![NATIVE_STEPS]);
+            out.capabilities.supports_negative_prompt = false;
+        }
+        TransformerVariant::Dev => {
+            out.capabilities.supported_steps = StepSupport::Exact(vec![30]);
+            out.capabilities.supports_negative_prompt = true;
+            // The dev transformer has one official guided Euler trajectory.  Leaving the curated
+            // distilled menu open would accept a knob that its variant cannot execute.
+            out.capabilities.samplers.clear();
+        }
+    }
     out
 }
 
@@ -1913,6 +2015,9 @@ pub struct Ltx25Generator {
     bundle: LtxBundle,
     device: Device,
     use_diffusion_decoder: bool,
+    /// Parsed from the split transformer metadata at ordinary provider load time and re-threaded
+    /// through the request-local pipeline materializer.
+    transformer_variant: TransformerVariant,
     /// Exact selected source mode; retained by the ordinary provider so a later load cannot
     /// silently report q4/bf16 after a distinct selector was requested.
     quant_mode: Ltx25QuantMode,
@@ -1943,6 +2048,8 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             resolved.layout().id()
         )));
     }
+    let transformer_variant = TransformerVariant::from_bundle(&resolved)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
     bundle::assert_gemma_version(&resolved)?;
     let use_diffusion_decoder = spec
         .components
@@ -1954,15 +2061,17 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         &Device::Cpu,
         use_diffusion_decoder,
         quant_mode,
+        transformer_variant,
     )?;
     resolved.require(LtxComponent::DurationHead)?;
     resolved.require(LtxComponent::TemporalUpsampler)?;
     drop(pipe);
     Ok(Box::new(Ltx25Generator {
-        descriptor: descriptor_25(),
+        descriptor: descriptor_25_for_variant(transformer_variant),
         bundle: resolved,
         device,
         use_diffusion_decoder,
+        transformer_variant,
         quant_mode,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
@@ -2011,6 +2120,7 @@ impl Generator for Ltx25Generator {
             &self.device,
             self.use_diffusion_decoder,
             self.quant_mode,
+            self.transformer_variant,
         )?;
         let mut slot = candle_gen::lock_recover(&self.components);
         let want_encoder = needs_ltx_vae_encoder(req);
@@ -2117,6 +2227,7 @@ mod tests {
                 .expect("empty validation-only bundle"),
             device: Device::Cpu,
             use_diffusion_decoder: false,
+            transformer_variant: TransformerVariant::Distilled,
             quant_mode: Ltx25QuantMode::Bf16,
             adapters: Vec::new(),
             components: Mutex::new(None),
@@ -2160,6 +2271,42 @@ mod tests {
     }
 
     #[test]
+    fn ltx25_loaded_variant_changes_the_ordinary_provider_request_surface() {
+        let distilled = descriptor_25_for_variant(TransformerVariant::Distilled);
+        assert_eq!(
+            distilled.capabilities.supported_steps,
+            StepSupport::Exact(vec![NATIVE_STEPS])
+        );
+        assert!(!distilled.capabilities.supports_negative_prompt);
+
+        let dev = descriptor_25_for_variant(TransformerVariant::Dev);
+        assert_eq!(
+            dev.capabilities.supported_steps,
+            StepSupport::Exact(vec![30])
+        );
+        assert!(dev.capabilities.supports_negative_prompt);
+        assert!(dev.capabilities.samplers.is_empty());
+
+        let request = GenerationRequest {
+            prompt: "a red kite over the sea".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            steps: Some(30),
+            negative_prompt: Some("blurred motion".into()),
+            ..Default::default()
+        };
+        assert!(dev
+            .capabilities
+            .validate_request(MODEL_25_ID, &request)
+            .is_ok());
+        assert!(distilled
+            .capabilities
+            .validate_request(MODEL_25_ID, &request)
+            .is_err());
+    }
+
+    #[test]
     fn ltx25_catalog_route_reaches_the_quant_policy_before_bundle_loading() {
         // This is intentionally an ordinary registry load, not a selector helper. The nonexistent
         // root proves that Q8 is parsed as the LTX ConvRot option at the provider boundary before
@@ -2197,6 +2344,8 @@ mod tests {
             .expect("ordinary renderer exists");
         assert!(renderer.contains("resolve_request_num_frames("));
         assert!(renderer.contains("self.render_dfr("));
+        assert!(renderer.contains("denoise_av_dev_conditioned("));
+        assert!(renderer.contains("negative_context"));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
     }
 
