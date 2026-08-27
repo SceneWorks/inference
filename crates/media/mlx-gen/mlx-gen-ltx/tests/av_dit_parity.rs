@@ -90,6 +90,7 @@ fn run(bf16: bool, golden: &str) {
             None,
             g.require("audio_positions").unwrap(),
             None,
+            None,
         )
         .expect("av dit forward");
 
@@ -116,6 +117,7 @@ fn run(bf16: bool, golden: &str) {
             g.require("audio_context").unwrap(),
             None,
             g.require("audio_positions").unwrap(),
+            None,
             Some(dit.next_rope_epoch()),
         )
         .expect("av dit forward (epoch path)");

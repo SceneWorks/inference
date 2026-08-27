@@ -204,6 +204,7 @@ fn ltx_av_compiled_vs_eager() {
             None,
             g.require("audio_positions").unwrap(),
             None,
+            None,
         )
         .expect("av dit forward")
     };

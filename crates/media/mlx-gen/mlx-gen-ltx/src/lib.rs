@@ -43,6 +43,7 @@ pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod convert;
+pub mod dfr;
 pub mod diff_vae;
 pub mod duration_head;
 pub mod enhance;

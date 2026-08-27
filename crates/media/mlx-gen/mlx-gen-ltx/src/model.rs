@@ -1225,6 +1225,25 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+    // (`use_keyframes_abs_pos_embedding: false`), so generated keyframe slots would be denoised as
+    // unmarked tokens — wasted compute with no conditioning effect. Refuse up front like the
+    // reference's `assert_generated_keyframes_supported`, typed so the worker distinguishes the
+    // capability gap from a generic failure.
+    if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+        return Err(Error::Unsupported(
+            "ltx_2_3: num_generated_keyframes requires a generated-keyframe checkpoint \
+             (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
+                .into(),
+        ));
+    }
+    if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+        return Err(Error::Unsupported(
+            "ltx_2_3: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
+             keyframe slots + the temporal latent upsampler)"
+                .into(),
+        ));
+    }
     let latent_frames = Ltx::latent_dims(req).0 as i32;
     let resolve_latent_index = |label: &str, idx: i32| -> Result<()> {
         let resolved = if idx < 0 { latent_frames + idx } else { idx };
@@ -1898,6 +1917,48 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Ltx::latent_dims(&req), (1, 8, 12, 16, 24));
+    }
+
+    /// sc-18789: the DFR knobs are refused on the 2.3 checkpoint with a TYPED `Unsupported` — its
+    /// transformer has no learned keyframe-slot marker, so slots would denoise as unmarked tokens
+    /// (wasted compute, no conditioning). `0`/`None` stay accepted (off).
+    #[test]
+    fn validate_refuses_dfr_knobs_on_2_3_typed() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "p".into(),
+            width: 640,
+            height: 384,
+            frames: Some(25),
+            ..Default::default()
+        };
+        for (label, req) in [
+            (
+                "num_generated_keyframes",
+                GenerationRequest {
+                    num_generated_keyframes: Some(3),
+                    ..base.clone()
+                },
+            ),
+            (
+                "temporal_upsample_rounds",
+                GenerationRequest {
+                    temporal_upsample_rounds: Some(1),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            let err = validate_request(&caps, &req).expect_err(label);
+            assert!(matches!(err, Error::Unsupported(_)), "{label}: {err}");
+            assert!(err.to_string().contains("2.5"), "{label}: {err}");
+        }
+        // Zero / unset are the off position, not a refusal.
+        let off = GenerationRequest {
+            num_generated_keyframes: Some(0),
+            temporal_upsample_rounds: Some(0),
+            ..base
+        };
+        validate_request(&caps, &off).expect("0 is off");
     }
 
     #[test]

@@ -54,6 +54,10 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
 /// stage-transition re-noise scale.
 pub const STAGE2_SIGMAS: [f32; 4] = [0.909_375, 0.725, 0.421_875, 0.0];
 
+/// DFR temporal-round sigmas (`dfr_pipeline`'s `DISTILLED_SIGMAS[4:]`, 4 denoise steps).
+/// `TEMPORAL_SIGMAS[0]` doubles as the tile-entry re-noise scale.
+pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909_375, 0.725, 0.421_875, 0.0];
+
 /// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`), and
 /// therefore the ONLY value of `req.steps` this engine can honor (sc-19502).
 ///
@@ -782,7 +786,7 @@ pub fn denoise_av(
         let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
         let (vvel, avel) = dit.forward(
             &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
-            rope_epoch,
+            None, rope_epoch,
         )?;
         let vvel = vvel
             .transpose_axes(&[0, 2, 1])?
@@ -860,7 +864,7 @@ pub fn denoise_av_curated(
             let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
             let (vvel, avel) = dit.forward(
                 &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
-                rope_epoch,
+                None, rope_epoch,
             )?;
             let vvel = vvel
                 .transpose_axes(&[0, 2, 1])?
@@ -894,7 +898,7 @@ pub struct StageKeyframe<'a> {
 
 /// Build the per-stage [`I2vConditioning`] for a stage's `keyframes` over `base` (zeros for stage 1,
 /// the upscaled latent for stage 2), casting each conditioning latent to the base dtype. Empty → T2V.
-fn stage_keyframe_state(
+pub(crate) fn stage_keyframe_state(
     base: &Array,
     keyframes: &[StageKeyframe],
     stage1: bool,
@@ -974,6 +978,7 @@ pub fn denoise_av_tokens(
             audio_ctx,
             None,
             audio_pos,
+            video.keyframes_mask.as_ref(),
             rope_epoch,
         )?;
         let avel = avel
@@ -999,6 +1004,189 @@ pub fn denoise_av_tokens(
             denoise_mask: video.denoise_mask.clone(),
             positions: video.positions.clone(),
             target_tokens: video.target_tokens,
+            keyframes_mask: video.keyframes_mask.clone(),
+            generated_keyframe_layout: video.generated_keyframe_layout.clone(),
+        },
+        alat,
+    ))
+}
+
+/// The audio side of an ancestral token denoise, when the audio modality is present.
+///
+/// Deliberately mask-free: the reference loop post-processes BOTH modalities after noise
+/// injection, but the audio `LatentState` it does that with always carries an all-ones
+/// `denoise_mask` (audio is never conditioned on this engine's surface), so its re-pin is the
+/// identity `x·1 + clean·0`. Carrying no mask here is that identity by construction — if audio
+/// conditioning ever lands, this struct must grow the `clean`/`mask` pair and the loop must
+/// re-pin audio exactly like video (sc-18789 review note).
+pub struct AncestralAudio<'a> {
+    /// `(B, 8, T, 16)` audio latent grid.
+    pub latent: &'a Array,
+    pub ctx: &'a Array,
+    pub positions: &'a Array,
+}
+
+/// Token-native **rectified-flow ancestral** joint denoise (sc-18789) — the reference
+/// `euler_ancestral_denoising_loop` + `EulerAncestralDiffusionStep` over a [`VideoTokenState`]:
+///
+/// * per step, the x0 prediction is mask-corrected (`post_process_latent`) exactly like the
+///   deterministic loop;
+/// * a terminal `σ_next = 0` short-circuits to the corrected x0;
+/// * otherwise the RF-ancestral update runs — interpolate to `σ_down`, variance-preserving rescale,
+///   inject `renoise_coeff · s_noise` of fresh seeded Gaussian noise — and, because injected noise
+///   lands on conditioning tokens too, the conditioning mask is re-applied to the *stepped* latent
+///   (the reference re-pins after noise injection, `draw_noise` branch only);
+/// * `audio: None` runs the video-only AV forward (the DFR temporal-tile configuration —
+///   cross-modal attention skipped, matching the reference `audio=None` stage call);
+/// * noise draws are keyed on `(noise_seed, step, modality)` — deterministic per seed, distinct per
+///   step, video before audio. Bit-parity with torch's generator stream is not a goal (the noise
+///   *distribution* and its seed-determinism are the contract).
+///
+/// At `eta = 0` the update is algebraically the deterministic Euler interpolation and no noise is
+/// drawn. Returns the final state (and the audio latent when the modality was present).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_tokens_rf_ancestral(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    video_ctx: &Array,
+    audio: Option<AncestralAudio<'_>>,
+    sigmas: &[f32],
+    eta: f32,
+    s_noise: f32,
+    noise_seed: u64,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(VideoTokenState, Option<Array>)> {
+    let dt = video.latent.dtype();
+    let mut vtok = video.latent.clone();
+    let mut alat = audio.as_ref().map(|a| a.latent.clone());
+    let audio_dims = audio.as_ref().map(|a| {
+        let s = a.latent.shape();
+        (s[0], s[1], s[2], s[3])
+    });
+    let rope_epoch = Some(dit.next_rope_epoch());
+    let seeded_normal = |shape: &[i32], step: usize, modality: u64| -> Result<Array> {
+        let key = mlx_rs::random::key(
+            noise_seed
+                .wrapping_add(2 * step as u64)
+                .wrapping_add(modality),
+        )?;
+        Ok(mlx_rs::random::normal::<f32>(shape, None, None, Some(&key))?.as_dtype(dt)?)
+    };
+
+    for i in 0..sigmas.len() - 1 {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
+        let sig = scalar(sigma).as_dtype(dt)?;
+
+        let (vvel, avel) = match (&alat, &audio, audio_dims) {
+            (Some(al), Some(a), Some((ab, ac, at, af))) => {
+                let aflat = al
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[ab, at, ac * af])?;
+                let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+                let (vv, av) = dit.forward(
+                    &vtok,
+                    &vts,
+                    video_ctx,
+                    None,
+                    &video.positions,
+                    &aflat,
+                    &ats,
+                    a.ctx,
+                    None,
+                    a.positions,
+                    video.keyframes_mask.as_ref(),
+                    rope_epoch,
+                )?;
+                let av = av
+                    .reshape(&[ab, at, ac, af])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
+                (vv, Some(av))
+            }
+            _ => (
+                dit.forward_video_only(
+                    &vtok,
+                    &vts,
+                    video_ctx,
+                    None,
+                    &video.positions,
+                    video.keyframes_mask.as_ref(),
+                    rope_epoch,
+                )?,
+                None,
+            ),
+        };
+
+        // Mask-corrected x0 (reference `post_process_latent` on the denoised prediction).
+        let vden = apply_denoise_mask(
+            &to_denoised(&vtok, &vvel, &sig)?,
+            &video.clean_latent,
+            &video.denoise_mask,
+        )?;
+        let aden = match (&alat, &avel) {
+            (Some(al), Some(av)) => Some(to_denoised(al, av, &sig)?),
+            _ => None,
+        };
+
+        if sigma_next <= 0.0 {
+            vtok = vden;
+            if let Some(ad) = aden {
+                alat = Some(ad);
+            }
+        } else {
+            let coeffs = mlx_gen::gen_core::ltx_dfr::RfAncestralCoeffs::new(
+                sigma, sigma_next, eta, s_noise,
+            )?;
+            let ratio = scalar(coeffs.sigma_down_ratio).as_dtype(dt)?;
+            let one_minus = scalar(1.0 - coeffs.sigma_down_ratio).as_dtype(dt)?;
+            let step_rf =
+                |x: &Array, x0: &Array, step_idx: usize, modality: u64| -> Result<Array> {
+                    let mut next = add(&multiply(x, &ratio)?, &multiply(x0, &one_minus)?)?;
+                    if eta > 0.0 {
+                        // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 — the
+                        // reference does not fall back to the noise-free branch when eta > 0).
+                        let ar = scalar(coeffs.alpha_ratio).as_dtype(dt)?;
+                        next = multiply(&next, &ar)?;
+                        if coeffs.renoise_coeff > 0.0 {
+                            let noise = seeded_normal(next.shape(), step_idx, modality)?;
+                            let rc = scalar(coeffs.renoise_coeff).as_dtype(dt)?;
+                            next = add(&next, &multiply(&noise, &rc)?)?;
+                        }
+                    }
+                    Ok(next)
+                };
+            let mut vnext = step_rf(&vtok, &vden, i, 0)?;
+            if eta > 0.0 {
+                // Injected noise reached the conditioning tokens; re-pin them (the reference
+                // re-applies `post_process_latent` after noise injection).
+                vnext = apply_denoise_mask(&vnext, &video.clean_latent, &video.denoise_mask)?;
+            }
+            vtok = vnext;
+            if let (Some(al), Some(ad)) = (&alat, &aden) {
+                alat = Some(step_rf(al, ad, i, 1)?);
+            }
+        }
+
+        match &alat {
+            Some(al) => mlx_rs::transforms::eval([&vtok, al])?,
+            None => mlx_rs::transforms::eval([&vtok])?,
+        }
+        on_step(i + 1);
+    }
+
+    Ok((
+        VideoTokenState {
+            latent: vtok,
+            clean_latent: video.clean_latent.clone(),
+            denoise_mask: video.denoise_mask.clone(),
+            positions: video.positions.clone(),
+            target_tokens: video.target_tokens,
+            keyframes_mask: video.keyframes_mask.clone(),
+            generated_keyframe_layout: video.generated_keyframe_layout.clone(),
         },
         alat,
     ))
