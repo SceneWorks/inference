@@ -39,8 +39,7 @@ fn candle_descriptor_does_not_advertise_prompt_enhancement() {
         !descriptor.capabilities.supports_prompt_enhancement,
         "{}/{}: the candle LTX provider has no enhancer, so it must not advertise \
          supports_prompt_enhancement",
-        descriptor.backend,
-        descriptor.id,
+        descriptor.backend, descriptor.id,
     );
 }
 
