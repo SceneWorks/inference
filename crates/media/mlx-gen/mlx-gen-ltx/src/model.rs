@@ -45,7 +45,7 @@
 //! I2V+Audio. The VAE **encoder** is loaded **lazily** on first encode, so pure-T2V runs never pay
 //! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -55,6 +55,7 @@ use mlx_gen::gen_core::ltx_checkpoint::{
 use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::{to_dtype, Weights};
+use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::{
     curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
@@ -82,11 +83,17 @@ use crate::transformer::{AvDiT, Precision};
 use crate::upsampler::LatentUpsampler;
 use crate::vae::LtxVideoVae;
 use crate::vocoder::LtxVocoder;
+use mlx_llm::core_llm::{ChatTemplate as CoreChatTemplate, JinjaChatTemplate, Message};
+use mlx_llm::primitives::Weights as LlmWeights;
+use mlx_llm::{CausalLm, ModelConfig};
 
 /// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
 /// Public provider id for the split-component Gemma-4 LTX-2.5 route.
 pub const MODEL_25_ID: &str = "ltx_2_5";
+/// The stock, locally staged Gemma-4 instruction snapshot used only for opt-in LTX-2.5 prompt
+/// enhancement.  It lives below the single LTX rehost rather than in a job-time HF cache.
+const LTX25_ENHANCER_COMPONENT: &str = "enhancer";
 
 /// The supported DiffVAE execution recipe.  The planner still chooses untiled versus tiled from
 /// the live process budget; this is the upstream semantic mode fed into that planner.
@@ -317,7 +324,7 @@ pub fn descriptor_25() -> ModelDescriptor {
     out.id = MODEL_25_ID;
     out.capabilities.supports_lora = false;
     out.capabilities.supports_lokr = false;
-    out.capabilities.supports_prompt_enhancement = false;
+    out.capabilities.supports_prompt_enhancement = true;
     out.capabilities.supports_auto_duration = true;
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds =
@@ -337,6 +344,7 @@ enum TextAssets {
         bundle: LtxBundle,
         connector: PathBuf,
         offload_policy: mlx_gen::gen_core::OffloadPolicy,
+        enhancer: PathBuf,
     },
 }
 
@@ -784,7 +792,8 @@ pub struct Ltx25 {
 /// assembly is request-scoped and invoked by [`Generator::generate`], not hidden behind a filename
 /// convention or a separate loader entry point.
 pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let known = crate::bundle::split_component_ids();
+    let mut known = crate::bundle::split_component_ids();
+    known.push(LTX25_ENHANCER_COMPONENT);
     reject_unknown_components(spec, &known, MODEL_25_ID)?;
     if !spec.adapters.is_empty() {
         return Err(Error::Unsupported(
@@ -845,6 +854,27 @@ fn ltx25_decoder_selection(spec: &LoadSpec) -> Ltx25DecoderSelection {
         Ltx25DecoderSelection::DiffusionBudgeted(DEFAULT_DIFFVAE_MODE)
     } else {
         Ltx25DecoderSelection::Conv
+    }
+}
+
+/// Resolve the opt-in stock Gemma-4 enhancer below the one LTX-2.5 rehost.  The only accepted
+/// override is another already-staged directory; no cache/environment/network lookup exists.
+fn ltx25_enhancer_dir(spec: &LoadSpec) -> Result<PathBuf> {
+    if let Some(source) = spec.components.get(LTX25_ENHANCER_COMPONENT) {
+        return match source {
+            WeightsSource::Dir(dir) => Ok(dir.clone()),
+            WeightsSource::File(path) => Err(Error::Msg(format!(
+                "ltx_2_5: '{LTX25_ENHANCER_COMPONENT}' must be the staged google/gemma-4-12B-it \
+                 snapshot directory, not file {}",
+                path.display()
+            ))),
+        };
+    }
+    match &spec.weights {
+        WeightsSource::Dir(root) => Ok(root.join(LTX25_ENHANCER_COMPONENT)),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "ltx_2_5: split bundles must be loaded from their component directory".into(),
+        )),
     }
 }
 
@@ -961,6 +991,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
         .path()
         .to_path_buf();
     let tokenizer = Ltx25Tokenizer::from_packed_te_file(&te_path)?;
+    let enhancer = ltx25_enhancer_dir(spec)?;
     let duration_w = Weights::from_file(bundle.require(LtxComponent::DurationHead)?.path())?;
     let duration_head = DurationHead::from_weights(&duration_w)?;
     let temporal_upsampler =
@@ -983,6 +1014,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             bundle,
             connector,
             offload_policy: spec.offload_policy,
+            enhancer,
         },
         execution: LtxExecution::Ltx25(Box::new(Ltx25Execution {
             duration_head,
@@ -1033,6 +1065,7 @@ impl Ltx {
                 bundle,
                 connector,
                 offload_policy,
+                ..
             } => {
                 let connector_w = Weights::from_file(connector)?;
                 Ok(StagedTextEncoder::Gemma4(Box::new(
@@ -1075,7 +1108,10 @@ impl Ltx {
         // uncensored path loads its own. Running it here keeps BOTH TE uses inside one staged load.
         let enhanced = match &te {
             StagedTextEncoder::Gemma3(te) => self.maybe_enhance(te, req),
-            StagedTextEncoder::Gemma4(_) => None,
+            // Unlike the legacy 2.3 best-effort enhancer, the declared 2.5 stock-snapshot route
+            // is fail-closed: an asset, version, template, or decode mismatch must not silently
+            // turn an enhancement request into ordinary conditioning.
+            StagedTextEncoder::Gemma4(_) => self.maybe_enhance_gemma4(req)?,
         };
         let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
         let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
@@ -1777,6 +1813,162 @@ impl Ltx {
         let tokenizer = LtxTokenizer::from_dir(dir)?;
         Ok((model, tokenizer))
     }
+
+    /// Load and validate the stock `google/gemma-4-12B-it` snapshot staged as `enhancer/` in the
+    /// LTX-2.5 rehost.  This is intentionally demand-loaded: an ordinary request never needs its
+    /// extra model, while an enhanced request gets a precise local remediation instead of a hidden
+    /// cache lookup or fallback to the packed LTX text encoder.
+    fn load_ltx25_enhancer(&self) -> Result<(CausalLm, TextTokenizer, JinjaChatTemplate)> {
+        let TextAssets::Gemma4 { enhancer, .. } = &self.text_assets else {
+            return Err(Error::Msg(
+                "ltx_2_5 enhancer selected on a non-2.5 provider route".into(),
+            ));
+        };
+        let required = ["config.json", "tokenizer.json", "tokenizer_config.json"];
+        for file in required {
+            let path = enhancer.join(file);
+            if !path.is_file() {
+                return Err(Error::Msg(format!(
+                    "ltx_2_5: prompt enhancement requires the offline google/gemma-4-12B-it \
+                     snapshot staged at {}; missing {file}. No job-time download is attempted",
+                    enhancer.display()
+                )));
+            }
+        }
+        let config_text = std::fs::read_to_string(enhancer.join("config.json"))?;
+        let config_json: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
+            Error::Msg(format!(
+                "ltx_2_5: enhancer config {} is not valid JSON: {e}",
+                enhancer.join("config.json").display()
+            ))
+        })?;
+        let cfg = ModelConfig::from_json(&config_json)
+            .map_err(|e| Error::Msg(format!("ltx_2_5: invalid Gemma-4 enhancer config: {e}")))?;
+        if !cfg.is_gemma4() {
+            return Err(Error::Msg(format!(
+                "ltx_2_5: enhancer at {} is not google/gemma-4-12B-it (expected a Gemma-4 \
+                 config); refusing to misreport prompt enhancement",
+                enhancer.display()
+            )));
+        }
+        let weights = LlmWeights::from_dir(enhancer).map_err(|e| {
+            Error::Msg(format!(
+                "ltx_2_5: staged enhancer weights at {} are unusable: {e}",
+                enhancer.display()
+            ))
+        })?;
+        let model = CausalLm::from_weights(&weights, "", cfg).map_err(|e| {
+            Error::Msg(format!(
+                "ltx_2_5: staged enhancer at {} does not match its Gemma-4 config: {e}",
+                enhancer.display()
+            ))
+        })?;
+        let tokenizer = TextTokenizer::from_file(
+            enhancer.join("tokenizer.json"),
+            TokenizerConfig {
+                max_length: usize::MAX,
+                pad_token_id: 0,
+                chat_template: ChatTemplate::None,
+                pad_to_max_length: false,
+            },
+        )?;
+        let template = ltx25_enhancer_chat_template(enhancer, &config_json)?;
+        Ok((model, tokenizer, template))
+    }
+
+    /// Run stock-Gemma enhancement with the snapshot's own template, then make that exact returned
+    /// string the only prompt fed to LTX's conditioning encoder below in `stage_text_phase`.
+    fn maybe_enhance_gemma4(&self, req: &GenerationRequest) -> Result<Option<String>> {
+        if !req.enhance_prompt {
+            return Ok(None);
+        }
+        if req.use_uncensored_enhancer {
+            return Err(Error::Unsupported(
+                "ltx_2_5: use_uncensored_enhancer is unsupported; this route uses only the \
+                 licensed stock google/gemma-4-12B-it enhancer staged at enhancer/".into(),
+            ));
+        }
+        let (model, tokenizer, template) = self.load_ltx25_enhancer()?;
+        let system = if req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::Reference { .. }))
+        {
+            enhance::I2V_SYSTEM_PROMPT
+        } else {
+            enhance::T2V_SYSTEM_PROMPT
+        };
+        let rendered = template
+            .render(
+                &[Message::system(system), Message::user(format!("user prompt: {}", req.prompt))],
+                true,
+            )
+            .map_err(|e| Error::Msg(format!("ltx_2_5: enhancer chat template mismatch: {e}")))?;
+        let cfg = EnhanceConfig {
+            max_tokens: enhance::clamp_max_tokens(req.enhance_max_tokens),
+            seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
+        };
+        let prompt = enhance::enhance_gemma4(
+            &model,
+            &tokenizer,
+            &rendered,
+            &cfg,
+            &SampleParams::censored(
+                req.enhance_temperature
+                    .unwrap_or(enhance::DEFAULT_TEMPERATURE),
+            ),
+            Some(&req.cancel),
+        )?;
+        if prompt.trim().is_empty() {
+            return Err(Error::Msg(
+                "ltx_2_5: Gemma-4 enhancer returned an empty prompt; refusing to silently use the \
+                 original prompt".into(),
+            ));
+        }
+        eprintln!("ENHANCED_PROMPT:{prompt}");
+        Ok(Some(prompt))
+    }
+}
+
+/// Prefer the snapshot's sidecar template — Gemma-4 ships it there — and only then accept the
+/// embedded tokenizer-config form.  There is deliberately no generic chat-format fallback.
+fn ltx25_enhancer_chat_template(
+    enhancer: &Path,
+    config: &serde_json::Value,
+) -> Result<JinjaChatTemplate> {
+    let tokenizer_config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        enhancer.join("tokenizer_config.json"),
+    )?)
+    .map_err(|e| Error::Msg(format!("ltx_2_5: enhancer tokenizer_config.json is invalid: {e}")))?;
+    let token = |name: &str| match tokenizer_config.get(name) {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(serde_json::Value::Object(value)) => value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    };
+    let sidecar = enhancer.join("chat_template.jinja");
+    if sidecar.is_file() {
+        let source = std::fs::read_to_string(&sidecar)?;
+        if !source.trim().is_empty() {
+            return Ok(JinjaChatTemplate::with_tokens(
+                source,
+                token("bos_token"),
+                token("eos_token"),
+            ));
+        }
+    }
+    // `config` is intentionally part of the signature: keeping construction next to model config
+    // validation makes it impossible to introduce a template-only alternate asset identity.
+    let _ = config;
+    JinjaChatTemplate::from_tokenizer_config(&tokenizer_config).map_err(|e| {
+        Error::Msg(format!(
+            "ltx_2_5: enhancer at {} has no usable Gemma-4 chat template: {e}",
+            enhancer.display()
+        ))
+    })
 }
 
 impl Generator for Ltx25 {
