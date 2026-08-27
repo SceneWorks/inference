@@ -74,8 +74,8 @@ per-file checksums and re-vendor policy in `../../../_vendor/VENDORED.md`. The w
 manifest row (`release/model-weight-licenses.json`) lands with the catalog surface in sc-14047.
 
 **Re-fetching:** copy the files out of a fresh snapshot and re-run
-`cargo test -p mlx-gen-mage --test config_conformance`. A SHA-256 mismatch means the published
-config changed — treat every constant transcribed from it as suspect and re-read
+`cargo test -p mlx-gen-mage --test integration -- config_conformance::`. A SHA-256 mismatch means
+the published config changed — treat every constant transcribed from it as suspect and re-read
 `_vendor/MAGE_FLOW_GAPS.md` before touching `src/config.rs`.
 
 ## `te_micro_golden.safetensors` — the text encoder's arithmetic oracle (sc-14038)

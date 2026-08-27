@@ -32,7 +32,7 @@ Then:
 
     MINIMAX_H3_SNAPSHOT=... \
     MINIMAX_H3_VIDEO_VAE_ENCODE_REFERENCE=~/minimax-h3-real-vae-encode-reference.safetensors \
-        cargo test -p candle-gen-minimax-h3 --test real_weights -- --ignored --nocapture
+        cargo test -p candle-gen-minimax-h3 --test integration -- real_weights:: --ignored --nocapture
 
 Memory: the whole ``vae/`` at float32 is ~9.7 GiB / 10.4 GB resident -- the component ships F32
 (703 of 703 tensors), so float32 is a no-op cast and not the ~19.4 GB doubling this note used to

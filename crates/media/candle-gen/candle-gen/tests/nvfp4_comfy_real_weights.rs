@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! SC20641_NVFP4=$HOME/models/kreamania_variant7.safetensors \
-//!   cargo test -p candle-gen --test nvfp4_comfy_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen --test integration -- nvfp4_comfy_real_weights:: --ignored --nocapture
 //! ```
 //!
 //! The reference artifact is `kreamania_variant7.safetensors` (8,167,318,440 B), written by the

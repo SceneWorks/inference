@@ -4,7 +4,7 @@
 //! tokenizer.json + *.safetensors) and run:
 //!
 //! ```text
-//! MLX_LLM_TEST_MODEL=/path/to/Llama-3.2-1B-Instruct cargo test --test real_weights -- --ignored --nocapture
+//! MLX_LLM_TEST_MODEL=/path/to/Llama-3.2-1B-Instruct cargo test --test integration -- real_weights:: --ignored --nocapture
 //! ```
 //!
 //! Asserts the engine loads the snapshot and streams non-empty text, that greedy decoding is

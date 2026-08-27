@@ -37,7 +37,7 @@
 //!
 //! `#[ignore]`d — needs the real snapshot. Defaults to the HF cache `SceneWorks/scail2-mlx` (the root
 //! snapshot dir = the Q4 tier); override with `SCAIL2_MODEL_DIR`. Run: `cargo test -p mlx-gen-scail2
-//! --release --test sequential_residency_real_weights -- --ignored --nocapture`.
+//! --release --test integration -- sequential_residency_real_weights:: --ignored --nocapture`.
 
 use std::path::{Path, PathBuf};
 
