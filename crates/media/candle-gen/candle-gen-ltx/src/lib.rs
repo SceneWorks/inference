@@ -312,7 +312,7 @@ impl Pipeline {
         with_vae_encoder: bool,
     ) -> CResult<Components> {
         if self.split_bundle.is_some() {
-            return self.load_components_split(with_vae_encoder);
+            return self.load_components_split(adapters, with_vae_encoder);
         }
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
         // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
@@ -388,7 +388,11 @@ impl Pipeline {
     /// Materialise the actual split LTX-2.5 component files.  This deliberately shares the 2.3
     /// renderer rather than creating a provider-local sampler: both decoder choices consume the
     /// same DiT-normalized latent and use the same learned spatial upsampler.
-    fn load_components_split(&self, with_vae_encoder: bool) -> CResult<Components> {
+    fn load_components_split(
+        &self,
+        adapters: &[AdapterSpec],
+        with_vae_encoder: bool,
+    ) -> CResult<Components> {
         let bundle = self.split_bundle.as_ref().expect("split route has bundle");
         let transformer = bundle
             .require(LtxComponent::Transformer)
@@ -406,7 +410,7 @@ impl Pipeline {
             candle_gen::mmap_var_builder(&[transformer.to_path_buf()], DIT_DTYPE, &self.device)?;
         let dit_vb = dit_all.pp("model.diffusion_model");
         let mut avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
-        adapters::install_ltx_adapters(&mut avdit, &[])?;
+        adapters::install_ltx25_adapters(&mut avdit, adapters)?;
         let te = Ltx25TextEncoder::from_bundle_av(
             bundle,
             dit_all.clone(),
@@ -1598,7 +1602,7 @@ pub fn descriptor() -> ModelDescriptor {
 pub fn descriptor_25() -> ModelDescriptor {
     let mut out = descriptor();
     out.id = MODEL_25_ID;
-    out.capabilities.supports_lora = false;
+    out.capabilities.supports_lora = true;
     out.capabilities.supports_lokr = false;
     out.capabilities.supports_prompt_enhancement = false;
     out.capabilities.supports_auto_duration = true;
@@ -1912,6 +1916,9 @@ pub struct Ltx25Generator {
     /// Exact selected source mode; retained by the ordinary provider so a later load cannot
     /// silently report q4/bf16 after a distinct selector was requested.
     quant_mode: Ltx25QuantMode,
+    /// Selected LoRA stack retained through the lazy provider boundary and installed while the
+    /// request-scoped split transformer is materialised.
+    adapters: Vec<AdapterSpec>,
     components: Mutex<Option<Components>>,
 }
 
@@ -1920,11 +1927,6 @@ pub struct Ltx25Generator {
 pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let known = bundle::split_component_ids();
     gen_core::reject_unknown_components(spec, &known, MODEL_25_ID)?;
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "ltx_2_5_distilled: LoRA/LoKr adapters are not supported by the split route".into(),
-        ));
-    }
     let quant_mode = Ltx25QuantMode::from_load_spec(spec)?;
     let device = candle_gen::default_device()?;
     let gpu = Ltx25GpuGeneration::from_device(&device)?;
@@ -1962,6 +1964,7 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         use_diffusion_decoder,
         quant_mode,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -2016,7 +2019,7 @@ impl Generator for Ltx25Generator {
             .is_none_or(|components| components.vae_has_encoder != want_encoder)
         {
             *slot = None;
-            *slot = Some(pipe.load_components(&[], want_encoder)?);
+            *slot = Some(pipe.load_components(&self.adapters, want_encoder)?);
         }
         let components = slot.as_ref().expect("split components populated").clone();
         drop(slot);
@@ -2115,6 +2118,7 @@ mod tests {
             device: Device::Cpu,
             use_diffusion_decoder: false,
             quant_mode: Ltx25QuantMode::Bf16,
+            adapters: Vec::new(),
             components: Mutex::new(None),
         };
         let request = GenerationRequest {

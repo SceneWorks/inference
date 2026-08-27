@@ -67,7 +67,7 @@ pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
-pub use adapters::{apply_ltx_adapters, LtxLoraReport};
+pub use adapters::{apply_ltx25_adapters, apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
 pub use bundle::{
     assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,

@@ -472,6 +472,15 @@ mod tests {
         }
     }
 
+    /// A deliberately tiny shape with the two LTX-2.5 DiT deltas enabled.  Keeping the lifecycle
+    /// test on this config catches a trainer accidentally falling back to the 2.3 FF-bias layout.
+    fn tiny_cfg_25() -> AvConfig {
+        let mut cfg = tiny_cfg();
+        cfg.video.ff_bias = false;
+        cfg.video.use_keyframes_abs_pos_embedding = true;
+        cfg
+    }
+
     fn put<S: Into<Shape>>(
         map: &mut HashMap<String, Tensor>,
         key: impl Into<String>,
@@ -546,6 +555,9 @@ mod tests {
         put_linear(&mut map, "patchify_proj", vi, 8, dev);
         put_linear(&mut map, "proj_out", 8, vi, dev);
         put(&mut map, "scale_shift_table", (2, vi), dev);
+        if cfg.video.use_keyframes_abs_pos_embedding {
+            put(&mut map, "keyframes_abs_pos_embedding", (1, vi), dev);
+        }
         put_adaln(&mut map, "adaln_single", vi, 9, dev);
         put_adaln(&mut map, "prompt_adaln_single", vi, 2, dev);
         put_adaln(&mut map, "av_ca_video_scale_shift_adaln_single", vi, 4, dev);
@@ -700,7 +712,7 @@ mod tests {
     }
 
     fn assert_trained_lora_inference_roundtrip(dev: Device, tag: &str) {
-        let cfg = tiny_cfg();
+        let cfg = tiny_cfg_25();
         let map = weights(&cfg, &dev);
         let mut train = LtxDiT::new(
             VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
@@ -729,7 +741,76 @@ mod tests {
         let path = path_tmp
             .path()
             .join(format!("ltx_infer_lora_roundtrip_{tag}.safetensors"));
-        save_lora_peft(&set, "", &HashMap::new(), &path).unwrap();
+        let ltx25_metadata = HashMap::from([
+            ("lora_rank".to_string(), "2".to_string()),
+            ("lora_alpha".to_string(), "2".to_string()),
+        ]);
+        save_lora_peft(&set, "", &ltx25_metadata, &path).unwrap();
+
+        // The declared header is authoritative on LTX-2.5: a rank mismatch or a missing rank is
+        // rejected before a residual can be installed, rather than falling back to the factor shape.
+        let wrong_rank_path = path_tmp
+            .path()
+            .join(format!("ltx_bad_rank_{tag}.safetensors"));
+        save_lora_peft(
+            &set,
+            "",
+            &HashMap::from([
+                ("lora_rank".to_string(), "3".to_string()),
+                ("lora_alpha".to_string(), "2".to_string()),
+            ]),
+            &wrong_rank_path,
+        )
+        .unwrap();
+        let mut wrong_rank = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let wrong_rank_error = crate::adapters::install_ltx25_adapters(
+            &mut wrong_rank,
+            &[candle_gen::gen_core::AdapterSpec::new(
+                wrong_rank_path.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_rank_error.contains("declares lora_rank 3"),
+            "{wrong_rank_error}"
+        );
+
+        let missing_rank_path = path_tmp
+            .path()
+            .join(format!("ltx_missing_rank_{tag}.safetensors"));
+        save_lora_peft(
+            &set,
+            "",
+            &HashMap::from([("lora_alpha".to_string(), "2".to_string())]),
+            &missing_rank_path,
+        )
+        .unwrap();
+        let mut missing_rank = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let missing_rank_error = crate::adapters::install_ltx25_adapters(
+            &mut missing_rank,
+            &[candle_gen::gen_core::AdapterSpec::new(
+                missing_rank_path.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_rank_error.contains("missing required `lora_rank`"),
+            "{missing_rank_error}"
+        );
         let spec = candle_gen::gen_core::AdapterSpec::new(
             path.clone(),
             1.0,
@@ -745,14 +826,14 @@ mod tests {
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
         let report =
-            crate::adapters::install_ltx_adapters(&mut inference, std::slice::from_ref(&spec))
+            crate::adapters::install_ltx25_adapters(&mut inference, std::slice::from_ref(&spec))
                 .unwrap();
         assert_eq!(report.applied, 8);
         assert_eq!(report.skipped_keys, 0);
         let adapted = inference
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
-        let effect = (adapted - &base)
+        let effect = (adapted.clone() - &base)
             .unwrap()
             .abs()
             .unwrap()
@@ -762,6 +843,32 @@ mod tests {
             .unwrap();
         assert!(effect > 1e-6, "nonzero trained factors must change output");
 
+        // Saving and loading a second copy must reproduce the adapted prediction exactly.  This is
+        // intentionally a separate DiT, so bypassing the adapter install cannot borrow the first
+        // model's in-memory residuals.
+        let mut reloaded = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        crate::adapters::install_ltx25_adapters(&mut reloaded, std::slice::from_ref(&spec))
+            .unwrap();
+        let reproduced = reloaded
+            .forward_video_only(&latent, 0.37, &context, &positions)
+            .unwrap();
+        let roundtrip_diff = (adapted - reproduced)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            roundtrip_diff < 1e-6,
+            "saved LTX-2.5 LoRA must reproduce on reload"
+        );
+
         let mut scale_zero =
             AvDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg).unwrap();
         let zero_spec = candle_gen::gen_core::AdapterSpec::new(
@@ -769,7 +876,7 @@ mod tests {
             0.0,
             candle_gen::gen_core::AdapterKind::Lora,
         );
-        crate::adapters::install_ltx_adapters(&mut scale_zero, &[zero_spec]).unwrap();
+        crate::adapters::install_ltx25_adapters(&mut scale_zero, &[zero_spec]).unwrap();
         let zero = scale_zero
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
@@ -782,6 +889,8 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(zero_diff, 0.0, "scale=0 must be an exact base no-op");
+        std::fs::remove_file(wrong_rank_path).ok();
+        std::fs::remove_file(missing_rank_path).ok();
         std::fs::remove_file(path).ok();
     }
 

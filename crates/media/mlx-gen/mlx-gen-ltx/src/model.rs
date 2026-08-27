@@ -322,7 +322,7 @@ pub fn descriptor() -> ModelDescriptor {
 pub fn descriptor_25() -> ModelDescriptor {
     let mut out = descriptor();
     out.id = MODEL_25_ID;
-    out.capabilities.supports_lora = false;
+    out.capabilities.supports_lora = true;
     out.capabilities.supports_lokr = false;
     out.capabilities.supports_prompt_enhancement = true;
     out.capabilities.supports_auto_duration = true;
@@ -795,11 +795,6 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut known = crate::bundle::split_component_ids();
     known.push(LTX25_ENHANCER_COMPONENT);
     reject_unknown_components(spec, &known, MODEL_25_ID)?;
-    if !spec.adapters.is_empty() {
-        return Err(Error::Unsupported(
-            "ltx_2_5: LoRA/LoKr adapters are not part of this provider route".into(),
-        ));
-    }
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
     if bundle.layout() != LtxCheckpointLayout::Split {
         return Err(Error::Msg(format!(
@@ -1009,7 +1004,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             .to_path_buf(),
         config,
         dit_prec,
-        adapters: Vec::new(),
+        adapters: spec.adapters.clone(),
         text_assets: TextAssets::Gemma4 {
             bundle,
             connector,
@@ -1089,11 +1084,19 @@ impl Ltx {
         let transformer_w = Weights::from_file(&self.transformer_path)?;
         let mut transformer = AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?;
         if !self.adapters.is_empty() {
-            crate::adapters::apply_ltx_adapters(
-                &mut transformer,
-                &self.adapters,
-                crate::pipeline::NUM_DENOISE_PASSES,
-            )?;
+            if self.descriptor.id == MODEL_25_ID {
+                crate::adapters::apply_ltx25_adapters(
+                    &mut transformer,
+                    &self.adapters,
+                    crate::pipeline::NUM_DENOISE_PASSES,
+                )?;
+            } else {
+                crate::adapters::apply_ltx_adapters(
+                    &mut transformer,
+                    &self.adapters,
+                    crate::pipeline::NUM_DENOISE_PASSES,
+                )?;
+            }
         }
         Ok(transformer)
     }
