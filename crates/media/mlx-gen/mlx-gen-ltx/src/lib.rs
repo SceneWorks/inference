@@ -51,6 +51,7 @@ pub mod gemma;
 pub mod gemma4_te;
 pub mod image_crf;
 pub mod memory_strategy;
+pub mod memory_strategy_2_5;
 pub mod model;
 pub mod params;
 pub mod pipeline;

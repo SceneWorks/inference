@@ -42,6 +42,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mlx_gen::attention::AttentionBudget;
 use mlx_gen::weights::Weights;
 use mlx_gen::{AdapterSpec, Error, Result};
 
@@ -94,6 +95,14 @@ pub struct LtxBlockStream {
     /// The precision the resident stack was built at, replayed per materialized block so a streamed
     /// block is bit-identical to its resident twin rather than merely close.
     prec: Precision,
+    /// Ladder rung 3, replayed onto each materialized block so a rung-3 + rung-4 composition runs
+    /// the SAME attention on the streamed path as on the resident one.
+    ///
+    /// Without this the composition is silently wrong in the direction that hides: the contract
+    /// declares both rungs, the selector engages both (rung 4 engages rung 3 by cost order), and
+    /// every window rebuilds a block at `UNBOUNDED` — bounded weights, unbounded scores, identical
+    /// output.
+    attn_budget: AttentionBudget,
 }
 
 impl LtxBlockStream {
@@ -128,7 +137,23 @@ impl LtxBlockStream {
                 source.display()
             )));
         }
-        Ok(Self { source, cfg, prec })
+        Ok(Self {
+            source,
+            cfg,
+            prec,
+            attn_budget: AttentionBudget::UNBOUNDED,
+        })
+    }
+
+    /// Record rung 3's attention budget so every materialized block executes the same attention its
+    /// resident twin would.
+    pub fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.attn_budget = budget;
+    }
+
+    /// The budget a materialized block will carry.
+    pub fn attention_budget(&self) -> AttentionBudget {
+        self.attn_budget
     }
 
     /// The stack depth this stream materializes — read from the model config, never a constant, so a
@@ -164,12 +189,13 @@ impl LtxBlockStream {
                 self.n_blocks()
             )));
         }
-        let block = AvBlock::load(
+        let mut block = AvBlock::load(
             view,
             &format!("transformer_blocks.{index}"),
             &self.cfg,
             self.prec,
         )?;
+        block.set_attention_budget(self.attn_budget);
         // LOAD-BEARING: the view keeps its own refcounted handle to every tensor the constructor
         // read. Draining exactly the accessed keys is what makes the window's drop a real release
         // rather than a no-op that still produces correct frames.

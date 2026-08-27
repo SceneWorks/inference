@@ -36,7 +36,15 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::block_residency::BlockPlan;
+
+/// sc-18797's rung-4 loader-identity and bit-identity suite. A `#[path]` submodule rather than a
+/// `tests/` file because it observes the private loader surface (`AvBlocks`, `AvBlock`'s attentions)
+/// that AC2's output-invisible failure mode can only be caught on.
+#[cfg(test)]
+#[path = "transformer_rung4_tests.rs"]
+mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::CancelFlag;
 
@@ -717,6 +725,11 @@ struct Attention {
     /// probability matrix. Training-only knob, set by [`set_sdpa_checkpoint`](Self::set_sdpa_checkpoint);
     /// `false` on the inference path (byte-identical to the pre-sc-4942 forward).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 — bounded attention (sc-18797). [`AttentionBudget::UNBOUNDED`] is the load
+    /// default and takes the single fused-SDPA call, byte-identical to the pre-rung forward; the
+    /// chunk boundaries under a real budget come from the SHARED planner
+    /// (`gen_core::attention_budget`) via `mlx_gen::attention`, never from arithmetic here.
+    attn_budget: AttentionBudget,
 }
 
 impl Attention {
@@ -748,12 +761,18 @@ impl Attention {
             dim_head,
             eps,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
     fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;
+    }
+
+    /// Select ladder rung 3's score budget for this attention.
+    fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.attn_budget = budget;
     }
 
     /// Cast the attention's frozen weights (q/k/v/out projections, optional gate, q/k RMSNorm
@@ -865,11 +884,24 @@ impl Attention {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::Msg("ltx: checkpoint SDPA produced no output".into()))?
-        } else {
+        } else if self.attn_budget.is_unbounded() {
             match mask {
                 Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
                 None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
             }
+        } else {
+            // Ladder rung 3 (sc-18797). On MLX the saving is NOT a bounded score tensor — `fast::sdpa`
+            // is a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting
+            // the lazy graph. See `mlx_gen::attention`'s module docs; the Candle magnitude (-32% on
+            // the denoise phase against -1.7% here) must NOT be carried across.
+            mlx_gen::attention::sdpa_budgeted_bhsd(
+                &qh,
+                &kh,
+                &vh,
+                scale,
+                mask,
+                AttentionPlan::budgeted(self.attn_budget),
+            )?
         };
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -2109,6 +2141,29 @@ impl AvBlock {
         self.ff.set_lora_pass(pass);
         self.a_ff.set_lora_pass(pass);
     }
+
+    /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
+    /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
+    /// would leave the audio branch's scores unbounded while the contract claimed the rung.
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        for attn in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attn.set_attention_budget(budget);
+        }
+    }
+
+    /// The budget this block's attentions carry. Read from the video self-attention; the six are
+    /// written together by [`Self::set_attention_budget`], and
+    /// `every_attention_in_a_block_carries_the_selected_budget` pins that they stay in step.
+    pub(crate) fn attention_budget(&self) -> AttentionBudget {
+        self.attn1.attn_budget
+    }
 }
 
 /// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
@@ -2311,6 +2366,35 @@ impl AvDiT {
     /// Attach the request's cancel flag, checked at every window boundary.
     pub fn set_cancel(&mut self, cancel: CancelFlag) {
         self.cancel = cancel;
+    }
+
+    /// Select ladder rung 3's attention budget for the whole trunk.
+    ///
+    /// Both arms are load-bearing. On a resident stack the budget is written into the blocks that
+    /// already exist; on a streamed stack there are no blocks yet, so it is recorded on the stream
+    /// and replayed onto every block a window materializes. Setting only the first would leave the
+    /// rung-3 + rung-4 composition — the one the cost-order default actually produces, since rung 4
+    /// engages rung 3 — running unbounded attention with identical output.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.set_attention_budget(budget);
+                }
+            }
+            AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// The budget the next forward will execute, read back from wherever it actually lives.
+    pub fn attention_budget(&self) -> mlx_gen::attention::AttentionBudget {
+        match &self.blocks {
+            AvBlocks::Resident(blocks) => blocks
+                .first()
+                .map(|block| block.attention_budget())
+                .unwrap_or(AttentionBudget::UNBOUNDED),
+            AvBlocks::Streamed(stream) => stream.attention_budget(),
+        }
     }
 
     /// Whether this AvDiT defers its block trunk. The loader-identity predicate: rung 4's failure is
