@@ -310,6 +310,12 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "candle the single-stage `ltx_2_3_distilled`, mlx the two-stage `ltx_2_3`. Both doc "
         "comments state which."
     ),
+    ("ltx", "MODEL_25_ID"): (
+        "LTX 2.5 deliberately preserves the same backend-split engine-id contract as 2.3: "
+        "candle registers `ltx_2_5_distilled`, while mlx registers `ltx_2_5`. Shortcut story "
+        "sc-18778 records these exact public ids, and SceneWorks maps the shared model to each "
+        "backend-specific id."
+    ),
     ("ltx", "CALIBRATION_FINGERPRINT"): (
         "a calibration identity is backend-specific: Candle names the released CUDA q4 I2V cell, "
         "while MLX names the Metal base/Eros I2V cell. Sharing a fingerprint would cross the "
