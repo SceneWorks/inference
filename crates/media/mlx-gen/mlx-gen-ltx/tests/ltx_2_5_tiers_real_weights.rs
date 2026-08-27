@@ -19,7 +19,7 @@
 //! ```text
 //! LTX25_BUNDLE_DIR=/path/to/a/curated/ltx-2.5-distilled-bf16 \
 //! LTX25_TIER_DIR=/path/to/scratch/ltx25-tiers \
-//!   cargo test -p mlx-gen-ltx --release --test ltx_2_5_tiers_real_weights -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration -- ltx_2_5_tiers_real_weights:: --ignored --nocapture
 //! ```
 //!
 //! `LTX25_BUNDLE_DIR` holds **exactly one file per component** and is scanned recursively, each file

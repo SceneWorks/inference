@@ -184,7 +184,7 @@ fn gemma3_path_repairs_a_tokenizer_that_emits_no_bos() {
 /// asset tensors are read — no weights, no GPU.
 ///
 /// `LTX25_TE_SAFETENSORS=<…>/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
-///  cargo test -p mlx-gen-ltx --test gemma_tokenizer -- --ignored`
+///  cargo test -p mlx-gen-ltx --test integration -- gemma_tokenizer:: --ignored`
 #[test]
 #[ignore = "needs the real LTX-2.5 text encoder; set LTX25_TE_SAFETENSORS"]
 fn real_packed_te_tokenizes_without_a_gemma_snapshot() {

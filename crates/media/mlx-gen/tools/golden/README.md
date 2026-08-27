@@ -96,7 +96,7 @@ Each script writes into `tools/golden/` next to itself (paths are `__file__`-rel
 works from any checkout/worktree). Run the matching `#[ignore]`d test with, e.g.:
 
 ```sh
-cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
+cargo test -p mlx-gen-z-image --release --test integration -- e2e_real_weights:: --ignored --nocapture
 ```
 
 Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the model weights in

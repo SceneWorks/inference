@@ -3,7 +3,7 @@
 //! ```text
 //! MLX_LLM_QWEN3_MODEL=/path/to/Qwen3-0.6B \
 //! MLX_LLM_TEST_MODEL=/path/to/Llama-snapshot \
-//!   cargo test --test byo -- --ignored --nocapture
+//!   cargo test --test integration -- byo:: --ignored --nocapture
 //! ```
 
 use core_llm::{

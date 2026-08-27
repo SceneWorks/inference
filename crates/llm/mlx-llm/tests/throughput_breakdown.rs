@@ -29,7 +29,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/tmp/smollm2-135m MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b \
-//!   cargo test --test throughput_breakdown -- --ignored --nocapture
+//!   cargo test --test integration -- throughput_breakdown:: --ignored --nocapture
 //! ```
 
 use std::time::Instant;
@@ -264,10 +264,10 @@ fn breakdown(name: &str, model: &CausalLm) {
 //
 // Run ONE model per process — libtest spawns a fresh thread per test and MLX's default GPU stream is
 // thread-local, so a second GPU test in the same run dies with "no Stream(gpu, 1)". E.g.:
-//   MLX_LLM_TEST_MODEL=/tmp/smollm2-135m  cargo test --test throughput_breakdown -- --ignored \
-//     --nocapture prefill_throughput_llama
-//   MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b   cargo test --test throughput_breakdown -- --ignored \
-//     --nocapture prefill_throughput_qwen3
+//   MLX_LLM_TEST_MODEL=/tmp/smollm2-135m  cargo test --test integration -- \
+//     throughput_breakdown::prefill_throughput_llama --ignored --nocapture
+//   MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b   cargo test --test integration -- \
+//     throughput_breakdown::prefill_throughput_qwen3 --ignored --nocapture
 //
 // The ONLY thing that differs between pre- and post-mitigation is the per-layer SDPA call — embed,
 // projections, RoPE, MLP, lm_head and the cache append are byte-identical. So the before/after delta

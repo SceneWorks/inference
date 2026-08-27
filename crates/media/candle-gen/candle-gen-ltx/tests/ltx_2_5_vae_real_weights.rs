@@ -21,7 +21,7 @@
 //!
 //! ```text
 //! LTX25_VAE_DIR=/path/to/Lightricks--LTX-2.5/vae \
-//!   cargo test -p candle-gen-ltx --release --test ltx_2_5_vae_real_weights -- --ignored --nocapture
+//!   cargo test -p candle-gen-ltx --release --test integration -- ltx_2_5_vae_real_weights:: --ignored --nocapture
 //! # on the CUDA lane, add --features cuda and LTX25_FULL=1
 //! ```
 
