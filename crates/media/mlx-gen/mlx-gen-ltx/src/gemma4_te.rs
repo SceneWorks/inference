@@ -990,8 +990,14 @@ mod version_assertion_tests {
             arrays.push((key.clone(), Array::from_slice(&data, &shape)));
         }
 
+        // The packed-asset floor `GemmaAssets::from_single_file` enforces: the tokenizer as a U8
+        // payload tensor, and the two required sidecars — which it accepts as `__metadata__`
+        // strings (the ComfyUI-pack fallback), so they need no tensors here.
+        arrays.push(("tokenizer_json".to_string(), Array::from_slice(b"{}", &[2])));
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("gemma_config".to_string(), cfg.to_string());
+        metadata.insert("tokenizer_config.json".to_string(), "{}".to_string());
+        metadata.insert("processor_config.json".to_string(), "{}".to_string());
 
         let path = dir.join("text_encoder.safetensors");
         let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
