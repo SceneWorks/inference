@@ -6,11 +6,16 @@
 //! mutable state in a forward pass is the KV cache, threaded in as `&mut dyn KvCache`.
 
 pub(crate) mod deepstack;
+pub mod gemma4_mm;
 pub mod llama;
 pub mod qwen35;
 pub mod qwen35_vision;
 pub mod siglip;
 
+pub use gemma4_mm::{
+    Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
+    Gemma4VisionConfig, Gemma4VisionEmbedder,
+};
 pub use llama::CausalLm;
 pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
 pub use qwen35_vision::{

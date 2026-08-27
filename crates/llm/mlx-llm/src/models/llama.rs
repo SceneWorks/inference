@@ -202,7 +202,16 @@ impl CausalLm {
         // norm, and `layers.{i}.*`) — there is no second `model.` segment — while `lm_head.weight`
         // lives at the checkpoint root (untied). A plain `*ForCausalLM` keeps the historical
         // `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight` layout.
-        let vlm_nested = cfg.architecture.is_qwen3_vl();
+        // Gemma 4 ships in BOTH layouts under the same `Gemma4UnifiedForConditionalGeneration`
+        // config: `google/gemma-4-12B-it` nests the decoder under `model.language_model.*` beside
+        // `model.vision_embedder` / `model.embed_{vision,audio}`, while the LTX-2.5 packed text
+        // encoder repacks the identical tensors flat under `model.*`. The config cannot tell them
+        // apart, so the *checkpoint* decides: probe the nested embedding table and fall back to the
+        // flat root. Getting this wrong is not a subtle numeric error — the flat lookup simply does
+        // not resolve against an HF Gemma 4 snapshot and the load fails on a missing tensor.
+        let gemma4_nested =
+            cfg.architecture.is_gemma4() && w.contains("model.language_model.embed_tokens.weight");
+        let vlm_nested = cfg.architecture.is_qwen3_vl() || gemma4_nested;
         let decoder_root = if vlm_nested {
             "model.language_model".to_string()
         } else {

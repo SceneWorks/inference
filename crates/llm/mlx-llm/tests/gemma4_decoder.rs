@@ -202,6 +202,60 @@ fn gemma4_logits_match_the_reference_at_every_position() {
     assert_abs_close(&host(&logits), &floats(&g["logits"]["data"]), "logits");
 }
 
+/// Gemma 4 unified ships **both** weight layouts under the same config:
+/// `Gemma4UnifiedForConditionalGeneration` (`google/gemma-4-12B-it`) nests the text decoder under
+/// `model.language_model.*` beside `model.vision_embedder` / `model.embed_{vision,audio}`, while the
+/// LTX-2.5 packed encoder keeps the plain `model.*` one. The config cannot tell them apart, so the
+/// loader probes the checkpoint (sc-18772).
+///
+/// Re-root the fixture's weight map and require the *same* goldens. Before the probe existed this
+/// crate always used the flat stem, so an HF Gemma 4 snapshot failed on the very first weight
+/// lookup — the general-purpose LLM could not be loaded at all. A probe that guessed wrong fails the
+/// same way; one that quietly fell back would build a model from nothing.
+#[test]
+fn gemma4_nested_language_model_layout_loads_to_the_same_logits() {
+    let g = goldens();
+    let cfg = ModelConfig::from_json(&g["config"]).expect("fixture config parses");
+
+    // `model.<rest>` -> `model.language_model.<rest>`, which is where the HF wrapper puts it.
+    let mut map: HashMap<String, Array> = HashMap::new();
+    for (key, entry) in g["weights"].as_object().expect("weights object") {
+        let rest = key
+            .strip_prefix("model.")
+            .unwrap_or_else(|| panic!("unexpected weight key {key}"));
+        let shape: Vec<i32> = entry["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect();
+        map.insert(
+            format!("model.language_model.{rest}"),
+            Array::from_slice(&floats(&entry["data"]), &shape),
+        );
+    }
+    assert!(
+        map.contains_key("model.language_model.embed_tokens.weight"),
+        "the probe keys on the nested embedding"
+    );
+
+    let weights = Weights::from_map(map);
+    let model = match CausalLm::from_weights(&weights, "", cfg) {
+        Ok(m) => m,
+        Err(e) => panic!("the loader must find the nested decoder: {e}"),
+    };
+    let ids = prompt_ids(&g);
+    let mut cache = model.new_cache();
+    let logits = model
+        .decode_logits_all(&input_ids(&ids), &mut cache, 0)
+        .expect("all-position logits forward");
+    assert_abs_close(
+        &host(&logits),
+        &floats(&g["logits"]["data"]),
+        "nested layout logits",
+    );
+}
+
 /// The two forwards agree where they overlap: the last position's logits from the single-position
 /// entry point equal the last row of the all-position one.
 ///

@@ -482,6 +482,8 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             supports_vision: true,
             supports_video: false,
+            // Text+vision captioner; no audio path at all.
+            supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
             supported_constraints: Vec::new(),
@@ -529,6 +531,9 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     // already declares `supports_vision=true` for every (LLaVA) snapshot its `can_load` claims,
     // so the core-llm gate's static fallback is correct. (`None` ⇒ unchanged prior behavior.)
     weightless_vision: None,
+    // JoyCaption is a text+vision captioner with no audio path at all; the static descriptor's
+    // `supports_audio=false` is correct for every snapshot it claims.
+    weightless_audio: None,
 };
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {

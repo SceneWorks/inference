@@ -20,6 +20,13 @@ pub struct TextLlmCapabilities {
     /// request carrying [`Content::Video`](crate::message::Content::Video) is rejected, never silently
     /// dropped.
     pub supports_video: bool,
+    /// Whether audio content (decoded mono PCM) is accepted. Independent of
+    /// [`supports_vision`](Self::supports_vision) and [`supports_video`](Self::supports_video):
+    /// Gemma 4's audio path is a separate projector over raw sample frames and has nothing to do with
+    /// its vision embedder, so a model may take images but not audio (and, in principle, the
+    /// reverse). `false` ⇒ a request carrying [`Content::Audio`](crate::message::Content::Audio) is
+    /// rejected, never silently dropped.
+    pub supports_audio: bool,
     /// Whether the model has a controllable reasoning ("thinking") mode — i.e. it honors the
     /// [`thinking`](crate::TextLlmRequest::thinking) request control (its chat template gates an
     /// `enable_thinking` kwarg). `false` ⇒ the model never reasons, and an explicit
@@ -52,11 +59,9 @@ impl TextLlmCapabilities {
         if req.messages.is_empty() {
             return reject("request has no messages".into());
         }
-        if req
-            .messages
-            .iter()
-            .all(|m| m.text_content().trim().is_empty() && !m.has_image() && !m.has_video())
-        {
+        if req.messages.iter().all(|m| {
+            m.text_content().trim().is_empty() && !m.has_image() && !m.has_video() && !m.has_audio()
+        }) {
             return reject("request has no non-empty content".into());
         }
 
@@ -80,6 +85,12 @@ impl TextLlmCapabilities {
         if !self.supports_video && req.has_video() {
             return Err(Error::Unsupported(format!(
                 "[{id}] provider does not support video input"
+            )));
+        }
+
+        if !self.supports_audio && req.has_audio() {
+            return Err(Error::Unsupported(format!(
+                "[{id}] provider does not support audio input"
             )));
         }
 
