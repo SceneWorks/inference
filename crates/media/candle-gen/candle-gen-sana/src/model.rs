@@ -950,6 +950,48 @@ mod tests {
         Ok(())
     }
 
+    fn check_staged_reference_adapters(source: &str) -> Result<(), String> {
+        for marker in [
+            "pub(crate) fn generate_base_staged(",
+            "pub(crate) fn generate_sprint_staged(",
+        ] {
+            let staged = braced_item(source, marker);
+            let fanout = staged
+                .find("for seed in seeds {")
+                .ok_or_else(|| format!("{marker} lost the production seed fanout"))?;
+            let (request_preamble, seed_tail) = staged.split_at(fanout);
+            if request_preamble.matches("encode_init_latents(").count() != 1
+                || seed_tail.contains("encode_init_latents(")
+                || seed_tail.matches("match &clean {").count() != 1
+            {
+                return Err(format!(
+                    "{marker} must encode one reference before fanout and borrow it in every seed tail"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn move_staged_encode_into_seed_tail(source: &str, marker: &str) -> String {
+        let item = braced_item(source, marker);
+        let without_preamble_encode =
+            item.replacen("encode_init_latents(", "deferred_reference_encode(", 1);
+        assert_ne!(item, without_preamble_encode);
+        let moved = without_preamble_encode.replacen(
+            "for seed in seeds {",
+            "for seed in seeds {\n        let _moved = encode_init_latents(",
+            1,
+        );
+        assert_ne!(without_preamble_encode, moved);
+        let start = source.find(marker).unwrap();
+        format!(
+            "{}{}{}",
+            &source[..start],
+            moved,
+            &source[start + item.len()..]
+        )
+    }
+
     #[test]
     fn registered_adapters_are_bound_to_the_prepared_reference_tail() {
         let shipped = include_str!("model.rs");
@@ -976,6 +1018,19 @@ mod tests {
             assert!(
                 check_registered_reference_adapters(&dropped).is_err(),
                 "{marker}: dropping the request-prepared value must fail"
+            );
+        }
+
+        let pipeline = include_str!("pipeline.rs");
+        check_staged_reference_adapters(pipeline).unwrap();
+        for marker in [
+            "pub(crate) fn generate_base_staged(",
+            "pub(crate) fn generate_sprint_staged(",
+        ] {
+            let moved = move_staged_encode_into_seed_tail(pipeline, marker);
+            assert!(
+                check_staged_reference_adapters(&moved).is_err(),
+                "{marker}: moving the production DC-AE encode into seed fanout must fail"
             );
         }
     }

@@ -1454,10 +1454,16 @@ mod tests {
     }
 
     fn call_arguments(source: &str, marker: &str) -> Vec<String> {
+        call_arguments_nth(source, marker, 0)
+    }
+
+    fn call_arguments_nth(source: &str, marker: &str, nth: usize) -> Vec<String> {
         let start = source
-            .find(marker)
+            .match_indices(marker)
+            .nth(nth)
+            .map(|(offset, _)| offset)
             .map(|offset| offset + marker.len())
-            .unwrap_or_else(|| panic!("missing production call {marker}"));
+            .unwrap_or_else(|| panic!("missing production call {marker} occurrence {nth}"));
         let mut depth = 0usize;
         let mut current = String::new();
         let mut arguments = Vec::new();
@@ -1485,6 +1491,10 @@ mod tests {
             }
         }
         panic!("production call {marker} has no closing parenthesis")
+    }
+
+    fn compact(item: &str) -> String {
+        item.split_whitespace().collect()
     }
 
     fn check_registered_mask_routes(source: &str) -> Result<()> {
@@ -1528,6 +1538,55 @@ mod tests {
                 "Sprint must route the selected positive embedding with its gathered mask".into(),
             ));
         }
+
+        let base_impl = braced_item(source, "pub(crate) fn denoise_cfg_with_memory(");
+        let cond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 0);
+        let uncond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 1);
+        if cond_call.len() != 7
+            || cond_call[1] != "cond"
+            || cond_call[4] != "cond_mask"
+            || uncond_call.len() != 7
+            || uncond_call[1] != "uc"
+            || uncond_call[4] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base's actual cond/uncond transformer calls must receive their matching masks"
+                    .into(),
+            ));
+        }
+
+        let sprint_impl = braced_item(source, "pub(crate) fn denoise_sprint_from_with_memory(");
+        let sprint_call = call_arguments(sprint_impl, "transformer.forward_with_memory(");
+        if sprint_call.len() != 7
+            || sprint_call[1] != "cond"
+            || sprint_call[3] != "Some(&guidance)"
+            || sprint_call[4] != "cond_mask"
+        {
+            return Err(Error::Msg(
+                "Sprint's actual transformer call must receive its gathered positive mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_transformer_mask_propagation(source: &str) -> Result<()> {
+        let forward = compact(braced_item(source, "pub(crate) fn forward_with_memory("));
+        if !forward.contains(
+            "block.forward(&hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,)?",
+        ) || !forward.contains(
+            "self.run_windowed_blocks(hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,window,cancel,)?",
+        ) {
+            return Err(Error::Msg(
+                "resident and windowed transformer routes must preserve caption_mask".into(),
+            ));
+        }
+
+        let windowed = compact(braced_item(source, "fn run_windowed_blocks("));
+        if !windowed.contains("block.forward(&cur,caption,caption_mask,temb,h,w,budget)?") {
+            return Err(Error::Msg(
+                "every materialized window block must receive caption_mask".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1552,6 +1611,60 @@ mod tests {
             assert!(
                 check_registered_mask_routes(&mutated).is_err(),
                 "dropping or swapping any Base/Sprint production mask must fail"
+            );
+        }
+
+        for mutated in [
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, cond, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, uc, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_sprint_from_with_memory(",
+                "            Some(&guidance),\n            cond_mask,\n            plan,",
+                "            Some(&guidance),\n            None,\n            plan,",
+            ),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping a mask at an actual Base/Sprint transformer call must fail"
+            );
+        }
+
+        let transformer = include_str!("transformer.rs");
+        check_transformer_mask_propagation(transformer).unwrap();
+        for mutated in [
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                        caption_mask,\n                        &temb,",
+                "                        None,\n                        &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                caption_mask,\n                &temb,",
+                "                None,\n                &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "fn run_windowed_blocks(",
+                "block.forward(&cur, caption, caption_mask, temb, h, w, budget)?",
+                "block.forward(&cur, caption, None, temb, h, w, budget)?",
+            ),
+        ] {
+            assert!(
+                check_transformer_mask_propagation(&mutated).is_err(),
+                "dropping caption_mask from resident/windowed block propagation must fail"
             );
         }
     }
