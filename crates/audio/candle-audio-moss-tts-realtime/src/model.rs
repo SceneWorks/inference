@@ -401,6 +401,7 @@ impl MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_frames_per_block = crate::codec::frames_per_block(budget);
         let synth_turns = turns
             .iter()
             .filter(|t| t.role == Role::Assistant && t.audio_codes.is_none())
@@ -444,7 +445,7 @@ impl MossTtsRealtimeGenerator {
         // per *turn* (not per block as the single-turn `StreamingChunker` path is): first-chunk latency
         // is one whole turn, not one block — the multi-turn session trades intra-turn streaming for the
         // per-turn independence that keeps A (batch) and B (session) byte-identical.
-        let block_samples = crate::codec::DECODE_FRAMES_PER_BLOCK * codec.samples_per_frame();
+        let block_samples = decode_frames_per_block * codec.samples_per_frame();
         let mut all: Vec<f32> = Vec::new();
         let mut chunk_index = 0usize;
         for frames in &rendered.turns {
@@ -452,7 +453,7 @@ impl MossTtsRealtimeGenerator {
                 continue;
             }
             let pcm = codec
-                .decode_frames(frames, &probe)
+                .decode_frames(frames, decode_frames_per_block, &probe)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
                 .ok_or(gen_core::Error::Canceled)?;
             emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
@@ -584,13 +585,12 @@ impl MossTtsRealtimeGenerator {
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
         // so the gen-core reproducibility law holds and generate/generate_streaming agree.
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
+        let decode_frames_per_block = crate::codec::frames_per_block(budget);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        let mut chunker = crate::chunk::StreamingChunker::new(
-            codec.as_ref(),
-            crate::codec::DECODE_FRAMES_PER_BLOCK,
-        );
+        let mut chunker =
+            crate::chunk::StreamingChunker::new(codec.as_ref(), decode_frames_per_block);
         let mut canceled = false;
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
@@ -683,6 +683,7 @@ impl Generator for MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_frames_per_block = crate::codec::frames_per_block(budget);
         let state = ConvState::new(&pipeline.decoder);
         Ok(Box::new(MossConversationSession {
             loaded: pipeline,
@@ -690,6 +691,7 @@ impl Generator for MossTtsRealtimeGenerator {
             voice_clone,
             base_seed,
             budget,
+            decode_frames_per_block,
             state,
             cancel: req.cancel.clone(),
             turn_index: 0,
@@ -707,6 +709,7 @@ struct MossConversationSession {
     voice_clone: Option<Vec<Vec<u32>>>,
     base_seed: u64,
     budget: usize,
+    decode_frames_per_block: usize,
     state: ConvState,
     cancel: CancelFlag,
     turn_index: usize,
@@ -786,10 +789,10 @@ impl ConversationSession for MossConversationSession {
                 ..Default::default()
             });
         }
-        let block_samples = crate::codec::DECODE_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
+        let block_samples = self.decode_frames_per_block * self.codec.samples_per_frame();
         let pcm = self
             .codec
-            .decode_frames(&frames, &probe)
+            .decode_frames(&frames, self.decode_frames_per_block, &probe)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
             .ok_or(gen_core::Error::Canceled)?;
         let mut chunk_index = 0usize;

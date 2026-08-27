@@ -467,7 +467,11 @@ fn codec_only_decodes_synthetic_frames() {
         (0..25).map(|_| (0..16).map(|_| next()).collect()).collect()
     };
     let wav = codec
-        .decode_frames(&frames, &|| false)
+        .decode_frames(
+            &frames,
+            moss::codec::frames_per_block(frames.len()),
+            &|| false,
+        )
         .expect("decode")
         .expect("not cancelled");
     let n = wav.len() as f32;
@@ -856,7 +860,11 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
     };
     let frames0: Vec<Vec<u32>> = (0..40).map(|_| (0..16).map(|_| next()).collect()).collect();
     let w0 = codec
-        .decode_frames(&frames0, &|| false)
+        .decode_frames(
+            &frames0,
+            moss::codec::frames_per_block(frames0.len()),
+            &|| false,
+        )
         .unwrap()
         .expect("decode w0");
     let codes1 = codec.encode(&w0, 24_000).expect("encode w0");
@@ -875,7 +883,11 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
         "codes in the codebook range [0, 1024)"
     );
     let w1 = codec
-        .decode_frames(&codes1, &|| false)
+        .decode_frames(
+            &codes1,
+            moss::codec::frames_per_block(codes1.len()),
+            &|| false,
+        )
         .unwrap()
         .expect("decode w1");
     let corr = pearson(&w0, &w1);
@@ -1071,7 +1083,11 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
         .map(|_| (0..16).map(|_| next()).collect())
         .collect();
     let clip = codec
-        .decode_frames(&pattern, &|| false)
+        .decode_frames(
+            &pattern,
+            moss::codec::frames_per_block(pattern.len()),
+            &|| false,
+        )
         .expect("decode long clip")
         .expect("not cancelled");
     let secs = clip.len() as f32 / moss::codec::SAMPLE_RATE as f32;

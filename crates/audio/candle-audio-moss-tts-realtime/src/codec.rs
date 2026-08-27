@@ -68,10 +68,23 @@ pub const DOWNSAMPLE_RATE: usize = 1920;
 pub const CODEBOOK_SIZE: usize = 1024;
 /// Per-code latent dimension (the `Embedding` width).
 pub const CODEBOOK_DIM: usize = 8;
-/// Canonical RVQ-frame partition for every production decode route. Keeping one fixed partition is
-/// load-bearing for exact one-shot/streaming identity: attention reductions over different widths
-/// are numerically equivalent but not byte-identical.
-pub(crate) const DECODE_FRAMES_PER_BLOCK: usize = 8;
+/// Default RVQ-frame partition for production decode routes (about 0.64 seconds at 12.5 fps).
+/// Short request budgets use [`frames_per_block`] to select a smaller canonical partition; keeping
+/// that one request-chosen value across one-shot, live, conversation, and session decode is
+/// load-bearing because different attention reduction widths are not byte-identical.
+pub const DEFAULT_DECODE_FRAMES_PER_BLOCK: usize = 8;
+
+/// Select the canonical decode partition for a request's AR frame budget. Normal requests use
+/// [`DEFAULT_DECODE_FRAMES_PER_BLOCK`]. A valid short request of two through seven frames uses at
+/// most half its budget (rounded up), guaranteeing two non-full-track chunks when the AR loop reaches
+/// the budget. The one-frame floor keeps defensive/direct callers panic-free.
+pub fn frames_per_block(budget_frames: usize) -> usize {
+    if budget_frames >= DEFAULT_DECODE_FRAMES_PER_BLOCK {
+        DEFAULT_DECODE_FRAMES_PER_BLOCK
+    } else {
+        budget_frames.div_ceil(2).max(1)
+    }
+}
 
 fn resample_for_encode(samples: &[f32], sample_rate: u32, native_rate: u32) -> Result<Vec<f32>> {
     candle_audio::dsp::resample(samples, sample_rate, native_rate, 1)
@@ -1148,14 +1161,22 @@ impl MossAudioCodec {
 
     /// Decode RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into interleaved mono
     /// PCM. This one-shot entry point deliberately drives the same request-local incremental decoder
-    /// in `DECODE_FRAMES_PER_BLOCK`-frame partitions as live synthesis. The shared partition makes
-    /// the returned samples byte-identical to concatenated streaming blocks while preserving the
-    /// bounded attention/state guarantees of [`decode_incremental`](Self::decode_incremental).
+    /// in the caller's request-chosen `frames_per_block` partition as live synthesis. The shared
+    /// partition makes the returned samples byte-identical to concatenated streaming blocks while
+    /// preserving the bounded attention/state guarantees of
+    /// [`decode_incremental`](Self::decode_incremental). Values above
+    /// [`DEFAULT_DECODE_FRAMES_PER_BLOCK`] are rejected so a direct caller cannot defeat that bound.
     pub fn decode_frames(
         &self,
         frames: &[Vec<u32>],
+        frames_per_block: usize,
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>> {
+        if !(1..=DEFAULT_DECODE_FRAMES_PER_BLOCK).contains(&frames_per_block) {
+            candle_audio::candle_core::bail!(
+                "codec decode frames_per_block must be in 1..={DEFAULT_DECODE_FRAMES_PER_BLOCK} (got {frames_per_block})"
+            );
+        }
         if frames.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -1167,7 +1188,7 @@ impl MossAudioCodec {
             })?;
         let mut state = self.new_decode_state();
         let mut wav = Vec::with_capacity(capacity);
-        for block in frames.chunks(DECODE_FRAMES_PER_BLOCK) {
+        for block in frames.chunks(frames_per_block) {
             let Some(pcm) = self.decode_incremental(&mut state, block, cancel)? else {
                 return Ok(None);
             };
@@ -1933,15 +1954,16 @@ mod tests {
         );
     }
 
-    /// Production-level identity gate for sc-21686. Both sides traverse the actual codec entrypoints,
-    /// including RLFQ, four retained transformer states, every patch expansion, and the streaming
-    /// chunker. The alternate-partition guard is load-bearing: the old one-shot path reduced attention
-    /// at context-sized widths and therefore matched that mutation rather than the live 8-frame path.
+    /// Production-level normal-budget identity gate for sc-21686. Both sides traverse the actual
+    /// codec entrypoints, including RLFQ, four retained transformer states, every patch expansion,
+    /// and the streaming chunker. The alternate-partition guard is load-bearing: the old one-shot
+    /// path reduced attention at context-sized widths and therefore matched that mutation rather than
+    /// the live canonical path.
     #[test]
     fn one_shot_and_streaming_share_the_canonical_four_stage_partition() {
         let dev = Device::Cpu;
         let codec = synthetic_four_stage_codec(&dev);
-        let frames: Vec<Vec<u32>> = (0..(2 * DECODE_FRAMES_PER_BLOCK + 3))
+        let frames: Vec<Vec<u32>> = (0..(2 * DEFAULT_DECODE_FRAMES_PER_BLOCK + 3))
             .map(|frame| {
                 vec![
                     ((frame * 7 + 3) % 32) as u32,
@@ -1950,10 +1972,15 @@ mod tests {
             })
             .collect();
         let no_cancel = || false;
+        let partition = frames_per_block(frames.len());
+        assert_eq!(partition, DEFAULT_DECODE_FRAMES_PER_BLOCK);
 
-        let one_shot = codec.decode_frames(&frames, &no_cancel).unwrap().unwrap();
+        let one_shot = codec
+            .decode_frames(&frames, partition, &no_cancel)
+            .unwrap()
+            .unwrap();
         let mut chunks = Vec::new();
-        let mut chunker = crate::chunk::StreamingChunker::new(&codec, DECODE_FRAMES_PER_BLOCK);
+        let mut chunker = crate::chunk::StreamingChunker::new(&codec, partition);
         for frame in &frames {
             chunker
                 .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
@@ -1984,7 +2011,7 @@ mod tests {
 
         // State mutation guard: resetting all four stage histories per canonical block must diverge.
         let mut reset_state_output = Vec::new();
-        for block in frames.chunks(DECODE_FRAMES_PER_BLOCK) {
+        for block in frames.chunks(partition) {
             let mut reset = codec.new_decode_state();
             reset_state_output.extend(
                 codec
@@ -1997,6 +2024,127 @@ mod tests {
             reset_state_output, one_shot,
             "dropping the four-stage causal state must fail the identity gate"
         );
+    }
+
+    /// Production-level identity gate for sc-21686. Every short valid request budget traverses the
+    /// actual codec entrypoints, including RLFQ, four retained transformer states, every patch
+    /// expansion, and the streaming chunker. The topology and alternate-partition guards are
+    /// load-bearing: a hard-coded 8 would collapse each short stream to one full-track chunk, while a
+    /// one-shot oracle using a different partition would no longer be byte-identical.
+    #[test]
+    fn short_requests_share_one_canonical_four_stage_partition() {
+        let dev = Device::Cpu;
+        let codec = synthetic_four_stage_codec(&dev);
+        let no_cancel = || false;
+
+        assert_eq!(frames_per_block(0), 1);
+        assert_eq!(frames_per_block(1), 1);
+        assert_eq!(frames_per_block(8), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        assert_eq!(frames_per_block(9), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        assert_eq!(frames_per_block(30_000), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+
+        let mut different_oracle_discriminated = Vec::new();
+        for budget in 2usize..=7 {
+            let partition = frames_per_block(budget);
+            assert_eq!(partition, budget.div_ceil(2), "budget {budget}");
+            assert!(partition < budget, "budget {budget} must stream before EOS");
+            let frames: Vec<Vec<u32>> = (0..budget)
+                .map(|frame| {
+                    vec![
+                        ((frame * 7 + 3) % 32) as u32,
+                        ((frame * 11 + 5) % 32) as u32,
+                    ]
+                })
+                .collect();
+
+            let one_shot = codec
+                .decode_frames(&frames, partition, &no_cancel)
+                .unwrap()
+                .unwrap();
+            let mut chunks = Vec::new();
+            let mut chunker = crate::chunk::StreamingChunker::new(&codec, partition);
+            for frame in &frames {
+                chunker
+                    .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+                    .unwrap()
+                    .unwrap();
+            }
+            let streamed = chunker
+                .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
+                .unwrap()
+                .unwrap();
+            assert_eq!(chunks.len(), 2, "budget {budget} must emit two chunks");
+            assert!(
+                chunks
+                    .iter()
+                    .all(|chunk| chunk.samples.len() < one_shot.len()),
+                "budget {budget}: neither chunk may contain the full track"
+            );
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+                vec![0, 1],
+                "budget {budget}: chunk indices"
+            );
+            assert_eq!(
+                streamed.samples, one_shot,
+                "budget {budget}: exact identity"
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.samples.iter().copied())
+                    .collect::<Vec<_>>(),
+                one_shot,
+                "budget {budget}: reassembly"
+            );
+
+            // Topology mutation: retaining the old hard-coded eight-frame block emits one full-track
+            // chunk for every short request and therefore violates the streaming surface.
+            let mut hard_coded_chunks = Vec::new();
+            let mut hard_coded =
+                crate::chunk::StreamingChunker::new(&codec, DEFAULT_DECODE_FRAMES_PER_BLOCK);
+            for frame in &frames {
+                hard_coded
+                    .push(frame.clone(), &no_cancel, &mut |chunk| {
+                        hard_coded_chunks.push(chunk)
+                    })
+                    .unwrap()
+                    .unwrap();
+            }
+            let hard_coded = hard_coded
+                .finish(&no_cancel, &mut |chunk| hard_coded_chunks.push(chunk))
+                .unwrap()
+                .unwrap();
+            assert_eq!(hard_coded_chunks.len(), 1, "budget {budget}: mutation");
+            assert_eq!(
+                hard_coded_chunks[0].samples, hard_coded.samples,
+                "budget {budget}: hard-coded eight emits the full track at EOS"
+            );
+
+            // Oracle mutation: a one-shot decode with a different partition must not accidentally
+            // satisfy the exact production partition identity.
+            let wrong_oracle = codec
+                .decode_frames(&frames, DEFAULT_DECODE_FRAMES_PER_BLOCK, &no_cancel)
+                .unwrap()
+                .unwrap();
+            if wrong_oracle != one_shot {
+                different_oracle_discriminated.push(budget);
+            }
+        }
+        assert!(
+            different_oracle_discriminated.len() >= 5,
+            "the synthetic production pipeline must reject a hard-coded one-shot oracle across the \
+             short-budget surface; discriminated {different_oracle_discriminated:?}"
+        );
+
+        let frames = vec![vec![0, 0]];
+        for invalid in [0, DEFAULT_DECODE_FRAMES_PER_BLOCK + 1] {
+            let error = codec
+                .decode_frames(&frames, invalid, &no_cancel)
+                .expect_err("invalid partition must fail before decode")
+                .to_string();
+            assert!(error.contains("frames_per_block must be in 1..=8"));
+        }
     }
 
     /// The model advertises a 40-minute (30,000-frame) realtime surface. The canonical production
@@ -2014,7 +2162,7 @@ mod tests {
         );
 
         let mut sequence_len = advertised_frames;
-        let mut block_len = DECODE_FRAMES_PER_BLOCK;
+        let mut block_len = frames_per_block(advertised_frames);
         let mut frame_rate = SAMPLE_RATE as f64 / DOWNSAMPLE_RATE as f64;
         for (stage_index, patch) in PATCH_SIZES.into_iter().enumerate() {
             let context = (frame_rate * CONTEXT_DURATION_SECS).floor() as usize;
