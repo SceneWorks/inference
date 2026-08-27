@@ -2,13 +2,17 @@
 //!
 //! Port of `text_encoder.py`'s `Embeddings1DConnector` as configured for the LTX-2.3 models
 //! (`connector.safetensors`): an **8-layer** pre-norm transformer over the Gemma feature-extractor
-//! output, dim **4096** (32 heads × 128), **gated** attention with q/k RMSNorm, a plain
-//! gelu MLP (inner 16384), **128 learnable registers** that replace left-padding, and a
-//! connector-specific **1-D SPLIT RoPE** (positions `arange(seq)/4096`, double-precision).
+//! output, dim **4096** (32 heads × 128), **gated** attention (`2·sigmoid`, zero-init identity)
+//! with q/k RMSNorm, a tanh-GELU MLP (inner 16384), **128 learnable registers** that replace
+//! left-padding, and a connector-specific **1-D SPLIT RoPE** (positions `arange(seq)/4096`,
+//! double-precision). The semantic authority is `ltx_core`'s `Embeddings1DConnector` (the stack
+//! the checkpoints were trained with) — NOT mlx_video's port, whose connector drops the gate's
+//! `2·` and uses exact GELU (sc-21663; both fixed here for 2.3 and 2.5 alike).
 //!
 //! Two connectors exist in the checkpoint (`video_embeddings_connector.*`,
-//! `audio_embeddings_connector.*`); this core uses the video one. Compute dtype is a parameter:
-//! **bf16** to match the reference pipeline end-to-end, **f32** for the isolated bit-exact gate.
+//! `audio_embeddings_connector.*`); this core uses the video one. Activations always compute in
+//! **f32** (sc-21663 — see the `dtype` field doc); the `Precision` parameter supplies the quant
+//! geometry and the *output* dtype only.
 //! The fused SDPA is always run in **f32** regardless — the pmetal bf16 maskless-SDPA kernel
 //! returns garbage at this shape (see `tests/bf16_sdpa_bug.rs`); the reference's wheel MLX has a
 //! correct bf16 SDPA, so f32 matches it to bf16 rounding.
@@ -16,10 +20,10 @@
 use std::f64::consts::PI;
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, concatenate_axis, multiply, sigmoid, sum, tile};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -28,6 +32,10 @@ use crate::rope::apply_split_rotary_emb;
 use crate::transformer::{Linear, Precision};
 
 const CONNECTOR_EPS: f32 = 1e-6;
+
+fn scalar(v: f32) -> Array {
+    Array::from_slice(&[v], &[1])
+}
 
 /// One connector transformer block (attn1 + gelu FF, both pre-normed with a unit-weight RMSNorm).
 ///
@@ -61,16 +69,35 @@ pub struct Connector {
     head_dim: i32,
     theta: f64,
     max_pos: i32,
-    ones: Array,  // unit RMSNorm weight (dim,)
-    dtype: Dtype, // compute dtype: bf16 to match the reference pipeline; f32 for the isolated gate
+    ones: Array, // unit RMSNorm weight (dim,)
+    /// Activation compute dtype — **always f32** (sc-21663). The connector ends in a per-row
+    /// RMS-norm over rows whose magnitudes span a >100x dynamic range (measured on the 2.3 golden
+    /// inputs: video 134x, audio 272x at the last block), so that renormalization converts
+    /// absolute-scale activation rounding into large *relative* error on the low-norm register
+    /// rows. Measured on the LTX-2.5 video golden, bf16 tier, sc-21663 (two comparisons, do not
+    /// conflate): the isolated connector fed the golden's own `video_features` scores 5.568e-2
+    /// bf16 vs 1.288e-2 f32; the full `Ltx25TextEncoder` path (which adds the encoder's own
+    /// ~2.3e-3 feature error) scores 6.094e-2 bf16 vs 9.107e-3 with f32 activations — against the
+    /// test's 6e-2 bar. The connector is 256 tokens × 8 layers — f32 activations are numerically
+    /// decisive and computationally free next to the TE/DiT; weights stay at the tier's own
+    /// dtype/packing. Same precedent as the f32 SDPA below.
+    ///
+    /// The FFN activation routes through [`gelu_tanh`], which under the `ExactEpilogues`
+    /// capability substitutes `mlx_rs::fast::gelu_tanh_exact` — that kernel's contract is
+    /// bit-identity with the eager expression (it preserves every eager rounding boundary), so
+    /// the capability toggle does not change the connector's numerics.
+    dtype: Dtype,
+    /// The pipeline dtype the output is returned in (`prec.dtype()`), so downstream consumers see
+    /// exactly the interface they always did.
+    out_dtype: Dtype,
 }
 
 impl Connector {
     /// Build the **video** connector from a `Weights` map (e.g. `connector.safetensors`) under
     /// `prefix` (`"video_embeddings_connector."`).
     ///
-    /// `prec` supplies both the compute dtype (bf16 to match the reference pipeline end-to-end; f32
-    /// for the isolated bit-exact gate) **and** the checkpoint's quant geometry, exactly as it does
+    /// `prec` supplies the **output** dtype (activations always compute f32 — see the `dtype`
+    /// field doc) **and** the checkpoint's quant geometry, exactly as it does
     /// for the DiT. Whether any given Linear is actually packed is decided per-Linear by the
     /// presence of `{prefix}.scales`, so a dense LTX-2.3 connector and a quantized LTX-2.5 tier
     /// connector both load through this one call.
@@ -110,7 +137,10 @@ impl Connector {
     ) -> Result<Self> {
         let n = num_layers as usize;
         let dim = num_heads * head_dim;
-        let dtype = prec.dtype();
+        // Activations always compute in f32 (see the `dtype` field doc); the pipeline's own dtype
+        // is only the output interface.
+        let dtype = Dtype::Float32;
+        let out_dtype = prec.dtype();
         // A non-Linear parameter (norm weight, registers) cast to the compute dtype.
         let w_at_dtype = |key: &str| -> Result<Array> {
             w.get(key)
@@ -145,6 +175,7 @@ impl Connector {
             max_pos,
             ones: Array::ones::<f32>(&[dim])?.as_dtype(dtype)?,
             dtype,
+            out_dtype,
         })
     }
 
@@ -161,20 +192,34 @@ impl Connector {
         } else {
             1.0 / (num_indices - 1) as f64
         };
-        let indices: Vec<f64> = (0..num_indices)
-            .map(|i| self.theta.powf(i as f64 * step) * (PI / 2.0))
+        // f64 exponentials rounded to f32 BEFORE the position multiply — exactly upstream's
+        // `generate_freq_grid_np` (its "double precision" covers only the log-spaced grid; the
+        // returned indices are f32, and `generate_freqs` forms the angles in f32). This table
+        // matches the reference's to 1 f32 ULP (6e-8, verified against torch on CPU). Keeping f64
+        // through `cos`/`sin` — what mlx_video and this port used to do — perturbs the top
+        // frequencies by up to ~9.4e-4; that is a real bit-level infidelity but NOT bar-pinned:
+        // the verified-rebuild mutation run (sc-21663, f64 revert vs the ltx_core-semantics 2.3
+        // golden, `connector_parity`) measured video 2.005e-3 / audio 8.238e-2 — both still green
+        // — because per-op deviations do not compound across blocks (see the parity test's
+        // decomposition). Kept for faithfulness, pinned by construction, not by a tolerance.
+        let indices: Vec<f32> = (0..num_indices)
+            .map(|i| (self.theta.powf(i as f64 * step) * (PI / 2.0)) as f32)
             .collect();
 
         let mut cos = vec![0f32; heads * seq * head_half];
         let mut sin = vec![0f32; heads * seq * head_half];
         for t in 0..seq {
-            let scaled = (t as f64 / self.max_pos as f64) * 2.0 - 1.0;
+            // All-f32 op order, as upstream's `get_fractional_positions` computes it (f32 arange /
+            // f32 max_pos, then *2-1 in f32). For a power-of-two `max_pos` (4096 in every shipped
+            // checkpoint) this is bit-identical to an f64-then-round formulation; computing in f32
+            // from the start removes even that constraint.
+            let scaled = (t as f32 / self.max_pos as f32) * 2.0 - 1.0;
             for h in 0..heads {
                 for p in 0..head_half {
                     let ang = scaled * indices[h * head_half + p];
                     let o = (h * seq + t) * head_half + p;
-                    cos[o] = ang.cos() as f32;
-                    sin[o] = ang.sin() as f32;
+                    cos[o] = ang.cos();
+                    sin[o] = ang.sin();
                 }
             }
         }
@@ -250,8 +295,13 @@ impl Connector {
         )?
         .as_dtype(self.dtype)?; // (b,h,s,d)
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, -1])?;
-        // Gated: out_head *= sigmoid(to_gate_logits(x)).
-        let gates = sigmoid(&blk.gate.forward(x)?)?.reshape(&[b, s, h, 1])?;
+        // Gated: out_head *= 2·sigmoid(to_gate_logits(x)) — zero-init identity, the same
+        // convention the DiT's own gated attention uses (`transformer.rs`). ltx_core's
+        // `PytorchGatedAttention` is the authority; the `2·` was missing here because this port
+        // was originally pinned against mlx_video's connector, which dropped it (sc-21663).
+        let logits = blk.gate.forward(x)?;
+        let gates = multiply(&sigmoid(&logits)?, scalar(2.0).as_dtype(logits.dtype())?)?
+            .reshape(&[b, s, h, 1])?;
         let out = multiply(&out.reshape(&[b, s, h, d])?, &gates)?.reshape(&[b, s, -1])?;
         blk.to_out.forward(&out)
     }
@@ -260,7 +310,9 @@ impl Connector {
         let n = rms_norm(x, &self.ones, CONNECTOR_EPS)?;
         let x = add(x, &self.attn(blk, &n, cos, sin)?)?;
         let n = rms_norm(&x, &self.ones, CONNECTOR_EPS)?;
-        let ff = blk.ff_out.forward(&gelu(&blk.ff_in.forward(&n)?)?)?;
+        // tanh-approximate GELU — ltx_core's `GELUApprox` (`gelu(x, approximate="tanh")`), the same
+        // activation the DiT FFN uses; mlx_video's connector used exact erf-GELU (sc-21663).
+        let ff = blk.ff_out.forward(&gelu_tanh(&blk.ff_in.forward(&n)?)?)?;
         Ok(add(&x, &ff)?)
     }
 
@@ -272,6 +324,7 @@ impl Connector {
         for blk in &self.blocks {
             h = self.block(blk, &h, &cos, &sin)?;
         }
-        rms_norm(&h, &self.ones, CONNECTOR_EPS).map_err(Error::from)
+        // Back to the pipeline dtype at the interface (a no-op for the isolated f32 gates).
+        Ok(rms_norm(&h, &self.ones, CONNECTOR_EPS)?.as_dtype(self.out_dtype)?)
     }
 }

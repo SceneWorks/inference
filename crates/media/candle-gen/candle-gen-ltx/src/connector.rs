@@ -1,9 +1,22 @@
 //! `Embeddings1DConnector` — the LTX-2.3 video text-feature connector. Port of mlx-gen-ltx
 //! `connector.rs`. An 8-layer pre-norm transformer over the Gemma feature-extractor output (dim
 //! 4096 = 32×128): per-block unit-weight RMSNorm → **gated** attention (q/k RMSNorm + 1-D split
-//! RoPE, per-head sigmoid gate) → unit-RMSNorm → exact-gelu MLP (inner 16384), then a final
-//! unit-RMSNorm. **128 learnable registers** replace the left-padding slots. Runs bf16; attention
-//! computes in f32.
+//! RoPE, per-head `2·sigmoid` gate — zero-init identity) → unit-RMSNorm → tanh-GELU MLP (inner
+//! 16384), then a final unit-RMSNorm. **128 learnable registers** replace the left-padding slots.
+//! Runs bf16; attention computes in f32. Semantic authority: `ltx_core`'s `Embeddings1DConnector`
+//! (sc-21663 — mlx_video's connector drops the gate's `2·` and uses exact GELU; both fixed here).
+//!
+//! **Known bf16-activation deficiency (sc-21663).** This module keeps bf16 activations (with f32
+//! attention), while the mlx twin moved to f32 activations throughout: the connector ends in a
+//! per-row RMS-norm over rows spanning a >100x norm range, which converts activation rounding
+//! into large relative error on low-norm register rows. Measured on the mlx side against the
+//! LTX-2.5 video golden's 6e-2 bar: bf16 activations 6.094e-2 (marginally OVER), f32 activations
+//! 9.107e-3. Mirroring f32 activations here is not free: candle matmul does not auto-promote
+//! dtypes, so the dense 2.3 connector's weights (~4 GB bf16 across both towers) would need f32
+//! residence or per-call casts — a VRAM/perf tradeoff that must be measured on CUDA. That
+//! measurement decision rides with the first CUDA run of `tests/connector_parity.rs` /
+//! `tests/ltx_2_5_te_connector_inputs.rs` (bars there carry provisional derived values and say
+//! what to record).
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{ops::rms_norm, ops::softmax_last_dim, VarBuilder};
@@ -122,9 +135,12 @@ impl Connector {
             .transpose(1, 2)?
             .reshape((b, s, h * d))?
             .to_dtype(DType::BF16)?;
-        // Per-head gate: out *= sigmoid(gate(x)).
-        let gates =
-            candle_gen::candle_nn::ops::sigmoid(&blk.gate.forward(x)?)?.reshape((b, s, h, 1))?;
+        // Per-head gate: out *= 2·sigmoid(gate(x)) — zero-init identity, the same convention the
+        // DiT's gated attention uses (`transformer.rs`). ltx_core's `PytorchGatedAttention` is the
+        // authority; the `2·` was missing because this port mirrored mlx-gen-ltx's connector,
+        // itself pinned against mlx_video's connector, which dropped it (sc-21663).
+        let gates = (candle_gen::candle_nn::ops::sigmoid(&blk.gate.forward(x)?)? * 2.0)?
+            .reshape((b, s, h, 1))?;
         let out = out
             .reshape((b, s, h, d))?
             .broadcast_mul(&gates)?
@@ -142,7 +158,9 @@ impl Connector {
         let n = rms_norm(&x.contiguous()?, &self.ones, EPS)?;
         let x = (x + self.attn(blk, &n, cos, sin)?)?;
         let n = rms_norm(&x.contiguous()?, &self.ones, EPS)?;
-        let ff = blk.ff_out.forward(&blk.ff_in.forward(&n)?.gelu_erf()?)?;
+        // tanh-approximate GELU (candle's `gelu()`), matching ltx_core's `GELUApprox` and the DiT
+        // FFN; the erf variant came from mlx_video's connector (sc-21663).
+        let ff = blk.ff_out.forward(&blk.ff_in.forward(&n)?.gelu()?)?;
         &x + ff
     }
 
