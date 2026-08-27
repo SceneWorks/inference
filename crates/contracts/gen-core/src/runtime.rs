@@ -1776,6 +1776,77 @@ impl std::fmt::Debug for PreviewSink {
     }
 }
 
+/// One decoded HDR frame, handed to an [`HdrFrameSink`] as the render produces it (sc-18790).
+///
+/// [`working`](Self::working) carries the VAE's decode output already mapped out of the `[-1, 1]`
+/// convention ([`from_vae_range`](crate::hdr::from_vae_range)) but **before** any transfer — the
+/// compressed `[0, 1]` working-space signal. That is deliberately the earliest common ancestor of
+/// the two output sinks: a consumer derives the EXR payload with
+/// [`working_frame_to_exr_payload`](crate::hdr::working_frame_to_exr_payload) and the HLG master's
+/// scene-linear input with
+/// [`working_frame_to_hlg_linear`](crate::hdr::working_frame_to_hlg_linear). Emitting the working
+/// signal once, rather than both derivations, keeps one frame in flight instead of two — and for
+/// [`HdrColorSpace::SrgbLinear`](crate::hdr::HdrColorSpace::SrgbLinear) the two derivations are
+/// the same pixels anyway.
+///
+/// `index` is 0-based and increments by one per frame with no gaps; `total` is the clip's frame
+/// count.
+#[derive(Clone, Debug)]
+pub struct HdrOutputFrame {
+    /// 0-based position of this frame in the clip.
+    pub index: u32,
+    /// Total frames in the clip.
+    pub total: u32,
+    /// The colour space the request opted into — the key to interpreting `working` and to
+    /// choosing the EXR header tags.
+    pub color_space: crate::hdr::HdrColorSpace,
+    /// The VAE working-space signal for this frame, `[0, 1]`.
+    pub working: crate::media::HdrFrame,
+}
+
+/// HDR output sink threaded onto a request
+/// ([`HdrRequest::sink`](crate::generator::HdrRequest::sink)).
+///
+/// The [`PreviewSink`] pattern, for the same reason: a cheap cloneable handle carried as a
+/// request **field** so no downstream `match` on [`GenerationOutput`](crate::GenerationOutput)
+/// changes, and so the frames stream out as they decode instead of the whole scene-linear clip
+/// being materialized in the output struct. A 121-frame 1080p `f32` clip is ~3 GB — streaming is
+/// not an optimization here, it is what makes the feature fit in memory at all.
+///
+/// **Emission is synchronous and on the decode thread**, so the closure must return promptly —
+/// hand the frame to a writer thread rather than encoding EXR or running libx265 inside it.
+#[derive(Clone, Default)]
+pub struct HdrFrameSink(Option<Arc<dyn Fn(HdrOutputFrame) + Send + Sync>>);
+
+impl HdrFrameSink {
+    /// Build an active sink from a callback. The callback runs on the decode thread, once per
+    /// decoded frame.
+    pub fn new(sink: impl Fn(HdrOutputFrame) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(sink)))
+    }
+
+    /// Whether anyone is listening. Engines gate the (comparatively expensive) HDR frame
+    /// materialization on this.
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Deliver one frame. A no-op on an inert sink.
+    pub fn emit(&self, frame: HdrOutputFrame) {
+        if let Some(sink) = &self.0 {
+            sink(frame);
+        }
+    }
+}
+
+impl std::fmt::Debug for HdrFrameSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HdrFrameSink")
+            .field(&self.is_active())
+            .finish()
+    }
+}
+
 /// The request-local outcome of optional prompt enhancement.
 ///
 /// This is deliberately a small, tensor-free fact rather than a log convention. Consumers use it

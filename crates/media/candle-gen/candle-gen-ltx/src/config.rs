@@ -106,6 +106,10 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
 /// eight steps while an Eros render executes 8 + 3 learned refinement steps.
 pub const STAGE2_SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
 
+/// DFR temporal-round sigmas (`dfr_pipeline`'s `DISTILLED_SIGMAS[4:]`, 4 denoise steps).
+/// `TEMPORAL_SIGMAS[0]` doubles as the tile-entry re-noise scale (sc-18789).
+pub const TEMPORAL_SIGMAS: [f32; 5] = [0.975, 0.909375, 0.725, 0.421875, 0.0];
+
 /// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`). This is
 /// the ONLY step count the distilled model supports — the σ waypoints are baked into training, so an
 /// arbitrary `req.steps` cannot be honored by resampling without going out-of-distribution. `render`

@@ -569,33 +569,244 @@ fn affine(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
     y.reshape(out_dims)
 }
 
+/// A projection weight as the checkpoint stores it: dense `[out, in]`, or the MLX affine triple a
+/// quantized LTX-2.5 tier ships.
+///
+/// The decoder is ~99.9 % rank-2 Linear by parameter count, so this enum is where a q4 tier's
+/// 834 MB → 235 MB actually comes from. The packed arm keeps the compact
+/// [`QTensor`](candle_gen::candle_core::quantized::QTensor) resident and materialises a dense weight
+/// only for the duration of a forward — the same trade the DiT's [`crate::quant::qlinear`] makes.
+///
+/// # The trade this makes, stated rather than implied
+///
+/// The dense weight is **not cached**. Every [`Weight::materialize`] decodes the full `[out, in]`
+/// matrix again, so a q4 decode pays the dequant of all 137 packed Linears **once per forward** —
+/// and `NaDiffusionDecoder::decode_tiled` runs the decoder body per tile, so it pays it once per
+/// tile, not once per decode. (Upstream's `default_num_inference_steps` for this decoder is 1, so
+/// the multi-*step* multiplier is normally absent; the per-tile one is not.)
+///
+/// Caching would trade that back for resident memory, and the trade is bad here in exactly the way
+/// that matters: the dense forms of this component's weights are 834 MB against the 235 MB the q4
+/// tier ships, so a full cache gives back the entire reason the tier packs this component at all.
+/// A bounded or per-decode cache is a real option, but it is a *budget* decision about how much
+/// transient the decode may hold — which is sc-18799's (`Memory ladder: budget the DiffVAE decode
+/// for LTX-2.5`). Until that lands, this stays on the side that cannot silently blow a VRAM
+/// budget.
+enum Weight {
+    /// `[out, in]`, read verbatim.
+    Dense(Tensor),
+    /// A repacked affine weight plus the logical `[out, in]` it decodes to.
+    Packed {
+        /// The resident Q4_1 / Q8_0 weight.
+        weight: std::sync::Arc<candle_gen::candle_core::quantized::QTensor>,
+        /// Logical output width.
+        out: usize,
+        /// Logical input width.
+        inp: usize,
+    },
+}
+
+impl std::fmt::Debug for Weight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Weight::Dense(w) => f.debug_tuple("Dense").field(&w.dims()).finish(),
+            Weight::Packed { out, inp, .. } => f
+                .debug_struct("Packed")
+                .field("out", out)
+                .field("inp", inp)
+                .finish(),
+        }
+    }
+}
+
+impl Weight {
+    fn out_features(&self) -> usize {
+        match self {
+            Weight::Dense(w) => w.dims()[0],
+            Weight::Packed { out, .. } => *out,
+        }
+    }
+
+    fn in_features(&self) -> usize {
+        match self {
+            Weight::Dense(w) => w.dims()[1],
+            Weight::Packed { inp, .. } => *inp,
+        }
+    }
+
+    /// The dense `[out, in]` weight at `dtype`, for one forward.
+    ///
+    /// Recomputed on every call by design — see the trade at [`Weight`]. A caller in a loop that
+    /// reuses the same weight should hoist this out of the loop the way [`SwiGlu::forward`] does.
+    fn materialize(&self, dtype: DType, device: &Device) -> Result<Tensor> {
+        match self {
+            Weight::Dense(w) => w.to_dtype(dtype),
+            Weight::Packed { weight, .. } => weight.dequantize(device)?.to_dtype(dtype),
+        }
+    }
+}
+
+/// One projection's raw stored parts, before repacking.
+///
+/// Kept as a separate step from [`Weight`] for exactly one reason: the attention block ships a
+/// **fused** `qkv` that upstream splits into three at load. Splitting has to happen on the raw
+/// triple — `q`, `scales` and `biases` all narrow together along the output axis, which the affine
+/// packing leaves intact — because once repacked into a `QTensor` there is nothing left to slice.
+enum RawWeight {
+    Dense(Tensor),
+    Packed {
+        q: Tensor,
+        scales: Tensor,
+        biases: Tensor,
+        quant: crate::tier::Ltx25Quant,
+    },
+}
+
+impl RawWeight {
+    /// Read `{prefix}.weight`, packed or dense, keyed on whether `{prefix}.scales` exists.
+    ///
+    /// `quant` is the tier's **declaration** (`None` = "this file is dense"). A `.scales` sibling
+    /// under `None` is a hard error, never a fallback: the packed payload is bit-packed `U32`, so
+    /// reading it as a float weight yields a decoder that loads, runs, and returns noise. This is
+    /// the candle twin of `mlx_gen_ltx::diff_vae::ProjWeight::load`.
+    fn load(vb: &VarBuilder, prefix: &str, quant: Option<crate::tier::Ltx25Quant>) -> Result<Self> {
+        let scales_key = format!("{prefix}.scales");
+        if !vb.contains_tensor(&scales_key) {
+            return Ok(RawWeight::Dense(
+                vb.get_unchecked(&format!("{prefix}.weight"))?,
+            ));
+        }
+        let Some(quant) = quant else {
+            return Err(Error::Msg(format!(
+                "ltx diffvae: `{prefix}.scales` is present but the caller declared this checkpoint \
+                 dense. Pass the tier's `Ltx25Quant` (quantization_bits / quantization_group_size \
+                 from split_model.json); loading the packed U32 payload as a float weight would \
+                 decode the decoder into noise."
+            )));
+        };
+        // The codes are bit-packed and must load at their native `U32` — a float cast would
+        // reinterpret the nibbles. Scales/biases upcast to f32 exactly. Read on the host because
+        // the repack is host work.
+        let host = vb.clone().set_device(Device::Cpu);
+        let q = host.get_unchecked_dtype(&format!("{prefix}.weight"), DType::U32)?;
+        let scales = host.get_unchecked_dtype(&scales_key, DType::F32)?;
+        let biases = host.get_unchecked_dtype(&format!("{prefix}.biases"), DType::F32)?;
+        // The declared geometry, checked against this triple's own shapes before anything is
+        // repacked under it. `q` is `[out, in·bits/32]` and `scales` is `[out, in/group]`, so
+        // `32·q_cols == bits·group·scales_cols` exactly. Without this a q8 triple repacked under a
+        // q4 declaration would produce plausible-looking, entirely wrong weights.
+        //
+        // Note what this pins: the **product** `bits·group`, not each independently — a
+        // q8/group-32 triple satisfies a q4/group-64 declaration (8·32 == 4·64). That is not a
+        // hole in practice, because the repack this feeds
+        // (`candle_gen::quant::repack_packed_weight`) derives its own width from the same product
+        // and bails on anything that is not 4 or 8, and because `Ltx25Tier::validate` refuses a
+        // manifest whose group is not `crate::quant::GROUP_SIZE` before any of this runs. A tier
+        // at a new group has to re-argue both.
+        let (q_out, q_cols) = q.dims2()?;
+        let (s_out, s_cols) = scales.dims2()?;
+        if q_out != s_out || 32 * q_cols != quant.bits * quant.group * s_cols {
+            return Err(Error::Msg(format!(
+                "ltx diffvae: `{prefix}` is weight {:?} / scales {:?}, which is not {} bits at \
+                 group {} (the tier's declaration)",
+                q.dims(),
+                scales.dims(),
+                quant.bits,
+                quant.group,
+            )));
+        }
+        Ok(RawWeight::Packed {
+            q,
+            scales,
+            biases,
+            quant,
+        })
+    }
+
+    /// Rows (the output axis) this weight spans.
+    fn rows(&self) -> Result<usize> {
+        Ok(match self {
+            RawWeight::Dense(w) => w.dims2()?.0,
+            RawWeight::Packed { q, .. } => q.dims2()?.0,
+        })
+    }
+
+    /// `[start, start+len)` along the output axis. The affine grid is laid out along the *input*
+    /// axis, so an output-axis slice of a packed triple is still a valid packed triple.
+    fn narrow_rows(&self, start: usize, len: usize) -> Result<Self> {
+        Ok(match self {
+            RawWeight::Dense(w) => RawWeight::Dense(w.narrow(0, start, len)?.contiguous()?),
+            RawWeight::Packed {
+                q,
+                scales,
+                biases,
+                quant,
+            } => RawWeight::Packed {
+                q: q.narrow(0, start, len)?.contiguous()?,
+                scales: scales.narrow(0, start, len)?.contiguous()?,
+                biases: biases.narrow(0, start, len)?.contiguous()?,
+                quant: *quant,
+            },
+        })
+    }
+
+    /// Repack into the resident [`Weight`] the forward uses, on `device`.
+    fn build(self, device: &Device) -> Result<Weight> {
+        match self {
+            RawWeight::Dense(w) => Ok(Weight::Dense(w)),
+            RawWeight::Packed {
+                q,
+                scales,
+                biases,
+                quant,
+            } => {
+                let out = q.dims2()?.0;
+                let inp = scales.dims2()?.1 * quant.group;
+                let weight = candle_gen::quant::repack_packed_weight(
+                    &q,
+                    &scales,
+                    &biases,
+                    quant.group,
+                    device,
+                )?;
+                Ok(Weight::Packed {
+                    weight: std::sync::Arc::new(weight),
+                    out,
+                    inp,
+                })
+            }
+        }
+    }
+}
+
 /// `[out, in]` weight + `[out]` bias.
 #[derive(Debug)]
 struct Linear {
-    w: Tensor,
+    w: Weight,
     b: Tensor,
 }
 
 impl Linear {
-    fn load(vb: &VarBuilder, prefix: &str) -> Result<Self> {
-        let w = vb.get_unchecked(&format!("{prefix}.weight"))?;
-        let (out, _) = w.dims2()?;
+    fn load(vb: &VarBuilder, prefix: &str, quant: Option<crate::tier::Ltx25Quant>) -> Result<Self> {
+        let raw = RawWeight::load(vb, prefix, quant)?;
+        let out = raw.rows()?;
         Ok(Self {
             b: vb.get(out, &format!("{prefix}.bias"))?,
-            w,
+            w: raw.build(vb.device())?,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        affine(x, &self.w, Some(&self.b))
+        let w = self.w.materialize(x.dtype(), x.device())?;
+        affine(x, &w, Some(&self.b))
     }
 
     fn out_features(&self) -> usize {
-        self.w.dims()[0]
+        self.w.out_features()
     }
 
     fn in_features(&self) -> usize {
-        self.w.dims()[1]
+        self.w.in_features()
     }
 }
 
@@ -604,17 +815,20 @@ impl Linear {
 /// result depends only on itself.
 #[derive(Debug)]
 struct SwiGlu {
-    w_gate: Tensor,
-    w_up: Tensor,
-    w_down: Tensor,
+    w_gate: Weight,
+    w_up: Weight,
+    w_down: Weight,
 }
 
 impl SwiGlu {
-    fn load(vb: &VarBuilder, prefix: &str) -> Result<Self> {
+    fn load(vb: &VarBuilder, prefix: &str, quant: Option<crate::tier::Ltx25Quant>) -> Result<Self> {
+        let load = |name: &str| -> Result<Weight> {
+            RawWeight::load(vb, &format!("{prefix}.{name}"), quant)?.build(vb.device())
+        };
         Ok(Self {
-            w_gate: vb.get_unchecked(&format!("{prefix}.w_gate.weight"))?,
-            w_up: vb.get_unchecked(&format!("{prefix}.w_up.weight"))?,
-            w_down: vb.get_unchecked(&format!("{prefix}.w_down.weight"))?,
+            w_gate: load("w_gate")?,
+            w_up: load("w_up")?,
+            w_down: load("w_down")?,
         })
     }
 
@@ -623,19 +837,37 @@ impl SwiGlu {
         let dim = *dims.last().expect("rank >= 1");
         let tokens: usize = dims[..dims.len() - 1].iter().product();
         let flat = x.contiguous()?.reshape((tokens, dim))?;
+        // Materialised once per forward, not once per tile: a packed weight decodes to the same
+        // dense matrix for every tile, so dequantizing inside the loop would repeat the whole
+        // decode for each of them while changing nothing.
+        let (dtype, device) = (x.dtype(), x.device());
+        let dense = SwiGluDense {
+            w_gate: self.w_gate.materialize(dtype, device)?,
+            w_up: self.w_up.materialize(dtype, device)?,
+            w_down: self.w_down.materialize(dtype, device)?,
+        };
         if tokens <= SWIGLU_TILE_TOKENS {
-            return self.tile(&flat)?.reshape(dims);
+            return dense.tile(&flat)?.reshape(dims);
         }
         let mut parts: Vec<Tensor> = Vec::new();
         let mut start = 0;
         while start < tokens {
             let len = SWIGLU_TILE_TOKENS.min(tokens - start);
-            parts.push(self.tile(&flat.narrow(0, start, len)?)?);
+            parts.push(dense.tile(&flat.narrow(0, start, len)?)?);
             start += len;
         }
         Tensor::cat(&parts, 0)?.reshape(dims)
     }
+}
 
+/// The three SwiGLU projections as dense matrices, for the span of one forward.
+struct SwiGluDense {
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+}
+
+impl SwiGluDense {
     fn tile(&self, flat: &Tensor) -> Result<Tensor> {
         let gate = silu(&affine(flat, &self.w_gate, None)?)?;
         let up = affine(flat, &self.w_up, None)?;
@@ -1003,9 +1235,15 @@ struct NaAttention {
 impl NaAttention {
     /// The checkpoint ships one fused `qkv` Linear; upstream splits it into three at load, and so
     /// does this — three narrow GEMMs never materialise a `3*dim`-wide intermediate.
-    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
-        let fused_w = vb.get_unchecked(&format!("{prefix}.qkv.weight"))?;
-        let (rows, _) = fused_w.dims2()?;
+    fn load(
+        vb: &VarBuilder,
+        prefix: &str,
+        kernel: [usize; 3],
+        head_dim: usize,
+        quant: Option<crate::tier::Ltx25Quant>,
+    ) -> Result<Self> {
+        let fused_w = RawWeight::load(vb, &format!("{prefix}.qkv"), quant)?;
+        let rows = fused_w.rows()?;
         let fused_b = vb.get(rows, &format!("{prefix}.qkv.bias"))?;
         if rows % 3 != 0 {
             return Err(Error::Msg(format!(
@@ -1018,19 +1256,20 @@ impl NaAttention {
                 "ltx diffvae: {prefix} width {dim} is not a multiple of head_dim {head_dim}"
             )));
         }
+        let device = vb.device().clone();
         let part = |i: usize| -> Result<Linear> {
             Ok(Linear {
-                w: fused_w.narrow(0, i * dim, dim)?.contiguous()?,
+                w: fused_w.narrow_rows(i * dim, dim)?.build(&device)?,
                 b: fused_b.narrow(0, i * dim, dim)?.contiguous()?,
             })
         };
         let split = rope_dim_split(head_dim)?;
-        let device = fused_w.device();
+        let device = &device;
         Ok(Self {
             to_q: part(0)?,
             to_k: part(1)?,
             to_v: part(2)?,
-            proj: Linear::load(vb, &format!("{prefix}.proj"))?,
+            proj: Linear::load(vb, &format!("{prefix}.proj"), quant)?,
             q_norm: vb.get(head_dim, &format!("{prefix}.q_norm.weight"))?,
             k_norm: vb.get(head_dim, &format!("{prefix}.k_norm.weight"))?,
             inv: [
@@ -1098,12 +1337,18 @@ struct NaBlock {
 }
 
 impl NaBlock {
-    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
+    fn load(
+        vb: &VarBuilder,
+        prefix: &str,
+        kernel: [usize; 3],
+        head_dim: usize,
+        quant: Option<crate::tier::Ltx25Quant>,
+    ) -> Result<Self> {
         Ok(Self {
             norm1: vb.get_unchecked(&format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim)?,
+            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
             norm2: vb.get_unchecked(&format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"))?,
+            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"), quant)?,
         })
     }
 
@@ -1133,7 +1378,13 @@ struct DiffusionBlock {
 }
 
 impl DiffusionBlock {
-    fn load(vb: &VarBuilder, prefix: &str, kernel: [usize; 3], head_dim: usize) -> Result<Self> {
+    fn load(
+        vb: &VarBuilder,
+        prefix: &str,
+        kernel: [usize; 3],
+        head_dim: usize,
+        quant: Option<crate::tier::Ltx25Quant>,
+    ) -> Result<Self> {
         let table = vb.get_unchecked(&format!("{prefix}.scale_shift_table"))?;
         if table.rank() != 2 || table.dims()[0] != ADALN_CHUNKS {
             return Err(Error::Msg(format!(
@@ -1142,12 +1393,12 @@ impl DiffusionBlock {
             )));
         }
         Ok(Self {
-            context_proj: Linear::load(vb, &format!("{prefix}.context_proj"))?,
+            context_proj: Linear::load(vb, &format!("{prefix}.context_proj"), quant)?,
             scale_shift_table: table,
             norm1: vb.get_unchecked(&format!("{prefix}.norm1.weight"))?,
-            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim)?,
+            attn: NaAttention::load(vb, &format!("{prefix}.attn"), kernel, head_dim, quant)?,
             norm2: vb.get_unchecked(&format!("{prefix}.norm2.weight"))?,
-            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"))?,
+            mlp: SwiGlu::load(vb, &format!("{prefix}.mlp"), quant)?,
         })
     }
 
@@ -1193,9 +1444,14 @@ struct PixelShuffleUpsample {
 }
 
 impl PixelShuffleUpsample {
-    fn load(vb: &VarBuilder, prefix: &str, stride: [usize; 3]) -> Result<Self> {
+    fn load(
+        vb: &VarBuilder,
+        prefix: &str,
+        stride: [usize; 3],
+        quant: Option<crate::tier::Ltx25Quant>,
+    ) -> Result<Self> {
         Ok(Self {
-            proj: Linear::load(vb, &format!("{prefix}.proj"))?,
+            proj: Linear::load(vb, &format!("{prefix}.proj"), quant)?,
             stride,
         })
     }
@@ -1450,7 +1706,28 @@ impl NaDiffusionDecoder {
     /// `per_channel_statistics.{mean,std}-of-means` live (the file root). Both are separate
     /// arguments for the same reason [`crate::vae::LtxVideoVae`] takes them separately: on LTX-2.3
     /// the statistics sit beside the decoder under `vae.`, on LTX-2.5 they sit above it.
+    /// This is the **dense** entry point and is unchanged: it declares the checkpoint carries no
+    /// packed weights, so a released bf16 file (upstream's, and the `bf16` tier's) loads exactly as
+    /// before, and a packed file handed to it is refused rather than mis-read. A quantized tier goes
+    /// through [`load_quantized`](Self::load_quantized).
     pub fn load(vb: VarBuilder, stats: VarBuilder, cfg: &NaDiffusionDecoderConfig) -> Result<Self> {
+        Self::load_quantized(vb, stats, cfg, None)
+    }
+
+    /// [`load`](Self::load), with the tier's affine-quant geometry (sc-18776).
+    ///
+    /// `quant` is the declaration from the LTX-2.5 tier manifest
+    /// ([`crate::tier::Ltx25Tier::quant`]): `None` for a dense checkpoint, `Some` for a `q4`/`q8`
+    /// tier. It is a declaration, not a request — every projection binds packed or dense according
+    /// to whether its **own** `.scales` sibling exists, so the Linears a tier leaves dense (the
+    /// 48-wide `conv_in_x_t`) load correctly beside their packed siblings. Declaring `None` against
+    /// a packed file is a hard error rather than a silent mis-read of the `U32` payload.
+    pub fn load_quantized(
+        vb: VarBuilder,
+        stats: VarBuilder,
+        cfg: &NaDiffusionDecoderConfig,
+        quant: Option<crate::tier::Ltx25Quant>,
+    ) -> Result<Self> {
         let stages = cfg.stage_channels.len();
         let det = stages - 1;
         let mut det_stages = Vec::with_capacity(det);
@@ -1464,6 +1741,7 @@ impl NaDiffusionDecoder {
                     &format!("det_stages.{stage}.{i}"),
                     kernel,
                     cfg.head_dim,
+                    quant,
                 )?);
             }
             det_stages.push(blocks);
@@ -1471,6 +1749,7 @@ impl NaDiffusionDecoder {
                 &vb,
                 &format!("upsamples.{stage}"),
                 cfg.upsamples[stage].0,
+                quant,
             )?);
         }
         let depth5 = *cfg.stage_depths.last().expect("validated");
@@ -1481,6 +1760,7 @@ impl NaDiffusionDecoder {
                 &format!("diff_blocks.{i}"),
                 cfg.stage5_kernel,
                 cfg.head_dim,
+                quant,
             )?);
         }
 
@@ -1497,16 +1777,16 @@ impl NaDiffusionDecoder {
             cfg: cfg.clone(),
             stat_mean: stat(STAT_MEAN_KEY)?,
             stat_std: stat(STAT_STD_KEY)?,
-            conv_in: Linear::load(&vb, "conv_in")?,
+            conv_in: Linear::load(&vb, "conv_in", quant)?,
             det_stages,
             upsamples,
-            t_linear1: Linear::load(&vb, "t_embedder.mlp.0")?,
-            t_linear2: Linear::load(&vb, "t_embedder.mlp.2")?,
-            shared_adaln: Linear::load(&vb, "shared_adaln.proj")?,
-            conv_in_x_t: Linear::load(&vb, "conv_in_x_t")?,
+            t_linear1: Linear::load(&vb, "t_embedder.mlp.0", quant)?,
+            t_linear2: Linear::load(&vb, "t_embedder.mlp.2", quant)?,
+            shared_adaln: Linear::load(&vb, "shared_adaln.proj", quant)?,
+            conv_in_x_t: Linear::load(&vb, "conv_in_x_t", quant)?,
             diff_blocks,
             norm_out: vb.get_unchecked("norm_out.weight")?,
-            conv_out: Linear::load(&vb, "conv_out")?,
+            conv_out: Linear::load(&vb, "conv_out", quant)?,
         };
         decoder.check_widths()?;
         Ok(decoder)
@@ -1582,7 +1862,7 @@ impl NaDiffusionDecoder {
             let dim = cfg.stage_channels[stage];
             expect(
                 &format!("det stage {stage} mlp hidden"),
-                blocks[0].mlp.w_gate.dims()[0],
+                blocks[0].mlp.w_gate.out_features(),
                 mlp_hidden(dim),
             )?;
         }

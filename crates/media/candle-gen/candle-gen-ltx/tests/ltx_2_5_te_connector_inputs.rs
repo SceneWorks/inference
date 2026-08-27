@@ -28,7 +28,7 @@ use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
 use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
 use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
-use candle_gen_ltx::tier::TierPaths;
+use candle_gen_ltx::tier::Ltx25Tier;
 use candle_gen_ltx::tokenizer::Ltx25Tokenizer;
 
 /// The committed 2.3 reference fixture, reached across the backend boundary exactly as
@@ -115,7 +115,13 @@ fn tier_inputs(dir: &std::path::Path, device: &Device) -> TierInputs {
     let te_path = dir.join("text_encoder.safetensors");
     let checkpoint = LtxCheckpointMetadata::from_file(dir.join("transformer.safetensors"))
         .expect("transformer metadata");
-    let paths = TierPaths::detect(dir, None).expect("LTX25_TIER_DIR/q8 must be a tier directory");
+    // sc-18776: the 2.5 tier is detected through `Ltx25Tier`, not `TierPaths`. `TierPaths::detect`
+    // requires a `quantize_config.json`, which no 2.5 tier ships (they carry `split_model.json` +
+    // `embedded_config.json`), so it returned `None` here and this `expect` would have fired on the
+    // first real run.
+    let paths = Ltx25Tier::detect(dir)
+        .expect("LTX25_TIER_DIR/q8 must carry a readable split_model.json")
+        .expect("LTX25_TIER_DIR/q8 must be a 2.5 tier directory");
     let root = paths
         .connector_vb(DType::BF16, device)
         .expect("connector varbuilder")
@@ -309,19 +315,22 @@ fn connector_inputs_match_the_2_5_reference_golden() {
     );
 }
 
-/// The same gate one stage further on — and **it is RED on MLX today**, on a defect this golden
-/// found. See the MLX twin's `connector_outputs_match_the_2_5_reference_golden` for the full
-/// analysis; in short, `video_embeddings 1.275e0` / `audio_embeddings 1.771e0` against a `6e-2`
-/// bar on the dense bf16 tier, while the connector *inputs* on the same run reproduce to
-/// `2.282e-3`. The defect is in the connector — shared with LTX-2.3 and pinned only against
-/// `mlx_video`'s `Embeddings1DConnector`, never against `ltx_core`'s — not in this adapter, and is
-/// tracked as **sc-21663**.
+/// The same gate one stage further on — GREEN on MLX since **sc-21663** fixed the connector
+/// defects this golden surfaced (gate `2·sigmoid`, tanh-GELU, f32-quantized rope indices; the
+/// pre-fix MLX numbers were `1.275e0` / `1.771e0`). MLX measured after the fix: `video_emb
+/// 9.107e-3` / `audio_emb 1.141e-2` — but with **f32 connector activations**, which this crate
+/// does not mirror yet.
 ///
-/// Kept as a real assertion rather than a comment so the day it is fixed, it turns green on its
-/// own, on both backends.
+/// **bf16-activation caveat.** This connector still runs bf16 activations (f32 attention), and
+/// the mlx side measured that configuration at `6.094e-2` against this very bar — marginally
+/// OVER. The connector's closing per-row RMS-norm rescales rows spanning a >100x norm range, so
+/// activation rounding lands as relative error on low-norm register rows; the valid rows stayed
+/// under `7e-3` even at bf16. If the first CUDA run of this test is marginally red on the global
+/// video bar, that is the expected signature — the decision (mirror f32 activations vs its VRAM
+/// cost) is documented in `src/connector.rs`'s bf16-deficiency note and rides with that run.
 #[test]
-#[ignore = "sc-18770: RED — records a connector defect the 2.5 golden surfaced; see the doc \
-            comment. Needs the bf16 tier (LTX25_TIER_DIR) and a CUDA GPU."]
+#[ignore = "sc-18770/sc-21663: needs the built LTX-2.5 bf16 tier (LTX25_TIER_DIR) and a CUDA GPU; \
+            see the doc comment's bf16-activation caveat before interpreting a marginal red."]
 fn connector_outputs_match_the_2_5_reference_golden() {
     let device = Device::new_cuda(0).expect("cuda device");
     let (g, nv, [_, _, ve, ae]) = against_the_golden(&device);

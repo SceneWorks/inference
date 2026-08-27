@@ -44,6 +44,9 @@ mod convert_parity;
 #[path = "descriptor_conformance.rs"]
 mod descriptor_conformance;
 
+#[path = "dfr_ab_fast_motion.rs"]
+mod dfr_ab_fast_motion;
+
 #[path = "dit_parity.rs"]
 mod dit_parity;
 

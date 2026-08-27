@@ -227,10 +227,8 @@ fn param(w: &Weights, key: &str, prec: Precision) -> Result<Array> {
 /// `use_keyframes_abs_pos_embedding`, matching `LTXModel._keyframes_embedding()`); `keyframes_mask`
 /// is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either `None` makes this
 /// an exact no-op — as does an embedding that is still zero-initialized (the loaded-but-untrained
-/// state). The DFR keyframe-slot conditioning pipeline that would supply a real, non-`None` mask is a
-/// Phase 7 story (epic 18755); every current call site passes `None`, so this is presently inert in
-/// the full generate path — the parameter load + apply mechanism is landed here because the flag is
-/// `true` and the weight ships in the real LTX-2.5 checkpoint.
+/// state). The DFR token loops (sc-18789, [`crate::dfr`] / the token-native pipeline paths) thread
+/// a real mask marking generated-keyframe slot tokens; grid paths with no slots pass `None`.
 fn apply_keyframes_embedding(
     x: &Array,
     embedding: Option<&Array>,
@@ -1393,9 +1391,9 @@ impl LtxDiT {
         let coeff = self.cfg.adaln_embedding_coefficient;
 
         let x = self.patchify_proj.forward(&latent.as_dtype(dt)?)?;
-        // sc-18758: the DFR keyframe-slot marker (a Phase 7 pipeline story supplies the real mask; no
-        // call site threads one yet, so this is presently an exact no-op — see
-        // `apply_keyframes_embedding`).
+        // sc-18758/sc-18789: the DFR keyframe-slot marker. This video-only (2.3) preprocess never
+        // carries generated slots, so no mask — the AV token loops are the mask-threading path
+        // (see `apply_keyframes_embedding`).
         let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
 
         // adaLN-single timestep projection. The `× timestep_scale_multiplier` runs in the **input
@@ -1761,6 +1759,7 @@ impl Stream {
         timestep: &Array,
         context: &Array,
         positions: &Array,
+        keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<StreamPrep> {
         let dt = self.prec.dtype();
@@ -1768,10 +1767,11 @@ impl Stream {
         let (inner, coeff) = (self.inner, self.coeff);
 
         let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
-        // sc-18758: the DFR keyframe-slot marker (video stream only; `self.keyframes_embedding` is
-        // always `None` for the audio stream). No call site threads a real mask yet (Phase 7), so
-        // this is presently an exact no-op — see `apply_keyframes_embedding`.
-        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
+        // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only;
+        // `self.keyframes_embedding` is always `None` for the audio stream). The DFR token loops
+        // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
+        // passes `None`, which keeps this an exact no-op.
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), keyframes_mask)?;
 
         // adaLN-single timestep projection (the `× ts_mult` runs in the input dtype; see the
         // video-only path's note — bf16 must round `bf16(σ·1000)` first).
@@ -2071,6 +2071,15 @@ impl AvBlock {
         Ok((vx, ax))
     }
 
+    /// The absent-audio block body (sc-18789): video self-attention + text cross-attention +
+    /// feed-forward. Per the reference block's `run_a2v = run_vx and audio is not None`, the
+    /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
+    /// absent — not run against a placeholder stream.
+    fn forward_video_only(&self, vx: &Array, v: &StreamArgs) -> Result<Array> {
+        let vx = self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
+    }
+
     /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
     /// the two cross-modal attns (`audio_to_video_attn`/`video_to_audio_attn`). `audio_ff.net.*` →
     /// `audio_ff.proj_*` is renamed by the loader before reaching here.
@@ -2262,6 +2271,7 @@ impl AvDiT {
     ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
     ///   falls back to the `positions`-content compare (behavior unchanged).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         video_latent: &Array,
@@ -2274,6 +2284,7 @@ impl AvDiT {
         audio_context: &Array,
         audio_mask: Option<&Array>,
         audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
@@ -2281,6 +2292,7 @@ impl AvDiT {
             video_timestep,
             video_context,
             video_positions,
+            video_keyframes_mask,
             rope_epoch,
         )?;
         let ap = self.audio.prepare(
@@ -2288,6 +2300,7 @@ impl AvDiT {
             audio_timestep,
             audio_context,
             audio_positions,
+            None,
             rope_epoch,
         )?;
         let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
@@ -2301,11 +2314,75 @@ impl AvDiT {
         let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
         Ok((v_vel, a_vel))
     }
+
+    /// **Video-only** forward through the AV stack — the reference `LTXModel` called with
+    /// `audio=None` (the DFR temporal-round tile denoise, `dfr_pipeline`'s `audio=None` stage
+    /// call): the audio stream is skipped entirely and, per the reference block
+    /// (`run_a2v = run_vx and audio is not None`), the cross-modal attentions do not run — each
+    /// block reduces to video self-attention + text cross-attention + feed-forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+    ) -> Result<Array> {
+        let vp = self.video.prepare(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+        )?;
+        let mut vx = vp.x.clone();
+        let va = vp.args(video_mask);
+        for block in &self.blocks {
+            vx = block.forward_video_only(&vx, &va)?;
+        }
+        self.video.output_head(&vx, &vp.emb_ts)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-18789: the keyframe absolute-position marker lands on exactly the tokens the mask
+    /// marks — marked tokens shift by the embedding, unmarked tokens are bit-identical, and an
+    /// absent mask (or absent embedding) is an exact no-op.
+    #[test]
+    fn keyframes_embedding_applies_only_to_marked_tokens() {
+        use mlx_rs::ops::indexing::IndexOp;
+        struct CpuGuard(mlx_rs::Device);
+        impl Drop for CpuGuard {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _cpu = CpuGuard(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 3, 2]);
+        let emb = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[0.0f32, 1.0, 0.0], &[1, 3, 1]);
+        let out = apply_keyframes_embedding(&x, Some(&emb), Some(&mask)).unwrap();
+        let got: Vec<f32> = (0..3)
+            .flat_map(|t| (0..2).map(move |c| (t, c)))
+            .map(|(t, c)| out.index((0, t, c)).item::<f32>())
+            .collect();
+        assert_eq!(got, vec![1.0, 2.0, 13.0, 24.0, 5.0, 6.0]);
+        for out in [
+            apply_keyframes_embedding(&x, Some(&emb), None).unwrap(),
+            apply_keyframes_embedding(&x, None, Some(&mask)).unwrap(),
+        ] {
+            let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&out, &x).unwrap()).unwrap();
+            assert_eq!(mlx_rs::ops::max(&d, None).unwrap().item::<f32>(), 0.0);
+        }
+    }
 
     #[test]
     fn rms_norm_noweight_matches_fresh_ones_and_caches() {
@@ -2925,8 +3002,8 @@ mod tests {
         mlx_rs::transforms::eval([&got, &x]).unwrap();
         assert!(array_eq(&got, &x, None).unwrap().item::<bool>());
 
-        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
-        // wiring is out of this story's scope) → exact passthrough.
+        // Embedding configured but no mask supplied (a grid path with no generated slots) → exact
+        // passthrough.
         let got2 = apply_keyframes_embedding(&x, Some(&embedding), None).unwrap();
         mlx_rs::transforms::eval([&got2]).unwrap();
         assert!(array_eq(&got2, &x, None).unwrap().item::<bool>());

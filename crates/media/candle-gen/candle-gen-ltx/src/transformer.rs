@@ -48,8 +48,9 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
 /// stream's `(1, inner)` `keyframes_abs_pos_embedding` (`None` for a model built without
 /// `use_keyframes_abs_pos_embedding`, or for the audio stream, which never carries one);
 /// `keyframes_mask` is `(B, T, 1)`, `> 0` marking a keyframe token (`None` = no token marked). Either
-/// `None` makes this an exact no-op. The DFR keyframe-slot pipeline that would supply a real mask is a
-/// Phase 7 story (epic 18755); every current call site passes `None`.
+/// `None` makes this an exact no-op. The DFR token loops (sc-18789, [`crate::dfr`] / the
+/// conditioned forwards) thread a real mask marking generated-keyframe slot tokens; paths with no
+/// slots pass `None`.
 fn apply_keyframes_embedding(
     x: &Tensor,
     embedding: Option<&Tensor>,
@@ -538,8 +539,7 @@ mod tests {
             x.flatten_all()?.to_vec1::<f32>()?
         );
 
-        // Embedding configured but no mask threaded yet (every current call site — Phase 7 pipeline
-        // wiring is out of this story's scope) → passthrough.
+        // Embedding configured but no mask supplied (a path with no generated slots) → passthrough.
         let got2 = apply_keyframes_embedding(&x, Some(&embedding), None)?;
         assert_eq!(
             got2.flatten_all()?.to_vec1::<f32>()?,
@@ -1135,6 +1135,7 @@ impl AvDiT {
             audio_latent,
             video_context,
             audio_context,
+            None,
             prepared,
             &v_ts,
             &a_ts,
@@ -1154,6 +1155,7 @@ impl AvDiT {
         audio_context: &Tensor,
         video_grid: &Tensor,
         audio_grid: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let prepared = self.prepare_rope(video_latent, audio_latent, video_grid, audio_grid)?;
         self.forward_conditioned_prepared(
@@ -1165,6 +1167,7 @@ impl AvDiT {
             audio_context,
             video_grid,
             audio_grid,
+            video_keyframes_mask,
             &prepared,
         )
     }
@@ -1180,6 +1183,7 @@ impl AvDiT {
         audio_context: &Tensor,
         video_grid: &Tensor,
         audio_grid: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
         prepared: &PreparedAvRope,
     ) -> Result<(Tensor, Tensor)> {
         prepared.request.validate(
@@ -1210,6 +1214,7 @@ impl AvDiT {
             audio_latent,
             video_context,
             audio_context,
+            video_keyframes_mask,
             prepared,
             &v_ts,
             &a_ts,
@@ -1223,6 +1228,7 @@ impl AvDiT {
         audio_latent: &Tensor,
         video_context: &Tensor,
         audio_context: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
         prepared: &PreparedAvRope,
         v_ts: &AvTs,
         a_ts: &AvTs,
@@ -1231,9 +1237,14 @@ impl AvDiT {
             .video
             .patchify
             .forward(&video_latent.to_dtype(self.video.dtype)?)?;
-        // sc-18758: the DFR keyframe-slot marker (video stream only). No call site threads a real
-        // mask yet (Phase 7), so this is presently an exact no-op — see `apply_keyframes_embedding`.
-        vx = apply_keyframes_embedding(&vx, self.video.keyframes_embedding.as_ref(), None)?;
+        // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only). The DFR token loops
+        // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
+        // passes `None`, keeping this an exact no-op.
+        vx = apply_keyframes_embedding(
+            &vx,
+            self.video.keyframes_embedding.as_ref(),
+            video_keyframes_mask,
+        )?;
         let mut ax = self
             .audio
             .patchify
@@ -1308,6 +1319,77 @@ impl AvDiT {
         let v_ctx = video_context.to_dtype(self.video.dtype)?;
         // The video-only path never consumes the cross-modal fields. Reuse the self-RoPE/timestep
         // tensors to keep this borrowed argument bundle allocation-free.
+        let va = AvStreamArgs {
+            ts_emb: &v_ts.ts_emb,
+            prompt_ts: &v_ts.prompt_ts,
+            context: &v_ctx,
+            cos: &v_cos,
+            sin: &v_sin,
+            cross_cos: &v_cos,
+            cross_sin: &v_sin,
+            cross_ss_ts: &v_ts.cross_ss_ts,
+            cross_gate_ts: &v_ts.cross_gate_ts,
+        };
+        for block in &self.blocks {
+            vx = block.self_and_text(
+                &vx,
+                &block.attn1,
+                &block.attn2,
+                &block.v_sst,
+                &block.v_pst,
+                &va,
+            )?;
+            vx = block.feed_forward(&vx, &block.ff, &block.v_sst, &v_ts.ts_emb)?;
+        }
+        self.video.output_head(&vx, &v_ts.emb_ts)
+    }
+
+    /// **Video-only** forward with per-token video timesteps and the DFR keyframes mask — the
+    /// reference `LTXModel` called with `audio=None` on a conditioned token state (the DFR
+    /// temporal-round tile denoise): the audio stream is skipped and the cross-modal attentions do
+    /// not run; each block is video self-attention + text cross-attention + feed-forward
+    /// (sc-18789; the uniform-sigma sibling above serves LoRA training).
+    pub fn forward_video_only_conditioned(
+        &self,
+        video_latent: &Tensor,
+        video_timesteps: &Tensor,
+        video_context: &Tensor,
+        video_grid: &Tensor,
+        video_keyframes_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let b = video_latent.dim(0)?;
+        if video_timesteps.dims2()? != (b, video_latent.dim(1)?) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx: video timestep shape {:?} must be [batch={}, tokens={}]",
+                video_timesteps.dims(),
+                b,
+                video_latent.dim(1)?
+            )));
+        }
+        let v_ts = self.video.ts_embeds_tokens(
+            video_timesteps,
+            self.cfg.video.timestep_scale_multiplier,
+            &self.device,
+        )?;
+        let (v_cos, v_sin) = precompute_split_freqs_nd(
+            video_grid,
+            self.cfg.video.inner_dim(),
+            self.cfg.video.rope_theta,
+            &self.cfg.video.rope_max_pos,
+            self.cfg.video.num_heads,
+            &self.device,
+        )?;
+        let mut vx = self
+            .video
+            .patchify
+            .forward(&video_latent.to_dtype(self.video.dtype)?)?;
+        vx = apply_keyframes_embedding(
+            &vx,
+            self.video.keyframes_embedding.as_ref(),
+            video_keyframes_mask,
+        )?;
+        let v_ctx = video_context.to_dtype(self.video.dtype)?;
+        // The video-only path never consumes the cross-modal fields; reuse the self-RoPE tensors.
         let va = AvStreamArgs {
             ts_emb: &v_ts.ts_emb,
             prompt_ts: &v_ts.prompt_ts,

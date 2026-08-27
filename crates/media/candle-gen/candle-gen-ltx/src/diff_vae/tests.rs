@@ -456,7 +456,7 @@ fn the_pixel_shuffle_places_each_sub_cell_where_the_reference_does() {
     }
     let up = PixelShuffleUpsample {
         proj: Linear {
-            w: Tensor::from_vec(eye, (packed, packed), &Device::Cpu).unwrap(),
+            w: Weight::Dense(Tensor::from_vec(eye, (packed, packed), &Device::Cpu).unwrap()),
             b: Tensor::zeros(packed, DType::F32, &Device::Cpu).unwrap(),
         },
         stride: [p1, p2, p3],

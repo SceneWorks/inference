@@ -11,6 +11,51 @@ pub struct Image {
     pub pixels: Vec<u8>,
 }
 
+/// One high-dynamic-range frame: interleaved `f32` RGB, row-major, `rgb.len() == width · height · 3`.
+///
+/// The HDR counterpart of [`Image`] (sc-18790). Deliberately **unbounded** — scene-linear light
+/// runs past `1.0` (a specular highlight is legitimately `50.0`), which is exactly the range an
+/// 8-bit [`Image`] cannot carry and the reason this type exists. Depending on the request's
+/// [`HdrColorSpace`](crate::hdr::HdrColorSpace) the samples are either scene-linear light or
+/// ACEScct log working codes; the colour space travels alongside the frame rather than being
+/// guessed from the values.
+///
+/// Tensor-free like every media type here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HdrFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Interleaved RGB, `width · height · 3` samples, row-major.
+    pub rgb: Vec<f32>,
+}
+
+impl HdrFrame {
+    /// Reject a frame whose buffer disagrees with its declared dimensions, or whose dimensions
+    /// are zero.
+    ///
+    /// Every colour-math entry point calls this first: the transforms index by `width`/`height`
+    /// and would otherwise panic deep inside a loop (or, worse, silently transform a partial
+    /// frame) when handed an inconsistent buffer.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Err(crate::Error::Msg(format!(
+                "HdrFrame: zero dimension — {}×{} (both edges must be > 0)",
+                self.width, self.height
+            )));
+        }
+        let want = self.width as usize * self.height as usize * 3;
+        if self.rgb.len() != want {
+            return Err(crate::Error::Msg(format!(
+                "HdrFrame: buffer length {} disagrees with {}×{} RGB (need {want})",
+                self.rgb.len(),
+                self.width,
+                self.height
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Interleaved PCM audio — the audio track of a video generation (e.g. LTX-2.3), a pure audio
 /// synthesis (TTS / music), or a voice conversion.
 ///

@@ -1,17 +1,36 @@
-//! S1 connector golden parity vs the reference `Embeddings1DConnector` (sc-18763) — the candle
-//! twin of `mlx-gen-ltx`'s `tests/connector_parity.rs`.
+//! S1 connector golden parity vs the reference `Embeddings1DConnector` (sc-18763; re-derived
+//! sc-21663) — the candle twin of `mlx-gen-ltx`'s `tests/connector_parity.rs`.
 //!
-//! `#[ignore]`d: needs the real eros connector weights, in the candle CUDA tier layout under
+//! `#[ignore]`d: needs the real 2.3 connector weights, in the candle CUDA tier layout under
 //! `LTX_BASE_DIR`, plus a CUDA GPU — candle's plain CPU backend has no bf16 matmul, the same
 //! reason `tests/conformance.rs` is `cuda`-only.
 //!
 //! The golden holds `features` / `mask01` / `video_embeddings` plus the audio equivalents. It is
-//! the SAME committed fixture `mlx-gen-ltx`'s own `connector_parity.rs` consumes, dumped once from
-//! the PyTorch reference and checked into `mlx-gen-ltx/tests/fixtures/`. `tests/vae_encode_parity.rs`
-//! establishes this cross-backend golden-reuse convention already; it applies here too because the
-//! connector's math is identical on both backends given the same feature-extractor output. This is
-//! the acceptance-criterion golden-parity gate for the connector input (post-projection,
-//! post-norm) against the reference, on the candle side.
+//! the SAME committed fixture `mlx-gen-ltx`'s own `connector_parity.rs` consumes. Since sc-21663
+//! its oracle is **ltx_core semantics executed via the patched mlx_video module in f32 on MLX**
+//! (see `tools/dump_ltx_connector_golden.py` for why the oracle is same-framework with the mlx
+//! port, and the torch cross-check it ships). The two backends are NOT numerically identical
+//! against it: the mlx port compares f32-vs-f32 on near-identical Metal kernels, while this crate
+//! runs **bf16 activations** (f32 attention) on CUDA kernels — so its bars must budget both the
+//! bf16-activation penalty and an unmeasured CUDA-vs-Metal kernel delta.
+//!
+//! # Bars (sc-21663) — provisional derived values, to be replaced by CUDA measurements
+//!
+//! No CUDA hardware was reachable when the golden was re-derived, so these bars are DERIVED
+//! bounds, not measured floors. Components (all measured on the mlx side, same fixture):
+//!
+//! * f32 kernel-pair floor vs this oracle: video `2.756e-3` global; audio `1.639e-2` valid /
+//!   `8.086e-2` global (register rows — the closing per-row RMS-norm rescales rows spanning a
+//!   272x norm range, converting kernel noise into relative error on near-cancelled register
+//!   rows; see the mlx twin's decomposition).
+//! * bf16-activation penalty, measured on the LTX-2.5 video golden: global `5.568e-2` bf16 vs
+//!   `1.288e-2` f32 (isolated connector); valid rows stayed under `7e-3` even at bf16.
+//!
+//! Bars = floor ⊕ bf16 penalty, ×~2 margin for the unmeasured CUDA kernel pair: video valid
+//! `3e-2` / global `1.5e-1`; audio valid `5e-2` / global `2.5e-1`. **The first CUDA run must
+//! record the printed peak_rels on the story/epic and tighten these to measured-floor × ~1.5** —
+//! and it is also the decision point for mirroring the mlx side's f32 activations (see
+//! `src/connector.rs`'s bf16-deficiency note).
 //!
 //! Run:
 //! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test integration --
@@ -40,6 +59,12 @@ fn peak_rel(got: &Tensor, want: &Tensor) -> CoreResult<f32> {
         mag = mag.max(w.abs());
     }
     Ok(diff / mag.max(1e-12))
+}
+
+/// [`peak_rel`] over token rows `[lo, hi)` of a `[1, seq, dim]` pair, denominator over the same
+/// slice — the valid-row bar must not hide behind (or be drowned by) the register rows.
+fn peak_rel_rows(got: &Tensor, want: &Tensor, lo: usize, hi: usize) -> CoreResult<f32> {
+    peak_rel(&got.narrow(1, lo, hi - lo)?, &want.narrow(1, lo, hi - lo)?)
 }
 
 /// The golden's `mask01` (stored int) → the connector's `nv` (valid, non-padding token count).
@@ -88,11 +113,17 @@ fn video_connector_matches_reference() -> candle_gen::Result<()> {
 
     let got = conn.forward(&features, nv)?;
     assert_eq!(got.shape(), want.shape());
+    // The connector reorders its input, so the valid rows are the PREFIX (`0..nv`).
     let pr = peak_rel(&got, want)?;
-    eprintln!("candle video connector peak_rel = {pr:.3e}");
-    // bf16 (candle always runs the connector at bf16, vs the mlx gate's f32 build) — looser than
-    // the mlx `connector_parity.rs` 5e-3, matching `te_parity.rs`'s bf16-through-connector budget.
-    assert!(pr < 6e-2, "video connector peak_rel {pr:.3e} too high");
+    let pr_valid = peak_rel_rows(&got, want, 0, nv)?;
+    eprintln!("candle video connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
+    // Provisional derived bars (sc-21663) — see the module docs; the first CUDA run records the
+    // printed values and tightens these.
+    assert!(
+        pr_valid < 3e-2,
+        "video connector valid-row peak_rel {pr_valid:.3e} too high"
+    );
+    assert!(pr < 1.5e-1, "video connector peak_rel {pr:.3e} too high");
     Ok(())
 }
 
@@ -117,7 +148,14 @@ fn audio_connector_matches_reference() -> candle_gen::Result<()> {
     let got = conn.forward(&features, nv)?;
     assert_eq!(got.shape(), want.shape());
     let pr = peak_rel(&got, want)?;
-    eprintln!("candle audio connector peak_rel = {pr:.3e}");
-    assert!(pr < 6e-2, "audio connector peak_rel {pr:.3e} too high");
+    let pr_valid = peak_rel_rows(&got, want, 0, nv)?;
+    eprintln!("candle audio connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
+    // Provisional derived bars (sc-21663) — see the module docs; the first CUDA run records the
+    // printed values and tightens these.
+    assert!(
+        pr_valid < 5e-2,
+        "audio connector valid-row peak_rel {pr_valid:.3e} too high"
+    );
+    assert!(pr < 2.5e-1, "audio connector peak_rel {pr:.3e} too high");
     Ok(())
 }
