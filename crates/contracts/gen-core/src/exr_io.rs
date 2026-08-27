@@ -77,15 +77,20 @@ pub fn write_rgb_exr(
         blue: Vec2(c[4], c[5]),
         white: Vec2(c[6], c[7]),
     };
-    let tag_key = Text::from(EXR_COLOR_SPACE_ATTRIBUTE);
-    let tag_value = AttributeValue::Text(Text::from(color_space_tag));
+    // `colorSpace` is a custom (non-standard) attribute, and the reader files unknown non-
+    // chromaticity/timecode attributes under the *layer*. Writing it there keeps the crate's own
+    // round-trip symmetric; either location serializes into the same OpenEXR header.
+    let mut layer_attributes = LayerAttributes::default();
+    layer_attributes.other.insert(
+        Text::from(EXR_COLOR_SPACE_ATTRIBUTE),
+        AttributeValue::Text(Text::from(color_space_tag)),
+    );
 
     let encoding = Encoding {
         compression: Compression::ZIP16,
         blocks: Blocks::ScanLines,
         line_order: LineOrder::Increasing,
     };
-    let layer_attributes = LayerAttributes::default();
 
     let mut out = Cursor::new(Vec::<u8>::new());
     // The two arms differ only in sample type, which `SpecificChannels` encodes in the closure's
@@ -101,7 +106,6 @@ pub fn write_rgb_exr(
         });
         let mut image = Image::from_layer(Layer::new((w, h), layer_attributes, encoding, channels));
         image.attributes.chromaticities = Some(chromaticities);
-        image.attributes.other.insert(tag_key, tag_value);
         image
             .write()
             .to_buffered(&mut out)
@@ -113,7 +117,6 @@ pub fn write_rgb_exr(
         });
         let mut image = Image::from_layer(Layer::new((w, h), layer_attributes, encoding, channels));
         image.attributes.chromaticities = Some(chromaticities);
-        image.attributes.other.insert(tag_key, tag_value);
         image
             .write()
             .to_buffered(&mut out)
@@ -186,10 +189,16 @@ pub fn read_rgb_exr(bytes: &[u8]) -> crate::Result<ExrImage> {
             c.white.y(),
         ]
     });
+    // The `exr` reader files unknown attributes under the *layer*, keeping only chromaticities
+    // and timecodes at image level — but OpenEXR itself has one header per part, so a file
+    // written by another tool may legitimately surface it either way. Check both.
+    let tag_key = Text::from(EXR_COLOR_SPACE_ATTRIBUTE);
     let color_space_tag = image
+        .layer_data
         .attributes
         .other
-        .get(&Text::from(EXR_COLOR_SPACE_ATTRIBUTE))
+        .get(&tag_key)
+        .or_else(|| image.attributes.other.get(&tag_key))
         .and_then(|v| match v {
             AttributeValue::Text(t) => Some(t.to_string()),
             _ => None,
