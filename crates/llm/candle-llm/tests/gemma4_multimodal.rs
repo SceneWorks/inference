@@ -492,7 +492,7 @@ fn descriptor_advertises_exactly_the_front_ends_the_checkpoint_ships() {
         let caps = &p.descriptor().capabilities;
         // Vision is NOT advertised even when the tensors are present: the front-end loads but its
         // end-to-end behaviour is unvalidated, so the descriptor stays honest rather than
-        // advertising a path that answers off-manifold (see `GEMMA4_VISION_UNVALIDATED`).
+        // advertising a path that answers off-manifold (see `gemma4_vision_is_validated` in the provider).
         assert!(
             !caps.supports_vision,
             "vision must stay unadvertised while it is unvalidated (vision tensors={with_vision})"
