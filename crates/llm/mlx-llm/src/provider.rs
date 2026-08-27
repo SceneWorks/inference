@@ -1100,6 +1100,7 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     load: load_registered,
     can_load,
     weightless_vision: Some(weightless_vision),
+    weightless_audio: Some(weightless_audio),
 };
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
@@ -1179,7 +1180,58 @@ fn weightless_vision_value(v: &serde_json::Value) -> bool {
     matches!(
         Architecture::from_config(v),
         Ok(Architecture::Qwen3Vl) | Ok(Architecture::Qwen35)
-    )
+    ) || gemma4_multimodal(v, "vision_config")
+}
+
+/// **Weightless** per-snapshot audio probe (sc-18772): does `mlx-llama` serve the snapshot at
+/// `spec.source` *with* audio? The audio analogue of [`weightless_vision`] — reads only
+/// `config.json`, never a weight shard.
+///
+/// Gemma 4 unified is the only architecture this provider serves that has an audio path at all, and
+/// like vision it is per-snapshot: the same registration also serves text-only checkpoints, so the
+/// static descriptor stays `supports_audio=false` and this probe is what lets a model-first
+/// audio-required load (`load_for_model_with(spec, with_audio())`) resolve here.
+pub fn weightless_audio(spec: &LoadSpec) -> bool {
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    weightless_audio_value(&v)
+}
+
+/// Pure per-snapshot audio decision over a parsed `config.json` (split out for unit testing).
+fn weightless_audio_value(v: &serde_json::Value) -> bool {
+    gemma4_multimodal(v, "audio_config")
+}
+
+/// Whether this provider claims `v` AND it is a Gemma 4 checkpoint declaring the named front-end
+/// block (`vision_config` / `audio_config`) plus the token id that front-end splices at.
+///
+/// The token-id check is not redundant with the block: a config carrying a `vision_config` but no
+/// `image_token_id` cannot be conditioned on an image at all (there is no row to splice into), so
+/// advertising vision for it would be exactly the advertised-but-absent case. The load path refuses
+/// such a config for the same reason, which keeps probe and loader agreeing.
+fn gemma4_multimodal(v: &serde_json::Value, block: &str) -> bool {
+    if !can_load_value(v) || v.get(block).is_none() {
+        return false;
+    }
+    if !matches!(Architecture::from_config(v), Ok(a) if a.is_gemma4()) {
+        return false;
+    }
+    let token_key = if block == "audio_config" {
+        "audio_token_id"
+    } else {
+        "image_token_id"
+    };
+    v.get(token_key).and_then(|x| x.as_i64()).is_some()
 }
 
 #[cfg(test)]

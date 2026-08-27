@@ -1652,6 +1652,7 @@ mod tests {
                 load: never_load,
                 can_load: cannot_load,
                 weightless_vision: None,
+                weightless_audio: None,
             })
             .build();
         let preparers = core_llm::SnapshotPreparerRegistryBuilder::new()

@@ -108,9 +108,58 @@ impl VideoRef {
     }
 }
 
+/// Decoded mono PCM audio: `f32` samples in `[-1, 1]` at a stated sample rate. Tensor-free like
+/// [`ImageRef`] — the host decodes/mixes the source file down to mono at its boundary and a provider
+/// lifts the samples into its own tensors.
+///
+/// Mono, not interleaved stereo: every audio-conditioned decoder in this workspace consumes a single
+/// channel, so carrying an interleaved buffer here would push a silent channel-count assumption into
+/// each provider. The sample rate travels with the samples rather than being fixed by the contract
+/// because it is a property of the *source*; a provider that needs a specific rate checks it and
+/// rejects a mismatch rather than resampling behind the caller's back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioRef {
+    /// Sample rate in Hz (e.g. `16_000`).
+    pub sample_rate: u32,
+    /// Mono PCM samples, nominally in `[-1, 1]`.
+    pub samples: Vec<f32>,
+}
+
+impl AudioRef {
+    /// Construct, validating a non-zero sample rate and at least one sample.
+    pub fn new(sample_rate: u32, samples: Vec<f32>) -> Result<Self, String> {
+        if sample_rate == 0 {
+            return Err("AudioRef: sample_rate must be > 0".to_string());
+        }
+        if samples.is_empty() {
+            return Err("AudioRef: needs at least one sample".to_string());
+        }
+        Ok(Self {
+            sample_rate,
+            samples,
+        })
+    }
+
+    /// The number of samples.
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether the clip has no samples (never true for an `AudioRef` built via [`Self::new`]).
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// Duration in seconds.
+    pub fn duration_secs(&self) -> f32 {
+        self.samples.len() as f32 / self.sample_rate as f32
+    }
+}
+
 /// A single piece of message content.
 ///
-/// Not `Eq` (only `PartialEq`): [`Content::Video`] carries `f32` timestamps.
+/// Not `Eq` (only `PartialEq`): [`Content::Video`] carries `f32` timestamps and [`Content::Audio`]
+/// carries `f32` samples.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     /// Text content.
@@ -119,6 +168,8 @@ pub enum Content {
     Image(ImageRef),
     /// Video content (sampled frames + per-frame timestamps for Text–Timestamp Alignment).
     Video(VideoRef),
+    /// Audio content (decoded mono PCM).
+    Audio(AudioRef),
 }
 
 impl Content {
@@ -135,6 +186,11 @@ impl Content {
     /// Whether this is video content.
     pub fn is_video(&self) -> bool {
         matches!(self, Content::Video(_))
+    }
+
+    /// Whether this is audio content.
+    pub fn is_audio(&self) -> bool {
+        matches!(self, Content::Audio(_))
     }
 }
 
@@ -205,13 +261,13 @@ impl Message {
         Self::text(Role::Assistant, text)
     }
 
-    /// Concatenated text of this turn (image and video blocks omitted).
+    /// Concatenated text of this turn (image, video, and audio blocks omitted).
     pub fn text_content(&self) -> String {
         self.content
             .iter()
             .filter_map(|c| match c {
                 Content::Text(t) => Some(t.as_str()),
-                Content::Image(_) | Content::Video(_) => None,
+                Content::Image(_) | Content::Video(_) | Content::Audio(_) => None,
             })
             .collect::<Vec<_>>()
             .join("")
@@ -225,6 +281,11 @@ impl Message {
     /// Whether the turn contains any video content.
     pub fn has_video(&self) -> bool {
         self.content.iter().any(Content::is_video)
+    }
+
+    /// Whether the turn contains any audio content.
+    pub fn has_audio(&self) -> bool {
+        self.content.iter().any(Content::is_audio)
     }
 }
 
@@ -267,6 +328,39 @@ mod tests {
         assert!(!m.has_image());
         // Video blocks are omitted from the flattened text, like images.
         assert_eq!(m.text_content(), "describe");
+    }
+
+    #[test]
+    fn audio_validates_rate_and_samples() {
+        assert!(AudioRef::new(16_000, vec![0.0; 4]).is_ok());
+        // A zero sample rate cannot be turned into a duration or a frame count.
+        assert!(AudioRef::new(0, vec![0.0; 4]).is_err());
+        // An empty clip carries no conditioning; reject rather than emit a zero-token span.
+        assert!(AudioRef::new(16_000, vec![]).is_err());
+    }
+
+    #[test]
+    fn audio_reports_duration_from_rate() {
+        let a = AudioRef::new(16_000, vec![0.0; 8_000]).unwrap();
+        assert_eq!(a.len(), 8_000);
+        assert!(!a.is_empty());
+        assert!((a.duration_secs() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn message_audio_helpers() {
+        let audio = AudioRef::new(16_000, vec![0.25; 640]).unwrap();
+        let m = Message {
+            role: Role::User,
+            content: vec![Content::Audio(audio), Content::text("transcribe")],
+            thinking: None,
+            tool_calls: Vec::new(),
+        };
+        assert!(m.has_audio());
+        assert!(!m.has_image());
+        assert!(!m.has_video());
+        // Audio blocks are omitted from the flattened text, like images and video.
+        assert_eq!(m.text_content(), "transcribe");
     }
 
     #[test]
