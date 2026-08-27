@@ -347,6 +347,212 @@ pub fn write_multimodal_encoder_contract_fixture_with_quant(
     Ok(())
 }
 
+/// Build the exact tensor-header facts serialized by [`write_encoder_contract_fixture_with_quant`]
+/// without creating its production-sized sparse payload.
+///
+/// Footprint tests should use these facts when their subject is projection or numeric-tier policy,
+/// reserving the sparse writer for bounded source-admission and loader-wiring coverage. The writer
+/// below consumes this function too, so the in-memory and on-disk fixture surfaces cannot drift.
+pub fn encoder_contract_fixture_tensor_headers(
+    contract: EncoderContract,
+    quant_bits: Option<i32>,
+) -> std::io::Result<Vec<gen_core::SafetensorsTensorHeader>> {
+    use gen_core::weightsmeta::Dtype;
+
+    if quant_bits.is_some_and(|bits| !matches!(bits, 4 | 8)) {
+        return Err(std::io::Error::other(
+            "encoder fixture quantization must be Q4 or Q8",
+        ));
+    }
+    if quant_bits.is_some() && contract.packing.is_none() {
+        return Err(std::io::Error::other(
+            "dense-only encoder contract cannot build packed header facts",
+        ));
+    }
+
+    let prefix = match contract.architecture {
+        "qwen3" | "qwen2_5_vl_text" => "model",
+        "qwen3_vl_text" => "language_model",
+        "mistral" => "language_model.model",
+        architecture => {
+            return Err(std::io::Error::other(format!(
+                "test fixture has no header signature for {architecture}"
+            )))
+        }
+    };
+    fn push_matrix(
+        tensors: &mut Vec<(String, Vec<usize>, Dtype)>,
+        quant: Option<(i32, usize)>,
+        base: String,
+        output: usize,
+        input: usize,
+    ) {
+        if let Some((bits, group_size)) = quant {
+            let bits = bits as usize;
+            tensors.extend([
+                (
+                    format!("{base}.weight"),
+                    vec![output, input * bits / 32],
+                    Dtype::U32,
+                ),
+                (
+                    format!("{base}.scales"),
+                    vec![output, input / group_size],
+                    Dtype::F16,
+                ),
+                (
+                    format!("{base}.biases"),
+                    vec![output, input / group_size],
+                    Dtype::F16,
+                ),
+            ]);
+        } else {
+            tensors.push((format!("{base}.weight"), vec![output, input], Dtype::F16));
+        }
+    }
+
+    let mut tensors: Vec<(String, Vec<usize>, Dtype)> = Vec::new();
+    let packing = quant_bits.zip(contract.packing);
+    push_matrix(
+        &mut tensors,
+        packing
+            .filter(|(_, packing)| packing.pack_embedding)
+            .map(|(bits, packing)| (bits, packing.group_size)),
+        format!("{prefix}.embed_tokens"),
+        contract.vocab_size,
+        contract.hidden_size,
+    );
+    let attention_width = contract.num_attention_heads * contract.head_dim;
+    let kv_width = contract.num_key_value_heads * contract.head_dim;
+    for layer in 0..contract.loaded_hidden_layers {
+        let base = format!("{prefix}.layers.{layer}");
+        for (suffix, output, input) in [
+            ("self_attn.q_proj", attention_width, contract.hidden_size),
+            ("self_attn.k_proj", kv_width, contract.hidden_size),
+            ("self_attn.v_proj", kv_width, contract.hidden_size),
+            ("self_attn.o_proj", contract.hidden_size, attention_width),
+            (
+                "mlp.gate_proj",
+                contract.intermediate_size,
+                contract.hidden_size,
+            ),
+            (
+                "mlp.up_proj",
+                contract.intermediate_size,
+                contract.hidden_size,
+            ),
+            (
+                "mlp.down_proj",
+                contract.hidden_size,
+                contract.intermediate_size,
+            ),
+        ] {
+            push_matrix(
+                &mut tensors,
+                packing.map(|(bits, packing)| (bits, packing.group_size)),
+                format!("{base}.{suffix}"),
+                output,
+                input,
+            );
+        }
+        tensors.extend([
+            (
+                format!("{base}.input_layernorm.weight"),
+                vec![contract.hidden_size],
+                Dtype::F16,
+            ),
+            (
+                format!("{base}.post_attention_layernorm.weight"),
+                vec![contract.hidden_size],
+                Dtype::F16,
+            ),
+        ]);
+        match contract.architecture {
+            "qwen3" | "qwen3_vl_text" => tensors.extend([
+                (
+                    format!("{base}.self_attn.q_norm.weight"),
+                    vec![contract.head_dim],
+                    Dtype::F16,
+                ),
+                (
+                    format!("{base}.self_attn.k_norm.weight"),
+                    vec![contract.head_dim],
+                    Dtype::F16,
+                ),
+            ]),
+            "qwen2_5_vl_text" => tensors.extend([
+                (
+                    format!("{base}.self_attn.q_proj.bias"),
+                    vec![attention_width],
+                    Dtype::F16,
+                ),
+                (
+                    format!("{base}.self_attn.k_proj.bias"),
+                    vec![kv_width],
+                    Dtype::F16,
+                ),
+                (
+                    format!("{base}.self_attn.v_proj.bias"),
+                    vec![kv_width],
+                    Dtype::F16,
+                ),
+            ]),
+            "mistral" => {}
+            _ => unreachable!("unsupported architecture rejected above"),
+        }
+    }
+    if contract.requires_final_norm {
+        tensors.push((
+            format!("{prefix}.norm.weight"),
+            vec![contract.hidden_size],
+            Dtype::F16,
+        ));
+    }
+    if contract.requires_lm_head {
+        let parent = match contract.architecture {
+            "mistral" => "language_model",
+            architecture => {
+                return Err(std::io::Error::other(format!(
+                    "test fixture has no LM-head signature for {architecture}"
+                )))
+            }
+        };
+        push_matrix(
+            &mut tensors,
+            packing
+                .filter(|(_, packing)| packing.pack_lm_head)
+                .map(|(bits, packing)| (bits, packing.group_size)),
+            format!("{parent}.lm_head"),
+            contract.vocab_size,
+            contract.hidden_size,
+        );
+    }
+
+    tensors
+        .into_iter()
+        .map(|(name, shape, dtype)| {
+            let element_bytes = match dtype {
+                Dtype::U32 => 4,
+                Dtype::F16 => 2,
+                _ => unreachable!("fixture generator emits only U32 and F16"),
+            };
+            let data_bytes = shape
+                .iter()
+                .try_fold(element_bytes, |total: u64, &dimension| {
+                    total.checked_mul(dimension as u64)
+                });
+            let data_bytes =
+                data_bytes.ok_or_else(|| std::io::Error::other("encoder fixture size overflow"))?;
+            Ok(gen_core::SafetensorsTensorHeader {
+                name,
+                dtype,
+                shape,
+                data_bytes,
+            })
+        })
+        .collect()
+}
+
 pub fn write_encoder_contract_fixture_with_quant(
     root: &std::path::Path,
     contract: EncoderContract,
@@ -418,171 +624,22 @@ pub fn write_encoder_contract_fixture_with_quant(
     }
     std::fs::write(root.join("config.json"), serde_json::to_vec(&config)?)?;
 
-    let prefix = match contract.architecture {
-        "qwen3" | "qwen2_5_vl_text" => "model",
-        "qwen3_vl_text" => "language_model",
-        "mistral" => "language_model.model",
-        architecture => panic!("test fixture has no header signature for {architecture}"),
-    };
-    fn push_matrix(
-        tensors: &mut Vec<(String, Vec<usize>, &'static str)>,
-        quant: Option<(i32, usize)>,
-        base: String,
-        output: usize,
-        input: usize,
-    ) {
-        if let Some((bits, group_size)) = quant {
-            let bits = bits as usize;
-            tensors.extend([
-                (
-                    format!("{base}.weight"),
-                    vec![output, input * bits / 32],
-                    "U32",
-                ),
-                (
-                    format!("{base}.scales"),
-                    vec![output, input / group_size],
-                    "F16",
-                ),
-                (
-                    format!("{base}.biases"),
-                    vec![output, input / group_size],
-                    "F16",
-                ),
-            ]);
-        } else {
-            tensors.push((format!("{base}.weight"), vec![output, input], "F16"));
-        }
-    }
-    let mut tensors: Vec<(String, Vec<usize>, &'static str)> = Vec::new();
-    let packing = quant_bits.zip(contract.packing);
-    push_matrix(
-        &mut tensors,
-        packing
-            .filter(|(_, packing)| packing.pack_embedding)
-            .map(|(bits, packing)| (bits, packing.group_size)),
-        format!("{prefix}.embed_tokens"),
-        contract.vocab_size,
-        contract.hidden_size,
-    );
-    let attention_width = contract.num_attention_heads * contract.head_dim;
-    let kv_width = contract.num_key_value_heads * contract.head_dim;
-    for layer in 0..contract.loaded_hidden_layers {
-        let base = format!("{prefix}.layers.{layer}");
-        for (suffix, output, input) in [
-            ("self_attn.q_proj", attention_width, contract.hidden_size),
-            ("self_attn.k_proj", kv_width, contract.hidden_size),
-            ("self_attn.v_proj", kv_width, contract.hidden_size),
-            ("self_attn.o_proj", contract.hidden_size, attention_width),
-            (
-                "mlp.gate_proj",
-                contract.intermediate_size,
-                contract.hidden_size,
-            ),
-            (
-                "mlp.up_proj",
-                contract.intermediate_size,
-                contract.hidden_size,
-            ),
-            (
-                "mlp.down_proj",
-                contract.hidden_size,
-                contract.intermediate_size,
-            ),
-        ] {
-            push_matrix(
-                &mut tensors,
-                packing.map(|(bits, packing)| (bits, packing.group_size)),
-                format!("{base}.{suffix}"),
-                output,
-                input,
-            );
-        }
-        tensors.extend([
-            (
-                format!("{base}.input_layernorm.weight"),
-                vec![contract.hidden_size],
-                "F16",
-            ),
-            (
-                format!("{base}.post_attention_layernorm.weight"),
-                vec![contract.hidden_size],
-                "F16",
-            ),
-        ]);
-        match contract.architecture {
-            "qwen3" | "qwen3_vl_text" => tensors.extend([
-                (
-                    format!("{base}.self_attn.q_norm.weight"),
-                    vec![contract.head_dim],
-                    "F16",
-                ),
-                (
-                    format!("{base}.self_attn.k_norm.weight"),
-                    vec![contract.head_dim],
-                    "F16",
-                ),
-            ]),
-            "qwen2_5_vl_text" => tensors.extend([
-                (
-                    format!("{base}.self_attn.q_proj.bias"),
-                    vec![attention_width],
-                    "F16",
-                ),
-                (
-                    format!("{base}.self_attn.k_proj.bias"),
-                    vec![kv_width],
-                    "F16",
-                ),
-                (
-                    format!("{base}.self_attn.v_proj.bias"),
-                    vec![kv_width],
-                    "F16",
-                ),
-            ]),
-            "mistral" => {}
-            _ => unreachable!(),
-        }
-    }
-    if contract.requires_final_norm {
-        tensors.push((
-            format!("{prefix}.norm.weight"),
-            vec![contract.hidden_size],
-            "F16",
-        ));
-    }
-    if contract.requires_lm_head {
-        let parent = match contract.architecture {
-            "mistral" => "language_model",
-            architecture => panic!("test fixture has no LM-head signature for {architecture}"),
-        };
-        push_matrix(
-            &mut tensors,
-            packing
-                .filter(|(_, packing)| packing.pack_lm_head)
-                .map(|(bits, packing)| (bits, packing.group_size)),
-            format!("{parent}.lm_head"),
-            contract.vocab_size,
-            contract.hidden_size,
-        );
-    }
+    let tensors = encoder_contract_fixture_tensor_headers(contract, quant_bits)?;
 
     let mut offset = 0_u64;
     let mut header = serde_json::Map::new();
-    for (name, shape, dtype) in tensors {
-        let element_bytes = if matches!(dtype, "F32" | "U32") { 4 } else { 2 };
-        let bytes = shape
-            .iter()
-            .try_fold(element_bytes, |total: u64, &dimension| {
-                total.checked_mul(dimension as u64)
-            });
-        let bytes = bytes.ok_or_else(|| std::io::Error::other("encoder fixture size overflow"))?;
+    for tensor in tensors {
+        let dtype = match tensor.dtype {
+            gen_core::weightsmeta::Dtype::U32 => "U32",
+            gen_core::weightsmeta::Dtype::F16 => "F16",
+            _ => unreachable!("fixture generator emits only U32 and F16"),
+        };
         let end = offset
-            .checked_add(bytes)
+            .checked_add(tensor.data_bytes)
             .ok_or_else(|| std::io::Error::other("encoder fixture offset overflow"))?;
         header.insert(
-            name,
-            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, end]}),
+            tensor.name,
+            serde_json::json!({"dtype": dtype, "shape": tensor.shape, "data_offsets": [offset, end]}),
         );
         offset = end;
     }
