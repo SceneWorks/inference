@@ -38,6 +38,7 @@ pub(crate) fn contiguous(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod block_stream;
 pub mod bundle;
 pub mod conditioning;
 pub mod config;
