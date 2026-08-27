@@ -22,8 +22,8 @@
 
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::{CancelFlag, Error, Result};
 use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_llm::CausalLm;
 // The token sampler (temperature / top-k / top-p / repetition penalty) + seeded PRNG live in the core
 // crate's shared `text_sample` module (sc-9561 / F-105) so the lens PromptReasoner reuses them rather
