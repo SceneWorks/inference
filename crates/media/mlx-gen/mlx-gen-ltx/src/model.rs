@@ -1206,6 +1206,32 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
     }
+    // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+    // (`use_keyframes_abs_pos_embedding: false`), so generated keyframe slots would be denoised as
+    // unmarked tokens — wasted compute with no conditioning effect. Refuse up front like the
+    // reference's `assert_generated_keyframes_supported`, typed so the worker distinguishes the
+    // capability gap from a generic failure.
+    //
+    // These run BEFORE the shared floor on purpose (sc-18778). The floor now refuses the same two
+    // knobs from `supports_generated_keyframes` / `max_temporal_upsample_rounds`, which this
+    // descriptor leaves at their refusing defaults — so the floor would catch them anyway. Going
+    // first is what keeps the more actionable message: the floor can only say "this engine does
+    // not support it", while these name the checkpoint generation that does, which is what a
+    // caller needs to act. Deleting them would not un-refuse the knobs, only blur the reason.
+    if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+        return Err(Error::Unsupported(
+            "ltx_2_3: num_generated_keyframes requires a generated-keyframe checkpoint \
+             (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
+                .into(),
+        ));
+    }
+    if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+        return Err(Error::Unsupported(
+            "ltx_2_3: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
+             keyframe slots + the temporal latent upsampler)"
+                .into(),
+        ));
+    }
     caps.validate_request(MODEL_ID, req)?;
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
@@ -1224,25 +1250,6 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                 "ltx_2_3: num_frames {frames} exceeds the maximum {MAX_FRAMES}"
             )));
         }
-    }
-    // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
-    // (`use_keyframes_abs_pos_embedding: false`), so generated keyframe slots would be denoised as
-    // unmarked tokens — wasted compute with no conditioning effect. Refuse up front like the
-    // reference's `assert_generated_keyframes_supported`, typed so the worker distinguishes the
-    // capability gap from a generic failure.
-    if req.num_generated_keyframes.is_some_and(|n| n > 0) {
-        return Err(Error::Unsupported(
-            "ltx_2_3: num_generated_keyframes requires a generated-keyframe checkpoint \
-             (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
-                .into(),
-        ));
-    }
-    if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
-        return Err(Error::Unsupported(
-            "ltx_2_3: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
-             keyframe slots + the temporal latent upsampler)"
-                .into(),
-        ));
     }
     let latent_frames = Ltx::latent_dims(req).0 as i32;
     let resolve_latent_index = |label: &str, idx: i32| -> Result<()> {

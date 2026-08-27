@@ -891,6 +891,30 @@ impl Generator for LtxGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
+        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
+        // same way).
+        //
+        // These run BEFORE the shared floor on purpose (sc-18778) — see the matching comment in
+        // `mlx-gen-ltx`'s `validate_request`. The floor refuses the same knobs from this
+        // descriptor's (defaulted-off) `supports_generated_keyframes` /
+        // `max_temporal_upsample_rounds`; going first only preserves the message that names the
+        // checkpoint generation which does support them.
+        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
+                 (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
+                    .into(),
+            ));
+        }
+        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
+                 keyframe slots + the temporal latent upsampler)"
+                    .into(),
+            ));
+        }
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -910,24 +934,6 @@ impl Generator for LtxGenerator {
                     config::TEMPORAL_SCALE
                 )));
             }
-        }
-        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
-        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
-        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
-        // same way).
-        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
-            return Err(gen_core::Error::Unsupported(
-                "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
-                 (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
-                    .into(),
-            ));
-        }
-        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
-            return Err(gen_core::Error::Unsupported(
-                "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
-                 keyframe slots + the temporal latent upsampler)"
-                    .into(),
-            ));
         }
         let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
             if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
