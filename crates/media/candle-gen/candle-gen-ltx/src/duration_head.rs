@@ -49,9 +49,24 @@ impl DurationHead {
     /// Build from a `Weights` map holding the `duration_head.*`-prefixed tensors (i.e. the
     /// as-shipped `ltx-2.5-duration-head-bf16.safetensors`, loaded whole via
     /// [`Weights::from_file`]).
+    /// Every shipped LTX-2.5 tier keeps this component **dense**, declaring `no-mlx-port` in its
+    /// `split_model.json` row (sc-18775). That is a fact about today's converter, not a guarantee:
+    /// its projections are real rank-2 Linears, so a future tier could pack them. This loader
+    /// therefore refuses a `.scales` sibling rather than accepting it — the tensors here are read
+    /// with `to_dtype(F32)`, which would *succeed* on a bit-packed `U32` payload and numerically
+    /// convert the codes into a plausible-looking, entirely wrong weight.
     pub fn from_weights(w: &Weights, device: &Device) -> Result<Self> {
         let get = |key: &str| -> Result<Tensor> {
-            w.require(&format!("duration_head.{key}"))
+            let full = format!("duration_head.{key}");
+            if w.contains(&format!("{full}.scales")) {
+                return Err(Error::Msg(format!(
+                    "ltx duration head: `{full}.scales` is present, but this loader reads \
+                     `{full}` as a dense float weight. The shipped tiers declare the duration head \
+                     dense (`no-mlx-port`); a packed one needs the affine triple threaded through \
+                     here first, because casting the U32 codes to f32 would decode to noise."
+                )));
+            }
+            w.require(&full)
                 .map_err(|e| Error::Msg(e.to_string()))?
                 .to_dtype(DType::F32)?
                 .contiguous()
