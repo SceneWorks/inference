@@ -36,7 +36,17 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::block_residency::BlockPlan;
+
+/// sc-18797's rung-4 loader-identity and bit-identity suite. A `#[path]` submodule rather than a
+/// `tests/` file because it observes the private loader surface (`AvBlocks`, `AvBlock`'s attentions)
+/// that AC2's output-invisible failure mode can only be caught on.
+#[cfg(test)]
+#[path = "transformer_rung4_tests.rs"]
+mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
+use mlx_gen::CancelFlag;
 
 use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
 use mlx_gen::qkv::{
@@ -713,6 +723,11 @@ struct Attention {
     /// probability matrix. Training-only knob, set by [`set_sdpa_checkpoint`](Self::set_sdpa_checkpoint);
     /// `false` on the inference path (byte-identical to the pre-sc-4942 forward).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 — bounded attention (sc-18797). [`AttentionBudget::UNBOUNDED`] is the load
+    /// default and takes the single fused-SDPA call, byte-identical to the pre-rung forward; the
+    /// chunk boundaries under a real budget come from the SHARED planner
+    /// (`gen_core::attention_budget`) via `mlx_gen::attention`, never from arithmetic here.
+    attn_budget: AttentionBudget,
 }
 
 impl Attention {
@@ -744,12 +759,18 @@ impl Attention {
             dim_head,
             eps,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
     fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;
+    }
+
+    /// Select ladder rung 3's score budget for this attention.
+    fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.attn_budget = budget;
     }
 
     /// Cast the attention's frozen weights (q/k/v/out projections, optional gate, q/k RMSNorm
@@ -861,11 +882,24 @@ impl Attention {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::Msg("ltx: checkpoint SDPA produced no output".into()))?
-        } else {
+        } else if self.attn_budget.is_unbounded() {
             match mask {
                 Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
                 None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
             }
+        } else {
+            // Ladder rung 3 (sc-18797). On MLX the saving is NOT a bounded score tensor — `fast::sdpa`
+            // is a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting
+            // the lazy graph. See `mlx_gen::attention`'s module docs; the Candle magnitude (-32% on
+            // the denoise phase against -1.7% here) must NOT be carried across.
+            mlx_gen::attention::sdpa_budgeted_bhsd(
+                &qh,
+                &kh,
+                &vh,
+                scale,
+                mask,
+                AttentionPlan::budgeted(self.attn_budget),
+            )?
         };
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -1895,7 +1929,7 @@ fn av_ca_ada(
 /// One AudioVideo transformer block: the video stack + the audio stack + bidirectional cross-modal
 /// attention (`BasicAVTransformerBlock`). Per-block order: video self+text-CA → audio self+text-CA →
 /// cross-modal (a2v updates video, v2a updates audio) → video FF → audio FF.
-struct AvBlock {
+pub(crate) struct AvBlock {
     // Video.
     attn1: Attention,
     attn2: Attention,
@@ -1919,7 +1953,12 @@ struct AvBlock {
 }
 
 impl AvBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    pub(crate) fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &LtxConfig,
+        prec: Precision,
+    ) -> Result<Self> {
         let eps = cfg.norm_eps as f32;
         let (vh, vdh) = (cfg.num_attention_heads, cfg.attention_head_dim);
         let (ah, adh) = (cfg.audio_num_attention_heads, cfg.audio_attention_head_dim);
@@ -2111,14 +2150,77 @@ impl AvBlock {
         self.ff.set_lora_pass(pass);
         self.a_ff.set_lora_pass(pass);
     }
+
+    /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
+    /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
+    /// would leave the audio branch's scores unbounded while the contract claimed the rung.
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        for attn in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attn.set_attention_budget(budget);
+        }
+    }
+
+    /// The budget this block's attentions carry. Read from the video self-attention; the six are
+    /// written together by [`Self::set_attention_budget`], and
+    /// `every_attention_in_a_block_carries_the_selected_budget` pins that they stay in step.
+    pub(crate) fn attention_budget(&self) -> AttentionBudget {
+        self.attn1.attn_budget
+    }
 }
 
 /// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
 /// audio_velocity)` from the two latent token streams + shared text conditioning.
+/// How the AvDiT's 48-block trunk is held — the intra-phase materialization axis
+/// ([`LoadShape`](mlx_gen::LoadShape)), independent of phase-level component residency.
+///
+/// This enum, not a boolean flag, is what the forward branches on. That is deliberate: rung 4's
+/// failure mode is output-invisible, so the streamed path must be **unrepresentable** alongside a
+/// resident stack rather than merely unselected. `Streamed` holds zero blocks, which is the entire
+/// rung — a variant that kept the `Vec` "just in case" would bound nothing while looking correct.
+pub(crate) enum AvBlocks {
+    /// The historical fast path: all `num_layers` blocks materialized and retained.
+    Resident(Vec<AvBlock>),
+    /// Rung 4: no blocks retained; each window rebuilds its own out of a fresh component view.
+    Streamed(crate::block_stream::LtxBlockStream),
+}
+
+impl AvBlocks {
+    /// Blocks actually held resident. `0` for a streamed stack — the property rung 4 buys.
+    pub(crate) fn resident_len(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(_) => 0,
+        }
+    }
+
+    /// Blocks the stack RUNS, which a streamed stack still does in full.
+    pub(crate) fn n_blocks(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(stream) => stream.n_blocks(),
+        }
+    }
+}
+
 pub struct AvDiT {
     video: Stream,
     audio: Stream,
-    blocks: Vec<AvBlock>,
+    blocks: AvBlocks,
+    /// Rung 4's window schedule. Unused by a resident stack. Carried as a `Cell` because `forward`
+    /// takes `&self` and the selected window is a per-request value, not a load-time one — the
+    /// selected value must be the executed one, or the calibration evidence describes a run that
+    /// never happened.
+    block_plan: Cell<BlockPlan>,
+    /// Checked at every window boundary by the shared driver, which reports a cancelled render as
+    /// [`Error::Canceled`] rather than a generic failure.
+    cancel: CancelFlag,
     /// Monotonic source of per-stage RoPE epoch tokens (sc-7141); see [`Self::next_rope_epoch`]. One
     /// counter for the whole joint DiT — the same token keys all four stream memos (video/audio ×
     /// self/cross), which are each constant across a stage's denoise steps.
@@ -2126,7 +2228,12 @@ pub struct AvDiT {
 }
 
 impl AvDiT {
-    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    /// Build the two per-modality streams — the patchify/adaLN/output-head surface that stays
+    /// resident under every load shape. Split out of [`Self::from_weights`] so the deferred
+    /// constructor builds the **same** objects rather than a second transcription of them: a
+    /// streamed AvDiT must differ from a resident one in the block axis alone, or the bit-identity
+    /// AC would be comparing two different models.
+    fn streams(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<(Stream, Stream)> {
         let video = Stream {
             patchify: Linear::load(w, "patchify_proj", prec)?,
             adaln: AdaLayerNormSingle::load(w, "adaln_single", prec)?,
@@ -2187,15 +2294,133 @@ impl AvDiT {
             self_rope_memo: RopeMemo::default(),
             cross_rope_memo: RopeMemo::default(),
         };
+        Ok((video, audio))
+    }
+
+    /// The historical eager load: every block materialized and retained.
+    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let (video, audio) = Self::streams(w, cfg, prec)?;
         let blocks = (0..cfg.num_layers)
             .map(|i| AvBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
             .collect::<Result<Vec<_>>>()?;
+        let plan = BlockPlan::resident(blocks.len().max(1))?;
         Ok(Self {
             video,
             audio,
-            blocks,
+            blocks: AvBlocks::Resident(blocks),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
             rope_epoch: Cell::new(0),
         })
+    }
+
+    /// Rung 4's load: build the resident stream surface from `w`, hold **zero** blocks, and rebuild
+    /// each one per window out of `stream` during the forward.
+    ///
+    /// `w` is still read for the patchify/adaLN/output-head tensors, which are small, are used on
+    /// every forward, and would cost a re-read per window for no residency saving. The 48-block
+    /// trunk — the part rung 4 exists to bound — is the only thing deferred.
+    pub fn from_weights_streamed(
+        w: &Weights,
+        cfg: &LtxConfig,
+        prec: Precision,
+        stream: crate::block_stream::LtxBlockStream,
+    ) -> Result<Self> {
+        if stream.n_blocks() != cfg.num_layers as usize {
+            return Err(Error::Msg(format!(
+                "ltx: the block stream declares {} blocks but the config declares {} — a plan built \
+                 from a desynchronized depth would silently skip or repeat layers",
+                stream.n_blocks(),
+                cfg.num_layers
+            )));
+        }
+        let (video, audio) = Self::streams(w, cfg, prec)?;
+        // Default to the tightest bound. A caller that selected a window carries it in the request
+        // and calls `set_transformer_window`; defaulting to `resident()` here would make an
+        // unconfigured streamed load silently run one all-covering window, which bounds nothing.
+        let plan = BlockPlan::new(stream.n_blocks(), 1)?;
+        Ok(Self {
+            video,
+            audio,
+            blocks: AvBlocks::Streamed(stream),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
+            rope_epoch: Cell::new(0),
+        })
+    }
+
+    /// Select rung 4's window size for the requests that follow.
+    ///
+    /// Rejected on a resident stack rather than ignored: silently accepting a window on a stack that
+    /// cannot honour it is how a calibration record comes to describe a run that never happened.
+    pub fn set_transformer_window(&self, window: usize) -> Result<()> {
+        let AvBlocks::Streamed(stream) = &self.blocks else {
+            return Err(Error::Unsupported(
+                "ltx: a transformer window was selected on a resident block stack — rung 4 requires \
+                 a deferred-materialization load"
+                    .into(),
+            ));
+        };
+        self.block_plan
+            .set(BlockPlan::new(stream.n_blocks(), window)?);
+        Ok(())
+    }
+
+    /// The window plan the next forward will execute. Reported so a caller can prove the selected
+    /// window is the executed one.
+    pub fn block_plan(&self) -> BlockPlan {
+        self.block_plan.get()
+    }
+
+    /// Attach the request's cancel flag, checked at every window boundary.
+    pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.cancel = cancel;
+    }
+
+    /// Select ladder rung 3's attention budget for the whole trunk.
+    ///
+    /// Both arms are load-bearing. On a resident stack the budget is written into the blocks that
+    /// already exist; on a streamed stack there are no blocks yet, so it is recorded on the stream
+    /// and replayed onto every block a window materializes. Setting only the first would leave the
+    /// rung-3 + rung-4 composition — the one the cost-order default actually produces, since rung 4
+    /// engages rung 3 — running unbounded attention with identical output.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.set_attention_budget(budget);
+                }
+            }
+            AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// The budget the next forward will execute, read back from wherever it actually lives.
+    pub fn attention_budget(&self) -> mlx_gen::attention::AttentionBudget {
+        match &self.blocks {
+            AvBlocks::Resident(blocks) => blocks
+                .first()
+                .map(|block| block.attention_budget())
+                .unwrap_or(AttentionBudget::UNBOUNDED),
+            AvBlocks::Streamed(stream) => stream.attention_budget(),
+        }
+    }
+
+    /// Whether this AvDiT defers its block trunk. The loader-identity predicate: rung 4's failure is
+    /// invisible in output, so a caller that needs to know *which* loader it got asks here rather
+    /// than inferring it from a request flag it passed in.
+    pub fn is_block_streamed(&self) -> bool {
+        matches!(self.blocks, AvBlocks::Streamed(_))
+    }
+
+    /// Blocks held resident. `0` on a streamed stack — that is the entire rung.
+    pub fn resident_blocks(&self) -> usize {
+        self.blocks.resident_len()
+    }
+
+    /// Blocks the stack runs, streamed or not.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.n_blocks()
     }
 
     /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a joint denoise loop
@@ -2217,10 +2442,16 @@ impl AvDiT {
     /// resolves to `None` → reported skipped, never silently dropped.
     pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
-            ["transformer_blocks", n, rest @ ..] => self
-                .blocks
-                .get_mut(n.parse::<usize>().ok()?)?
-                .adaptable_mut(rest),
+            // A streamed trunk holds no blocks to adapt. `LtxBlockStream::new` already refuses to
+            // construct over a non-empty adapter set, so this arm is the second half of the same
+            // guarantee rather than a silent drop: there is no block object here that an adapter
+            // could be installed onto and then be rebuilt away by the next window.
+            ["transformer_blocks", n, rest @ ..] => match &mut self.blocks {
+                AvBlocks::Resident(blocks) => blocks
+                    .get_mut(n.parse::<usize>().ok()?)?
+                    .adaptable_mut(rest),
+                AvBlocks::Streamed(_) => None,
+            },
             // Video-stream globals.
             ["patchify_proj"] => Some(&mut self.video.patchify),
             ["proj_out"] => Some(&mut self.video.proj_out),
@@ -2253,8 +2484,12 @@ impl AvDiT {
     pub fn set_lora_pass(&self, pass: usize) {
         self.video.set_lora_pass(pass);
         self.audio.set_lora_pass(pass);
-        for b in &self.blocks {
-            b.set_lora_pass(pass);
+        // A streamed trunk carries no adapters (refused at `LtxBlockStream::new`), so there is no
+        // per-pass strength to select on it.
+        if let AvBlocks::Resident(blocks) = &self.blocks {
+            for b in blocks {
+                b.set_lora_pass(pass);
+            }
         }
     }
 
@@ -2303,13 +2538,49 @@ impl AvDiT {
             None,
             rope_epoch,
         )?;
-        let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
+        let (vx0, ax0) = (vp.x.clone(), ap.x.clone());
         let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
-        for block in &self.blocks {
-            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
-            vx = nv;
-            ax = na;
-        }
+        let (vx, ax) = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let (mut vx, mut ax) = (vx0, ax0);
+                for block in blocks {
+                    let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                    vx = nv;
+                    ax = na;
+                }
+                (vx, ax)
+            }
+            AvBlocks::Streamed(stream) => {
+                // Rung 4. The schedule is the SHARED driver — window arithmetic, loop order,
+                // release discipline and the cancellation contract all live in
+                // `gen_core::block_window` via MLX's binding. Only the "rebuild AvBlock n" step is
+                // this family's, and it lives in `crate::block_stream`.
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    (vx0, ax0),
+                    || stream.open(),
+                    |(mut vx, mut ax), view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                            vx = nv;
+                            ax = na;
+                            // `block` drops here: a window holds `window_size` blocks, never the
+                            // whole range's worth.
+                        }
+                        Ok((vx, ax))
+                    },
+                    // LOAD-BEARING on MLX: the carried activations are unevaluated graph nodes that
+                    // still reference this window's weights, so dropping before forcing evaluation
+                    // frees nothing — identical output, zero saving, silently.
+                    |(vx, ax): &(Array, Array)| {
+                        mlx_rs::transforms::eval([vx, ax]).map_err(Error::from)
+                    },
+                )?
+            }
+        };
         let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
         Ok((v_vel, a_vel))

@@ -42,6 +42,7 @@
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod block_stream;
 pub mod bundle;
 pub mod conditioning;
 pub mod config;
@@ -55,6 +56,7 @@ pub mod gemma;
 pub mod gemma4_te;
 pub mod image_crf;
 pub mod memory_strategy;
+pub mod memory_strategy_2_5;
 pub mod params;
 pub mod pipeline;
 pub mod quant;
