@@ -86,8 +86,12 @@ pub fn precompute_connector_freqs(
     };
     // f64 exponentials rounded to f32 BEFORE the position multiply — exactly upstream ltx_core's
     // `generate_freq_grid_np` (its "double precision" covers only the log-spaced grid; the angles
-    // are formed in f32). Keeping f64 through cos/sin perturbs the top frequencies by ~1e-3 rad,
-    // which the connector's 2·sigmoid gates amplify coherently (sc-21663; mirrors the mlx port).
+    // are formed in f32). The table matches the reference's to 1 f32 ULP. Keeping f64 through
+    // cos/sin (the old behaviour, inherited from mlx_video) perturbs the top frequencies by up to
+    // ~9.4e-4 — a real bit-level infidelity, though the mlx-side verified-rebuild mutation run
+    // measured only an ~e-3-scale end-to-end parity shift from it (per-op deviations do not
+    // compound across blocks — sc-21663; see mlx connector_parity.rs's decomposition). Kept for
+    // faithfulness, pinned by construction rather than by a tolerance bar.
     let indices: Vec<f32> = (0..num_indices)
         .map(|i| (theta.powf(i as f64 * step) * (PI / 2.0)) as f32)
         .collect();
@@ -100,8 +104,9 @@ pub fn precompute_connector_freqs(
     let mut cos_out = vec![0f32; total];
     let mut sin_out = vec![0f32; total];
     for t in 0..seq {
-        // position = raw index t, scaled by max_pos, *2-1 (mlx connector `rope`).
-        let scaled = (t as f64 / max_pos as f64 * 2.0 - 1.0) as f32;
+        // All-f32 op order, as upstream's `get_fractional_positions` computes it (bit-identical
+        // to f64-then-round for the shipped power-of-two max_pos, exact for any max_pos this way).
+        let scaled = (t as f32 / max_pos as f32) * 2.0 - 1.0;
         for h in 0..num_heads {
             for p in 0..head_half {
                 let flat = h * head_half + p;

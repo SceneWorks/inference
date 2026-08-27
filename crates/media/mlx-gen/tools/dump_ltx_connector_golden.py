@@ -21,22 +21,35 @@ three places, each patched below before the dump:
   the exponentials; the ~1e-3-rad top-frequency difference matters — see the bar note below).
 
 Why the execution vehicle is still MLX (mlx_video's module, patched) rather than torch: the
-corrected `2·sigmoid` gating makes the 8-layer stack expansive (~2x/layer), so ANY per-op backend
-difference is amplified ~50x by the final output. Measured on these weights+inputs, plain f32
-GEMM accumulation-order differences between MLX-Metal and torch-CPU (~3e-4 peak-rel per 4096-wide
-projection) reach ~1.4e-2 video / ~8e-2 audio at the output — a cross-backend floor far above the
-5e-3 bar `connector_parity.rs` holds the port to. Dumping from patched-MLX keeps the comparison
-same-framework (the old fixture's convention too), preserving the bar's power; the semantics were
-cross-checked against stock torch ltx_core (`EmbeddingsProcessor.create_embeddings` at the pinned
-commit), which reproduces this oracle exactly to that measured cross-backend floor and reproduces
-the PREVIOUS (un-patched) fixture to 1.9e-4 when the three divergences are re-introduced — i.e.
-the patches below are the complete semantic delta.
+connector ends in a per-row RMS-norm over rows whose magnitudes span a >100x dynamic range
+(video 134x, audio 272x on this fixture), which converts absolute-scale kernel noise into large
+*relative* error on the near-cancelled low-norm register rows. GEMM accumulation differences
+between any two backends are ~1e-4-class per projection (measured: MLX-Metal vs torch-CPU ~3e-4;
+pmetal-fork vs wheel Metal 1e-4..7e-4); they do NOT compound per layer (flat through block 6),
+but the final renormalization turns them into ~5e-2..8e-2 audio-global deviations for a
+cross-backend pairing — far above the 5e-3-class bar `connector_parity.rs` holds the port to.
+Dumping from patched-MLX keeps the comparison near-same-kernel (the old fixture's convention
+too), preserving the bar's power on the rows that carry prompt information.
+
+The semantics were cross-checked against stock torch ltx_core
+(`EmbeddingsProcessor.create_embeddings` at the pinned commit) — run `--cross-check` below to
+reproduce: stock torch matches this oracle to the measured cross-backend floor, and re-introducing
+the three divergences reproduces the PREVIOUS (un-patched) fixture to 1.9e-4 — i.e. the patches
+below are the complete semantic delta.
 
 Run (mflux venv + mlx_video source):
     MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg \
     LTX_EROS_DIR=<LTX-2.3 tier dir with connector.safetensors + embedded_config.json> \
       ~/Repos/mflux/.venv/bin/python tools/dump_ltx_connector_golden.py
 Output (committed): mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors
+
+Cross-check (torch, CPU; needs LTX2_SRC → <LTX-2 checkout>/packages/ltx-core/src):
+    LTX2_SRC=... LTX_EROS_DIR=... python tools/dump_ltx_connector_golden.py --cross-check \
+        [--old-fixture <path to the pre-sc-21663 fixture, e.g. from `git show`>]
+prints stock-torch-vs-committed-fixture peak_rels (the cross-backend floor), and with
+`--old-fixture` also the σ-gate + erf-GELU torch variant vs that old fixture (the semantic-delta
+completeness check — 1.9e-4 measured; the rope-table delta is inside that residue since the
+variant keeps torch's own f32-quantized rope). No file is written in this mode.
 """
 
 import glob
@@ -94,6 +107,11 @@ def _ff_call_tanh_gelu(self, x):
 
 
 def _attn_call_2sigmoid(self, x, attention_mask=None, pe=None):
+    """mlx_video `ConnectorAttention.__call__` reproduced verbatim (text_encoder.py, the
+    projection/norm/reshape/rope/SDPA/reshape sequence and its unmasked-SDPA comment path),
+    with exactly ONE change: the gate multiplies by `2.0 *` (ltx_core's convention). Any other
+    behaviour of the upstream method is preserved; re-verify against upstream when bumping the
+    mlx_video pin."""
     batch_size, seq_len, _ = x.shape
     q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
     q, k = self.q_norm(q), self.k_norm(k)
@@ -120,7 +138,8 @@ def _rope_f32_quantized_indices(self, seq_len, dtype):
     dim = self.num_heads * self.head_dim
     n = dim // 2  # n_elem = 2 * len(max_pos) = 2
     step = 1.0 / (n - 1)
-    idx32 = (np.power(10000.0, np.arange(n, dtype=np.float64) * step) * (np.pi / 2)).astype(np.float32)
+    theta = self.positional_embedding_theta
+    idx32 = (np.power(theta, np.arange(n, dtype=np.float64) * step) * (np.pi / 2)).astype(np.float32)
     t = np.arange(seq_len, dtype=np.float64)
     scaled32 = ((t / self.positional_embedding_max_pos[0]) * 2.0 - 1.0).astype(np.float32)
     ang = (scaled32[:, None] * idx32[None, :]).astype(np.float32)
@@ -130,6 +149,10 @@ def _rope_f32_quantized_indices(self, seq_len, dtype):
     return mx.array(cos.astype(np.float32)).astype(dtype), mx.array(sin.astype(np.float32)).astype(dtype)
 
 
+# A renamed/removed upstream method would make these assignments silently create dead attributes.
+assert hasattr(ConnectorFeedForward, "__call__")
+assert hasattr(ConnectorAttention, "__call__")
+assert hasattr(Embeddings1DConnector, "_precompute_freqs_cis"), "mlx_video renamed the rope hook"
 ConnectorFeedForward.__call__ = _ff_call_tanh_gelu
 ConnectorAttention.__call__ = _attn_call_2sigmoid
 Embeddings1DConnector._precompute_freqs_cis = _rope_f32_quantized_indices
@@ -154,6 +177,90 @@ AUDIO_DIM = AUDIO_HEADS * AUDIO_HEAD_DIM
 GATED = bool(tcfg["connector_apply_gated_attention"])
 
 SEQ, NUM_VALID = 256, 40  # left-padded: 216 pad + 40 valid; SEQ % REGISTERS == 0.
+
+FIXTURE = fixture("mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors")
+
+
+def cross_check(old_fixture: str | None) -> None:
+    """Torch (CPU, f32) reproduction of this golden's semantics — see the module docstring.
+
+    Prints (1) stock ltx_core vs the committed fixture (the cross-backend floor), and, given
+    ``--old-fixture``, (2) ltx_core with the σ gate + erf GELU re-introduced vs that pre-sc-21663
+    fixture (the semantic-delta completeness check; torch's own f32-quantized rope is kept, so
+    the rope-table delta is inside the printed residue).
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    ltx_core_on_path_torch = require_env(
+        "LTX2_SRC", f"path to packages/ltx-core/src of a Lightricks/LTX-2 checkout at {REFERENCE_COMMIT}"
+    )
+    if ltx_core_on_path_torch not in sys.path:
+        sys.path.insert(0, str(Path(ltx_core_on_path_torch).expanduser()))
+    import ltx_core.model.transformer.gelu_approx as ga
+    from ltx_core.text_encoders.gemma.embeddings_connector import (
+        AudioEmbeddings1DConnectorConfigurator,
+        Embeddings1DConnectorConfigurator,
+    )
+    from ltx_core.text_encoders.gemma.embeddings_processor import (
+        EmbeddingsProcessor,
+        convert_to_additive_mask,
+    )
+
+    metadata = {"config": {"transformer": tcfg}}
+    raw_t = load_file(str(MODEL_DIR / "connector.safetensors"))
+
+    def sigma_gate(x, attn_out, attn_module):
+        gate_logits = attn_module.to_gate_logits(x)
+        b, t, _ = attn_out.shape
+        out = attn_out.view(b, t, attn_module.heads, attn_module.dim_head)
+        return (out * torch.sigmoid(gate_logits).unsqueeze(-1)).view(b, t, -1)
+
+    def erf_gelu(self, x):
+        return torch.nn.functional.gelu(self.proj(x))
+
+    tanh_gelu = ga.GELUApprox.forward
+
+    def build(mlx_video_semantics: bool) -> EmbeddingsProcessor:
+        ga.GELUApprox.forward = erf_gelu if mlx_video_semantics else tanh_gelu
+        vc = Embeddings1DConnectorConfigurator.from_metadata(metadata).to(torch.float32)
+        ac = AudioEmbeddings1DConnectorConfigurator.from_metadata(metadata).to(torch.float32)
+        if mlx_video_semantics:
+            for module in (vc, ac):
+                for blk in module.transformer_1d_blocks:
+                    blk.attn1.gated_attention_function = sigma_gate
+        for module, pfx in ((vc, "video_embeddings_connector."), (ac, "audio_embeddings_connector.")):
+            sub = {k[len(pfx):]: t.to(torch.float32) for k, t in raw_t.items() if k.startswith(pfx)}
+            module.load_state_dict(sub, strict=True)
+            module.eval()
+        return EmbeddingsProcessor(video_connector=vc, audio_connector=ac)
+
+    def peak_rel(a: torch.Tensor, b: torch.Tensor) -> float:
+        return ((a - b).abs().max() / b.abs().max().clamp_min(1e-12)).item()
+
+    def run(label: str, fixture_path: str, mlx_video_semantics: bool) -> None:
+        g = load_file(fixture_path)
+        feats = g["features"].to(torch.float32)
+        afeats = g["audio_features"].to(torch.float32)
+        additive_t = convert_to_additive_mask(g["mask01"].to(torch.int64), feats.dtype)
+        with torch.no_grad():
+            ve, ae, _ = build(mlx_video_semantics).create_embeddings(feats, afeats, additive_t)
+        print(
+            f"{label}: video peak_rel {peak_rel(ve, g['video_embeddings'].float()):.3e}  "
+            f"audio peak_rel {peak_rel(ae, g['audio_embeddings'].float()):.3e}"
+        )
+
+    run("stock ltx_core (torch f32) vs committed fixture", FIXTURE, mlx_video_semantics=False)
+    if old_fixture:
+        run("sigma-gate + erf-GELU (torch f32) vs old fixture", old_fixture, mlx_video_semantics=True)
+
+
+if "--cross-check" in sys.argv:
+    _old = None
+    if "--old-fixture" in sys.argv:
+        _old = sys.argv[sys.argv.index("--old-fixture") + 1]
+    cross_check(_old)
+    raise SystemExit(0)
 
 mx.random.seed(0)
 

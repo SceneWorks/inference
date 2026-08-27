@@ -7,22 +7,43 @@
 //! tanh-GELU, f32-quantized RoPE indices) since sc-21663; this test loads the SAME connector
 //! weights and checks the Rust `Connector` reproduces the video/audio embeddings.
 //!
-//! # Bars (sc-21663)
+//! # Bars (sc-21663) — derivation from the measured per-op decomposition
 //!
-//! The correct `2·sigmoid` gates make the 8-layer stack expansive (~2x/layer), so per-op
-//! implementation differences between the port and any oracle are amplified coherently at the
-//! output. Measured floors on these weights+inputs against the same-framework (patched-MLX)
-//! oracle, all f32:
+//! The audio widening is NOT an amplification story and NOT an absorbed defect. The full per-op
+//! decomposition (port vs the patched-MLX oracle, identical inputs, all f32, audio connector on
+//! this fixture) measured:
 //!
-//! * video: `2.76e-3` global — the historical `5e-3` bar still holds.
-//! * audio: `1.64e-2` over the valid rows, `8.09e-2` over the register rows / globally. The audio
-//!   stack amplifies far harder (even the oracle's own f64-vs-f32-quantized rope tables alone move
-//!   its output by `1.2e-2`, and stock-torch-vs-patched-MLX sits at `6.4e-2`), so a `5e-3` audio
-//!   bar is unattainable for ANY cross-implementation comparison under the correct semantics —
-//!   the old bar passed only because the σ-gated (bugged) stack was contractive. The audio
-//!   assertions are therefore split: valid rows at `3e-2` (the conditioning that reaches the DiT
-//!   from real tokens), global at `1.2e-1` (register rows — model constants, no prompt
-//!   information, maximally amplified).
+//! ```text
+//! rope tables               6.0e-8      (1 f32 ULP — bit-matched construction)
+//! b0 q/k-norm, v, sdpa,
+//!   gate, to_out, ff        1.0e-4 … 7.5e-4   (GEMM/kernel accumulation differences: the pmetal
+//!                                              fork's Metal kernels vs the wheel's — measurably
+//!                                              ~1e-4-class per op, NOT 1e-7; torch-CPU vs MLX
+//!                                              GEMMs sit in the same class)
+//! block_0 … block_6         ~5e-4 FLAT        (per-op deviations do NOT compound per layer)
+//! block_7                   3.3e-3
+//! final rms_norm            8.086e-2          (the entire jump happens AT the renormalization)
+//! ```
+//!
+//! The mechanism of the final jump is the row-norm dynamic range, not any op: at the last block
+//! the audio rows' RMS spans `1.74 … 473` (272x; video: 134x), and the closing per-row RMS-norm
+//! rescales every row to unit size — converting absolute-scale kernel noise into large
+//! *relative* error on the near-cancelled low-norm register rows (the worst row is a register
+//! row; `corr(log rowRMS, log rowErr) = -0.62`). No implementation pair escapes this: stock torch
+//! ltx_core differs from the patched-MLX oracle by `6.4e-2` audio-global on this same fixture,
+//! and even the oracle's own rope-table precision (f64 vs f32-quantized indices, everything else
+//! identical) moves its audio output by `1.2e-2`. The old 5e-3 audio bar was attainable only
+//! because the σ-gated (bugged) connector produced a different register-row norm distribution.
+//!
+//! Bars, from the measured values: video keeps the historical `5e-3` global (measured `2.756e-3`);
+//! audio splits into valid rows `< 3e-2` (measured `1.639e-2` — the rows carrying prompt
+//! information) and global `< 1.2e-1` (measured `8.086e-2`, register rows).
+//!
+//! Reconciliation with the LTX-2.5 outputs gate (`ltx_2_5_te_connector_inputs.rs`: video
+//! `9.107e-3` / audio `1.141e-2` against a torch-f32 oracle): the register-row norm distribution
+//! is a property of the weights AND the inputs — the 2.5 checkpoint's audio connector on the real
+//! prompt cancels its register rows far less than the 2.3 checkpoint does on this fixture's
+//! random features, so the video/audio gap here does not contradict the near-parity there.
 //!
 //! Run: `LTX_EROS_DIR=… cargo test -p mlx-gen-ltx --test integration connector_parity:: -- --ignored --nocapture`
 
@@ -126,8 +147,9 @@ fn audio_connector_matches_reference() {
     let pr = peak_rel(&got, want);
     let pr_valid = peak_rel_rows(&got, want, 0, nv);
     eprintln!("audio connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
-    // Split bars — measured cross-implementation floors of the expansive gated audio stack; see
-    // the module docs for the derivation (valid floor 1.64e-2, register/global floor 8.09e-2).
+    // Split bars — measured cross-implementation floors of the final-norm row-renormalization on
+    // this fixture's register-row norm distribution; see the module docs for the per-op
+    // decomposition (valid floor 1.64e-2, register/global floor 8.09e-2).
     assert!(
         pr_valid < 3e-2,
         "audio connector valid-row peak_rel {pr_valid:.3e} too high"

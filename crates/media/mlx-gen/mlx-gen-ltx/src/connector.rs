@@ -10,8 +10,9 @@
 //! `2·` and uses exact GELU (sc-21663; both fixed here for 2.3 and 2.5 alike).
 //!
 //! Two connectors exist in the checkpoint (`video_embeddings_connector.*`,
-//! `audio_embeddings_connector.*`); this core uses the video one. Compute dtype is a parameter:
-//! **bf16** to match the reference pipeline end-to-end, **f32** for the isolated bit-exact gate.
+//! `audio_embeddings_connector.*`); this core uses the video one. Activations always compute in
+//! **f32** (sc-21663 — see the `dtype` field doc); the `Precision` parameter supplies the quant
+//! geometry and the *output* dtype only.
 //! The fused SDPA is always run in **f32** regardless — the pmetal bf16 maskless-SDPA kernel
 //! returns garbage at this shape (see `tests/bf16_sdpa_bug.rs`); the reference's wheel MLX has a
 //! correct bf16 SDPA, so f32 matches it to bf16 rounding.
@@ -69,13 +70,22 @@ pub struct Connector {
     theta: f64,
     max_pos: i32,
     ones: Array, // unit RMSNorm weight (dim,)
-    /// Activation compute dtype — **always f32** (sc-21663). With the correct `2·sigmoid` gates
-    /// the 8-layer stack is expansive (~2x/layer): per-op rounding differences are amplified
-    /// ~50-500x at the output, so bf16 activations cost ~5e-2 peak-rel of conditioning fidelity
-    /// against the f32 reference (measured: 5.57e-2 bf16 vs 1.29e-2 f32 on the LTX-2.5 video
-    /// golden). The connector is 256 tokens × 8 layers — f32 activations are numerically decisive
-    /// and computationally free next to the TE/DiT; weights stay at the tier's own dtype/packing.
-    /// Same precedent as the f32 SDPA below.
+    /// Activation compute dtype — **always f32** (sc-21663). The connector ends in a per-row
+    /// RMS-norm over rows whose magnitudes span a >100x dynamic range (measured on the 2.3 golden
+    /// inputs: video 134x, audio 272x at the last block), so that renormalization converts
+    /// absolute-scale activation rounding into large *relative* error on the low-norm register
+    /// rows. Measured on the LTX-2.5 video golden, bf16 tier, sc-21663 (two comparisons, do not
+    /// conflate): the isolated connector fed the golden's own `video_features` scores 5.568e-2
+    /// bf16 vs 1.288e-2 f32; the full `Ltx25TextEncoder` path (which adds the encoder's own
+    /// ~2.3e-3 feature error) scores 6.094e-2 bf16 vs 9.107e-3 with f32 activations — against the
+    /// test's 6e-2 bar. The connector is 256 tokens × 8 layers — f32 activations are numerically
+    /// decisive and computationally free next to the TE/DiT; weights stay at the tier's own
+    /// dtype/packing. Same precedent as the f32 SDPA below.
+    ///
+    /// The FFN activation routes through [`gelu_tanh`], which under the `ExactEpilogues`
+    /// capability substitutes `mlx_rs::fast::gelu_tanh_exact` — that kernel's contract is
+    /// bit-identity with the eager expression (it preserves every eager rounding boundary), so
+    /// the capability toggle does not change the connector's numerics.
     dtype: Dtype,
     /// The pipeline dtype the output is returned in (`prec.dtype()`), so downstream consumers see
     /// exactly the interface they always did.
@@ -86,8 +96,8 @@ impl Connector {
     /// Build the **video** connector from a `Weights` map (e.g. `connector.safetensors`) under
     /// `prefix` (`"video_embeddings_connector."`).
     ///
-    /// `prec` supplies both the compute dtype (bf16 to match the reference pipeline end-to-end; f32
-    /// for the isolated bit-exact gate) **and** the checkpoint's quant geometry, exactly as it does
+    /// `prec` supplies the **output** dtype (activations always compute f32 — see the `dtype`
+    /// field doc) **and** the checkpoint's quant geometry, exactly as it does
     /// for the DiT. Whether any given Linear is actually packed is decided per-Linear by the
     /// presence of `{prefix}.scales`, so a dense LTX-2.3 connector and a quantized LTX-2.5 tier
     /// connector both load through this one call.
@@ -184,11 +194,14 @@ impl Connector {
         };
         // f64 exponentials rounded to f32 BEFORE the position multiply — exactly upstream's
         // `generate_freq_grid_np` (its "double precision" covers only the log-spaced grid; the
-        // returned indices are f32, and `generate_freqs` forms the angles in f32). Keeping f64
+        // returned indices are f32, and `generate_freqs` forms the angles in f32). This table
+        // matches the reference's to 1 f32 ULP (6e-8, verified against torch on CPU). Keeping f64
         // through `cos`/`sin` — what mlx_video and this port used to do — perturbs the top
-        // frequencies by ~1e-3 rad; the connector's 2·sigmoid gates amplify that identical
-        // per-layer table delta coherently (~2×/layer over 8 layers), which alone holds the
-        // parity gate at 1.3e-2 video / 8.8e-2 audio vs the ltx_core golden (sc-21663).
+        // frequencies by up to ~9.4e-4; that is a real bit-level infidelity but NOT bar-pinned:
+        // the verified-rebuild mutation run (sc-21663, f64 revert vs the ltx_core-semantics 2.3
+        // golden, `connector_parity`) measured video 2.005e-3 / audio 8.238e-2 — both still green
+        // — because per-op deviations do not compound across blocks (see the parity test's
+        // decomposition). Kept for faithfulness, pinned by construction, not by a tolerance.
         let indices: Vec<f32> = (0..num_indices)
             .map(|i| (self.theta.powf(i as f64 * step) * (PI / 2.0)) as f32)
             .collect();
@@ -196,7 +209,11 @@ impl Connector {
         let mut cos = vec![0f32; heads * seq * head_half];
         let mut sin = vec![0f32; heads * seq * head_half];
         for t in 0..seq {
-            let scaled = ((t as f64 / self.max_pos as f64) * 2.0 - 1.0) as f32;
+            // All-f32 op order, as upstream's `get_fractional_positions` computes it (f32 arange /
+            // f32 max_pos, then *2-1 in f32). For a power-of-two `max_pos` (4096 in every shipped
+            // checkpoint) this is bit-identical to an f64-then-round formulation; computing in f32
+            // from the start removes even that constraint.
+            let scaled = (t as f32 / self.max_pos as f32) * 2.0 - 1.0;
             for h in 0..heads {
                 for p in 0..head_half {
                     let ang = scaled * indices[h * head_half + p];

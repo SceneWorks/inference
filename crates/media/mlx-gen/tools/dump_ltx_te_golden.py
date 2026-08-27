@@ -7,9 +7,10 @@ dumping the intermediate video_features and the final video_embeddings. The Rust
 `LtxTextEncoder::encode` (tests/te_parity.rs) must reproduce these (it runs the real Gemma forward
 itself, so this is the end-to-end S1 gate).
 
-The connector runs with **ltx_core (training) semantics** — `2·sigmoid` attention gate and
-tanh-approximate GELU — patched over the mlx_video port below (sc-21663): a golden dumped from
-stock mlx_video would re-encode the two connector bugs the Rust ports just fixed, and
+The connector runs with **ltx_core (training) semantics** — `2·sigmoid` attention gate,
+tanh-approximate GELU, and f32-quantized RoPE indices — patched over the mlx_video port below
+(sc-21663, the same three overrides `dump_ltx_connector_golden.py` applies): a golden dumped
+from stock mlx_video would re-encode the connector bugs the Rust ports just fixed, and
 `te_parity.rs` would go red against a correct port. Re-dump this golden after sc-21663.
 
 Weights come from a converted BASE model's connector.safetensors (NOT eros). Run:
@@ -49,6 +50,7 @@ sys.modules["mlx_vlm.models.gemma3.config"] = _cfg
 import mlx.core as mx  # noqa: E402
 
 import mlx.nn as nn  # noqa: E402
+import numpy as np  # noqa: E402
 
 from mlx_video.models.ltx.text_encoder import (  # noqa: E402
     ConnectorAttention,
@@ -94,8 +96,31 @@ def _attn_call_2sigmoid(self, x, attention_mask=None, pe=None):
     return self.to_out(out)
 
 
+def _rope_f32_quantized_indices(self, seq_len, dtype):
+    """ltx_core `generate_freq_grid_np` + `generate_freqs`: f64 exponentials rounded to f32 BEFORE
+    the (f32) position multiply; cos/sin on the f32 angles. mlx_video keeps f64 through cos/sin,
+    perturbing the top frequencies by up to ~9.4e-4 (the third sc-21663 divergence)."""
+    dim = self.num_heads * self.head_dim
+    n = dim // 2  # n_elem = 2 * len(max_pos) = 2
+    step = 1.0 / (n - 1)
+    theta = self.positional_embedding_theta
+    idx32 = (np.power(theta, np.arange(n, dtype=np.float64) * step) * (np.pi / 2)).astype(np.float32)
+    t = np.arange(seq_len, dtype=np.float64)
+    scaled32 = ((t / self.positional_embedding_max_pos[0]) * 2.0 - 1.0).astype(np.float32)
+    ang = (scaled32[:, None] * idx32[None, :]).astype(np.float32)
+    half = self.head_dim // 2
+    cos = np.cos(ang).reshape(seq_len, self.num_heads, half).transpose(1, 0, 2)[np.newaxis]
+    sin = np.sin(ang).reshape(seq_len, self.num_heads, half).transpose(1, 0, 2)[np.newaxis]
+    return mx.array(cos.astype(np.float32)).astype(dtype), mx.array(sin.astype(np.float32)).astype(dtype)
+
+
+# A renamed/removed upstream method would make these assignments silently create dead attributes.
+assert hasattr(ConnectorFeedForward, "__call__")
+assert hasattr(ConnectorAttention, "__call__")
+assert hasattr(Embeddings1DConnector, "_precompute_freqs_cis"), "mlx_video renamed the rope hook"
 ConnectorFeedForward.__call__ = _ff_call_tanh_gelu
 ConnectorAttention.__call__ = _attn_call_2sigmoid
+Embeddings1DConnector._precompute_freqs_cis = _rope_f32_quantized_indices
 # -----------------------------------------------------------------------------------------------
 
 BASE = Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8"

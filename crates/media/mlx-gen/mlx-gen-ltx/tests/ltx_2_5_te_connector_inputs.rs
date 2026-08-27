@@ -290,8 +290,9 @@ fn connector_inputs_match_the_2_5_reference_golden() {
 /// tanh-approximate, not erf) plus the RoPE table's f32 index quantization. This golden was the
 /// first comparison against upstream's own implementation. sc-21663 fixed all three (both
 /// backends), re-derived the 2.3 golden from the correct authority, and moved the connector's
-/// activations to f32 — with the correct expansive `2·sigmoid` gates, bf16 activation rounding
-/// alone amplified to `6.09e-2` against this bar.
+/// activations to f32 — the connector's closing per-row RMS-norm rescales rows whose magnitudes
+/// span >100x, so bf16 activation rounding alone reached `6.094e-2` against this bar on the same
+/// run (see `connector.rs`'s dtype doc for both measured comparisons and the mechanism).
 ///
 /// Measured after the fix on the bf16 (dense) tier:
 ///
