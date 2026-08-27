@@ -911,6 +911,24 @@ impl Generator for LtxGenerator {
                 )));
             }
         }
+        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
+        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
+        // same way).
+        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
+                 (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
+                    .into(),
+            ));
+        }
+        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
+                 keyframe slots + the temporal latent upsampler)"
+                    .into(),
+            ));
+        }
         let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
             if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
                 return Err(gen_core::Error::Msg(format!(
@@ -2011,6 +2029,53 @@ mod tests {
             }],
             ..base
         }));
+    }
+
+    /// sc-18789: the DFR knobs are refused on the 2.3 checkpoint with a TYPED `Unsupported`
+    /// (candle twin of the mlx refusal); `0`/`None` stay accepted.
+    #[test]
+    fn validate_refuses_dfr_knobs_on_2_3_typed() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let model = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .unwrap();
+        let base = GenerationRequest {
+            prompt: "p".into(),
+            width: 640,
+            height: 384,
+            frames: Some(25),
+            ..Default::default()
+        };
+        for (label, req) in [
+            (
+                "num_generated_keyframes",
+                GenerationRequest {
+                    num_generated_keyframes: Some(3),
+                    ..base.clone()
+                },
+            ),
+            (
+                "temporal_upsample_rounds",
+                GenerationRequest {
+                    temporal_upsample_rounds: Some(1),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            let err = model.validate(&req).expect_err(label);
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "{label}: {err}"
+            );
+            assert!(err.to_string().contains("2.5"), "{label}: {err}");
+        }
+        let off = GenerationRequest {
+            num_generated_keyframes: Some(0),
+            temporal_upsample_rounds: Some(0),
+            ..base
+        };
+        model.validate(&off).expect("0 is off");
     }
 
     #[test]

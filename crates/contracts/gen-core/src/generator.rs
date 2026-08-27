@@ -379,6 +379,24 @@ pub struct GenerationRequest {
     /// models that don't support it ignore it.
     pub trim_first_frames: Option<u32>,
 
+    // --- LTX-2.5 DFR (sc-18789; the `--num-generated-keyframes` / `--temporal-upsample-rounds`
+    //     CLI equivalents) ---
+    /// Number of extra **generated keyframe slots** placed at evenly spaced interior frame
+    /// positions (reference `--num-generated-keyframes`; `ltx_dfr::evenly_spaced_keyframe_positions`).
+    /// Each slot relaxes the effective temporal compression at its position at the cost of one
+    /// latent frame's worth of tokens for one pixel frame. Requires a checkpoint whose transformer
+    /// sets `use_keyframes_abs_pos_embedding` (LTX ≥ 2.5) — an engine whose checkpoint lacks the
+    /// learned marker (`ltx_2_3`) **refuses** the request with a typed `Unsupported` rather than
+    /// denoising unmarked slots as wasted compute (the reference validates the same way, up
+    /// front). `None`/0 = off. Non-LTX models ignore it.
+    pub num_generated_keyframes: Option<u32>,
+    /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
+    /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
+    /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
+    /// generated-keyframe-capable checkpoint (LTX ≥ 2.5); `ltx_2_3` refuses a non-zero value with
+    /// a typed `Unsupported`. `None`/0 = off. Non-LTX models ignore it.
+    pub temporal_upsample_rounds: Option<u32>,
+
     // --- SVD image→video micro-conditioning (sc-3523; ignored by other models) ---
     /// SVD `motion_bucket_id` — the motion-strength bucket baked into the `added_time_ids`
     /// micro-conditioning (higher = more motion). `None` ⇒ the model default (127). Only the
@@ -838,6 +856,8 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             trim_first_frames: None,
+            num_generated_keyframes: None,
+            temporal_upsample_rounds: None,
             motion_bucket_id: None,
             noise_aug_strength: None,
             decode_chunk_size: None,
@@ -1078,6 +1098,9 @@ impl GenerationRequest {
             fps: _,
             video_mode: _,
             trim_first_frames: _,
+            // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
+            num_generated_keyframes: _,
+            temporal_upsample_rounds: _,
             decode_chunk_size: _,
             conditioning_fps: _,
             enhance_prompt: _,
