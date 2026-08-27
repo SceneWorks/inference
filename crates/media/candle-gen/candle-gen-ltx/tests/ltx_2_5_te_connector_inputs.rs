@@ -28,7 +28,7 @@ use candle_gen::candle_core::{safetensors, DType, Device, Tensor};
 use candle_gen::gen_core::ltx_checkpoint::{CaptionFeatureVersion, LtxCheckpointMetadata};
 use candle_gen_ltx::config::{AvConfig, ConnectorConfig};
 use candle_gen_ltx::gemma4_te::Ltx25TextEncoder;
-use candle_gen_ltx::tier::TierPaths;
+use candle_gen_ltx::tier::Ltx25Tier;
 use candle_gen_ltx::tokenizer::Ltx25Tokenizer;
 
 /// The committed 2.3 reference fixture, reached across the backend boundary exactly as
@@ -115,7 +115,13 @@ fn tier_inputs(dir: &std::path::Path, device: &Device) -> TierInputs {
     let te_path = dir.join("text_encoder.safetensors");
     let checkpoint = LtxCheckpointMetadata::from_file(dir.join("transformer.safetensors"))
         .expect("transformer metadata");
-    let paths = TierPaths::detect(dir, None).expect("LTX25_TIER_DIR/q8 must be a tier directory");
+    // sc-18776: the 2.5 tier is detected through `Ltx25Tier`, not `TierPaths`. `TierPaths::detect`
+    // requires a `quantize_config.json`, which no 2.5 tier ships (they carry `split_model.json` +
+    // `embedded_config.json`), so it returned `None` here and this `expect` would have fired on the
+    // first real run.
+    let paths = Ltx25Tier::detect(dir)
+        .expect("LTX25_TIER_DIR/q8 must carry a readable split_model.json")
+        .expect("LTX25_TIER_DIR/q8 must be a 2.5 tier directory");
     let root = paths
         .connector_vb(DType::BF16, device)
         .expect("connector varbuilder")
