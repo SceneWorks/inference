@@ -19,6 +19,7 @@
 //! live here too; they moved into candle-llm's `candle-llava` provider when this crate was repointed
 //! onto the unified engine (sc-7692). What remains is product content only.
 
+use candle_gen::gen_core;
 use candle_gen::gen_core::{CaptionCapabilities, CaptionOptions};
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
@@ -192,21 +193,9 @@ pub fn build_prompt(options: &CaptionOptions) -> String {
         .replace("{word_count}", caption_length)
 }
 
-pub fn apply_trigger_words(caption: &str, trigger_words: &[String]) -> String {
-    let cleaned = caption.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower_caption = cleaned.to_lowercase();
-    let mut parts: Vec<String> = trigger_words
-        .iter()
-        .map(|word| word.trim())
-        .filter(|word| !word.is_empty())
-        .filter(|word| !lower_caption.contains(&word.to_lowercase()))
-        .map(ToOwned::to_owned)
-        .collect();
-    if !cleaned.is_empty() {
-        parts.push(cleaned);
-    }
-    parts.join(", ")
-}
+/// Compatibility export for backend callers. The policy itself is backend-neutral and lives in
+/// `gen-core`, shared with the SceneWorks worker.
+pub use gen_core::apply_caption_trigger_words as apply_trigger_words;
 
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES
@@ -283,15 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn trigger_words_are_prepended_only_when_missing() {
-        let trigger_words = vec!["mika_token".to_owned(), "hat".to_owned()];
-        assert_eq!(
-            apply_trigger_words("A portrait of Mika wearing a hat.", &trigger_words),
-            "mika_token, A portrait of Mika wearing a hat."
-        );
-        assert_eq!(
-            apply_trigger_words("   ", &trigger_words),
-            "mika_token, hat"
-        );
+    fn trigger_words_follow_gen_core_conformance_matrix() {
+        for case in candle_gen::gen_core::caption::CAPTION_TRIGGER_WORD_CONFORMANCE {
+            let triggers = case
+                .trigger_words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(apply_trigger_words(case.caption, &triggers), case.expected);
+        }
     }
 }

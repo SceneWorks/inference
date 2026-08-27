@@ -1940,6 +1940,26 @@ class CrossBackendGeometryLiveTests(unittest.TestCase):
                 constant,
             )
 
+    def test_identifier_resolution_stops_at_the_edge_of_a_string_literal(self) -> None:
+        """A backend that gains a `pub const ALL` must not have the English word "ALL" rewritten
+        inside its prose constants. flux2's `SYSTEM_MESSAGE_UPSAMPLING_T2I` says "Put ALL text in
+        quotation marks"; resolving into the literal rewrote it on the candle side alone and
+        reported two byte-identical strings as divergent (sc-11045). Resolution outside a literal —
+        the reason the substitution exists — still has to happen."""
+        prose = '"Put ALL text in quotation marks."'
+        without = {"MESSAGE": {prose}}
+        with_const = {"MESSAGE": {prose}, "ALL": {"[Self::QkvMlp, Self::Out]"}}
+        self.assertEqual(
+            self.gate._canonical_const_value(prose, with_const),
+            self.gate._canonical_const_value(prose, without),
+        )
+        self.assertNotIn("QkvMlp", self.gate._canonical_const_value(prose, with_const))
+        aliased = {"ALIAS": {"SPELLED_OUT"}, "SPELLED_OUT": {'"black-forest-labs/FLUX.2-dev"'}}
+        self.assertEqual(
+            self.gate._canonical_const_value("ALIAS", aliased),
+            self.gate._canonical_const_value('"black-forest-labs/FLUX.2-dev"', aliased),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

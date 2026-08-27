@@ -270,16 +270,18 @@ fn render_encoded_components(
     let sampler = opts.sampler.as_deref().or(Some(DEFAULT_SAMPLER));
 
     let dit = render.dit();
+    // Latent geometry and dtype are fixed for this render, including both CFG branches.
+    let prepared_rope = dit.prepare_rope(&noise)?;
     // The DiT is a **standard flow denoiser**: it predicts the flow velocity `v ≈ ε − x0` and
     // embeds the **raw σ** as its timestep. So `run_flow_sampler` (`TimestepConvention::Sigma`,
     // integrating `x + (σ_next − σ)·v`) consumes the DiT output directly — no negation, no `1 − σ`.
     let predict = |x: &Tensor, sigma: f32| -> Result<Tensor> {
         let s = Tensor::from_vec(vec![sigma], (1,), device)?;
-        let v_cond = dit.forward(x, &s, &cond, dtype)?;
+        let v_cond = dit.forward_prepared(x, &s, &cond, dtype, &prepared_rope)?;
         let v = match &uncond {
             // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
             Some(u) => {
-                let v_u = dit.forward(x, &s, u, dtype)?;
+                let v_u = dit.forward_prepared(x, &s, u, dtype, &prepared_rope)?;
                 (&v_u + ((v_cond - &v_u)? * guidance)?)?
             }
             None => v_cond,
