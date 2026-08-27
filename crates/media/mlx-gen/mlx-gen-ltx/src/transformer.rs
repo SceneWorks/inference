@@ -1926,6 +1926,73 @@ fn av_ca_ada(
     ))
 }
 
+/// Attention controls for one AV-DiT evaluation.
+///
+/// STG perturbs only the two self-attention calls of selected blocks.  In
+/// particular, it must not turn a selected block into a no-op: text attention,
+/// cross-modal attention, and both feed-forward paths still run.  The modality
+/// pass takes the complementary form and suppresses only the two inter-modality
+/// attention calls at every block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvPerturbation {
+    skip_self_blocks: &'static [usize],
+    isolate_modalities: bool,
+}
+
+impl AvPerturbation {
+    /// The ordinary, unperturbed AV-DiT evaluation.
+    pub const NONE: Self = Self {
+        skip_self_blocks: &[],
+        isolate_modalities: false,
+    };
+
+    /// STG evaluation: skip video and audio self-attention at precisely these
+    /// transformer block indices.
+    pub const fn stg(skip_self_blocks: &'static [usize]) -> Self {
+        Self {
+            skip_self_blocks,
+            isolate_modalities: false,
+        }
+    }
+
+    /// A modality-isolated evaluation, retaining self/text/FF processing while
+    /// suppressing both audio-to-video and video-to-audio attention calls.
+    pub const fn modality_isolated() -> Self {
+        Self {
+            skip_self_blocks: &[],
+            isolate_modalities: true,
+        }
+    }
+
+    #[must_use]
+    const fn attention_plan(self, block_index: usize) -> AvAttentionPlan {
+        AvAttentionPlan {
+            run_self: !contains_block(self.skip_self_blocks, block_index),
+            run_cross_modal: !self.isolate_modalities,
+        }
+    }
+}
+
+const fn contains_block(blocks: &[usize], needle: usize) -> bool {
+    let mut index = 0;
+    while index < blocks.len() {
+        if blocks[index] == needle {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The four attention calls that an [`AvBlock`] may execute.  Text attention
+/// and feed-forward are deliberately not represented because neither control
+/// is allowed to suppress them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AvAttentionPlan {
+    run_self: bool,
+    run_cross_modal: bool,
+}
+
 /// One AudioVideo transformer block: the video stack + the audio stack + bidirectional cross-modal
 /// attention (`BasicAVTransformerBlock`). Per-block order: video self+text-CA → audio self+text-CA →
 /// cross-modal (a2v updates video, v2a updates audio) → video FF → audio FF.
@@ -2018,11 +2085,15 @@ impl AvBlock {
         sst: &Array,
         pst: &Array,
         a: &StreamArgs,
+        run_self: bool,
     ) -> Result<Array> {
-        let msa = ada_values(sst, a.ts_emb, 0, 3)?;
-        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
-        let mut x = gated(x, &attn, &msa[2])?;
+        let mut x = x.clone();
+        if run_self {
+            let msa = ada_values(sst, a.ts_emb, 0, 3)?;
+            let norm = modulate(&rms_norm_noweight(&x, self.eps)?, &msa[1], &msa[0])?;
+            let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
+            x = gated(&x, &attn, &msa[2])?;
+        }
 
         let p = ada_values(pst, a.prompt_ts, 0, 2)?;
         let context = modulate(a.context, &p[1], &p[0])?;
@@ -2048,17 +2119,26 @@ impl AvBlock {
         gated(x, &ff_out, &mlp[2])
     }
 
-    /// Joint forward: `(vx, ax)` in, `(vx, ax)` out.
-    fn forward(
+    /// Joint forward with the attention-level controls used by the dev sampler.
+    /// This controls calls inside a block, never whether an entire block runs.
+    fn forward_controlled(
         &self,
         vx: &Array,
         ax: &Array,
         v: &StreamArgs,
         a: &StreamArgs,
+        control: AvAttentionPlan,
     ) -> Result<(Array, Array)> {
         // Video / audio self-attention + text cross-attention.
-        let mut vx =
-            self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let mut vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            control.run_self,
+        )?;
         let mut ax = self.self_and_text(
             ax,
             &self.a_attn1,
@@ -2066,43 +2146,46 @@ impl AvBlock {
             &self.a_sst,
             &self.a_pst,
             a,
+            control.run_self,
         )?;
 
-        // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
-        let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
-        let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
-        let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
-            &self.ca_audio_ss,
-            &self.ca_audio_gate,
-            a.cross_ss_ts,
-            a.cross_gate_ts,
-        )?;
-        let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
-            &self.ca_video_ss,
-            &self.ca_video_gate,
-            v.cross_ss_ts,
-            v.cross_gate_ts,
-        )?;
+        if control.run_cross_modal {
+            // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
+            let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
+            let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
+            let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
+                &self.ca_audio_ss,
+                &self.ca_audio_gate,
+                a.cross_ss_ts,
+                a.cross_gate_ts,
+            )?;
+            let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
+                &self.ca_video_ss,
+                &self.ca_video_gate,
+                v.cross_ss_ts,
+                v.cross_gate_ts,
+            )?;
 
-        // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
-        let a2v = self.a2v.forward(
-            &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
-            Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
-            None,
-            Some((v.cross_cos, v.cross_sin)),
-            Some((a.cross_cos, a.cross_sin)),
-        )?;
-        vx = gated(&vx, &a2v, &gate_a2v)?;
+            // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
+            let a2v = self.a2v.forward(
+                &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
+                Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+                None,
+                Some((v.cross_cos, v.cross_sin)),
+                Some((a.cross_cos, a.cross_sin)),
+            )?;
+            vx = gated(&vx, &a2v, &gate_a2v)?;
 
-        // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
-        let v2a = self.v2a.forward(
-            &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
-            Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
-            None,
-            Some((a.cross_cos, a.cross_sin)),
-            Some((v.cross_cos, v.cross_sin)),
-        )?;
-        ax = gated(&ax, &v2a, &gate_v2a)?;
+            // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
+            let v2a = self.v2a.forward(
+                &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
+                Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+                None,
+                Some((a.cross_cos, a.cross_sin)),
+                Some((v.cross_cos, v.cross_sin)),
+            )?;
+            ax = gated(&ax, &v2a, &gate_v2a)?;
+        }
 
         // FeedForward.
         vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
@@ -2115,7 +2198,15 @@ impl AvBlock {
     /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
     /// absent — not run against a placeholder stream.
     fn forward_video_only(&self, vx: &Array, v: &StreamArgs) -> Result<Array> {
-        let vx = self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            true,
+        )?;
         self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
     }
 
@@ -2493,19 +2584,10 @@ impl AvDiT {
         }
     }
 
-    /// Joint velocity forward.
+    /// Ordinary, unperturbed joint velocity forward.
     ///
-    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
-    /// * `*_timestep` — `(B, S)` per-token sigma.
-    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
-    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
-    ///
-    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
-    ///
-    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
-    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
-    ///   falls back to the `positions`-content compare (behavior unchanged).
-    #[allow(clippy::too_many_arguments)]
+    /// This is the compatibility path for distilled inference. Guided dev
+    /// evaluations opt into [`Self::forward_controlled`] explicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -2521,6 +2603,52 @@ impl AvDiT {
         audio_positions: &Array,
         video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
+    ) -> Result<(Array, Array)> {
+        self.forward_controlled(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_mask,
+            audio_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            AvPerturbation::NONE,
+        )
+    }
+
+    /// Controlled joint velocity forward for STG and modality guidance.
+    ///
+    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
+    /// * `*_timestep` — `(B, S)` per-token sigma.
+    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
+    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
+    ///
+    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
+    ///
+    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
+    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
+    ///   falls back to the `positions`-content compare (behavior unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_controlled(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
     ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
             video_latent,
@@ -2543,8 +2671,14 @@ impl AvDiT {
         let (vx, ax) = match &self.blocks {
             AvBlocks::Resident(blocks) => {
                 let (mut vx, mut ax) = (vx0, ax0);
-                for block in blocks {
-                    let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                for (index, block) in blocks.iter().enumerate() {
+                    let (nv, na) = block.forward_controlled(
+                        &vx,
+                        &ax,
+                        &va,
+                        &aa,
+                        perturbation.attention_plan(index),
+                    )?;
                     vx = nv;
                     ax = na;
                 }
@@ -2564,7 +2698,13 @@ impl AvDiT {
                     |(mut vx, mut ax), view, range| {
                         for index in range {
                             let block = stream.materialize(view, index)?;
-                            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                            let (nv, na) = block.forward_controlled(
+                                &vx,
+                                &ax,
+                                &va,
+                                &aa,
+                                perturbation.attention_plan(index),
+                            )?;
                             vx = nv;
                             ax = na;
                             // `block` drops here: a window holds `window_size` blocks, never the
@@ -2644,6 +2784,77 @@ impl AvDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stg_control_selects_only_configured_self_attention_block() {
+        // Mutation-sensitive for the SC-18759 block-28 row: changing either the
+        // actual block index passed by a resident/streamed loop or the selected
+        // index makes this fail. STG suppresses self attention only.
+        let control = AvPerturbation::stg(&[28]);
+        let before = control.attention_plan(27);
+        let target = control.attention_plan(28);
+        let after = control.attention_plan(29);
+
+        assert_eq!(
+            before,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            target,
+            AvAttentionPlan {
+                run_self: false,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn modality_isolation_suppresses_only_cross_modal_attention() {
+        // This must remain distinct from STG: self/text/FF still execute at
+        // every block, while both A2V and V2A calls are skipped.
+        let normal = AvPerturbation::NONE.attention_plan(28);
+        let isolated = AvPerturbation::modality_isolated().attention_plan(28);
+        assert_eq!(
+            normal,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            isolated,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: false,
+            }
+        );
+        assert_ne!(normal, isolated);
+    }
+
+    #[test]
+    fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
+        // Structural mutation proof: both executable layouts must derive their
+        // per-block calls from the materialized/enumerated `index`, not a fixed
+        // STG layer or a mode that silently becomes a whole-block skip.
+        let source = include_str!("transformer.rs");
+        assert_eq!(
+            source.matches("perturbation.attention_plan(index)").count(),
+            2,
+            "resident and streamed AV-DiT loops must both apply the actual block index"
+        );
+        assert!(
+            source.contains("if run_self {") && source.contains("if control.run_cross_modal {"),
+            "self and cross-modal calls must be independently controlled inside AvBlock"
+        );
+        assert!(
+            source.contains("let cross = attn2.forward") && source.contains("self.feed_forward"),
+            "STG/modality controls must retain text cross-attention and feed-forward"
+        );
+    }
 
     /// sc-18789: the keyframe absolute-position marker lands on exactly the tokens the mask
     /// marks — marked tokens shift by the embedding, unmarked tokens are bit-identical, and an
