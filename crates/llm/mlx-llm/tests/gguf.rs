@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MLX_LLM_GGUF_DIR=/path/to/ggufs MLX_LLM_TEST_MODEL=/path/to/HF-snapshot \
-//!   cargo test --test gguf -- --ignored --nocapture
+//!   cargo test --test integration -- gguf:: --ignored --nocapture
 //! ```
 //!
 //! ## What parity means here, and how it's measured
@@ -471,7 +471,7 @@ fn ggml_type_name(tag: u32) -> &'static str {
 ///
 /// ```text
 /// MLX_LLM_IQ_GGUF_DIR=/path/to/iq-ggufs MLX_LLM_TEST_MODEL=/tmp/qwen3-0.6b \
-///   cargo test --test gguf -- --ignored gguf_iq_dequant_matches_hf_by_type --nocapture
+///   cargo test --test integration -- gguf::gguf_iq_dequant_matches_hf_by_type --ignored --nocapture
 /// ```
 ///
 /// Unlike the per-file check above, this buckets every converted tensor's cosine-vs-HF by the

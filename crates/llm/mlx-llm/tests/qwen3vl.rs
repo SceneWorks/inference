@@ -21,7 +21,7 @@
 //! cleanly** when it is absent, but run fully when present (it is present in this env).
 //!
 //! ```text
-//! QWEN3VL_SNAPSHOT=/path/to/Qwen3-VL-8B-Instruct cargo test --test qwen3vl -- --nocapture
+//! QWEN3VL_SNAPSHOT=/path/to/Qwen3-VL-8B-Instruct cargo test --test integration -- qwen3vl:: --nocapture
 //! ```
 
 use std::path::PathBuf;

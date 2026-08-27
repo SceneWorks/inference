@@ -9,7 +9,7 @@
 //! Run:
 //! ```text
 //! LTX25_DURATION_HEAD_FILE=/path/to/ltx-2.5-duration-head-bf16.safetensors \
-//!   cargo test -p mlx-gen-ltx --test duration_head_golden -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --test integration -- duration_head_golden:: --ignored --nocapture
 //! ```
 
 use mlx_gen::weights::Weights;

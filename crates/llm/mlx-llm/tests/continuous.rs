@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/tmp/smollm2-135m MLX_LLM_QWEN3_MODEL=/tmp/qwen3-0.6b \
-//!   cargo test --test continuous -- --ignored --nocapture
+//!   cargo test --test integration -- continuous:: --ignored --nocapture
 //! ```
 //!
 //! ## What these prove (the story-7281 acceptance, on real weights)

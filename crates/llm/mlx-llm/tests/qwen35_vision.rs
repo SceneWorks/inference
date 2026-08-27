@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! MLX_LLM_QWEN35_MODEL=/path/to/Qwen3.6-27B \
-//!   cargo test --test qwen35_vision -- --ignored --nocapture
+//!   cargo test --test integration -- qwen35_vision:: --ignored --nocapture
 //! ```
 //!
 //! This exercises the whole vision stack on real weights: image → preprocess → ViT encoder → merger

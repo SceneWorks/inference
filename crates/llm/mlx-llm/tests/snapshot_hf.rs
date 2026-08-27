@@ -5,7 +5,7 @@
 //! *.safetensors) — the acceptance models are SmolLM2-135M and Qwen3-0.6B — and run:
 //!
 //! ```text
-//! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M cargo test --test snapshot_hf -- --ignored --nocapture
+//! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M cargo test --test integration -- snapshot_hf:: --ignored --nocapture
 //! ```
 //!
 //! Asserts (1) `write_hf_snapshot` produces dense / Q4 / Q8 snapshots that load through the provider
