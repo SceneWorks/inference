@@ -68,21 +68,64 @@ pub const DOWNSAMPLE_RATE: usize = 1920;
 pub const CODEBOOK_SIZE: usize = 1024;
 /// Per-code latent dimension (the `Embedding` width).
 pub const CODEBOOK_DIM: usize = 8;
-/// Default RVQ-frame partition for production decode routes (about 0.64 seconds at 12.5 fps).
-/// Short request budgets use [`frames_per_block`] to select a smaller canonical partition; keeping
-/// that one request-chosen value across one-shot, live, conversation, and session decode is
-/// load-bearing because different attention reduction widths are not byte-identical.
+/// Default steady-state RVQ-frame partition for production decode routes (about 0.64 seconds at
+/// 12.5 fps). Short request budgets select a smaller steady block through
+/// [`decode_partition_schedule`].
 pub const DEFAULT_DECODE_FRAMES_PER_BLOCK: usize = 8;
 
-/// Select the canonical decode partition for a request's AR frame budget. Normal requests use
-/// [`DEFAULT_DECODE_FRAMES_PER_BLOCK`]. A valid short request of two through seven frames uses at
-/// most half its budget (rounded up), guaranteeing two non-full-track chunks when the AR loop reaches
-/// the budget. The one-frame floor keeps defensive/direct callers panic-free.
-pub fn frames_per_block(budget_frames: usize) -> usize {
-    if budget_frames >= DEFAULT_DECODE_FRAMES_PER_BLOCK {
+/// The canonical request-local decode partition. Production always decodes the first RVQ frame as a
+/// one-frame block, then uses `steady_frames` for every later block. The leading frame guarantees
+/// that any natural-EOS completion with at least two frames emits at least two non-full chunks,
+/// without knowing its eventual length up front. Keeping this exact schedule across one-shot, live,
+/// conversation, and session routes is also numerically load-bearing: different attention reduction
+/// widths are not byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodePartitionSchedule {
+    first_frames: usize,
+    steady_frames: usize,
+}
+
+impl DecodePartitionSchedule {
+    /// Construct a bounded schedule. Direct codec callers cannot select a block wider than the
+    /// production bound and thereby defeat the incremental attention limit.
+    #[cfg(test)]
+    pub(crate) fn new(first_frames: usize, steady_frames: usize) -> CandleResult<Self> {
+        for (name, frames) in [("first", first_frames), ("steady", steady_frames)] {
+            if !(1..=DEFAULT_DECODE_FRAMES_PER_BLOCK).contains(&frames) {
+                candle_audio::candle_core::bail!(
+                    "codec decode {name} partition must be in 1..={DEFAULT_DECODE_FRAMES_PER_BLOCK} (got {frames})"
+                );
+            }
+        }
+        Ok(Self {
+            first_frames,
+            steady_frames,
+        })
+    }
+
+    /// Frame width for the zero-based codec block/chunk index.
+    pub(crate) fn block_frames(self, block_index: usize) -> usize {
+        if block_index == 0 {
+            self.first_frames
+        } else {
+            self.steady_frames
+        }
+    }
+}
+
+/// Select the canonical decode schedule for a request's AR frame budget. Normal requests use a
+/// steady eight-frame block; two-to-seven-frame budgets retain their prior request-sized steady
+/// block (`ceil(budget / 2)`). Every request starts with one frame so early EOS cannot collapse a
+/// valid multi-frame stream to one terminal full-track chunk.
+pub fn decode_partition_schedule(budget_frames: usize) -> DecodePartitionSchedule {
+    let steady_frames = if budget_frames >= DEFAULT_DECODE_FRAMES_PER_BLOCK {
         DEFAULT_DECODE_FRAMES_PER_BLOCK
     } else {
         budget_frames.div_ceil(2).max(1)
+    };
+    DecodePartitionSchedule {
+        first_frames: 1,
+        steady_frames,
     }
 }
 
@@ -1161,22 +1204,18 @@ impl MossAudioCodec {
 
     /// Decode RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into interleaved mono
     /// PCM. This one-shot entry point deliberately drives the same request-local incremental decoder
-    /// in the caller's request-chosen `frames_per_block` partition as live synthesis. The shared
-    /// partition makes the returned samples byte-identical to concatenated streaming blocks while
+    /// in the caller's request-chosen partition schedule as live synthesis. The shared schedule
+    /// makes the returned samples byte-identical to concatenated streaming blocks while
     /// preserving the bounded attention/state guarantees of
-    /// [`decode_incremental`](Self::decode_incremental). Values above
-    /// [`DEFAULT_DECODE_FRAMES_PER_BLOCK`] are rejected so a direct caller cannot defeat that bound.
+    /// [`decode_incremental`](Self::decode_incremental). The opaque schedule is created by
+    /// [`decode_partition_schedule`], so a direct caller cannot select a wider block and defeat that
+    /// bound.
     pub fn decode_frames(
         &self,
         frames: &[Vec<u32>],
-        frames_per_block: usize,
+        schedule: DecodePartitionSchedule,
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>> {
-        if !(1..=DEFAULT_DECODE_FRAMES_PER_BLOCK).contains(&frames_per_block) {
-            candle_audio::candle_core::bail!(
-                "codec decode frames_per_block must be in 1..={DEFAULT_DECODE_FRAMES_PER_BLOCK} (got {frames_per_block})"
-            );
-        }
         if frames.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -1188,11 +1227,17 @@ impl MossAudioCodec {
             })?;
         let mut state = self.new_decode_state();
         let mut wav = Vec::with_capacity(capacity);
-        for block in frames.chunks(frames_per_block) {
+        let mut start = 0usize;
+        let mut block_index = 0usize;
+        while start < frames.len() {
+            let len = schedule.block_frames(block_index).min(frames.len() - start);
+            let block = &frames[start..start + len];
             let Some(pcm) = self.decode_incremental(&mut state, block, cancel)? else {
                 return Ok(None);
             };
             wav.extend(pcm);
+            start += len;
+            block_index += 1;
         }
         debug_assert_eq!(wav.len(), capacity);
         Ok(Some(wav))
@@ -1900,7 +1945,7 @@ mod tests {
     }
 
     /// Retaining stage state across request blocks must reproduce the existing one-shot chunked
-    /// execution with the same block partition. Exact equality here is stronger than the tolerated
+    /// execution with the same block schedule. Exact equality here is stronger than the tolerated
     /// chunked-vs-single-shot FP gap: both sides run identical kernel shapes, absolute RoPE rows, and
     /// cache windows; only the lifetime of the state differs.
     #[test]
@@ -1956,11 +2001,11 @@ mod tests {
 
     /// Production-level normal-budget identity gate for sc-21686. Both sides traverse the actual
     /// codec entrypoints, including RLFQ, four retained transformer states, every patch expansion,
-    /// and the streaming chunker. The alternate-partition guard is load-bearing: the old one-shot
+    /// and the streaming chunker. The alternate-schedule guard is load-bearing: the old one-shot
     /// path reduced attention at context-sized widths and therefore matched that mutation rather than
     /// the live canonical path.
     #[test]
-    fn one_shot_and_streaming_share_the_canonical_four_stage_partition() {
+    fn one_shot_and_streaming_share_the_canonical_four_stage_schedule() {
         let dev = Device::Cpu;
         let codec = synthetic_four_stage_codec(&dev);
         let frames: Vec<Vec<u32>> = (0..(2 * DEFAULT_DECODE_FRAMES_PER_BLOCK + 3))
@@ -1972,15 +2017,16 @@ mod tests {
             })
             .collect();
         let no_cancel = || false;
-        let partition = frames_per_block(frames.len());
-        assert_eq!(partition, DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        let schedule = decode_partition_schedule(frames.len());
+        assert_eq!(schedule.block_frames(0), 1);
+        assert_eq!(schedule.block_frames(1), DEFAULT_DECODE_FRAMES_PER_BLOCK);
 
         let one_shot = codec
-            .decode_frames(&frames, partition, &no_cancel)
+            .decode_frames(&frames, schedule, &no_cancel)
             .unwrap()
             .unwrap();
         let mut chunks = Vec::new();
-        let mut chunker = crate::chunk::StreamingChunker::new(&codec, partition);
+        let mut chunker = crate::chunk::StreamingChunker::new(&codec, schedule);
         for frame in &frames {
             chunker
                 .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
@@ -1991,12 +2037,17 @@ mod tests {
             .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
             .unwrap()
             .unwrap();
-        assert_eq!(chunks.len(), 3, "two canonical blocks plus one remainder");
+        assert_eq!(
+            chunks.len(),
+            4,
+            "leading frame, two steady blocks, and one remainder"
+        );
         assert_eq!(streamed.samples, one_shot);
 
-        // Mutation/discrimination guard: changing only the request partition must change exact bytes.
-        // A context-sized partition of five recreates the old one-shot stage schedule [5,10,20,40].
-        let mut alternate = crate::chunk::StreamingChunker::new(&codec, 5);
+        // Mutation/discrimination guard: changing only the request schedule must change exact bytes.
+        // A uniform context-sized five recreates the old one-shot stage schedule [5,10,20,40].
+        let alternate_schedule = DecodePartitionSchedule::new(5, 5).unwrap();
+        let mut alternate = crate::chunk::StreamingChunker::new(&codec, alternate_schedule);
         for frame in &frames {
             alternate
                 .push(frame.clone(), &no_cancel, &mut |_| {})
@@ -2006,12 +2057,16 @@ mod tests {
         let alternate = alternate.finish(&no_cancel, &mut |_| {}).unwrap().unwrap();
         assert_ne!(
             alternate.samples, one_shot,
-            "different attention reduction widths must not satisfy the exact-partition oracle"
+            "different attention reduction widths must not satisfy the exact-schedule oracle"
         );
 
         // State mutation guard: resetting all four stage histories per canonical block must diverge.
         let mut reset_state_output = Vec::new();
-        for block in frames.chunks(partition) {
+        let mut start = 0usize;
+        let mut block_index = 0usize;
+        while start < frames.len() {
+            let len = schedule.block_frames(block_index).min(frames.len() - start);
+            let block = &frames[start..start + len];
             let mut reset = codec.new_decode_state();
             reset_state_output.extend(
                 codec
@@ -2019,6 +2074,8 @@ mod tests {
                     .unwrap()
                     .unwrap(),
             );
+            start += len;
+            block_index += 1;
         }
         assert_ne!(
             reset_state_output, one_shot,
@@ -2026,29 +2083,35 @@ mod tests {
         );
     }
 
-    /// Production-level identity gate for sc-21686. Every short valid request budget traverses the
-    /// actual codec entrypoints, including RLFQ, four retained transformer states, every patch
-    /// expansion, and the streaming chunker. The topology and alternate-partition guards are
-    /// load-bearing: a hard-coded 8 would collapse each short stream to one full-track chunk, while a
-    /// one-shot oracle using a different partition would no longer be byte-identical.
+    /// Production-level early-EOS identity gate for sc-21686. Every actual completion length from two
+    /// through seven frames runs under both its matching short request budget and a normal request
+    /// budget. Both sides traverse RLFQ, all four retained transformer states, every patch expansion,
+    /// and the streaming chunker. The scalar-eight and wrong-one-shot mutations are load-bearing: the
+    /// former collapses every case to one full-track chunk, while the latter changes exact bytes.
     #[test]
-    fn short_requests_share_one_canonical_four_stage_partition() {
+    fn early_eos_requests_share_one_canonical_four_stage_schedule() {
         let dev = Device::Cpu;
         let codec = synthetic_four_stage_codec(&dev);
         let no_cancel = || false;
 
-        assert_eq!(frames_per_block(0), 1);
-        assert_eq!(frames_per_block(1), 1);
-        assert_eq!(frames_per_block(8), DEFAULT_DECODE_FRAMES_PER_BLOCK);
-        assert_eq!(frames_per_block(9), DEFAULT_DECODE_FRAMES_PER_BLOCK);
-        assert_eq!(frames_per_block(30_000), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        for budget in [0usize, 1] {
+            let schedule = decode_partition_schedule(budget);
+            assert_eq!(schedule.block_frames(0), 1);
+            assert_eq!(schedule.block_frames(1), 1);
+        }
+        for budget in [8usize, 9, 30_000] {
+            let schedule = decode_partition_schedule(budget);
+            assert_eq!(schedule.block_frames(0), 1);
+            assert_eq!(schedule.block_frames(1), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        }
 
-        let mut different_oracle_discriminated = Vec::new();
-        for budget in 2usize..=7 {
-            let partition = frames_per_block(budget);
-            assert_eq!(partition, budget.div_ceil(2), "budget {budget}");
-            assert!(partition < budget, "budget {budget} must stream before EOS");
-            let frames: Vec<Vec<u32>> = (0..budget)
+        let scalar_eight = DecodePartitionSchedule::new(
+            DEFAULT_DECODE_FRAMES_PER_BLOCK,
+            DEFAULT_DECODE_FRAMES_PER_BLOCK,
+        )
+        .unwrap();
+        for actual_frames in 2usize..=7 {
+            let frames: Vec<Vec<u32>> = (0..actual_frames)
                 .map(|frame| {
                     vec![
                         ((frame * 7 + 3) % 32) as u32,
@@ -2057,98 +2120,110 @@ mod tests {
                 })
                 .collect();
 
-            let one_shot = codec
-                .decode_frames(&frames, partition, &no_cancel)
-                .unwrap()
-                .unwrap();
-            let mut chunks = Vec::new();
-            let mut chunker = crate::chunk::StreamingChunker::new(&codec, partition);
-            for frame in &frames {
-                chunker
-                    .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+            for requested_budget in [actual_frames, 19] {
+                let schedule = decode_partition_schedule(requested_budget);
+                assert_eq!(schedule.block_frames(0), 1);
+                assert_eq!(
+                    schedule.block_frames(1),
+                    if requested_budget < DEFAULT_DECODE_FRAMES_PER_BLOCK {
+                        requested_budget.div_ceil(2)
+                    } else {
+                        DEFAULT_DECODE_FRAMES_PER_BLOCK
+                    },
+                    "actual {actual_frames}, requested budget {requested_budget}"
+                );
+
+                let one_shot = codec
+                    .decode_frames(&frames, schedule, &no_cancel)
                     .unwrap()
                     .unwrap();
-            }
-            let streamed = chunker
-                .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
-                .unwrap()
-                .unwrap();
-            assert_eq!(chunks.len(), 2, "budget {budget} must emit two chunks");
-            assert!(
-                chunks
-                    .iter()
-                    .all(|chunk| chunk.samples.len() < one_shot.len()),
-                "budget {budget}: neither chunk may contain the full track"
-            );
-            assert_eq!(
-                chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
-                vec![0, 1],
-                "budget {budget}: chunk indices"
-            );
-            assert_eq!(
-                streamed.samples, one_shot,
-                "budget {budget}: exact identity"
-            );
-            assert_eq!(
-                chunks
-                    .iter()
-                    .flat_map(|chunk| chunk.samples.iter().copied())
-                    .collect::<Vec<_>>(),
-                one_shot,
-                "budget {budget}: reassembly"
-            );
-
-            // Topology mutation: retaining the old hard-coded eight-frame block emits one full-track
-            // chunk for every short request and therefore violates the streaming surface.
-            let mut hard_coded_chunks = Vec::new();
-            let mut hard_coded =
-                crate::chunk::StreamingChunker::new(&codec, DEFAULT_DECODE_FRAMES_PER_BLOCK);
-            for frame in &frames {
-                hard_coded
-                    .push(frame.clone(), &no_cancel, &mut |chunk| {
-                        hard_coded_chunks.push(chunk)
-                    })
+                let mut chunks = Vec::new();
+                let mut chunker = crate::chunk::StreamingChunker::new(&codec, schedule);
+                for frame in &frames {
+                    chunker
+                        .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+                        .unwrap()
+                        .unwrap();
+                }
+                let streamed = chunker
+                    .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
                     .unwrap()
                     .unwrap();
-            }
-            let hard_coded = hard_coded
-                .finish(&no_cancel, &mut |chunk| hard_coded_chunks.push(chunk))
-                .unwrap()
-                .unwrap();
-            assert_eq!(hard_coded_chunks.len(), 1, "budget {budget}: mutation");
-            assert_eq!(
-                hard_coded_chunks[0].samples, hard_coded.samples,
-                "budget {budget}: hard-coded eight emits the full track at EOS"
-            );
+                assert!(
+                    chunks.len() >= 2,
+                    "actual {actual_frames}, requested budget {requested_budget}: must emit >=2 chunks"
+                );
+                assert!(
+                    chunks
+                        .iter()
+                        .all(|chunk| chunk.samples.len() < one_shot.len()),
+                    "actual {actual_frames}, requested budget {requested_budget}: no full-track chunk"
+                );
+                assert_eq!(
+                    chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+                    (0..chunks.len()).collect::<Vec<_>>(),
+                    "actual {actual_frames}, requested budget {requested_budget}: chunk indices"
+                );
+                assert_eq!(
+                    streamed.samples, one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: exact identity"
+                );
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.samples.iter().copied())
+                        .collect::<Vec<_>>(),
+                    one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: reassembly"
+                );
 
-            // Oracle mutation: a one-shot decode with a different partition must not accidentally
-            // satisfy the exact production partition identity.
-            let wrong_oracle = codec
-                .decode_frames(&frames, DEFAULT_DECODE_FRAMES_PER_BLOCK, &no_cancel)
-                .unwrap()
-                .unwrap();
-            if wrong_oracle != one_shot {
-                different_oracle_discriminated.push(budget);
+                // Topology mutation: the old scalar-eight live schedule buffers every actual 2..=7
+                // completion and emits one full-track chunk at EOS.
+                let mut hard_coded_chunks = Vec::new();
+                let mut hard_coded = crate::chunk::StreamingChunker::new(&codec, scalar_eight);
+                for frame in &frames {
+                    hard_coded
+                        .push(frame.clone(), &no_cancel, &mut |chunk| {
+                            hard_coded_chunks.push(chunk)
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+                let hard_coded = hard_coded
+                    .finish(&no_cancel, &mut |chunk| hard_coded_chunks.push(chunk))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(hard_coded_chunks.len(), 1);
+                assert_eq!(hard_coded_chunks[0].samples, hard_coded.samples);
+
+                // Oracle mutation: one-shot using the scalar-eight reduction schedule must not satisfy
+                // the canonical live identity even though it consumes the same frames and weights.
+                let wrong_oracle = codec
+                    .decode_frames(&frames, scalar_eight, &no_cancel)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(
+                    wrong_oracle, one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: schedule drift must change exact bytes"
+                );
             }
         }
-        assert!(
-            different_oracle_discriminated.len() >= 5,
-            "the synthetic production pipeline must reject a hard-coded one-shot oracle across the \
-             short-budget surface; discriminated {different_oracle_discriminated:?}"
-        );
 
-        let frames = vec![vec![0, 0]];
-        for invalid in [0, DEFAULT_DECODE_FRAMES_PER_BLOCK + 1] {
-            let error = codec
-                .decode_frames(&frames, invalid, &no_cancel)
-                .expect_err("invalid partition must fail before decode")
+        for (first, steady) in [
+            (0, 1),
+            (1, 0),
+            (DEFAULT_DECODE_FRAMES_PER_BLOCK + 1, 1),
+            (1, DEFAULT_DECODE_FRAMES_PER_BLOCK + 1),
+        ] {
+            let error = DecodePartitionSchedule::new(first, steady)
+                .expect_err("invalid partition schedule must fail before decode")
                 .to_string();
-            assert!(error.contains("frames_per_block must be in 1..=8"));
+            assert!(error.contains("partition must be in 1..=8"), "{error}");
         }
     }
 
     /// The model advertises a 40-minute (30,000-frame) realtime surface. The canonical production
-    /// partition expands through the four decoder stages but remains request-length-independent, so
+    /// schedule expands through the four decoder stages but remains request-length-independent, so
     /// each score/mask allocation is bounded by `block * (block + context - 1)` per head rather than
     /// the stage's full sequence square. This proves the dispatch bound without allocating the
     /// advertised-duration tensors in a host-only test.
@@ -2162,7 +2237,8 @@ mod tests {
         );
 
         let mut sequence_len = advertised_frames;
-        let mut block_len = frames_per_block(advertised_frames);
+        let schedule = decode_partition_schedule(advertised_frames);
+        let mut block_len = schedule.block_frames(1);
         let mut frame_rate = SAMPLE_RATE as f64 / DOWNSAMPLE_RATE as f64;
         for (stage_index, patch) in PATCH_SIZES.into_iter().enumerate() {
             let context = (frame_rate * CONTEXT_DURATION_SECS).floor() as usize;

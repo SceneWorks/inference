@@ -469,7 +469,7 @@ fn codec_only_decodes_synthetic_frames() {
     let wav = codec
         .decode_frames(
             &frames,
-            moss::codec::frames_per_block(frames.len()),
+            moss::codec::decode_partition_schedule(frames.len()),
             &|| false,
         )
         .expect("decode")
@@ -862,7 +862,7 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
     let w0 = codec
         .decode_frames(
             &frames0,
-            moss::codec::frames_per_block(frames0.len()),
+            moss::codec::decode_partition_schedule(frames0.len()),
             &|| false,
         )
         .unwrap()
@@ -885,7 +885,7 @@ fn moss_audio_codec_encode_roundtrip_and_reference() {
     let w1 = codec
         .decode_frames(
             &codes1,
-            moss::codec::frames_per_block(codes1.len()),
+            moss::codec::decode_partition_schedule(codes1.len()),
             &|| false,
         )
         .unwrap()
@@ -1085,7 +1085,7 @@ fn moss_audio_codec_chunked_encode_matches_single_shot() {
     let clip = codec
         .decode_frames(
             &pattern,
-            moss::codec::frames_per_block(pattern.len()),
+            moss::codec::decode_partition_schedule(pattern.len()),
             &|| false,
         )
         .expect("decode long clip")
