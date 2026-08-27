@@ -39,6 +39,8 @@ pub mod registry;
 pub mod residency;
 pub mod runtime;
 pub mod sampling;
+pub mod sd3_encoder_artifacts;
+pub mod sd3_request;
 pub mod sdxl_ldm;
 pub mod text_embed;
 pub mod tier_integrity;
@@ -201,6 +203,10 @@ pub use runtime::{
     COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
     LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
+pub use sd3_encoder_artifacts::{
+    resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,
+};
+pub use sd3_request::map_sd3_seeded_outputs;
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};

@@ -262,6 +262,10 @@ impl Sd3TextEncoders {
         device: &Device,
         dtype: DType,
     ) -> CandleResult<Self> {
+        // Resolve checkpoint identity before tokenizer/config parsing so every route fails at the
+        // same trust boundary and both tensor backends consume the exact same master family.
+        let artifacts = candle_gen::gen_core::resolve_sd3_text_encoder_artifacts(root)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
         let cfg_l = clip::Config::sdxl(); // CLIP-L (openai/clip-vit-large-patch14, embed 768)
         let cfg_g = clip::Config::sdxl2(); // OpenCLIP bigG (embed 1280)
 
@@ -282,8 +286,8 @@ impl Sd3TextEncoders {
         let tok_t5 = Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
 
-        let l_file = single_safetensors(root, "text_encoder")?;
-        let g_file = single_safetensors(root, "text_encoder_2")?;
+        let l_file = artifacts.clip_l;
+        let g_file = artifacts.clip_g;
         let clip_l = stable_diffusion::build_clip_transformer(&cfg_l, &l_file, device, dtype)?;
         let clip_g = stable_diffusion::build_clip_transformer(&cfg_g, &g_file, device, dtype)?;
         let proj_l = load_text_projection(&l_file, "text_encoder", device, dtype)?;
@@ -298,8 +302,7 @@ impl Sd3TextEncoders {
             serde_json::from_str(&cfg)
                 .map_err(|e| CandleError::Msg(format!("sd3: parse T5 config.json: {e}")))?
         };
-        let t5_files = safetensors_in(&t5_dir)?;
-        let t5_vb = candle_gen::mmap_var_builder(&t5_files, dtype, device)?;
+        let t5_vb = candle_gen::mmap_var_builder(&artifacts.t5_shards, dtype, device)?;
         let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
 
         Ok(Self {
@@ -426,32 +429,6 @@ impl Sd3TextEncoders {
     }
 }
 
-/// Resolve the single CLIP safetensors file in a snapshot component subdir.
-fn single_safetensors(root: &Path, sub: &str) -> CandleResult<std::path::PathBuf> {
-    let files = safetensors_in(&root.join(sub))?;
-    let [file] = files.as_slice() else {
-        return Err(CandleError::Msg(format!(
-            "sd3: {sub} CLIP encoder requires a single .safetensors file, found {} shards in {}",
-            files.len(),
-            root.join(sub).display()
-        )));
-    };
-    Ok(file.clone())
-}
-
-/// Sorted list of every `.safetensors` in `dir` (single-file or sharded), erroring if absent.
-fn safetensors_in(dir: &Path) -> CandleResult<Vec<std::path::PathBuf>> {
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "sd3 snapshot is missing the {} component directory",
-            dir.display()
-        )));
-    }
-    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
-    // above stays local.
-    candle_gen::sorted_safetensors(dir, "sd3")
-}
-
 /// Load a CLIP `text_projection.weight` (no bias) from a CLIP checkpoint into a [`Linear`]. SD3.5's
 /// CLIP-L and bigG are `CLIPTextModelWithProjection`s — `build_clip_transformer` reads only the
 /// `text_model.*`; the pooled head's projection lives at the top level as `text_projection.weight`.
@@ -562,19 +539,20 @@ mod tests {
     }
 
     #[test]
-    fn single_safetensors_rejects_sharded_clip_encoder() {
+    fn load_rejects_sharded_clip_before_backend_or_tokenizer_work() {
         let root = tempfile::tempdir().unwrap();
         let component = root.path().join("text_encoder");
         std::fs::create_dir(&component).unwrap();
+        std::fs::write(component.join("model.safetensors"), []).unwrap();
         std::fs::write(component.join("model-00001-of-00002.safetensors"), []).unwrap();
-        std::fs::write(component.join("model-00002-of-00002.safetensors"), []).unwrap();
 
-        let error = single_safetensors(root.path(), "text_encoder")
-            .unwrap_err()
-            .to_string();
+        let error = match Sd3TextEncoders::load(root.path(), 256, &Device::Cpu, DType::F32) {
+            Ok(_) => panic!("sharded CLIP fixture unexpectedly loaded"),
+            Err(error) => error.to_string(),
+        };
         assert!(
-            error.contains("text_encoder CLIP encoder requires a single .safetensors file")
-                && error.contains("found 2 shards"),
+            error.contains("CLIP component `text_encoder` is sharded")
+                && error.contains("one authoritative `model.safetensors`"),
             "unexpected error: {error}"
         );
     }

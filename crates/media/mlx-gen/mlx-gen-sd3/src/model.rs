@@ -401,59 +401,69 @@ impl Sd3Large {
                     steps,
                 ))?;
 
-                let mut images = Vec::with_capacity(req.count as usize);
                 let attention = crate::memory_strategy::attention_plan(req);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
-                for i in 0..req.count {
-                    let seed = base_seed.wrapping_add(i as u64);
-                    let latents = if let Some((init, _)) = reference {
-                        pipeline::denoise_img2img_cfg_with_memory(
-                            &heavy.transformer,
-                            &scheduler,
-                            sampler_name,
-                            seed,
+                let images = mlx_gen::gen_core::map_sd3_seeded_outputs(
+                    reference.map(|(image, _)| image),
+                    base_seed,
+                    req.count,
+                    |init| {
+                        let clean =
+                            pipeline::encode_reference(&heavy.vae, init, req.width, req.height)?;
+                        // MLX is lazy: force the clean latent while the one reference-encode graph is
+                        // current so per-seed denoising reuses data, not a deferred VAE graph.
+                        mlx_rs::transforms::eval([&clean])?;
+                        Ok(clean)
+                    },
+                    |seed, clean| {
+                        let latents = if let Some(clean) = clean {
+                            pipeline::denoise_img2img_from_clean_cfg_with_memory(
+                                &heavy.transformer,
+                                &scheduler,
+                                sampler_name,
+                                seed,
+                                clean,
+                                strength,
+                                req.width,
+                                req.height,
+                                steps,
+                                &cond,
+                                uncond.as_ref(),
+                                guidance,
+                                &req.cancel,
+                                on_progress,
+                                &req.preview,
+                                attention,
+                                transformer_window,
+                            )?
+                        } else {
+                            let latents = pipeline::create_noise(seed, req.width, req.height)?;
+                            pipeline::denoise_cfg_with_memory(
+                                &heavy.transformer,
+                                &scheduler,
+                                sampler_name,
+                                seed,
+                                latents,
+                                &cond,
+                                uncond.as_ref(),
+                                guidance,
+                                &req.cancel,
+                                on_progress,
+                                &req.preview,
+                                attention,
+                                transformer_window,
+                            )?
+                        };
+                        on_progress(Progress::Decoding);
+                        pipeline::decode_to_image_tiled(
                             &heavy.vae,
-                            init,
-                            strength,
-                            req.width,
-                            req.height,
-                            steps,
-                            &cond,
-                            uncond.as_ref(),
-                            guidance,
+                            &latents,
+                            decode_tiling.as_ref(),
                             &req.cancel,
-                            on_progress,
-                            &req.preview,
-                            attention,
-                            transformer_window,
-                        )?
-                    } else {
-                        let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                        pipeline::denoise_cfg_with_memory(
-                            &heavy.transformer,
-                            &scheduler,
-                            sampler_name,
-                            seed,
-                            latents,
-                            &cond,
-                            uncond.as_ref(),
-                            guidance,
-                            &req.cancel,
-                            on_progress,
-                            &req.preview,
-                            attention,
-                            transformer_window,
-                        )?
-                    };
-                    on_progress(Progress::Decoding);
-                    images.push(pipeline::decode_to_image_tiled(
-                        &heavy.vae,
-                        &latents,
-                        decode_tiling.as_ref(),
-                        &req.cancel,
-                    )?);
-                }
+                        )
+                    },
+                )?;
                 Ok(GenerationOutput::Images(images))
             },
         )

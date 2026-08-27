@@ -393,17 +393,65 @@ pub(crate) fn denoise_img2img_cfg_with_memory(
     attention: mlx_gen::attention::AttentionPlan<'_>,
     transformer_window: Option<usize>,
 ) -> Result<Array> {
+    let clean = encode_reference(vae, init, width, height)?;
+    denoise_img2img_from_clean_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        &clean,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        attention,
+        transformer_window,
+    )
+}
+
+/// Encode the seed-independent SD3 img2img reference into its normalized clean latent. Callers
+/// producing multiple outputs must materialize and reuse this value across their per-seed loop.
+pub fn encode_reference(vae: &Vae, init: &Image, width: u32, height: u32) -> Result<Array> {
     // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
     // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
     // unpacked.
     let image_nchw = preprocess_init_image(init, width, height)?;
-    let clean = vae.encode(&image_nchw)?;
+    vae.encode(&image_nchw)
+}
+
+/// Per-seed img2img denoise from an already encoded clean reference latent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_from_clean_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    clean: &Array,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     let noise = create_noise(seed, width, height)?;
 
     // Start step from strength; blend clean⊕noise at σ_k, then denoise sigmas[k..]. The schedule has
     // `steps + 1` sigmas, so clamp the start index inside it (strength ≥ 1 → the last usable step).
     let start = init_time_step(steps, Some(strength)).min(scheduler.sigmas.len().saturating_sub(1));
-    let x_start = add_noise_by_interpolation(&clean, &noise, scheduler.sigmas[start])?;
+    let x_start = add_noise_by_interpolation(clean, &noise, scheduler.sigmas[start])?;
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas[start..],
