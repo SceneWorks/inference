@@ -340,6 +340,7 @@ pub fn enhance_gemma4(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     #[test]
     fn clean_response_strips_leading_punctuation_and_whitespace() {
@@ -398,6 +399,21 @@ mod tests {
         assert!(GEMMA4_I2V_SYSTEM_PROMPT.contains("REFERENCE IMAGE"));
         assert_ne!(GEMMA4_T2V_SYSTEM_PROMPT, T2V_SYSTEM_PROMPT);
         assert_ne!(GEMMA4_I2V_SYSTEM_PROMPT, I2V_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn gemma4_v120_prompts_are_exact_pinned_upstream_bytes() {
+        let sha256 = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+        assert_eq!(GEMMA4_T2V_SYSTEM_PROMPT.len(), 3_769);
+        assert_eq!(
+            sha256(GEMMA4_T2V_SYSTEM_PROMPT.as_bytes()),
+            "0cddf69456bcd51e65430f848386295d9ac4d17d5df3ea65d5f3d8a9ad842f3c"
+        );
+        assert_eq!(GEMMA4_I2V_SYSTEM_PROMPT.len(), 4_708);
+        assert_eq!(
+            sha256(GEMMA4_I2V_SYSTEM_PROMPT.as_bytes()),
+            "15992bfb757d3bbd83f2d27ad86e450fc4caffa0f7cb7523772a60e346ef3fee"
+        );
     }
 
     #[test]

@@ -47,8 +47,12 @@
 //! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::{BufReader, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -91,6 +95,7 @@ use mlx_llm::core_llm::{ChatTemplate as CoreChatTemplate, JinjaChatTemplate, Mes
 use mlx_llm::models::{gemma4_mm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig};
 use mlx_llm::primitives::Weights as LlmWeights;
 use mlx_llm::{CausalLm, ModelConfig, PrefixCache};
+use sha2::{Digest, Sha256};
 
 /// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
@@ -99,6 +104,16 @@ pub const MODEL_25_ID: &str = "ltx_2_5";
 /// The stock, locally staged Gemma-4 instruction snapshot used only for opt-in LTX-2.5 prompt
 /// enhancement.  It lives below the single LTX rehost rather than in a job-time HF cache.
 const LTX25_ENHANCER_COMPONENT: &str = "enhancer";
+/// Rehost-owned inventory that must accompany the exact stock enhancer snapshot.
+const LTX25_ENHANCER_MANIFEST_FILE: &str = "sceneworks_asset_manifest.json";
+/// Canonical SC-18780 publication manifest. Its semantic inventory digest binds the source repo,
+/// immutable source revision, exact file names, byte lengths, and SHA-256 values.
+const LTX25_ENHANCER_MANIFEST: &str = include_str!("../assets/ltx25_enhancer_manifest.json");
+const LTX25_ENHANCER_SCHEMA: &str = "sceneworks-ltx25-enhancer-v1";
+const LTX25_ENHANCER_REPOSITORY: &str = "google/gemma-4-12b-it";
+const LTX25_ENHANCER_REVISION: &str = "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7";
+const LTX25_ENHANCER_INVENTORY_SHA256: &str =
+    "8e094af99d14d8639760b07be5d433306b404fa3380be1e5043a53700d731e7e";
 
 /// Upstream LTX-2 default negative conditioning for the non-distilled guided pipeline.  A caller's
 /// explicit `negative_prompt` replaces this text; an omitted field does not mean an all-zero or
@@ -2174,6 +2189,228 @@ fn ltx25_packed_chat_template(assets: &GemmaAssets) -> Result<JinjaChatTemplate>
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct EnhancerFileIdentity {
+    canonical: PathBuf,
+    device: u64,
+    inode: u64,
+    size: u64,
+    mtime: i64,
+    mtime_ns: i64,
+    ctime: i64,
+    ctime_ns: i64,
+}
+
+fn enhancer_file_identity(path: &Path) -> Result<EnhancerFileIdentity> {
+    let canonical = std::fs::canonicalize(path)?;
+    let metadata = std::fs::metadata(&canonical)?;
+    Ok(EnhancerFileIdentity {
+        canonical,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        mtime: metadata.mtime(),
+        mtime_ns: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_ns: metadata.ctime_nsec(),
+    })
+}
+
+fn enhancer_digest_cache() -> &'static Mutex<HashMap<EnhancerFileIdentity, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<EnhancerFileIdentity, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// SHA-256 a staged asset once per immutable filesystem identity. The stock model is ~22 GiB, so
+/// recomputing it on every enhanced request would erase the reusable-prefix win; device/inode,
+/// size, mtime and ctime invalidate the cache whenever the staged file is replaced or rewritten.
+fn enhancer_file_sha256(path: &Path, identity: &EnhancerFileIdentity) -> Result<String> {
+    if let Some(value) = enhancer_digest_cache()
+        .lock()
+        .map_err(|_| Error::Msg("ltx_2_5: enhancer digest cache poisoned".into()))?
+        .get(identity)
+        .cloned()
+    {
+        return Ok(value);
+    }
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut digest = Sha256::new();
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let value = format!("{:x}", digest.finalize());
+    if enhancer_file_identity(path).ok().as_ref() != Some(identity) {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer asset {} changed while its identity was verified",
+            path.display()
+        )));
+    }
+    enhancer_digest_cache()
+        .lock()
+        .map_err(|_| Error::Msg("ltx_2_5: enhancer digest cache poisoned".into()))?
+        .insert(identity.clone(), value.clone());
+    Ok(value)
+}
+
+fn manifest_string<'a>(manifest: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    manifest
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Msg(format!("ltx_2_5: enhancer manifest needs string `{key}`")))
+}
+
+/// Recompute the manifest's semantic digest independent of JSON whitespace/key order.
+fn ltx25_enhancer_inventory_sha256(manifest: &serde_json::Value) -> Result<String> {
+    let schema = manifest_string(manifest, "schema_version")?;
+    let repository = manifest_string(manifest, "source_repository")?;
+    let revision = manifest_string(manifest, "source_revision")?;
+    let files = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| Error::Msg("ltx_2_5: enhancer manifest needs object `files`".into()))?;
+    let mut digest = Sha256::new();
+    for value in [schema, repository, revision] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    let mut names: Vec<&str> = files.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    for name in names {
+        let entry = &files[name];
+        let bytes = entry
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "ltx_2_5: enhancer manifest file `{name}` needs integer `bytes`"
+                ))
+            })?;
+        let sha256 = entry
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "ltx_2_5: enhancer manifest file `{name}` needs lowercase SHA-256"
+                ))
+            })?;
+        for value in [name.to_owned(), bytes.to_string(), sha256.to_owned()] {
+            digest.update(value.as_bytes());
+            digest.update([0]);
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Require SC-18780's exact publication inventory before consulting any model config or mapping
+/// any weights. The manifest is copied into `enhancer/` alongside the stock snapshot and is fully
+/// reproducible offline from that snapshot's file sizes and SHA-256 values.
+fn validate_ltx25_enhancer_manifest(enhancer: &Path) -> Result<serde_json::Value> {
+    let canonical: serde_json::Value =
+        serde_json::from_str(LTX25_ENHANCER_MANIFEST).map_err(|error| {
+            Error::Msg(format!(
+                "ltx_2_5: embedded enhancer manifest invalid: {error}"
+            ))
+        })?;
+    let computed = ltx25_enhancer_inventory_sha256(&canonical)?;
+    if computed != LTX25_ENHANCER_INVENTORY_SHA256
+        || manifest_string(&canonical, "inventory_sha256")? != computed
+    {
+        return Err(Error::Msg(
+            "ltx_2_5: embedded enhancer inventory digest is inconsistent".into(),
+        ));
+    }
+    if manifest_string(&canonical, "schema_version")? != LTX25_ENHANCER_SCHEMA
+        || manifest_string(&canonical, "source_repository")? != LTX25_ENHANCER_REPOSITORY
+        || manifest_string(&canonical, "source_revision")? != LTX25_ENHANCER_REVISION
+    {
+        return Err(Error::Msg(
+            "ltx_2_5: embedded enhancer source identity is inconsistent".into(),
+        ));
+    }
+
+    let path = enhancer.join(LTX25_ENHANCER_MANIFEST_FILE);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        Error::Msg(format!(
+            "ltx_2_5: prompt enhancement requires the offline {LTX25_ENHANCER_REPOSITORY} \
+             snapshot plus {LTX25_ENHANCER_MANIFEST_FILE} staged at {}; {error}. No job-time \
+             download is attempted",
+            enhancer.display()
+        ))
+    })?;
+    let staged: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::Msg(format!(
+            "ltx_2_5: enhancer asset manifest {} is invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    if staged != canonical
+        || manifest_string(&staged, "inventory_sha256")? != LTX25_ENHANCER_INVENTORY_SHA256
+        || ltx25_enhancer_inventory_sha256(&staged)? != LTX25_ENHANCER_INVENTORY_SHA256
+    {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer asset manifest {} does not identify exact \
+             {LTX25_ENHANCER_REPOSITORY}@{LTX25_ENHANCER_REVISION}",
+            path.display()
+        )));
+    }
+    Ok(staged)
+}
+
+fn validate_ltx25_enhancer_file(
+    enhancer: &Path,
+    manifest: &serde_json::Value,
+    name: &str,
+) -> Result<()> {
+    let entry = manifest
+        .get("files")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|files| files.get(name))
+        .ok_or_else(|| Error::Msg(format!("ltx_2_5: enhancer manifest is missing `{name}`")))?;
+    let expected_bytes = entry
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| Error::Msg(format!("ltx_2_5: enhancer manifest `{name}` has no size")))?;
+    let expected_sha256 = entry
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Msg(format!("ltx_2_5: enhancer manifest `{name}` has no digest")))?;
+    let path = enhancer.join(name);
+    if !path.is_file() {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: exact stock enhancer is missing `{name}` at {}",
+            enhancer.display()
+        )));
+    }
+    let identity = enhancer_file_identity(&path)?;
+    if identity.size != expected_bytes {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer asset `{name}` is {} bytes, expected {expected_bytes} for \
+             {LTX25_ENHANCER_REPOSITORY}@{LTX25_ENHANCER_REVISION}",
+            identity.size
+        )));
+    }
+    let actual = enhancer_file_sha256(&path, &identity)?;
+    if actual != expected_sha256 {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer asset `{name}` digest mismatch (got {actual}, expected \
+             {expected_sha256} for {LTX25_ENHANCER_REPOSITORY}@{LTX25_ENHANCER_REVISION})"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate the immutable, offline asset identity before `Weights::from_dir` maps any tensor.
 /// A version/config/template mismatch is a request error rather than a fallback to a different
 /// model or chat format.  Kept free-standing so the weights-free provider tests exercise the same
@@ -2181,21 +2418,11 @@ fn ltx25_packed_chat_template(assets: &GemmaAssets) -> Result<JinjaChatTemplate>
 fn validate_ltx25_enhancer_snapshot(
     enhancer: &Path,
 ) -> Result<(ModelConfig, serde_json::Value, Option<serde_json::Value>)> {
-    for file in [
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "processor_config.json",
-    ] {
-        let path = enhancer.join(file);
-        if !path.is_file() {
-            return Err(Error::Msg(format!(
-                "ltx_2_5: prompt enhancement requires the offline google/gemma-4-12B-it \
-                 snapshot staged at {}; missing {file}. No job-time download is attempted",
-                enhancer.display()
-            )));
-        }
-    }
+    let manifest = validate_ltx25_enhancer_manifest(enhancer)?;
+    // Config first: a matching-but-wrong Gemma-4 snapshot fails on its exact config digest without
+    // ever touching the 22 GiB model file. The remaining complete inventory is still verified below
+    // before `load_ltx25_enhancer` reaches `LlmWeights::from_dir`.
+    validate_ltx25_enhancer_file(enhancer, &manifest, "config.json")?;
     let config_text = std::fs::read_to_string(enhancer.join("config.json"))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
         Error::Msg(format!(
@@ -2206,10 +2433,15 @@ fn validate_ltx25_enhancer_snapshot(
     let model_type = config_json
         .get("model_type")
         .and_then(serde_json::Value::as_str);
-    if !matches!(model_type, Some("gemma4" | "gemma4_unified")) {
+    if model_type != Some("gemma4_unified")
+        || config_json.get("architectures")
+            != Some(&serde_json::json!([
+                "Gemma4UnifiedForConditionalGeneration"
+            ]))
+    {
         return Err(Error::Msg(format!(
-            "ltx_2_5: enhancer at {} declares model_type={model_type:?}; expected the stock Gemma-4 \
-             model_type `gemma4` or `gemma4_unified`",
+            "ltx_2_5: enhancer at {} does not declare the exact stock Gemma-4 unified config \
+             (model_type={model_type:?})",
             enhancer.display()
         )));
     }
@@ -2228,6 +2460,16 @@ fn validate_ltx25_enhancer_snapshot(
             enhancer.display(),
             cfg.final_logit_softcap
         )));
+    }
+    for file in [
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+        "chat_template.jinja",
+        "model.safetensors",
+    ] {
+        validate_ltx25_enhancer_file(enhancer, &manifest, file)?;
     }
     let _: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         enhancer.join("tokenizer_config.json"),
@@ -2980,16 +3222,38 @@ mod tests {
     fn ltx25_enhancer_asset_gate_fails_loudly_before_any_weight_or_network_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let err = validate_ltx25_enhancer_snapshot(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("offline google/gemma-4-12B-it"));
+        assert!(err.to_string().contains("offline google/gemma-4-12b-it"));
 
-        std::fs::write(dir.path().join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
-        std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("processor_config.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join(LTX25_ENHANCER_MANIFEST_FILE),
+            LTX25_ENHANCER_MANIFEST,
+        )
+        .unwrap();
+        // Same public Gemma-4 unified identity strings, but not the exact stock config. Pad it to
+        // the stock byte length so the content digest, rather than the size check, discriminates it.
+        let mut wrong = r#"{"model_type":"gemma4_unified","architectures":["Gemma4UnifiedForConditionalGeneration"],"text_config":{"final_logit_softcapping":30.0}}"#.to_owned();
+        wrong.push_str(&" ".repeat(4_423 - wrong.len()));
+        std::fs::write(dir.path().join("config.json"), wrong).unwrap();
         let err = validate_ltx25_enhancer_snapshot(dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("declares model_type=Some(\"llama\")"));
+        assert!(err.to_string().contains("config.json` digest mismatch"));
+    }
+
+    #[test]
+    fn ltx25_enhancer_publication_manifest_has_the_sealed_offline_inventory_digest() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(LTX25_ENHANCER_MANIFEST).expect("embedded manifest JSON");
+        assert_eq!(
+            manifest_string(&manifest, "source_repository").unwrap(),
+            LTX25_ENHANCER_REPOSITORY
+        );
+        assert_eq!(
+            manifest_string(&manifest, "source_revision").unwrap(),
+            LTX25_ENHANCER_REVISION
+        );
+        assert_eq!(
+            ltx25_enhancer_inventory_sha256(&manifest).unwrap(),
+            LTX25_ENHANCER_INVENTORY_SHA256
+        );
     }
 
     #[test]
