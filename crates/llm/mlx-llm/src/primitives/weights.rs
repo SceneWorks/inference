@@ -203,4 +203,52 @@ mod tests {
     fn weights_fixture_is_self_removing() {
         assert_fixture_is_self_removing(Fixture::new("mlx-llm-weights-test-", None));
     }
+
+    /// The view-drain primitive the sequential decoder stack is built on (sc-18798).
+    ///
+    /// Two properties, and the second is the one that makes it worth having over a prefix sweep:
+    ///
+    /// 1. `remove_accessed` drops exactly what was read since the last drain, and resets the set —
+    ///    so draining after layer 0 must not touch layer 1's tensors.
+    /// 2. A key under the drained prefix that was **not** read survives, and `unused_keys` names it.
+    ///    `remove_prefix("model.layers.0.")` would delete it along with the rest, turning an omitted
+    ///    constructor read into silence.
+    ///
+    /// MUTATION: make `remove_accessed` sweep by prefix instead of by access set, and the
+    /// `never_read` assertion goes RED. Make `require`/`get` stop recording, and the first
+    /// `len()` assertion goes RED.
+    #[test]
+    fn remove_accessed_drains_exactly_what_was_read() {
+        let t = |v: f32| Array::from_slice(&[v], &[1]);
+        let mut m = HashMap::new();
+        m.insert("model.layers.0.q".to_string(), t(0.0));
+        m.insert("model.layers.0.k".to_string(), t(1.0));
+        m.insert("model.layers.0.never_read".to_string(), t(2.0));
+        m.insert("model.layers.1.q".to_string(), t(3.0));
+        let mut w = Weights::from_map(m);
+        assert_eq!(w.unused_keys().len(), 4, "nothing has been read yet");
+
+        // "Build layer 0" — read its q and k, but not `never_read`.
+        w.require("model.layers.0.q").expect("q");
+        w.get("model.layers.0.k").expect("k");
+        w.remove_accessed();
+
+        assert_eq!(w.len(), 2, "exactly the two read tensors were dropped");
+        assert!(
+            w.contains("model.layers.0.never_read"),
+            "a key under the same prefix that the layer did NOT read must survive the drain — a \
+             prefix sweep would delete it and hide the omitted read"
+        );
+        assert!(
+            w.contains("model.layers.1.q"),
+            "the next layer's tensors must be untouched"
+        );
+
+        // The access set reset with the drain: reading layer 1 and draining again must not
+        // retroactively remove anything else.
+        w.require("model.layers.1.q").expect("layer 1 q");
+        w.remove_accessed();
+        assert_eq!(w.keys().collect::<Vec<_>>(), ["model.layers.0.never_read"]);
+        assert_eq!(w.unused_keys(), ["model.layers.0.never_read"]);
+    }
 }
