@@ -46,7 +46,9 @@
 //! I2V+Audio. The VAE **encoder** is loaded **lazily** on first encode, so pure-T2V runs never pay
 //! its resident cost (F-048). LoRA/LoKr are sibling slices.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -80,14 +82,15 @@ use crate::pipeline::{
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
-use crate::tokenizer::{Ltx25Tokenizer, LtxTokenizer};
+use crate::tokenizer::{GemmaAssets, Ltx25Tokenizer, LtxTokenizer};
 use crate::transformer::{AvDiT, Precision};
 use crate::upsampler::LatentUpsampler;
 use crate::vae::LtxVideoVae;
 use crate::vocoder::LtxVocoder;
 use mlx_llm::core_llm::{ChatTemplate as CoreChatTemplate, JinjaChatTemplate, Message};
+use mlx_llm::models::{gemma4_mm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig};
 use mlx_llm::primitives::Weights as LlmWeights;
-use mlx_llm::{CausalLm, ModelConfig};
+use mlx_llm::{CausalLm, ModelConfig, PrefixCache};
 
 /// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
@@ -377,6 +380,7 @@ enum TextAssets {
         connector: PathBuf,
         offload_policy: mlx_gen::gen_core::OffloadPolicy,
         enhancer: PathBuf,
+        enhancer_template: JinjaChatTemplate,
     },
 }
 
@@ -480,6 +484,9 @@ pub struct Ltx {
     /// provisioned it; a request that sets `use_uncensored_enhancer` without it staged is a
     /// generate-time actionable error (no `$LTX_UNCENSORED_GEMMA_DIR` / HF-cache scan any more).
     uncensored_enhancer: Option<PathBuf>,
+    /// Reuses the immutable Gemma-4 system-prefix KV between enhancement requests. I2V prefills
+    /// remain request-local because their image embeddings are input-specific.
+    enhancer_cache: Option<Rc<RefCell<PrefixCache>>>,
     // The small components (each ≪ the TE / DiT) stay resident — the AvDiT is the denoise peak and the
     // Gemma drop is the win (sc-10976). Staging these too would add parity risk for ~no memory gain.
     upsampler: LatentUpsampler,
@@ -810,6 +817,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         },
         execution: LtxExecution::Ltx23,
         uncensored_enhancer,
+        enhancer_cache: None,
         upsampler,
         vae,
         audio_decoder,
@@ -828,6 +836,7 @@ pub struct Ltx25 {
     descriptor: ModelDescriptor,
     spec: LoadSpec,
     variant: TransformerVariant,
+    enhancer_cache: Rc<RefCell<PrefixCache>>,
 }
 
 /// Resolve the LTX-2.5 split layout through the ordinary provider registration. The actual tensor
@@ -872,6 +881,7 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor_25_for_variant(variant),
         spec: spec.clone(),
         variant,
+        enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
     }))
 }
 
@@ -947,7 +957,7 @@ fn ltx25_encoder_path(
     }
 }
 
-fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
+fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Result<Ltx> {
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
     let variant = crate::dev_sampler::from_bundle(&bundle)?;
     let config = LtxConfig::from_bundle(&bundle)?;
@@ -1030,7 +1040,9 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
         .require(LtxComponent::TextEncoder)?
         .path()
         .to_path_buf();
-    let tokenizer = Ltx25Tokenizer::from_packed_te_file(&te_path)?;
+    let assets = GemmaAssets::load(&te_path)?;
+    let tokenizer = Ltx25Tokenizer::from_assets(&assets)?;
+    let enhancer_template = ltx25_packed_chat_template(&assets)?;
     let enhancer = ltx25_enhancer_dir(spec)?;
     let duration_w = Weights::from_file(bundle.require(LtxComponent::DurationHead)?.path())?;
     let duration_head = DurationHead::from_weights(&duration_w)?;
@@ -1055,6 +1067,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             connector,
             offload_policy: spec.offload_policy,
             enhancer,
+            enhancer_template,
         },
         execution: LtxExecution::Ltx25(Box::new(Ltx25Execution {
             variant,
@@ -1063,6 +1076,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             decoder,
         })),
         uncensored_enhancer: None,
+        enhancer_cache: Some(enhancer_cache),
         upsampler,
         vae,
         audio_decoder,
@@ -1921,7 +1935,7 @@ impl Ltx {
     /// LTX-2.5 rehost.  This is intentionally demand-loaded: an ordinary request never needs its
     /// extra model, while an enhanced request gets a precise local remediation instead of a hidden
     /// cache lookup or fallback to the packed LTX text encoder.
-    fn load_ltx25_enhancer(&self) -> Result<(CausalLm, TextTokenizer, JinjaChatTemplate)> {
+    fn load_ltx25_enhancer(&self) -> Result<(CausalLm, TextTokenizer, Gemma4Mm, usize)> {
         let TextAssets::Gemma4 { enhancer, .. } = &self.text_assets else {
             return Err(Error::Msg(
                 "ltx_2_5 enhancer selected on a non-2.5 provider route".into(),
@@ -1938,13 +1952,31 @@ impl Ltx {
                 )));
             }
         }
-        let cfg = validate_ltx25_enhancer_snapshot(enhancer)?;
+        let (cfg, config_json, processor_json) = validate_ltx25_enhancer_snapshot(enhancer)?;
+        let vocab_size = cfg.vocab_size as usize;
         let weights = LlmWeights::from_dir(enhancer).map_err(|e| {
             Error::Msg(format!(
                 "ltx_2_5: staged enhancer weights at {} are unusable: {e}",
                 enhancer.display()
             ))
         })?;
+        let layout = Gemma4Layout::detect(&weights).map_err(|e| {
+            Error::Msg(format!(
+                "ltx_2_5: staged enhancer at {} has no recognized Gemma-4 tensor layout: {e}",
+                enhancer.display()
+            ))
+        })?;
+        let mm_cfg = Gemma4MmConfig::from_json(&config_json, processor_json.as_ref())
+            .map_err(|e| Error::Msg(format!("ltx_2_5: invalid Gemma-4 multimodal config: {e}")))?;
+        let mm = Gemma4Mm::from_weights(&weights, layout, mm_cfg)
+            .map_err(|e| Error::Msg(format!("ltx_2_5: invalid Gemma-4 vision weights: {e}")))?;
+        if mm.vision.is_none() {
+            return Err(Error::Msg(format!(
+                "ltx_2_5: enhancer at {} has no complete Gemma-4 vision/projector tensors; I2V \
+                 prompt enhancement cannot be advertised",
+                enhancer.display()
+            )));
+        }
         let model = CausalLm::from_weights(&weights, "", cfg).map_err(|e| {
             Error::Msg(format!(
                 "ltx_2_5: staged enhancer at {} does not match its Gemma-4 config: {e}",
@@ -1960,8 +1992,7 @@ impl Ltx {
                 pad_to_max_length: false,
             },
         )?;
-        let template = ltx25_enhancer_chat_template(enhancer)?;
-        Ok((model, tokenizer, template))
+        Ok((model, tokenizer, mm, vocab_size))
     }
 
     /// Run stock-Gemma enhancement with the snapshot's own template, then make that exact returned
@@ -1977,39 +2008,44 @@ impl Ltx {
                     .into(),
             ));
         }
-        let (model, tokenizer, template) = self.load_ltx25_enhancer()?;
-        let system = if req
+        let (model, tokenizer, mm, vocab_size) = self.load_ltx25_enhancer()?;
+        let reference = req
             .conditioning
             .iter()
-            .any(|c| matches!(c, Conditioning::Reference { .. }))
-        {
-            enhance::I2V_SYSTEM_PROMPT
-        } else {
-            enhance::T2V_SYSTEM_PROMPT
+            .find_map(|condition| match condition {
+                Conditioning::Reference { image, .. } => Some(image),
+                _ => None,
+            });
+        let TextAssets::Gemma4 {
+            enhancer_template, ..
+        } = &self.text_assets
+        else {
+            unreachable!("Gemma-4 enhancement only runs on the 2.5 text-assets route")
         };
-        let rendered = template
-            .render(
-                &[
-                    Message::system(system),
-                    Message::user(format!("user prompt: {}", req.prompt)),
-                ],
-                true,
-            )
+        let (system, user) = ltx25_enhancer_turn(&req.prompt, reference.is_some());
+        let rendered = enhancer_template
+            .render(&[Message::system(system), Message::user(user)], true)
             .map_err(|e| Error::Msg(format!("ltx_2_5: enhancer chat template mismatch: {e}")))?;
-        let cfg = EnhanceConfig {
-            max_tokens: enhance::clamp_max_tokens(req.enhance_max_tokens),
-            seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
+        let prompt_ids = tokenizer.encode_ids(&rendered, false)?;
+        let prefill = match reference {
+            Some(image) => ltx25_i2v_enhancer_prefill(&model, &mm, prompt_ids, image)?,
+            None => enhance::Gemma4EnhancePrefill::Text(prompt_ids),
         };
+        let cfg = EnhanceConfig {
+            max_tokens: enhance::clamp_gemma4_max_tokens(req.enhance_max_tokens),
+            seed: req.seed.unwrap_or(enhance::GEMMA4_DEFAULT_SEED),
+        };
+        let cache = self.enhancer_cache.as_ref().ok_or_else(|| {
+            Error::Msg("ltx_2_5: Gemma-4 enhancer cache is absent from the 2.5 route".into())
+        })?;
         let prompt = enhance::enhance_gemma4(
             &model,
             &tokenizer,
-            &rendered,
+            prefill,
             &cfg,
-            &SampleParams::censored(
-                req.enhance_temperature
-                    .unwrap_or(enhance::DEFAULT_TEMPERATURE),
-            ),
-            Some(&req.cancel),
+            vocab_size,
+            &req.cancel,
+            &mut cache.borrow_mut(),
         )?;
         if prompt.trim().is_empty() {
             return Err(Error::Msg(
@@ -2023,17 +2059,99 @@ impl Ltx {
     }
 }
 
-/// Prefer the snapshot's sidecar template — Gemma-4 ships it there — and only then accept the
-/// embedded tokenizer-config form.  There is deliberately no generic chat-format fallback.
-fn ltx25_enhancer_chat_template(enhancer: &Path) -> Result<JinjaChatTemplate> {
-    let tokenizer_config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-        enhancer.join("tokenizer_config.json"),
-    )?)
-    .map_err(|e| {
-        Error::Msg(format!(
-            "ltx_2_5: enhancer tokenizer_config.json is invalid: {e}"
-        ))
+/// Exact v1.2.0 Gemma-4 conversation payload. The image marker occupies the image content item in
+/// the upstream multimodal message; the stock tokenizer maps it to `image_token_id`, which the
+/// prefill path expands and replaces with projected patch rows.
+fn ltx25_enhancer_turn(prompt: &str, is_i2v: bool) -> (&'static str, String) {
+    if is_i2v {
+        (
+            enhance::GEMMA4_I2V_SYSTEM_PROMPT,
+            format!("<|image|>User Raw Input Prompt: {prompt}."),
+        )
+    } else {
+        (
+            enhance::GEMMA4_T2V_SYSTEM_PROMPT,
+            format!("user prompt: {prompt}"),
+        )
+    }
+}
+
+/// Prepare the actual Gemma-4 I2V prefill: resize to an aspect-preserving soft-token grid,
+/// channel-major patchify, run `patch_dense` + norms/position table + multimodal projector, expand
+/// the single image marker to `boi + image_token*N + eoi`, and splice those projected rows into the
+/// decoder input embeddings.
+fn ltx25_i2v_enhancer_prefill(
+    model: &CausalLm,
+    mm: &Gemma4Mm,
+    prompt_ids: Vec<i32>,
+    image: &Image,
+) -> Result<enhance::Gemma4EnhancePrefill> {
+    let tower = mm.vision.as_ref().ok_or_else(|| {
+        Error::Msg("ltx_2_5: Gemma-4 enhancer has no vision/projector path for I2V".into())
     })?;
+    let expected = image.width as usize * image.height as usize * 3;
+    if image.pixels.len() != expected {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: I2V enhancer image {}x{} needs {expected} RGB bytes, got {}",
+            image.width,
+            image.height,
+            image.pixels.len()
+        )));
+    }
+    let cfg = tower.config();
+    let (gh, gw) = gemma4_mm::soft_token_grid(
+        image.width as usize,
+        image.height as usize,
+        cfg.max_soft_tokens,
+    );
+    let (target_w, target_h) = (gw * cfg.patch_pixels, gh * cfg.patch_pixels);
+    let resized = mlx_llm::image::resize_bicubic_u8(
+        &image.pixels,
+        image.height as usize,
+        image.width as usize,
+        target_h,
+        target_w,
+    )
+    .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer image resize: {e}")))?;
+    let flat = gemma4_mm::patchify(&resized, target_w, target_h, cfg.patch_pixels)
+        .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer patchify: {e}")))?;
+    let patches = gemma4_mm::patch_array(&flat, cfg.patch_elems())
+        .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer patch tensor: {e}")))?;
+    let features = tower
+        .forward(&patches, (gh, gw))
+        .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer vision/projector: {e}")))?;
+    let expanded = gemma4_mm::expand_framed_placeholders(
+        &prompt_ids,
+        mm.cfg.image_token_id,
+        mm.cfg.boi_token_id,
+        mm.cfg.eoi_token_id,
+        &[gh * gw],
+    )
+    .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer image marker: {e}")))?;
+    let ids = Array::from_slice(&expanded, &[1, expanded.len() as i32]);
+    let embeds = model
+        .embed_input_ids(&ids)
+        .and_then(|embeds| {
+            model.splice_image_features(&embeds, &expanded, &features, mm.cfg.image_token_id)
+        })
+        .map_err(|e| Error::Msg(format!("ltx_2_5: I2V enhancer embedding splice: {e}")))?;
+    Ok(enhance::Gemma4EnhancePrefill::Multimodal {
+        input_ids: expanded,
+        embeds,
+    })
+}
+
+/// Build the enhancer chat renderer from the LTX-2.5 text encoder's packed
+/// `hf_asset__chat_template.jinja`. This is the story's single template authority; the separately
+/// staged stock decoder contributes weights/tokenizer/processor, not a competing conversation
+/// format.
+fn ltx25_packed_chat_template(assets: &GemmaAssets) -> Result<JinjaChatTemplate> {
+    let tokenizer_config: serde_json::Value =
+        serde_json::from_slice(assets.sidecar("tokenizer_config.json")?).map_err(|e| {
+            Error::Msg(format!(
+                "ltx_2_5: packed enhancer tokenizer_config.json is invalid: {e}"
+            ))
+        })?;
     let token = |name: &str| match tokenizer_config.get(name) {
         Some(serde_json::Value::String(value)) => value.clone(),
         Some(serde_json::Value::Object(value)) => value
@@ -2043,31 +2161,32 @@ fn ltx25_enhancer_chat_template(enhancer: &Path) -> Result<JinjaChatTemplate> {
             .to_string(),
         _ => String::new(),
     };
-    let sidecar = enhancer.join("chat_template.jinja");
-    if sidecar.is_file() {
-        let source = std::fs::read_to_string(&sidecar)?;
-        if !source.trim().is_empty() {
-            return Ok(JinjaChatTemplate::with_tokens(
-                source,
-                token("bos_token"),
-                token("eos_token"),
-            ));
-        }
+    let source = assets.sidecar_str("chat_template.jinja")?;
+    if source.trim().is_empty() {
+        return Err(Error::Msg(
+            "ltx_2_5: packed hf_asset__chat_template.jinja is empty".into(),
+        ));
     }
-    JinjaChatTemplate::from_tokenizer_config(&tokenizer_config).map_err(|e| {
-        Error::Msg(format!(
-            "ltx_2_5: enhancer at {} has no usable Gemma-4 chat template: {e}",
-            enhancer.display()
-        ))
-    })
+    Ok(JinjaChatTemplate::with_tokens(
+        source,
+        token("bos_token"),
+        token("eos_token"),
+    ))
 }
 
 /// Validate the immutable, offline asset identity before `Weights::from_dir` maps any tensor.
 /// A version/config/template mismatch is a request error rather than a fallback to a different
 /// model or chat format.  Kept free-standing so the weights-free provider tests exercise the same
 /// gate the ordinary route executes.
-fn validate_ltx25_enhancer_snapshot(enhancer: &Path) -> Result<ModelConfig> {
-    for file in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
+fn validate_ltx25_enhancer_snapshot(
+    enhancer: &Path,
+) -> Result<(ModelConfig, serde_json::Value, Option<serde_json::Value>)> {
+    for file in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processor_config.json",
+    ] {
         let path = enhancer.join(file);
         if !path.is_file() {
             return Err(Error::Msg(format!(
@@ -2084,6 +2203,16 @@ fn validate_ltx25_enhancer_snapshot(enhancer: &Path) -> Result<ModelConfig> {
             enhancer.join("config.json").display()
         ))
     })?;
+    let model_type = config_json
+        .get("model_type")
+        .and_then(serde_json::Value::as_str);
+    if !matches!(model_type, Some("gemma4" | "gemma4_unified")) {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer at {} declares model_type={model_type:?}; expected the stock Gemma-4 \
+             model_type `gemma4` or `gemma4_unified`",
+            enhancer.display()
+        )));
+    }
     let cfg = ModelConfig::from_json(&config_json)
         .map_err(|e| Error::Msg(format!("ltx_2_5: invalid Gemma-4 enhancer config: {e}")))?;
     if !cfg.is_gemma4() {
@@ -2093,7 +2222,14 @@ fn validate_ltx25_enhancer_snapshot(enhancer: &Path) -> Result<ModelConfig> {
             enhancer.display()
         )));
     }
-    let tokenizer_config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+    if cfg.final_logit_softcap != Some(30.0) {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: enhancer at {} declares final_logit_softcapping={:?}, expected exactly 30.0",
+            enhancer.display(),
+            cfg.final_logit_softcap
+        )));
+    }
+    let _: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         enhancer.join("tokenizer_config.json"),
     )?)
     .map_err(|e| {
@@ -2101,20 +2237,15 @@ fn validate_ltx25_enhancer_snapshot(enhancer: &Path) -> Result<ModelConfig> {
             "ltx_2_5: enhancer tokenizer_config.json is invalid: {e}"
         ))
     })?;
-    let sidecar = enhancer.join("chat_template.jinja");
-    let has_template = sidecar.is_file()
-        && std::fs::read_to_string(&sidecar)
-            .map(|source| !source.trim().is_empty())
-            .unwrap_or(false)
-        || tokenizer_config.get("chat_template").is_some();
-    if !has_template {
-        return Err(Error::Msg(format!(
-            "ltx_2_5: enhancer at {} has no chat_template.jinja or tokenizer-config chat_template; \
-             refusing an incompatible fallback format",
-            enhancer.display()
-        )));
-    }
-    Ok(cfg)
+    let processor_json = serde_json::from_str(&std::fs::read_to_string(
+        enhancer.join("processor_config.json"),
+    )?)
+    .map_err(|e| {
+        Error::Msg(format!(
+            "ltx_2_5: enhancer processor_config.json is invalid: {e}"
+        ))
+    })?;
+    Ok((cfg, config_json, Some(processor_json)))
 }
 
 impl Generator for Ltx25 {
@@ -2135,6 +2266,13 @@ impl Generator for Ltx25 {
                     .into(),
             ));
         }
+        if req.enhance_prompt && req.enhance_temperature.is_some() {
+            return Err(mlx_gen::gen_core::Error::Unsupported(
+                "ltx_2_5: enhance_temperature is not selectable; Gemma-4 enhancement uses the \
+                 v1.2.0 greedy generation policy with no_repeat_ngram_size=5"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2147,7 +2285,8 @@ impl Generator for Ltx25 {
         // The load-time metadata checks above prove the provider is a split 2.5 route; this is the
         // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
         // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
-        let route = build_ltx25(&self.spec).map_err(mlx_gen::gen_core::Error::from)?;
+        let route = build_ltx25(&self.spec, Rc::clone(&self.enhancer_cache))
+            .map_err(mlx_gen::gen_core::Error::from)?;
         debug_assert_eq!(route.transformer_variant(), self.variant);
         route.generate(req, on_progress)
     }
@@ -2737,17 +2876,96 @@ mod tests {
     }
 
     #[test]
+    fn ltx25_production_enhancer_reaches_exact_gemma4_t2v_i2v_and_shared_decode_paths() {
+        let start = MODEL_SRC
+            .find("fn maybe_enhance_gemma4(")
+            .expect("2.5 enhancer production method");
+        let end = MODEL_SRC[start..]
+            .find("\n}\n\n/// Prepare the actual Gemma-4 I2V prefill")
+            .map(|offset| start + offset)
+            .expect("enhancer method ends before I2V prefill helper");
+        let route = &MODEL_SRC[start..end];
+        for required in [
+            "ltx25_enhancer_turn(&req.prompt, reference.is_some())",
+            "ltx25_i2v_enhancer_prefill(&model, &mm, prompt_ids, image)?",
+            "enhance::clamp_gemma4_max_tokens",
+            "&mut cache.borrow_mut()",
+        ] {
+            assert!(
+                route.contains(required),
+                "missing `{required}` from:\n{route}"
+            );
+        }
+        assert!(!route.contains("SampleParams::censored"));
+        assert!(!route.contains("enhance::I2V_SYSTEM_PROMPT"));
+
+        let vision_start = MODEL_SRC
+            .find("fn ltx25_i2v_enhancer_prefill(")
+            .expect("I2V enhancer prefill helper");
+        let vision_end = MODEL_SRC[vision_start..]
+            .find("\n}\n\n/// Build the enhancer chat renderer")
+            .map(|offset| vision_start + offset)
+            .expect("vision helper ends before template helper");
+        let vision = &MODEL_SRC[vision_start..vision_end];
+        for required in [
+            "resize_bicubic_u8(",
+            "gemma4_mm::patchify(",
+            ".forward(&patches, (gh, gw))",
+            "gemma4_mm::expand_framed_placeholders(",
+            "model.splice_image_features(",
+        ] {
+            assert!(
+                vision.contains(required),
+                "missing `{required}` from:\n{vision}"
+            );
+        }
+
+        let enhance_src = include_str!("enhance.rs");
+        for required in [
+            "temperature: 0.0",
+            "GEMMA4_NO_REPEAT_NGRAM",
+            "generate_cached_with(",
+            "generate_from_prefill(",
+        ] {
+            assert!(
+                enhance_src.contains(required),
+                "shared Gemma-4 decode path lost `{required}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ltx25_gemma4_t2v_and_i2v_turns_match_upstream_contracts() {
+        let (t2v_system, t2v_user) = ltx25_enhancer_turn("A red kite", false);
+        assert_eq!(t2v_system, enhance::GEMMA4_T2V_SYSTEM_PROMPT);
+        assert_eq!(t2v_user, "user prompt: A red kite");
+
+        let (i2v_system, i2v_user) = ltx25_enhancer_turn("A red kite", true);
+        assert_eq!(i2v_system, enhance::GEMMA4_I2V_SYSTEM_PROMPT);
+        assert_eq!(i2v_user, "<|image|>User Raw Input Prompt: A red kite.");
+    }
+
+    #[test]
     fn ltx25_provider_enhancement_is_registered_and_refuses_the_unlicensed_axis() {
         let generator = Ltx25 {
             descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
             variant: TransformerVariant::Distilled,
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
         };
         let enhanced = GenerationRequest {
             enhance_prompt: true,
             ..ltx25_request("a paper kite")
         };
         assert!(Generator::validate(&generator, &enhanced).is_ok());
+        let temperature = GenerationRequest {
+            enhance_temperature: Some(0.7),
+            ..enhanced.clone()
+        };
+        let err = Generator::validate(&generator, &temperature)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("greedy"), "{err}");
         let forbidden = GenerationRequest {
             use_uncensored_enhancer: true,
             ..enhanced
@@ -2767,8 +2985,11 @@ mod tests {
         std::fs::write(dir.path().join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
         std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
         std::fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("processor_config.json"), "{}").unwrap();
         let err = validate_ltx25_enhancer_snapshot(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("invalid Gemma-4 enhancer config"));
+        assert!(err
+            .to_string()
+            .contains("declares model_type=Some(\"llama\")"));
     }
 
     #[test]
@@ -2777,6 +2998,7 @@ mod tests {
             descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
             variant: TransformerVariant::Distilled,
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
         };
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),
@@ -2808,6 +3030,7 @@ mod tests {
             descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
             variant: TransformerVariant::Distilled,
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
         };
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),
