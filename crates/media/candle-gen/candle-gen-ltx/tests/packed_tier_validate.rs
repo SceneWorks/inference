@@ -1952,3 +1952,53 @@ mod ltx25_real_packed_forward {
         assert!(max_abs(&features).is_finite());
     }
 }
+
+/// **R1 on real bytes: a shipped LTX-2.3 tier still resolves through the 2.3 path.**
+///
+/// The synthetic and fixture-based checks above prove `Ltx25Tier::detect` says "not mine" to a 2.3
+/// manifest. This proves the other half on the actual hosted `SceneWorks/ltx-2.3-mlx` tier: that
+/// the 2.3 resolver still claims it. Together they are the dispatch behaviour a future caller
+/// depends on — 2.5 declines, 2.3 accepts — and a one-sided check would let a regression that
+/// broke *both* still look green.
+mod ltx23_still_resolves_through_the_2_3_path {
+    use candle_gen_ltx::tier::{Ltx25Tier, TierPaths};
+
+    /// The 2.3 tier subdir, the same env var this file's 2.3 render checks use.
+    fn tier_dir() -> std::path::PathBuf {
+        match std::env::var_os("LTX_PACKED_Q4") {
+            Some(d) => std::path::PathBuf::from(d),
+            None => panic!("set LTX_PACKED_Q4 to a shipped LTX-2.3 packed tier subdir (…/q4)"),
+        }
+    }
+
+    #[test]
+    #[ignore = "sc-18776: needs a shipped LTX-2.3 packed tier (LTX_PACKED_Q4). CPU-only, no weight reads"]
+    fn a_shipped_2_3_tier_declines_2_5_detection_and_is_claimed_by_tier_paths() {
+        let dir = tier_dir();
+        // It really is the 2.3 layout: a `split_model.json` (so `Ltx25Tier::detect` is reached at
+        // all) beside the `quantize_config.json` that marks a 2.3 tier.
+        assert!(
+            dir.join("split_model.json").is_file(),
+            "{} ships no split_model.json — this test would prove nothing",
+            dir.display()
+        );
+
+        // 2.5 declines, and does so as `Ok(None)` — NOT as an error. An error here is what a
+        // dispatcher would surface instead of falling through.
+        let detected = Ltx25Tier::detect(&dir).unwrap_or_else(|e| {
+            panic!("a shipped 2.3 tier must be `not mine` to the 2.5 reader, not a hard error: {e}")
+        });
+        assert!(
+            detected.is_none(),
+            "{} is a 2.3 tier and must not be claimed as 2.5",
+            dir.display()
+        );
+
+        // And the 2.3 resolver still claims it — the fall-through target is intact.
+        assert!(
+            TierPaths::detect(&dir, None).is_some(),
+            "{} must still resolve through TierPaths (R1)",
+            dir.display()
+        );
+    }
+}
