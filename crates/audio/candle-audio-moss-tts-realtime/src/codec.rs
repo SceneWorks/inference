@@ -51,8 +51,8 @@
 //!   `w = g · v / ‖v‖`, norm over the non-output dims), matching the pinned checkpoint's key layout.
 //!
 //! The whole decode graph is **causal** (transformers causal, projections/patching pointwise-in-
-//! time), so decoding a growing prefix reproduces the earlier samples byte-for-byte — the property
-//! [`crate::model`]'s streaming path relies on for the `AudioChunk` reassembly law.
+//! time), so the streaming path can retain each stage's bounded KV history and decode only newly
+//! appended frames. The concatenated block outputs are the request's one canonical waveform path.
 
 use candle_audio::candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
 use candle_audio::{AudioError, Result};
@@ -68,6 +68,66 @@ pub const DOWNSAMPLE_RATE: usize = 1920;
 pub const CODEBOOK_SIZE: usize = 1024;
 /// Per-code latent dimension (the `Embedding` width).
 pub const CODEBOOK_DIM: usize = 8;
+/// Default steady-state RVQ-frame partition for production decode routes (about 0.64 seconds at
+/// 12.5 fps). Short request budgets select a smaller steady block through
+/// [`decode_partition_schedule`].
+pub const DEFAULT_DECODE_FRAMES_PER_BLOCK: usize = 8;
+
+/// The canonical request-local decode partition. Production always decodes the first RVQ frame as a
+/// one-frame block, then uses `steady_frames` for every later block. The leading frame guarantees
+/// that any natural-EOS completion with at least two frames emits at least two non-full chunks,
+/// without knowing its eventual length up front. Keeping this exact schedule across one-shot, live,
+/// conversation, and session routes is also numerically load-bearing: different attention reduction
+/// widths are not byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodePartitionSchedule {
+    first_frames: usize,
+    steady_frames: usize,
+}
+
+impl DecodePartitionSchedule {
+    /// Construct a bounded schedule. Direct codec callers cannot select a block wider than the
+    /// production bound and thereby defeat the incremental attention limit.
+    #[cfg(test)]
+    pub(crate) fn new(first_frames: usize, steady_frames: usize) -> CandleResult<Self> {
+        for (name, frames) in [("first", first_frames), ("steady", steady_frames)] {
+            if !(1..=DEFAULT_DECODE_FRAMES_PER_BLOCK).contains(&frames) {
+                candle_audio::candle_core::bail!(
+                    "codec decode {name} partition must be in 1..={DEFAULT_DECODE_FRAMES_PER_BLOCK} (got {frames})"
+                );
+            }
+        }
+        Ok(Self {
+            first_frames,
+            steady_frames,
+        })
+    }
+
+    /// Frame width for the zero-based codec block/chunk index.
+    pub(crate) fn block_frames(self, block_index: usize) -> usize {
+        if block_index == 0 {
+            self.first_frames
+        } else {
+            self.steady_frames
+        }
+    }
+}
+
+/// Select the canonical decode schedule for a request's AR frame budget. Normal requests use a
+/// steady eight-frame block; two-to-seven-frame budgets retain their prior request-sized steady
+/// block (`ceil(budget / 2)`). Every request starts with one frame so early EOS cannot collapse a
+/// valid multi-frame stream to one terminal full-track chunk.
+pub fn decode_partition_schedule(budget_frames: usize) -> DecodePartitionSchedule {
+    let steady_frames = if budget_frames >= DEFAULT_DECODE_FRAMES_PER_BLOCK {
+        DEFAULT_DECODE_FRAMES_PER_BLOCK
+    } else {
+        budget_frames.div_ceil(2).max(1)
+    };
+    DecodePartitionSchedule {
+        first_frames: 1,
+        steady_frames,
+    }
+}
 
 fn resample_for_encode(samples: &[f32], sample_rate: u32, native_rate: u32) -> Result<Vec<f32>> {
     candle_audio::dsp::resample(samples, sample_rate, native_rate, 1)
@@ -361,10 +421,25 @@ fn rope_tables(
     head_dim: usize,
     max_period: f64,
 ) -> CandleResult<(Tensor, Tensor)> {
+    rope_tables_range(device, 0, len, head_dim, max_period)
+}
+
+/// Interleaved-RoPE cos/sin rows for exactly the absolute positions `start..start+len`. Streaming
+/// requests use this range form so appending one block does not rebuild tables for the full prefix.
+fn rope_tables_range(
+    device: &Device,
+    start: usize,
+    len: usize,
+    head_dim: usize,
+    max_period: f64,
+) -> CandleResult<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let mut cos = Vec::with_capacity(len * half);
     let mut sin = Vec::with_capacity(len * half);
-    for pos in 0..len {
+    let end = start.checked_add(len).ok_or_else(|| {
+        candle_audio::candle_core::Error::Msg("codec RoPE position overflow".to_owned())
+    })?;
+    for pos in start..end {
         for j in 0..half {
             let inv = max_period.powf(-(2.0 * j as f64) / head_dim as f64);
             let angle = pos as f64 * inv;
@@ -554,39 +629,32 @@ impl CodecLayer {
         self.out_proj.forward(&out)
     }
 
-    /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions starting
-    /// at absolute `pos` (`x` = `[1, c, d_model]`). `cos`/`sin` are the stage's **full** RoPE tables
-    /// (`[T, head_dim/2]`, sliced here to `[pos, pos+c)`); `cache` carries this layer's post-RoPE K/V
-    /// for the preceding positions. Every op outside attention is pointwise in time, and the attention
-    /// attends exactly the sliding window [`banded_causal_mask`] would admit, so the returned chunk is
-    /// byte-identical to the corresponding rows of `forward` over the whole sequence.
+    /// Streaming counterpart of [`forward`](Self::forward) for a chunk of `c` new positions (`x` =
+    /// `[1, c, d_model]`). `cos`/`sin` are exactly those `c` positions' absolute RoPE rows; `cache`
+    /// carries this layer's post-RoPE K/V for the preceding positions. Every op outside attention is
+    /// pointwise in time, and the attention admits exactly the window [`banded_causal_mask`] would.
     fn forward_streaming(
         &self,
         x: &Tensor,
-        pos: usize,
         cos: &Tensor,
         sin: &Tensor,
         context: usize,
         cache: &mut KvCache,
     ) -> CandleResult<Tensor> {
-        let attn =
-            self.attention_streaming(&self.norm1.forward(x)?, pos, cos, sin, context, cache)?;
+        let attn = self.attention_streaming(&self.norm1.forward(x)?, cos, sin, context, cache)?;
         let x = (x + attn.broadcast_mul(&self.layer_scale_1)?)?;
         let h = self.linear1.forward(&self.norm2.forward(&x)?)?;
         let h = self.linear2.forward(&h.gelu_erf()?)?;
         x.broadcast_add(&h.broadcast_mul(&self.layer_scale_2)?)
     }
 
-    /// The sliding-window self-attention of one streaming chunk (`x` = normed `[1, c, d_model]` at
-    /// absolute `pos`): fused-qkv, interleaved RoPE at the chunk's absolute positions, then attend the
-    /// new queries against `[cache | new]` K/V under [`streaming_band_mask`], and retain the last
-    /// `context − 1` positions for the next chunk. The finite `q·k` scores are computed per key over
-    /// `head_dim` (independent of the matrix width), and the mask admits exactly the single-shot
-    /// window, so the result matches [`attention`](Self::attention) row-for-row.
+    /// The sliding-window self-attention of one streaming chunk (`x` = normed `[1, c, d_model]`):
+    /// fused-qkv, interleaved RoPE using the supplied absolute-position rows, then attend the new
+    /// queries against `[cache | new]` K/V under [`streaming_band_mask`], retaining the last
+    /// `context − 1` positions for the next chunk.
     fn attention_streaming(
         &self,
         x: &Tensor,
-        pos: usize,
         cos: &Tensor,
         sin: &Tensor,
         context: usize,
@@ -599,11 +667,8 @@ impl CodecLayer {
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?.contiguous()?; // [b, h, c, d]
         let k = qkv.i((.., .., 1))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., .., 2))?.transpose(1, 2)?.contiguous()?;
-        // RoPE at the chunk's absolute positions [pos, pos+c) — the slice of the stage's full tables.
-        let cos_c = cos.narrow(0, pos, c)?;
-        let sin_c = sin.narrow(0, pos, c)?;
-        let q = candle_nn::rotary_emb::rope_i(&q, &cos_c, &sin_c)?;
-        let k = candle_nn::rotary_emb::rope_i(&k, &cos_c, &sin_c)?;
+        let q = candle_nn::rotary_emb::rope_i(&q, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope_i(&k, cos, sin)?;
         // Attend the new queries against [cached | new] post-RoPE K/V.
         let (k_all, v_all, cache_len) = cache.append(&k, &v)?;
         let scale = 1.0 / (d as f64).sqrt();
@@ -627,6 +692,14 @@ struct CodecStage {
     head_dim: usize,
     /// Sliding-window context (positions) for this stage's causal attention.
     context: usize,
+}
+
+/// Request-local state for one decoder stage: one bounded KV cache per layer plus the absolute
+/// position of the next input. No decoded activations or request-length prefix is retained.
+#[derive(Default)]
+struct CodecStageState {
+    position: usize,
+    layers: Vec<KvCache>,
 }
 
 impl CodecStage {
@@ -711,11 +784,12 @@ impl CodecStage {
             while p < t {
                 let c = chunk_len.min(t - p);
                 let chunk = h.narrow(1, p, c)?; // [1, c, d_model]
+                let cos_c = cos.narrow(0, p, c)?;
+                let sin_c = sin.narrow(0, p, c)?;
                 outs.push(layer.forward_streaming(
                     &chunk,
-                    p,
-                    &cos,
-                    &sin,
+                    &cos_c,
+                    &sin_c,
                     self.context,
                     &mut cache,
                 )?);
@@ -730,24 +804,47 @@ impl CodecStage {
         h.transpose(1, 2)?.contiguous()
     }
 
-    /// Decode with a bounded attention working set. Short inputs retain the historical single-shot
-    /// path exactly; longer inputs use the stage's causal-context window as the chunk size. That
-    /// keeps each attention score/mask allocation bounded by the model's fixed context instead of
-    /// the request's (potentially 40-minute) duration.
-    fn forward_decode_bounded(&self, x: &Tensor) -> CandleResult<Tensor> {
+    /// Process only newly appended positions while retaining this request's bounded per-layer KV
+    /// history. Unlike [`forward_chunked`](Self::forward_chunked), this method does not replay earlier
+    /// chunks or rebuild their RoPE rows on later calls.
+    fn forward_incremental(&self, x: &Tensor, state: &mut CodecStageState) -> CandleResult<Tensor> {
         let t = x.dim(2)?;
-        match bounded_decode_chunk_len(t, self.context) {
-            Some(chunk_len) => self.forward_chunked(x, chunk_len),
-            None => self.forward(x),
+        if state.layers.is_empty() {
+            state.layers = (0..self.layers.len()).map(|_| KvCache::default()).collect();
         }
-    }
-}
+        if state.layers.len() != self.layers.len() {
+            candle_audio::candle_core::bail!(
+                "codec stage state has {} layer caches; expected {}",
+                state.layers.len(),
+                self.layers.len()
+            );
+        }
 
-/// Select the bounded decoder path only once a sequence exceeds the stage's fixed causal context.
-/// Keeping this decision separate makes the advertised-duration work bound directly testable without
-/// loading codec weights or constructing a large tensor.
-fn bounded_decode_chunk_len(sequence_len: usize, context: usize) -> Option<usize> {
-    (sequence_len > context).then_some(context.max(1))
+        let next_position = state.position.checked_add(t).ok_or_else(|| {
+            candle_audio::candle_core::Error::Msg(
+                "codec stage absolute position overflow".to_owned(),
+            )
+        })?;
+        let mut h = x.transpose(1, 2)?.contiguous()?;
+        if let Some(p) = &self.input_proj {
+            h = p.forward(&h)?;
+        }
+        let (cos, sin) = rope_tables_range(
+            h.device(),
+            state.position,
+            t,
+            self.head_dim,
+            ROPE_MAX_PERIOD,
+        )?;
+        for (layer, cache) in self.layers.iter().zip(&mut state.layers) {
+            h = layer.forward_streaming(&h, &cos, &sin, self.context, cache)?;
+        }
+        if let Some(p) = &self.output_proj {
+            h = p.forward(&h)?;
+        }
+        state.position = next_position;
+        h.transpose(1, 2)?.contiguous()
+    }
 }
 
 /// `PatchedPretransform.decode`: `[b, d·h, l] → [b, d, l·h]` (channels→time upsample by `h`).
@@ -942,6 +1039,14 @@ pub struct MossAudioCodec {
     encoder: std::sync::OnceLock<EncoderHalf>,
 }
 
+/// Bounded causal decoder state for one MOSS synthesis request. A fresh value is created by the
+/// streaming chunker; it is never stored on the shared [`MossAudioCodec`] itself, so concurrent
+/// requests cannot contaminate each other's positions or KV history.
+pub struct MossAudioDecodeState {
+    stages: Vec<CodecStageState>,
+    decoded_frames: usize,
+}
+
 impl MossAudioCodec {
     /// Load the codec decoder for `num_code_quantizers` (the AR side's `rvq`, 16) from a snapshot
     /// directory holding `config.json` + the sharded `model*.safetensors`.
@@ -1014,14 +1119,22 @@ impl MossAudioCodec {
         self.num_code_quantizers
     }
 
-    /// Decode a block of RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into an
-    /// interleaved mono PCM `Vec<f32>` of `frames.len() * downsample_rate` samples. Each decoder
-    /// stage keeps its historical single-shot path through one causal-context window, then streams
-    /// longer inputs through bounded windows; consequently no stage materializes a duration-sized
-    /// quadratic attention mask or score tensor. `cancel` is polled once up front (each stage is a
-    /// bounded matmul; the AR loop is where cancellation primarily lands).
-    pub fn decode_frames(
+    /// Create empty, request-local incremental decoder state.
+    pub fn new_decode_state(&self) -> MossAudioDecodeState {
+        MossAudioDecodeState {
+            stages: (0..self.stages.len())
+                .map(|_| CodecStageState::default())
+                .collect(),
+            decoded_frames: 0,
+        }
+    }
+
+    /// Decode only a newly appended block of RVQ frames, retaining bounded causal state across calls.
+    /// Work and transient tensors scale with `frames` plus each stage's fixed context; prior request
+    /// frames and activations are never replayed. Returns only this block's new PCM samples.
+    pub fn decode_incremental(
         &self,
+        state: &mut MossAudioDecodeState,
         frames: &[Vec<u32>],
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>> {
@@ -1031,37 +1144,102 @@ impl MossAudioCodec {
         if cancel() {
             return Ok(None);
         }
-        // Transpose frames [T][nq] → per-quantizer rows [nq][T] for the RLFQ decode.
+        if state.stages.len() != self.stages.len() {
+            candle_audio::candle_core::bail!(
+                "codec decode state has {} stages; expected {}",
+                state.stages.len(),
+                self.stages.len()
+            );
+        }
+
         let nq = self.num_code_quantizers;
-        let t = frames.len();
-        let mut rows: Vec<Vec<u32>> = vec![Vec::with_capacity(t); nq];
+        let mut rows: Vec<Vec<u32>> = vec![Vec::with_capacity(frames.len()); nq];
         for frame in frames {
             for (q, row) in rows.iter_mut().enumerate() {
-                // A frame shorter than nq (shouldn't happen) is padded with code 0.
                 row.push(frame.get(q).copied().unwrap_or(0));
             }
         }
         let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
-        let mut x = self.quantizer.decode(&rows, &self.device)?; // [1, code_dim, T]
+        let mut x = self.quantizer.decode(&rows, &self.device)?;
         if debug {
-            eprintln!("[codec] after quantizer: {:?} rms={:.5}", x.dims(), rms(&x));
+            eprintln!(
+                "[codec] incremental block at frame {} after quantizer: {:?} rms={:.5}",
+                state.decoded_frames,
+                x.dims(),
+                rms(&x)
+            );
         }
-        for (si, stage) in self.stages.iter().enumerate() {
+        for (si, ((stage, stage_state), patch)) in self
+            .stages
+            .iter()
+            .zip(&mut state.stages)
+            .zip(PATCH_SIZES)
+            .enumerate()
+        {
             if cancel() {
                 return Ok(None);
             }
-            x = stage.forward_decode_bounded(&x)?;
+            x = stage.forward_incremental(&x, stage_state)?;
             if debug {
                 eprintln!(
-                    "[codec] after stage {si} (before unpatch): {:?} rms={:.5}",
+                    "[codec] incremental block after stage {si} (before unpatch): {:?} rms={:.5}",
                     x.dims(),
                     rms(&x)
                 );
             }
-            x = patched_unpatch(&x, PATCH_SIZES[si])?;
+            x = patched_unpatch(&x, patch)?;
         }
-        // x is [1, 1, T*downsample_rate].
+        state.decoded_frames = state
+            .decoded_frames
+            .checked_add(frames.len())
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "codec decoded frame count overflow".to_owned(),
+                )
+            })?;
         let wav = x.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        debug_assert_eq!(wav.len(), frames.len() * self.config.downsample_rate);
+        Ok(Some(wav))
+    }
+
+    /// Decode RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into interleaved mono
+    /// PCM. This one-shot entry point deliberately drives the same request-local incremental decoder
+    /// in the caller's request-chosen partition schedule as live synthesis. The shared schedule
+    /// makes the returned samples byte-identical to concatenated streaming blocks while
+    /// preserving the bounded attention/state guarantees of
+    /// [`decode_incremental`](Self::decode_incremental). The opaque schedule is created by
+    /// [`decode_partition_schedule`], so a direct caller cannot select a wider block and defeat that
+    /// bound.
+    pub fn decode_frames(
+        &self,
+        frames: &[Vec<u32>],
+        schedule: DecodePartitionSchedule,
+        cancel: &dyn Fn() -> bool,
+    ) -> CandleResult<Option<Vec<f32>>> {
+        if frames.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let capacity = frames
+            .len()
+            .checked_mul(self.config.downsample_rate)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg("codec output length overflow".to_owned())
+            })?;
+        let mut state = self.new_decode_state();
+        let mut wav = Vec::with_capacity(capacity);
+        let mut start = 0usize;
+        let mut block_index = 0usize;
+        while start < frames.len() {
+            let len = schedule.block_frames(block_index).min(frames.len() - start);
+            let block = &frames[start..start + len];
+            let Some(pcm) = self.decode_incremental(&mut state, block, cancel)? else {
+                return Ok(None);
+            };
+            wav.extend(pcm);
+            start += len;
+            block_index += 1;
+        }
+        debug_assert_eq!(wav.len(), capacity);
         Ok(Some(wav))
     }
 
@@ -1190,7 +1368,9 @@ impl MossAudioCodec {
     }
 }
 
-impl crate::chunk::PrefixDecoder for MossAudioCodec {
+impl crate::chunk::IncrementalDecoder for MossAudioCodec {
+    type State = MossAudioDecodeState;
+
     fn sample_rate(&self) -> u32 {
         self.config.sample_rate
     }
@@ -1199,15 +1379,17 @@ impl crate::chunk::PrefixDecoder for MossAudioCodec {
         self.config.downsample_rate
     }
 
-    /// Decode a growing RVQ-frame prefix into its full mono PCM (the causal decode the streaming
-    /// chunker relies on). Delegates to [`MossAudioCodec::decode_frames`], so a prefix decode is
-    /// byte-identical to the head of any longer decode.
-    fn decode_prefix(
+    fn new_state(&self) -> Self::State {
+        self.new_decode_state()
+    }
+
+    fn decode_next(
         &self,
+        state: &mut Self::State,
         frames: &[Vec<u32>],
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>> {
-        self.decode_frames(frames, cancel)
+        self.decode_incremental(state, frames, cancel)
     }
 }
 
@@ -1487,6 +1669,121 @@ mod tests {
         CodecStage::load(spec, context, module, &vb).unwrap()
     }
 
+    fn synthetic_conv1d(
+        out_channels: usize,
+        in_channels: usize,
+        seed: u64,
+        dev: &Device,
+    ) -> Conv1d {
+        Conv1d::new(
+            lcg_tensor(&[out_channels, in_channels, 1], seed, 0.15, dev),
+            Some(lcg_tensor(&[out_channels], seed + 1, 0.02, dev)),
+            Conv1dConfig::default(),
+        )
+    }
+
+    /// A small deterministic codec that preserves the production topology: RLFQ decode, all four
+    /// causal transformer stages, and the real `[2, 2, 2, 240]` patch cascade. Dimensions and layer
+    /// counts are reduced so the complete production decode seams remain cheap on CPU.
+    fn synthetic_four_stage_codec(dev: &Device) -> MossAudioCodec {
+        const NQ: usize = 2;
+        const SYNTH_CODEBOOK_SIZE: usize = 32;
+        const SYNTH_CODEBOOK_DIM: usize = 3;
+        const SYNTH_RVQ_DIM: usize = 6;
+        const SYNTH_CODE_DIM: usize = 8;
+
+        let quantizer = RlfqDecoder {
+            codebooks: (0..NQ)
+                .map(|q| {
+                    lcg_tensor(
+                        &[SYNTH_CODEBOOK_SIZE, SYNTH_CODEBOOK_DIM],
+                        0xA000 + q as u64,
+                        0.2,
+                        dev,
+                    )
+                })
+                .collect(),
+            out_projs: (0..NQ)
+                .map(|q| {
+                    synthetic_conv1d(
+                        SYNTH_RVQ_DIM,
+                        SYNTH_CODEBOOK_DIM,
+                        0xB000 + 2 * q as u64,
+                        dev,
+                    )
+                })
+                .collect(),
+            output_proj: synthetic_conv1d(SYNTH_CODE_DIM, SYNTH_RVQ_DIM, 0xC000, dev),
+            rvq_dim: SYNTH_RVQ_DIM,
+            codebook_size: SYNTH_CODEBOOK_SIZE,
+        };
+
+        // Each stage emits `next_input_dim * patch` channels, exactly as the production graph does.
+        let specs = [
+            StageSpec {
+                index: 0,
+                input_dim: SYNTH_CODE_DIM,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 2,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 4,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 6,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 240,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+        ];
+        let contexts = [5, 10, 20, 40];
+        let stages = specs
+            .iter()
+            .zip(contexts)
+            .map(|(spec, context)| synthetic_stage(spec, "decoder", context, dev))
+            .collect();
+
+        MossAudioCodec {
+            config: CodecConfig {
+                sample_rate: SAMPLE_RATE,
+                downsample_rate: DOWNSAMPLE_RATE,
+                context_duration: CONTEXT_DURATION_SECS,
+                num_quantizers: NQ,
+                codebook_size: SYNTH_CODEBOOK_SIZE,
+                codebook_dim: SYNTH_CODEBOOK_DIM,
+                rvq_dim: SYNTH_RVQ_DIM,
+                output_dim: SYNTH_CODE_DIM,
+            },
+            quantizer,
+            stages,
+            num_code_quantizers: NQ,
+            device: dev.clone(),
+            shards: Vec::new(),
+            encoder: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Largest absolute elementwise difference between two same-shaped tensors.
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1640,23 +1937,318 @@ mod tests {
 
         let single = stage.forward(&x).unwrap();
         let chunked = stage.forward_chunked(&x, context).unwrap();
-        let bounded = stage.forward_decode_bounded(&x).unwrap();
         assert_eq!(
             chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             "a one-window chunk must preserve the prior single-shot bytes"
         );
+    }
+
+    /// Retaining stage state across request blocks must reproduce the existing one-shot chunked
+    /// execution with the same block schedule. The offline helper is layer-major (it concatenates a
+    /// layer's blocks before advancing) while the retained-state path is block-major, so CPU kernel
+    /// packing can introduce platform-specific reduction-order noise even though both paths use the
+    /// same RoPE rows and causal windows. The production one-shot/streaming tests below still require
+    /// exact bytes because those routes deliberately share the same block-major state machine.
+    #[test]
+    fn retained_decoder_state_matches_one_shot_chunked_blocks() {
+        let dev = Device::Cpu;
+        let spec = StageSpec {
+            index: 0,
+            input_dim: 8,
+            d_model: 16,
+            output_dim: 8,
+            num_heads: 4,
+            num_layers: 3,
+            dim_feedforward: 32,
+        };
+        let context = 5;
+        let stage = synthetic_stage(&spec, "decoder", context, &dev);
+        let t = 23;
+        let block = 4;
+        let x = lcg_tensor(&[1, spec.input_dim, t], 0x21686, 1.0, &dev);
+        let expected = stage.forward_chunked(&x, block).unwrap();
+
+        let mut state = CodecStageState::default();
+        let mut actual_blocks = Vec::new();
+        for start in (0..t).step_by(block) {
+            let len = block.min(t - start);
+            let input = x.narrow(2, start, len).unwrap();
+            actual_blocks.push(stage.forward_incremental(&input, &mut state).unwrap());
+        }
+        let actual = Tensor::cat(&actual_blocks, 2).unwrap();
         assert_eq!(
-            bounded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            "the bounded decode entrypoint must preserve short-fixture bytes"
+            state.position, t,
+            "absolute position advances only by new work"
+        );
+        assert!(
+            state.layers.iter().all(|cache| {
+                cache
+                    .k
+                    .as_ref()
+                    .is_some_and(|k| k.dim(2).unwrap() <= context.saturating_sub(1))
+                    && cache
+                        .v
+                        .as_ref()
+                        .is_some_and(|v| v.dim(2).unwrap() <= context.saturating_sub(1))
+            }),
+            "each layer retains only its fixed causal history"
+        );
+        let diff = max_abs_diff(&actual, &expected);
+        assert!(
+            diff < 1e-4,
+            "multi-block retained-state output diverged from one-shot chunked decode by {diff:.3e}"
+        );
+
+        // Mutation guard: the tolerance must still reject an implementation that resets bounded
+        // causal state between request blocks. Such a regression changes the signal, not merely the
+        // floating-point reduction order.
+        let reset_blocks = (0..t)
+            .step_by(block)
+            .map(|start| {
+                let len = block.min(t - start);
+                let input = x.narrow(2, start, len).unwrap();
+                stage
+                    .forward_incremental(&input, &mut CodecStageState::default())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let reset = Tensor::cat(&reset_blocks, 2).unwrap();
+        let reset_diff = max_abs_diff(&reset, &expected);
+        assert!(
+            reset_diff > 1e-3,
+            "resetting causal state changed output by only {reset_diff:.3e}; equivalence tolerance \
+             would not discriminate the missing-state mutation"
         );
     }
 
-    /// The model advertises a 40-minute (30,000-frame) realtime surface. Every decoder stage must
-    /// choose its fixed context window beyond that duration, so score/mask work is bounded by
-    /// `context * (2 * context - 1)` per head rather than the stage's full sequence square. This is
-    /// a structural allocation seam: it proves the dispatch decision without allocating the
+    /// Production-level normal-budget identity gate for sc-21686. Both sides traverse the actual
+    /// codec entrypoints, including RLFQ, four retained transformer states, every patch expansion,
+    /// and the streaming chunker. The alternate-schedule guard is load-bearing: the old one-shot
+    /// path reduced attention at context-sized widths and therefore matched that mutation rather than
+    /// the live canonical path.
+    #[test]
+    fn one_shot_and_streaming_share_the_canonical_four_stage_schedule() {
+        let dev = Device::Cpu;
+        let codec = synthetic_four_stage_codec(&dev);
+        let frames: Vec<Vec<u32>> = (0..(2 * DEFAULT_DECODE_FRAMES_PER_BLOCK + 3))
+            .map(|frame| {
+                vec![
+                    ((frame * 7 + 3) % 32) as u32,
+                    ((frame * 11 + 5) % 32) as u32,
+                ]
+            })
+            .collect();
+        let no_cancel = || false;
+        let schedule = decode_partition_schedule(frames.len());
+        assert_eq!(schedule.block_frames(0), 1);
+        assert_eq!(schedule.block_frames(1), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+
+        let one_shot = codec
+            .decode_frames(&frames, schedule, &no_cancel)
+            .unwrap()
+            .unwrap();
+        let mut chunks = Vec::new();
+        let mut chunker = crate::chunk::StreamingChunker::new(&codec, schedule);
+        for frame in &frames {
+            chunker
+                .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+                .unwrap()
+                .unwrap();
+        }
+        let streamed = chunker
+            .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            chunks.len(),
+            4,
+            "leading frame, two steady blocks, and one remainder"
+        );
+        assert_eq!(streamed.samples, one_shot);
+
+        // Mutation/discrimination guard: changing only the request schedule must change exact bytes.
+        // A uniform context-sized five recreates the old one-shot stage schedule [5,10,20,40].
+        let alternate_schedule = DecodePartitionSchedule::new(5, 5).unwrap();
+        let mut alternate = crate::chunk::StreamingChunker::new(&codec, alternate_schedule);
+        for frame in &frames {
+            alternate
+                .push(frame.clone(), &no_cancel, &mut |_| {})
+                .unwrap()
+                .unwrap();
+        }
+        let alternate = alternate.finish(&no_cancel, &mut |_| {}).unwrap().unwrap();
+        assert_ne!(
+            alternate.samples, one_shot,
+            "different attention reduction widths must not satisfy the exact-schedule oracle"
+        );
+
+        // State mutation guard: resetting all four stage histories per canonical block must diverge.
+        let mut reset_state_output = Vec::new();
+        let mut start = 0usize;
+        let mut block_index = 0usize;
+        while start < frames.len() {
+            let len = schedule.block_frames(block_index).min(frames.len() - start);
+            let block = &frames[start..start + len];
+            let mut reset = codec.new_decode_state();
+            reset_state_output.extend(
+                codec
+                    .decode_incremental(&mut reset, block, &no_cancel)
+                    .unwrap()
+                    .unwrap(),
+            );
+            start += len;
+            block_index += 1;
+        }
+        assert_ne!(
+            reset_state_output, one_shot,
+            "dropping the four-stage causal state must fail the identity gate"
+        );
+    }
+
+    /// Production-level early-EOS identity gate for sc-21686. Every actual completion length from two
+    /// through seven frames runs under both its matching short request budget and a normal request
+    /// budget. Both sides traverse RLFQ, all four retained transformer states, every patch expansion,
+    /// and the streaming chunker. The scalar-eight and wrong-one-shot mutations are load-bearing: the
+    /// former collapses every case to one full-track chunk, while the latter changes exact bytes.
+    #[test]
+    fn early_eos_requests_share_one_canonical_four_stage_schedule() {
+        let dev = Device::Cpu;
+        let codec = synthetic_four_stage_codec(&dev);
+        let no_cancel = || false;
+
+        for budget in [0usize, 1] {
+            let schedule = decode_partition_schedule(budget);
+            assert_eq!(schedule.block_frames(0), 1);
+            assert_eq!(schedule.block_frames(1), 1);
+        }
+        for budget in [8usize, 9, 30_000] {
+            let schedule = decode_partition_schedule(budget);
+            assert_eq!(schedule.block_frames(0), 1);
+            assert_eq!(schedule.block_frames(1), DEFAULT_DECODE_FRAMES_PER_BLOCK);
+        }
+
+        let scalar_eight = DecodePartitionSchedule::new(
+            DEFAULT_DECODE_FRAMES_PER_BLOCK,
+            DEFAULT_DECODE_FRAMES_PER_BLOCK,
+        )
+        .unwrap();
+        for actual_frames in 2usize..=7 {
+            let frames: Vec<Vec<u32>> = (0..actual_frames)
+                .map(|frame| {
+                    vec![
+                        ((frame * 7 + 3) % 32) as u32,
+                        ((frame * 11 + 5) % 32) as u32,
+                    ]
+                })
+                .collect();
+
+            for requested_budget in [actual_frames, 19] {
+                let schedule = decode_partition_schedule(requested_budget);
+                assert_eq!(schedule.block_frames(0), 1);
+                assert_eq!(
+                    schedule.block_frames(1),
+                    if requested_budget < DEFAULT_DECODE_FRAMES_PER_BLOCK {
+                        requested_budget.div_ceil(2)
+                    } else {
+                        DEFAULT_DECODE_FRAMES_PER_BLOCK
+                    },
+                    "actual {actual_frames}, requested budget {requested_budget}"
+                );
+
+                let one_shot = codec
+                    .decode_frames(&frames, schedule, &no_cancel)
+                    .unwrap()
+                    .unwrap();
+                let mut chunks = Vec::new();
+                let mut chunker = crate::chunk::StreamingChunker::new(&codec, schedule);
+                for frame in &frames {
+                    chunker
+                        .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+                        .unwrap()
+                        .unwrap();
+                }
+                let streamed = chunker
+                    .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    chunks.len() >= 2,
+                    "actual {actual_frames}, requested budget {requested_budget}: must emit >=2 chunks"
+                );
+                assert!(
+                    chunks
+                        .iter()
+                        .all(|chunk| chunk.samples.len() < one_shot.len()),
+                    "actual {actual_frames}, requested budget {requested_budget}: no full-track chunk"
+                );
+                assert_eq!(
+                    chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+                    (0..chunks.len()).collect::<Vec<_>>(),
+                    "actual {actual_frames}, requested budget {requested_budget}: chunk indices"
+                );
+                assert_eq!(
+                    streamed.samples, one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: exact identity"
+                );
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.samples.iter().copied())
+                        .collect::<Vec<_>>(),
+                    one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: reassembly"
+                );
+
+                // Topology mutation: the old scalar-eight live schedule buffers every actual 2..=7
+                // completion and emits one full-track chunk at EOS.
+                let mut hard_coded_chunks = Vec::new();
+                let mut hard_coded = crate::chunk::StreamingChunker::new(&codec, scalar_eight);
+                for frame in &frames {
+                    hard_coded
+                        .push(frame.clone(), &no_cancel, &mut |chunk| {
+                            hard_coded_chunks.push(chunk)
+                        })
+                        .unwrap()
+                        .unwrap();
+                }
+                let hard_coded = hard_coded
+                    .finish(&no_cancel, &mut |chunk| hard_coded_chunks.push(chunk))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(hard_coded_chunks.len(), 1);
+                assert_eq!(hard_coded_chunks[0].samples, hard_coded.samples);
+
+                // Oracle mutation: one-shot using the scalar-eight reduction schedule must not satisfy
+                // the canonical live identity even though it consumes the same frames and weights.
+                let wrong_oracle = codec
+                    .decode_frames(&frames, scalar_eight, &no_cancel)
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(
+                    wrong_oracle, one_shot,
+                    "actual {actual_frames}, requested budget {requested_budget}: schedule drift must change exact bytes"
+                );
+            }
+        }
+
+        for (first, steady) in [
+            (0, 1),
+            (1, 0),
+            (DEFAULT_DECODE_FRAMES_PER_BLOCK + 1, 1),
+            (1, DEFAULT_DECODE_FRAMES_PER_BLOCK + 1),
+        ] {
+            let error = DecodePartitionSchedule::new(first, steady)
+                .expect_err("invalid partition schedule must fail before decode")
+                .to_string();
+            assert!(error.contains("partition must be in 1..=8"), "{error}");
+        }
+    }
+
+    /// The model advertises a 40-minute (30,000-frame) realtime surface. The canonical production
+    /// schedule expands through the four decoder stages but remains request-length-independent, so
+    /// each score/mask allocation is bounded by `block * (block + context - 1)` per head rather than
+    /// the stage's full sequence square. This proves the dispatch bound without allocating the
     /// advertised-duration tensors in a host-only test.
     #[test]
     fn advertised_duration_decode_selects_bounded_attention_work() {
@@ -1668,18 +2260,18 @@ mod tests {
         );
 
         let mut sequence_len = advertised_frames;
+        let schedule = decode_partition_schedule(advertised_frames);
+        let mut block_len = schedule.block_frames(1);
         let mut frame_rate = SAMPLE_RATE as f64 / DOWNSAMPLE_RATE as f64;
         for (stage_index, patch) in PATCH_SIZES.into_iter().enumerate() {
             let context = (frame_rate * CONTEXT_DURATION_SECS).floor() as usize;
-            let chunk_len = bounded_decode_chunk_len(sequence_len, context)
-                .expect("advertised-duration stage must not use single-shot attention");
-            assert_eq!(chunk_len, context);
-            let max_scores_per_head = chunk_len * (chunk_len + context - 1);
+            let max_scores_per_head = block_len * (block_len + context - 1);
             assert!(
                 max_scores_per_head < sequence_len * sequence_len,
                 "stage {stage_index}: bounded score work must be sub-quadratic in advertised length"
             );
             sequence_len *= patch;
+            block_len *= patch;
             frame_rate *= patch as f64;
         }
     }
@@ -1723,7 +2315,7 @@ mod tests {
                 let (cos, sin) = rope_tables(&dev, c, stage.head_dim, ROPE_MAX_PERIOD).unwrap();
                 outs.push(
                     layer
-                        .forward_streaming(&chunk_x, 0, &cos, &sin, context, &mut cache)
+                        .forward_streaming(&chunk_x, &cos, &sin, context, &mut cache)
                         .unwrap(),
                 );
                 p += c;

@@ -177,6 +177,17 @@ class SelectLanesTests(unittest.TestCase):
                 lanes = select_lanes([path])
                 self.assertTrue(all(lanes[lane] for lane in LANES))
 
+    def test_dependency_policy_files_select_release_without_a_path_gated_audit(self) -> None:
+        self.assertNotIn("supply_chain", LANES)
+        for path in ("LICENSE", "deny.toml", "advisory-ignores.toml"):
+            with self.subTest(path=path):
+                selected = {
+                    lane
+                    for lane, enabled in select_lanes([path]).items()
+                    if enabled
+                }
+                self.assertEqual(selected, {"workspace", "release"})
+
     def test_empty_or_forced_input_selects_everything(self) -> None:
         self.assertTrue(all(select_lanes([]).values()))
         self.assertTrue(all(select_lanes(["README.md"], force_all=True).values()))

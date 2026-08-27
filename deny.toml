@@ -1,5 +1,5 @@
 [graph]
-all-features = false
+all-features = true
 targets = [
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "aarch64-apple-darwin" },
@@ -9,11 +9,8 @@ targets = [
 [advisories]
 yanked = "warn"
 ignore = [
-    # Unmaintained `number_prefix` through hf-hub 0.4.3/indicatif. No security
-    # vulnerability or safe compatible upgrade; remove with the hf-hub refresh.
-    "RUSTSEC-2025-0119",
-    # Unmaintained `paste` through the pinned Candle/GEMM graph. Remove when the
-    # upstream Candle revision replaces it; no safe in-place upgrade exists.
+    # Every ignored advisory must have current, expiring governance metadata in
+    # advisory-ignores.toml. scripts/ci/check_advisory_policy.py enforces the pairing.
     "RUSTSEC-2024-0436",
 ]
 
