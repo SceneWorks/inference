@@ -11,8 +11,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use candle_gen::block_window::BlockPlan;
 use candle_gen::candle_core::{DType, Device, DeviceLocation, Result, Tensor, TensorId, D};
 use candle_gen::candle_nn::{ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, VarBuilder};
+use candle_gen::gen_core::CancelFlag;
 
 use crate::config::AvConfig;
 use crate::quant::{qlinear, QLinear};
@@ -112,6 +114,14 @@ struct Attention {
     heads: usize,
     dim_head: usize,
     eps: f64,
+    /// Ladder rung 3 — bounded attention (sc-18797), as a score-element budget handed to the SHARED
+    /// planner (`gen_core::attention_budget` via `candle_gen::sdpa_budgeted_bhsd`).
+    ///
+    /// Defaults to [`candle_gen::ATTN_SCORES_BUDGET`], which is the i32-overflow guard this call
+    /// site already used (sc-9116) — so an untouched load is byte-for-byte the pre-rung forward. The
+    /// rung selects the tighter `CONSTRAINED_ATTN_SCORES_BUDGET`; both are the same planner at two
+    /// settings, which is exactly why the budget is a value here and not a second code path.
+    attn_budget: usize,
 }
 
 impl Attention {
@@ -129,7 +139,13 @@ impl Attention {
             heads,
             dim_head,
             eps,
+            attn_budget: candle_gen::ATTN_SCORES_BUDGET,
         })
+    }
+
+    /// Select ladder rung 3's score budget for this attention.
+    fn set_attention_budget(&mut self, budget: usize) {
+        self.attn_budget = budget;
     }
 
     fn visit_adaptable_mut(
@@ -209,7 +225,7 @@ impl Attention {
             scale,
             None,
             softmax_last_dim,
-            candle_gen::ATTN_SCORES_BUDGET,
+            self.attn_budget,
         )?; // (b,h,s,d)
         let (b, s, _) = x.dims3()?;
         let inner = self.heads * self.dim_head;
@@ -629,7 +645,7 @@ fn av_ca_ada(
 }
 
 /// One AudioVideo transformer block (`BasicAVTransformerBlock`).
-struct AvBlock {
+pub(crate) struct AvBlock {
     attn1: Attention,
     attn2: Attention,
     ff: FeedForward,
@@ -650,7 +666,7 @@ struct AvBlock {
 }
 
 impl AvBlock {
-    fn load(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
+    pub(crate) fn load(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
         let eps = cfg.video.norm_eps;
         let (vh, vdh) = (cfg.video.num_heads, cfg.video.head_dim);
         let (ah, adh) = (cfg.audio_heads, cfg.audio_head_dim);
@@ -709,6 +725,28 @@ impl AvBlock {
         self.a_ff.set_adapter_pass(pass);
         self.a2v.set_adapter_pass(pass);
         self.v2a.set_adapter_pass(pass);
+    }
+
+    /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
+    /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
+    /// would leave the audio branch's scores unbounded while the contract claimed the rung.
+    pub(crate) fn set_attention_budget(&mut self, budget: usize) {
+        for attn in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attn.set_attention_budget(budget);
+        }
+    }
+
+    /// The budget this block's attentions carry. Read from the video self-attention; the six are
+    /// written together by [`Self::set_attention_budget`].
+    pub(crate) fn attention_budget(&self) -> usize {
+        self.attn1.attn_budget
     }
 
     /// Self-attn (RoPE) → prompt-modulated text cross-attention (no RoPE), for one modality.
@@ -922,10 +960,50 @@ pub(crate) struct PreparedAvRope {
 
 /// The LTX-2.3 **AudioVideo** DiT. Predicts `(video_velocity, audio_velocity)` from the two latent
 /// token streams + shared text conditioning.
+/// How the AvDiT's 48-block trunk is held — the intra-phase materialization axis
+/// ([`LoadShape`](candle_gen::gen_core::LoadShape)), independent of phase-level component residency.
+///
+/// An enum rather than a boolean, and the forward branches on it rather than on a request flag.
+/// That is deliberate: rung 4's failure mode is output-invisible, so the streamed path must be
+/// **unrepresentable** alongside a resident stack rather than merely unselected. `Streamed` holds
+/// zero blocks, which is the entire rung — a variant that kept the `Vec` "just in case" would bound
+/// nothing while looking correct.
+pub(crate) enum AvBlocks {
+    /// The historical fast path: all `num_layers` blocks materialized and retained.
+    Resident(Vec<AvBlock>),
+    /// Rung 4: no blocks retained; each window rebuilds its own out of a fresh view.
+    Streamed(crate::block_stream::LtxBlockStream),
+}
+
+impl AvBlocks {
+    /// Blocks actually held resident. `0` for a streamed stack — the property rung 4 buys.
+    pub(crate) fn resident_len(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(_) => 0,
+        }
+    }
+
+    /// Blocks the stack RUNS, which a streamed stack still does in full.
+    pub(crate) fn n_blocks(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(stream) => stream.n_blocks(),
+        }
+    }
+}
+
 pub struct AvDiT {
     video: AvStream,
     audio: AvStream,
-    blocks: Vec<AvBlock>,
+    pub(crate) blocks: AvBlocks,
+    /// Rung 4's synchronized window schedule. Unused by a resident stack. The selected value is
+    /// per-request and must be the one `forward` executes, or calibration evidence would describe a
+    /// run that never happened.
+    block_plan: std::sync::Mutex<BlockPlan>,
+    /// Checked at every window boundary by the shared driver, which reports a cancelled render as
+    /// `Error::Canceled` rather than a generic failure.
+    cancel: CancelFlag,
     cfg: AvConfig,
     device: Device,
     load_id: u64,
@@ -934,9 +1012,33 @@ pub struct AvDiT {
 impl AvDiT {
     /// Build from a VarBuilder rooted at `model.diffusion_model.`.
     pub fn new(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
+        let (device, video, audio) = Self::streams(&vb, cfg)?;
+        let mut blocks = Vec::with_capacity(cfg.video.num_layers);
+        for i in 0..cfg.video.num_layers {
+            blocks.push(AvBlock::load(
+                vb.pp(format!("transformer_blocks.{i}")),
+                cfg,
+            )?);
+        }
+        let plan = BlockPlan::resident(blocks.len().max(1))
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        Ok(Self {
+            video,
+            audio,
+            blocks: AvBlocks::Resident(blocks),
+            block_plan: std::sync::Mutex::new(plan),
+            cancel: CancelFlag::default(),
+            cfg: cfg.clone(),
+            device,
+            load_id: next_avdit_load_id(),
+        })
+    }
+
+    /// Load the non-block surface shared by resident and streamed trunks.
+    fn streams(vb: &VarBuilder, cfg: &AvConfig) -> Result<(Device, AvStream, AvStream)> {
         let device = vb.device().clone();
         let video = AvStream::load(
-            &vb,
+            vb,
             "patchify_proj",
             "adaln_single",
             "prompt_adaln_single",
@@ -951,7 +1053,7 @@ impl AvDiT {
                 .then_some("keyframes_abs_pos_embedding"),
         )?;
         let audio = AvStream::load(
-            &vb,
+            vb,
             "audio_patchify_proj",
             "audio_adaln_single",
             "audio_prompt_adaln_single",
@@ -964,21 +1066,122 @@ impl AvDiT {
             // The reference never builds a keyframe marker for the audio stream (`_init_video` only).
             None,
         )?;
-        let mut blocks = Vec::with_capacity(cfg.video.num_layers);
-        for i in 0..cfg.video.num_layers {
-            blocks.push(AvBlock::load(
-                vb.pp(format!("transformer_blocks.{i}")),
-                cfg,
-            )?);
-        }
+        Ok((device, video, audio))
+    }
+
+    fn from_stream_surface(
+        vb: VarBuilder,
+        cfg: &AvConfig,
+        stream: crate::block_stream::LtxBlockStream,
+    ) -> Result<Self> {
+        let (device, video, audio) = Self::streams(&vb, cfg)?;
+        let plan = BlockPlan::new(stream.n_blocks(), 1)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
         Ok(Self {
             video,
             audio,
-            blocks,
+            blocks: AvBlocks::Streamed(stream),
+            block_plan: std::sync::Mutex::new(plan),
+            cancel: CancelFlag::default(),
             cfg: cfg.clone(),
             device,
             load_id: next_avdit_load_id(),
         })
+    }
+
+    /// Rung 4's load: build the resident stream surface from `vb`, hold **zero** blocks, and rebuild
+    /// each one per window out of `stream` during the forward.
+    ///
+    /// `vb` is still read for the patchify/adaLN/output-head tensors, which are small, are used on
+    /// every forward, and would cost a re-read per window for no residency saving. The 48-block
+    /// trunk — the part rung 4 exists to bound — is the only thing deferred.
+    pub fn new_block_streamed(
+        vb: VarBuilder,
+        cfg: &AvConfig,
+        stream: crate::block_stream::LtxBlockStream,
+    ) -> Result<Self> {
+        if stream.n_blocks() != cfg.video.num_layers {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "ltx: the block stream declares {} blocks but the config declares {} — a plan built \
+                 from a desynchronized depth would silently skip or repeat layers",
+                stream.n_blocks(),
+                cfg.video.num_layers
+            )));
+        }
+        Self::from_stream_surface(vb, cfg, stream)
+    }
+
+    /// Whether this AvDiT defers its block trunk. The loader-identity predicate: rung 4's failure is
+    /// invisible in output, so a caller that needs to know *which* loader it got asks here rather
+    /// than inferring it from a request flag it passed in.
+    pub fn is_block_streamed(&self) -> bool {
+        matches!(self.blocks, AvBlocks::Streamed(_))
+    }
+
+    /// Blocks held resident. `0` on a streamed stack — that is the entire rung.
+    pub fn resident_blocks(&self) -> usize {
+        self.blocks.resident_len()
+    }
+
+    /// Blocks the stack runs, streamed or not.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.n_blocks()
+    }
+
+    /// Select rung 4's window size for the requests that follow.
+    ///
+    /// Rejected on a resident stack rather than ignored: silently accepting a window on a stack that
+    /// cannot honour it is how a calibration record comes to describe a run that never happened.
+    pub fn set_transformer_window(&self, window: usize) -> Result<()> {
+        let AvBlocks::Streamed(stream) = &self.blocks else {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ltx: a transformer window was selected on a resident block stack — rung 4 requires \
+                 a deferred-materialization load"
+                    .into(),
+            ));
+        };
+        *candle_gen::lock_recover(&self.block_plan) = BlockPlan::new(stream.n_blocks(), window)
+            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
+        Ok(())
+    }
+
+    /// The window plan the next forward will execute.
+    pub fn block_plan(&self) -> BlockPlan {
+        *candle_gen::lock_recover(&self.block_plan)
+    }
+
+    /// Attach the request's cancel flag, checked at every window boundary.
+    pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.cancel = cancel;
+    }
+
+    /// Select ladder rung 3's attention budget for the whole trunk.
+    ///
+    /// Both arms are load-bearing. On a resident stack the budget is written into the blocks that
+    /// already exist; on a streamed stack there are no blocks yet, so it is recorded on the stream
+    /// and replayed onto every block a window materializes. Setting only the first would leave the
+    /// rung-3 + rung-4 composition — the one the cost-order default actually produces, since rung 4
+    /// engages rung 3 — running unbounded attention with identical output.
+    pub fn set_attention_budget(&mut self, budget: usize) {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.set_attention_budget(budget);
+                }
+            }
+            AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// The budget the next forward will execute, read back from wherever it actually lives.
+    pub fn attention_budget(&self) -> usize {
+        match &self.blocks {
+            AvBlocks::Resident(blocks) => blocks
+                .first()
+                .map(|block| block.attention_budget())
+                .unwrap_or(candle_gen::ATTN_SCORES_BUDGET),
+            AvBlocks::Streamed(stream) => stream.attention_budget(),
+        }
     }
 
     /// Walk the complete LTX-2.3 AudioVideo inference adapter surface. This is a superset of the
@@ -989,8 +1192,14 @@ impl AvDiT {
     ) -> Result<()> {
         self.video.visit_adaptable_mut(f)?;
         self.audio.visit_adaptable_mut(f)?;
-        for block in &mut self.blocks {
-            block.visit_adaptable_mut(f)?;
+        // A streamed trunk holds no blocks to adapt. `LtxBlockStream::new` already refuses to
+        // construct over a non-empty adapter set, so this is the second half of the same guarantee
+        // rather than a silent drop: there is no block object here that an adapter could be
+        // installed onto and then be rebuilt away by the next window.
+        if let AvBlocks::Resident(blocks) = &mut self.blocks {
+            for block in blocks {
+                block.visit_adaptable_mut(f)?;
+            }
         }
         Ok(())
     }
@@ -1005,8 +1214,10 @@ impl AvDiT {
     pub(crate) fn set_adapter_pass(&self, pass: usize) {
         self.video.set_adapter_pass(pass);
         self.audio.set_adapter_pass(pass);
-        for block in &self.blocks {
-            block.set_adapter_pass(pass);
+        if let AvBlocks::Resident(blocks) = &self.blocks {
+            for block in blocks {
+                block.set_adapter_pass(pass);
+            }
         }
     }
 
@@ -1234,7 +1445,7 @@ impl AvDiT {
         // sc-18758: the DFR keyframe-slot marker (video stream only). No call site threads a real
         // mask yet (Phase 7), so this is presently an exact no-op — see `apply_keyframes_embedding`.
         vx = apply_keyframes_embedding(&vx, self.video.keyframes_embedding.as_ref(), None)?;
-        let mut ax = self
+        let ax = self
             .audio
             .patchify
             .forward(&audio_latent.to_dtype(self.audio.dtype)?)?;
@@ -1264,11 +1475,43 @@ impl AvDiT {
             cross_gate_ts: &a_ts.cross_gate_ts,
         };
 
-        for block in &self.blocks {
-            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
-            vx = nv;
-            ax = na;
-        }
+        let (vx, ax) = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let (mut vx, mut ax) = (vx, ax);
+                for block in blocks {
+                    let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                    vx = nv;
+                    ax = na;
+                }
+                (vx, ax)
+            }
+            AvBlocks::Streamed(stream) => {
+                // Rung 4. The schedule is the SHARED driver — window arithmetic, loop order,
+                // release discipline, the teardown synchronize and the cancellation contract all
+                // live in `gen_core::block_window` via Candle's binding. Only the "rebuild AvBlock
+                // n" step is this family's, and it lives in `crate::block_stream`.
+                let plan = *candle_gen::lock_recover(&self.block_plan);
+                candle_gen::block_window::run_windowed(
+                    &self.device,
+                    &plan,
+                    &self.cancel,
+                    (vx, ax),
+                    || stream.open(),
+                    |(mut vx, mut ax), view: &mut VarBuilder<'static>, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+                            vx = nv;
+                            ax = na;
+                            // `block` drops here: a window holds `window_size` blocks, never the
+                            // whole range's worth.
+                        }
+                        Ok((vx, ax))
+                    },
+                )
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?
+            }
+        };
         let v_vel = self.video.output_head(&vx, &v_ts.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &a_ts.emb_ts)?;
         Ok((v_vel, a_vel))
@@ -1319,7 +1562,15 @@ impl AvDiT {
             cross_ss_ts: &v_ts.cross_ss_ts,
             cross_gate_ts: &v_ts.cross_gate_ts,
         };
-        for block in &self.blocks {
+        let AvBlocks::Resident(blocks) = &self.blocks else {
+            // The video-only reduction is the LoRA TRAINING path, which never streams: an adapted
+            // load cannot construct a stream at all. Refusing by name beats silently running a
+            // zero-block trunk and returning a plausible velocity.
+            return Err(candle_gen::candle_core::Error::Msg(
+                "ltx: the video-only training forward requires a resident block stack".into(),
+            ));
+        };
+        for block in blocks {
             vx = block.self_and_text(
                 &vx,
                 &block.attn1,

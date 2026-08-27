@@ -32,6 +32,7 @@
 //! inert, exactly as the story anticipates; sc-18778 wires it in one line. Inventing a descriptor
 //! here to make it "reachable" would be inventing a routing entry, which is not this story's to do.
 
+use gen_core::OffloadPolicy;
 use gen_core::{
     LoadShape, LoadSpec, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
@@ -124,7 +125,8 @@ const CALIBRATION_FINGERPRINT: &str = "sc-18797-ltx-2-5-mlx-ladder-v1";
 /// 3. **A directory bundle.** The stream reopens the resolved *transformer component* file; a
 ///    single-file spec is not a 2.5 split bundle.
 fn streamable(spec: &LoadSpec) -> bool {
-    spec.load_shape == LoadShape::DeferredMaterialization
+    spec.offload_policy == OffloadPolicy::Sequential
+        && spec.load_shape == LoadShape::DeferredMaterialization
         && spec.adapters.is_empty()
         && matches!(spec.weights, WeightsSource::Dir(_))
 }
@@ -367,6 +369,21 @@ mod tests {
                 ATTENTION_CHUNK_SIZES,
             );
         }
+    }
+
+    /// `DeferredMaterialization` supplies the re-openable source, but it is not itself an
+    /// execution policy. Under `Resident`, re-materializing the trunk changes neither the peak nor
+    /// output, so the rung must remain unavailable.
+    #[test]
+    fn resident_policy_does_not_declare_rung_four() {
+        let mut resident = spec(LoadShape::DeferredMaterialization);
+        resident.offload_policy = OffloadPolicy::Resident;
+        let contract = memory_strategy_contract(&resident).unwrap();
+        assert_eq!(
+            support(&contract, MemoryStrategy::BoundedTransformerResidency),
+            MemoryStrategySupport::Missing
+        );
+        assert!(!contract.lifecycle.transformer_window_materialization);
     }
 
     /// The story's "gate streaming to `Sequential`" decision, asserted as the contract edge that

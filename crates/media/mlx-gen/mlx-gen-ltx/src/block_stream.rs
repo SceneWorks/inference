@@ -1,7 +1,7 @@
 //! Ladder rung 4 — **bounded transformer residency** for the LTX AvDiT block stack (sc-18797).
 //!
 //! The window lifecycle is NOT here: it is [`mlx_gen::block_residency::run_windowed`], which binds
-//! MLX's two operations to the shared [`gen_core::block_window`] driver. This module is only the
+//! MLX's two operations to the shared `gen_core::block_window` driver. This module is only the
 //! family-side half — *"how do I rebuild AvBlock `n` from the transformer component, at the same
 //! precision the resident block carries"* — which is the part that genuinely differs per family.
 //!
@@ -23,7 +23,7 @@
 //! LTX's audio branch is **not** a second transformer. Each of the 48 `transformer_blocks.{n}`
 //! entries carries the video stack, the audio stack *and* the two cross-modal attentions
 //! (`AvBlock`), so one window over the block axis bounds video and audio weights together. That is
-//! why rung 4 here is declared at [`TransformerComponent::Dit`](gen_core::TransformerComponent::Dit)
+//! why rung 4 here is declared at `TransformerComponent::Dit`
 //! rather than `Both`: `Both` would additionally claim the **Gemma text encoder**, which is a
 //! separate component, is not windowed by this module, and has nothing measured for it on this
 //! family. Declaring a scope this code does not execute is exactly the unreachable-declaration
@@ -31,13 +31,13 @@
 //!
 //! ## The per-window cost obligation
 //!
-//! [`gen_core::block_window`]'s module docs price a window at `n_blocks x steps` materializations,
+//! `gen_core::block_window`'s module docs price a window at `n_blocks x steps` materializations,
 //! so `open_view` plus the reads `apply` makes must be a transfer of bytes already in the form the
 //! accelerator consumes. This module satisfies that structurally: the source is a packed
 //! `.safetensors` whose quantized triples are independent file entries, `AvBlock::load` reads them
 //! through the same `param`/`Linear::load` path the resident stack uses, and no repack, transpose or
 //! dtype round trip happens per window. That is what lets the MLX realization answer
-//! [`MemoryWindowMaterialization::DeviceFormatTransfer`](gen_core::MemoryWindowMaterialization::DeviceFormatTransfer).
+//! `MemoryWindowMaterialization::DeviceFormatTransfer`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
