@@ -154,7 +154,7 @@ fn config_json(with_vision: bool, with_audio: bool) -> String {
     };
     format!(
         r#"{{ "architectures": ["Gemma4UnifiedForConditionalGeneration"],
-            "model_type": "gemma4_unified",
+            "model_type": "gemma4_unified", "tie_word_embeddings": false,
             "boi_token_id": {BOI}, "eoi_token_id": {EOI}, "image_token_id": {IMAGE_TOK},
             "boa_token_id": {BOA}, "eoa_token_index": {EOA}, "audio_token_id": {AUDIO_TOK},
             {vision}{audio}
@@ -199,7 +199,20 @@ fn write_snapshot(with_vision: bool, with_audio: bool) -> common::Fixture {
         randn((VOCAB, HIDDEN), &mut rng),
     );
     t.insert("model.language_model.norm.weight".into(), ones(HIDDEN));
-    t.insert("lm_head.weight".into(), randn((VOCAB, HIDDEN), &mut rng));
+    // `lm_head` is a scaled identity slice, NOT a random matrix: row i reads hidden dim i, so the
+    // argmax is the largest of the first VOCAB hidden coordinates. With a random head, an untrained
+    // Gemma degenerates into "re-emit the last prompt token" — the residual stream (embeddings
+    // scaled by sqrt(hidden)) dominates the final state — and then NO prompt content, spliced or
+    // not, can move the output. Reading the hidden state directly keeps the toy model responsive to
+    // the whole sequence, which is what lets a provider-level conditioning assertion mean anything.
+    let mut head = vec![0f32; VOCAB * HIDDEN];
+    for (i, row) in head.chunks_mut(HIDDEN).enumerate() {
+        row[i] = 4.0;
+    }
+    t.insert(
+        "lm_head.weight".into(),
+        Tensor::from_vec(head, (VOCAB, HIDDEN), &Device::Cpu).unwrap(),
+    );
     for i in 0..LAYERS {
         let p = |s: &str| format!("model.language_model.layers.{i}.{s}");
         // Gemma 4's four-norm sandwich, both attention norms, and the per-layer scalar.
@@ -638,6 +651,80 @@ fn image_and_audio_together_both_reserve_their_spans() {
     assert!(!generate(&p, &request(vec![img(), Content::text("t1"), aud()])).is_empty());
 }
 
+/// **Through the provider**, an image changes the generated tokens — and two images that differ only
+/// in their spatial arrangement change them differently.
+///
+/// This is the assertion the story's "image conditioning demonstrated" claim rests on, and it is the
+/// only one that observes the provider's own splice. Everything else here checks a piece: the tower
+/// emits distinct rows, the span is the right length, `splice_vision_features` replaces the marked
+/// rows. All of those stay green if `prepare_gemma4` computes the features and then forgets to
+/// splice them, which is precisely the silent failure this catches.
+///
+/// The mirrored pair matters as much as the image/text pair: same pixels, same histogram, only the
+/// left-right order differs. A pipeline that dropped the positional embedding (or collapsed its two
+/// axes) would give both the same answer.
+#[test]
+fn image_conditioning_changes_the_provider_output() {
+    let fx = write_snapshot(true, true);
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert!(p.descriptor().capabilities.supports_vision);
+
+    let with = |a: [u8; 3], b: [u8; 3]| {
+        generate(
+            &p,
+            &request(vec![Content::Image(image(4, 4, a, b)), Content::text("t1")]),
+        )
+    };
+    let text_only = generate(&p, &request(vec![Content::text("t1")]));
+    let red_blue = with([255, 0, 0], [0, 0, 255]);
+    let blue_red = with([0, 0, 255], [255, 0, 0]);
+
+    assert_ne!(
+        red_blue, text_only,
+        "an image must change the output; identical to text-only means the splice never landed"
+    );
+    assert_ne!(
+        red_blue, blue_red,
+        "a mirrored image must change the output — the positional table distinguishes them"
+    );
+    // The same image twice is deterministic, so the differences above are conditioning, not noise.
+    assert_eq!(red_blue, with([255, 0, 0], [0, 0, 255]), "generation is deterministic");
+}
+
+/// **Through the provider**, audio changes the generated tokens, and different waveforms change them
+/// differently. The audio half of [`image_conditioning_changes_the_provider_output`].
+#[test]
+fn audio_conditioning_changes_the_provider_output() {
+    let fx = write_snapshot(true, true);
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert!(p.descriptor().capabilities.supports_audio);
+
+    let clip = |v: Vec<f32>| {
+        generate(
+            &p,
+            &request(vec![
+                Content::Audio(AudioRef::new(AUDIO_RATE, v).unwrap()),
+                Content::text("t1"),
+            ]),
+        )
+    };
+    let text_only = generate(&p, &request(vec![Content::text("t1")]));
+    let rising: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
+    let falling: Vec<f32> = (0..8).map(|i| 1.0 - i as f32 / 8.0).collect();
+
+    assert_ne!(
+        clip(rising.clone()),
+        text_only,
+        "audio must change the output; identical to text-only means the splice never landed"
+    );
+    assert_ne!(
+        clip(rising.clone()),
+        clip(falling),
+        "different waveforms must produce different outputs"
+    );
+    assert_eq!(clip(rising.clone()), clip(rising), "generation is deterministic");
+}
+
 /// A clip at the wrong sample rate is refused rather than silently reinterpreted.
 ///
 /// The projector frames audio in *samples*, so feeding 8 kHz into a 16 kHz framing would halve the
@@ -743,5 +830,6 @@ fn the_nested_decoder_layout_loads() {
     );
     CausalLm::from_weights(&weights, "", cfg).expect("the nested decoder must load");
 }
+
 
 
