@@ -602,51 +602,49 @@ pub const AVCOL_SPC_BT2020_NCL: u32 = 9;
 // Decode / conditioning helpers
 // ---------------------------------------------------------------------------------------------
 
-/// VAE decode output → the frame that gets written to EXR, for `color_space`.
+/// One VAE-decoded frame in the **working space** (`[0, 1]` compressed codes) → the frame that
+/// gets written to EXR, for `color_space`.
 ///
-/// `vae_out` is one frame's interleaved RGB in the VAE's `[-1, 1]` convention. For a log working
-/// space the working codes **are** the EXR payload (no transfer); otherwise they are decompressed
-/// to scene-linear light in the source primaries.
-pub fn vae_frame_to_exr_payload(
-    vae_out: &[f32],
-    width: u32,
-    height: u32,
+/// `working` is what an engine hands an
+/// [`HdrFrameSink`](crate::runtime::HdrFrameSink): [`from_vae_range`] already applied, no
+/// transfer yet. For a log working space the codes **are** the EXR payload (no transfer);
+/// otherwise they are decompressed to scene-linear light in the authoring primaries.
+pub fn working_frame_to_exr_payload(
+    working: &HdrFrame,
     color_space: HdrColorSpace,
 ) -> crate::Result<HdrFrame> {
-    let mut rgb: Vec<f32> = vae_out.iter().copied().map(from_vae_range).collect();
+    working.validate()?;
+    let mut rgb = working.rgb.clone();
     if !color_space.is_log_working() {
         color_space
             .transfer()
             .to_linear(&mut rgb, color_space.source_primaries());
     }
-    let frame = HdrFrame {
-        width,
-        height,
+    Ok(HdrFrame {
+        width: working.width,
+        height: working.height,
         rgb,
-    };
-    frame.validate()?;
-    Ok(frame)
+    })
 }
 
-/// VAE decode output → the scene-linear Rec.709 frame the HLG master is encoded from.
+/// One VAE-decoded working-space frame → the scene-linear **Rec.709** frame the HLG master is
+/// encoded from.
 ///
-/// Always Rec.709 scene-linear regardless of `color_space`'s authoring basis — the HLG converter
-/// owns the rotation to Rec.2020, so feeding it a consistent basis keeps one matrix in play.
-pub fn vae_frame_to_hlg_linear(
-    vae_out: &[f32],
-    width: u32,
-    height: u32,
+/// Always Rec.709 regardless of `color_space`'s authoring basis (upstream does the same): the
+/// [`HlgConverter`] owns the rotation into Rec.2020, so pinning its input basis keeps exactly one
+/// matrix in play on the master path.
+pub fn working_frame_to_hlg_linear(
+    working: &HdrFrame,
     color_space: HdrColorSpace,
 ) -> crate::Result<HdrFrame> {
-    let mut rgb: Vec<f32> = vae_out.iter().copied().map(from_vae_range).collect();
+    working.validate()?;
+    let mut rgb = working.rgb.clone();
     color_space.transfer().to_linear(&mut rgb, Primaries::Rec709);
-    let frame = HdrFrame {
-        width,
-        height,
+    Ok(HdrFrame {
+        width: working.width,
+        height: working.height,
         rgb,
-    };
-    frame.validate()?;
-    Ok(frame)
+    })
 }
 
 /// An EXR conditioning frame → the VAE's `[-1, 1]` input range, for `color_space`.

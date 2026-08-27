@@ -126,7 +126,8 @@ pub use generator::{
     AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
+    PrecisionFloorComponent,
     ReplacementMode, SizeFloor, SpeechSegment, StagedResidencyAvailability, StepSupport,
     TimeRegion, VideoClipRef,
 };
@@ -149,7 +150,13 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
+pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
+pub use hdr::{
+    from_vae_range, hlg_inverse_oetf, hlg_oetf, to_vae_range, working_frame_to_exr_payload,
+    working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
+    Primaries, Yuv420p10, HLG_MASTER_TAGS,
+};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
@@ -197,7 +204,8 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
+    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, HdrFrameSink,
+    HdrOutputFrame, IdentityWeights,
     LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
     PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
     Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
