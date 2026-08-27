@@ -81,8 +81,11 @@ class DependencyCiPolicyTests(unittest.TestCase):
         pull_request = event_triggers["pull_request"]
         if pull_request is not None:
             self.assertIsInstance(pull_request, Mapping)
-            self.assertNotIn("paths", pull_request)
-            self.assertNotIn("paths-ignore", pull_request)
+            self.assertFalse(
+                pull_request,
+                "pull_request must be null or an empty mapping so no branch, action, or path "
+                "filter can skip dependency policy",
+            )
 
         commands = [normalized(step["run"]) for step in job["steps"] if "run" in step]
         self.assertEqual(commands.count(GOVERNANCE), 1)
@@ -95,6 +98,9 @@ class DependencyCiPolicyTests(unittest.TestCase):
 
     def test_supply_chain_policy_is_blocking_and_unconditional(self) -> None:
         self.assert_supply_chain_policy_is_blocking_and_unconditional(self.workflow)
+        workflow = copy.deepcopy(self.workflow)
+        triggers(workflow)["pull_request"] = {}
+        self.assert_supply_chain_policy_is_blocking_and_unconditional(workflow)
 
     def test_skip_and_non_blocking_mutations_are_rejected(self) -> None:
         mutations = (
@@ -122,6 +128,24 @@ class DependencyCiPolicyTests(unittest.TestCase):
                 "job continue-on-error",
                 lambda workflow: workflow["jobs"]["supply-chain"].__setitem__(
                     "continue-on-error", True
+                ),
+            ),
+            (
+                "pull-request branches",
+                lambda workflow: triggers(workflow).__setitem__(
+                    "pull_request", {"branches": ["main"]}
+                ),
+            ),
+            (
+                "pull-request branches-ignore",
+                lambda workflow: triggers(workflow).__setitem__(
+                    "pull_request", {"branches-ignore": ["feature/**"]}
+                ),
+            ),
+            (
+                "pull-request types",
+                lambda workflow: triggers(workflow).__setitem__(
+                    "pull_request", {"types": ["closed"]}
                 ),
             ),
             (
