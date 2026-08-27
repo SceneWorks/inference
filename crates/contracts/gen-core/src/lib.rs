@@ -35,6 +35,7 @@ pub mod json_constraint;
 pub mod latent;
 pub mod license;
 pub mod ltx_checkpoint;
+pub mod ltx_dfr;
 mod macros;
 pub mod media;
 pub mod memory_strategy;
