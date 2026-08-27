@@ -49,7 +49,9 @@ use std::path::PathBuf;
 
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::gen_core::ltx_checkpoint::{layout_for_declared_version, LtxCheckpointLayout};
+use mlx_gen::gen_core::ltx_checkpoint::{
+    layout_for_declared_version, LtxBundle, LtxCheckpointLayout, LtxComponent,
+};
 use mlx_gen::gen_core::reject_unknown_components;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::weights::{to_dtype, Weights};
@@ -63,6 +65,7 @@ use crate::audio_vae::AudioDecoder;
 use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
+use crate::gemma4_te::Ltx25TextEncoder;
 use crate::image_crf::{condition_image_for_checkpoint, default_image_recompress};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
@@ -71,7 +74,7 @@ use crate::pipeline::{
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
-use crate::tokenizer::LtxTokenizer;
+use crate::tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 use crate::transformer::{AvDiT, Precision};
 use crate::upsampler::LatentUpsampler;
 use crate::vae::LtxVideoVae;
@@ -79,6 +82,8 @@ use crate::vocoder::LtxVocoder;
 
 /// Public provider id: `"ltx_2_3"`.
 pub const MODEL_ID: &str = "ltx_2_3";
+/// Public provider id for the split-component Gemma-4 LTX-2.5 route.
+pub const MODEL_25_ID: &str = "ltx_2_5";
 
 /// The `model_version` this engine's checkpoints declare, used to resolve generation params
 /// (sc-18759 — see [`crate::params`]). This crate loads only `ltx_2_3` checkpoints today (the
@@ -298,6 +303,64 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// Stable identity and the deliberately conservative capability surface of the LTX-2.5 MLX
+/// route.  The ordinary 2.3 conditioning paths are shared by the two execution shells; advanced
+/// DFR controls are left closed until their separately loaded temporal/duration components are
+/// consumed by this route rather than being accepted as inert metadata.
+pub fn descriptor_25() -> ModelDescriptor {
+    let mut out = descriptor();
+    out.id = MODEL_25_ID;
+    out.capabilities.supports_lora = false;
+    out.capabilities.supports_lokr = false;
+    out.capabilities.supports_prompt_enhancement = false;
+    out.capabilities.supports_auto_duration = false;
+    out.capabilities.supports_generated_keyframes = false;
+    out.capabilities.max_temporal_upsample_rounds = 0;
+    out.capabilities.supports_diffusion_decoder = false;
+    out
+}
+
+/// Text assets selected by a checkpoint layout. Keeping this selection in the shared execution
+/// shell avoids a provider-local copy of the mature audio/video conditioning implementation.
+enum TextAssets {
+    Gemma3 {
+        dir: PathBuf,
+        quant: Option<GemmaQuant>,
+    },
+    Gemma4 {
+        bundle: LtxBundle,
+        connector: PathBuf,
+    },
+}
+
+enum Tokenizer {
+    Gemma3(LtxTokenizer),
+    Gemma4(Ltx25Tokenizer),
+}
+
+impl Tokenizer {
+    fn encode(&self, prompt: &str, max_length: usize) -> Result<(Array, Array)> {
+        match self {
+            Self::Gemma3(tokenizer) => tokenizer.encode(prompt, max_length),
+            Self::Gemma4(tokenizer) => tokenizer.encode(prompt, max_length),
+        }
+    }
+}
+
+enum StagedTextEncoder {
+    Gemma3(Box<LtxTextEncoder>),
+    Gemma4(Box<Ltx25TextEncoder>),
+}
+
+impl StagedTextEncoder {
+    fn encode_av(&self, ids: &Array, mask: &Array) -> Result<(Array, Array)> {
+        match self {
+            Self::Gemma3(encoder) => encoder.encode_av(ids, mask),
+            Self::Gemma4(encoder) => encoder.encode_av(ids, mask),
+        }
+    }
+}
+
 /// The loaded LTX-2.3 model: the assembled **AudioVideo** components + the cached descriptor. The
 /// production path is the joint A/V denoise (`generate_av.py`) — the audio latents are always
 /// denoised (the cross-modal attention couples them to the video every step), so the video stream
@@ -308,17 +371,16 @@ pub struct Ltx {
     memory_strategy: Option<mlx_gen::gen_core::MemoryProviderContract>,
     memory_tier: Option<mlx_gen::gen_core::MemoryNumericTier>,
     memory_overlay: Option<String>,
-    tokenizer: LtxTokenizer,
+    tokenizer: Tokenizer,
     // sc-10976 (epic 10975): the two GIANTS — the ~24 GB Gemma-3-12B text encoder and the AvDiT — are
     // NOT held resident. They are built on demand inside `generate` (load → use → drop), mirroring
     // Wan's `root`-only struct (`mlx-gen-wan/src/model.rs`): the TE is freed (+ `clear_cache()`) before
     // the DiT materializes, so peak ≈ max(TE, DiT) instead of the sum. The lazy-build inputs live here.
-    root: PathBuf,
+    transformer_path: PathBuf,
     config: LtxConfig,
     dit_prec: Precision,
     adapters: Vec<AdapterSpec>,
-    gemma_dir: PathBuf,
-    gemma_quant: Option<GemmaQuant>,
+    text_assets: TextAssets,
     /// The optional **uncensored** 4-bit Gemma enhancer snapshot dir (the amoral
     /// `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`, sc-2845), staged by the caller in the
     /// `uncensored_enhancer` [`LoadSpec::components`] entry (sc-13664). `None` unless the caller
@@ -563,13 +625,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         memory_strategy,
         memory_tier,
         memory_overlay,
-        tokenizer,
-        root: root.clone(),
+        tokenizer: Tokenizer::Gemma3(tokenizer),
+        transformer_path: root.join("transformer.safetensors"),
         config,
         dit_prec,
         adapters: spec.adapters.clone(),
-        gemma_dir,
-        gemma_quant,
+        text_assets: TextAssets::Gemma3 {
+            dir: gemma_dir,
+            quant: gemma_quant,
+        },
         uncensored_enhancer,
         upsampler,
         vae,
@@ -582,6 +646,127 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Lazy split-bundle LTX-2.5 provider.  Resolving the metadata/configuration is deliberately part
+/// of `load`; materialising multi-gigabyte tensors remains request-scoped, matching the staged LTX
+/// route and keeping ordinary catalog construction weights-free.
+pub struct Ltx25 {
+    descriptor: ModelDescriptor,
+    spec: LoadSpec,
+}
+
+/// Resolve the LTX-2.5 split layout through the ordinary provider registration.  The actual tensor
+/// assembly lives in [`build_ltx25`] and is invoked by [`Generator::generate`], not hidden behind a
+/// filename convention or a separate loader entry point.
+pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let known = crate::bundle::split_component_ids();
+    reject_unknown_components(spec, &known, MODEL_25_ID)?;
+    if !spec.adapters.is_empty() {
+        return Err(Error::Unsupported(
+            "ltx_2_5: LoRA/LoKr adapters are not part of this provider route".into(),
+        ));
+    }
+    let bundle = crate::bundle::resolve_split_bundle(spec)?;
+    if bundle.layout() != LtxCheckpointLayout::Split {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: expected an LTX-2.5 split-component bundle, got {}",
+            bundle.layout().id()
+        )));
+    }
+    // These are intentional load-path checks, not descriptor-only declarations.  In particular,
+    // `from_bundle` selects the transformer's own 2.5 config and the Gemma check ties that DiT to
+    // the packed encoder before a generation can allocate noise.
+    let _ = LtxConfig::from_bundle(&bundle)?;
+    crate::bundle::assert_gemma_version(&bundle)?;
+    Ok(Box::new(Ltx25 {
+        descriptor: descriptor_25(),
+        spec: spec.clone(),
+    }))
+}
+
+fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
+    let bundle = crate::bundle::resolve_split_bundle(spec)?;
+    let config = LtxConfig::from_bundle(&bundle)?;
+    crate::bundle::assert_gemma_version(&bundle)?;
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(
+                "ltx_2_5: split bundles must be loaded from their component directory".into(),
+            ))
+        }
+    };
+    let split = SplitModel::from_model_dir(root)?;
+    let (dit_prec, stat_dt) = match spec.precision {
+        LoadPrecision::Bf16 => (
+            Precision::quant_bf16(split.bits, split.group),
+            Dtype::Bfloat16,
+        ),
+        LoadPrecision::Fp32 => (
+            Precision::quant_f32(split.bits, split.group),
+            Dtype::Float32,
+        ),
+    };
+    let conv = bundle
+        .require(LtxComponent::ConvVideoVae)?
+        .path()
+        .to_path_buf();
+    let audio = bundle.require(LtxComponent::AudioVae)?.path().to_path_buf();
+    let connector = bundle
+        .require(LtxComponent::Transformer)?
+        .path()
+        .with_file_name("connector.safetensors");
+    // The converter keeps the connector beside the transformer.  A separately staged connector is
+    // not a public component because the transformer metadata remains its identity authority.
+    if !connector.exists() {
+        return Err(Error::Msg(format!(
+            "ltx_2_5: missing connector.safetensors beside transformer {}",
+            bundle.require(LtxComponent::Transformer)?.path().display()
+        )));
+    }
+    let conv_w = Weights::from_file(&conv)?;
+    let audio_w = Weights::from_file(&audio)?;
+    let vae_cfg = LtxVaeConfig::from_bundle(&bundle, LtxComponent::ConvVideoVae)?;
+    let audio_cfg = AudioVaeConfig::from_bundle(&bundle)?;
+    let vocoder_cfg = VocoderConfig::from_bundle(&bundle)?;
+    let vae = LtxVideoVae::from_weights_lazy_encoder(&conv_w, conv.clone(), &vae_cfg)?;
+    let audio_decoder = AudioDecoder::from_weights(&audio_w, &audio_cfg)?;
+    let vocoder = LtxVocoder::from_weights(&audio_w, &vocoder_cfg)?;
+    let spatial = bundle.require(LtxComponent::SpatialUpsampler)?.path();
+    let upsampler = LatentUpsampler::from_checkpoint(spatial)?;
+    let latent_mean = to_dtype(conv_w.require("per_channel_statistics.mean")?, stat_dt)?;
+    let latent_std = to_dtype(conv_w.require("per_channel_statistics.std")?, stat_dt)?;
+    let te_path = bundle
+        .require(LtxComponent::TextEncoder)?
+        .path()
+        .to_path_buf();
+    let tokenizer = Ltx25Tokenizer::from_packed_te_file(&te_path)?;
+
+    Ok(Ltx {
+        descriptor: descriptor_25(),
+        memory_strategy: None,
+        memory_tier: None,
+        memory_overlay: None,
+        tokenizer: Tokenizer::Gemma4(tokenizer),
+        transformer_path: bundle
+            .require(LtxComponent::Transformer)?
+            .path()
+            .to_path_buf(),
+        config,
+        dit_prec,
+        adapters: Vec::new(),
+        text_assets: TextAssets::Gemma4 { bundle, connector },
+        uncensored_enhancer: None,
+        upsampler,
+        vae,
+        audio_decoder,
+        vocoder,
+        latent_mean,
+        latent_std,
+        audio_sample_rate: vocoder_cfg.final_sample_rate() as u32,
+        stat_dt,
+    })
+}
+
 impl Ltx {
     /// Build the AudioVideo Gemma-3-12B text encoder from the resolved `gemma_dir` + the snapshot's
     /// `connector.safetensors` (sc-10976). Called per-generate and dropped (+ `clear_cache()`) before
@@ -589,21 +774,39 @@ impl Ltx {
     /// ~24 GB TE and the DiT never co-reside. bf16 activations (the reference TE dtype); the backbone is
     /// selectively quantized iff `gemma_quant` is set (`None` ⇒ dense bf16, the default `…-bf16`
     /// snapshot). Identical construction to the pre-sc-10976 `load()`, only deferred.
-    fn build_text_encoder(&self) -> Result<LtxTextEncoder> {
-        let gemma_w = Weights::from_dir(&self.gemma_dir)?;
-        let connector_w = Weights::from_file(self.root.join("connector.safetensors"))?;
-        LtxTextEncoder::from_weights_av(
-            &gemma_w,
-            &connector_w,
-            GemmaConfig::gemma_3_12b(),
-            self.gemma_quant,
-            &self.config,
-            // The DiT's own checkpoint geometry re-targeted at bf16 activations: the connector and
-            // the feature-extractor Linear are packed on an LTX-2.5 `q4`/`q8` tier (sc-18775) and
-            // dense on LTX-2.3, decided per tensor by whether `.scales` is present — so one
-            // `Precision` serves both without a per-generation branch.
-            self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
-        )
+    fn build_text_encoder(&self) -> Result<StagedTextEncoder> {
+        match &self.text_assets {
+            TextAssets::Gemma3 { dir, quant } => {
+                let gemma_w = Weights::from_dir(dir)?;
+                let connector_w = Weights::from_file(
+                    self.transformer_path
+                        .parent()
+                        .expect("transformer path has a parent")
+                        .join("connector.safetensors"),
+                )?;
+                Ok(StagedTextEncoder::Gemma3(Box::new(
+                    LtxTextEncoder::from_weights_av(
+                        &gemma_w,
+                        &connector_w,
+                        GemmaConfig::gemma_3_12b(),
+                        *quant,
+                        &self.config,
+                        self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
+                    )?,
+                )))
+            }
+            TextAssets::Gemma4 { bundle, connector } => {
+                let connector_w = Weights::from_file(connector)?;
+                Ok(StagedTextEncoder::Gemma4(Box::new(
+                    Ltx25TextEncoder::from_bundle_av(
+                        bundle,
+                        &connector_w,
+                        &self.config,
+                        self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
+                    )?,
+                )))
+            }
+        }
     }
 
     /// Build the AvDiT from the snapshot's `transformer.safetensors` at the load-time precision,
@@ -611,7 +814,7 @@ impl Ltx {
     /// freed (sc-10976), so the 24 GB TE and the DiT never co-reside. LoRA is a forward-time residual
     /// over the (quantized/dense) base; `pass_scales` carries one strength per distilled denoise pass.
     fn build_transformer(&self) -> Result<AvDiT> {
-        let transformer_w = Weights::from_file(self.root.join("transformer.safetensors"))?;
+        let transformer_w = Weights::from_file(&self.transformer_path)?;
         let mut transformer = AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?;
         if !self.adapters.is_empty() {
             crate::adapters::apply_ltx_adapters(
@@ -631,7 +834,10 @@ impl Ltx {
         let te = self.build_text_encoder()?;
         // Prompt enhancement (sc-2845) reuses the just-built Gemma backbone (the censored path); the
         // uncensored path loads its own. Running it here keeps BOTH TE uses inside one staged load.
-        let enhanced = self.maybe_enhance(&te, req);
+        let enhanced = match &te {
+            StagedTextEncoder::Gemma3(te) => self.maybe_enhance(te, req),
+            StagedTextEncoder::Gemma4(_) => None,
+        };
         let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
         let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;
@@ -1161,9 +1367,12 @@ impl Ltx {
                 Some(&req.cancel),
             )
         } else {
+            let Tokenizer::Gemma3(tokenizer) = &self.tokenizer else {
+                unreachable!("Gemma-4 routes are filtered before prompt enhancement")
+            };
             enhance::enhance(
                 te.gemma(),
-                &self.tokenizer,
+                tokenizer,
                 enhance::T2V_SYSTEM_PROMPT,
                 &req.prompt,
                 &cfg,
@@ -1194,6 +1403,31 @@ impl Ltx {
             GemmaModel::from_weights_with_prefix(&w, GemmaConfig::gemma_3_12b(), quant, "model.")?;
         let tokenizer = LtxTokenizer::from_dir(dir)?;
         Ok((model, tokenizer))
+    }
+}
+
+impl Generator for Ltx25 {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
+        // Reuse the full conditioning/index validation that owns the LTX request surface.  The
+        // descriptor supplied here is the 2.5 descriptor, so shared capability gates stay closed
+        // for any axis not yet consumed by the assembled execution route.
+        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        // The load-time metadata checks above prove the provider is a split 2.5 route; this is the
+        // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
+        // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
+        let route = build_ltx25(&self.spec).map_err(mlx_gen::gen_core::Error::from)?;
+        route.generate(req, on_progress)
     }
 }
 
@@ -1585,11 +1819,73 @@ mlx_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load
 }
 
+mlx_gen::register_generators! {
+    pub(crate) const REGISTRATION_25 = descriptor_25 => load_25
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     // sc-19502: the derived stage-1 step count the descriptor advertises.
     use crate::pipeline::NATIVE_STEPS;
+
+    #[test]
+    fn ltx25_registered_route_enforces_geometry_and_temporal_constraints() {
+        let generator = Ltx25 {
+            descriptor: descriptor_25(),
+            spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
+        };
+        let request = GenerationRequest {
+            prompt: "a quiet moonlit harbor".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            ..Default::default()
+        };
+        Generator::validate(&generator, &request).expect("64px / 1+8*k request must pass");
+
+        let mut geometry = request.clone();
+        geometry.width = 672; // divisible by 32, but not the provider's 64px stage-1 stride.
+        assert!(Generator::validate(&generator, &geometry)
+            .unwrap_err()
+            .to_string()
+            .contains("divisible by 64"));
+
+        let mut temporal = request;
+        temporal.frames = Some(16);
+        assert!(Generator::validate(&generator, &temporal)
+            .unwrap_err()
+            .to_string()
+            .contains("1 + 8"));
+    }
+
+    #[test]
+    fn ltx25_descriptor_closes_unwired_advanced_axes() {
+        let generator = Ltx25 {
+            descriptor: descriptor_25(),
+            spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
+        };
+        let request = GenerationRequest {
+            prompt: "a quiet moonlit harbor".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            num_generated_keyframes: Some(1),
+            ..Default::default()
+        };
+        assert!(Generator::validate(&generator, &request).is_err());
+        let mut temporal = request.clone();
+        temporal.num_generated_keyframes = None;
+        temporal.temporal_upsample_rounds = Some(1);
+        assert!(Generator::validate(&generator, &temporal).is_err());
+        let mut automatic = request;
+        automatic.num_generated_keyframes = None;
+        automatic.auto_duration = Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+            min_seconds: 1.0,
+            max_seconds: 2.0,
+        });
+        assert!(Generator::validate(&generator, &automatic).is_err());
+    }
 
     #[test]
     fn calibration_fault_is_request_local_and_phase_exact() {
