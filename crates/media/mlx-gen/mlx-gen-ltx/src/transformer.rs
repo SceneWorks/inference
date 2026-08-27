@@ -44,7 +44,7 @@ use mlx_gen::block_residency::BlockPlan;
 /// that AC2's output-invisible failure mode can only be caught on.
 #[cfg(test)]
 #[path = "transformer_rung4_tests.rs"]
-mod rung4_block_window_tests;
+pub(crate) mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::CancelFlag;
 
@@ -1935,31 +1935,60 @@ fn av_ca_ada(
 /// attention calls at every block.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AvPerturbation {
-    skip_self_blocks: &'static [usize],
+    skip_self_mask: u64,
     isolate_modalities: bool,
 }
 
 impl AvPerturbation {
     /// The ordinary, unperturbed AV-DiT evaluation.
     pub const NONE: Self = Self {
-        skip_self_blocks: &[],
+        skip_self_mask: 0,
         isolate_modalities: false,
     };
 
     /// STG evaluation: skip video and audio self-attention at precisely these
     /// transformer block indices.
     pub const fn stg(skip_self_blocks: &'static [usize]) -> Self {
+        let mut mask = 0_u64;
+        let mut index = 0;
+        while index < skip_self_blocks.len() {
+            let block = skip_self_blocks[index];
+            if block < u64::BITS as usize {
+                mask |= 1_u64 << block;
+            }
+            index += 1;
+        }
         Self {
-            skip_self_blocks,
+            skip_self_mask: mask,
             isolate_modalities: false,
         }
+    }
+
+    /// Runtime STG sibling used by typed validation overrides. LTX-2.5 has 48 blocks, so a u64
+    /// mask preserves the cheap `Copy` perturbation value while accepting a request-owned block
+    /// list instead of leaking it to manufacture a `'static` slice.
+    pub fn stg_blocks(skip_self_blocks: &[usize]) -> Result<Self> {
+        let mut mask = 0_u64;
+        for &block in skip_self_blocks {
+            if block >= u64::BITS as usize {
+                return Err(Error::Msg(format!(
+                    "LTX STG block {block} is outside the supported 0..{} range",
+                    u64::BITS
+                )));
+            }
+            mask |= 1_u64 << block;
+        }
+        Ok(Self {
+            skip_self_mask: mask,
+            isolate_modalities: false,
+        })
     }
 
     /// A modality-isolated evaluation, retaining self/text/FF processing while
     /// suppressing both audio-to-video and video-to-audio attention calls.
     pub const fn modality_isolated() -> Self {
         Self {
-            skip_self_blocks: &[],
+            skip_self_mask: 0,
             isolate_modalities: true,
         }
     }
@@ -1967,21 +1996,11 @@ impl AvPerturbation {
     #[must_use]
     const fn attention_plan(self, block_index: usize) -> AvAttentionPlan {
         AvAttentionPlan {
-            run_self: !contains_block(self.skip_self_blocks, block_index),
+            run_self: block_index >= u64::BITS as usize
+                || self.skip_self_mask & (1_u64 << block_index) == 0,
             run_cross_modal: !self.isolate_modalities,
         }
     }
-}
-
-const fn contains_block(blocks: &[usize], needle: usize) -> bool {
-    let mut index = 0;
-    while index < blocks.len() {
-        if blocks[index] == needle {
-            return true;
-        }
-        index += 1;
-    }
-    false
 }
 
 /// The four attention calls that an [`AvBlock`] may execute.  Text attention
@@ -2197,7 +2216,12 @@ impl AvBlock {
     /// feed-forward. Per the reference block's `run_a2v = run_vx and audio is not None`, the
     /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
     /// absent — not run against a placeholder stream.
-    fn forward_video_only(&self, vx: &Array, v: &StreamArgs) -> Result<Array> {
+    fn forward_video_only_controlled(
+        &self,
+        vx: &Array,
+        v: &StreamArgs,
+        run_self: bool,
+    ) -> Result<Array> {
         let vx = self.self_and_text(
             vx,
             &self.attn1,
@@ -2205,9 +2229,24 @@ impl AvBlock {
             &self.v_sst,
             &self.v_pst,
             v,
-            true,
+            run_self,
         )?;
         self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
+    }
+
+    /// Audio-only sibling of [`Self::forward_video_only_controlled`]. With no video modality the cross-modal
+    /// attentions are absent, while audio self/text attention and audio FF remain executable.
+    fn forward_audio_only(&self, ax: &Array, a: &StreamArgs) -> Result<Array> {
+        let ax = self.self_and_text(
+            ax,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a_sst,
+            &self.a_pst,
+            a,
+            true,
+        )?;
+        self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)
     }
 
     /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
@@ -2240,6 +2279,19 @@ impl AvBlock {
         }
         self.ff.set_lora_pass(pass);
         self.a_ff.set_lora_pass(pass);
+    }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for attention in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attention.set_sdpa_checkpoint(on);
+        }
     }
 
     /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
@@ -2483,6 +2535,16 @@ impl AvDiT {
                 }
             }
             AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// Training-only attention-segment checkpoint switch over the complete resident AV trunk.
+    /// Streamed trunks are inference-only and cannot carry trainable adapters.
+    pub(crate) fn set_sdpa_checkpoint(&mut self, on: bool) {
+        if let AvBlocks::Resident(blocks) = &mut self.blocks {
+            for block in blocks {
+                block.set_sdpa_checkpoint(on);
+            }
         }
     }
 
@@ -2742,6 +2804,32 @@ impl AvDiT {
         video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<Array> {
+        self.forward_video_only_controlled(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            AvPerturbation::NONE,
+        )
+    }
+
+    /// Video-only Dev validation forward with STG self-attention controls. Modality isolation is a
+    /// no-op when audio is absent, while the supplied STG block mask remains fully executable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only_controlled(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
+    ) -> Result<Array> {
         let vp = self.video.prepare(
             video_latent,
             video_timestep,
@@ -2754,8 +2842,12 @@ impl AvDiT {
         let vx = match &self.blocks {
             AvBlocks::Resident(blocks) => {
                 let mut vx = vp.x.clone();
-                for block in blocks {
-                    vx = block.forward_video_only(&vx, &va)?;
+                for (index, block) in blocks.iter().enumerate() {
+                    vx = block.forward_video_only_controlled(
+                        &vx,
+                        &va,
+                        perturbation.attention_plan(index).run_self,
+                    )?;
                 }
                 vx
             }
@@ -2769,7 +2861,11 @@ impl AvDiT {
                     |mut vx, view, range| {
                         for index in range {
                             let block = stream.materialize(view, index)?;
-                            vx = block.forward_video_only(&vx, &va)?;
+                            vx = block.forward_video_only_controlled(
+                                &vx,
+                                &va,
+                                perturbation.attention_plan(index).run_self,
+                            )?;
                         }
                         Ok(vx)
                     },
@@ -2778,6 +2874,56 @@ impl AvDiT {
             }
         };
         self.video.output_head(&vx, &vp.emb_ts)
+    }
+
+    /// Audio-only flexible-training forward. The video stream and both cross-modal attentions are
+    /// skipped exactly as the upstream model does when `video=None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_audio_only(
+        &self,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        rope_epoch: Option<u64>,
+    ) -> Result<Array> {
+        let ap = self.audio.prepare(
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_positions,
+            None,
+            rope_epoch,
+        )?;
+        let aa = ap.args(audio_mask);
+        let ax = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let mut ax = ap.x.clone();
+                for block in blocks {
+                    ax = block.forward_audio_only(&ax, &aa)?;
+                }
+                ax
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    ap.x.clone(),
+                    || stream.open(),
+                    |mut ax, view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            ax = block.forward_audio_only(&ax, &aa)?;
+                        }
+                        Ok(ax)
+                    },
+                    |ax: &Array| mlx_rs::transforms::eval([ax]).map_err(Error::from),
+                )?
+            }
+        };
+        self.audio.output_head(&ax, &ap.emb_ts)
     }
 }
 
@@ -2813,6 +2959,14 @@ mod tests {
     }
 
     #[test]
+    fn runtime_stg_override_selects_every_requested_block() {
+        let control = AvPerturbation::stg_blocks(&[3, 7]).unwrap();
+        assert!(!control.attention_plan(3).run_self);
+        assert!(!control.attention_plan(7).run_self);
+        assert!(control.attention_plan(28).run_self);
+    }
+
+    #[test]
     fn modality_isolation_suppresses_only_cross_modal_attention() {
         // This must remain distinct from STG: self/text/FF still execute at
         // every block, while both A2V and V2A calls are skipped.
@@ -2837,9 +2991,9 @@ mod tests {
 
     #[test]
     fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
-        // Structural mutation proof: both executable layouts must derive their
-        // per-block calls from the materialized/enumerated `index`, not a fixed
-        // STG layer or a mode that silently becomes a whole-block skip.
+        // Structural mutation proof: the resident and streamed loops for both AV and video-only
+        // execution must derive their per-block calls from the materialized/enumerated `index`,
+        // not a fixed STG layer or a mode that silently becomes a whole-block skip.
         let source = include_str!("transformer.rs");
         // The literal appears once in this assertion itself; subtract that self-reference so the
         // production count remains exact even though this file has multiple earlier test modules.
@@ -2848,8 +3002,8 @@ mod tests {
             .count()
             .saturating_sub(1);
         assert_eq!(
-            production_index_uses, 2,
-            "resident and streamed AV-DiT loops must both apply the actual block index"
+            production_index_uses, 4,
+            "resident and streamed AV/video-only loops must all apply the actual block index"
         );
         assert!(
             source.contains("if run_self {") && source.contains("if control.run_cross_modal {"),

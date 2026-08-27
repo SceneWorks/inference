@@ -39,7 +39,7 @@ const N_LAYERS: i32 = 4;
 /// also the adaLN embedding coefficient the AV path must run at.
 const ADALN_ROWS: i32 = 9;
 
-fn tiny_cfg() -> LtxConfig {
+pub(crate) fn tiny_cfg() -> LtxConfig {
     let mut cfg = LtxConfig::video_only_defaults();
     cfg.num_attention_heads = VIDEO_HEADS;
     cfg.attention_head_dim = VIDEO_HEAD_DIM;
@@ -124,7 +124,7 @@ impl Builder {
 }
 
 /// Every tensor `AvDiT::from_weights` reads, at the tiny config's dims.
-fn tiny_weight_map(cfg: &LtxConfig) -> HashMap<String, Array> {
+pub(crate) fn tiny_weight_map(cfg: &LtxConfig) -> HashMap<String, Array> {
     let vi = cfg.inner_dim();
     let ai = cfg.audio_inner_dim();
     let vctx = cfg.cross_attention_dim;

@@ -13,7 +13,7 @@ use crate::config::{
 use crate::vocoder::LtxVocoder;
 use crate::{
     conditioning, dev_sampler,
-    params::LTX_2_5_PARAMS,
+    params::GuiderParams,
     transformer::{AvDiT, AvPerturbation},
 };
 
@@ -393,6 +393,90 @@ pub fn denoise_av_conditioned(
     Ok((state, alat))
 }
 
+/// Non-distilled LTX-2.5 single-video Dev denoise.  This is the actual
+/// `ltxValidation.generateAudio=false` route: no audio latent is allocated, patchified, or
+/// forwarded.  With no cross-modal stream the isolated-modality prediction is the conditional
+/// prediction, so its configured guidance contribution is exactly zero.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_video_dev_conditioned(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    video_ctx: &Tensor,
+    negative_video_ctx: &Tensor,
+    sigmas: &[f32],
+    stg_blocks: &[usize],
+    video_guider: GuiderParams,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<conditioning::VideoTokenState> {
+    let mut state = video.clone();
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
+    {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx_2_5: dev STG blocks must contain 1..=8 unique indices in 0..48, got {stg_blocks:?}"
+        )));
+    }
+    let mut unique = stg_blocks.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != stg_blocks.len() {
+        return Err(candle_gen::CandleError::Msg(
+            "ltx_2_5: dev STG blocks must not contain duplicates".into(),
+        ));
+    }
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let timesteps = state.token_timesteps(sigma)?;
+        let mut forward = |context: &Tensor, perturbation: AvPerturbation| -> Result<Tensor> {
+            on_model_forward()?;
+            dit.forward_video_only_conditioned_controlled(
+                &state.latent,
+                &timesteps,
+                context,
+                &state.positions,
+                state.keyframes_mask.as_ref(),
+                &perturbation,
+            )
+        };
+        let conditional = forward(video_ctx, AvPerturbation::none())?;
+        let negative = forward(negative_video_ctx, AvPerturbation::none())?;
+        let perturbed = forward(video_ctx, AvPerturbation::stg(stg_blocks))?;
+        let denoise = |velocity: Tensor| -> Result<Tensor> {
+            conditioning::apply_denoise_mask(
+                &(&state.latent - (&velocity.to_dtype(DType::F32)? * sigma as f64)?)?,
+                &state.clean_latent,
+                &state.denoise_mask,
+            )
+        };
+        let conditional = denoise(conditional)?;
+        let negative = denoise(negative)?;
+        let perturbed = denoise(perturbed)?;
+        let video_denoised = dev_sampler::combine_guidance(
+            &conditional,
+            &negative,
+            &perturbed,
+            &conditional,
+            video_guider,
+        )?;
+        state.latent = if sigma_next <= 0.0 {
+            video_denoised
+        } else {
+            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&video_denoised + step)?
+        };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok(state)
+}
+
 /// Non-distilled LTX-2.5 stage-one denoise.  Each of the thirty official transitions makes four
 /// real joint-AvDiT evaluations: positive, negative-text, STG (self attention skipped at block
 /// 28 only), and modality-isolated (A2V/V2A skipped at every block).  Guidance combines denoised
@@ -409,7 +493,9 @@ pub fn denoise_av_dev_conditioned(
     audio_frames: usize,
     audio_grid: &Tensor,
     sigmas: &[f32],
-    stg_blocks: &'static [u32],
+    stg_blocks: &[usize],
+    video_guider: GuiderParams,
+    audio_guider: GuiderParams,
     cancel: &candle_gen::gen_core::CancelFlag,
     on_model_forward: &mut dyn FnMut() -> Result<()>,
     on_progress: &mut dyn FnMut(Progress),
@@ -420,14 +506,12 @@ pub fn denoise_av_dev_conditioned(
     let prepared_rope =
         dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
     let total = sigmas.len().saturating_sub(1).max(1) as u32;
-    let stg_blocks: &'static [usize] = match stg_blocks {
-        [28] => &[28],
-        other => {
-            return Err(candle_gen::CandleError::Msg(format!(
-                "ltx_2_5: dev STG blocks must be exactly [28], got {other:?}"
-            )));
-        }
-    };
+    if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
+    {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx_2_5: dev STG blocks must contain 1..=8 unique indices in 0..48, got {stg_blocks:?}"
+        )));
+    }
     for (step, window) in sigmas.windows(2).enumerate() {
         if cancel.is_cancelled() {
             return Err(candle_gen::CandleError::Canceled);
@@ -451,13 +535,16 @@ pub fn denoise_av_dev_conditioned(
                 audio_grid,
                 state.keyframes_mask.as_ref(),
                 &prepared_rope,
-                perturbation,
+                &perturbation,
             )
         };
         let (conditional_video, conditional_audio) =
-            forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
-        let (negative_video, negative_audio) =
-            forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
+            forward(video_ctx, audio_ctx, AvPerturbation::none())?;
+        let (negative_video, negative_audio) = forward(
+            negative_video_ctx,
+            negative_audio_ctx,
+            AvPerturbation::none(),
+        )?;
         let (perturbed_video, perturbed_audio) =
             forward(video_ctx, audio_ctx, AvPerturbation::stg(stg_blocks))?;
         let (isolated_video, isolated_audio) =
@@ -496,14 +583,14 @@ pub fn denoise_av_dev_conditioned(
             &negative_video,
             &perturbed_video,
             &isolated_video,
-            LTX_2_5_PARAMS.video_guider,
+            video_guider,
         )?;
         let audio_denoised = dev_sampler::combine_guidance(
             &conditional_audio,
             &negative_audio,
             &perturbed_audio,
             &isolated_audio,
-            LTX_2_5_PARAMS.audio_guider,
+            audio_guider,
         )?;
         state.latent = if sigma_next <= 0.0 {
             video_denoised

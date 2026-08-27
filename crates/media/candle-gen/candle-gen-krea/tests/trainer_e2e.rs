@@ -79,6 +79,7 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
             image_path: path,
             caption: format!("a solid colour swatch number {i}"),
             control_image_path: None,
+            model_options: Default::default(),
         });
     }
     items
@@ -477,6 +478,7 @@ fn make_concept_dataset(dir: &Path, rgb: [u8; 3], caption: &str, n: usize) -> Ve
                 image_path: path,
                 caption: caption.to_string(),
                 control_image_path: None,
+                model_options: Default::default(),
             }
         })
         .collect()

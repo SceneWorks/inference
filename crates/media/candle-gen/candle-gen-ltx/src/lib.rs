@@ -1022,6 +1022,11 @@ impl Pipeline {
                     )
                 })?;
             let mut stage1_forward = || Ok(());
+            let stage1_stg_blocks: Vec<usize> = stage1_plan
+                .stg_blocks
+                .iter()
+                .map(|&block| block as usize)
+                .collect();
             let (state, audio) = pipeline::denoise_av_dev_conditioned(
                 &comps.avdit,
                 &state,
@@ -1033,7 +1038,9 @@ impl Pipeline {
                 af,
                 &audio_grid,
                 &stage1_plan.sigmas,
-                stage1_plan.stg_blocks,
+                &stage1_stg_blocks,
+                crate::params::LTX_2_5_PARAMS.video_guider,
+                crate::params::LTX_2_5_PARAMS.audio_guider,
                 &req.cancel,
                 &mut stage1_forward,
                 &mut stage1_progress,
@@ -2159,7 +2166,9 @@ pub fn register_providers(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
-    registry.register_trainer(training::TRAINER_REGISTRATION)
+    registry
+        .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION_25)
 }
 
 /// Register the weights-free Candle/CUDA q4 I2V memory surface without requiring CUDA or weights.
@@ -2208,7 +2217,7 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(generators, ["ltx_2_3_distilled", "ltx_2_5_distilled"]);
-        assert_eq!(trainers, ["ltx_2_3"]);
+        assert_eq!(trainers, ["ltx_2_3", "ltx_2_5_distilled"]);
     }
 }
 

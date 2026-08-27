@@ -5570,6 +5570,7 @@ mod tests {
                 "krea_2_control",
                 "lens",
                 "ltx_2_3",
+                "ltx_2_5_distilled",
                 "mage_flow_base",
                 "sd3_5_large",
                 "sd3_5_medium",

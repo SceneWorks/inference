@@ -1533,6 +1533,7 @@ mod tests {
                 image_path: PathBuf::from("/tmp/x.png"),
                 caption: "a swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             }],
             config,
             output_dir: PathBuf::from("/tmp/lens_unused"),

@@ -732,6 +732,11 @@ pub fn generate_dfr_av_latents(
                     "ltx_2_5: dev DFR stage one is missing negative audio conditioning".into(),
                 )
             })?;
+            let stg_blocks: Vec<usize> = stage1_plan
+                .stg_blocks
+                .iter()
+                .map(|&block| block as usize)
+                .collect();
             denoise_av_dev_conditioned(
                 parts.dit,
                 &state,
@@ -743,7 +748,9 @@ pub fn generate_dfr_av_latents(
                 parts.audio_frames,
                 parts.audio_grid,
                 &stage1_plan.sigmas,
-                stage1_plan.stg_blocks,
+                &stg_blocks,
+                crate::params::LTX_2_5_PARAMS.video_guider,
+                crate::params::LTX_2_5_PARAMS.audio_guider,
                 cancel,
                 &mut on_forward,
                 on_progress,
@@ -951,7 +958,8 @@ mod tests {
         assert!(stage_one.contains("ExecutionPlan::for_variant(parts.transformer_variant)"));
         assert!(stage_one.contains("TransformerVariant::Dev =>"));
         assert!(stage_one.contains("denoise_av_dev_conditioned("));
-        assert!(stage_one.contains("stage1_plan.stg_blocks"));
+        assert!(stage_one.contains("let stg_blocks: Vec<usize>"));
+        assert!(stage_one.contains("&stg_blocks"));
         let stage_two = source
             .split("// --- Stage 2:")
             .nth(1)

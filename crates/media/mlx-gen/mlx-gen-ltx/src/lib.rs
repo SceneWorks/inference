@@ -165,6 +165,7 @@ pub fn register_providers(
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION_25)
 }
 
 /// Build the complete explicit MLX LTX provider catalog.
@@ -269,7 +270,7 @@ mod explicit_registry_tests {
             .collect();
 
         assert_eq!(explicit_generators, ["ltx_2_3", "ltx_2_5"]);
-        assert_eq!(explicit_trainers, ["ltx_2_3"]);
+        assert_eq!(explicit_trainers, ["ltx_2_3", "ltx_2_5"]);
     }
 
     #[test]

@@ -970,7 +970,7 @@ mod tests {
         }
     }
 
-    /// One row per id, and the fifteen trainer registrations reuse their generator's row rather than
+    /// One row per id, and the sixteen trainer registrations reuse their generator's row rather than
     /// duplicating it — `provider_id` is unique across the table, so they have to.
     #[test]
     fn trainer_ids_reuse_their_generator_row() {
@@ -984,7 +984,7 @@ mod tests {
             .map(|r| (r.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(trainers.len(), 15);
+        assert_eq!(trainers.len(), 16);
         for id in &trainers {
             assert!(
                 generators.contains(id),

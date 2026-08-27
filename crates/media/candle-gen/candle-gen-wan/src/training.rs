@@ -1546,6 +1546,7 @@ mod tests {
                 image_path: "/img.png".into(),
                 caption: "x".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             }],
             config: TrainingConfig::default(),
             output_dir: "/out".into(),
