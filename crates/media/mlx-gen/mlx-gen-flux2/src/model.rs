@@ -3304,6 +3304,26 @@ mod tests {
         )
     }
 
+    fn bounded_dev_control_registry_footprint(
+        spec: &LoadSpec,
+    ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+        bounded_component_footprint_for(
+            Flux2Variant::Dev,
+            crate::config::FLUX2_DEV_CONTROL_ID,
+            false,
+            spec,
+        )
+    }
+
+    fn bounded_dev_control_registry() -> mlx_gen::gen_core::ProviderRegistry {
+        let mut registration = crate::model_control::DEV_CONTROL_REGISTRATION;
+        registration.footprint = Some(bounded_dev_control_registry_footprint);
+        mlx_gen::gen_core::ProviderRegistryBuilder::new()
+            .register_generator(registration)
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn dev_estimated_fallback_projects_each_effective_language_tier_for_every_route() {
         let language_headers =
@@ -3362,13 +3382,10 @@ mod tests {
         .unwrap();
         let bounded_language_contract = crate::config::bounded_dev_encoder_contract();
         let bounded_language = exact_encoder_header_facts(bounded_language_contract, None);
-        let footprint = bounded_component_footprint_for(
-            Flux2Variant::Dev,
-            crate::config::FLUX2_DEV_CONTROL_ID,
-            false,
-            &spec,
-        )
-        .unwrap();
+        let footprint = bounded_dev_control_registry()
+            .footprint(crate::config::FLUX2_DEV_CONTROL_ID, &spec)
+            .unwrap()
+            .expect("the bounded public registration must expose its footprint callback");
         assert_eq!(
             footprint.text_encoder,
             projected_conditioning_from_exact_facts(

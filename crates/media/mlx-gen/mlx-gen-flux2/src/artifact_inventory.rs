@@ -1253,6 +1253,7 @@ mod tests {
         for (name, dtype, shape) in tensors {
             let width = match dtype {
                 "U32" => 4_u64,
+                "F16" => 2_u64,
                 "BF16" => 2_u64,
                 "I64" => 8_u64,
                 _ => unreachable!("fixture dtypes are exhaustive"),
@@ -1690,11 +1691,44 @@ mod tests {
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
+        let bounded_contract = crate::config::bounded_klein_encoder_contract();
+        let encoder_source = WeightsSource::Dir(root.join("text_encoder"));
+        let validated = bounded_contract
+            .validate_source_for_planning(&encoder_source)
+            .expect("the bounded encoder fixture must be valid before mutation");
         let encoder_file = single_safetensors(&root.join("text_encoder")).unwrap().0;
-        write_safetensors(&encoder_file, false);
-        assert!(crate::config::KLEIN_ENCODER_CONTRACT
-            .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))
-            .is_err());
+        let mut mutated_headers =
+            gen_core_testkit::encoder_contract_fixture_tensor_headers(bounded_contract, None)
+                .unwrap();
+        mutated_headers
+            .iter_mut()
+            .find(|header| header.name == "model.layers.0.self_attn.q_proj.weight")
+            .unwrap()
+            .shape[0] += 1;
+        write_tensor_file(
+            &encoder_file,
+            mutated_headers
+                .into_iter()
+                .map(|header| {
+                    let dtype = match header.dtype {
+                        Dtype::F16 => "F16",
+                        Dtype::BF16 => "BF16",
+                        Dtype::U32 => "U32",
+                        other => unreachable!("bounded encoder fixture dtype {other:?}"),
+                    };
+                    (header.name, dtype, header.shape)
+                })
+                .collect(),
+        );
+        let seal_error = validated
+            .materialized_language_tensor_headers(&bounded_contract)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            seal_error.contains("pinned weights entry changed after load")
+                || seal_error.contains("artifact seal mismatch after load"),
+            "{seal_error}"
+        );
 
         let mut transformer = transformer_tensors(Some(Quant::Q8));
         for suffix in ["weight", "scales", "biases"] {
