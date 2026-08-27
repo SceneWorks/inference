@@ -641,18 +641,9 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
         count = count
             .checked_add(add)
             .ok_or_else(|| Error::Msg("boogu_image_edit: reference image count overflow".into()))?;
-        if count > MAX_EDIT_REFS {
-            return Err(Error::Msg(format!(
-                "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {count})"
-            )));
-        }
+        validate_max_edit_reference_count(count)?;
     }
-    if count == 0 {
-        return Err(Error::Msg(
-            "boogu_image_edit: an instruction edit requires at least one source reference image"
-                .into(),
-        ));
-    }
+    validate_edit_reference_count(count)?;
 
     let mut refs: Vec<&Image> = Vec::with_capacity(count);
     for c in &req.conditioning {
@@ -667,6 +658,40 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
         validate_edit_reference(index, image)?;
     }
     Ok(refs)
+}
+
+/// Reject an over-cap reference count before any flattened or per-reference admission vectors can
+/// be allocated. Kept separate from the final non-empty check because registered requests may carry
+/// unrelated conditioning entries before their first reference.
+fn validate_max_edit_reference_count(count: usize) -> Result<()> {
+    if count > MAX_EDIT_REFS {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {count})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_edit_reference_count(count: usize) -> Result<()> {
+    validate_max_edit_reference_count(count)?;
+    if count == 0 {
+        return Err(Error::Msg(
+            "boogu_image_edit: an instruction edit requires at least one source reference image"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the registered generator's complete raw-reference carrier contract to a direct resident
+/// pipeline slice. This is allocation-free and must run before token/grid admission or component
+/// entry so the public [`crate::BooguPipeline`] route cannot bypass the generator boundary.
+pub(crate) fn validate_raw_edit_references(references: &[Image]) -> Result<()> {
+    validate_edit_reference_count(references.len())?;
+    for (index, image) in references.iter().enumerate() {
+        validate_edit_reference(index, image)?;
+    }
+    Ok(())
 }
 
 /// Validate one Edit source at the public generator boundary, before the request can enter either
@@ -953,22 +978,105 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write_tiny_tokenizer(root.path(), false);
         let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
-        let references = vec![img(512, 512)];
+        // Exercise the direct resident seam at the inclusive five-reference boundary while each
+        // conditioning/CFG mode proves that the exact admitted leg set reaches component entry.
+        let references = (0..MAX_EDIT_REFS).map(|_| img(16, 16)).collect::<Vec<_>>();
 
-        let text_negative =
-            crate::pipeline::preflight_edit(&tok, &references, "edit", true, true, false).unwrap();
-        assert_eq!(text_negative.admitted_legs(), (false, true, true, false));
+        for (condition_on_image, grounded_negative, expected) in [
+            (true, false, (false, true, true, false)),
+            (true, true, (false, true, false, true)),
+            (false, false, (true, false, true, false)),
+        ] {
+            let opts = crate::pipeline::EditOptions {
+                condition_on_image,
+                use_input_images_4_neg_instruct: grounded_negative,
+                ..Default::default()
+            };
+            let admitted = crate::pipeline::with_resident_edit_preflight(
+                &tok,
+                &references,
+                "edit",
+                &opts,
+                |preflight| Ok(preflight.admitted_legs()),
+            )
+            .unwrap();
+            assert_eq!(admitted, expected);
+        }
+    }
 
-        let grounded_negative =
-            crate::pipeline::preflight_edit(&tok, &references, "edit", true, true, true).unwrap();
-        assert_eq!(
-            grounded_negative.admitted_legs(),
-            (false, true, false, true)
-        );
+    /// The exported resident `BooguPipeline` seam must reject every raw-reference boundary before
+    /// it enters the closure that owns text/vision/VAE work. Each row is independently
+    /// mutation-sensitive: weakening count, geometry, alignment, or RGB8 admission makes its entry
+    /// counter non-zero instead of returning the named typed diagnostic.
+    #[test]
+    fn resident_edit_reference_preflight_has_zero_component_entry_on_every_invalid_carrier() {
+        use std::cell::Cell;
 
-        let text_only =
-            crate::pipeline::preflight_edit(&tok, &references, "edit", true, false, false).unwrap();
-        assert_eq!(text_only.admitted_legs(), (true, false, true, false));
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_edit_tokenizer(root.path());
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        let opts = crate::pipeline::EditOptions::default();
+        let invalid = [
+            ("zero references", Vec::new(), "at least one"),
+            (
+                "six references",
+                (0..=MAX_EDIT_REFS).map(|_| img(16, 16)).collect(),
+                "at most 5",
+            ),
+            (
+                "zero geometry",
+                vec![Image {
+                    width: 0,
+                    height: 16,
+                    pixels: Vec::new(),
+                }],
+                "non-zero",
+            ),
+            (
+                "oversized geometry",
+                vec![img(RES_MAX + RES_MULTIPLE, 16)],
+                "reference envelope",
+            ),
+            (
+                "misaligned geometry",
+                vec![img(RES_MULTIPLE + 1, RES_MULTIPLE)],
+                "multiples of 16",
+            ),
+            (
+                "malformed RGB8",
+                vec![Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3 - 1],
+                }],
+                "RGB8 buffer",
+            ),
+        ];
+
+        for (case, references, expected) in invalid {
+            let component_entries = Cell::new(0usize);
+            let error = crate::pipeline::with_resident_edit_preflight(
+                &tok,
+                &references,
+                "edit",
+                &opts,
+                |_| {
+                    component_entries.set(component_entries.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+            assert_eq!(
+                component_entries.get(),
+                0,
+                "{case}: invalid carrier entered resident components"
+            );
+        }
     }
 
     /// The real generator boundary must reject combined edit budgets before entering either

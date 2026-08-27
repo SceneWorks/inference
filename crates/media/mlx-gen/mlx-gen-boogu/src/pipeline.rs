@@ -98,8 +98,10 @@ pub(crate) fn preflight_text(
     Ok(TextPreflight { positive, negative })
 }
 
-/// Derive every reference's exact smart-resize geometry and tokenize/check the combined edit before
-/// any vision-tower or VAE work. Reference carriers have already passed the generator boundary.
+/// Validate every raw reference, derive its exact smart-resize geometry, and tokenize/check the
+/// combined edit before any allocation beyond the bounded five-reference host vectors or any
+/// text/vision/VAE component entry. This owns the carrier boundary for both the registered generator
+/// and direct resident [`BooguPipeline`] callers.
 pub(crate) fn preflight_edit(
     tok: &BooguTokenizer,
     references: &[Image],
@@ -108,6 +110,7 @@ pub(crate) fn preflight_edit(
     condition_on_image: bool,
     image_conditioned_negative: bool,
 ) -> Result<EditPreflight> {
+    crate::model::validate_raw_edit_references(references)?;
     if image_conditioned_negative && !condition_on_image {
         return Err(Error::Msg(
             "boogu edit: image-conditioned CFG-negative requires image-conditioned positive".into(),
@@ -140,6 +143,27 @@ pub(crate) fn preflight_edit(
         grids,
         counts,
     })
+}
+
+/// Direct resident edit admission seam. The component closure is entered only after the same raw
+/// carrier and token contracts as the registered generator have succeeded, and receives the exact
+/// admitted IDs/grids for reuse by the text/vision encoder and VAE/render path.
+pub(crate) fn with_resident_edit_preflight<T>(
+    tok: &BooguTokenizer,
+    references: &[Image],
+    instruction: &str,
+    opts: &EditOptions,
+    enter_components: impl FnOnce(&EditPreflight) -> Result<T>,
+) -> Result<T> {
+    let preflight = preflight_edit(
+        tok,
+        references,
+        instruction,
+        opts.text_guidance_scale > 1.0,
+        opts.condition_on_image,
+        opts.condition_on_image && opts.use_input_images_4_neg_instruct,
+    )?;
+    enter_components(&preflight)
 }
 
 /// Static-v1 time-shift parameters from the snapshot `scheduler/scheduler_config.json`
@@ -1028,16 +1052,18 @@ impl BooguPipeline {
         instruction: &str,
         opts: &EditOptions,
     ) -> Result<Image> {
-        let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
-        self.generate_edit_multi_with_progress(
-            references,
-            instruction,
-            opts,
-            &sigmas,
-            None,
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
+        with_resident_edit_preflight(&self.tok, references, instruction, opts, |preflight| {
+            let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
+            self.generate_edit_multi_admitted(
+                references,
+                opts,
+                preflight,
+                &sigmas,
+                None,
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+        })
     }
 
     /// Multi-reference Edit with [`Progress`] + cancellation. VAE-encodes each of the `N ∈ [1, 5]`
@@ -1056,17 +1082,33 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = preflight_edit(
-            &self.tok,
-            references,
-            instruction,
-            opts.text_guidance_scale > 1.0,
-            opts.condition_on_image,
-            opts.condition_on_image && opts.use_input_images_4_neg_instruct,
-        )?;
+        with_resident_edit_preflight(&self.tok, references, instruction, opts, |preflight| {
+            self.generate_edit_multi_admitted(
+                references,
+                opts,
+                preflight,
+                sigmas,
+                decoder,
+                cancel,
+                on_progress,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_edit_multi_admitted(
+        &self,
+        references: &[Image],
+        opts: &EditOptions,
+        preflight: &EditPreflight,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let cond = self
             .enc
-            .encode_edit_preflight(references, opts, Some(&preflight))?;
+            .encode_edit_preflight(references, opts, Some(preflight))?;
         let ref_latents = self.heavy.encode_ref_latents(references)?;
         self.heavy.render_edit(
             &cond,
