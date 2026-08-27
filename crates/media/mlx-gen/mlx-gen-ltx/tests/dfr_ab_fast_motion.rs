@@ -172,8 +172,17 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         dir.join("transformer.safetensors"),
     )
     .expect("transformer metadata");
-    let te = Ltx25TextEncoder::from_packed_av(&checkpoint, &te_path, &connector_w, &cfg, prec)
-        .expect("build the 2.5 text encoder");
+    let te = Ltx25TextEncoder::from_packed_av(
+        &checkpoint,
+        &te_path,
+        &connector_w,
+        &cfg,
+        prec,
+        // sc-18798: this A/B measures DFR motion, not memory — keep the historical resident
+        // encoder so nothing here is attributed to residency.
+        mlx_gen::gen_core::OffloadPolicy::Resident,
+    )
+    .expect("build the 2.5 text encoder");
     let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
     let (input_ids, mask) = tok.encode(PROMPT, MAX_LEN).expect("tokenize");
     let (_, _, video_ctx, audio_ctx) = te
