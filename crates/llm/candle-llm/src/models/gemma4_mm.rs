@@ -537,8 +537,15 @@ pub fn soft_token_grid(width: usize, height: usize, max_soft_tokens: usize) -> (
     let budget = max_soft_tokens.max(1);
     let (w, h) = (width.max(1) as f64, height.max(1) as f64);
     let aspect = w / h;
+    // Aspect fidelity first, token count second — NOT the other way round. Maximizing tokens alone
+    // picks a grid one row taller than the true ratio whenever that squeezes more patches under the
+    // budget (a 1:2 image would take 23x12 = 276 over the exact 22x11 = 242), and since the image is
+    // then resized onto that grid, the stretch is baked into what the model sees and into where the
+    // resampled positional table places every patch. A systematic distortion on every portrait image
+    // is a worse trade than 34 fewer soft tokens.
+    const EXACT: f64 = 1e-9;
     let mut best = (1usize, 1usize);
-    let mut best_score = (1usize, f64::INFINITY);
+    let mut best_score = (f64::INFINITY, 0usize);
     for gh in 1..=budget {
         let gw = ((gh as f64) * aspect).round().max(1.0) as usize;
         let count = gh * gw;
@@ -546,9 +553,11 @@ pub fn soft_token_grid(width: usize, height: usize, max_soft_tokens: usize) -> (
             continue;
         }
         let distortion = ((gw as f64 / gh as f64) / aspect).ln().abs();
-        if count > best_score.0 || (count == best_score.0 && distortion < best_score.1) {
+        let better = distortion < best_score.0 - EXACT
+            || ((distortion - best_score.0).abs() <= EXACT && count > best_score.1);
+        if better {
             best = (gh, gw);
-            best_score = (count, distortion);
+            best_score = (distortion, count);
         }
     }
     best
@@ -815,13 +824,25 @@ mod tests {
 
     #[test]
     fn soft_token_grid_fits_the_budget_and_tracks_aspect() {
+        // A square image gets a square grid within budget: 16x16 = 256 <= 280, and 17x17 = 289 > 280.
         assert_eq!(soft_token_grid(480, 480, 280), (16, 16));
-        let (gh, gw) = soft_token_grid(960, 480, 280);
-        assert!(gh * gw <= 280, "grid {gh}x{gw} must fit the budget");
-        assert_eq!(gw, gh * 2, "a 2:1 image must get a 2:1 grid");
-        let (ph, pw) = soft_token_grid(480, 960, 280);
-        assert_eq!(ph, pw * 2);
+        // A 2:1 landscape image gets an EXACTLY 2:1 grid, the largest that fits: 11x22 = 242
+        // (12x24 = 288 overruns). The nearby 12x23 = 276 packs in more patches but is not 2:1 —
+        // preferring it would stretch the image, which is the trade this rule refuses.
+        assert_eq!(soft_token_grid(960, 480, 280), (11, 22));
+        // Portrait mirrors it exactly.
+        assert_eq!(soft_token_grid(480, 960, 280), (22, 11));
+        // A 5:3 image likewise lands on an exact ratio: 12x20 = 240.
+        assert_eq!(soft_token_grid(500, 300, 280), (12, 20));
+        // Every grid stays within the budget and is never empty.
+        for (w, h) in [(960, 480), (480, 960), (500, 300), (1, 999), (999, 1), (37, 53)] {
+            let (gh, gw) = soft_token_grid(w, h, 280);
+            assert!(gh * gw <= 280, "{w}x{h} -> grid {gh}x{gw} exceeds the budget");
+            assert!(gh >= 1 && gw >= 1, "{w}x{h} -> empty grid {gh}x{gw}");
+        }
+        // Smaller than one patch still yields a real span.
         assert_eq!(soft_token_grid(10, 10, 280), (16, 16));
+        // A tiny budget cannot produce an empty grid.
         assert_eq!(soft_token_grid(100, 100, 1), (1, 1));
     }
 
@@ -950,7 +971,15 @@ mod tests {
         t.insert("vision_model.patch_ln2.weight".into(), ones(hidden));
         t.insert("vision_model.patch_ln2.bias".into(), zeros(hidden));
         // Distinct row/col position vectors so a swapped or dropped axis changes the output.
-        let pos: Vec<f32> = (0..posemb * 2 * hidden).map(|i| i as f32 * 0.01).collect();
+        //
+        // The values must vary WITHIN each position vector, not just between positions: `pos_norm`
+        // is a LayerNorm, which subtracts the per-row mean, so two positions differing by a constant
+        // offset (what a plain `i * 0.01` ramp produces) are indistinguishable downstream and this
+        // test would pass on a broken gather. A non-monotone pattern gives each position its own
+        // shape, not just its own level.
+        let pos: Vec<f32> = (0..posemb * 2 * hidden)
+            .map(|i| (((i * 37) % 23) as f32) * 0.05)
+            .collect();
         t.insert(
             "vision_model.pos_embedding".into(),
             Tensor::from_vec(pos, (posemb, 2, hidden), &dev).unwrap(),

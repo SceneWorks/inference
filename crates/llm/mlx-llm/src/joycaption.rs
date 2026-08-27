@@ -482,6 +482,8 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_system_prompt: true,
             supports_vision: true,
             supports_video: false,
+            // Text+vision captioner; no audio path at all.
+            supports_audio: false,
             supports_thinking: false,
             supports_tools: false,
             supported_constraints: Vec::new(),
