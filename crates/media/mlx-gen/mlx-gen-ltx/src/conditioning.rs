@@ -125,6 +125,11 @@ fn frame(x: &Array, i: i32) -> Result<Array> {
     Ok(x.take_axis(idx, 2)?)
 }
 
+/// Zeros with `tokens`' shape and dtype (`torch.zeros_like` for the appended-placeholder pattern).
+fn zeros_like_tokens(tokens: &Array) -> Result<Array> {
+    Ok(Array::zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?)
+}
+
 /// The I2V conditioning state (reference `LatentState`): the current (noised) latent, the clean
 /// conditioning latent, and the per-frame denoise mask. `clean_latent` + `denoise_mask` are fixed
 /// across the denoise loop; only `latent` evolves (it seeds the loop).
@@ -309,6 +314,14 @@ pub struct VideoTokenState {
     /// The target token count (the first `target_tokens` tokens are the generated grid; the rest are
     /// appended conditioning). `unpatchify` reads exactly these back into a grid.
     pub target_tokens: i32,
+    /// `(B, S, 1)` generated-keyframe marker (`> 0` = a slot token that receives the model's learned
+    /// keyframe absolute-position embedding, sc-18758/sc-18789). `None` until
+    /// [`append_generated_keyframe_slots`] marks a run — every other append keeps existing tokens
+    /// unmarked, mirroring the reference `extend_keyframes_mask(marked=False)`.
+    pub keyframes_mask: Option<Array>,
+    /// Where the single contiguous run of generated-keyframe slot tokens sits (`None` = no slots).
+    /// At most one [`append_generated_keyframe_slots`] per state, like the reference item.
+    pub generated_keyframe_layout: Option<mlx_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout>,
 }
 
 /// Patchify a latent grid `(B, C, F, H, W)` → tokens `(B, F·H·W, C)` (patch size 1, the reference
@@ -343,6 +356,31 @@ impl VideoTokenState {
             denoise_mask,
             positions: positions.clone(),
             target_tokens: s,
+            keyframes_mask: None,
+            generated_keyframe_layout: None,
+        })
+    }
+
+    /// Token-native view of a replace-latent [`I2vConditioning`] grid state (candle's `from_i2v`
+    /// sibling): patchify latent + clean, broadcast the per-frame mask `(B,1,F,1,1)` over space and
+    /// flatten it to `(B, F·H·W, 1)`. Lets the DFR stages compose grid image conditioning with
+    /// appended slot/keyframe tokens on one sequence.
+    pub fn from_i2v(state: &I2vConditioning, positions: &Array) -> Result<Self> {
+        let latent = patchify_grid(&state.latent)?;
+        let clean_latent = patchify_grid(&state.clean_latent)?;
+        let sh = state.latent.shape(); // (B, C, F, H, W)
+        let (b, f, h, w) = (sh[0], sh[2], sh[3], sh[4]);
+        let denoise_mask =
+            broadcast_to(&state.denoise_mask, &[b, 1, f, h, w])?.reshape(&[b, f * h * w, 1])?;
+        let s = latent.shape()[1];
+        Ok(Self {
+            latent,
+            clean_latent,
+            denoise_mask,
+            positions: positions.clone(),
+            target_tokens: s,
+            keyframes_mask: None,
+            generated_keyframe_layout: None,
         })
     }
 }
@@ -435,7 +473,350 @@ pub fn append_keyframe_clip(
         denoise_mask: concatenate_axis(&[&state.denoise_mask, &denoise_mask], 1)?,
         positions: concatenate_axis(&[&state.positions, &positions], 2)?,
         target_tokens: state.target_tokens,
+        // In-context clip tokens are ordinary conditioning, never keyframe slots.
+        keyframes_mask: extend_keyframes_mask(state, n, false)?,
+        generated_keyframe_layout: state.generated_keyframe_layout.clone(),
     })
+}
+
+// ===================================================================================================
+// DFR generated-keyframe slots + single-frame keyframe / reference-latent conditioning (sc-18789).
+// ===================================================================================================
+
+use mlx_gen::gen_core::ltx_dfr::GeneratedKeyframeLayout;
+
+/// Extend the state's keyframe marker for `num_new` appended tokens (reference
+/// `mask_utils.extend_keyframes_mask`): `marked = false` keeps an absent mask absent (the common,
+/// allocation-free path); any present mask — or a `marked = true` append — materializes zeros for
+/// every existing token plus the new run's value.
+pub fn extend_keyframes_mask(
+    state: &VideoTokenState,
+    num_new: i32,
+    marked: bool,
+) -> Result<Option<Array>> {
+    let dt = state.latent.dtype();
+    let b = state.latent.shape()[0];
+    let existing = match &state.keyframes_mask {
+        Some(mask) => mask.clone(),
+        None if !marked => return Ok(None),
+        None => {
+            let s = state.latent.shape()[1];
+            Array::zeros::<f32>(&[b, s, 1])?.as_dtype(dt)?
+        }
+    };
+    let fill = scalar(if marked { 1.0 } else { 0.0 }, dt)?;
+    let new = broadcast_to(&fill.reshape(&[1, 1, 1])?, &[b, num_new, 1])?;
+    Ok(Some(concatenate_axis(&[&existing, &new], 1)?))
+}
+
+/// RoPE positions for one **single-pixel-frame** appended token block (a generated-keyframe slot,
+/// or given single-frame keyframe content): full spatial grid at the target latent resolution, the
+/// frame axis spanning exactly `[pixel_frame, pixel_frame + 1) / fps`. The single-frame temporal
+/// extent is what distinguishes these tokens from a regular latent frame (which spans
+/// `temporal_scale` pixel frames) in RoPE space — reference
+/// `VideoGeneratedKeyframeSlots._slot_positions` / `VideoConditionByKeyframeIndex`
+/// (`num_pixel_frames == 1` narrowing). Output `(1, 3, h·w, 2)` f32, same layout as
+/// [`keyframe_append_positions`].
+pub fn single_frame_positions(
+    h: usize,
+    w: usize,
+    pixel_frame: i64,
+    spatial_scale: i64,
+    fps: f32,
+) -> Array {
+    let num = h * w;
+    let mut data = vec![0f32; 3 * num * 2];
+    for p in 0..num {
+        let hh = (p / w) as i64;
+        let ww = (p % w) as i64;
+        for e in 0..2i64 {
+            let base = p * 2 + e as usize;
+            data[base] = (pixel_frame + e) as f32 / fps;
+            data[base + num * 2] = ((hh + e) * spatial_scale) as f32;
+            data[base + 2 * num * 2] = ((ww + e) * spatial_scale) as f32;
+        }
+    }
+    Array::from_slice(&data, &[1, 3, num as i32, 2])
+}
+
+fn broadcast_positions(positions: Array, b: i32, n: i32) -> Result<Array> {
+    if b > 1 {
+        Ok(broadcast_to(&positions, &[b, 3, n, 2])?)
+    } else {
+        Ok(positions)
+    }
+}
+
+/// Append **generated keyframe slots** — the DFR conditioning item
+/// (`VideoGeneratedKeyframeSlots.apply_to`). Each slot occupies one latent frame's worth of tokens
+/// (`h·w` at patch size 1) at the target's spatial resolution, with `denoise_mask = 1` so the
+/// stage-entry noiser fills it from the slot `latent` (zeros, or `initial_keyframes` when given —
+/// `clean` is ignored at mask 1) and the denoise loop generates its content. The run is marked in
+/// `keyframes_mask` so it receives the learned keyframe absolute-position embedding, and recorded
+/// as the state's single [`GeneratedKeyframeLayout`].
+///
+/// * `pixel_frame_indices` — strictly increasing, in `[0, num_pixel_frames)`.
+/// * `initial_keyframes` — optional `(B, C, K, H, W)` latent content seeding the appended `latent`
+///   tokens (the stage-2 / temporal-round warm start).
+/// * `h`/`w` — the **target** latent spatial dims (slots always sit at target resolution).
+#[allow(clippy::too_many_arguments)]
+pub fn append_generated_keyframe_slots(
+    state: &VideoTokenState,
+    pixel_frame_indices: &[i64],
+    initial_keyframes: Option<&Array>,
+    num_pixel_frames: i64,
+    h: usize,
+    w: usize,
+    spatial_scale: i64,
+    fps: f32,
+) -> Result<VideoTokenState> {
+    if state.generated_keyframe_layout.is_some() {
+        return Err(Error::Msg(
+            "ltx dfr: generated keyframe slots were already applied to this state; append all \
+             slots through a single call"
+                .into(),
+        ));
+    }
+    if pixel_frame_indices.is_empty() {
+        return Err(Error::Msg(
+            "ltx dfr: pixel_frame_indices must be non-empty".into(),
+        ));
+    }
+    if pixel_frame_indices.windows(2).any(|p| p[1] <= p[0]) || pixel_frame_indices[0] < 0 {
+        return Err(Error::Msg(format!(
+            "ltx dfr: pixel_frame_indices must be non-negative and strictly increasing, got \
+             {pixel_frame_indices:?}"
+        )));
+    }
+    let last = *pixel_frame_indices.last().expect("non-empty");
+    if last >= num_pixel_frames {
+        return Err(Error::Msg(format!(
+            "ltx dfr: generated keyframe at pixel frame {last} is outside the target's \
+             {num_pixel_frames} frames"
+        )));
+    }
+
+    let dt = state.latent.dtype();
+    let b = state.latent.shape()[0];
+    let c = state.latent.shape()[2];
+    let k = pixel_frame_indices.len();
+    let tokens_per_keyframe = h * w;
+    let num_new = (tokens_per_keyframe * k) as i32;
+
+    let slot_tokens = match initial_keyframes {
+        None => Array::zeros::<f32>(&[b, num_new, c])?.as_dtype(dt)?,
+        Some(init) => {
+            let ish = init.shape();
+            if ish.len() != 5 || ish[2] as usize != k {
+                return Err(Error::Msg(format!(
+                    "ltx dfr: initial_keyframes must be (B, C, {k}, H, W), got {ish:?}"
+                )));
+            }
+            if ish[0] != b {
+                return Err(Error::Msg(format!(
+                    "ltx dfr: initial_keyframes batch {} does not match latent batch {b}",
+                    ish[0]
+                )));
+            }
+            if (ish[3] as usize, ish[4] as usize) != (h, w) {
+                return Err(Error::Msg(format!(
+                    "ltx dfr: initial_keyframes spatial size ({}, {}) does not match target \
+                     latent spatial size ({h}, {w})",
+                    ish[3], ish[4]
+                )));
+            }
+            // Patchify each single-frame block in index order so slot k's tokens are contiguous.
+            let mut blocks = Vec::with_capacity(k);
+            for index in 0..k {
+                blocks.push(patchify_grid(&frame(init, index as i32)?.as_dtype(dt)?)?);
+            }
+            concatenate_axis(&blocks.iter().collect::<Vec<_>>(), 1)?
+        }
+    };
+
+    let mut position_blocks = Vec::with_capacity(k);
+    for &pixel_frame in pixel_frame_indices {
+        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps));
+    }
+    let positions = concatenate_axis(&position_blocks.iter().collect::<Vec<_>>(), 2)?;
+    let positions = broadcast_positions(positions, b, num_new)?;
+
+    // denoise_mask 1 ⇒ the stage noiser lerps the slot latent toward noise (clean is ignored).
+    let denoise_mask = broadcast_to(&scalar(1.0, dt)?.reshape(&[1, 1, 1])?, &[b, num_new, 1])?;
+    let keyframes_mask = extend_keyframes_mask(state, num_new, true)?;
+    let first_token = state.latent.shape()[1] as usize;
+
+    Ok(VideoTokenState {
+        latent: concatenate_axis(&[&state.latent, &slot_tokens], 1)?,
+        clean_latent: concatenate_axis(
+            &[&state.clean_latent, &Array::zeros::<f32>(&[b, num_new, c])?.as_dtype(dt)?],
+            1,
+        )?,
+        denoise_mask: concatenate_axis(&[&state.denoise_mask, &denoise_mask], 1)?,
+        positions: concatenate_axis(&[&state.positions, &positions], 2)?,
+        target_tokens: state.target_tokens,
+        keyframes_mask,
+        generated_keyframe_layout: Some(GeneratedKeyframeLayout {
+            pixel_frame_indices: pixel_frame_indices.to_vec(),
+            tokens_per_keyframe,
+            first_token,
+        }),
+    })
+}
+
+/// Append **given** single-pixel-frame keyframe content as clean-latent guidance at explicit pixel
+/// frames (`VideoConditionByKeyframeIndex` with `num_pixel_frames = 1` — the DFR anchor-keyframe
+/// carry). `keyframes` is `(B, C, K, H, W)` with one latent frame per position; each block gets
+/// placeholder zeros in the noisy latent, the content in `clean_latent`, `denoise_mask =
+/// 1 − strength`, and single-frame RoPE spans. Deliberately **unmarked** in `keyframes_mask`: the
+/// reference only marks generated slots, never given keyframe content.
+#[allow(clippy::too_many_arguments)]
+pub fn append_single_frame_keyframes(
+    state: &VideoTokenState,
+    keyframes: &Array,
+    pixel_frame_indices: &[i64],
+    strength: f32,
+    spatial_scale: i64,
+    fps: f32,
+) -> Result<VideoTokenState> {
+    let sh = keyframes.shape();
+    if sh.len() != 5 {
+        return Err(Error::Msg(format!(
+            "ltx dfr: keyframes must be (B, C, K, H, W), got {sh:?}"
+        )));
+    }
+    if sh[2] as usize != pixel_frame_indices.len() {
+        return Err(Error::Msg(format!(
+            "ltx dfr: expected {} keyframe latents, got K={}",
+            pixel_frame_indices.len(),
+            sh[2]
+        )));
+    }
+    if pixel_frame_indices.iter().any(|&p| p <= 0) {
+        // Position 0 never carries an anchor (frame 0 is not a keyframe on the DFR canvas), and a
+        // zero offset would need the causal-fix path this single-frame builder deliberately omits.
+        return Err(Error::Msg(format!(
+            "ltx dfr: single-frame keyframe positions must be > 0, got {pixel_frame_indices:?}"
+        )));
+    }
+    let dt = state.latent.dtype();
+    let (b, h, w) = (sh[0], sh[3] as usize, sh[4] as usize);
+
+    let mut token_blocks = Vec::with_capacity(pixel_frame_indices.len());
+    let mut position_blocks = Vec::with_capacity(pixel_frame_indices.len());
+    for (index, &pixel_frame) in pixel_frame_indices.iter().enumerate() {
+        token_blocks.push(patchify_grid(&frame(keyframes, index as i32)?.as_dtype(dt)?)?);
+        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps));
+    }
+    let tokens = concatenate_axis(&token_blocks.iter().collect::<Vec<_>>(), 1)?;
+    let positions = concatenate_axis(&position_blocks.iter().collect::<Vec<_>>(), 2)?;
+    let n = tokens.shape()[1];
+    let positions = broadcast_positions(positions, b, n)?;
+    let denoise_mask = broadcast_to(
+        &scalar(1.0 - strength, dt)?.reshape(&[1, 1, 1])?,
+        &[b, n, 1],
+    )?;
+
+    Ok(VideoTokenState {
+        latent: concatenate_axis(&[&state.latent, &zeros_like_tokens(&tokens)?], 1)?,
+        clean_latent: concatenate_axis(&[&state.clean_latent, &tokens], 1)?,
+        denoise_mask: concatenate_axis(&[&state.denoise_mask, &denoise_mask], 1)?,
+        positions: concatenate_axis(&[&state.positions, &positions], 2)?,
+        target_tokens: state.target_tokens,
+        keyframes_mask: extend_keyframes_mask(state, n, false)?,
+        generated_keyframe_layout: state.generated_keyframe_layout.clone(),
+    })
+}
+
+/// Append a **reference video latent** for IC-LoRA detailing (`VideoConditionByReferenceLatent`,
+/// the `temporal_scale_factor = 1` configuration the DFR stage-2 detailing pass uses): the
+/// half-res stage-1 video rides along as clean in-context tokens whose spatial positions are
+/// scaled by `downscale_factor` into the target's coordinate frame (`(hh+e)·scale·d`), preserving
+/// the positional relationship the detailing IC-LoRA was trained with. Frame positions keep the
+/// standard causal grid (`frame_offset = 0`). Never marked as keyframes — the reference's own
+/// first latent frame also spans a single pixel frame, so a position-derived marker would wrongly
+/// claim it.
+#[allow(clippy::too_many_arguments)]
+pub fn append_reference_latent(
+    state: &VideoTokenState,
+    reference: &Array,
+    downscale_factor: i64,
+    strength: f32,
+    temporal_scale: i64,
+    spatial_scale: i64,
+    fps: f32,
+) -> Result<VideoTokenState> {
+    let sh = reference.shape(); // (B, C, F, h_ref, w_ref)
+    if sh.len() != 5 {
+        return Err(Error::Msg(format!(
+            "ltx dfr: reference latent must be (B, C, F, H, W), got {sh:?}"
+        )));
+    }
+    if downscale_factor < 1 {
+        return Err(Error::Msg(format!(
+            "ltx dfr: reference downscale_factor must be >= 1, got {downscale_factor}"
+        )));
+    }
+    let dt = state.latent.dtype();
+    let (b, cf, h, w) = (sh[0], sh[2] as usize, sh[3] as usize, sh[4] as usize);
+    let tokens = patchify_grid(&reference.as_dtype(dt)?)?;
+    let n = tokens.shape()[1];
+    // The standard causal appended-token grid at the reference's own dims; the downscale factor
+    // multiplies only the spatial axes ((hh+e)·32·d ≡ upstream's positions[:,1:] · d).
+    let positions = keyframe_append_positions(
+        cf,
+        h,
+        w,
+        0,
+        temporal_scale,
+        spatial_scale * downscale_factor,
+        fps,
+    );
+    let positions = broadcast_positions(positions, b, n)?;
+    let denoise_mask = broadcast_to(
+        &scalar(1.0 - strength, dt)?.reshape(&[1, 1, 1])?,
+        &[b, n, 1],
+    )?;
+
+    Ok(VideoTokenState {
+        latent: concatenate_axis(&[&state.latent, &zeros_like_tokens(&tokens)?], 1)?,
+        clean_latent: concatenate_axis(&[&state.clean_latent, &tokens], 1)?,
+        denoise_mask: concatenate_axis(&[&state.denoise_mask, &denoise_mask], 1)?,
+        positions: concatenate_axis(&[&state.positions, &positions], 2)?,
+        target_tokens: state.target_tokens,
+        keyframes_mask: extend_keyframes_mask(state, n, false)?,
+        generated_keyframe_layout: state.generated_keyframe_layout.clone(),
+    })
+}
+
+/// Read the denoised generated-keyframe slots back out of a post-denoise state as a
+/// `(B, C, K, H, W)` latent, using the recorded [`GeneratedKeyframeLayout`]. Errors when the state
+/// carries no layout — the caller asked for slots it never appended.
+pub fn take_generated_keyframes(state: &VideoTokenState, h: i32, w: i32) -> Result<Array> {
+    let layout = state.generated_keyframe_layout.as_ref().ok_or_else(|| {
+        Error::Msg(
+            "ltx dfr: this state carries no generated-keyframe layout; slots were never appended"
+                .into(),
+        )
+    })?;
+    if layout.tokens_per_keyframe != (h * w) as usize {
+        return Err(Error::Msg(format!(
+            "ltx dfr: layout tokens_per_keyframe {} != h·w {}",
+            layout.tokens_per_keyframe,
+            h * w
+        )));
+    }
+    let c = state.latent.shape()[2];
+    let mut frames = Vec::with_capacity(layout.pixel_frame_indices.len());
+    for k in 0..layout.pixel_frame_indices.len() {
+        let start = (layout.first_token + k * layout.tokens_per_keyframe) as i32;
+        let idx: Vec<i32> = (start..start + (h * w)).collect();
+        let tokens = state
+            .latent
+            .take_axis(Array::from_slice(&idx, &[h * w]), 1)?;
+        frames.push(unpatchify_grid(&tokens, c, 1, h, w)?);
+    }
+    concatenate_axis(&frames.iter().collect::<Vec<_>>(), 2).map_err(Into::into)
 }
 
 /// Blend a denoised latent toward the clean conditioning by the mask (reference `apply_denoise_mask`):

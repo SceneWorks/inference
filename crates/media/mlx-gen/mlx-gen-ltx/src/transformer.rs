@@ -1761,6 +1761,7 @@ impl Stream {
         timestep: &Array,
         context: &Array,
         positions: &Array,
+        keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<StreamPrep> {
         let dt = self.prec.dtype();
@@ -1768,10 +1769,11 @@ impl Stream {
         let (inner, coeff) = (self.inner, self.coeff);
 
         let x = self.patchify.forward(&latent.as_dtype(dt)?)?;
-        // sc-18758: the DFR keyframe-slot marker (video stream only; `self.keyframes_embedding` is
-        // always `None` for the audio stream). No call site threads a real mask yet (Phase 7), so
-        // this is presently an exact no-op — see `apply_keyframes_embedding`.
-        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), None)?;
+        // sc-18758/sc-18789: the DFR keyframe-slot marker (video stream only;
+        // `self.keyframes_embedding` is always `None` for the audio stream). The DFR token loops
+        // thread a real `(B, S, 1)` mask marking generated-keyframe slot tokens; every other path
+        // passes `None`, which keeps this an exact no-op.
+        let x = apply_keyframes_embedding(&x, self.keyframes_embedding.as_ref(), keyframes_mask)?;
 
         // adaLN-single timestep projection (the `× ts_mult` runs in the input dtype; see the
         // video-only path's note — bf16 must round `bf16(σ·1000)` first).
@@ -2071,6 +2073,15 @@ impl AvBlock {
         Ok((vx, ax))
     }
 
+    /// The absent-audio block body (sc-18789): video self-attention + text cross-attention +
+    /// feed-forward. Per the reference block's `run_a2v = run_vx and audio is not None`, the
+    /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
+    /// absent — not run against a placeholder stream.
+    fn forward_video_only(&self, vx: &Array, v: &StreamArgs) -> Result<Array> {
+        let vx = self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
+    }
+
     /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
     /// the two cross-modal attns (`audio_to_video_attn`/`video_to_audio_attn`). `audio_ff.net.*` →
     /// `audio_ff.proj_*` is renamed by the loader before reaching here.
@@ -2262,6 +2273,7 @@ impl AvDiT {
     ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
     ///   falls back to the `positions`-content compare (behavior unchanged).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         video_latent: &Array,
@@ -2274,6 +2286,7 @@ impl AvDiT {
         audio_context: &Array,
         audio_mask: Option<&Array>,
         audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
     ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
@@ -2281,6 +2294,7 @@ impl AvDiT {
             video_timestep,
             video_context,
             video_positions,
+            video_keyframes_mask,
             rope_epoch,
         )?;
         let ap = self.audio.prepare(
@@ -2288,6 +2302,7 @@ impl AvDiT {
             audio_timestep,
             audio_context,
             audio_positions,
+            None,
             rope_epoch,
         )?;
         let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
@@ -2300,6 +2315,38 @@ impl AvDiT {
         let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
         Ok((v_vel, a_vel))
+    }
+
+    /// **Video-only** forward through the AV stack — the reference `LTXModel` called with
+    /// `audio=None` (the DFR temporal-round tile denoise, `dfr_pipeline`'s `audio=None` stage
+    /// call): the audio stream is skipped entirely and, per the reference block
+    /// (`run_a2v = run_vx and audio is not None`), the cross-modal attentions do not run — each
+    /// block reduces to video self-attention + text cross-attention + feed-forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_video_only(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+    ) -> Result<Array> {
+        let vp = self.video.prepare(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_positions,
+            video_keyframes_mask,
+            rope_epoch,
+        )?;
+        let mut vx = vp.x.clone();
+        let va = vp.args(video_mask);
+        for block in &self.blocks {
+            vx = block.forward_video_only(&vx, &va)?;
+        }
+        self.video.output_head(&vx, &vp.emb_ts)
     }
 }
 

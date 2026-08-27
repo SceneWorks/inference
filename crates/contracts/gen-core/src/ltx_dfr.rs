@@ -323,6 +323,17 @@ pub fn dfr_target_frames(requested_frames: i64, rounds: u32) -> i64 {
     (requested_frames - 1) * (1i64 << rounds) + 1
 }
 
+/// Where one contiguous run of generated-keyframe slot tokens sits in a token sequence
+/// (`ltx_core.types.GeneratedKeyframeLayout`): appended by a single conditioning item so the run
+/// is exactly locatable — `first_token` is the sequence length before the append, and each of the
+/// `pixel_frame_indices` owns `tokens_per_keyframe` consecutive tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedKeyframeLayout {
+    pub pixel_frame_indices: Vec<i64>,
+    pub tokens_per_keyframe: usize,
+    pub first_token: usize,
+}
+
 /// Coefficients of one **rectified-flow** ancestral Euler step
 /// (`EulerAncestralDiffusionStep.step`, computed in f64 like the reference's f32-upcast):
 ///
