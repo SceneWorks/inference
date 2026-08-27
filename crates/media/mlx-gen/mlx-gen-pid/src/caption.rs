@@ -31,6 +31,30 @@ pub const CHI_PROMPT: &str = "Given a user prompt, generate an \"Enhanced prompt
 const MODEL_MAX_LENGTH: i32 = 300;
 const PAD_ID: i32 = 0;
 
+/// Apply the released CHI caption `select_index` to a pre-selection padding mask.
+///
+/// Returning the indices and mask together keeps the embedding gather and mask gather structurally
+/// inseparable: `[0] + range(-(MODEL_MAX_LENGTH - 1), 0)` must select the same 300 positions from
+/// both arrays.
+fn gather_selected_mask(mask: &[i32]) -> Result<(Vec<i32>, Vec<f32>)> {
+    let max_len = i32::try_from(mask.len())
+        .map_err(|_| mlx_gen::Error::Msg("caption attention mask length exceeds i32".into()))?;
+    if max_len < MODEL_MAX_LENGTH {
+        return Err(mlx_gen::Error::Msg(format!(
+            "caption attention mask has {max_len} positions, expected at least {MODEL_MAX_LENGTH}"
+        )));
+    }
+
+    let mut select_index = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
+    select_index.push(0);
+    select_index.extend((max_len - (MODEL_MAX_LENGTH - 1))..max_len);
+    let selected_mask = select_index
+        .iter()
+        .map(|&index| mask[index as usize] as f32)
+        .collect();
+    Ok((select_index, selected_mask))
+}
+
 /// Gemma-2 caption encoder: tokenizer + CHI-prompt + the released token-selection policy.
 ///
 /// This is the shared SANA-lineage text-conditioning path. PiD and SANA both: prepend a fixed CHI
@@ -87,8 +111,10 @@ impl CaptionEncoder {
         self.num_chi_tokens
     }
 
-    /// The padded `[input_ids, attention_mask]` for a caption — exposed so the tokenizer + Chi-prompt
-    /// + length policy can be parity-checked against the reference without the Gemma weights.
+    /// The padded, pre-selection `[input_ids, attention_mask]` for a caption. This mask is consumed by
+    /// Gemma while producing last-hidden states; [`Self::encode_with_mask`] then gathers the same
+    /// released `select_index` from both hidden states and this mask before returning the SANA-facing
+    /// `[1, 300]` cross-attention mask.
     pub fn token_ids(&self, caption: &str) -> Result<(Vec<i32>, Vec<i32>)> {
         let max_len = self.num_chi_tokens + MODEL_MAX_LENGTH - 2;
         // The caption is fed RAW (no lowercasing) because PiD was TRAINED on raw-case captions, so raw
@@ -133,13 +159,43 @@ impl CaptionEncoder {
         let mask_arr = Array::from_slice(&mask, &[1, max_len]);
         let hidden = self.gemma.forward(&ids_arr, Some(&mask_arr))?; // [1, max_len, 2304]
 
-        let mut sel = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
-        sel.push(0);
-        sel.extend((max_len - (MODEL_MAX_LENGTH - 1))..max_len);
         // Gather the padding mask at the SAME select_index so it stays aligned with the embeddings.
-        let sel_mask: Vec<f32> = sel.iter().map(|&i| mask[i as usize] as f32).collect();
+        let (sel, sel_mask) = gather_selected_mask(&mask)?;
         let sel_arr = Array::from_slice(&sel, &[MODEL_MAX_LENGTH]);
         let sel_mask_arr = Array::from_slice(&sel_mask, &[1, MODEL_MAX_LENGTH]);
         Ok((hidden.take_axis(&sel_arr, 1)?, sel_mask_arr)) // ([1,300,2304], [1,300])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gather_selected_mask;
+
+    #[test]
+    fn gathered_mask_uses_the_embedding_select_index() {
+        // With 305 pre-selection positions, the released index is [0, 6, 7, ..., 304]. Index 5 is
+        // deliberately marked real but skipped; the two retained edge positions are marked too. A
+        // prefix/suffix slice, an ungathered mask, or an off-by-one mutation changes this fixture.
+        let mut mask = vec![0; 305];
+        mask[0] = 1;
+        mask[5] = 1;
+        mask[6] = 1;
+        mask[304] = 1;
+
+        let (indices, gathered) = gather_selected_mask(&mask).unwrap();
+        assert_eq!(indices.len(), 300);
+        assert_eq!(&indices[..3], &[0, 6, 7]);
+        assert_eq!(*indices.last().unwrap(), 304);
+        assert_eq!(gathered.len(), 300);
+        assert_eq!(gathered.iter().filter(|&&value| value == 1.0).count(), 3);
+        assert_eq!(gathered[0], 1.0);
+        assert_eq!(gathered[1], 1.0);
+        assert_eq!(*gathered.last().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn gathered_mask_rejects_a_short_preselection_mask() {
+        let error = gather_selected_mask(&vec![1; 299]).unwrap_err();
+        assert!(error.to_string().contains("expected at least 300"));
     }
 }

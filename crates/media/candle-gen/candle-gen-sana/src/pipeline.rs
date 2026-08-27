@@ -454,6 +454,35 @@ impl SanaPipeline {
         Ok(SanaConditioning { cond, uncond })
     }
 
+    /// Encode the seed-independent base-SANA img2img reference once for a whole `count` batch.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Tensor>> {
+        let start_step = resolve_init_start(
+            req.init_image,
+            req.steps.unwrap_or(DEFAULT_STEPS),
+            req.strength,
+        );
+        if start_step == 0 {
+            return Ok(None);
+        }
+        let image = req.init_image.ok_or_else(|| {
+            CandleError::Msg("SANA positive img2img start requires an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            &self.encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?))
+    }
+
     /// Run the seed-dependent sampling and decode tail with precomputed conditioning.
     pub(crate) fn generate_with_conditioning(
         &self,
@@ -486,6 +515,31 @@ impl SanaPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<candle_gen::gen_core::GenerationMemory>,
     ) -> Result<Image> {
+        let prepared_reference = self.prepare_reference(req, device, cancel)?;
+        self.generate_with_conditioning_and_reference_memory(
+            req,
+            conditioning,
+            prepared_reference.as_ref(),
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_and_reference_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &SanaConditioning,
+        prepared_reference: Option<&Tensor>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -497,16 +551,10 @@ impl SanaPipeline {
         let noise = create_noise(device, seed, req.width, req.height)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
         let latents = if start_step > 0 {
-            let clean = encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                req.init_image.expect("positive start requires init image"),
-                req.width,
-                req.height,
-                device,
-                cancel,
-            )?;
-            blend_flow_init(&clean, &noise, &sigmas, start_step)?
+            let clean = prepared_reference.ok_or_else(|| {
+                CandleError::Msg("SANA img2img denoise requires a prepared reference latent".into())
+            })?;
+            blend_flow_init(clean, &noise, &sigmas, start_step)?
         } else {
             noise
         };
@@ -964,6 +1012,35 @@ impl SanaSprintPipeline {
         self.text_encoder.encode(prompt)
     }
 
+    /// Encode the seed-independent Sprint img2img reference once for a whole `count` batch.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Tensor>> {
+        let start_step = resolve_init_start(
+            req.init_image,
+            req.steps.unwrap_or(SPRINT_DEFAULT_STEPS),
+            req.strength,
+        );
+        if start_step == 0 {
+            return Ok(None);
+        }
+        let image = req.init_image.ok_or_else(|| {
+            CandleError::Msg("SANA-Sprint positive img2img start requires an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            &self.encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?))
+    }
+
     /// Run the seed-dependent Sprint sampling and decode tail with precomputed conditioning.
     pub(crate) fn generate_with_conditioning(
         &self,
@@ -996,6 +1073,31 @@ impl SanaSprintPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<candle_gen::gen_core::GenerationMemory>,
     ) -> Result<Image> {
+        let prepared_reference = self.prepare_reference(req, device, cancel)?;
+        self.generate_with_conditioning_and_reference_memory(
+            req,
+            cond,
+            prepared_reference.as_ref(),
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_and_reference_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cond: &Tensor,
+        prepared_reference: Option<&Tensor>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -1004,16 +1106,12 @@ impl SanaSprintPipeline {
         let noise = create_noise(device, seed, req.width, req.height)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
         let latents = if start_step > 0 {
-            let clean = encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                req.init_image.expect("positive start requires init image"),
-                req.width,
-                req.height,
-                device,
-                cancel,
-            )?;
-            renoise_sprint_init(&clean, &noise, &scheduler, start_step)?
+            let clean = prepared_reference.ok_or_else(|| {
+                CandleError::Msg(
+                    "SANA-Sprint img2img denoise requires a prepared reference latent".into(),
+                )
+            })?;
+            renoise_sprint_init(clean, &noise, &scheduler, start_step)?
         } else {
             noise.affine(scheduler.sigma_data as f64, 0.0)?
         };

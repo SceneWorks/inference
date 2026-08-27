@@ -78,17 +78,25 @@ pub struct SanaGenerator {
 
 trait BaseBatchPipeline {
     type Conditioning;
+    type PreparedReference;
 
     fn encode_batch(
         &self,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
     ) -> candle_gen::Result<Self::Conditioning>;
+    fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+    ) -> candle_gen::Result<Option<Self::PreparedReference>>;
     #[allow(clippy::too_many_arguments)]
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
         conditioning: &Self::Conditioning,
+        prepared_reference: Option<&Self::PreparedReference>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -99,6 +107,7 @@ trait BaseBatchPipeline {
 
 impl BaseBatchPipeline for SanaPipeline {
     type Conditioning = crate::pipeline::SanaConditioning;
+    type PreparedReference = candle_gen::candle_core::Tensor;
 
     fn encode_batch(
         &self,
@@ -108,19 +117,30 @@ impl BaseBatchPipeline for SanaPipeline {
         self.encode_conditioning(req, guidance)
     }
 
+    fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+    ) -> candle_gen::Result<Option<Self::PreparedReference>> {
+        self.prepare_reference(req, device, cancel)
+    }
+
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
         conditioning: &Self::Conditioning,
+        prepared_reference: Option<&Self::PreparedReference>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning_memory(
+        self.generate_with_conditioning_and_reference_memory(
             req,
             conditioning,
+            prepared_reference,
             device,
             cancel,
             on_progress,
@@ -383,6 +403,25 @@ fn generate_base_images(
             guidance,
         )
         .map_err(gen_core::Error::from)?;
+    let prepared_reference = pipeline
+        .prepare_reference(
+            &SanaGenerateRequest {
+                prompt: &req.prompt,
+                negative_prompt: req.negative_prompt.as_deref(),
+                height: req.height,
+                width: req.width,
+                steps,
+                guidance_scale,
+                seed: None,
+                sampler: req.sampler.as_deref(),
+                scheduler: req.scheduler.as_deref(),
+                init_image,
+                strength,
+            },
+            device,
+            &req.cancel,
+        )
+        .map_err(gen_core::Error::from)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         pipeline
@@ -401,6 +440,7 @@ fn generate_base_images(
                     strength,
                 },
                 &conditioning,
+                prepared_reference.as_ref(),
                 device,
                 &req.cancel,
                 on_progress,
@@ -534,13 +574,21 @@ impl SanaSprintGenerator {
 
 trait SprintBatchPipeline {
     type Conditioning;
+    type PreparedReference;
 
     fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning>;
+    fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+    ) -> candle_gen::Result<Option<Self::PreparedReference>>;
     #[allow(clippy::too_many_arguments)]
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
         conditioning: &Self::Conditioning,
+        prepared_reference: Option<&Self::PreparedReference>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -551,24 +599,36 @@ trait SprintBatchPipeline {
 
 impl SprintBatchPipeline for SanaSprintPipeline {
     type Conditioning = candle_gen::candle_core::Tensor;
+    type PreparedReference = candle_gen::candle_core::Tensor;
 
     fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning> {
         self.encode_conditioning(prompt)
+    }
+
+    fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &gen_core::CancelFlag,
+    ) -> candle_gen::Result<Option<Self::PreparedReference>> {
+        self.prepare_reference(req, device, cancel)
     }
 
     fn render_seed(
         &self,
         req: &SanaGenerateRequest<'_>,
         conditioning: &Self::Conditioning,
+        prepared_reference: Option<&Self::PreparedReference>,
         device: &Device,
         cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<gen_core::GenerationMemory>,
     ) -> candle_gen::Result<Image> {
-        self.generate_with_conditioning_memory(
+        self.generate_with_conditioning_and_reference_memory(
             req,
             conditioning,
+            prepared_reference,
             device,
             cancel,
             on_progress,
@@ -599,6 +659,25 @@ fn generate_sprint_images(
     let conditioning = pipeline
         .encode_batch(&req.prompt)
         .map_err(gen_core::Error::from)?;
+    let prepared_reference = pipeline
+        .prepare_reference(
+            &SanaGenerateRequest {
+                prompt: &req.prompt,
+                negative_prompt: None,
+                height: req.height,
+                width: req.width,
+                steps,
+                guidance_scale: req.guidance,
+                seed: None,
+                sampler: None,
+                scheduler: None,
+                init_image,
+                strength,
+            },
+            device,
+            &req.cancel,
+        )
+        .map_err(gen_core::Error::from)?;
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         pipeline
@@ -617,6 +696,7 @@ fn generate_sprint_images(
                     strength,
                 },
                 &conditioning,
+                prepared_reference.as_ref(),
                 device,
                 &req.cancel,
                 on_progress,
@@ -797,18 +877,21 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct RenderedInputs {
         has_reference: bool,
+        has_prepared_reference: bool,
         strength: Option<f32>,
         guidance_scale: Option<f32>,
     }
 
     struct BaseFixturePipeline {
         encoder_calls: Cell<usize>,
+        reference_encoder_calls: Cell<usize>,
         rendered_seeds: RefCell<Vec<u64>>,
         rendered_inputs: RefCell<Vec<RenderedInputs>>,
     }
 
     impl BaseBatchPipeline for BaseFixturePipeline {
         type Conditioning = Vec<u8>;
+        type PreparedReference = Vec<u8>;
 
         fn encode_batch(
             &self,
@@ -824,10 +907,26 @@ mod tests {
             Ok(bytes)
         }
 
+        fn prepare_reference(
+            &self,
+            req: &SanaGenerateRequest<'_>,
+            _device: &Device,
+            _cancel: &gen_core::CancelFlag,
+        ) -> candle_gen::Result<Option<Self::PreparedReference>> {
+            if req.init_image.is_some() && req.strength.unwrap_or(0.0) > 0.0 {
+                self.reference_encoder_calls
+                    .set(self.reference_encoder_calls.get() + 1);
+                Ok(Some(b"base-reference-latent".to_vec()))
+            } else {
+                Ok(None)
+            }
+        }
+
         fn render_seed(
             &self,
             req: &SanaGenerateRequest<'_>,
             conditioning: &Self::Conditioning,
+            prepared_reference: Option<&Self::PreparedReference>,
             _device: &Device,
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
@@ -838,6 +937,7 @@ mod tests {
             self.rendered_seeds.borrow_mut().push(seed);
             self.rendered_inputs.borrow_mut().push(RenderedInputs {
                 has_reference: req.init_image.is_some(),
+                has_prepared_reference: prepared_reference.is_some(),
                 strength: req.strength,
                 guidance_scale: req.guidance_scale,
             });
@@ -847,21 +947,40 @@ mod tests {
 
     struct SprintFixturePipeline {
         encoder_calls: Cell<usize>,
+        reference_encoder_calls: Cell<usize>,
         rendered_seeds: RefCell<Vec<u64>>,
+        rendered_references: RefCell<Vec<bool>>,
     }
 
     impl SprintBatchPipeline for SprintFixturePipeline {
         type Conditioning = Vec<u8>;
+        type PreparedReference = Vec<u8>;
 
         fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning> {
             self.encoder_calls.set(self.encoder_calls.get() + 1);
             Ok(prompt.as_bytes().to_vec())
         }
 
+        fn prepare_reference(
+            &self,
+            req: &SanaGenerateRequest<'_>,
+            _device: &Device,
+            _cancel: &gen_core::CancelFlag,
+        ) -> candle_gen::Result<Option<Self::PreparedReference>> {
+            if req.init_image.is_some() && req.strength.unwrap_or(0.0) > 0.0 {
+                self.reference_encoder_calls
+                    .set(self.reference_encoder_calls.get() + 1);
+                Ok(Some(b"sprint-reference-latent".to_vec()))
+            } else {
+                Ok(None)
+            }
+        }
+
         fn render_seed(
             &self,
             req: &SanaGenerateRequest<'_>,
             conditioning: &Self::Conditioning,
+            prepared_reference: Option<&Self::PreparedReference>,
             _device: &Device,
             _cancel: &gen_core::CancelFlag,
             _on_progress: &mut dyn FnMut(Progress),
@@ -870,6 +989,9 @@ mod tests {
         ) -> candle_gen::Result<Image> {
             let seed = req.seed.expect("the adapter supplies every per-image seed");
             self.rendered_seeds.borrow_mut().push(seed);
+            self.rendered_references
+                .borrow_mut()
+                .push(prepared_reference.is_some());
             Ok(fixture_image(conditioning, seed))
         }
     }
@@ -878,6 +1000,7 @@ mod tests {
     fn base_adapter_encodes_cfg_once_and_preserves_per_seed_tail() {
         let pipeline = BaseFixturePipeline {
             encoder_calls: Cell::new(0),
+            reference_encoder_calls: Cell::new(0),
             rendered_seeds: RefCell::new(Vec::new()),
             rendered_inputs: RefCell::new(Vec::new()),
         };
@@ -911,6 +1034,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 2);
+        assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(
             *pipeline.rendered_seeds.borrow(),
             vec![u64::MAX - 1, u64::MAX, 0, 1]
@@ -920,6 +1044,7 @@ mod tests {
             vec![
                 RenderedInputs {
                     has_reference: true,
+                    has_prepared_reference: true,
                     strength: Some(0.6),
                     guidance_scale: Some(4.5),
                 };
@@ -934,6 +1059,7 @@ mod tests {
     fn base_adapter_without_cfg_encodes_only_cond_once() {
         let pipeline = BaseFixturePipeline {
             encoder_calls: Cell::new(0),
+            reference_encoder_calls: Cell::new(0),
             rendered_seeds: RefCell::new(Vec::new()),
             rendered_inputs: RefCell::new(Vec::new()),
         };
@@ -955,12 +1081,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 1);
+        assert_eq!(pipeline.reference_encoder_calls.get(), 0);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![7, 8, 9]);
         assert_eq!(
             *pipeline.rendered_inputs.borrow(),
             vec![
                 RenderedInputs {
                     has_reference: false,
+                    has_prepared_reference: false,
                     strength: None,
                     guidance_scale: Some(1.0),
                 };
@@ -975,12 +1103,18 @@ mod tests {
     fn sprint_adapter_encodes_once_and_preserves_per_seed_tail() {
         let pipeline = SprintFixturePipeline {
             encoder_calls: Cell::new(0),
+            reference_encoder_calls: Cell::new(0),
             rendered_seeds: RefCell::new(Vec::new()),
+            rendered_references: RefCell::new(Vec::new()),
         };
         let request = GenerationRequest {
             prompt: "sprint cond".into(),
             seed: Some(11),
             count: 3,
+            conditioning: vec![Conditioning::Reference {
+                image: reference_image(),
+                strength: Some(0.6),
+            }],
             ..req(256, 256)
         };
         let expected = [11, 12, 13]
@@ -998,7 +1132,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(pipeline.encoder_calls.get(), 1);
+        assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);
+        assert_eq!(*pipeline.rendered_references.borrow(), vec![true; 3]);
         assert_eq!(actual, expected);
     }
 

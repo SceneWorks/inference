@@ -1039,10 +1039,11 @@ mod tests {
                 "{declaration} must take its hook by reference"
             );
         }
-        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint), the two
-        // public txt2img denoise wrappers, and their img2img schedule-tail twins: eight declarations
-        // in shipped `pipeline.rs`, line-exact for the same reason as `model.rs` above.
-        assert_eq!(hook_parameters(pipeline), 15);
+        // Both `generate_with` / `generate_with_conditioning` pairs (base and Sprint), their two
+        // prepared-reference batch tails, the two public txt2img denoise wrappers, and their img2img
+        // schedule-tail twins: every declaration remains line-exact for the same reason as
+        // `model.rs` above.
+        assert_eq!(hook_parameters(pipeline), 17);
 
         // The only hooks shipped `pipeline.rs` builds are the two documented INERT ones in the
         // `generate` convenience wrappers. A hook over anything else there would be a second wiring

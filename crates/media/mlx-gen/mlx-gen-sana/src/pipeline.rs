@@ -952,6 +952,43 @@ impl SanaHeavy {
         }
     }
 
+    /// Encode the request's seed-independent img2img reference once. The returned denoise-space
+    /// latent is reusable for every seed in a `count` batch; `None` is the exact txt2img / explicit
+    /// zero-strength path. Both base flow-match and Sprint SCM use this same preparation boundary.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Array>> {
+        let steps = req.steps.unwrap_or(if self.sprint {
+            SPRINT_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        });
+        let start_step = match req.init_image {
+            Some(_) => init_time_step(steps, req.strength),
+            None => 0,
+        };
+        if start_step == 0 {
+            return Ok(None);
+        }
+
+        let image = req.init_image.ok_or_else(|| {
+            Error::Msg("SANA positive img2img start requires an init image".into())
+        })?;
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            cancel,
+        )?))
+    }
+
     /// Render ONE image from pre-encoded [`SanaConditioning`] + a per-image request. `guidance` is the
     /// already-resolved guidance scale (the caller resolved it against [`Self::default_guidance`] so the
     /// encode's uncond decision and this render agree). Branches on `sprint`. Byte-identical to the tail
@@ -1038,10 +1075,54 @@ impl SanaHeavy {
         preview: &PreviewSink,
         plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
+        let prepared_reference = self.prepare_reference(req, cancel)?;
+        self.denoise_one_with_prepared_reference(
+            cond,
+            req,
+            guidance,
+            prepared_reference.as_ref(),
+            cancel,
+            on_progress,
+            preview,
+            plan,
+        )
+    }
+
+    /// Seed-dependent denoise tail over a reference latent prepared once at request scope.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_with_prepared_reference(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        prepared_reference: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
         if self.sprint {
-            self.denoise_sprint(cond, req, guidance, cancel, on_progress, preview, plan)
+            self.denoise_sprint(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
         } else {
-            self.denoise_cfg(cond, req, guidance, cancel, on_progress, preview, plan)
+            self.denoise_cfg(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
         }
     }
 
@@ -1052,6 +1133,7 @@ impl SanaHeavy {
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
+        prepared_reference: Option<&Array>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
@@ -1077,38 +1159,20 @@ impl SanaHeavy {
             Some(_) => init_time_step(steps, req.strength),
             None => 0,
         };
-        let clean = if start_step > 0 {
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
-            })?;
-            Some(encode_init_latents(
-                encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?)
-        } else {
-            None
-        };
-
         let noise = create_noise(seed, req.width, req.height)?;
-        let latents = match &clean {
-            // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[start_step]`.
-            Some(clean) => {
-                let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "sana img2img: start step {start_step} out of range for {}-element schedule",
-                        scheduler.sigmas.len()
-                    ))
-                })?;
-                add_noise_by_interpolation(clean, &noise, sigma)?
-            }
-            None => noise,
+        let latents = if start_step > 0 {
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg("SANA img2img denoise requires a prepared reference latent".into())
+            })?;
+            let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
+                Error::Msg(format!(
+                    "sana img2img: start step {start_step} out of range for {}-element schedule",
+                    scheduler.sigmas.len()
+                ))
+            })?;
+            add_noise_by_interpolation(clean, &noise, sigma)?
+        } else {
+            noise
         };
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
@@ -1148,6 +1212,7 @@ impl SanaHeavy {
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
+        prepared_reference: Option<&Array>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
@@ -1167,22 +1232,13 @@ impl SanaHeavy {
         let noise = create_noise(seed, req.width, req.height)?;
         let latents = if start_step > 0 {
             // img2img: renoise the encoded init to the start angle `timesteps[start_step]`.
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg(
+                    "SANA-Sprint img2img denoise requires a prepared reference latent".into(),
+                )
             })?;
-            let clean = encode_init_latents(
-                encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?;
             // x0 in the SCM prior space (σ_data-scaled); noise likewise. TrigFlow renoise to angle t.
-            let x0 = multiply(&clean, arr1(sd))?;
+            let x0 = multiply(clean, arr1(sd))?;
             let noise_sd = multiply(&noise, arr1(sd))?;
             let t = scheduler.timesteps[start_step];
             add(

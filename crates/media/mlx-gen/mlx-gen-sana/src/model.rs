@@ -431,6 +431,26 @@ fn base_sana_request<'a>(
     }
 }
 
+/// Prepare seed-independent reference state once, then fan the same borrowed value out across the
+/// request's seed sequence. Keeping preparation outside the loop is the work-count contract for both
+/// resident MLX SANA routes (base and Sprint).
+fn render_batch_with_prepared_reference<P, O>(
+    base_seed: u64,
+    count: u32,
+    prepare: impl FnOnce() -> Result<Option<P>>,
+    mut render: impl FnMut(u64, Option<&P>) -> Result<O>,
+) -> Result<Vec<O>> {
+    let prepared_reference = prepare()?;
+    let mut outputs = Vec::with_capacity(count as usize);
+    for offset in 0..count {
+        outputs.push(render(
+            base_seed.wrapping_add(offset as u64),
+            prepared_reference.as_ref(),
+        )?);
+    }
+    Ok(outputs)
+}
+
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Delegates the shared size/count/guidance/negative/conditioning checks to the descriptor
 /// (`Capabilities::validate_request`) and adds SANA's `RES_MULTIPLE` (32×, DC-AE) divisor rule.
@@ -591,21 +611,27 @@ impl Sana {
                 // Rungs 3 and 4, resolved against the trunk that will actually run them.
                 let plan =
                     crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
-                let mut latents = Vec::with_capacity(req.count as usize);
-                for n in 0..req.count {
-                    let seed = base_seed.wrapping_add(n as u64);
-                    let sana_req =
-                        base_sana_request(req, seed, init_image, strength, guidance_scale);
-                    latents.push(heavy.denoise_one_with_preview(
-                        &cond,
-                        &sana_req,
-                        guidance,
-                        &req.cancel,
-                        on_progress,
-                        &req.preview,
-                        plan,
-                    )?);
-                }
+                let prepare_req =
+                    base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+                let latents = render_batch_with_prepared_reference(
+                    base_seed,
+                    req.count,
+                    || heavy.prepare_reference(&prepare_req, &req.cancel),
+                    |seed, prepared_reference| {
+                        let sana_req =
+                            base_sana_request(req, seed, init_image, strength, guidance_scale);
+                        heavy.denoise_one_with_prepared_reference(
+                            &cond,
+                            &sana_req,
+                            guidance,
+                            prepared_reference,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            plan,
+                        )
+                    },
+                )?;
                 mlx_rs::transforms::eval(latents.iter())?;
                 Ok(latents)
             },
@@ -683,6 +709,7 @@ mod tests {
     use super::*;
     use crate::pipeline::{DEFAULT_GUIDANCE, DEFAULT_STEPS};
     use mlx_gen::Quant;
+    use std::cell::{Cell, RefCell};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -690,6 +717,42 @@ mod tests {
             width: w,
             height: h,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_and_sprint_prepare_one_reference_before_count_fanout() {
+        for route in ["base", "sprint"] {
+            let encoder_calls = Cell::new(0);
+            let rendered = RefCell::new(Vec::new());
+            let outputs = render_batch_with_prepared_reference(
+                u64::MAX - 1,
+                4,
+                || {
+                    encoder_calls.set(encoder_calls.get() + 1);
+                    Ok(Some(route.to_owned()))
+                },
+                |seed, prepared| {
+                    rendered
+                        .borrow_mut()
+                        .push((seed, prepared.expect("reference must be shared").clone()));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(encoder_calls.get(), 1, "{route} reference encode count");
+            assert_eq!(outputs, vec![u64::MAX - 1, u64::MAX, 0, 1]);
+            assert_eq!(
+                *rendered.borrow(),
+                vec![
+                    (u64::MAX - 1, route.to_owned()),
+                    (u64::MAX, route.to_owned()),
+                    (0, route.to_owned()),
+                    (1, route.to_owned()),
+                ],
+                "{route} must reuse one prepared latent across every distinct seed"
+            );
         }
     }
 
