@@ -60,10 +60,7 @@ impl TextLlmCapabilities {
             return reject("request has no messages".into());
         }
         if req.messages.iter().all(|m| {
-            m.text_content().trim().is_empty()
-                && !m.has_image()
-                && !m.has_video()
-                && !m.has_audio()
+            m.text_content().trim().is_empty() && !m.has_image() && !m.has_video() && !m.has_audio()
         }) {
             return reject("request has no non-empty content".into());
         }

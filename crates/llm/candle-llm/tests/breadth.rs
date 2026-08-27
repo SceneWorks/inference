@@ -233,11 +233,19 @@ fn gemma4_answers_at_a_quantized_tier() {
 /// makes left and right indistinguishable. Either one survives every shape assertion and shows up
 /// only here, as the model getting the side wrong.
 ///
-/// If this leg cannot be made to pass, the honest outcome is `supports_vision = false` in the
-/// descriptor — advertising a vision path that answers at chance is exactly the failure the story
-/// forbids.
+/// **This leg currently FAILS and vision is therefore not advertised** (sc-18772). Measured on
+/// `google/gemma-4-12B-it` at Q4 on CPU: an image-conditioned prompt degenerates into a
+/// `thought\nthought\n...` loop and, where it emits anything else, describes the input as *audio* —
+/// while a text-only prompt through the same provider instance answers cleanly and audio
+/// conditioning discriminates content correctly. The span is right (261 prompt tokens for a
+/// 17-token question is exactly `boi + 11x22 soft tokens + eoi`), so the framing is correct and the
+/// features are wrong. Both plausible patch flattening orders were tried against real weights.
+///
+/// It is kept, and kept `#[ignore]`d, as the gate: `supports_vision` may be flipped on only when
+/// this goes green. `images_are_refused_while_the_vision_path_is_unvalidated` in
+/// `gemma4_multimodal.rs` fails first if anyone flips the flag without it.
 #[test]
-#[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL"]
+#[ignore = "needs a Gemma 4 snapshot via CANDLE_LLM_GEMMA4_MODEL; currently RED - vision unvalidated"]
 fn gemma4_answers_about_an_image() {
     let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
         return;
@@ -325,7 +333,10 @@ fn gemma4_accepts_audio_conditioning() {
     );
     println!("[gemma4 audio] tone={a:?} silence={b:?}");
 
-    assert!(!a.trim().is_empty(), "audio-conditioned generation produced no text");
+    assert!(
+        !a.trim().is_empty(),
+        "audio-conditioned generation produced no text"
+    );
     assert!(
         a.chars().any(|c| c.is_alphabetic()),
         "output should contain words"

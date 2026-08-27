@@ -30,8 +30,8 @@ use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model, Qwen35VisionConfig,
-    Qwen35VisionModel, VlmDecode,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
+    Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
@@ -356,9 +356,10 @@ fn substitute_vision_placeholders(
                 .iter()
                 .map(|c| match c {
                     Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
-                    Content::Video(v) => {
-                        Ok(Content::text(video_placeholder_text(v, temporal_patch_size)))
-                    }
+                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
+                        v,
+                        temporal_patch_size,
+                    ))),
                     Content::Text(t) => Ok(Content::Text(t.clone())),
                     // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
                     // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
@@ -435,6 +436,38 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+}
+
+/// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
+///
+/// **`false`** (sc-18772). The front-end is implemented and its pieces are unit-tested, but its
+/// end-to-end behaviour could not be demonstrated on real weights, and two of its steps had to be
+/// chosen without a reference implementation to check against (upstream `transformers` with
+/// `Gemma4Unified` is not available offline):
+///
+/// * the patch-grid tiling — how an arbitrary aspect ratio maps onto a patch grid within the
+///   280-soft-token budget, and
+/// * the resampling of the 1120-entry positional table onto that grid.
+///
+/// Measured on `google/gemma-4-12B-it` at Q4 on CPU, through this provider:
+///
+/// * a text-only prompt through the SAME provider instance answers cleanly ("The sun dipped below
+///   the horizon, bleeding hues of molten gold ...");
+/// * audio conditioning answers cleanly and discriminates content (a 440 Hz tone is described as
+///   "a low-frequency, rhythmic thumping or pulsing", silence as "I cannot hear anything");
+/// * an image-conditioned prompt degenerates into a `thought` loop and, where it emits anything
+///   else, describes the input as **audio**. The span itself is correct — 261 prompt tokens for a
+///   17-token question is exactly `boi + 11x22 soft tokens + eoi` — so the framing and expansion
+///   are right and the *features* are wrong. Both plausible patch flattening orders (row-major and
+///   the channel-major Conv2d equivalent) were tried on real weights and fail the same way.
+///
+/// Advertising vision on that evidence is exactly the advertised-but-absent failure this story
+/// forbids, so an image-carrying request is REJECTED by the capability gate rather than answered
+/// from its text. The embedder and its host-side geometry stay in the tree, unadvertised and
+/// unreachable, so the next attempt starts from them and from the real-weight leg that must pass
+/// before this returns `true` (`gemma4_answers_about_an_image` in the breadth suite).
+fn gemma4_vision_is_validated() -> bool {
+    false
 }
 
 /// Gemma 4's loaded multimodal front-ends plus the tensor context they build in.
@@ -545,9 +578,11 @@ impl LlamaProvider {
                 Gemma4MmConfig::from_json(&cfg_value, processor.as_ref()).map_err(to_core)?;
             let dtype = model_dtype(&model);
             let mm = Gemma4Mm::from_weights(&weights, layout, mm_cfg, dtype).map_err(to_core)?;
-            descriptor.capabilities.supports_vision = mm.vision.is_some();
+            // Audio tracks the loaded tensors; vision does not — see `gemma4_vision_is_validated`.
+            descriptor.capabilities.supports_vision =
+                mm.vision.is_some() && gemma4_vision_is_validated();
             descriptor.capabilities.supports_audio = mm.audio.is_some();
-            (mm.vision.is_some() || mm.audio.is_some()).then(|| Gemma4Runtime {
+            mm.audio.is_some().then(|| Gemma4Runtime {
                 mm,
                 dtype,
                 device: device.clone(),
@@ -735,13 +770,9 @@ impl LlamaProvider {
                     acfg.max_soft_tokens,
                 )
                 .map_err(to_core)?;
-                let frames = gemma4_mm::frame_tensor(
-                    &framed,
-                    acfg.samples_per_token,
-                    &rt.device,
-                    rt.dtype,
-                )
-                .map_err(to_core)?;
+                let frames =
+                    gemma4_mm::frame_tensor(&framed, acfg.samples_per_token, &rt.device, rt.dtype)
+                        .map_err(to_core)?;
                 let feats = proj.forward(&frames).map_err(to_core)?;
                 audio_counts.push(framed.len() / acfg.samples_per_token);
                 audio_feats.push(feats);
@@ -945,6 +976,23 @@ impl ConstraintMask for JsonMask<'_> {
 /// - **tools** — the template renders tool calls (its source mentions `tool_call`), so it has a
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+    // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
+    if let Some(t) = sidecar_chat_template(dir) {
+        let supports_thinking = t.source().contains("enable_thinking");
+        let supports_tools = t.source().contains("tool_call");
+        return (Box::new(t), supports_thinking, supports_tools);
+    }
+    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
+        Ok(t) => {
+            let supports_thinking = t.source().contains("enable_thinking");
+            let supports_tools = t.source().contains("tool_call");
+            (Box::new(t), supports_thinking, supports_tools)
+        }
+        Err(_) => (Box::new(Llama3Template), false, false),
+    }
+}
+
 /// The modern HF layout ships the chat template as a **separate `chat_template.jinja`** beside
 /// `tokenizer_config.json` rather than inside it (transformers writes it that way for newer
 /// releases — `google/gemma-4-12B-it` is one, and its `tokenizer_config.json` carries no
@@ -983,23 +1031,6 @@ fn tokenizer_special_tokens(dir: &Path) -> (String, String) {
         }
     };
     (token("bos_token"), token("eos_token"))
-}
-
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
-    // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
-    if let Some(t) = sidecar_chat_template(dir) {
-        let supports_thinking = t.source().contains("enable_thinking");
-        let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
-    }
-    match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
-        Ok(t) => {
-            let supports_thinking = t.source().contains("enable_thinking");
-            let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
-        }
-        Err(_) => (Box::new(Llama3Template), false, false),
-    }
 }
 
 /// Pick a chat template for a GGUF load: a sibling `tokenizer_config.json` first, then the GGUF's
@@ -1612,7 +1643,10 @@ pub fn can_load_vision(spec: &LoadSpec) -> bool {
             Architecture::from_config(&v),
             Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl)
         );
-    qwen_vl || gemma4_multimodal(&v, "vision_config")
+    // Gemma 4 is deliberately absent: its vision path is loaded but unvalidated and therefore
+    // unadvertised (see `gemma4_vision_is_validated`). The probe must agree with the loaded
+    // descriptor, or a model-first vision-required load would resolve here and then be rejected.
+    qwen_vl
 }
 
 /// Weightless per-snapshot **audio** probe (core-llm `weightless_audio`, sc-18772): does this
@@ -1624,7 +1658,7 @@ pub fn can_load_audio(spec: &LoadSpec) -> bool {
     let Some(v) = probe_config(spec) else {
         return false;
     };
-    gemma4_multimodal(&v, "audio_config")
+    gemma4_multimodal(&v, "audio_config", "audio_token_id")
 }
 
 /// Read and parse a snapshot's `config.json` for a weightless probe, or `None` when the source is a
@@ -1650,18 +1684,13 @@ fn probe_config(spec: &LoadSpec) -> Option<serde_json::Value> {
 /// `image_token_id` has no row to splice image features into, so advertising vision for it would be
 /// exactly the advertised-but-absent case. The load path refuses such a config for the same reason,
 /// which keeps probe and loader agreeing.
-fn gemma4_multimodal(v: &serde_json::Value, block: &str) -> bool {
+fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> bool {
     if v.get(block).is_none() {
         return false;
     }
     if !matches!(Architecture::from_config(v), Ok(a) if a.is_gemma4()) {
         return false;
     }
-    let token_key = if block == "audio_config" {
-        "audio_token_id"
-    } else {
-        "image_token_id"
-    };
     v.get(token_key).and_then(|x| x.as_i64()).is_some()
 }
 
@@ -1711,10 +1740,8 @@ pub fn can_load(spec: &LoadSpec) -> bool {
     // (sc-18772). Gemma 4 is the reason this is not a Qwen-only list: `google/gemma-4-12B-it` carries
     // a `vision_config`, so the old rule declined the general-purpose Gemma 4 LLM outright.
     let arch = Architecture::from_config(&v);
-    let serves_multimodal = matches!(
-        arch,
-        Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl)
-    ) || matches!(arch, Ok(a) if a.is_gemma4());
+    let serves_multimodal = matches!(arch, Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl))
+        || matches!(arch, Ok(a) if a.is_gemma4());
     if v.get("vision_config").is_some() && !serves_multimodal {
         return false;
     }

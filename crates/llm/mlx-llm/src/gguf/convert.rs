@@ -515,15 +515,11 @@ mod tests {
     /// failure loud.
     #[test]
     fn gemma4_gguf_is_refused_with_a_specific_reason() {
-        let out = Fixture::new("gemma4-gguf-refusal");
+        let out = Fixture::new("gemma4-gguf-refusal", None);
         for arch in ["gemma4", "gemma4_unified"] {
-            let err = convert(
-                &arch_only_gguf(arch),
-                out.path(),
-                ConvertOptions::default(),
-            )
-            .map(|_| ())
-            .expect_err("a Gemma 4 GGUF must be refused");
+            let err = convert(&arch_only_gguf(arch), &out, ConvertOptions::default())
+                .map(|_| ())
+                .expect_err("a Gemma 4 GGUF must be refused");
             let msg = format!("{err}");
             assert!(
                 matches!(err, Error::Unsupported(_)),
@@ -537,13 +533,9 @@ mod tests {
         }
         // An unrelated unknown architecture still gets the ordinary message, so the Gemma 4 branch
         // has not swallowed the general case.
-        let err = convert(
-            &arch_only_gguf("bert"),
-            out.path(),
-            ConvertOptions::default(),
-        )
-        .map(|_| ())
-        .expect_err("an unsupported architecture must be refused");
+        let err = convert(&arch_only_gguf("bert"), &out, ConvertOptions::default())
+            .map(|_| ())
+            .expect_err("an unsupported architecture must be refused");
         assert!(format!("{err}").contains("bert"), "{err}");
         assert!(!format!("{err}").contains("layer_scalar"), "{err}");
     }

@@ -149,11 +149,6 @@ impl AudioRef {
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
-
-    /// Duration in seconds.
-    pub fn duration_secs(&self) -> f32 {
-        self.samples.len() as f32 / self.sample_rate as f32
-    }
 }
 
 /// A single piece of message content.
@@ -340,11 +335,11 @@ mod tests {
     }
 
     #[test]
-    fn audio_reports_duration_from_rate() {
+    fn audio_reports_its_sample_count() {
         let a = AudioRef::new(16_000, vec![0.0; 8_000]).unwrap();
         assert_eq!(a.len(), 8_000);
         assert!(!a.is_empty());
-        assert!((a.duration_secs() - 0.5).abs() < 1e-6);
+        assert_eq!(a.sample_rate, 16_000);
     }
 
     #[test]

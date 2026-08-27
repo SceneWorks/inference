@@ -855,8 +855,12 @@ mod tests {
         // `no` probe ⇒ defer to the static descriptor (which is audio-free here) ⇒ unmet.
         let spec = LoadSpec::dense("/no/such/snapshot");
         let declines = reg_with_audio_probe(text_desc, yes, no);
-        let err = picked_for(&[&declines], &spec, &ModelRequirements::default().with_audio())
-            .expect_err("an audio probe that declines must not be routed audio work");
+        let err = picked_for(
+            &[&declines],
+            &spec,
+            &ModelRequirements::default().with_audio(),
+        )
+        .expect_err("an audio probe that declines must not be routed audio work");
         // The diagnostic names the unmet audio requirement, not just vision.
         assert!(
             format!("{err}").contains("audio=true"),
@@ -875,7 +879,10 @@ mod tests {
         // re-route an audio-only request to a VLM.
         let reqs = ModelRequirements::default().with_audio();
         assert!(reqs.audio);
-        assert!(!reqs.vision, "with_audio must not set the vision requirement");
+        assert!(
+            !reqs.vision,
+            "with_audio must not set the vision requirement"
+        );
         // ...while `with_video` still implies vision, as before.
         assert!(ModelRequirements::default().with_video().vision);
     }

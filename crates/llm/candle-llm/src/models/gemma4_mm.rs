@@ -424,10 +424,7 @@ impl Gemma4AudioEmbedder {
         cfg: Gemma4AudioConfig,
         dtype: DType,
     ) -> Result<Self> {
-        let key = format!(
-            "{}.embedding_projection.weight",
-            layout.audio_proj_prefix()
-        );
+        let key = format!("{}.embedding_projection.weight", layout.audio_proj_prefix());
         let proj_w = w.require(&key)?.to_dtype(dtype)?;
         let shape = proj_w.dims().to_vec();
         if shape.len() != 2 || shape[1] != cfg.samples_per_token {
@@ -574,7 +571,7 @@ pub fn patchify(pixels: &[f32], width: usize, height: usize, patch: usize) -> Re
     if patch == 0 {
         return Err(Error::Config("Gemma 4 vision: patch size 0".to_string()));
     }
-    if width % patch != 0 || height % patch != 0 {
+    if !width.is_multiple_of(patch) || !height.is_multiple_of(patch) {
         return Err(Error::Config(format!(
             "Gemma 4 vision: {width}x{height} is not a whole number of {patch}x{patch} patches; \
              the caller must resize to a patch multiple first"
@@ -588,16 +585,24 @@ pub fn patchify(pixels: &[f32], width: usize, height: usize, patch: usize) -> Re
         )));
     }
     let (gh, gw) = (height / patch, width / patch);
-    let mut out = vec![0f32; gh * gw * patch * patch * 3];
     let patch_elems = patch * patch * 3;
+    let mut out = vec![0f32; gh * gw * patch_elems];
+    let plane = patch * patch;
     for pr in 0..gh {
         for pc in 0..gw {
             let base = (pr * gw + pc) * patch_elems;
             for y in 0..patch {
                 let src_row = (pr * patch + y) * width * 3 + pc * patch * 3;
-                let dst_row = base + y * patch * 3;
-                for i in 0..patch * 3 {
-                    out[dst_row + i] = pixels[src_row + i] / 255.0;
+                for x in 0..patch {
+                    for c in 0..3 {
+                        // CHANNEL-major within the patch: `patch_dense` is the Linear form of the
+                        // Conv2d patch embedding it replaces, and a Conv2d weight is
+                        // `[out, C, kH, kW]` — so its flattened input axis runs channel, then row,
+                        // then column. Interleaved (row, col, channel) order feeds the same numbers
+                        // through a permuted weight, which produces plausible-looking embeddings
+                        // that are off-manifold rather than an error.
+                        out[base + c * plane + y * patch + x] = pixels[src_row + x * 3 + c] / 255.0;
+                    }
                 }
             }
         }
@@ -835,9 +840,19 @@ mod tests {
         // A 5:3 image likewise lands on an exact ratio: 12x20 = 240.
         assert_eq!(soft_token_grid(500, 300, 280), (12, 20));
         // Every grid stays within the budget and is never empty.
-        for (w, h) in [(960, 480), (480, 960), (500, 300), (1, 999), (999, 1), (37, 53)] {
+        for (w, h) in [
+            (960, 480),
+            (480, 960),
+            (500, 300),
+            (1, 999),
+            (999, 1),
+            (37, 53),
+        ] {
             let (gh, gw) = soft_token_grid(w, h, 280);
-            assert!(gh * gw <= 280, "{w}x{h} -> grid {gh}x{gw} exceeds the budget");
+            assert!(
+                gh * gw <= 280,
+                "{w}x{h} -> grid {gh}x{gw} exceeds the budget"
+            );
             assert!(gh >= 1 && gw >= 1, "{w}x{h} -> empty grid {gh}x{gw}");
         }
         // Smaller than one patch still yields a real span.
@@ -863,7 +878,8 @@ mod tests {
     }
 
     #[test]
-    fn patchify_reads_each_patch_in_row_col_channel_order() {
+    fn patchify_reads_each_patch_channel_major() {
+        // 2x1 patches of side 2. Each pixel gets a unique value so the layout is checkable.
         let (w, h, p) = (4usize, 2usize, 2usize);
         let mut pixels = vec![0f32; w * h * 3];
         for y in 0..h {
@@ -875,19 +891,25 @@ mod tests {
         }
         let out = patchify(&pixels, w, h, p).unwrap();
         assert_eq!(out.len(), 2 * p * p * 3);
-        // Patch 0 covers x in 0..2; its first row is pixels (0,0) and (0,1) => 0,1,2, 10,11,12.
-        let expect0: Vec<f32> = [0, 1, 2, 10, 11, 12]
-            .iter()
-            .map(|v| *v as f32 / 255.0)
-            .collect();
-        assert_eq!(&out[..6], &expect0[..]);
+
+        // CHANNEL-major within a patch: the R plane for all 4 pixels, then G, then B — the layout a
+        // Conv2d patch embedding's `[out, C, kH, kW]` weight expects. Patch 0 covers x in 0..2, so
+        // its R plane is pixels (0,0) (0,1) (1,0) (1,1) => 0, 10, 40, 50.
+        let want_r0: Vec<f32> = [0.0, 10.0, 40.0, 50.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(&out[..4], &want_r0[..], "patch 0 R plane");
+        // ...then its G plane, the same pixels' channel 1 => 1, 11, 41, 51.
+        let want_g0: Vec<f32> = [1.0, 11.0, 41.0, 51.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(&out[4..8], &want_g0[..], "patch 0 G plane");
+
         // Patch 1 covers x in 2..4 — so the SECOND patch must read the right-hand columns, which is
         // what fails if the patch walk is column-major or the row stride is wrong.
-        let expect1: Vec<f32> = [20, 21, 22, 30, 31, 32]
-            .iter()
-            .map(|v| *v as f32 / 255.0)
-            .collect();
-        assert_eq!(&out[p * p * 3..p * p * 3 + 6], &expect1[..]);
+        let want_r1: Vec<f32> = [20.0, 30.0, 60.0, 70.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(
+            &out[p * p * 3..p * p * 3 + 4],
+            &want_r1[..],
+            "patch 1 R plane"
+        );
+
         // Rescale is 1/255 with no mean/std step, so a full-scale sample maps to exactly 1.0.
         assert!(patchify(&[255f32; 12], 2, 2, 2)
             .unwrap()
@@ -897,9 +919,9 @@ mod tests {
 
     #[test]
     fn patchify_refuses_a_non_patch_multiple() {
-        let err = patchify(&vec![0f32; 5 * 2 * 3], 5, 2, 2).expect_err("must refuse");
+        let err = patchify(&[0f32; 5 * 2 * 3], 5, 2, 2).expect_err("must refuse");
         assert!(format!("{err}").contains("whole number"), "{err}");
-        assert!(patchify(&vec![0f32; 10], 2, 2, 2).is_err());
+        assert!(patchify(&[0f32; 10], 2, 2, 2).is_err());
     }
 
     #[test]
@@ -989,7 +1011,9 @@ mod tests {
         t.insert(
             "multi_modal_projector.embedding_projection.weight".into(),
             Tensor::from_vec(
-                (0..hidden * hidden).map(|i| (i % 5) as f32 * 0.2).collect::<Vec<f32>>(),
+                (0..hidden * hidden)
+                    .map(|i| (i % 5) as f32 * 0.2)
+                    .collect::<Vec<f32>>(),
                 (hidden, hidden),
                 &dev,
             )
@@ -1018,7 +1042,10 @@ mod tests {
         assert_eq!(out.dims(), &[2, hidden]);
         let rows: Vec<Vec<f32>> = out.to_vec2().unwrap();
         assert!(
-            rows[0].iter().zip(&rows[1]).any(|(a, b)| (a - b).abs() > 1e-5),
+            rows[0]
+                .iter()
+                .zip(&rows[1])
+                .any(|(a, b)| (a - b).abs() > 1e-5),
             "identical patches at different columns must not embed identically — the positional \
              table is what distinguishes them"
         );
@@ -1059,7 +1086,9 @@ mod tests {
         t.insert(
             "audio_projector.embedding_projection.weight".into(),
             Tensor::from_vec(
-                (0..hidden * spt).map(|i| (i + 1) as f32 * 0.25).collect::<Vec<f32>>(),
+                (0..hidden * spt)
+                    .map(|i| (i + 1) as f32 * 0.25)
+                    .collect::<Vec<f32>>(),
                 (hidden, spt),
                 &dev,
             )
@@ -1071,8 +1100,8 @@ mod tests {
             sample_rate: 16_000,
             max_soft_tokens: 750,
         };
-        let proj =
-            Gemma4AudioEmbedder::from_weights(&w, Gemma4Layout::LtxPacked, cfg, DType::F32).unwrap();
+        let proj = Gemma4AudioEmbedder::from_weights(&w, Gemma4Layout::LtxPacked, cfg, DType::F32)
+            .unwrap();
 
         let framed = audio_frames(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0], spt, 750).unwrap();
         assert_eq!(framed.len(), 2 * spt, "6 samples at 4/frame => 2 frames");
@@ -1082,7 +1111,10 @@ mod tests {
         let rows: Vec<Vec<f32>> = out.to_vec2().unwrap();
         assert!(rows.iter().flatten().all(|v| v.is_finite()));
         assert!(
-            rows[0].iter().zip(&rows[1]).any(|(a, b)| (a - b).abs() > 1e-6),
+            rows[0]
+                .iter()
+                .zip(&rows[1])
+                .any(|(a, b)| (a - b).abs() > 1e-6),
             "distinct waveforms must produce distinct audio embeddings"
         );
 

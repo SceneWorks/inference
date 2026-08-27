@@ -218,8 +218,11 @@ fn gemma4_answers_at_a_quantized_tier() {
 /// and the resampling of the 1120-entry positional table onto that grid. A wrong tiling scrambles
 /// patch order; a wrong or dropped positional resampling makes left and right indistinguishable.
 /// Both survive every shape assertion and show up only here.
+/// **Currently expected RED — vision is not advertised** (sc-18772). The candle leg of the same
+/// name was measured against real weights and fails; see its doc comment for the evidence. Kept as
+/// the gate that must go green before `supports_vision` is flipped on.
 #[test]
-#[ignore = "needs a Gemma 4 snapshot via MLX_LLM_GEMMA4_MODEL"]
+#[ignore = "needs a Gemma 4 snapshot via MLX_LLM_GEMMA4_MODEL; currently RED - vision unvalidated"]
 fn gemma4_answers_about_an_image() {
     let Some(p) = gemma4_provider(Some(Quantize::Q4)) else {
         return;
@@ -300,7 +303,10 @@ fn gemma4_accepts_audio_conditioning() {
         16,
     );
     println!("[gemma4 audio] tone={a:?} silence={b:?}");
-    assert!(!a.trim().is_empty(), "audio-conditioned generation produced no text");
+    assert!(
+        !a.trim().is_empty(),
+        "audio-conditioned generation produced no text"
+    );
     assert_ne!(
         a, b,
         "a tone and silence must not produce identical continuations — identical output means the \

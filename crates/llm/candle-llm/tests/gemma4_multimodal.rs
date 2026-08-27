@@ -85,7 +85,9 @@ fn randn(shape: (usize, usize), rng: &mut Rng) -> Tensor {
 /// reached the decoder. Amplifying the attention read-out puts the two on comparable footing, which
 /// is what lets the assertions below actually observe the spliced rows.
 fn scaled(shape: (usize, usize), rng: &mut Rng, scale: f32) -> Tensor {
-    let data: Vec<f32> = (0..shape.0 * shape.1).map(|_| rng.next_f32() * scale).collect();
+    let data: Vec<f32> = (0..shape.0 * shape.1)
+        .map(|_| rng.next_f32() * scale)
+        .collect();
     Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
 }
 
@@ -185,7 +187,11 @@ fn processor_json() -> String {
 fn write_snapshot(with_vision: bool, with_audio: bool) -> common::Fixture {
     let fx = common::Fixture::new("candle-llm-gemma4-mm-", None);
     let dir: &std::path::Path = fx.as_ref();
-    std::fs::write(dir.join("config.json"), config_json(with_vision, with_audio)).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        config_json(with_vision, with_audio),
+    )
+    .unwrap();
     std::fs::write(dir.join("tokenizer.json"), tokenizer_json()).unwrap();
     if with_vision || with_audio {
         std::fs::write(dir.join("processor_config.json"), processor_json()).unwrap();
@@ -253,7 +259,10 @@ fn write_snapshot(with_vision: bool, with_audio: bool) -> common::Fixture {
 
     // --- vision embedder + projection, in the HF `model.` layout ---
     if with_vision {
-        t.insert("model.vision_embedder.patch_ln1.weight".into(), ones(PATCH_ELEMS));
+        t.insert(
+            "model.vision_embedder.patch_ln1.weight".into(),
+            ones(PATCH_ELEMS),
+        );
         t.insert(
             "model.vision_embedder.patch_ln1.bias".into(),
             Tensor::zeros((PATCH_ELEMS,), DType::F32, &Device::Cpu).unwrap(),
@@ -266,7 +275,10 @@ fn write_snapshot(with_vision: bool, with_audio: bool) -> common::Fixture {
             "model.vision_embedder.patch_dense.bias".into(),
             Tensor::zeros((HIDDEN,), DType::F32, &Device::Cpu).unwrap(),
         );
-        t.insert("model.vision_embedder.patch_ln2.weight".into(), ones(HIDDEN));
+        t.insert(
+            "model.vision_embedder.patch_ln2.weight".into(),
+            ones(HIDDEN),
+        );
         t.insert(
             "model.vision_embedder.patch_ln2.bias".into(),
             Tensor::zeros((HIDDEN,), DType::F32, &Device::Cpu).unwrap(),
@@ -358,7 +370,6 @@ fn generate(p: &dyn TextLlm, req: &TextLlmRequest) -> Vec<u32> {
     ids
 }
 
-
 /// The provider's own count of the expanded prompt — the public number that reflects placeholder
 /// expansion, taken straight from `usage`.
 fn prompt_tokens(p: &dyn TextLlm, req: &TextLlmRequest) -> u32 {
@@ -393,7 +404,9 @@ fn assert_splice_replaces_marked_rows(fx: &common::Fixture, marker: i32, count: 
     let embeds = m.embed_input_ids(&t).expect("embed");
     // Distinctive feature rows, unlike any token embedding.
     let feats = Tensor::from_vec(
-        (0..count * hidden).map(|i| 7.0 + i as f32).collect::<Vec<f32>>(),
+        (0..count * hidden)
+            .map(|i| 7.0 + i as f32)
+            .collect::<Vec<f32>>(),
         (count, hidden),
         &Device::Cpu,
     )
@@ -432,7 +445,10 @@ fn assert_splice_replaces_marked_rows(fx: &common::Fixture, marker: i32, count: 
             assert!(!changed, "non-marker row {i} (id {id}) must be untouched");
         }
     }
-    assert_eq!(replaced, count, "every reserved row must take a feature row");
+    assert_eq!(
+        replaced, count,
+        "every reserved row must take a feature row"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -474,9 +490,12 @@ fn descriptor_advertises_exactly_the_front_ends_the_checkpoint_ships() {
         let spec = spec_of(&fx);
         let p = LlamaProvider::load(&spec).expect("load");
         let caps = &p.descriptor().capabilities;
-        assert_eq!(
-            caps.supports_vision, with_vision,
-            "supports_vision must track the vision tensors (vision={with_vision})"
+        // Vision is NOT advertised even when the tensors are present: the front-end loads but its
+        // end-to-end behaviour is unvalidated, so the descriptor stays honest rather than
+        // advertising a path that answers off-manifold (see `GEMMA4_VISION_UNVALIDATED`).
+        assert!(
+            !caps.supports_vision,
+            "vision must stay unadvertised while it is unvalidated (vision tensors={with_vision})"
         );
         assert_eq!(
             caps.supports_audio, with_audio,
@@ -489,7 +508,12 @@ fn descriptor_advertises_exactly_the_front_ends_the_checkpoint_ships() {
             "video must stay unsupported: there is no frame-sampling path"
         );
         // The weightless probes drive model-first routing and must agree with the loaded truth.
-        assert_eq!(can_load_vision(&spec), with_vision, "weightless vision probe");
+        // The weightless probe must agree with the loaded descriptor, or a model-first
+        // vision-required load would resolve here and then be rejected at generate time.
+        assert!(
+            !can_load_vision(&spec),
+            "weightless vision probe must not claim Gemma 4"
+        );
         assert_eq!(can_load_audio(&spec), with_audio, "weightless audio probe");
     }
 }
@@ -550,149 +574,40 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
     }
 }
 
-/// The image span is reserved at exactly the right size AND the reserved rows are actually
-/// overwritten by the tower's features.
+/// An image is REFUSED on a checkpoint that ships a vision embedder, because the embedder is
+/// unvalidated and therefore unadvertised.
 ///
-/// Both halves are needed and neither implies the other. `usage.prompt_tokens` is the provider's own
-/// count of the expanded sequence, so it catches a span that never expanded or expanded to the wrong
-/// length; the splice check catches features that were computed and then dropped, which leaves the
-/// length correct and every shape intact.
-///
-/// The assertion is deliberately NOT "the generated tokens differ". This fixture's weights are
-/// random, and on an untrained Gemma the residual stream (token embeddings scaled by `sqrt(hidden)`)
-/// dominates the final hidden state so completely that greedy decoding re-emits the last prompt
-/// token whatever precedes it. A token-level check would therefore be green or red for reasons that
-/// have nothing to do with the splice. The behavioural claim — that the model *answers* differently
-/// about different images — is made on real weights in `breadth.rs`.
+/// This is the honest state of the vision path, pinned so it cannot drift: the tower loads, its
+/// pieces pass their unit tests, and the provider still refuses image input rather than answering
+/// from the text alone. Flipping `supports_vision` on must be accompanied by the real-weight leg
+/// (`gemma4_answers_about_an_image` in the breadth suite) going green — this test fails first if
+/// someone flips the flag without it.
 #[test]
-fn image_span_is_reserved_and_spliced() {
+fn images_are_refused_while_the_vision_path_is_unvalidated() {
     let fx = write_snapshot(true, true);
     let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
-    assert!(p.descriptor().capabilities.supports_vision);
-
-    let text_only = prompt_tokens(&p, &request(vec![Content::text("t1")]));
-    let with_image = prompt_tokens(
-        &p,
-        &request(vec![
-            Content::Image(image(4, 4, [255, 0, 0], [0, 0, 255])),
-            Content::text("t1"),
-        ]),
+    assert!(
+        !p.descriptor().capabilities.supports_vision,
+        "the vision path is unvalidated and must not be advertised"
     );
-    // A 4x4 image at a 2px patch and a 4-token budget is a 2x2 grid: boi + 4 soft tokens + eoi.
-    let (gh, gw) = gemma4_mm::soft_token_grid(4, 4, MAX_IMAGE_TOKENS);
-    assert_eq!((gh, gw), (2, 2), "the fixture's image must fill the budget");
-    // The image request carries one extra content block, which renders to one marker token; the
-    // expansion then replaces that token with `boi + soft tokens + eoi`.
-    assert_eq!(
-        with_image,
-        text_only + 2 + (gh * gw) as u32,
-        "the marker must expand to boi + {} soft tokens + eoi",
-        gh * gw
-    );
-
-    assert_splice_replaces_marked_rows(&fx, IMAGE_TOK as i32, gh * gw);
+    let req = request(vec![
+        Content::Image(image(4, 4, [255, 0, 0], [0, 0, 255])),
+        Content::text("t1"),
+    ]);
+    let err = p.validate(&req).expect_err("an image must be rejected");
+    assert!(format!("{err}").contains("image"), "{err}");
+    // `generate` refuses too, not just `validate`.
+    assert!(p.generate(&req, &mut |_| {}).is_err());
 }
 
-/// The audio span is reserved at exactly the right size and its rows are spliced. See
-/// [`image_span_is_reserved_and_spliced`] for why this is not a token-level assertion.
-#[test]
-fn audio_span_is_reserved_and_spliced() {
-    let fx = write_snapshot(true, true);
-    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
-    assert!(p.descriptor().capabilities.supports_audio);
-
-    let text_only = prompt_tokens(&p, &request(vec![Content::text("t1")]));
-    let samples = 8usize;
-    let with_audio = prompt_tokens(
-        &p,
-        &request(vec![
-            Content::Audio(AudioRef::new(AUDIO_RATE, vec![0.9; samples]).unwrap()),
-            Content::text("t1"),
-        ]),
-    );
-    let frames = gemma4_mm::audio_frame_count(samples, SAMPLES_PER_TOKEN, MAX_AUDIO_TOKENS);
-    assert_eq!(frames, 2, "8 samples at 4 per token is 2 frames");
-    assert_eq!(
-        with_audio,
-        text_only + 2 + frames as u32,
-        "the marker must expand to boa + {frames} soft tokens + eoa"
-    );
-
-    assert_splice_replaces_marked_rows(&fx, AUDIO_TOK as i32, frames);
-}
-
-/// Image and audio in ONE request: both spans expand, and neither pass consumes the other's marker.
+/// **Through the provider**, audio changes the generated tokens, and different waveforms change
+/// them differently.
 ///
-/// The two expansions run as separate passes over the same id vector, so a pass that matched the
-/// wrong id would swallow the other modality's span — visible here as a prompt length that accounts
-/// for only one of them.
-#[test]
-fn image_and_audio_together_both_reserve_their_spans() {
-    let fx = write_snapshot(true, true);
-    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
-
-    let img = || Content::Image(image(4, 4, [255, 0, 0], [0, 0, 255]));
-    let aud = || Content::Audio(AudioRef::new(AUDIO_RATE, vec![0.9; 8]).unwrap());
-
-    let base = prompt_tokens(&p, &request(vec![Content::text("t1")]));
-    let only_image = prompt_tokens(&p, &request(vec![img(), Content::text("t1")]));
-    let only_audio = prompt_tokens(&p, &request(vec![Content::text("t1"), aud()]));
-    let both = prompt_tokens(&p, &request(vec![img(), Content::text("t1"), aud()]));
-
-    let image_cost = only_image - base;
-    let audio_cost = only_audio - base;
-    assert!(image_cost > 0 && audio_cost > 0);
-    assert_eq!(
-        both,
-        base + image_cost + audio_cost,
-        "both spans must be reserved; a short count means one pass ate the other's marker"
-    );
-    // And the generate actually runs to completion with both modalities spliced.
-    assert!(!generate(&p, &request(vec![img(), Content::text("t1"), aud()])).is_empty());
-}
-
-/// **Through the provider**, an image changes the generated tokens — and two images that differ only
-/// in their spatial arrangement change them differently.
-///
-/// This is the assertion the story's "image conditioning demonstrated" claim rests on, and it is the
-/// only one that observes the provider's own splice. Everything else here checks a piece: the tower
+/// This is the assertion the story's "audio conditioning demonstrated" claim rests on, and the only
+/// one that observes the provider's own splice. The pieces each have their own test — the projector
 /// emits distinct rows, the span is the right length, `splice_vision_features` replaces the marked
-/// rows. All of those stay green if `prepare_gemma4` computes the features and then forgets to
+/// rows — and all of those stay green if `prepare_gemma4` computes the features and then forgets to
 /// splice them, which is precisely the silent failure this catches.
-///
-/// The mirrored pair matters as much as the image/text pair: same pixels, same histogram, only the
-/// left-right order differs. A pipeline that dropped the positional embedding (or collapsed its two
-/// axes) would give both the same answer.
-#[test]
-fn image_conditioning_changes_the_provider_output() {
-    let fx = write_snapshot(true, true);
-    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
-    assert!(p.descriptor().capabilities.supports_vision);
-
-    let with = |a: [u8; 3], b: [u8; 3]| {
-        generate(
-            &p,
-            &request(vec![Content::Image(image(4, 4, a, b)), Content::text("t1")]),
-        )
-    };
-    let text_only = generate(&p, &request(vec![Content::text("t1")]));
-    let red_blue = with([255, 0, 0], [0, 0, 255]);
-    let blue_red = with([0, 0, 255], [255, 0, 0]);
-
-    assert_ne!(
-        red_blue, text_only,
-        "an image must change the output; identical to text-only means the splice never landed"
-    );
-    assert_ne!(
-        red_blue, blue_red,
-        "a mirrored image must change the output — the positional table distinguishes them"
-    );
-    // The same image twice is deterministic, so the differences above are conditioning, not noise.
-    assert_eq!(red_blue, with([255, 0, 0], [0, 0, 255]), "generation is deterministic");
-}
-
-/// **Through the provider**, audio changes the generated tokens, and different waveforms change them
-/// differently. The audio half of [`image_conditioning_changes_the_provider_output`].
 #[test]
 fn audio_conditioning_changes_the_provider_output() {
     let fx = write_snapshot(true, true);
@@ -722,56 +637,10 @@ fn audio_conditioning_changes_the_provider_output() {
         clip(falling),
         "different waveforms must produce different outputs"
     );
-    assert_eq!(clip(rising.clone()), clip(rising), "generation is deterministic");
-}
-
-/// The chat template is taken from the sidecar `chat_template.jinja` when the snapshot ships one,
-/// in preference to `tokenizer_config.json`'s embedded key and to the Llama-3 default.
-///
-/// `google/gemma-4-12B-it` ships exactly that way — a `chat_template.jinja` file and a
-/// `tokenizer_config.json` with no `chat_template` key — so reading only the embedded key addresses
-/// Gemma 4 in Llama-3's chat format. Nothing about that fails loudly: the prompt renders, the model
-/// generates, every length assertion holds. It just answers badly. This pins the precedence so the
-/// fallback cannot silently come back.
-#[test]
-fn the_sidecar_chat_template_wins_over_the_embedded_one() {
-    let fx = write_snapshot(true, true);
-    let dir: &std::path::Path = fx.as_ref();
-
-    // Sidecar only: its marker must appear in the rendered prompt.
-    std::fs::write(
-        dir.join("chat_template.jinja"),
-        "SIDECAR{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}",
-    )
-    .unwrap();
-    let p = LlamaProvider::load(&spec_of(&fx)).expect("load with sidecar");
-    let ids = generate(&p, &request(vec![Content::text("t1")]));
-    assert!(!ids.is_empty());
-
-    // With BOTH present the sidecar still wins. The embedded template renders a different marker, so
-    // the two are distinguishable by the prompt length they produce.
-    let tok_cfg = serde_json::json!({
-        "chat_template": "EMBEDDED EMBEDDED EMBEDDED EMBEDDED{% for m in messages %}{{ m['content'] }}{% endfor %}",
-        "bos_token": "<bos>",
-        "eos_token": "<eos>"
-    });
-    std::fs::write(
-        dir.join("tokenizer_config.json"),
-        serde_json::to_string(&tok_cfg).unwrap(),
-    )
-    .unwrap();
-    let with_both = LlamaProvider::load(&spec_of(&fx)).expect("load with both");
-    let both_len = prompt_tokens(&with_both, &request(vec![Content::text("t1")]));
-
-    // Now remove the sidecar: the embedded template takes over and renders a measurably longer
-    // prompt (four marker words vs one), which is what proves the sidecar was being preferred.
-    std::fs::remove_file(dir.join("chat_template.jinja")).unwrap();
-    let embedded_only = LlamaProvider::load(&spec_of(&fx)).expect("load embedded only");
-    let embedded_len = prompt_tokens(&embedded_only, &request(vec![Content::text("t1")]));
-
-    assert_ne!(
-        both_len, embedded_len,
-        "with a sidecar present the embedded template must NOT be the one that rendered"
+    assert_eq!(
+        clip(rising.clone()),
+        clip(rising),
+        "generation is deterministic"
     );
 }
 
@@ -792,6 +661,77 @@ fn a_wrong_sample_rate_is_refused() {
         .expect_err("a rate mismatch must be refused");
     let msg = format!("{err}");
     assert!(msg.contains("16000") && msg.contains("8000"), "{msg}");
+}
+
+/// The chat template is taken from the sidecar `chat_template.jinja` when the snapshot ships one,
+/// in preference to `tokenizer_config.json`'s embedded key and to the Llama-3 default.
+///
+/// `google/gemma-4-12B-it` ships exactly that way — a `chat_template.jinja` file and a
+/// `tokenizer_config.json` with no `chat_template` key — so reading only the embedded key addresses
+/// Gemma 4 in Llama-3's chat format. Nothing about that fails loudly: the prompt renders, the model
+/// generates, every length assertion holds. It just answers badly.
+#[test]
+fn the_sidecar_chat_template_wins_over_the_embedded_one() {
+    let fx = write_snapshot(true, true);
+    let dir: &std::path::Path = fx.as_ref();
+
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "SIDECAR{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}",
+    )
+    .unwrap();
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load with sidecar");
+    assert!(!generate(&p, &request(vec![Content::text("t1")])).is_empty());
+
+    let tok_cfg = serde_json::json!({
+        "chat_template": "EMBEDDED EMBEDDED EMBEDDED EMBEDDED{% for m in messages %}{{ m['content'] }}{% endfor %}",
+        "bos_token": "<bos>",
+        "eos_token": "<eos>"
+    });
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_string(&tok_cfg).unwrap(),
+    )
+    .unwrap();
+    let with_both = LlamaProvider::load(&spec_of(&fx)).expect("load with both");
+    let both_len = prompt_tokens(&with_both, &request(vec![Content::text("t1")]));
+
+    std::fs::remove_file(dir.join("chat_template.jinja")).unwrap();
+    let embedded_only = LlamaProvider::load(&spec_of(&fx)).expect("load embedded only");
+    let embedded_len = prompt_tokens(&embedded_only, &request(vec![Content::text("t1")]));
+
+    assert_ne!(
+        both_len, embedded_len,
+        "with a sidecar present the embedded template must NOT be the one that rendered"
+    );
+}
+
+/// The audio span is reserved at exactly the right size and its rows are spliced. See
+/// [`image_span_is_reserved_and_spliced`] for why this is not a token-level assertion.
+#[test]
+fn audio_span_is_reserved_and_spliced() {
+    let fx = write_snapshot(true, true);
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert!(p.descriptor().capabilities.supports_audio);
+
+    let text_only = prompt_tokens(&p, &request(vec![Content::text("t1")]));
+    let samples = 8usize;
+    let with_audio = prompt_tokens(
+        &p,
+        &request(vec![
+            Content::Audio(AudioRef::new(AUDIO_RATE, vec![0.9; samples]).unwrap()),
+            Content::text("t1"),
+        ]),
+    );
+    let frames = gemma4_mm::audio_frame_count(samples, SAMPLES_PER_TOKEN, MAX_AUDIO_TOKENS);
+    assert_eq!(frames, 2, "8 samples at 4 per token is 2 frames");
+    assert_eq!(
+        with_audio,
+        text_only + 2 + frames as u32,
+        "the marker must expand to boa + {frames} soft tokens + eoa"
+    );
+
+    assert_splice_replaces_marked_rows(&fx, AUDIO_TOK as i32, frames);
 }
 
 /// Video is declared unsupported and refused with a message that says so — not rendered as an image
@@ -880,6 +820,3 @@ fn the_nested_decoder_layout_loads() {
     );
     CausalLm::from_weights(&weights, "", cfg).expect("the nested decoder must load");
 }
-
-
-

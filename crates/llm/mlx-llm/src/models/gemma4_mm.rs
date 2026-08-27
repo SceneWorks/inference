@@ -331,7 +331,11 @@ impl Gemma4VisionEmbedder {
 
     /// Load the tower. Every tensor is required: a partially-present vision embedder is a broken
     /// checkpoint, not a text-only one ([`present`](Self::present) already answered that question).
-    pub fn from_weights(w: &Weights, layout: Gemma4Layout, cfg: Gemma4VisionConfig) -> Result<Self> {
+    pub fn from_weights(
+        w: &Weights,
+        layout: Gemma4Layout,
+        cfg: Gemma4VisionConfig,
+    ) -> Result<Self> {
         let vp = layout.vision_prefix();
         let get = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
 
@@ -447,10 +451,7 @@ impl Gemma4AudioEmbedder {
 
     /// Load the projector, checking its input width against the config's frame size.
     pub fn from_weights(w: &Weights, layout: Gemma4Layout, cfg: Gemma4AudioConfig) -> Result<Self> {
-        let key = format!(
-            "{}.embedding_projection.weight",
-            layout.audio_proj_prefix()
-        );
+        let key = format!("{}.embedding_projection.weight", layout.audio_proj_prefix());
         let proj_w = w.require(&key)?.as_dtype(COMPUTE_DTYPE)?;
         let shape = proj_w.shape().to_vec();
         if shape.len() != 2 || shape[1] as usize != cfg.samples_per_token {
@@ -585,7 +586,7 @@ pub fn patchify(pixels: &[f32], width: usize, height: usize, patch: usize) -> Re
     if patch == 0 {
         return Err(Error::Config("Gemma 4 vision: patch size 0".to_string()));
     }
-    if width % patch != 0 || height % patch != 0 {
+    if !width.is_multiple_of(patch) || !height.is_multiple_of(patch) {
         return Err(Error::Config(format!(
             "Gemma 4 vision: {width}x{height} is not a whole number of {patch}x{patch} patches; \
              the caller must resize to a patch multiple first"
@@ -599,16 +600,24 @@ pub fn patchify(pixels: &[f32], width: usize, height: usize, patch: usize) -> Re
         )));
     }
     let (gh, gw) = (height / patch, width / patch);
-    let mut out = vec![0f32; gh * gw * patch * patch * 3];
     let patch_elems = patch * patch * 3;
+    let mut out = vec![0f32; gh * gw * patch_elems];
+    let plane = patch * patch;
     for pr in 0..gh {
         for pc in 0..gw {
             let base = (pr * gw + pc) * patch_elems;
             for y in 0..patch {
                 let src_row = (pr * patch + y) * width * 3 + pc * patch * 3;
-                let dst_row = base + y * patch * 3;
-                for i in 0..patch * 3 {
-                    out[dst_row + i] = pixels[src_row + i] / 255.0;
+                for x in 0..patch {
+                    for c in 0..3 {
+                        // CHANNEL-major within the patch: `patch_dense` is the Linear form of the
+                        // Conv2d patch embedding it replaces, and a Conv2d weight is
+                        // `[out, C, kH, kW]` — so its flattened input axis runs channel, then row,
+                        // then column. Interleaved (row, col, channel) order feeds the same numbers
+                        // through a permuted weight, which produces plausible-looking embeddings
+                        // that are off-manifold rather than an error.
+                        out[base + c * plane + y * patch + x] = pixels[src_row + x * 3 + c] / 255.0;
+                    }
                 }
             }
         }
@@ -701,18 +710,13 @@ pub fn expand_framed_placeholders(
 /// Lift host patch rows into an `[N, patch_elems]` array in the compute dtype.
 pub fn patch_array(flat: &[f32], patch_elems: usize) -> Result<Array> {
     let n = flat.len() / patch_elems.max(1);
-    Ok(
-        Array::from_slice(flat, &[n as i32, patch_elems as i32]).as_dtype(COMPUTE_DTYPE)?,
-    )
+    Ok(Array::from_slice(flat, &[n as i32, patch_elems as i32]).as_dtype(COMPUTE_DTYPE)?)
 }
 
 /// Lift host audio frames into an `[M, samples_per_token]` array in the compute dtype.
 pub fn frame_array(flat: &[f32], samples_per_token: usize) -> Result<Array> {
     let m = flat.len() / samples_per_token.max(1);
-    Ok(
-        Array::from_slice(flat, &[m as i32, samples_per_token as i32])
-            .as_dtype(COMPUTE_DTYPE)?,
-    )
+    Ok(Array::from_slice(flat, &[m as i32, samples_per_token as i32]).as_dtype(COMPUTE_DTYPE)?)
 }
 
 /// Concatenate per-visual feature blocks into the single `[total, hidden]` buffer the splice
@@ -854,9 +858,19 @@ mod tests {
         // A 5:3 image likewise lands on an exact ratio: 12x20 = 240.
         assert_eq!(soft_token_grid(500, 300, 280), (12, 20));
         // Every grid stays within the budget and is never empty.
-        for (w, h) in [(960, 480), (480, 960), (500, 300), (1, 999), (999, 1), (37, 53)] {
+        for (w, h) in [
+            (960, 480),
+            (480, 960),
+            (500, 300),
+            (1, 999),
+            (999, 1),
+            (37, 53),
+        ] {
             let (gh, gw) = soft_token_grid(w, h, 280);
-            assert!(gh * gw <= 280, "{w}x{h} -> grid {gh}x{gw} exceeds the budget");
+            assert!(
+                gh * gw <= 280,
+                "{w}x{h} -> grid {gh}x{gw} exceeds the budget"
+            );
             assert!(gh >= 1 && gw >= 1, "{w}x{h} -> empty grid {gh}x{gw}");
         }
         // Smaller than one patch still yields a real span.
@@ -886,8 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn patchify_reads_each_patch_in_row_col_channel_order() {
-        // 2x1 patches of side 2: pixel (y, x) gets a unique value so the layout is checkable.
+    fn patchify_reads_each_patch_channel_major() {
+        // 2x1 patches of side 2. Each pixel gets a unique value so the layout is checkable.
         let (w, h, p) = (4usize, 2usize, 2usize);
         let mut pixels = vec![0f32; w * h * 3];
         for y in 0..h {
@@ -899,23 +913,39 @@ mod tests {
         }
         let out = patchify(&pixels, w, h, p).unwrap();
         assert_eq!(out.len(), 2 * p * p * 3);
-        // Patch 0 covers x in 0..2; its first row is pixels (0,0) and (0,1) => 0,1,2, 10,11,12.
-        let expect0: Vec<f32> = [0, 1, 2, 10, 11, 12].iter().map(|v| *v as f32 / 255.0).collect();
-        assert_eq!(&out[..6], &expect0[..]);
-        // Patch 1 covers x in 2..4; its first row is pixels (0,2) and (0,3).
-        let expect1: Vec<f32> = [20, 21, 22, 30, 31, 32].iter().map(|v| *v as f32 / 255.0).collect();
-        assert_eq!(&out[p * p * 3..p * p * 3 + 6], &expect1[..]);
+
+        // CHANNEL-major within a patch: the R plane for all 4 pixels, then G, then B — the layout a
+        // Conv2d patch embedding's `[out, C, kH, kW]` weight expects. Patch 0 covers x in 0..2, so
+        // its R plane is pixels (0,0) (0,1) (1,0) (1,1) => 0, 10, 40, 50.
+        let want_r0: Vec<f32> = [0.0, 10.0, 40.0, 50.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(&out[..4], &want_r0[..], "patch 0 R plane");
+        // ...then its G plane, the same pixels' channel 1 => 1, 11, 41, 51.
+        let want_g0: Vec<f32> = [1.0, 11.0, 41.0, 51.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(&out[4..8], &want_g0[..], "patch 0 G plane");
+
+        // Patch 1 covers x in 2..4 — so the SECOND patch must read the right-hand columns, which is
+        // what fails if the patch walk is column-major or the row stride is wrong.
+        let want_r1: Vec<f32> = [20.0, 30.0, 60.0, 70.0].iter().map(|v| v / 255.0).collect();
+        assert_eq!(
+            &out[p * p * 3..p * p * 3 + 4],
+            &want_r1[..],
+            "patch 1 R plane"
+        );
+
         // Rescale is 1/255 with no mean/std step, so a full-scale sample maps to exactly 1.0.
-        assert!(patchify(&[255f32; 12], 2, 2, 2).unwrap().iter().all(|v| *v == 1.0));
+        assert!(patchify(&[255f32; 12], 2, 2, 2)
+            .unwrap()
+            .iter()
+            .all(|v| *v == 1.0));
     }
 
     #[test]
     fn patchify_refuses_a_non_patch_multiple() {
         // 5 is not a multiple of 2: silently cropping would drop a pixel column from the conditioning.
-        let err = patchify(&vec![0f32; 5 * 2 * 3], 5, 2, 2).expect_err("must refuse");
+        let err = patchify(&[0f32; 5 * 2 * 3], 5, 2, 2).expect_err("must refuse");
         assert!(format!("{err}").contains("whole number"), "{err}");
         // A sample-count mismatch is likewise refused rather than read past the end.
-        assert!(patchify(&vec![0f32; 10], 2, 2, 2).is_err());
+        assert!(patchify(&[0f32; 10], 2, 2, 2).is_err());
     }
 
     #[test]
@@ -964,7 +994,10 @@ mod tests {
         // feature buffer sized for two images into a prompt with one span.
         let err = expand_framed_placeholders(&[258880, 258880], 258880, 255999, 258882, &[3])
             .expect_err("must refuse");
-        assert!(format!("{err}").contains("2 `258880` placeholder(s)"), "{err}");
+        assert!(
+            format!("{err}").contains("2 `258880` placeholder(s)"),
+            "{err}"
+        );
         // One marker but two counts is equally refused.
         assert!(expand_framed_placeholders(&[258880], 258880, 255999, 258882, &[1, 1]).is_err());
     }
