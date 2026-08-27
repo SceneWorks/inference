@@ -2921,10 +2921,6 @@ mod tests {
         file.set_len(8 + encoded.len() as u64 + end).unwrap();
     }
 
-    fn append_sparse_f16_tensor(root: &Path, name: &str, shape: &[usize]) {
-        append_sparse_f16_tensor_to(&root.join("text_encoder/model.safetensors"), name, shape);
-    }
-
     #[test]
     fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
         // One sparse fixture represents a logical production-size multimodal checkpoint. Reuse it
@@ -2983,63 +2979,52 @@ mod tests {
     }
 
     #[test]
-    fn dev_registry_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = crate::provider_registry().unwrap();
-        let base_spec = production_multimodal_snapshot_spec(tmp.path());
-        let footprint =
-            |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
-        let dev = footprint(crate::config::FLUX2_DEV_ID, &base_spec);
-        let edit = footprint(crate::config::FLUX2_DEV_EDIT_ID, &base_spec);
-        let control = footprint(crate::config::FLUX2_DEV_CONTROL_ID, &base_spec);
+    fn dev_projection_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
+        let language = exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, None);
+        let multimodal = exact_dev_multimodal_header_facts();
+        let projected = |id: &str, language: &[mlx_gen::gen_core::SafetensorsTensorHeader]| {
+            projected_conditioning_bytes(
+                crate::config::DEV_ENCODER_CONTRACT,
+                language,
+                None,
+                (id != crate::config::FLUX2_DEV_CONTROL_ID).then_some(multimodal.as_slice()),
+                id,
+            )
+            .unwrap()
+        };
+        let dev = projected(crate::config::FLUX2_DEV_ID, &language);
+        let edit = projected(crate::config::FLUX2_DEV_EDIT_ID, &language);
+        let control = projected(crate::config::FLUX2_DEV_CONTROL_ID, &language);
         assert_eq!(dev, edit);
         assert!(dev > control, "Dev routes add Pixtral + projector once");
 
-        let language_only = tmp.path().join("alternate-language");
-        gen_core_testkit::write_encoder_contract_fixture(
-            &language_only,
-            crate::config::DEV_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        let complete = tmp.path().join("alternate-complete");
-        gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &complete.join("text_encoder"),
-            crate::config::DEV_ENCODER_CONTRACT,
-            crate::config::DEV_VISION_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        let language_spec = base_spec
-            .clone()
-            .with_text_encoder(WeightsSource::Dir(language_only));
-        let complete_spec = base_spec
-            .clone()
-            .with_text_encoder(WeightsSource::Dir(complete));
+        let mut complete_override = language.clone();
+        complete_override.extend(multimodal.iter().cloned());
+        let selected_language = crate::config::DEV_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&complete_override)
+            .unwrap();
+        assert_eq!(
+            selected_language, language,
+            "a complete override must project only its language constructor surface"
+        );
         for id in [
             crate::config::FLUX2_DEV_ID,
             crate::config::FLUX2_DEV_EDIT_ID,
             crate::config::FLUX2_DEV_CONTROL_ID,
         ] {
             assert_eq!(
-                footprint(id, &language_spec),
-                footprint(id, &complete_spec),
+                projected(id, &language),
+                projected(id, &selected_language),
                 "{id}: alternate visual/projector tensors are not consumed"
             );
         }
         assert_eq!(
-            footprint(crate::config::FLUX2_DEV_ID, &language_spec)
-                - footprint(crate::config::FLUX2_DEV_CONTROL_ID, &language_spec),
             dev - control,
+            expected_stored_header_bytes(&multimodal),
             "builtin Pixtral + projector must be counted exactly once"
         );
-
-        let estimated = mlx_gen::PerComponentBytes::from_spec_subdirs(
-            &base_spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .expect("the generic estimated-fallback path remains available");
-        assert!(estimated.text_encoder > 0);
+        // Real registry/source selection and generic transformer/VAE accounting remain bounded in
+        // `dev_estimated_fallback_projects_each_effective_language_tier_for_every_route`.
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3509,6 +3494,45 @@ mod tests {
 
     #[test]
     fn registry_footprint_excludes_unrelated_loaded_layer_namespace_tensors() {
+        let headers = exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, None);
+        let selected = crate::config::KLEIN_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&headers)
+            .unwrap();
+        let baseline = projected_conditioning_bytes(
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            &selected,
+            None,
+            None,
+            FLUX2_KLEIN_9B_ID,
+        )
+        .unwrap();
+
+        let mut with_unused = headers;
+        with_unused.push(mlx_gen::gen_core::SafetensorsTensorHeader {
+            name: "model.layers.0.unused_projection.weight".into(),
+            dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+            shape: vec![257],
+            data_bytes: 514,
+        });
+        let selected_with_unused = crate::config::KLEIN_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&with_unused)
+            .unwrap();
+        assert_eq!(selected_with_unused, selected);
+        assert_eq!(
+            projected_conditioning_bytes(
+                crate::config::KLEIN_ENCODER_CONTRACT,
+                &selected_with_unused,
+                None,
+                None,
+                FLUX2_KLEIN_9B_ID,
+            )
+            .unwrap(),
+            baseline,
+            "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
+        );
+
+        // Retain one real dense builtin registry receipt; the unused-namespace contrast above is
+        // pure because its subject is the contract's exact materialized-name projection.
         let fixture = tempfile::tempdir().unwrap();
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &fixture.path().join("text_encoder"),
@@ -3517,24 +3541,14 @@ mod tests {
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
-        let footprint = || {
+        assert_eq!(
             crate::provider_registry()
                 .unwrap()
                 .footprint(crate::config::FLUX2_KLEIN_9B_ID, &spec)
                 .unwrap()
                 .unwrap()
-                .text_encoder
-        };
-        let baseline = footprint();
-        append_sparse_f16_tensor(
-            fixture.path(),
-            "model.layers.0.unused_projection.weight",
-            &[257],
-        );
-        assert_eq!(
-            footprint(),
-            baseline,
-            "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
+                .text_encoder,
+            baseline
         );
     }
 
@@ -3618,46 +3632,48 @@ mod tests {
 
     #[test]
     fn packed_dev_materialized_surface_keeps_the_dense_lm_head_only() {
+        let mut expected_matrix_bases = std::collections::BTreeSet::from([
+            "language_model.model.embed_tokens".to_owned(),
+            "language_model.lm_head".to_owned(),
+        ]);
+        for layer in 0..crate::config::DEV_ENCODER_CONTRACT.loaded_hidden_layers {
+            for suffix in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                expected_matrix_bases
+                    .insert(format!("language_model.model.layers.{layer}.{suffix}"));
+            }
+        }
+
         for bits in [4, 8] {
-            let fixture = tempfile::tempdir().unwrap();
-            let spec = dev_encoder_spec_with_sidecars(
-                fixture.path(),
-                bits,
-                DevEncoderSelection::OverrideFile,
-                &[],
-            );
-            let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
-            let selected = crate::config::DEV_ENCODER_CONTRACT
-                .source_for_load(&spec, base)
-                .unwrap();
-            let names = selected
-                .materialized_language_tensor_headers(&crate::config::DEV_ENCODER_CONTRACT)
-                .unwrap()
-                .into_iter()
-                .map(|header| header.name)
+            let headers =
+                exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, Some(bits));
+            let names = headers
+                .iter()
+                .map(|header| header.name.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             assert!(names.contains("language_model.lm_head.weight"));
             assert!(!names.contains("language_model.lm_head.scales"));
             assert!(!names.contains("language_model.lm_head.biases"));
+            let lm_head = headers
+                .iter()
+                .find(|header| header.name == "language_model.lm_head.weight")
+                .unwrap();
+            assert_eq!(lm_head.dtype, mlx_gen::gen_core::weightsmeta::Dtype::F16);
+            assert_eq!(
+                lm_head.shape,
+                [
+                    crate::config::DEV_ENCODER_CONTRACT.vocab_size,
+                    crate::config::DEV_ENCODER_CONTRACT.hidden_size,
+                ]
+            );
 
-            let mut expected_matrix_bases = std::collections::BTreeSet::from([
-                "language_model.model.embed_tokens".to_owned(),
-                "language_model.lm_head".to_owned(),
-            ]);
-            for layer in 0..crate::config::DEV_ENCODER_CONTRACT.loaded_hidden_layers {
-                for suffix in [
-                    "self_attn.q_proj",
-                    "self_attn.k_proj",
-                    "self_attn.v_proj",
-                    "self_attn.o_proj",
-                    "mlp.gate_proj",
-                    "mlp.up_proj",
-                    "mlp.down_proj",
-                ] {
-                    expected_matrix_bases
-                        .insert(format!("language_model.model.layers.{layer}.{suffix}"));
-                }
-            }
             let actual_matrix_bases = names
                 .iter()
                 .filter_map(|name| {
@@ -3683,30 +3699,56 @@ mod tests {
                 .map(str::to_owned)
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(actual_matrix_bases, expected_matrix_bases);
+        }
 
-            let runtime = [
-                include_str!("text_encoder/attention.rs"),
-                include_str!("text_encoder/mlp.rs"),
-                include_str!("text_encoder/encoder.rs"),
-                include_str!("text_encoder/mod.rs"),
-            ]
-            .join("\n");
-            for suffix in [
-                "q_proj.weight",
-                "k_proj.weight",
-                "v_proj.weight",
-                "o_proj.weight",
-                "gate_proj.weight",
-                "up_proj.weight",
-                "down_proj.weight",
-                "embed_tokens",
-                "lm_head.weight",
-            ] {
-                assert!(
-                    runtime.contains(suffix),
-                    "contract matrix surface has no matching runtime constructor for {suffix}"
-                );
-            }
+        // One real packed OverrideFile receipt proves the validated-source materialization matches
+        // the exact Q4 facts shared with the sparse writer. Q8 differs only in the in-memory packed
+        // shapes and is covered above without another production-sized acquisition hash.
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = dev_encoder_spec_with_sidecars(
+            fixture.path(),
+            4,
+            DevEncoderSelection::OverrideFile,
+            &[],
+        );
+        let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
+        let selected = crate::config::DEV_ENCODER_CONTRACT
+            .source_for_load(&spec, base)
+            .unwrap();
+        let actual = selected
+            .materialized_language_tensor_headers(&crate::config::DEV_ENCODER_CONTRACT)
+            .unwrap()
+            .into_iter()
+            .map(|header| (header.name, header.dtype, header.shape, header.data_bytes))
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, Some(4))
+            .into_iter()
+            .map(|header| (header.name, header.dtype, header.shape, header.data_bytes))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+
+        let runtime = [
+            include_str!("text_encoder/attention.rs"),
+            include_str!("text_encoder/mlp.rs"),
+            include_str!("text_encoder/encoder.rs"),
+            include_str!("text_encoder/mod.rs"),
+        ]
+        .join("\n");
+        for suffix in [
+            "q_proj.weight",
+            "k_proj.weight",
+            "v_proj.weight",
+            "o_proj.weight",
+            "gate_proj.weight",
+            "up_proj.weight",
+            "down_proj.weight",
+            "embed_tokens",
+            "lm_head.weight",
+        ] {
+            assert!(
+                runtime.contains(suffix),
+                "contract matrix surface has no matching runtime constructor for {suffix}"
+            );
         }
     }
 
