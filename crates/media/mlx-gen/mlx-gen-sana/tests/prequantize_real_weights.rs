@@ -5,7 +5,7 @@
 //! `pipeline_contract::real_weight_1024_e2e` at it (its `from_weights` packed-detects the same dir):
 //!
 //!   SANA_PIPELINE_WEIGHTS=$SANA_OUT cargo test -p mlx-gen-sana --release \
-//!     --test pipeline_contract -- --ignored --nocapture real_weight_1024_e2e
+//!     --test integration -- pipeline_contract::real_weight_1024_e2e --ignored --nocapture
 //!
 //! Build:
 //!   SANA_SRC=/path/to/models--SceneWorks--Sana_1600M_1024px_mlx/snapshots/<hash> \

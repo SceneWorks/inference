@@ -12,7 +12,7 @@
 //! `quantize` are byte-proven by the TI2V-5B + LTX parity tests.
 //!
 //! Run with: `WAN_I2V_14B_CKPT=… WAN_I2V_14B_GOLDEN=… cargo test -p mlx-gen-wan
-//!   --test convert_i2v_14b_parity -- --ignored --nocapture`
+//!   --test integration -- convert_i2v_14b_parity:: --ignored --nocapture`
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

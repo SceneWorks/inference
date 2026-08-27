@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M-Instruct \
-//!   cargo test --test prefix -- --ignored --nocapture
+//!   cargo test --test integration -- prefix:: --ignored --nocapture
 //! ```
 //!
 //! ## What these prove

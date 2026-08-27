@@ -36,7 +36,8 @@ Then:
 
     MINIMAX_H3_SNAPSHOT=... \
     MINIMAX_H3_VIDEO_VAE_TILING_REFERENCE=~/minimax-h3-vae-tiling-reference.safetensors \
-        cargo test -p mlx-gen-minimax-h3 --test real_weights -- --ignored --nocapture tiling
+        cargo test -p mlx-gen-minimax-h3 --test integration -- \
+            real_weights::real_weight_tiling --ignored --nocapture
 """
 
 from __future__ import annotations

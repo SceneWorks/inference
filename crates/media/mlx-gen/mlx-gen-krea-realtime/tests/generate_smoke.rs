@@ -3235,8 +3235,8 @@ fn long_clip_coherence_under_the_bounded_window() {
         println!(
             "  (partial sweep: rows `{want_rows}` are not the whole A/D/F dose ladder, so no \
              verdict is computed — re-aggregate the S18CELL lines with \
-             `KREA_S18_CELLS=<file> cargo test -p mlx-gen-krea-realtime --test \
-             generate_smoke s18_verdict_from_accumulated_cells -- --exact --ignored --nocapture`)"
+             `KREA_S18_CELLS=<file> cargo test -p mlx-gen-krea-realtime --test integration -- \
+             generate_smoke::s18_verdict_from_accumulated_cells --exact --ignored --nocapture`)"
         );
     }
 }

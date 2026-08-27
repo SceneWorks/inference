@@ -913,7 +913,8 @@ mod budget_tests {
     /// anchors (RTX PRO 6000 Blackwell, sm_120, f32) it was fit from — `estimated ≥ measured` for every
     /// anchor (never under-predict ⇒ the selector never OKs a tile that OOMs), and not absurdly over
     /// (≤ 2.5×). Regenerate the anchors with `cargo test -p candle-gen-ltx --features cuda --release
-    /// --test vae_decode_sweep -- --ignored --nocapture` after a decoder or candle-allocator change.
+    /// --test integration -- vae_decode_sweep:: --ignored --nocapture` after a decoder or
+    /// candle-allocator change.
     #[test]
     fn ltx_decode_peak_matches_cuda_anchors() {
         // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_peak_gib). Single-pass ⇒ tile == out.

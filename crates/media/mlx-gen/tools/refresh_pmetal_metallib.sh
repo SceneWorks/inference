@@ -37,8 +37,8 @@
 #   tools/refresh_pmetal_metallib.sh /path/to/mlx.metallib   # install an explicit metallib
 #
 # Run --check as a preflight before any local real-weight MLX *training* run. The standing
-# tripwire in the test suite is `cargo test -p mlx-gen-qwen-image --release --test
-# bf16_matmul_sweep` — it exercises small-M NAX GEMM and crashes/fails if the cache regresses.
+# tripwire in the test suite is `cargo test -p mlx-gen-qwen-image --release --test integration --
+# bf16_matmul_sweep::` — it exercises small-M NAX GEMM and crashes/fails if the cache regresses.
 set -euo pipefail
 
 # The exact tile whose absence blocks small-M (training) matmuls. f32 + bf16 both required.
