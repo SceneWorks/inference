@@ -57,12 +57,13 @@
 //! sc-16665 gains a row, this test fails and forces the list to be extended. 39 of the 59 mapped ids
 //! are short today.
 //!
-//! Nine registered ids load **nothing** the shared table covers, so they have no row at all. They
+//! Ten registered ids load **nothing** the shared table covers, so they have no row at all. They
 //! register, load and render unchanged; what is missing is our metadata, and it is pinned by
 //! `every_registered_id_maps_or_is_a_pinned_hole`:
 //!
 //! | id(s) | why |
 //! | --- | --- |
+//! | `ltx_2_5` | the product ships the distinct August 11, 2026 LTX-2.x agreement plus Apache-2.0 and the Gemma Prohibited Use Policy; the shared component table only models the older LTX-2.3/Gemma-3 terms and must not be reused |
 //! | the six `mage_flow*` generators | every `microsoft/Mage-Flow*` repository 404s and the bundled Qwen3-VL-4B tower's upstream is unnamed, so neither the DiT, the VAE nor the encoder has a row |
 //! | `fancyfeast/llama-joycaption-beta-one-hf-llava` | one snapshot carries the whole captioner, and its only declaration is second-hand (`release/real-weight-models.toml`) |
 //! | `clip_vit_l14`, `clip_vit_l14_text` | both read one `openai/clip-vit-large-patch14` snapshot, whose card declares nothing |
@@ -82,7 +83,7 @@ use mlx_gen::gen_core::{self, ComponentLicense, LicenseFamily, ProviderComponent
 /// Which components each id this catalog registers loads — the per-backend half of the licence
 /// surface, in catalog registration order.
 ///
-/// 60 rows over 69 registered ids: the fifteen trainer ids reuse their generator's row, and nine ids
+/// 60 rows over 70 registered ids: the fifteen trainer ids reuse their generator's row, and ten ids
 /// load nothing the shared table covers (see the module note). Every key resolves into
 /// [`gen_core::MEDIA_COMPONENT_LICENSES`].
 pub const MLX_MEDIA_PROVIDER_COMPONENTS: &[ProviderComponents] = &[
@@ -639,13 +640,22 @@ mod tests {
             .collect()
     }
 
-    /// Nine registered ids load nothing the shared table covers, so they carry no row.
+    /// Ten registered ids load nothing the shared table covers, so they carry no row.
     ///
     /// **This is an annotation, never a filter.** Every id below registers, loads and renders
     /// exactly as it did before this module existed; what is absent is our metadata, which is a hole
     /// for CI to report and never a reason to withhold a provider. It is deliberately `#[cfg(test)]`
     /// rather than a public const, so no gate can quietly use it to suppress the ids it names.
     const IDS_WITHOUT_A_RESOLVABLE_COMPONENT: &[(&str, &str)] = &[
+        // LTX-2.5 does not share LTX-2.3's licence rows. The product's authoritative About surface
+        // ships the August 11, 2026 LTX-2.x agreement plus Apache-2.0 and the Gemma Prohibited Use
+        // Policy. The shared inference table currently models only the older January 5, 2026
+        // LTX-2 Community agreement and Gemma 1-3 Terms; mapping this id to those rows would be a
+        // materially false disclosure. This annotation is non-gating and keeps the provider live.
+        (
+            "ltx_2_5",
+            "DISTINCT TERMS — product license surface is authoritative; shared table has only the older LTX-2.3/Gemma-3 rows",
+        ),
         // Every `microsoft/Mage-Flow*` repository 404s (six NOT FOUND holes) and the Qwen3-VL-4B
         // tower bit-identical across all six is UNDETERMINED, so the DiT, the Mage-VAE and the
         // encoder are all unrowed. Four of the six are pinned with `license = "MIT"` in
@@ -876,10 +886,10 @@ mod tests {
             .map(|(id, _)| id.to_string())
             .collect();
 
-        assert_eq!(registered.len(), 69, "registered ids: {registered:?}");
+        assert_eq!(registered.len(), 70, "registered ids: {registered:?}");
         assert_eq!(mapped.len(), 60);
         assert_eq!(pinned.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
-        assert_eq!(pinned.len(), 9);
+        assert_eq!(pinned.len(), 10);
 
         let unaccounted: Vec<&String> = registered
             .iter()

@@ -30,6 +30,7 @@ use mlx_gen::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GuiderParams {
     pub cfg_scale: f32,
+    pub stg_scale: f32,
     pub stg_blocks: &'static [u32],
     pub rescale_scale: f32,
     pub modality_scale: f32,
@@ -50,6 +51,7 @@ pub struct LtxGenerationParams {
 
 const LTX_2_3_VIDEO_GUIDER: GuiderParams = GuiderParams {
     cfg_scale: 3.0,
+    stg_scale: 1.0,
     stg_blocks: &[28],
     rescale_scale: 0.7,
     modality_scale: 3.0,
@@ -57,6 +59,7 @@ const LTX_2_3_VIDEO_GUIDER: GuiderParams = GuiderParams {
 
 const LTX_2_3_AUDIO_GUIDER: GuiderParams = GuiderParams {
     cfg_scale: 7.0,
+    stg_scale: 1.0,
     stg_blocks: &[28],
     rescale_scale: 0.7,
     modality_scale: 3.0,
@@ -119,6 +122,8 @@ mod tests {
         assert_eq!(p.audio_guider.stg_blocks, &[28]);
         assert_eq!(p.video_guider.cfg_scale, 3.0);
         assert_eq!(p.audio_guider.cfg_scale, 7.0);
+        assert_eq!(p.video_guider.stg_scale, 1.0);
+        assert_eq!(p.audio_guider.stg_scale, 1.0);
         assert_eq!(p.video_guider.rescale_scale, 0.7);
         assert_eq!(p.audio_guider.rescale_scale, 0.7);
         assert_eq!(p.video_guider.modality_scale, 3.0);

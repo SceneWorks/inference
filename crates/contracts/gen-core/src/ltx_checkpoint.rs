@@ -325,6 +325,11 @@ pub struct LtxCheckpointMetadata {
 }
 
 impl LtxCheckpointMetadata {
+    /// A raw checkpoint metadata value.  Consumers must treat missing values as an explicit
+    /// identity decision; this accessor never synthesizes a default.
+    pub fn raw_value(&self, key: &str) -> Option<&str> {
+        self.raw.get(key).map(String::as_str)
+    }
     /// Parse a raw `__metadata__` map (the shape
     /// [`safetensors_file_metadata`] returns).
     ///

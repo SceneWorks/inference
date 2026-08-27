@@ -77,6 +77,13 @@ use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
 
 use crate::vae::{patchify, unpatchify};
 
+pub mod budget;
+
+pub use budget::{
+    auto_diffvae_tiling_budgeted_ltx, compute_cap_is_datacenter_blackwell, DecodeGeometry,
+    DecodePlan, DiffVaeMode, HostNaSupport, NaKind, ResolvedDiffVaeMode,
+};
+
 /// `nn.RMSNorm(..., eps=1e-6)` — every norm in the decoder, deterministic and diffusion alike.
 const NORM_EPS: f32 = 1e-6;
 
@@ -2375,6 +2382,35 @@ impl NaDiffusionDecoder {
         match tiling {
             Some(t) => self.decode_tiled(latent, &noise, t),
             None => self.decode(latent, &noise),
+        }
+    }
+
+    /// **Memory-budgeted** decode (sc-18799): let [`budget::auto_diffvae_tiling_budgeted_ltx`]
+    /// choose between the single-pass [`Self::decode`] and a [`Self::decode_tiled`] whose tile fits
+    /// this machine's VRAM budget, then run it. An over-budget geometry returns a catchable error
+    /// here instead of OOM-ing the worker.
+    ///
+    /// The DiffVAE analogue of [`crate::vae::LtxVideoVae::decode_budgeted`], which is what the conv
+    /// decoder has run behind since sc-7076.
+    pub fn decode_budgeted(
+        &self,
+        latent: &Tensor,
+        noise: &Tensor,
+        mode: budget::DiffVaeMode,
+    ) -> Result<Tensor> {
+        self.check_latent(latent)?;
+        let sh = latent.dims().to_vec();
+        let selected = budget::auto_diffvae_tiling_budgeted_ltx(
+            &self.cfg,
+            &self.device,
+            sh[2],
+            sh[3],
+            sh[4],
+            mode,
+        )?;
+        match selected {
+            Some(tiling) => self.decode_tiled(latent, noise, &tiling),
+            None => self.decode(latent, noise),
         }
     }
 }

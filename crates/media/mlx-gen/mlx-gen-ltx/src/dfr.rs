@@ -644,6 +644,11 @@ pub struct DfrComponents<'a> {
     pub latent_std: &'a Array,
     pub video_ctx: &'a Array,
     pub audio_ctx: &'a Array,
+    /// Present for a dev transformer, whose DFR stage one executes the negative-text guidance
+    /// evaluation rather than silently borrowing the distilled single-forward loop.
+    pub negative_video_ctx: Option<&'a Array>,
+    pub negative_audio_ctx: Option<&'a Array>,
+    pub variant: crate::dev_sampler::TransformerVariant,
     pub audio_pos: &'a Array,
 }
 
@@ -684,10 +689,11 @@ pub struct DfrOutput {
 /// full-res re-denoise with slot warm starts and the optional detailing reference → up to two
 /// tiled temporal rounds ([`run_temporal_rounds`]) → trim to the caller's frame contract.
 ///
-/// Stages run the deterministic distilled Euler ([`crate::pipeline::denoise_av_tokens`], per the
-/// reference's default stage loop); only the temporal-round tiles run the RF-ancestral loop.
-/// LoRA passes: stage 1 and the temporal tiles select pass 0, stage 2 selects pass 1 (where the
-/// engine scopes any detailing LoRA).
+/// A distilled transformer runs the deterministic distilled Euler
+/// ([`crate::pipeline::denoise_av_tokens`]); a dev transformer runs the native thirty-step four-pass
+/// guided token loop in stage one and retains the shipped distilled refinement in stage two. Only the
+/// temporal-round tiles run the RF-ancestral loop. LoRA passes: stage 1 and the temporal tiles select
+/// pass 0, stage 2 selects pass 1 (where the engine scopes any detailing LoRA).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_dfr_av_latents(
     parts: &DfrComponents<'_>,
@@ -701,7 +707,7 @@ pub fn generate_dfr_av_latents(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<DfrOutput> {
-    use crate::pipeline::{denoise_av_tokens, renoise, STAGE1_SIGMAS, STAGE2_SIGMAS};
+    use crate::pipeline::{denoise_av_tokens, denoise_av_tokens_dev, renoise, STAGE2_SIGMAS};
 
     let rounds = req.temporal_upsample_rounds;
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
@@ -723,6 +729,8 @@ pub fn generate_dfr_av_latents(
         ));
     }
     let temporal_scale = TEMPORAL_SCALE;
+    let execution_plan = crate::dev_sampler::ExecutionPlan::for_variant(parts.variant);
+    let stage1_sigmas = execution_plan.sigmas.as_slice();
     let s1 = video_s1_noise.shape();
     let (h1, w1) = (s1[3] as usize, s1[4] as usize);
     let s2 = video_s2_noise.shape();
@@ -740,7 +748,7 @@ pub fn generate_dfr_av_latents(
     let mut state = match crate::pipeline::stage_keyframe_state(&zeros1, req.video_keyframes, true)?
     {
         Some(i2v) => {
-            let noised = i2v.noised(video_s1_noise, STAGE1_SIGMAS[0])?;
+            let noised = i2v.noised(video_s1_noise, stage1_sigmas[0])?;
             VideoTokenState::from_i2v(&noised, video_pos1)?
         }
         None => VideoTokenState::base(video_s1_noise, video_pos1)?,
@@ -756,20 +764,47 @@ pub fn generate_dfr_av_latents(
         req.fps,
     )?;
     // Zero-seeded slots still enter at full noise: lerp them toward the stage-entry σ.
-    state.latent = noise_slot_tokens(&state, STAGE1_SIGMAS[0], req.seed.wrapping_add(11))?;
+    state.latent = noise_slot_tokens(&state, stage1_sigmas[0], req.seed.wrapping_add(11))?;
 
     parts.dit.set_lora_pass(0);
-    let (state, audio_s1) = denoise_av_tokens(
-        parts.dit,
-        &state,
-        audio_s1_noise,
-        parts.video_ctx,
-        parts.audio_ctx,
-        parts.audio_pos,
-        &STAGE1_SIGMAS,
-        cancel,
-        on_step,
-    )?;
+    let (state, audio_s1) = match parts.variant {
+        crate::dev_sampler::TransformerVariant::Dev => {
+            let negative_video_ctx = parts.negative_video_ctx.ok_or_else(|| {
+                Error::Msg(
+                    "ltx_2_5: dev DFR sampling requires staged negative video conditioning".into(),
+                )
+            })?;
+            let negative_audio_ctx = parts.negative_audio_ctx.ok_or_else(|| {
+                Error::Msg(
+                    "ltx_2_5: dev DFR sampling requires staged negative audio conditioning".into(),
+                )
+            })?;
+            denoise_av_tokens_dev(
+                parts.dit,
+                &state,
+                audio_s1_noise,
+                parts.video_ctx,
+                parts.audio_ctx,
+                negative_video_ctx,
+                negative_audio_ctx,
+                parts.audio_pos,
+                stage1_sigmas,
+                cancel,
+                on_step,
+            )?
+        }
+        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens(
+            parts.dit,
+            &state,
+            audio_s1_noise,
+            parts.video_ctx,
+            parts.audio_ctx,
+            parts.audio_pos,
+            stage1_sigmas,
+            cancel,
+            on_step,
+        )?,
+    };
     let stage1_audio_latent = audio_s1.clone();
     let grid_tokens: Vec<i32> = (0..state.target_tokens).collect();
     let grid = state
@@ -938,6 +973,60 @@ mod tests {
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::Device;
     use std::cell::RefCell;
+
+    /// The production DFR entry, inspected narrowly to ensure the ordinary provider cannot validate a
+    /// dev request while still taking the distilled stage-one loop.
+    const DFR_SRC: &str = include_str!("dfr.rs");
+
+    /// This follows the DFR stage-one execution branch itself. Removing the guided call, omitting
+    /// either negative context, or moving the built-in distilled adapter off pass 1 makes the route
+    /// assertion fail without requiring an AvDiT checkpoint.
+    #[test]
+    fn dfr_dev_stage_one_routes_through_four_pass_guidance_before_pass_one_refinement() {
+        let start = DFR_SRC
+            .find("pub fn generate_dfr_av_latents(")
+            .expect("dfr.rs must define its production entry");
+        let end = DFR_SRC
+            .find("\n#[cfg(test)]")
+            .expect("the production DFR entry must precede its tests");
+        let body = &DFR_SRC[start..end];
+        assert!(
+            body.contains("ExecutionPlan::for_variant(parts.variant)"),
+            "DFR must select the loaded transformer's stage-one schedule:\n{body}"
+        );
+        let dev = body
+            .find("TransformerVariant::Dev =>")
+            .expect("DFR must branch for a dev transformer");
+        let guided = body[dev..]
+            .find("denoise_av_tokens_dev(")
+            .map(|offset| dev + offset)
+            .expect("dev DFR must execute the token-native four-pass denoiser");
+        assert!(
+            body[dev..guided].contains("negative_video_ctx")
+                && body[dev..guided].contains("negative_audio_ctx"),
+            "the dev DFR branch must consume both staged negative contexts"
+        );
+        let stage_two_pass = body
+            .find("parts.dit.set_lora_pass(1)")
+            .expect("DFR stage two must select the built-in distilled adapter pass");
+        assert!(
+            body.find("parts.dit.set_lora_pass(0)") < Some(guided) && guided < stage_two_pass,
+            "the guided dev loop must run in stage one on adapter pass 0"
+        );
+        assert!(
+            body[stage_two_pass..].contains("denoise_av_tokens(")
+                && body[stage_two_pass..].contains("&STAGE2_SIGMAS"),
+            "DFR stage two must remain the simple distilled refinement on pass 1"
+        );
+        assert_eq!(
+            crate::dev_sampler::ExecutionPlan::for_variant(
+                crate::dev_sampler::TransformerVariant::Dev
+            )
+            .transitions(),
+            30,
+            "the selected dev plan must execute all thirty transitions"
+        );
+    }
 
     /// All orchestration tests run on the CPU stream — the gpu-local lane is queued and nothing
     /// here needs Metal. RAII-restored so the process-global default device does not leak into

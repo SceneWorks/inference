@@ -36,7 +36,17 @@ use mlx_rs::transforms::checkpoint;
 use mlx_rs::transforms::compile::{compile, compile_retained};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::block_residency::BlockPlan;
+
+/// sc-18797's rung-4 loader-identity and bit-identity suite. A `#[path]` submodule rather than a
+/// `tests/` file because it observes the private loader surface (`AvBlocks`, `AvBlock`'s attentions)
+/// that AC2's output-invisible failure mode can only be caught on.
+#[cfg(test)]
+#[path = "transformer_rung4_tests.rs"]
+mod rung4_block_window_tests;
 use mlx_gen::train::lora::LoraParams;
+use mlx_gen::CancelFlag;
 
 use mlx_gen::nn::{gelu_tanh, linear, quantized_matmul_with_bias};
 use mlx_gen::qkv::{
@@ -713,6 +723,11 @@ struct Attention {
     /// probability matrix. Training-only knob, set by [`set_sdpa_checkpoint`](Self::set_sdpa_checkpoint);
     /// `false` on the inference path (byte-identical to the pre-sc-4942 forward).
     ckpt_sdpa: bool,
+    /// Ladder rung 3 — bounded attention (sc-18797). [`AttentionBudget::UNBOUNDED`] is the load
+    /// default and takes the single fused-SDPA call, byte-identical to the pre-rung forward; the
+    /// chunk boundaries under a real budget come from the SHARED planner
+    /// (`gen_core::attention_budget`) via `mlx_gen::attention`, never from arithmetic here.
+    attn_budget: AttentionBudget,
 }
 
 impl Attention {
@@ -744,12 +759,18 @@ impl Attention {
             dim_head,
             eps,
             ckpt_sdpa: false,
+            attn_budget: AttentionBudget::UNBOUNDED,
         })
     }
 
     /// Toggle SDPA-segment gradient checkpointing (sc-4942). Training-only — see `ckpt_sdpa`.
     fn set_sdpa_checkpoint(&mut self, on: bool) {
         self.ckpt_sdpa = on;
+    }
+
+    /// Select ladder rung 3's score budget for this attention.
+    fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        self.attn_budget = budget;
     }
 
     /// Cast the attention's frozen weights (q/k/v/out projections, optional gate, q/k RMSNorm
@@ -861,11 +882,24 @@ impl Attention {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::Msg("ltx: checkpoint SDPA produced no output".into()))?
-        } else {
+        } else if self.attn_budget.is_unbounded() {
             match mask {
                 Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
                 None => scaled_dot_product_attention(&qh, &kh, &vh, scale, None, None)?,
             }
+        } else {
+            // Ladder rung 3 (sc-18797). On MLX the saving is NOT a bounded score tensor — `fast::sdpa`
+            // is a fused Metal kernel that already streams them — it is the per-chunk `eval` cutting
+            // the lazy graph. See `mlx_gen::attention`'s module docs; the Candle magnitude (-32% on
+            // the denoise phase against -1.7% here) must NOT be carried across.
+            mlx_gen::attention::sdpa_budgeted_bhsd(
+                &qh,
+                &kh,
+                &vh,
+                scale,
+                mask,
+                AttentionPlan::budgeted(self.attn_budget),
+            )?
         };
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -1892,10 +1926,77 @@ fn av_ca_ada(
     ))
 }
 
+/// Attention controls for one AV-DiT evaluation.
+///
+/// STG perturbs only the two self-attention calls of selected blocks.  In
+/// particular, it must not turn a selected block into a no-op: text attention,
+/// cross-modal attention, and both feed-forward paths still run.  The modality
+/// pass takes the complementary form and suppresses only the two inter-modality
+/// attention calls at every block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvPerturbation {
+    skip_self_blocks: &'static [usize],
+    isolate_modalities: bool,
+}
+
+impl AvPerturbation {
+    /// The ordinary, unperturbed AV-DiT evaluation.
+    pub const NONE: Self = Self {
+        skip_self_blocks: &[],
+        isolate_modalities: false,
+    };
+
+    /// STG evaluation: skip video and audio self-attention at precisely these
+    /// transformer block indices.
+    pub const fn stg(skip_self_blocks: &'static [usize]) -> Self {
+        Self {
+            skip_self_blocks,
+            isolate_modalities: false,
+        }
+    }
+
+    /// A modality-isolated evaluation, retaining self/text/FF processing while
+    /// suppressing both audio-to-video and video-to-audio attention calls.
+    pub const fn modality_isolated() -> Self {
+        Self {
+            skip_self_blocks: &[],
+            isolate_modalities: true,
+        }
+    }
+
+    #[must_use]
+    const fn attention_plan(self, block_index: usize) -> AvAttentionPlan {
+        AvAttentionPlan {
+            run_self: !contains_block(self.skip_self_blocks, block_index),
+            run_cross_modal: !self.isolate_modalities,
+        }
+    }
+}
+
+const fn contains_block(blocks: &[usize], needle: usize) -> bool {
+    let mut index = 0;
+    while index < blocks.len() {
+        if blocks[index] == needle {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The four attention calls that an [`AvBlock`] may execute.  Text attention
+/// and feed-forward are deliberately not represented because neither control
+/// is allowed to suppress them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AvAttentionPlan {
+    run_self: bool,
+    run_cross_modal: bool,
+}
+
 /// One AudioVideo transformer block: the video stack + the audio stack + bidirectional cross-modal
 /// attention (`BasicAVTransformerBlock`). Per-block order: video self+text-CA → audio self+text-CA →
 /// cross-modal (a2v updates video, v2a updates audio) → video FF → audio FF.
-struct AvBlock {
+pub(crate) struct AvBlock {
     // Video.
     attn1: Attention,
     attn2: Attention,
@@ -1919,7 +2020,12 @@ struct AvBlock {
 }
 
 impl AvBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    pub(crate) fn load(
+        w: &Weights,
+        prefix: &str,
+        cfg: &LtxConfig,
+        prec: Precision,
+    ) -> Result<Self> {
         let eps = cfg.norm_eps as f32;
         let (vh, vdh) = (cfg.num_attention_heads, cfg.attention_head_dim);
         let (ah, adh) = (cfg.audio_num_attention_heads, cfg.audio_attention_head_dim);
@@ -1979,11 +2085,15 @@ impl AvBlock {
         sst: &Array,
         pst: &Array,
         a: &StreamArgs,
+        run_self: bool,
     ) -> Result<Array> {
-        let msa = ada_values(sst, a.ts_emb, 0, 3)?;
-        let norm = modulate(&rms_norm_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
-        let mut x = gated(x, &attn, &msa[2])?;
+        let mut x = x.clone();
+        if run_self {
+            let msa = ada_values(sst, a.ts_emb, 0, 3)?;
+            let norm = modulate(&rms_norm_noweight(&x, self.eps)?, &msa[1], &msa[0])?;
+            let attn = attn1.forward(&norm, None, None, Some((a.cos, a.sin)), None)?;
+            x = gated(&x, &attn, &msa[2])?;
+        }
 
         let p = ada_values(pst, a.prompt_ts, 0, 2)?;
         let context = modulate(a.context, &p[1], &p[0])?;
@@ -2009,17 +2119,26 @@ impl AvBlock {
         gated(x, &ff_out, &mlp[2])
     }
 
-    /// Joint forward: `(vx, ax)` in, `(vx, ax)` out.
-    fn forward(
+    /// Joint forward with the attention-level controls used by the dev sampler.
+    /// This controls calls inside a block, never whether an entire block runs.
+    fn forward_controlled(
         &self,
         vx: &Array,
         ax: &Array,
         v: &StreamArgs,
         a: &StreamArgs,
+        control: AvAttentionPlan,
     ) -> Result<(Array, Array)> {
         // Video / audio self-attention + text cross-attention.
-        let mut vx =
-            self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let mut vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            control.run_self,
+        )?;
         let mut ax = self.self_and_text(
             ax,
             &self.a_attn1,
@@ -2027,43 +2146,46 @@ impl AvBlock {
             &self.a_sst,
             &self.a_pst,
             a,
+            control.run_self,
         )?;
 
-        // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
-        let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
-        let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
-        let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
-            &self.ca_audio_ss,
-            &self.ca_audio_gate,
-            a.cross_ss_ts,
-            a.cross_gate_ts,
-        )?;
-        let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
-            &self.ca_video_ss,
-            &self.ca_video_gate,
-            v.cross_ss_ts,
-            v.cross_gate_ts,
-        )?;
+        if control.run_cross_modal {
+            // Cross-modal attention — both directions read the pre-update rms_norm snapshots.
+            let vx_n3 = rms_norm_noweight(&vx, self.eps)?;
+            let ax_n3 = rms_norm_noweight(&ax, self.eps)?;
+            let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
+                &self.ca_audio_ss,
+                &self.ca_audio_gate,
+                a.cross_ss_ts,
+                a.cross_gate_ts,
+            )?;
+            let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
+                &self.ca_video_ss,
+                &self.ca_video_gate,
+                v.cross_ss_ts,
+                v.cross_gate_ts,
+            )?;
 
-        // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
-        let a2v = self.a2v.forward(
-            &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
-            Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
-            None,
-            Some((v.cross_cos, v.cross_sin)),
-            Some((a.cross_cos, a.cross_sin)),
-        )?;
-        vx = gated(&vx, &a2v, &gate_a2v)?;
+            // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
+            let a2v = self.a2v.forward(
+                &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
+                Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+                None,
+                Some((v.cross_cos, v.cross_sin)),
+                Some((a.cross_cos, a.cross_sin)),
+            )?;
+            vx = gated(&vx, &a2v, &gate_a2v)?;
 
-        // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
-        let v2a = self.v2a.forward(
-            &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
-            Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
-            None,
-            Some((a.cross_cos, a.cross_sin)),
-            Some((v.cross_cos, v.cross_sin)),
-        )?;
-        ax = gated(&ax, &v2a, &gate_v2a)?;
+            // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
+            let v2a = self.v2a.forward(
+                &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
+                Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+                None,
+                Some((a.cross_cos, a.cross_sin)),
+                Some((v.cross_cos, v.cross_sin)),
+            )?;
+            ax = gated(&ax, &v2a, &gate_v2a)?;
+        }
 
         // FeedForward.
         vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
@@ -2076,7 +2198,15 @@ impl AvBlock {
     /// cross-modal attention (and its adaLN gate) is skipped entirely when the audio modality is
     /// absent — not run against a placeholder stream.
     fn forward_video_only(&self, vx: &Array, v: &StreamArgs) -> Result<Array> {
-        let vx = self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let vx = self.self_and_text(
+            vx,
+            &self.attn1,
+            &self.attn2,
+            &self.v_sst,
+            &self.v_pst,
+            v,
+            true,
+        )?;
         self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)
     }
 
@@ -2111,14 +2241,77 @@ impl AvBlock {
         self.ff.set_lora_pass(pass);
         self.a_ff.set_lora_pass(pass);
     }
+
+    /// Select ladder rung 3's score budget across **all six** attentions this block runs: the video
+    /// and audio self+text attentions and both cross-modal attentions. Bounding only the video half
+    /// would leave the audio branch's scores unbounded while the contract claimed the rung.
+    pub(crate) fn set_attention_budget(&mut self, budget: AttentionBudget) {
+        for attn in [
+            &mut self.attn1,
+            &mut self.attn2,
+            &mut self.a_attn1,
+            &mut self.a_attn2,
+            &mut self.a2v,
+            &mut self.v2a,
+        ] {
+            attn.set_attention_budget(budget);
+        }
+    }
+
+    /// The budget this block's attentions carry. Read from the video self-attention; the six are
+    /// written together by [`Self::set_attention_budget`], and
+    /// `every_attention_in_a_block_carries_the_selected_budget` pins that they stay in step.
+    pub(crate) fn attention_budget(&self) -> AttentionBudget {
+        self.attn1.attn_budget
+    }
 }
 
 /// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
 /// audio_velocity)` from the two latent token streams + shared text conditioning.
+/// How the AvDiT's 48-block trunk is held — the intra-phase materialization axis
+/// ([`LoadShape`](mlx_gen::LoadShape)), independent of phase-level component residency.
+///
+/// This enum, not a boolean flag, is what the forward branches on. That is deliberate: rung 4's
+/// failure mode is output-invisible, so the streamed path must be **unrepresentable** alongside a
+/// resident stack rather than merely unselected. `Streamed` holds zero blocks, which is the entire
+/// rung — a variant that kept the `Vec` "just in case" would bound nothing while looking correct.
+pub(crate) enum AvBlocks {
+    /// The historical fast path: all `num_layers` blocks materialized and retained.
+    Resident(Vec<AvBlock>),
+    /// Rung 4: no blocks retained; each window rebuilds its own out of a fresh component view.
+    Streamed(crate::block_stream::LtxBlockStream),
+}
+
+impl AvBlocks {
+    /// Blocks actually held resident. `0` for a streamed stack — the property rung 4 buys.
+    pub(crate) fn resident_len(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(_) => 0,
+        }
+    }
+
+    /// Blocks the stack RUNS, which a streamed stack still does in full.
+    pub(crate) fn n_blocks(&self) -> usize {
+        match self {
+            Self::Resident(blocks) => blocks.len(),
+            Self::Streamed(stream) => stream.n_blocks(),
+        }
+    }
+}
+
 pub struct AvDiT {
     video: Stream,
     audio: Stream,
-    blocks: Vec<AvBlock>,
+    blocks: AvBlocks,
+    /// Rung 4's window schedule. Unused by a resident stack. Carried as a `Cell` because `forward`
+    /// takes `&self` and the selected window is a per-request value, not a load-time one — the
+    /// selected value must be the executed one, or the calibration evidence describes a run that
+    /// never happened.
+    block_plan: Cell<BlockPlan>,
+    /// Checked at every window boundary by the shared driver, which reports a cancelled render as
+    /// [`Error::Canceled`] rather than a generic failure.
+    cancel: CancelFlag,
     /// Monotonic source of per-stage RoPE epoch tokens (sc-7141); see [`Self::next_rope_epoch`]. One
     /// counter for the whole joint DiT — the same token keys all four stream memos (video/audio ×
     /// self/cross), which are each constant across a stage's denoise steps.
@@ -2126,7 +2319,12 @@ pub struct AvDiT {
 }
 
 impl AvDiT {
-    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+    /// Build the two per-modality streams — the patchify/adaLN/output-head surface that stays
+    /// resident under every load shape. Split out of [`Self::from_weights`] so the deferred
+    /// constructor builds the **same** objects rather than a second transcription of them: a
+    /// streamed AvDiT must differ from a resident one in the block axis alone, or the bit-identity
+    /// AC would be comparing two different models.
+    fn streams(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<(Stream, Stream)> {
         let video = Stream {
             patchify: Linear::load(w, "patchify_proj", prec)?,
             adaln: AdaLayerNormSingle::load(w, "adaln_single", prec)?,
@@ -2187,15 +2385,133 @@ impl AvDiT {
             self_rope_memo: RopeMemo::default(),
             cross_rope_memo: RopeMemo::default(),
         };
+        Ok((video, audio))
+    }
+
+    /// The historical eager load: every block materialized and retained.
+    pub fn from_weights(w: &Weights, cfg: &LtxConfig, prec: Precision) -> Result<Self> {
+        let (video, audio) = Self::streams(w, cfg, prec)?;
         let blocks = (0..cfg.num_layers)
             .map(|i| AvBlock::load(w, &format!("transformer_blocks.{i}"), cfg, prec))
             .collect::<Result<Vec<_>>>()?;
+        let plan = BlockPlan::resident(blocks.len().max(1))?;
         Ok(Self {
             video,
             audio,
-            blocks,
+            blocks: AvBlocks::Resident(blocks),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
             rope_epoch: Cell::new(0),
         })
+    }
+
+    /// Rung 4's load: build the resident stream surface from `w`, hold **zero** blocks, and rebuild
+    /// each one per window out of `stream` during the forward.
+    ///
+    /// `w` is still read for the patchify/adaLN/output-head tensors, which are small, are used on
+    /// every forward, and would cost a re-read per window for no residency saving. The 48-block
+    /// trunk — the part rung 4 exists to bound — is the only thing deferred.
+    pub fn from_weights_streamed(
+        w: &Weights,
+        cfg: &LtxConfig,
+        prec: Precision,
+        stream: crate::block_stream::LtxBlockStream,
+    ) -> Result<Self> {
+        if stream.n_blocks() != cfg.num_layers as usize {
+            return Err(Error::Msg(format!(
+                "ltx: the block stream declares {} blocks but the config declares {} — a plan built \
+                 from a desynchronized depth would silently skip or repeat layers",
+                stream.n_blocks(),
+                cfg.num_layers
+            )));
+        }
+        let (video, audio) = Self::streams(w, cfg, prec)?;
+        // Default to the tightest bound. A caller that selected a window carries it in the request
+        // and calls `set_transformer_window`; defaulting to `resident()` here would make an
+        // unconfigured streamed load silently run one all-covering window, which bounds nothing.
+        let plan = BlockPlan::new(stream.n_blocks(), 1)?;
+        Ok(Self {
+            video,
+            audio,
+            blocks: AvBlocks::Streamed(stream),
+            block_plan: Cell::new(plan),
+            cancel: CancelFlag::default(),
+            rope_epoch: Cell::new(0),
+        })
+    }
+
+    /// Select rung 4's window size for the requests that follow.
+    ///
+    /// Rejected on a resident stack rather than ignored: silently accepting a window on a stack that
+    /// cannot honour it is how a calibration record comes to describe a run that never happened.
+    pub fn set_transformer_window(&self, window: usize) -> Result<()> {
+        let AvBlocks::Streamed(stream) = &self.blocks else {
+            return Err(Error::Unsupported(
+                "ltx: a transformer window was selected on a resident block stack — rung 4 requires \
+                 a deferred-materialization load"
+                    .into(),
+            ));
+        };
+        self.block_plan
+            .set(BlockPlan::new(stream.n_blocks(), window)?);
+        Ok(())
+    }
+
+    /// The window plan the next forward will execute. Reported so a caller can prove the selected
+    /// window is the executed one.
+    pub fn block_plan(&self) -> BlockPlan {
+        self.block_plan.get()
+    }
+
+    /// Attach the request's cancel flag, checked at every window boundary.
+    pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.cancel = cancel;
+    }
+
+    /// Select ladder rung 3's attention budget for the whole trunk.
+    ///
+    /// Both arms are load-bearing. On a resident stack the budget is written into the blocks that
+    /// already exist; on a streamed stack there are no blocks yet, so it is recorded on the stream
+    /// and replayed onto every block a window materializes. Setting only the first would leave the
+    /// rung-3 + rung-4 composition — the one the cost-order default actually produces, since rung 4
+    /// engages rung 3 — running unbounded attention with identical output.
+    pub fn set_attention_budget(&mut self, budget: mlx_gen::attention::AttentionBudget) {
+        match &mut self.blocks {
+            AvBlocks::Resident(blocks) => {
+                for block in blocks {
+                    block.set_attention_budget(budget);
+                }
+            }
+            AvBlocks::Streamed(stream) => stream.set_attention_budget(budget),
+        }
+    }
+
+    /// The budget the next forward will execute, read back from wherever it actually lives.
+    pub fn attention_budget(&self) -> mlx_gen::attention::AttentionBudget {
+        match &self.blocks {
+            AvBlocks::Resident(blocks) => blocks
+                .first()
+                .map(|block| block.attention_budget())
+                .unwrap_or(AttentionBudget::UNBOUNDED),
+            AvBlocks::Streamed(stream) => stream.attention_budget(),
+        }
+    }
+
+    /// Whether this AvDiT defers its block trunk. The loader-identity predicate: rung 4's failure is
+    /// invisible in output, so a caller that needs to know *which* loader it got asks here rather
+    /// than inferring it from a request flag it passed in.
+    pub fn is_block_streamed(&self) -> bool {
+        matches!(self.blocks, AvBlocks::Streamed(_))
+    }
+
+    /// Blocks held resident. `0` on a streamed stack — that is the entire rung.
+    pub fn resident_blocks(&self) -> usize {
+        self.blocks.resident_len()
+    }
+
+    /// Blocks the stack runs, streamed or not.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.n_blocks()
     }
 
     /// Issue a fresh per-stage RoPE epoch token (sc-7141). Call once at the top of a joint denoise loop
@@ -2217,10 +2533,16 @@ impl AvDiT {
     /// resolves to `None` → reported skipped, never silently dropped.
     pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
-            ["transformer_blocks", n, rest @ ..] => self
-                .blocks
-                .get_mut(n.parse::<usize>().ok()?)?
-                .adaptable_mut(rest),
+            // A streamed trunk holds no blocks to adapt. `LtxBlockStream::new` already refuses to
+            // construct over a non-empty adapter set, so this arm is the second half of the same
+            // guarantee rather than a silent drop: there is no block object here that an adapter
+            // could be installed onto and then be rebuilt away by the next window.
+            ["transformer_blocks", n, rest @ ..] => match &mut self.blocks {
+                AvBlocks::Resident(blocks) => blocks
+                    .get_mut(n.parse::<usize>().ok()?)?
+                    .adaptable_mut(rest),
+                AvBlocks::Streamed(_) => None,
+            },
             // Video-stream globals.
             ["patchify_proj"] => Some(&mut self.video.patchify),
             ["proj_out"] => Some(&mut self.video.proj_out),
@@ -2253,24 +2575,19 @@ impl AvDiT {
     pub fn set_lora_pass(&self, pass: usize) {
         self.video.set_lora_pass(pass);
         self.audio.set_lora_pass(pass);
-        for b in &self.blocks {
-            b.set_lora_pass(pass);
+        // A streamed trunk carries no adapters (refused at `LtxBlockStream::new`), so there is no
+        // per-pass strength to select on it.
+        if let AvBlocks::Resident(blocks) = &self.blocks {
+            for b in blocks {
+                b.set_lora_pass(pass);
+            }
         }
     }
 
-    /// Joint velocity forward.
+    /// Ordinary, unperturbed joint velocity forward.
     ///
-    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
-    /// * `*_timestep` — `(B, S)` per-token sigma.
-    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
-    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
-    ///
-    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
-    ///
-    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
-    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
-    ///   falls back to the `positions`-content compare (behavior unchanged).
-    #[allow(clippy::too_many_arguments)]
+    /// This is the compatibility path for distilled inference. Guided dev
+    /// evaluations opt into [`Self::forward_controlled`] explicitly.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -2286,6 +2603,52 @@ impl AvDiT {
         audio_positions: &Array,
         video_keyframes_mask: Option<&Array>,
         rope_epoch: Option<u64>,
+    ) -> Result<(Array, Array)> {
+        self.forward_controlled(
+            video_latent,
+            video_timestep,
+            video_context,
+            video_mask,
+            video_positions,
+            audio_latent,
+            audio_timestep,
+            audio_context,
+            audio_mask,
+            audio_positions,
+            video_keyframes_mask,
+            rope_epoch,
+            AvPerturbation::NONE,
+        )
+    }
+
+    /// Controlled joint velocity forward for STG and modality guidance.
+    ///
+    /// * `*_latent` — `(B, S, in_channels)` patchified tokens (video 128, audio 128).
+    /// * `*_timestep` — `(B, S)` per-token sigma.
+    /// * `*_context` — text embeddings (video 4096, audio 2048); `*_mask` their additive masks.
+    /// * `*_positions` — the position grids (video `(B,3,T,2)`, audio `(B,1,T,2)`).
+    ///
+    /// Returns `(video_velocity (B, S_v, 128), audio_velocity (B, S_a, 128))`.
+    ///
+    /// * `rope_epoch` — per-stage RoPE cache token (sc-7141): `Some(epoch)` from a denoise loop (see
+    ///   [`Self::next_rope_epoch`]) takes the O(1) memo fast path for all four stream tables; `None`
+    ///   falls back to the `positions`-content compare (behavior unchanged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_controlled(
+        &self,
+        video_latent: &Array,
+        video_timestep: &Array,
+        video_context: &Array,
+        video_mask: Option<&Array>,
+        video_positions: &Array,
+        audio_latent: &Array,
+        audio_timestep: &Array,
+        audio_context: &Array,
+        audio_mask: Option<&Array>,
+        audio_positions: &Array,
+        video_keyframes_mask: Option<&Array>,
+        rope_epoch: Option<u64>,
+        perturbation: AvPerturbation,
     ) -> Result<(Array, Array)> {
         let vp = self.video.prepare(
             video_latent,
@@ -2303,13 +2666,61 @@ impl AvDiT {
             None,
             rope_epoch,
         )?;
-        let (mut vx, mut ax) = (vp.x.clone(), ap.x.clone());
+        let (vx0, ax0) = (vp.x.clone(), ap.x.clone());
         let (va, aa) = (vp.args(video_mask), ap.args(audio_mask));
-        for block in &self.blocks {
-            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
-            vx = nv;
-            ax = na;
-        }
+        let (vx, ax) = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let (mut vx, mut ax) = (vx0, ax0);
+                for (index, block) in blocks.iter().enumerate() {
+                    let (nv, na) = block.forward_controlled(
+                        &vx,
+                        &ax,
+                        &va,
+                        &aa,
+                        perturbation.attention_plan(index),
+                    )?;
+                    vx = nv;
+                    ax = na;
+                }
+                (vx, ax)
+            }
+            AvBlocks::Streamed(stream) => {
+                // Rung 4. The schedule is the SHARED driver — window arithmetic, loop order,
+                // release discipline and the cancellation contract all live in
+                // `gen_core::block_window` via MLX's binding. Only the "rebuild AvBlock n" step is
+                // this family's, and it lives in `crate::block_stream`.
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    (vx0, ax0),
+                    || stream.open(),
+                    |(mut vx, mut ax), view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            let (nv, na) = block.forward_controlled(
+                                &vx,
+                                &ax,
+                                &va,
+                                &aa,
+                                perturbation.attention_plan(index),
+                            )?;
+                            vx = nv;
+                            ax = na;
+                            // `block` drops here: a window holds `window_size` blocks, never the
+                            // whole range's worth.
+                        }
+                        Ok((vx, ax))
+                    },
+                    // LOAD-BEARING on MLX: the carried activations are unevaluated graph nodes that
+                    // still reference this window's weights, so dropping before forcing evaluation
+                    // frees nothing — identical output, zero saving, silently.
+                    |(vx, ax): &(Array, Array)| {
+                        mlx_rs::transforms::eval([vx, ax]).map_err(Error::from)
+                    },
+                )?
+            }
+        };
         let v_vel = self.video.output_head(&vx, &vp.emb_ts)?;
         let a_vel = self.audio.output_head(&ax, &ap.emb_ts)?;
         Ok((v_vel, a_vel))
@@ -2339,11 +2750,33 @@ impl AvDiT {
             video_keyframes_mask,
             rope_epoch,
         )?;
-        let mut vx = vp.x.clone();
         let va = vp.args(video_mask);
-        for block in &self.blocks {
-            vx = block.forward_video_only(&vx, &va)?;
-        }
+        let vx = match &self.blocks {
+            AvBlocks::Resident(blocks) => {
+                let mut vx = vp.x.clone();
+                for block in blocks {
+                    vx = block.forward_video_only(&vx, &va)?;
+                }
+                vx
+            }
+            AvBlocks::Streamed(stream) => {
+                let plan = self.block_plan.get();
+                mlx_gen::block_residency::run_windowed(
+                    &plan,
+                    &self.cancel,
+                    vp.x.clone(),
+                    || stream.open(),
+                    |mut vx, view, range| {
+                        for index in range {
+                            let block = stream.materialize(view, index)?;
+                            vx = block.forward_video_only(&vx, &va)?;
+                        }
+                        Ok(vx)
+                    },
+                    |vx: &Array| mlx_rs::transforms::eval([vx]).map_err(Error::from),
+                )?
+            }
+        };
         self.video.output_head(&vx, &vp.emb_ts)
     }
 }
@@ -2351,6 +2784,82 @@ impl AvDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stg_control_selects_only_configured_self_attention_block() {
+        // Mutation-sensitive for the SC-18759 block-28 row: changing either the
+        // actual block index passed by a resident/streamed loop or the selected
+        // index makes this fail. STG suppresses self attention only.
+        let control = AvPerturbation::stg(&[28]);
+        let before = control.attention_plan(27);
+        let target = control.attention_plan(28);
+        let after = control.attention_plan(29);
+
+        assert_eq!(
+            before,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            target,
+            AvAttentionPlan {
+                run_self: false,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn modality_isolation_suppresses_only_cross_modal_attention() {
+        // This must remain distinct from STG: self/text/FF still execute at
+        // every block, while both A2V and V2A calls are skipped.
+        let normal = AvPerturbation::NONE.attention_plan(28);
+        let isolated = AvPerturbation::modality_isolated().attention_plan(28);
+        assert_eq!(
+            normal,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: true,
+            }
+        );
+        assert_eq!(
+            isolated,
+            AvAttentionPlan {
+                run_self: true,
+                run_cross_modal: false,
+            }
+        );
+        assert_ne!(normal, isolated);
+    }
+
+    #[test]
+    fn controlled_path_uses_actual_indices_for_resident_and_streamed_blocks() {
+        // Structural mutation proof: both executable layouts must derive their
+        // per-block calls from the materialized/enumerated `index`, not a fixed
+        // STG layer or a mode that silently becomes a whole-block skip.
+        let source = include_str!("transformer.rs");
+        // The literal appears once in this assertion itself; subtract that self-reference so the
+        // production count remains exact even though this file has multiple earlier test modules.
+        let production_index_uses = source
+            .matches("perturbation.attention_plan(index)")
+            .count()
+            .saturating_sub(1);
+        assert_eq!(
+            production_index_uses, 2,
+            "resident and streamed AV-DiT loops must both apply the actual block index"
+        );
+        assert!(
+            source.contains("if run_self {") && source.contains("if control.run_cross_modal {"),
+            "self and cross-modal calls must be independently controlled inside AvBlock"
+        );
+        assert!(
+            source.contains("let cross = attn2.forward") && source.contains("self.feed_forward"),
+            "STG/modality controls must retain text cross-attention and feed-forward"
+        );
+    }
 
     /// sc-18789: the keyframe absolute-position marker lands on exactly the tokens the mask
     /// marks — marked tokens shift by the embedding, unmarked tokens are bit-identical, and an

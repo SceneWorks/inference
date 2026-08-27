@@ -88,12 +88,13 @@
 //! CI-visible hole, reported by sc-16669's gate — never a reason to withhold an id, and never
 //! something to paper over by pointing at a plausible-looking substitute row.
 //!
-//! Nine registered ids reach **zero** resolvable components and therefore have no row here at all.
+//! Ten registered ids reach **zero** resolvable components and therefore have no row here at all.
 //! They register, load and render unchanged; what is missing is our metadata, and it is pinned by
 //! `every_registered_id_is_mapped_or_a_named_hole`:
 //!
 //! | id(s) | why |
 //! | --- | --- |
+//! | `ltx_2_5_distilled` | the product ships the distinct August 11, 2026 LTX-2.x agreement plus Apache-2.0 and the Gemma Prohibited Use Policy; the shared component table only models the older LTX-2.3/Gemma-3 terms and must not be reused |
 //! | the six `mage_flow*` generators | every `microsoft/Mage-Flow*` repository 404s and the Qwen3-VL-4B tower bundled in each `text_encoder/` could not be named, so neither the DiT, the VAE nor the encoder has a row |
 //! | `fancyfeast/llama-joycaption-beta-one-hf-llava` | one snapshot carries the whole captioner, and its only declaration is second-hand (`release/real-weight-models.toml`) |
 //! | `clip_vit_l14`, `clip_vit_l14_text` | both read one `openai/clip-vit-large-patch14` snapshot, whose card declares nothing |
@@ -460,6 +461,15 @@ mod tests {
     /// list is indistinguishable from a forgotten one, so the surface spells the absence out here
     /// instead.
     const IDS_WITHOUT_A_RESOLVABLE_COMPONENT: &[(&str, &str)] = &[
+        // LTX-2.5 does not share LTX-2.3's licence rows. The product's authoritative About surface
+        // ships the August 11, 2026 LTX-2.x agreement plus Apache-2.0 and the Gemma Prohibited Use
+        // Policy. The shared inference table currently models only the older January 5, 2026
+        // LTX-2 Community agreement and Gemma 1-3 Terms; mapping this id to those rows would be a
+        // materially false disclosure. This annotation is non-gating and keeps the provider live.
+        (
+            "ltx_2_5_distilled",
+            "DISTINCT TERMS — product license surface is authoritative; shared table has only the older LTX-2.3/Gemma-3 rows",
+        ),
         ("mage_flow", MAGE_FLOW_REASON),
         ("mage_flow_base", MAGE_FLOW_REASON),
         ("mage_flow_turbo", MAGE_FLOW_REASON),
@@ -572,8 +582,8 @@ mod tests {
         let registered = registered_ids();
         assert_eq!(
             registered.len(),
-            59,
-            "59 distinct Candle provider ids: 54 generators + 7 trainers (5 of them also generator \
+            60,
+            "60 distinct Candle provider ids: 55 generators + 7 trainers (5 of them also generator \
              ids) + 1 captioner + 2 embedders"
         );
 
@@ -583,7 +593,7 @@ mod tests {
             .map(|(id, _)| *id)
             .collect();
         assert_eq!(holes.len(), IDS_WITHOUT_A_RESOLVABLE_COMPONENT.len());
-        assert_eq!(holes.len(), 9);
+        assert_eq!(holes.len(), 10);
         assert_eq!(mapped.len() + holes.len(), registered.len());
 
         for id in &registered {

@@ -1710,6 +1710,7 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3",
+                "ltx_2_5",
                 "mage_flow",
                 "mage_flow_base",
                 "mage_flow_turbo",
@@ -1775,11 +1776,12 @@ mod tests {
 
         // sc-16666: the licence mapping in [`crate::licenses`] is keyed off exactly these lists, so
         // this is where a surface change and a mapping change meet. All fifteen trainer ids are
-        // also generator ids, which is why 65 + 15 + 1 + 2 registrations are 68 distinct ids.
+        // also generator ids, which is why 67 generators + 1 captioner + 2 embedders are 70
+        // distinct ids.
         //
-        // Registration is never conditioned on the mapping — 59 < 68 because nine ids load nothing
+        // Registration is never conditioned on the mapping — 60 < 70 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
-        // our metadata for CI to report, and `licenses::tests` pins which nine and why.
+        // our metadata for CI to report, and `licenses::tests` pins which ten and why.
         let distinct: std::collections::BTreeSet<&String> = generators
             .iter()
             .chain(&trainers)
@@ -1787,7 +1789,7 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 69);
+        assert_eq!(distinct.len(), 70);
         assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 60);
     }
 

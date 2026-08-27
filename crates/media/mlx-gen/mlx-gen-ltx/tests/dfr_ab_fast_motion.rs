@@ -30,6 +30,7 @@ use mlx_rs::Array;
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
+use mlx_gen_ltx::dev_sampler::TransformerVariant;
 use mlx_gen_ltx::dfr::{generate_dfr_av_latents, DfrComponents, DfrRequest};
 use mlx_gen_ltx::gemma4_te::Ltx25TextEncoder;
 use mlx_gen_ltx::pipeline::{generate_av_latents, to_uint8_frames};
@@ -172,8 +173,17 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         dir.join("transformer.safetensors"),
     )
     .expect("transformer metadata");
-    let te = Ltx25TextEncoder::from_packed_av(&checkpoint, &te_path, &connector_w, &cfg, prec)
-        .expect("build the 2.5 text encoder");
+    let te = Ltx25TextEncoder::from_packed_av(
+        &checkpoint,
+        &te_path,
+        &connector_w,
+        &cfg,
+        prec,
+        // sc-18798: this A/B measures DFR motion, not memory — keep the historical resident
+        // encoder so nothing here is attributed to residency.
+        mlx_gen::gen_core::OffloadPolicy::Resident,
+    )
+    .expect("build the 2.5 text encoder");
     let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
     let (input_ids, mask) = tok.encode(PROMPT, MAX_LEN).expect("tokenize");
     let (_, _, video_ctx, audio_ctx) = te
@@ -272,6 +282,9 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         latent_std: &latent_std,
         video_ctx: &video_ctx,
         audio_ctx: &audio_ctx,
+        negative_video_ctx: None,
+        negative_audio_ctx: None,
+        variant: TransformerVariant::Distilled,
         audio_pos: &audio_pos,
     };
     let req = DfrRequest {

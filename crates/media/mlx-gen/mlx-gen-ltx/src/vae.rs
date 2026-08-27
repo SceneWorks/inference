@@ -603,6 +603,17 @@ impl LtxVideoVae {
         })
     }
 
+    /// Build an encoder-only VAE whose encoder is materialised only for an image-conditioned
+    /// request.  Split LTX-2.5 tiers store this half beside the selected decoder, so eagerly
+    /// loading it would make a pure text-to-video DiffVAE route retain an unused VAE encoder.
+    pub fn encoder_only_lazy(encoder_path: PathBuf, cfg: &LtxVaeConfig) -> Result<Self> {
+        Ok(Self {
+            decoder: None,
+            encoder: Mutex::new(None),
+            lazy: Some((encoder_path, cfg.clone())),
+        })
+    }
+
     /// Like [`Self::from_weights`] but **defers** loading the encoder until the first [`Self::encode`]:
     /// `vae_encoder.safetensors` (hundreds of MB) is never read for pure-T2V runs, which never encode
     /// (F-048). The decoder is built eagerly (every mode decodes). A missing encoder file surfaces as

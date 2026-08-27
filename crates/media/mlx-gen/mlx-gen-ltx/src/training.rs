@@ -874,6 +874,11 @@ fn save_lora(
     meta.insert("networkType".to_string(), "lora".to_string());
     meta.insert("rank".to_string(), rank.to_string());
     meta.insert("alpha".to_string(), alpha.to_string());
+    // The split LTX-2.5 provider consumes this explicit file-wide contract and deliberately does
+    // not infer a rank from a factor.  Retain the legacy keys above so LTX-2.3/third-party loaders
+    // remain byte-for-byte compatible while a newly trained adapter can be selected by either route.
+    meta.insert("lora_rank".to_string(), rank.to_string());
+    meta.insert("lora_alpha".to_string(), alpha.to_string());
     Array::save_safetensors(entries, Some(&meta), path)?;
     Ok(())
 }

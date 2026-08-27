@@ -22,7 +22,9 @@
 
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
+use mlx_llm::CausalLm;
 // The token sampler (temperature / top-k / top-p / repetition penalty) + seeded PRNG live in the core
 // crate's shared `text_sample` module (sc-9561 / F-105) so the lens PromptReasoner reuses them rather
 // than cloning. `SampleParams` stays part of this crate's public API via the re-export.
@@ -162,6 +164,58 @@ pub fn enhance(
 
     let text = tokenizer.decode(&generated)?;
     Ok(clean_response(&text))
+}
+
+/// Run the same seeded enhancement decode over the stock Gemma-4 causal decoder used by the
+/// LTX-2.5 rehost.  The caller owns rendering the snapshot's own Jinja chat template; keeping
+/// that rendering beside snapshot validation prevents the old Gemma-3 turn markers from leaking
+/// into a Gemma-4 request.
+#[allow(clippy::too_many_arguments)]
+pub fn enhance_gemma4(
+    gemma: &CausalLm,
+    tokenizer: &TextTokenizer,
+    formatted: &str,
+    cfg: &EnhanceConfig,
+    sampler: &SampleParams,
+    cancel: Option<&CancelFlag>,
+) -> Result<String> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    let prompt_ids = tokenizer.encode_ids(formatted, false)?;
+    if prompt_ids.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut history = prompt_ids.clone();
+    let mut cache = gemma.new_cache();
+    let mut rng = SplitMix64::new(cfg.seed);
+    let prompt_len = prompt_ids.len() as i32;
+    let ids = Array::from_slice(&prompt_ids, &[1, prompt_len]);
+    let mut logits = gemma
+        .decode_logits(&ids, &mut cache, 0)
+        .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer decode prefill: {e}")))?;
+
+    let mut generated = Vec::new();
+    for step in 0..cfg.max_tokens {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
+        let logits_host = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+        let next = sample_token(&logits_host, &history, sampler, &mut rng);
+        generated.push(next);
+        history.push(next);
+        if STOP_TOKENS.contains(&next) {
+            break;
+        }
+        let nxt = Array::from_slice(&[next], &[1, 1]);
+        logits = gemma
+            .decode_logits(&nxt, &mut cache, prompt_len + step as i32)
+            .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer decode token: {e}")))?;
+    }
+
+    let ids: Vec<u32> = generated.iter().map(|&id| id as u32).collect();
+    Ok(clean_response(&tokenizer.decode(&ids, true)?))
 }
 
 #[cfg(test)]

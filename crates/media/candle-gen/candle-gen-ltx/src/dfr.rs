@@ -19,7 +19,11 @@ use crate::conditioning::{
     append_generated_keyframe_slots, append_single_frame_keyframes, VideoTokenState,
 };
 use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE, TEMPORAL_SIGMAS};
-use crate::pipeline::{denoise_tokens_rf_ancestral, unflatten_latent};
+use crate::dev_sampler::{ExecutionPlan, TransformerVariant};
+use crate::pipeline::{
+    denoise_av_conditioned, denoise_av_dev_conditioned, denoise_tokens_rf_ancestral,
+    unflatten_latent,
+};
 use crate::transformer::AvDiT;
 
 /// Gather latent frames (axis 2) by index.
@@ -583,6 +587,11 @@ pub struct DfrComponents<'a> {
     pub temporal_upsampler: Option<&'a crate::upsampler::LatentUpsampler>,
     pub video_ctx: &'a Tensor,
     pub audio_ctx: &'a Tensor,
+    /// Required for the dev transformer's negative-text guidance branch; absent only for the
+    /// distilled checkpoint that has no CFG execution surface.
+    pub negative_video_ctx: Option<&'a Tensor>,
+    pub negative_audio_ctx: Option<&'a Tensor>,
+    pub transformer_variant: TransformerVariant,
     pub audio_grid: &'a Tensor,
     pub audio_frames: usize,
 }
@@ -623,10 +632,8 @@ pub fn generate_dfr_av_latents(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> candle_gen::Result<DfrOutput> {
-    use crate::config::{STAGE1_SIGMAS, STAGE2_SIGMAS};
-    use crate::pipeline::{
-        create_audio_noise, create_noise, denoise_av_conditioned, renoise, unflatten_latent,
-    };
+    use crate::config::STAGE2_SIGMAS;
+    use crate::pipeline::{create_audio_noise, create_noise, renoise};
 
     let rounds = req.temporal_upsample_rounds;
     if rounds > gen_core_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS {
@@ -665,6 +672,7 @@ pub fn generate_dfr_av_latents(
         };
 
     // --- Stage 1: half-res base + keyframe slots -------------------------------------------------
+    let stage1_plan = ExecutionPlan::for_variant(parts.transformer_variant);
     let vnoise1 = create_noise(req.seed, g.t, g.h1, g.w1, &device)?;
     let anoise1 = create_audio_noise(req.seed.wrapping_add(2), parts.audio_frames, &device)?;
     let grid1 = crate::rope::create_position_grid(g.t, g.h1, g.w1, req.fps, &device)?;
@@ -682,7 +690,7 @@ pub fn generate_dfr_av_latents(
             })
             .collect();
         let i2v = crate::conditioning::apply_keyframes(&zeros, &borrowed)?
-            .noised(&vnoise1, STAGE1_SIGMAS[0])?;
+            .noised(&vnoise1, stage1_plan.sigmas[0])?;
         VideoTokenState::from_i2v(&i2v, &grid1)?
     };
     state = append_generated_keyframe_slots(
@@ -695,23 +703,53 @@ pub fn generate_dfr_av_latents(
         SPATIAL_SCALE as i64,
         req.fps,
     )?;
-    state.latent = noise_slot_tokens(&state, STAGE1_SIGMAS[0], req.seed.wrapping_add(11))?;
+    state.latent = noise_slot_tokens(&state, stage1_plan.sigmas[0], req.seed.wrapping_add(11))?;
 
     parts.dit.set_adapter_pass(0);
     let mut on_forward = || Ok(());
-    let (state, audio_s1) = denoise_av_conditioned(
-        parts.dit,
-        &state,
-        &anoise1,
-        parts.video_ctx,
-        parts.audio_ctx,
-        parts.audio_frames,
-        parts.audio_grid,
-        &STAGE1_SIGMAS,
-        cancel,
-        &mut on_forward,
-        on_progress,
-    )?;
+    let (state, audio_s1) = match parts.transformer_variant {
+        TransformerVariant::Distilled => denoise_av_conditioned(
+            parts.dit,
+            &state,
+            &anoise1,
+            parts.video_ctx,
+            parts.audio_ctx,
+            parts.audio_frames,
+            parts.audio_grid,
+            &stage1_plan.sigmas,
+            cancel,
+            &mut on_forward,
+            on_progress,
+        )?,
+        TransformerVariant::Dev => {
+            let negative_video_ctx = parts.negative_video_ctx.ok_or_else(|| {
+                candle_gen::CandleError::Msg(
+                    "ltx_2_5: dev DFR stage one is missing negative video conditioning".into(),
+                )
+            })?;
+            let negative_audio_ctx = parts.negative_audio_ctx.ok_or_else(|| {
+                candle_gen::CandleError::Msg(
+                    "ltx_2_5: dev DFR stage one is missing negative audio conditioning".into(),
+                )
+            })?;
+            denoise_av_dev_conditioned(
+                parts.dit,
+                &state,
+                &anoise1,
+                parts.video_ctx,
+                parts.audio_ctx,
+                negative_video_ctx,
+                negative_audio_ctx,
+                parts.audio_frames,
+                parts.audio_grid,
+                &stage1_plan.sigmas,
+                stage1_plan.stg_blocks,
+                cancel,
+                &mut on_forward,
+                on_progress,
+            )?
+        }
+    };
     let stage1_audio_latent = audio_s1.clone();
     let grid_tokens = state.latent.narrow(1, 0, state.target_tokens)?;
     let reserved_half_res = unflatten_latent(&grid_tokens, g.t, g.h1, g.w1)?;
@@ -897,6 +935,29 @@ mod tests {
             }
         }
         take_frames(x, &idx)
+    }
+
+    #[test]
+    fn dev_dfr_stage_one_cannot_fall_back_to_the_distilled_sampler() {
+        // This protects the ordinary DFR execution route, not an isolated schedule helper.  The
+        // variant match owns the base stage; stage two intentionally remains the existing simple
+        // distilled refinement even for a dev transformer.
+        let source = include_str!("dfr.rs");
+        let stage_one = source
+            .split("// --- Stage 1:")
+            .nth(1)
+            .and_then(|section| section.split("// --- Stage 2:").next())
+            .expect("two-stage DFR source markers");
+        assert!(stage_one.contains("ExecutionPlan::for_variant(parts.transformer_variant)"));
+        assert!(stage_one.contains("TransformerVariant::Dev =>"));
+        assert!(stage_one.contains("denoise_av_dev_conditioned("));
+        assert!(stage_one.contains("stage1_plan.stg_blocks"));
+        let stage_two = source
+            .split("// --- Stage 2:")
+            .nth(1)
+            .expect("DFR stage two marker");
+        assert!(stage_two.contains("denoise_av_conditioned("));
+        assert!(stage_two.contains("&STAGE2_SIGMAS"));
     }
 
     #[derive(Clone, Debug)]

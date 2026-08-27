@@ -11,7 +11,11 @@ use crate::config::{
     AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE,
 };
 use crate::vocoder::LtxVocoder;
-use crate::{conditioning, transformer::AvDiT};
+use crate::{
+    conditioning, dev_sampler,
+    params::LTX_2_5_PARAMS,
+    transformer::{AvDiT, AvPerturbation},
+};
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`: temporal `(F-1)/8 + 1`, spatial
 /// `/32`.
@@ -380,6 +384,138 @@ pub fn denoise_av_conditioned(
         } else {
             let step = (((&alat - &aden)? * sigma_next as f64)? / sigma as f64)?;
             (&aden + step)?
+        };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok((state, alat))
+}
+
+/// Non-distilled LTX-2.5 stage-one denoise.  Each of the thirty official transitions makes four
+/// real joint-AvDiT evaluations: positive, negative-text, STG (self attention skipped at block
+/// 28 only), and modality-isolated (A2V/V2A skipped at every block).  Guidance combines denoised
+/// predictions, not velocities; stage two deliberately remains the existing distilled refinement.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_dev_conditioned(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    audio: &Tensor,
+    video_ctx: &Tensor,
+    audio_ctx: &Tensor,
+    negative_video_ctx: &Tensor,
+    negative_audio_ctx: &Tensor,
+    audio_frames: usize,
+    audio_grid: &Tensor,
+    sigmas: &[f32],
+    stg_blocks: &'static [u32],
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    let mut state = video.clone();
+    let mut alat = audio.clone();
+    let audio_request = flatten_audio_latent(&alat)?;
+    let prepared_rope =
+        dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    let stg_blocks: &'static [usize] = match stg_blocks {
+        [28] => &[28],
+        other => {
+            return Err(candle_gen::CandleError::Msg(format!(
+                "ltx_2_5: dev STG blocks must be exactly [28], got {other:?}"
+            )));
+        }
+    };
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let aflat = flatten_audio_latent(&alat)?;
+        let timesteps = state.token_timesteps(sigma)?;
+        let mut forward = |video_context: &Tensor,
+                           audio_context: &Tensor,
+                           perturbation: AvPerturbation|
+         -> Result<(Tensor, Tensor)> {
+            on_model_forward()?;
+            dit.forward_conditioned_prepared_controlled(
+                &state.latent,
+                &aflat,
+                &timesteps,
+                sigma as f64,
+                video_context,
+                audio_context,
+                &state.positions,
+                audio_grid,
+                state.keyframes_mask.as_ref(),
+                &prepared_rope,
+                perturbation,
+            )
+        };
+        let (conditional_video, conditional_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
+        let (negative_video, negative_audio) =
+            forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
+        let (perturbed_video, perturbed_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::stg(stg_blocks))?;
+        let (isolated_video, isolated_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
+
+        let conditional_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&conditional_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let negative_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&negative_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let perturbed_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&perturbed_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let isolated_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&isolated_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let denoise_audio = |velocity: Tensor| -> Result<Tensor> {
+            let velocity = unflatten_audio_latent(&velocity.to_dtype(DType::F32)?, audio_frames)?;
+            &alat - (&velocity * sigma as f64)?
+        };
+        let conditional_audio = denoise_audio(conditional_audio)?;
+        let negative_audio = denoise_audio(negative_audio)?;
+        let perturbed_audio = denoise_audio(perturbed_audio)?;
+        let isolated_audio = denoise_audio(isolated_audio)?;
+        let video_denoised = dev_sampler::combine_guidance(
+            &conditional_video,
+            &negative_video,
+            &perturbed_video,
+            &isolated_video,
+            LTX_2_5_PARAMS.video_guider,
+        )?;
+        let audio_denoised = dev_sampler::combine_guidance(
+            &conditional_audio,
+            &negative_audio,
+            &perturbed_audio,
+            &isolated_audio,
+            LTX_2_5_PARAMS.audio_guider,
+        )?;
+        state.latent = if sigma_next <= 0.0 {
+            video_denoised
+        } else {
+            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&video_denoised + step)?
+        };
+        alat = if sigma_next <= 0.0 {
+            audio_denoised
+        } else {
+            let step = (((&alat - &audio_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&audio_denoised + step)?
         };
         on_progress(Progress::Step {
             current: step as u32 + 1,

@@ -38,11 +38,13 @@ pub(crate) fn contiguous(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod block_stream;
 pub mod bundle;
 pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod convert;
+pub mod dev_sampler;
 pub mod dfr;
 pub mod diff_vae;
 pub mod duration_head;
@@ -51,6 +53,7 @@ pub mod gemma;
 pub mod gemma4_te;
 pub mod image_crf;
 pub mod memory_strategy;
+pub mod memory_strategy_2_5;
 pub mod model;
 pub mod params;
 pub mod pipeline;
@@ -65,7 +68,7 @@ pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
-pub use adapters::{apply_ltx_adapters, LtxLoraReport};
+pub use adapters::{apply_ltx25_adapters, apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
 pub use bundle::{
     assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,
@@ -80,14 +83,17 @@ pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
 pub use diff_vae::{
-    DiffVaeTiling, ModelOutputType, NaDiffusionDecoder, NaDiffusionDecoderConfig,
-    DIFFUSION_DECODER_COMPONENT,
+    auto_diffvae_tiling_budgeted_ltx, DiffVaeMode, DiffVaeTiling, HostNaSupport, ModelOutputType,
+    NaDiffusionDecoder, NaDiffusionDecoderConfig, NaKind, DIFFUSION_DECODER_COMPONENT,
 };
 pub use duration_head::DurationHead;
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
 pub use gemma4_te::{materialize_in_batches, Ltx25TextEncoder};
 pub use image_crf::{condition_image_for_checkpoint, default_image_recompress};
-pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};
+pub use model::{
+    apply_replacement_mask, descriptor, descriptor_25, load, load_25, Ltx, Ltx25, MODEL_25_ID,
+    MODEL_ID, SIZE_MULTIPLE,
+};
 pub use params::{
     resolve_generation_params, GuiderParams, LtxGenerationParams, LTX_2_3_PARAMS, LTX_2_5_PARAMS,
 };
@@ -150,6 +156,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_generator(model::REGISTRATION_25)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
@@ -167,7 +174,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 /// Resolve the load-bearing VAE geometry for an MLX LTX generator id.
 pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
-    (provider_id == MODEL_ID).then_some(VAE_TILING)
+    (provider_id == MODEL_ID || provider_id == MODEL_25_ID).then_some(VAE_TILING)
 }
 
 /// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
@@ -261,7 +268,7 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit_generators, ["ltx_2_3"]);
+        assert_eq!(explicit_generators, ["ltx_2_3", "ltx_2_5"]);
         assert_eq!(explicit_trainers, ["ltx_2_3"]);
     }
 
