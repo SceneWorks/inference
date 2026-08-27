@@ -45,6 +45,7 @@ use mlx_gen::{
 
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_z_image::vae::Vae;
+use mlx_rs::Array;
 
 use crate::config::Sd3Variant;
 use crate::loader;
@@ -114,24 +115,54 @@ pub(crate) struct Sd3Heavy {
     vae: Vae,
 }
 
+/// Seed-independent reference work for one SD3 request. The production implementation owns both
+/// the VAE encode and the eager eval, while tests inject a tensor-free counter through this exact
+/// boundary. [`Sd3Variant::map_seeded_outputs`] calls `prepare` before entering its output loop.
+trait Sd3ReferencePreparer<R, P, E> {
+    fn prepare(&mut self, route: Sd3Variant, reference: &R) -> std::result::Result<P, E>;
+}
+
+/// Production reference preparer shared by Large, Turbo, and Medium. Keeping the only reference
+/// encode/eval pair in this adapter makes its placement independently mutation-checkable without
+/// loading MLX tensors or weights.
+struct MlxReferencePreparer<'a> {
+    vae: &'a Vae,
+    width: u32,
+    height: u32,
+}
+
+impl Sd3ReferencePreparer<Image, Array, Error> for MlxReferencePreparer<'_> {
+    fn prepare(&mut self, _route: Sd3Variant, init: &Image) -> Result<Array> {
+        let clean = pipeline::encode_reference(self.vae, init, self.width, self.height)?;
+        // MLX is lazy: force the clean latent while the one reference-encode graph is current so
+        // every seed reuses data, not a deferred VAE graph.
+        mlx_rs::transforms::eval([&clean])?;
+        Ok(clean)
+    }
+}
+
 impl Sd3Variant {
     /// Tensor-free request scheduler shared by the production Large, Turbo, and Medium generator
-    /// path. `prepare` owns the one seed-independent reference encode/materialization; `output` owns
-    /// each seed-specific noise, denoise, and decode. Keeping this seam on the route itself makes the
-    /// production call injectable without constructing MLX arrays in its mutation-sensitive tests.
-    fn map_seeded_outputs<R, P, O, E>(
+    /// path. `preparer` owns the one seed-independent reference encode/materialization; `output`
+    /// owns each seed-specific noise, denoise, and decode. Keeping this seam on the route itself
+    /// makes the production call injectable without constructing MLX arrays in its
+    /// mutation-sensitive tests.
+    fn map_seeded_outputs<R, P, O, E, A>(
         self,
         reference: Option<&R>,
         base_seed: u64,
         count: u32,
-        prepare: impl FnOnce(Self, &R) -> std::result::Result<P, E>,
+        preparer: &mut A,
         mut output: impl FnMut(Self, u64, Option<&P>) -> std::result::Result<O, E>,
-    ) -> std::result::Result<Vec<O>, E> {
+    ) -> std::result::Result<Vec<O>, E>
+    where
+        A: Sd3ReferencePreparer<R, P, E>,
+    {
         mlx_gen::gen_core::map_sd3_seeded_outputs(
             reference,
             base_seed,
             count,
-            |reference| prepare(self, reference),
+            |reference| preparer.prepare(self, reference),
             |seed, prepared| output(self, seed, prepared),
         )
     }
@@ -427,18 +458,16 @@ impl Sd3Large {
                 let attention = crate::memory_strategy::attention_plan(req);
                 let transformer_window = crate::memory_strategy::transformer_window(req)?;
                 let decode_tiling = crate::memory_strategy::decode_tiling(req)?;
+                let mut reference_preparer = MlxReferencePreparer {
+                    vae: &heavy.vae,
+                    width: req.width,
+                    height: req.height,
+                };
                 let images = self.variant.map_seeded_outputs(
                     reference.map(|(image, _)| image),
                     base_seed,
                     req.count,
-                    |_route, init| {
-                        let clean =
-                            pipeline::encode_reference(&heavy.vae, init, req.width, req.height)?;
-                        // MLX is lazy: force the clean latent while the one reference-encode graph is
-                        // current so per-seed denoising reuses data, not a deferred VAE graph.
-                        mlx_rs::transforms::eval([&clean])?;
-                        Ok(clean)
-                    },
+                    &mut reference_preparer,
                     |_route, seed, clean| {
                         let latents = if let Some(clean) = clean {
                             pipeline::denoise_img2img_from_clean_cfg_with_memory(
@@ -623,6 +652,82 @@ mod tests {
     use mlx_gen::{ConditioningKind, Modality};
     use std::cell::Cell;
 
+    struct CountingReferencePreparer<'a> {
+        expected_route: Sd3Variant,
+        expected_reference: u8,
+        request_id: u32,
+        encode_count: &'a Cell<u32>,
+        eval_count: &'a Cell<u32>,
+    }
+
+    impl Sd3ReferencePreparer<u8, Box<u32>, ()> for CountingReferencePreparer<'_> {
+        fn prepare(&mut self, route: Sd3Variant, source: &u8) -> std::result::Result<Box<u32>, ()> {
+            assert_eq!(route, self.expected_route);
+            assert_eq!(*source, self.expected_reference);
+            self.encode_count.set(self.encode_count.get() + 1);
+            // The production adapter evaluates the lazy VAE result immediately after encoding.
+            // Keep a separate counter so moving either operation into the output loop fails.
+            self.eval_count.set(self.eval_count.get() + 1);
+            Ok(Box::new(self.request_id))
+        }
+    }
+
+    fn production_reference_placement_is_valid(source: &str) -> bool {
+        let Some((_, adapter_tail)) = source.split_once(
+            "impl Sd3ReferencePreparer<Image, Array, Error> for MlxReferencePreparer<'_> {",
+        ) else {
+            return false;
+        };
+        let Some((adapter_body, _)) = adapter_tail.split_once("\n}\n\nimpl Sd3Variant {") else {
+            return false;
+        };
+
+        let Some((_, generate_tail)) = source.split_once("    fn generate_impl(") else {
+            return false;
+        };
+        let Some((generate_body, _)) =
+            generate_tail.split_once("\n/// Required divisor for requested image dims")
+        else {
+            return false;
+        };
+
+        let encode = "pipeline::encode_reference(";
+        let eval = "mlx_rs::transforms::eval([&clean])";
+        let adapter_order_is_encode_then_eval = adapter_body
+            .find(encode)
+            .zip(adapter_body.find(eval))
+            .is_some_and(|(encode_at, eval_at)| encode_at < eval_at);
+
+        adapter_body.matches(encode).count() == 1
+            && adapter_body.matches(eval).count() == 1
+            && adapter_order_is_encode_then_eval
+            && generate_body
+                .matches("let mut reference_preparer = MlxReferencePreparer {")
+                .count()
+                == 1
+            && generate_body
+                .matches("self.variant.map_seeded_outputs(")
+                .count()
+                == 1
+            && generate_body.matches("&mut reference_preparer,").count() == 1
+            && !generate_body.contains(encode)
+            && !generate_body.contains(eval)
+    }
+
+    fn move_prepare_operation_into_output(
+        source: &str,
+        operation: &str,
+        replacement: &str,
+        output_statement: &str,
+    ) -> String {
+        let without_adapter_operation = source.replacen(operation, replacement, 1);
+        without_adapter_operation.replacen(
+            "                    |_route, seed, clean| {",
+            &format!("                    |_route, seed, clean| {{\n{output_statement}"),
+            1,
+        )
+    }
+
     fn tiny_image() -> Image {
         Image {
             width: 16,
@@ -657,21 +762,19 @@ mod tests {
             let reference = 17_u8;
 
             let run_request = |request_id: u32, base_seed: u64, count: u32| {
+                let mut preparer = CountingReferencePreparer {
+                    expected_route: route,
+                    expected_reference: reference,
+                    request_id,
+                    encode_count: &encode_count,
+                    eval_count: &eval_count,
+                };
                 route
                     .map_seeded_outputs(
                         Some(&reference),
                         base_seed,
                         count,
-                        |prepared_route, source| {
-                            assert_eq!(prepared_route, route);
-                            assert_eq!(*source, reference);
-                            encode_count.set(encode_count.get() + 1);
-                            // The production closure evaluates the lazy VAE result immediately after
-                            // encoding. Keep a separate counter so moving either operation back into
-                            // the output loop fails this route table.
-                            eval_count.set(eval_count.get() + 1);
-                            Ok::<_, ()>(Box::new(request_id))
-                        },
+                        &mut preparer,
                         |output_route, seed, clean| {
                             assert_eq!(output_route, route);
                             let clean = clean.expect("reference request carries a clean latent");
@@ -710,28 +813,50 @@ mod tests {
     }
 
     #[test]
-    fn production_generate_impl_cannot_bypass_the_variant_scheduler() {
+    fn production_reference_work_is_bound_to_the_tested_adapter_and_scheduler() {
         let source = include_str!("model.rs");
-        let (_, tail) = source
-            .split_once("    fn generate_impl(")
-            .expect("production generate_impl must remain discoverable");
-        let (body, _) = tail
-            .split_once("\n/// Required divisor for requested image dims")
-            .expect("production generate_impl boundary must remain discoverable");
-        assert_eq!(
-            body.matches("self.variant.map_seeded_outputs(").count(),
-            1,
-            "all MLX SD3 routes must execute the tested request scheduler"
-        );
-        assert_eq!(
-            body.matches("pipeline::encode_reference(").count(),
-            1,
-            "reference encoding must remain the scheduler's one preparation operation"
-        );
-        assert!(
-            !body.contains("for i in 0..req.count") && !body.contains("for index in 0..req.count"),
-            "generate_impl must not restore a per-output reference-encode loop"
-        );
+        assert!(production_reference_placement_is_valid(source));
+
+        let mutations = [
+            (
+                "production scheduler bypass",
+                source.replacen(
+                    "self.variant.map_seeded_outputs(",
+                    "self.variant.map_seeded_outputs_bypassed(",
+                    1,
+                ),
+            ),
+            (
+                "reference encode moved into the per-output closure",
+                move_prepare_operation_into_output(
+                    source,
+                    "pipeline::encode_reference(",
+                    "pipeline::reference_encode_moved_for_mutation(",
+                    "                        let _mutation = \
+                         pipeline::encode_reference(/* moved per output */);\n",
+                ),
+            ),
+            (
+                "reference eval moved into the per-output closure",
+                move_prepare_operation_into_output(
+                    source,
+                    "mlx_rs::transforms::eval([&clean])",
+                    "mlx_rs::transforms::eval_moved_for_mutation([&clean])",
+                    "                        let _mutation = \
+                         mlx_rs::transforms::eval([&clean]);\n",
+                ),
+            ),
+            (
+                "production adapter disconnected",
+                source.replacen("&mut reference_preparer,", "&mut bypass_preparer,", 1),
+            ),
+        ];
+        for (mutation, mutated_source) in mutations {
+            assert!(
+                !production_reference_placement_is_valid(&mutated_source),
+                "placement contract must reject mutation: {mutation}"
+            );
+        }
     }
 
     #[test]
