@@ -1104,9 +1104,9 @@ mod tests {
     }
 
     fn assert_no_heavy_cache(generator: &BooguGenerator) {
-        assert!(generator.components.lock().unwrap().is_none());
-        assert!(generator.edit_components.lock().unwrap().is_none());
-        assert!(generator.img2img_encoder.lock().unwrap().is_none());
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
+        assert!(candle_gen::lock_recover(&generator.edit_components).is_none());
+        assert!(candle_gen::lock_recover(&generator.img2img_encoder).is_none());
     }
 
     /// Mutation-sensitive production route table: ordinary positive and CFG-negative ids must be
@@ -1231,8 +1231,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("max_edit_tokens=8192"), "{error}");
-        assert!(generator.components.lock().unwrap().is_none());
-        assert!(generator.edit_components.lock().unwrap().is_none());
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
+        assert!(candle_gen::lock_recover(&generator.edit_components).is_none());
 
         let prompt_over = GenerationRequest {
             prompt: "<|image_pad|>".repeat(pipeline::MAX_EDIT_TOKENS),
@@ -1247,8 +1247,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("max_edit_tokens=8192"), "{error}");
-        assert!(generator.components.lock().unwrap().is_none());
-        assert!(generator.edit_components.lock().unwrap().is_none());
+        assert!(candle_gen::lock_recover(&generator.components).is_none());
+        assert!(candle_gen::lock_recover(&generator.edit_components).is_none());
     }
 
     #[test]
