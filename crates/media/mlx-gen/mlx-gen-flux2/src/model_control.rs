@@ -599,13 +599,16 @@ impl Generator for Flux2DevControl {
 }
 
 // The registration constant bridges the crate's rich `Result` into backend-neutral
-// `gen_core::Result`. The `impl Generator`
+// `gen_core::Result`. Its footprint is a direct function pointer so the public catalog's production
+// callback mapping is mechanically testable without opening model artifacts. The `impl Generator`
 // above stays hand-written because `validate` adds a control-conditioning check beyond the shared
 // `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! {
-    pub(crate) const DEV_CONTROL_REGISTRATION = descriptor_dev_control => load_dev_control;
-    footprint = crate::model::dev_control_component_footprint
-}
+pub(crate) const DEV_CONTROL_REGISTRATION: gen_core::ModelRegistration =
+    gen_core::ModelRegistration {
+        descriptor: descriptor_dev_control,
+        load: |spec| load_dev_control(spec).map_err(Into::into),
+        footprint: Some(crate::model::dev_control_component_footprint),
+    };
 
 pub(crate) const DEV_CONTROL_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {

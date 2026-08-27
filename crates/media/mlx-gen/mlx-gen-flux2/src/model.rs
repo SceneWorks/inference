@@ -1742,27 +1742,43 @@ pub(crate) fn dev_control_component_footprint(
     )
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_REGISTRATION = descriptor_klein_9b => load_klein_9b;
-    footprint = component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_EDIT_REGISTRATION = descriptor_klein_9b_edit => load_klein_9b_edit;
-    footprint = klein_edit_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_KV_EDIT_REGISTRATION =
-        descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit;
-    footprint = klein_kv_edit_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
-    footprint = dev_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit;
-    footprint = dev_edit_component_footprint
-}
+// Keep footprint callbacks as direct function pointers so the public production catalog mapping
+// can be verified without opening or hashing a model artifact. The load closures retain the same
+// backend-error conversion supplied by `register_generators!`.
+pub(crate) const KLEIN_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b,
+        load: |spec| load_klein_9b(spec).map_err(Into::into),
+        footprint: Some(component_footprint),
+    };
+
+pub(crate) const KLEIN_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b_edit,
+        load: |spec| load_klein_9b_edit(spec).map_err(Into::into),
+        footprint: Some(klein_edit_component_footprint),
+    };
+
+pub(crate) const KLEIN_KV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b_kv_edit,
+        load: |spec| load_klein_9b_kv_edit(spec).map_err(Into::into),
+        footprint: Some(klein_kv_edit_component_footprint),
+    };
+
+pub(crate) const DEV_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_dev,
+        load: |spec| load_dev(spec).map_err(Into::into),
+        footprint: Some(dev_component_footprint),
+    };
+
+pub(crate) const DEV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_dev_edit,
+        load: |spec| load_dev_edit(spec).map_err(Into::into),
+        footprint: Some(dev_edit_component_footprint),
+    };
 
 pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
@@ -3322,6 +3338,42 @@ mod tests {
             .register_generator(registration)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn production_registry_keeps_every_flux2_footprint_callback_mapping() {
+        type FootprintCallback =
+            fn(&LoadSpec) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes>;
+
+        let registry = crate::provider_registry().unwrap();
+        let mappings: [(&str, FootprintCallback); 6] = [
+            (FLUX2_KLEIN_9B_ID, component_footprint),
+            (FLUX2_KLEIN_9B_EDIT_ID, klein_edit_component_footprint),
+            (
+                crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                klein_kv_edit_component_footprint,
+            ),
+            (FLUX2_DEV_ID, dev_component_footprint),
+            (FLUX2_DEV_EDIT_ID, dev_edit_component_footprint),
+            (
+                crate::config::FLUX2_DEV_CONTROL_ID,
+                dev_control_component_footprint,
+            ),
+        ];
+
+        for (provider_id, expected) in mappings {
+            let registration = registry
+                .generators()
+                .find(|registration| (registration.descriptor)().id == provider_id)
+                .unwrap_or_else(|| panic!("missing production registration for {provider_id}"));
+            let actual = registration
+                .footprint
+                .unwrap_or_else(|| panic!("{provider_id} must declare a footprint callback"));
+            assert!(
+                std::ptr::fn_addr_eq(actual, expected),
+                "{provider_id} is wired to the wrong production footprint callback"
+            );
+        }
     }
 
     #[test]
