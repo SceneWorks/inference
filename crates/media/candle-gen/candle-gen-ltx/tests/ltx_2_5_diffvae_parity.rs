@@ -690,7 +690,7 @@ fn budgeted_diffvae_estimate_never_under_predicts_the_measured_peak() {
         .decode(&latent, &noise)
         .expect("exact untiled decode");
     device.synchronize().expect("synchronize untiled decode");
-    let measured = (sampler.stop() as u64) * 1024 * 1024;
+    let measured = sampler.stop() * 1024 * 1024;
     let estimated =
         estimated_diffvae_decode_peak_bytes(&geometry, DecodePlan::SinglePass, &resolved);
     assert!(

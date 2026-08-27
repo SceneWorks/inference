@@ -2585,7 +2585,7 @@ pub struct Capabilities {
     /// exists to prevent.
     pub max_temporal_upsample_rounds: u32,
     /// Whether this model can decode through the **diffusion VAE decoder** (DiffVAE) when the
-    /// caller stages that component in [`LoadSpec::components`].
+    /// caller stages that component in [`crate::LoadSpec::components`].
     ///
     /// Unlike the two knobs above this is a **load-time** selection, not a request field — it
     /// follows the alternate-decoder contract already in
