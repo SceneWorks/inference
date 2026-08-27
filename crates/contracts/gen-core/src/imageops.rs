@@ -250,6 +250,94 @@ pub fn resize_lanczos_u8(
     resize_u8(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
 }
 
+/// PIL `Image.LANCZOS` resize of an **unbounded f32** RGB HWC image — the HDR counterpart of
+/// [`resize_lanczos_u8`] (sc-18790).
+///
+/// Shares [`precompute_coeffs`] with the uint8 path, so the sampling geometry is identical, but
+/// accumulates in `f64` and **never quantizes or clips**. That difference is the whole point: the
+/// uint8 path's fixed-point accumulator and `clip8` saturate at 255, which would crush every
+/// scene-linear highlight above diffuse white to the same value. HDR conditioning must preserve
+/// them, so this path stays unbounded — negative lobes from the Lanczos kernel included, which
+/// the caller's colour transform clamps at the point it actually matters.
+///
+/// `Err` (never a panic) on a zero dimension or a `src` buffer smaller than `in_h·in_w·3`.
+pub fn resize_lanczos_f32(
+    src: &[f32],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> crate::Result<Vec<f32>> {
+    resize_f32(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
+}
+
+/// PIL `Image.BILINEAR` resize of an unbounded f32 RGB HWC image. See [`resize_lanczos_f32`].
+pub fn resize_bilinear_f32(
+    src: &[f32],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> crate::Result<Vec<f32>> {
+    resize_f32(src, in_h, in_w, out_h, out_w, 1.0, &triangle)
+}
+
+/// Two-pass separable resize of an unbounded f32 RGB HWC image. Assumes 3 channels.
+fn resize_f32(
+    src: &[f32],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+    support_radius: f64,
+    filter: &dyn Fn(f64) -> f64,
+) -> crate::Result<Vec<f32>> {
+    let c = 3usize;
+    if !(in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0) {
+        return Err(Error::Msg(format!(
+            "resize_f32: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+        )));
+    }
+    if src.len() < in_h * in_w * c {
+        return Err(Error::Msg(format!(
+            "resize_f32: pixel buffer too small — {} samples for a {in_w}×{in_h} RGB image (need {})",
+            src.len(),
+            in_h * in_w * c
+        )));
+    }
+
+    // Horizontal pass: (in_h, in_w) -> (in_h, out_w).
+    let hcoeffs = precompute_coeffs(in_w, out_w, support_radius, filter);
+    let mut horiz = vec![0f32; in_h * out_w * c];
+    for y in 0..in_h {
+        for (xx, (xmin, w)) in hcoeffs.iter().enumerate() {
+            for ch in 0..c {
+                let mut acc = 0f64;
+                for (k, &wk) in w.iter().enumerate() {
+                    acc += src[(y * in_w + xmin + k) * c + ch] as f64 * wk;
+                }
+                horiz[(y * out_w + xx) * c + ch] = acc as f32;
+            }
+        }
+    }
+
+    // Vertical pass: (in_h, out_w) -> (out_h, out_w).
+    let vcoeffs = precompute_coeffs(in_h, out_h, support_radius, filter);
+    let mut out = vec![0f32; out_h * out_w * c];
+    for (yy, (ymin, w)) in vcoeffs.iter().enumerate() {
+        for x in 0..out_w {
+            for ch in 0..c {
+                let mut acc = 0f64;
+                for (k, &wk) in w.iter().enumerate() {
+                    acc += horiz[((ymin + k) * out_w + x) * c + ch] as f64 * wk;
+                }
+                out[(yy * out_w + x) * c + ch] = acc as f32;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Nearest-neighbour resize of a uint8 HWC image (`C = len / (in_h·in_w)`), torch
 /// `F.interpolate(mode="nearest")`: each destination samples source index `floor(dst · in/out)`.
 /// Unlike the windowed filters above it introduces **no** intermediate values, so it's the right
