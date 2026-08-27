@@ -72,7 +72,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::ltx_checkpoint::LtxCheckpointLayout;
+#[cfg(test)]
+use candle_gen::gen_core::ltx_checkpoint::LtxBundleBuilder;
+use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxCheckpointLayout, LtxComponent};
 #[cfg(test)]
 use candle_gen::gen_core::AdapterKind;
 use candle_gen::gen_core::{
@@ -88,8 +90,11 @@ use config::{
     DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, STAGE2_SIGMAS,
     TEXT_MAX_LENGTH,
 };
+use diff_vae::{NaDiffusionDecoder, NaDiffusionDecoderConfig};
+use duration_head::DurationHead;
+use gemma4_te::Ltx25TextEncoder;
 use text_encoder::LtxTextEncoder;
-use tokenizer::{ensure_single_leading_bos_u32, gemma_bos_id};
+use tokenizer::{ensure_single_leading_bos_u32, gemma_bos_id, Ltx25Tokenizer};
 use transformer::AvDiT;
 use upsampler::LatentUpsampler;
 use vae::LtxVideoVae;
@@ -99,6 +104,9 @@ use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
+
+/// Public provider id for the split-component Gemma-4 LTX-2.5 distilled route.
+pub const MODEL_25_ID: &str = "ltx_2_5_distilled";
 
 #[cfg(test)]
 mod vae_tiling_assignment_tests {
@@ -120,10 +128,15 @@ pub const SIZE_MULTIPLE: u32 = (config::SPATIAL_SCALE * 2) as u32;
 
 #[derive(Clone)]
 struct Components {
-    te: Arc<LtxTextEncoder>,
+    te: Arc<TextEncoder>,
     avdit: Arc<AvDiT>,
     vae: Arc<LtxVideoVae>,
+    /// The selected alternate decoder.  Its latent input is exactly the conv VAE's DiT-normalized
+    /// space, so conditioning and the learned upsamplers remain shared while final decode changes.
+    diffusion_decoder: Option<Arc<NaDiffusionDecoder>>,
+    duration_head: Option<Arc<DurationHead>>,
     upsampler: Arc<LatentUpsampler>,
+    temporal_upsampler: Option<Arc<LatentUpsampler>>,
     vae_has_encoder: bool,
     /// Audio decode chain — `None` on the packed MLX tier path (sc-9545), which is **video-only**: the
     /// tier's audio-VAE + vocoder ship in a different key layout (channels-last convs, no `decoder.`/
@@ -131,7 +144,26 @@ struct Components {
     /// video render. The audio latent stream still runs through the joint AvDiT (cross-modal coupling
     /// keeps the video coherent); only the audio VAE→vocoder decode is skipped.
     audio: Option<AudioChain>,
-    tokenizer: Arc<tokenizers::Tokenizer>,
+    tokenizer: Arc<PromptTokenizer>,
+}
+
+enum TextEncoder {
+    Gemma3(Box<LtxTextEncoder>),
+    Gemma4(Box<Ltx25TextEncoder>),
+}
+
+impl TextEncoder {
+    fn encode_both(&self, input_ids: &Tensor, mask01: &[u32]) -> CResult<(Tensor, Tensor)> {
+        match self {
+            Self::Gemma3(te) => Ok(te.encode_both(input_ids, mask01)?),
+            Self::Gemma4(te) => Ok(te.encode_both(input_ids, mask01)?),
+        }
+    }
+}
+
+enum PromptTokenizer {
+    Gemma3(tokenizers::Tokenizer),
+    Gemma4(Ltx25Tokenizer),
 }
 
 #[derive(Clone)]
@@ -166,6 +198,9 @@ struct Pipeline {
     /// Gemma-encoder path from `LoadSpec::text_encoder` (sc-8827); see [`Pipeline::gemma_dir`].
     gemma_override: Option<PathBuf>,
     upsampler_override: Option<PathBuf>,
+    /// `Some` makes this the split LTX-2.5 route.  All config is read before weights are materialised.
+    split_bundle: Option<LtxBundle>,
+    use_diffusion_decoder: bool,
 }
 
 impl Pipeline {
@@ -186,7 +221,52 @@ impl Pipeline {
             device: device.clone(),
             gemma_override,
             upsampler_override,
+            split_bundle: None,
+            use_diffusion_decoder: false,
         }
+    }
+
+    fn load_split(
+        bundle: LtxBundle,
+        device: &Device,
+        use_diffusion_decoder: bool,
+    ) -> gen_core::Result<Self> {
+        let av_cfg = AvConfig::from_bundle(&bundle)?;
+        let conn_cfg = ConnectorConfig::from_bundle(&bundle)?;
+        let audio_conn_cfg = ConnectorConfig::audio_from_bundle(&bundle)?;
+        let audio_vae_cfg = AudioVaeConfig::from_bundle(&bundle)?;
+        let vocoder_cfg = VocoderConfig::from_bundle(&bundle)?;
+        // Make the selected decoder's declaration a load-path fact, rather than a descriptor claim.
+        let selected = if use_diffusion_decoder {
+            LtxComponent::DiffusionVideoVae
+        } else {
+            LtxComponent::ConvVideoVae
+        };
+        let declaration = config::VideoVaeDeclaration::from_bundle(&bundle, selected)?;
+        if declaration.is_diffusion() != use_diffusion_decoder {
+            return Err(gen_core::Error::Msg(
+                "ltx_2_5: selected video decoder declaration disagrees with its component".into(),
+            ));
+        }
+        Ok(Self {
+            av_cfg,
+            gemma_cfg: GemmaConfig::gemma_3_12b(),
+            conn_cfg,
+            audio_conn_cfg,
+            audio_vae_cfg,
+            vocoder_cfg,
+            root: bundle
+                .require(LtxComponent::Transformer)?
+                .path()
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
+            device: device.clone(),
+            gemma_override: None,
+            upsampler_override: None,
+            split_bundle: Some(bundle),
+            use_diffusion_decoder,
+        })
     }
 
     /// The single full **dense bf16** LTX-2.3 checkpoint in `root` — the 22B model bundling DiT + VAE +
@@ -222,6 +302,9 @@ impl Pipeline {
         adapters: &[AdapterSpec],
         with_vae_encoder: bool,
     ) -> CResult<Components> {
+        if self.split_bundle.is_some() {
+            return self.load_components_split(with_vae_encoder);
+        }
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
         // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
         // weights with no dense staging; the single-bundle dense checkpoint keeps the legacy path below.
@@ -276,17 +359,139 @@ impl Pipeline {
             .map_err(|e| CandleError::Msg(format!("ltx: load gemma tokenizer: {e}")))?;
 
         Ok(Components {
-            te: Arc::new(te),
+            te: Arc::new(TextEncoder::Gemma3(Box::new(te))),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            diffusion_decoder: None,
+            duration_head: None,
             upsampler: Arc::new(upsampler),
+            temporal_upsampler: None,
             vae_has_encoder: with_vae_encoder,
             audio: Some(AudioChain {
                 decoder: Arc::new(audio_decoder),
                 vocoder: Arc::new(vocoder),
                 sample_rate: audio_sample_rate,
             }),
-            tokenizer: Arc::new(tokenizer),
+            tokenizer: Arc::new(PromptTokenizer::Gemma3(tokenizer)),
+        })
+    }
+
+    /// Materialise the actual split LTX-2.5 component files.  This deliberately shares the 2.3
+    /// renderer rather than creating a provider-local sampler: both decoder choices consume the
+    /// same DiT-normalized latent and use the same learned spatial upsampler.
+    fn load_components_split(&self, with_vae_encoder: bool) -> CResult<Components> {
+        let bundle = self.split_bundle.as_ref().expect("split route has bundle");
+        let transformer = bundle
+            .require(LtxComponent::Transformer)
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+            .path();
+        let conv = bundle
+            .require(LtxComponent::ConvVideoVae)
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+            .path();
+        let audio = bundle
+            .require(LtxComponent::AudioVae)
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+            .path();
+        let dit_all =
+            candle_gen::mmap_var_builder(&[transformer.to_path_buf()], DIT_DTYPE, &self.device)?;
+        let dit_vb = dit_all.pp("model.diffusion_model");
+        let mut avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
+        adapters::install_ltx_adapters(&mut avdit, &[])?;
+        let te = Ltx25TextEncoder::from_bundle_av(
+            bundle,
+            dit_all.clone(),
+            dit_vb,
+            &self.av_cfg,
+            &self.conn_cfg,
+            &self.audio_conn_cfg,
+        )?;
+        let conv_vb = candle_gen::mmap_var_builder(&[conv.to_path_buf()], VAE_DTYPE, &self.device)?;
+        let vae = if with_vae_encoder {
+            LtxVideoVae::new_with_encoder(
+                conv_vb.pp("vae"),
+                conv_vb.pp("vae"),
+                config::LATENT_CHANNELS,
+                4,
+            )?
+        } else {
+            LtxVideoVae::new(conv_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
+        };
+        let upsampler = LatentUpsampler::from_checkpoint(
+            bundle
+                .require(LtxComponent::SpatialUpsampler)
+                .map_err(|e| CandleError::Msg(e.to_string()))?
+                .path(),
+            VAE_DTYPE,
+            &self.device,
+        )?;
+        let audio_vb =
+            candle_gen::mmap_var_builder(&[audio.to_path_buf()], VAE_DTYPE, &self.device)?;
+        let audio_decoder = AudioDecoder::load(&audio_vb.pp("audio_vae"), &self.audio_vae_cfg)?;
+        let vocoder = LtxVocoder::load(audio_vb, &self.device, &self.vocoder_cfg)?;
+        let diffusion_decoder = if self.use_diffusion_decoder {
+            let component = bundle
+                .require(LtxComponent::DiffusionVideoVae)
+                .map_err(|e| CandleError::Msg(e.to_string()))?;
+            let cfg = NaDiffusionDecoderConfig::from_embedded_vae(
+                component
+                    .config()
+                    .map_err(|e| CandleError::Msg(e.to_string()))?,
+            )?;
+            let diff_vb = candle_gen::mmap_var_builder(
+                &[component.path().to_path_buf()],
+                VAE_DTYPE,
+                &self.device,
+            )?;
+            Some(Arc::new(NaDiffusionDecoder::load(
+                diff_vb.pp("decoder"),
+                diff_vb,
+                &cfg,
+            )?))
+        } else {
+            None
+        };
+        let duration_weights = candle_gen::Weights::from_file(
+            bundle
+                .require(LtxComponent::DurationHead)
+                .map_err(|e| CandleError::Msg(e.to_string()))?
+                .path(),
+            &self.device,
+            DType::F32,
+        )?;
+        let duration_head = Some(Arc::new(DurationHead::from_weights(
+            &duration_weights,
+            &self.device,
+        )?));
+        let temporal_upsampler = Some(Arc::new(LatentUpsampler::from_checkpoint(
+            bundle
+                .require(LtxComponent::TemporalUpsampler)
+                .map_err(|e| CandleError::Msg(e.to_string()))?
+                .path(),
+            VAE_DTYPE,
+            &self.device,
+        )?));
+        let tokenizer = Ltx25Tokenizer::from_packed_te_file(
+            bundle
+                .require(LtxComponent::TextEncoder)
+                .map_err(|e| CandleError::Msg(e.to_string()))?
+                .path(),
+        )?;
+        Ok(Components {
+            te: Arc::new(TextEncoder::Gemma4(Box::new(te))),
+            avdit: Arc::new(avdit),
+            vae: Arc::new(vae),
+            diffusion_decoder,
+            duration_head,
+            upsampler: Arc::new(upsampler),
+            temporal_upsampler,
+            vae_has_encoder: with_vae_encoder,
+            audio: Some(AudioChain {
+                decoder: Arc::new(audio_decoder),
+                vocoder: Arc::new(vocoder),
+                sample_rate: self.vocoder_cfg.final_sample_rate() as u32,
+            }),
+            tokenizer: Arc::new(PromptTokenizer::Gemma4(tokenizer)),
         })
     }
 
@@ -352,13 +557,16 @@ impl Pipeline {
             .map_err(|e| CandleError::Msg(format!("ltx tier: load gemma tokenizer: {e}")))?;
 
         Ok(Components {
-            te: Arc::new(te),
+            te: Arc::new(TextEncoder::Gemma3(Box::new(te))),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            diffusion_decoder: None,
+            duration_head: None,
             upsampler: Arc::new(upsampler),
+            temporal_upsampler: None,
             vae_has_encoder: with_vae_encoder,
             audio: None,
-            tokenizer: Arc::new(tokenizer),
+            tokenizer: Arc::new(PromptTokenizer::Gemma3(tokenizer)),
         })
     }
 
@@ -369,7 +577,13 @@ impl Pipeline {
     /// [`ensure_single_leading_bos_u32`] call is normally a no-op — it is the explicit guard against
     /// the two ways this goes wrong (no BOS from a post-processor-less tokenizer, a duplicate one
     /// from an unconditional prepend), and it is the same policy the 2.5 path runs (sc-18762).
-    fn tokenize(&self, tok: &tokenizers::Tokenizer, prompt: &str) -> CResult<(Tensor, Vec<u32>)> {
+    fn tokenize(&self, tok: &PromptTokenizer, prompt: &str) -> CResult<(Tensor, Vec<u32>)> {
+        if let PromptTokenizer::Gemma4(tok) = tok {
+            return tok.encode(prompt, TEXT_MAX_LENGTH, &self.device);
+        }
+        let PromptTokenizer::Gemma3(tok) = tok else {
+            unreachable!("Gemma tokenizer variants covered");
+        };
         let bos_id = gemma_bos_id(tok)?;
         let enc = tok
             .encode(prompt, true)
@@ -536,13 +750,114 @@ impl Pipeline {
         Ok(out)
     }
 
+    /// The split LTX-2.5 DFR execution branch.  It deliberately consumes the ordinary provider's
+    /// already-materialised Gemma contexts, VAE conditioning latents, DiT, and learned upsamplers;
+    /// there is no second loader or helper-only sampler path.
+    #[allow(clippy::too_many_arguments)]
+    fn render_dfr(
+        &self,
+        req: &GenerationRequest,
+        comps: &Components,
+        frames: u32,
+        fps: u32,
+        seed: u64,
+        video_ctx: &Tensor,
+        audio_ctx: &Tensor,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
+        let (canvas_frames, _, mut keyframe_positions) =
+            candle_gen::gen_core::ltx_dfr::resolve_canvas(
+                frames as i64,
+                config::TEMPORAL_SCALE as i64,
+            )
+            .map_err(|e| CandleError::Msg(e.to_string()))?;
+        if let Some(count) = req.num_generated_keyframes.filter(|count| *count > 0) {
+            keyframe_positions.extend(
+                candle_gen::gen_core::ltx_dfr::evenly_spaced_keyframe_positions(
+                    count,
+                    canvas_frames,
+                ),
+            );
+            keyframe_positions.sort_unstable();
+            keyframe_positions.dedup();
+        }
+        let geometry = pipeline::two_stage_geometry(canvas_frames as u32, req.width, req.height);
+        let audio_frames = compute_audio_frames(canvas_frames as usize, fps as f64).max(1);
+        let audio_grid = rope::create_audio_position_grid(audio_frames, &self.device)?;
+        let stage1 =
+            self.build_keyframes(req, &comps.vae, geometry.t, req.width / 2, req.height / 2)?;
+        let stage2 = self.build_keyframes(req, &comps.vae, geometry.t, req.width, req.height)?;
+        if stage1.len() != stage2.len()
+            || stage1
+                .iter()
+                .zip(&stage2)
+                .any(|(left, right)| left.frame_idx != right.frame_idx)
+        {
+            return Err(CandleError::Msg(
+                "ltx_2_5_distilled: DFR keyframe encodes disagree between stages".into(),
+            ));
+        }
+        let image_keyframes: Vec<dfr::DfrStageKeyframe> = stage1
+            .into_iter()
+            .zip(stage2)
+            .map(|(low, full)| dfr::DfrStageKeyframe {
+                stage1: low.latent,
+                stage2: full.latent,
+                frame_idx: low.frame_idx,
+                strength: low.strength,
+            })
+            .collect();
+        let temporal = comps.temporal_upsampler.as_deref().ok_or_else(|| {
+            CandleError::Msg("ltx_2_5_distilled: DFR requires the temporal latent upsampler".into())
+        })?;
+        let parts = dfr::DfrComponents {
+            dit: &comps.avdit,
+            vae: &comps.vae,
+            spatial_upsampler: &comps.upsampler,
+            temporal_upsampler: Some(temporal),
+            video_ctx,
+            audio_ctx,
+            audio_grid: &audio_grid,
+            audio_frames,
+        };
+        let dfr_req = dfr::DfrRequest {
+            canvas_frames,
+            requested_frames: frames as i64,
+            keyframe_positions: &keyframe_positions,
+            geometry,
+            fps: fps as f32,
+            seed,
+            temporal_upsample_rounds: req.temporal_upsample_rounds.unwrap_or(0),
+            detailing_downscale: None,
+            video_keyframes: &image_keyframes,
+        };
+        let output = dfr::generate_dfr_av_latents(&parts, &dfr_req, &req.cancel, on_progress)?;
+        on_progress(Progress::Decoding);
+        let decoded = match &comps.diffusion_decoder {
+            Some(decoder) => {
+                decoder.decode_seeded(&output.video_latent, seed.wrapping_add(4), None)?
+            }
+            None => comps.vae.decode_budgeted(&output.video_latent)?,
+        };
+        let images = pipeline::frames_to_images(&decoded)?;
+        let audio = match &comps.audio {
+            Some(chain) => Some(pipeline::decode_audio_track(
+                &chain.decoder,
+                &chain.vocoder,
+                &output.audio_latent,
+                chain.sample_rate,
+            )?),
+            None => None,
+        };
+        Ok((images, output.playback_fps.round() as u32, audio))
+    }
+
     fn render(
         &self,
         req: &GenerationRequest,
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
-        let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let mut orchestration = pipeline::TwoStageOrchestration::new(seed);
@@ -553,6 +868,39 @@ impl Pipeline {
         // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
         let (video_ctx, audio_ctx) = comps.te.encode_both(&input_ids, &mask01)?;
+        let mut predict = || -> gen_core::Result<f32> {
+            let head = comps.duration_head.as_ref().ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "ltx_2_5_distilled: auto_duration requires the DurationHead component".into(),
+                )
+            })?;
+            head.predict_seconds(Some(&video_ctx), Some(&audio_ctx))
+                .map_err(|e| gen_core::Error::Msg(e.to_string()))
+        };
+        let frames = candle_gen::gen_core::duration_head::resolve_request_num_frames(
+            req.frames,
+            req.auto_duration,
+            fps as f32,
+            config::TEMPORAL_SCALE as u32,
+            &mut predict,
+        )?
+        .unwrap_or(DEFAULT_FRAMES);
+        let uses_dfr = req.num_generated_keyframes.is_some_and(|count| count > 0)
+            || req
+                .temporal_upsample_rounds
+                .is_some_and(|rounds| rounds > 0);
+        if uses_dfr {
+            return self.render_dfr(
+                req,
+                comps,
+                frames,
+                fps,
+                seed,
+                &video_ctx,
+                &audio_ctx,
+                on_progress,
+            );
+        }
 
         // Stage one lives on the half-resolution grid; the learned upsampler is
         // the only bridge to the full-resolution stage-two grid.
@@ -831,11 +1179,16 @@ impl Pipeline {
         on_progress(Progress::Decoding);
         // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
         // full-video decode that OOMs the worker on large/long outputs.
-        let decoded = match memory_strategy::selected_decode_cap(req)? {
-            Some((edge, overlap)) => comps
-                .vae
-                .decode_budgeted_with_spatial_cap(&vlat, edge, overlap)?,
-            None => comps.vae.decode_budgeted(&vlat)?,
+        let decoded = match &comps.diffusion_decoder {
+            // The explicit `diffusion_video_vae` LoadSpec component is an alternate decoder, not a
+            // second denoise route.  It consumes the same final normalized latent as the conv VAE.
+            Some(decoder) => decoder.decode_seeded(&vlat, seed.wrapping_add(4), None)?,
+            None => match memory_strategy::selected_decode_cap(req)? {
+                Some((edge, overlap)) => comps
+                    .vae
+                    .decode_budgeted_with_spatial_cap(&vlat, edge, overlap)?,
+                None => comps.vae.decode_budgeted(&vlat)?,
+            },
         };
         let images = pipeline::frames_to_images(&decoded)?;
         // Audio decode only when the audio chain is loaded (the dense bundle); the packed MLX tier is
@@ -891,6 +1244,30 @@ impl Generator for LtxGenerator {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
+        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
+        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
+        // same way).
+        //
+        // These run BEFORE the shared floor on purpose (sc-18778) — see the matching comment in
+        // `mlx-gen-ltx`'s `validate_request`. The floor refuses the same knobs from this
+        // descriptor's (defaulted-off) `supports_generated_keyframes` /
+        // `max_temporal_upsample_rounds`; going first only preserves the message that names the
+        // checkpoint generation which does support them.
+        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
+                 (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
+                    .into(),
+            ));
+        }
+        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+            return Err(gen_core::Error::Unsupported(
+                "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
+                 keyframe slots + the temporal latent upsampler)"
+                    .into(),
+            ));
+        }
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
@@ -910,24 +1287,6 @@ impl Generator for LtxGenerator {
                     config::TEMPORAL_SCALE
                 )));
             }
-        }
-        // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
-        // (`use_keyframes_abs_pos_embedding: false`); refuse up front like the reference's
-        // `assert_generated_keyframes_supported`, typed as `Unsupported` (the mlx twin refuses the
-        // same way).
-        if req.num_generated_keyframes.is_some_and(|n| n > 0) {
-            return Err(gen_core::Error::Unsupported(
-                "ltx: num_generated_keyframes requires a generated-keyframe checkpoint \
-                 (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
-                    .into(),
-            ));
-        }
-        if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
-            return Err(gen_core::Error::Unsupported(
-                "ltx: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
-                 keyframe slots + the temporal latent upsampler)"
-                    .into(),
-            ));
         }
         let check_strength = |label: &str, strength: f32| -> gen_core::Result<()> {
             if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
@@ -1225,6 +1584,21 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// The ordinary Candle provider descriptor for LTX-2.5's split Gemma-4 bundle.  Axes that are not
+/// materialised by this route stay explicitly closed; they are never accepted as inert metadata.
+pub fn descriptor_25() -> ModelDescriptor {
+    let mut out = descriptor();
+    out.id = MODEL_25_ID;
+    out.capabilities.supports_lora = false;
+    out.capabilities.supports_lokr = false;
+    out.capabilities.supports_prompt_enhancement = false;
+    out.capabilities.supports_auto_duration = true;
+    out.capabilities.supports_generated_keyframes = true;
+    out.capabilities.max_temporal_upsample_rounds = 2;
+    out.capabilities.supports_diffusion_decoder = true;
+    out
+}
+
 /// The single full **dense bf16** LTX-2.3 checkpoint in `root` — the 22B model bundling DiT + VAE +
 /// audio-VAE + vocoder + projection (not a LoRA / upscaler / fp8 variant). Handles both the base
 /// `Lightricks/LTX-2.3` (`ltx-2.3-22b-distilled*.safetensors`) and full-model fine-tunes whose file is
@@ -1519,16 +1893,131 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     }))
 }
 
+/// Lazy LTX-2.5 split-bundle provider.  Metadata/configuration is resolved at ordinary catalog
+/// load time; multi-gigabyte tensors remain request-scoped in the existing LTX renderer.
+pub struct Ltx25Generator {
+    descriptor: ModelDescriptor,
+    bundle: LtxBundle,
+    device: Device,
+    use_diffusion_decoder: bool,
+    components: Mutex<Option<Components>>,
+}
+
+/// Load the split LTX-2.5 route through the standard generator registry.  The selected decoder is
+/// intentional: staging `diffusion_video_vae` selects DiffVAE; otherwise the conv decoder is used.
+pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    let known = bundle::split_component_ids();
+    gen_core::reject_unknown_components(spec, &known, MODEL_25_ID)?;
+    if !spec.adapters.is_empty() {
+        return Err(gen_core::Error::Unsupported(
+            "ltx_2_5_distilled: LoRA/LoKr adapters are not supported by the split route".into(),
+        ));
+    }
+    if spec.quantize.is_some() && spec.quantize != Some(Quant::Q4) {
+        return Err(gen_core::Error::Unsupported(
+            "ltx_2_5_distilled: only the released q4 component tier is supported".into(),
+        ));
+    }
+    let resolved = bundle::resolve_split_bundle(spec)?;
+    if resolved.layout() != LtxCheckpointLayout::Split {
+        return Err(gen_core::Error::Msg(format!(
+            "ltx_2_5_distilled: expected an LTX-2.5 split-component bundle, got {}",
+            resolved.layout().id()
+        )));
+    }
+    bundle::assert_gemma_version(&resolved)?;
+    let use_diffusion_decoder = spec
+        .components
+        .contains_key(LtxComponent::DiffusionVideoVae.id());
+    // Validate every production component/config now.  The actual constructors are deliberately
+    // deferred until generation so normal provider/catalog construction is weights-free.
+    let pipe = Pipeline::load_split(resolved.clone(), &Device::Cpu, use_diffusion_decoder)?;
+    resolved.require(LtxComponent::DurationHead)?;
+    resolved.require(LtxComponent::TemporalUpsampler)?;
+    drop(pipe);
+    Ok(Box::new(Ltx25Generator {
+        descriptor: descriptor_25(),
+        bundle: resolved,
+        device: candle_gen::default_device()?,
+        use_diffusion_decoder,
+        components: Mutex::new(None),
+    }))
+}
+
+impl Generator for Ltx25Generator {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        self.descriptor
+            .capabilities
+            .validate_request(MODEL_25_ID, req)?;
+        if req.prompt.is_empty() {
+            return Err(gen_core::Error::Msg(
+                "ltx_2_5_distilled: prompt must not be empty".into(),
+            ));
+        }
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(gen_core::Error::Msg(format!(
+                "ltx_2_5_distilled: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        if let Some(frames) = req.frames {
+            if frames == 0 || frames % config::TEMPORAL_SCALE as u32 != 1 {
+                return Err(gen_core::Error::Msg(format!(
+                    "ltx_2_5_distilled: frames must satisfy frames % {} == 1 (got {frames})",
+                    config::TEMPORAL_SCALE
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn generate(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
+        let pipe = Pipeline::load_split(
+            self.bundle.clone(),
+            &self.device,
+            self.use_diffusion_decoder,
+        )?;
+        let mut slot = candle_gen::lock_recover(&self.components);
+        let want_encoder = needs_ltx_vae_encoder(req);
+        if slot
+            .as_ref()
+            .is_none_or(|components| components.vae_has_encoder != want_encoder)
+        {
+            *slot = None;
+            *slot = Some(pipe.load_components(&[], want_encoder)?);
+        }
+        let components = slot.as_ref().expect("split components populated").clone();
+        drop(slot);
+        let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
+        Ok(GenerationOutput::Video { frames, fps, audio })
+    }
+}
+
 candle_gen::register_generators! {
     pub(crate) const REGISTRATION = descriptor => load;
     footprint = component_footprint
+}
+
+candle_gen::register_generators! {
+    pub(crate) const REGISTRATION_25 = descriptor_25 => load_25
 }
 
 /// Add the Candle LTX generator and trainer to an explicit media registry builder.
 pub fn register_providers(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
-    let registry = registry.register_generator(REGISTRATION);
+    let registry = registry
+        .register_generator(REGISTRATION)
+        .register_generator(REGISTRATION_25);
     #[cfg(feature = "cuda")]
     let registry = registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
@@ -1554,7 +2043,7 @@ pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core:
 
 /// Resolve the load-bearing VAE geometry for a Candle LTX generator id.
 pub fn vae_tiling(provider_id: &str) -> Option<candle_gen::gen_core::tiling::VaeTiling> {
-    (provider_id == MODEL_ID).then_some(VAE_TILING)
+    (provider_id == MODEL_ID || provider_id == MODEL_25_ID).then_some(VAE_TILING)
 }
 
 /// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
@@ -1582,7 +2071,7 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(generators, ["ltx_2_3_distilled"]);
+        assert_eq!(generators, ["ltx_2_3_distilled", "ltx_2_5_distilled"]);
         assert_eq!(trainers, ["ltx_2_3"]);
     }
 }
@@ -1590,6 +2079,72 @@ mod explicit_registry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ltx25_ordinary_provider_validation_enforces_declared_geometry_and_closed_axes() {
+        let generator = Ltx25Generator {
+            descriptor: descriptor_25(),
+            // Validation is deliberately independent of tensor construction; this is the ordinary
+            // provider object the catalog returns after its split-bundle load gate.
+            bundle: LtxBundleBuilder::new()
+                .build()
+                .expect("empty validation-only bundle"),
+            device: Device::Cpu,
+            use_diffusion_decoder: false,
+            components: Mutex::new(None),
+        };
+        let request = GenerationRequest {
+            prompt: "a quiet moonlit harbor".into(),
+            width: 512,
+            height: 512,
+            frames: Some(17),
+            ..Default::default()
+        };
+        Generator::validate(&generator, &request).expect("64px / 1+8*k must pass");
+
+        let mut bad_width = request.clone();
+        bad_width.width = 672; // divisible by 32 but not the two-stage 64px provider stride.
+        assert!(Generator::validate(&generator, &bad_width)
+            .unwrap_err()
+            .to_string()
+            .contains("multiples of 64"));
+
+        let mut bad_frames = request.clone();
+        bad_frames.frames = Some(16);
+        assert!(Generator::validate(&generator, &bad_frames)
+            .unwrap_err()
+            .to_string()
+            .contains("frames"));
+
+        let mut dfr = request.clone();
+        dfr.num_generated_keyframes = Some(1);
+        Generator::validate(&generator, &dfr).expect("declared generated-keyframe axis must pass");
+        let mut temporal = request;
+        temporal.temporal_upsample_rounds = Some(2);
+        Generator::validate(&generator, &temporal).expect("declared temporal-DFR axis must pass");
+
+        assert!(generator.descriptor.capabilities.supports_diffusion_decoder);
+    }
+
+    #[test]
+    fn ltx25_provider_path_cannot_bypass_duration_or_dfr_execution() {
+        // Mutation-sensitive production-path witness: deleting either call site makes the ordinary
+        // `Ltx25Generator::generate → Pipeline::render` path fail, rather than leaving a helper test
+        // green while a request silently ignores its advanced axis.
+        let source = include_str!("lib.rs");
+        let provider = source
+            .split("impl Generator for Ltx25Generator")
+            .nth(1)
+            .expect("LTX-2.5 provider implementation exists");
+        assert!(provider.contains("pipe.render(req, &components, on_progress)"));
+        let renderer = source
+            .split("fn render(")
+            .nth(1)
+            .expect("ordinary renderer exists");
+        assert!(renderer.contains("resolve_request_num_frames("));
+        assert!(renderer.contains("self.render_dfr("));
+        assert!(source.contains("dfr::generate_dfr_av_latents("));
+    }
 
     #[test]
     fn missing_spatial_upscaler_is_actionable() {
