@@ -132,9 +132,9 @@ export HYPER_LORA="$("$REF_HF" download ByteDance/Hyper-SD \
   --revision bc08d970a87c74c71209491d64e3525845698863)"
 
 # Reference goldens. Keep the 512² base and adapter configurations identical.
-ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
   ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_golden.py"
-ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
   ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_adapter_golden.py"
 
 QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
@@ -181,8 +181,8 @@ residual cap may be locked only after the adapted residual is measured below the
 control; the reviewed rule is their integer midpoint. If there is no separation, the parity claim
 must be reframed instead of forcing a passing cap.
 
-The retained residual diagnostic separated Z LoRA (15,692 adapted vs 26,587 zero control) and
-Z LoKr (15,476 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
+The retained residual diagnostic separated Z LoRA (12,940 adapted vs 26,587 zero control) and
+Z LoKr (14,028 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
 (69,111 vs 50,446): both Qwen adapted residual errors were worse than the dropped-adapter
 control. Qwen therefore keeps the original floor-relative fork gate
 `adapted_px_gt8 <= 2 * base_floor + rgb_samples / 200` and uses a separate same-runtime effect

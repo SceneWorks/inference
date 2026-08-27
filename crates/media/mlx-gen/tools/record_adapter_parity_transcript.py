@@ -294,7 +294,7 @@ def expected_runs(manifest: dict) -> list[dict]:
         ),
     )
     runs = []
-    for name, package, test_binary, test_name, environment in specs:
+    for name, package, test_module, test_name, environment in specs:
         runs.append(
             {
                 "name": name,
@@ -306,8 +306,8 @@ def expected_runs(manifest: dict) -> list[dict]:
                     "-p",
                     package,
                     "--test",
-                    test_binary,
-                    test_name,
+                    "integration",
+                    f"{test_module}::{test_name}",
                     "--",
                     "--ignored",
                     "--nocapture",
@@ -349,8 +349,8 @@ def residual_diagnostic_runs(manifest: dict) -> list[dict]:
                 "-p",
                 package,
                 "--test",
-                "adapter_real_weights",
-                "residual_mutation_diagnostic",
+                "integration",
+                "adapter_real_weights::residual_mutation_diagnostic",
                 "--",
                 "--ignored",
                 "--nocapture",
@@ -379,8 +379,8 @@ def qwen_effect_diagnostic_runs(manifest: dict) -> list[dict]:
                 "-p",
                 "mlx-gen-qwen-image",
                 "--test",
-                "adapter_real_weights",
-                "adapter_effect_diagnostic",
+                "integration",
+                "adapter_real_weights::adapter_effect_diagnostic",
                 "--",
                 "--ignored",
                 "--nocapture",

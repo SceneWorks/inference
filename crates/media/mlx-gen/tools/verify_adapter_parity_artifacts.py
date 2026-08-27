@@ -184,7 +184,7 @@ def validate_manifest(manifest: dict, tools: Path = TOOLS) -> None:
     _require(manifest.get("schema") == 1, "schema must be 1")
     _require(manifest.get("story") == "sc-15505", "story must be sc-15505")
     _require(
-        manifest.get("implementation_base") == "39a11d363663924869ea51c7cc4a8a3a6d68a2e1",
+        manifest.get("implementation_base") == "8b1f1bdb37e449778d3a2110425dbe1ec5cb0c8b",
         "wrong inference implementation base",
     )
     reference = manifest.get("reference", {})
