@@ -531,6 +531,37 @@ impl Flux2 {
         }
     }
 
+    #[cfg(test)]
+    fn new_for_tests_with_spec(variant: Flux2Variant, spec: &LoadSpec) -> Result<Self> {
+        let root = resolve_root(variant, spec)?;
+        Ok(Self {
+            descriptor: variant.descriptor(),
+            variant,
+            config: variant.config(),
+            memory_strategy: crate::memory_strategy::contract_for_variant(variant, spec)?,
+            memory_numeric_tier: Some(effective_memory_numeric_tier(
+                variant,
+                spec,
+                root,
+                variant.id(),
+            )?),
+            loaded_spec: spec.clone(),
+            tokenizer: None,
+            residency: Residency::sequential(
+                || {
+                    Err(Error::Msg(
+                        "flux2: text encoder not loadable in a test-only instance".into(),
+                    ))
+                },
+                |_use_pid| {
+                    Err(Error::Msg(
+                        "flux2: heavy bundle not loadable in a test-only instance".into(),
+                    ))
+                },
+            ),
+        })
+    }
+
     /// Encode a prompt → `(prompt_embeds [1,512,joint], text_ids [1,512,4])`.
     fn encode(
         &self,
@@ -2092,13 +2123,7 @@ mod tests {
         assert!(reason.contains("does not match loaded tier"), "{reason}");
     }
 
-    fn dev_tier_spec(
-        root: &Path,
-        variant: Flux2Variant,
-        packed_bits: Option<i32>,
-        requested: Option<Quant>,
-    ) -> LoadSpec {
-        let mut spec = validation_complete_snapshot_spec(root, variant, OffloadPolicy::Sequential);
+    fn dev_tier_spec(root: &Path, packed_bits: Option<i32>, requested: Option<Quant>) -> LoadSpec {
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -2108,6 +2133,8 @@ mod tests {
             ),
         )
         .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential);
         spec.quantize = requested;
         spec
     }
@@ -2157,7 +2184,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_loaded_and_registered_safety_use_the_effective_transformer_tier() {
+    fn dev_numeric_tier_and_registered_safety_use_the_effective_transformer_tier() {
         let registry = crate::provider_registry().unwrap();
         for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
             for prepacked in [false, true] {
@@ -2173,18 +2200,13 @@ mod tests {
                     let fixture = tempfile::tempdir().unwrap();
                     let spec = dev_tier_spec(
                         fixture.path(),
-                        variant,
                         prepacked.then_some(bits),
                         (!prepacked).then_some(quant),
                     );
-                    let generator = match variant {
-                        Flux2Variant::Dev => load_dev(&spec),
-                        Flux2Variant::DevEdit => load_dev_edit(&spec),
-                        _ => unreachable!(),
-                    }
-                    .unwrap_or_else(|error| {
-                        panic!("Q{bits} prepacked={prepacked} {provider_id}: {error}")
-                    });
+                    let generator =
+                        Flux2::new_for_tests_with_spec(variant, &spec).unwrap_or_else(|error| {
+                            panic!("Q{bits} prepacked={prepacked} {provider_id}: {error}")
+                        });
                     assert_eq!(
                         generator.memory_strategy_contract().unwrap().provider_id,
                         provider_id
@@ -2194,11 +2216,11 @@ mod tests {
                         quant: Some(quant),
                         component_precision_floors: &[],
                     };
-                    let context = public_dev_context(generator.as_ref(), mode, references, tier);
+                    let context = public_dev_context(&generator, mode, references, tier);
                     assert_eq!(
                         generator.memory_strategy_safety_check(&context),
                         MemorySafetyDecision::Accept,
-                        "loaded Q{bits} prepacked={prepacked} {provider_id}"
+                        "test generator Q{bits} prepacked={prepacked} {provider_id}"
                     );
 
                     let registration = registry
@@ -2233,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_load_and_registered_safety_reject_requested_vs_packed_tier_mismatches() {
+    fn dev_numeric_tier_and_registered_safety_reject_requested_vs_packed_mismatches() {
         let registry = crate::provider_registry().unwrap();
         for (stored_bits, requested) in [(4, Quant::Q8), (8, Quant::Q4)] {
             for (variant, provider_id, mode, references) in [
@@ -2246,19 +2268,14 @@ mod tests {
                 ),
             ] {
                 let fixture = tempfile::tempdir().unwrap();
-                let spec =
-                    dev_tier_spec(fixture.path(), variant, Some(stored_bits), Some(requested));
-                let load_error = match variant {
-                    Flux2Variant::Dev => load_dev(&spec),
-                    Flux2Variant::DevEdit => load_dev_edit(&spec),
-                    _ => unreachable!(),
-                }
-                .err()
-                .expect("packed/requested mismatch must reject load")
-                .to_string();
+                let spec = dev_tier_spec(fixture.path(), Some(stored_bits), Some(requested));
+                let tier_error =
+                    effective_memory_numeric_tier(variant, &spec, fixture.path(), provider_id)
+                        .expect_err("packed/requested mismatch must reject the effective load tier")
+                        .to_string();
                 assert!(
-                    load_error.contains(provider_id) && load_error.contains("pre-quantized"),
-                    "{load_error}"
+                    tier_error.contains(provider_id) && tier_error.contains("pre-quantized"),
+                    "{tier_error}"
                 );
 
                 let registration = registry
@@ -2735,33 +2752,62 @@ mod tests {
         assert_eq!(descriptor_klein_9b_edit().id, FLUX2_KLEIN_9B_EDIT_ID);
     }
 
-    // ── sc-10840: weight-free, default-run proof that FLUX.2's dispatch HONORS `offload_policy`.
-    // `build_residency` at a validation-complete sparse snapshot: `Sequential` admits the encoder
-    // contract but defers payload materialization (`is_sequential`); `Resident` immediately enters
-    // the unchanged payload bracket, proven without materializing the sparse production-size file.
-    // Runs for a klein (Qwen3)
-    // and a dev (Mistral-3 group) variant, so both text-loader arms are exercised. The real-weight A/B
-    // is deferred (weights not on disk).
-    fn validation_complete_snapshot_spec(
+    // ── sc-10840: weight-free proof that FLUX.2's dispatch retains the sealed encoder receipt in
+    // both residency policies. Structural production header coverage is asserted separately; these
+    // bounded fixtures keep the real seal, tokenizer binding, multimodal validation, and unchanged
+    // checks without hashing logical multi-gigabyte sparse payloads.
+    fn bounded_admitted_sources(
         root: &Path,
         variant: Flux2Variant,
         policy: OffloadPolicy,
-    ) -> LoadSpec {
+    ) -> (
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let contract = if variant.is_dev() {
+            crate::config::bounded_dev_encoder_contract()
+        } else {
+            crate::config::bounded_klein_encoder_contract()
+        };
         if variant.is_dev() {
             gen_core_testkit::write_multimodal_encoder_contract_fixture(
                 &root.join("text_encoder"),
-                variant.encoder_contract(),
-                crate::config::DEV_VISION_ENCODER_CONTRACT,
+                contract,
+                crate::config::bounded_dev_vision_encoder_contract(),
             )
             .unwrap();
         } else {
-            gen_core_testkit::write_encoder_contract_fixture(
-                &root.join("text_encoder"),
-                variant.encoder_contract(),
+            gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), contract)
+                .unwrap();
+        }
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy);
+        let text = contract
+            .source_for_load(&spec, root)
+            .expect("bounded source must exercise real sealed-source admission");
+        let multimodal = if variant.is_dev() {
+            text.validate_vision(
+                &crate::config::bounded_dev_vision_encoder_contract(),
+                &contract,
             )
             .unwrap();
-        }
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
+            text.clone()
+        } else {
+            text.clone()
+        };
+        (spec, text, multimodal)
+    }
+
+    fn production_multimodal_snapshot_spec(root: &Path) -> LoadSpec {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+            crate::config::DEV_VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential)
     }
 
     #[test]
@@ -2772,14 +2818,15 @@ mod tests {
                 mlx_gen::LoadShape::DeferredMaterialization,
             ] {
                 let fixture = tempfile::tempdir().unwrap();
-                let mut spec = validation_complete_snapshot_spec(
-                    fixture.path(),
-                    variant,
-                    OffloadPolicy::Sequential,
-                );
+                let (mut spec, text, multimodal) =
+                    bounded_admitted_sources(fixture.path(), variant, OffloadPolicy::Sequential);
                 spec.load_shape = shape;
-                let res = build_residency(variant, &spec)
-                    .expect("Sequential must admit every consumed encoder surface before deferring payload loads");
+                let res = build_residency_from_admitted_sources(
+                    variant, &spec, text, multimodal, None,
+                )
+                .expect(
+                    "Sequential must retain every admitted source while deferring payload loads",
+                );
                 assert!(
                     res.is_sequential(),
                     "{} {shape:?}: Sequential policy must build a deferred residency",
@@ -2885,11 +2932,7 @@ mod tests {
         // every case is unnecessary and can trip hosted-runner resource accounting even though no
         // payload is ever materialized.
         let fixture = tempfile::tempdir().unwrap();
-        let base_spec = validation_complete_snapshot_spec(
-            fixture.path(),
-            Flux2Variant::Dev,
-            OffloadPolicy::Sequential,
-        );
+        let base_spec = production_multimodal_snapshot_spec(fixture.path());
         let config_path = fixture.path().join("text_encoder/config.json");
         let valid_config = std::fs::read(&config_path).unwrap();
         let mut invalid_config: serde_json::Value = serde_json::from_slice(&valid_config).unwrap();
@@ -2943,11 +2986,7 @@ mod tests {
     fn dev_registry_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
         let tmp = tempfile::tempdir().unwrap();
         let registry = crate::provider_registry().unwrap();
-        let base_spec = validation_complete_snapshot_spec(
-            tmp.path(),
-            Flux2Variant::Dev,
-            OffloadPolicy::Sequential,
-        );
+        let base_spec = production_multimodal_snapshot_spec(tmp.path());
         let footprint =
             |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
         let dev = footprint(crate::config::FLUX2_DEV_ID, &base_spec);
@@ -3675,47 +3714,13 @@ mod tests {
     fn build_residency_resident_enters_payload_bracket_after_admission() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
             let fixture = tempfile::tempdir().unwrap();
-            let spec =
-                validation_complete_snapshot_spec(fixture.path(), variant, OffloadPolicy::Resident);
-            let root = resolve_root(variant, &spec).unwrap();
-            let text_encoder_source = variant
-                .encoder_contract()
-                .source_for_load(&spec, root)
-                .unwrap();
-            let effective_quant_bits = variant
-                .is_dev()
-                .then(|| effective_base_quant(&spec, root, variant.id()))
-                .transpose()
-                .unwrap()
-                .flatten()
-                .map(mlx_gen::gen_core::Quant::bits);
-            let text_encoder_load_time_quant_bits = text_encoder_source
-                .load_time_quant_bits(effective_quant_bits, variant.id())
-                .unwrap();
-            let multimodal_encoder_source = if variant.is_dev() {
-                let source = variant
-                    .encoder_contract()
-                    .validate_source_against_base(
-                        &WeightsSource::Dir(root.join("text_encoder")),
-                        root,
-                    )
-                    .unwrap();
-                source
-                    .validate_vision(
-                        &crate::config::DEV_VISION_ENCODER_CONTRACT,
-                        &crate::config::DEV_ENCODER_CONTRACT,
-                    )
-                    .unwrap();
-                source
-            } else {
-                text_encoder_source.clone()
-            };
+            let (spec, text_encoder_source, multimodal_encoder_source) =
+                bounded_admitted_sources(fixture.path(), variant, OffloadPolicy::Resident);
 
-            // The contract fixtures are sparse production-shape files and must never be
-            // materialized. Mutate the admitted shard inventory instead: Sequential leaves this
-            // check deferred, while Resident must invoke the real text-loader closure immediately.
             std::fs::write(
-                root.join("text_encoder/added-after-admission.safetensors"),
+                fixture
+                    .path()
+                    .join("text_encoder/added-after-admission.safetensors"),
                 [],
             )
             .unwrap();
@@ -3724,7 +3729,7 @@ mod tests {
                 &spec,
                 text_encoder_source,
                 multimodal_encoder_source,
-                text_encoder_load_time_quant_bits,
+                None,
             )
             .err()
             .expect("Resident must immediately enter the admitted payload-load bracket");

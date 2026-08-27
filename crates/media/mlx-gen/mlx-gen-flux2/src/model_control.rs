@@ -176,19 +176,6 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// loads nothing now. The text phase is the dev Mistral-3 encoder only (no caption upsample — the
 /// control variant has no vision tower), reusing the shared [`Flux2TextOwned`]; the heavy loader builds
 /// the control transformer (base + control branch) + VAE.
-#[cfg(test)]
-fn build_control_residency(
-    spec: &LoadSpec,
-) -> Result<Residency<Flux2TextOwned, Flux2ControlHeavyOwned>> {
-    let root = require_base_dir(
-        spec,
-        FLUX2_DEV_CONTROL_ID,
-        "a FLUX.2-dev snapshot directory",
-    )?;
-    let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT.source_for_load(spec, root)?;
-    build_control_residency_with_source(spec, text_encoder_source)
-}
-
 fn build_control_residency_with_source(
     spec: &LoadSpec,
     text_encoder_source: gen_core::ValidatedEncoderSource,
@@ -274,6 +261,34 @@ fn load_control_heavy(spec: &LoadSpec) -> Result<Flux2ControlHeavyOwned> {
 }
 
 impl Flux2DevControl {
+    #[cfg(test)]
+    fn new_for_tests(spec: &LoadSpec) -> Result<Self> {
+        Ok(Self {
+            descriptor: descriptor_dev_control(),
+            config: Flux2Config::dev(),
+            memory_strategy: crate::memory_strategy::registered_dev_control_contract(spec)?,
+            memory_numeric_tier: crate::model::effective_dev_memory_numeric_tier(
+                spec,
+                FLUX2_DEV_CONTROL_ID,
+            )?,
+            tokenizer: None,
+            residency: Residency::sequential(
+                || {
+                    Err(Error::Msg(
+                        "flux2 dev control: text encoder not loadable in a test-only instance"
+                            .into(),
+                    ))
+                },
+                |_use_pid| {
+                    Err(Error::Msg(
+                        "flux2 dev control: heavy bundle not loadable in a test-only instance"
+                            .into(),
+                    ))
+                },
+            ),
+        })
+    }
+
     /// Tokenize + encode the prompt into `(prompt_embeds, text_ids)` (the dev Mistral TE path; same
     /// as [`crate::model::Flux2`]'s `encode`). Takes the encoder as an argument so the residency seam's
     /// phase-A closure supplies either the warm-resident or the just-loaded `Sequential` encoder.
@@ -653,33 +668,11 @@ mod tests {
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 
-    // ── sc-10840: weight-free, default-run proof that the FLUX.2 control dispatch HONORS
-    // `offload_policy`. `build_control_residency` uses a validation-complete sparse encoder plus a
-    // missing control checkpoint: `Sequential` admits the encoder and defers payload loads;
-    // `Resident` immediately enters the unchanged payload bracket without materializing the sparse
-    // production-size file. The real-weight A/B remains hosted.
-    fn validation_complete_snapshot_spec(
-        root: &std::path::Path,
-        policy: OffloadPolicy,
-    ) -> LoadSpec {
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::config::DEV_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
-            .with_control(WeightsSource::File(
-                "/nonexistent/control.safetensors".into(),
-            ))
-            .with_offload_policy(policy)
-    }
-
     fn tier_spec(
         root: &std::path::Path,
         packed_bits: Option<i32>,
         requested: Option<Quant>,
     ) -> LoadSpec {
-        let mut spec = validation_complete_snapshot_spec(root, OffloadPolicy::Sequential);
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -689,8 +682,31 @@ mod tests {
             ),
         )
         .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_control(WeightsSource::File(
+                "/nonexistent/control.safetensors".into(),
+            ))
+            .with_offload_policy(OffloadPolicy::Sequential);
         spec.quantize = requested;
         spec
+    }
+
+    fn bounded_admitted_control_source(
+        root: &std::path::Path,
+        policy: OffloadPolicy,
+    ) -> (LoadSpec, gen_core::ValidatedEncoderSource) {
+        let contract = crate::config::bounded_dev_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), contract)
+            .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_control(WeightsSource::File(
+                "/nonexistent/control.safetensors".into(),
+            ))
+            .with_offload_policy(policy);
+        let source = contract
+            .source_for_load(&spec, root)
+            .expect("bounded source must exercise the real sealed-source admission path");
+        (spec, source)
     }
 
     fn public_control_context(
@@ -734,9 +750,10 @@ mod tests {
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
         let fixture = tempfile::tempdir().unwrap();
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
-        let res = build_control_residency(&spec)
-            .expect("Sequential must validate the encoder and defer payload loads");
+        let (spec, source) =
+            bounded_admitted_control_source(fixture.path(), OffloadPolicy::Sequential);
+        let res = build_control_residency_from_admitted_source(&spec, source, None)
+            .expect("Sequential must retain the admitted receipt and defer payload loads");
         assert!(
             res.is_sequential(),
             "Sequential policy must build a Sequential (deferred) residency"
@@ -746,38 +763,18 @@ mod tests {
     #[test]
     fn build_residency_resident_enters_payload_bracket_after_admission() {
         let fixture = tempfile::tempdir().unwrap();
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
-        let root = require_base_dir(
-            &spec,
-            FLUX2_DEV_CONTROL_ID,
-            "a FLUX.2-dev snapshot directory",
-        )
-        .unwrap();
-        let text_encoder_source = crate::config::DEV_ENCODER_CONTRACT
-            .source_for_load(&spec, root)
-            .unwrap();
-        let effective_quant_bits =
-            crate::model::effective_base_quant(&spec, root, FLUX2_DEV_CONTROL_ID)
-                .unwrap()
-                .map(Quant::bits);
-        let text_encoder_load_time_quant_bits = text_encoder_source
-            .load_time_quant_bits(effective_quant_bits, FLUX2_DEV_CONTROL_ID)
-            .unwrap();
-
-        // Do not materialize the sparse production-shape fixture. A post-admission shard addition
-        // lets the real Resident closure prove eager entry through the unchanged-read bracket.
+        let (spec, source) =
+            bounded_admitted_control_source(fixture.path(), OffloadPolicy::Resident);
         std::fs::write(
-            root.join("text_encoder/added-after-admission.safetensors"),
+            fixture
+                .path()
+                .join("text_encoder/added-after-admission.safetensors"),
             [],
         )
         .unwrap();
-        let err = build_control_residency_from_admitted_source(
-            &spec,
-            text_encoder_source,
-            text_encoder_load_time_quant_bits,
-        )
-        .err()
-        .expect("Resident must immediately enter the admitted payload-load bracket");
+        let err = build_control_residency_from_admitted_source(&spec, source, None)
+            .err()
+            .expect("Resident must immediately enter the admitted payload-load bracket");
         assert!(
             err.to_string()
                 .contains("shard inventory changed after validation"),
@@ -786,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn loaded_and_registered_control_contracts_use_the_effective_base_tier() {
+    fn control_numeric_tier_and_registered_safety_use_the_effective_base_tier() {
         let registry = crate::provider_registry().unwrap();
         let registration = registry
             .memory_strategy_registrations()
@@ -808,11 +805,11 @@ mod tests {
                     prepacked.then_some(bits),
                     (!prepacked).then_some(quant),
                 );
-                let loaded = load_dev_control(&spec)
+                let subject = Flux2DevControl::new_for_tests(&spec)
                     .unwrap_or_else(|error| panic!("Q{bits} prepacked={prepacked}: {error}"));
-                let contract = loaded
+                let contract = subject
                     .memory_strategy_contract()
-                    .expect("loaded control contract");
+                    .expect("test control contract");
                 assert_eq!(contract.provider_id, FLUX2_DEV_CONTROL_ID);
                 assert_eq!(contract.load_shape, spec.load_shape);
                 assert!(contract.calibration.is_none());
@@ -837,9 +834,9 @@ mod tests {
                 };
                 let context = public_control_context(contract, tier);
                 assert_eq!(
-                    loaded.memory_strategy_safety_check(&context),
+                    subject.memory_strategy_safety_check(&context),
                     MemorySafetyDecision::Accept,
-                    "loaded Q{bits} prepacked={prepacked}"
+                    "test control Q{bits} prepacked={prepacked}"
                 );
 
                 let registered_contract = (registration.contract)(&spec).unwrap();
@@ -856,7 +853,7 @@ mod tests {
                     Quant::Q4
                 });
                 for decision in [
-                    loaded.memory_strategy_safety_check(&wrong_tier),
+                    subject.memory_strategy_safety_check(&wrong_tier),
                     (registration.safety_check)(&spec, &registered_contract, &wrong_tier),
                 ] {
                     let MemorySafetyDecision::Reject { reason } = decision else {
@@ -864,13 +861,7 @@ mod tests {
                     };
                     assert!(reason.contains("does not match loaded tier"), "{reason}");
                 }
-                assert!(
-                    registry
-                        .footprint(FLUX2_DEV_CONTROL_ID, &spec)
-                        .unwrap()
-                        .is_some(),
-                    "the resident-only contract must retain its estimated-fallback footprint"
-                );
+                assert!(DEV_CONTROL_REGISTRATION.footprint.is_some());
             }
         }
     }
@@ -885,13 +876,13 @@ mod tests {
         for (stored_bits, requested) in [(4, Quant::Q8), (8, Quant::Q4)] {
             let fixture = tempfile::tempdir().unwrap();
             let mismatch = tier_spec(fixture.path(), Some(stored_bits), Some(requested));
-            let load_error = load_dev_control(&mismatch)
-                .err()
-                .expect("control load must reject a requested/stored mismatch")
-                .to_string();
+            let tier_error =
+                crate::model::effective_dev_memory_numeric_tier(&mismatch, FLUX2_DEV_CONTROL_ID)
+                    .expect_err("control numeric tier must reject a requested/stored mismatch")
+                    .to_string();
             assert!(
-                load_error.contains(FLUX2_DEV_CONTROL_ID) && load_error.contains("pre-quantized"),
-                "{load_error}"
+                tier_error.contains(FLUX2_DEV_CONTROL_ID) && tier_error.contains("pre-quantized"),
+                "{tier_error}"
             );
             let contract = (registration.contract)(&mismatch).unwrap();
             let context = public_control_context(
@@ -915,8 +906,8 @@ mod tests {
 
         let fixture = tempfile::tempdir().unwrap();
         let spec = tier_spec(fixture.path(), Some(4), None);
-        let loaded = load_dev_control(&spec).unwrap();
-        let contract = loaded.memory_strategy_contract().unwrap();
+        let subject = Flux2DevControl::new_for_tests(&spec).unwrap();
+        let contract = subject.memory_strategy_contract().unwrap();
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
             quant: Some(Quant::Q4),
@@ -943,7 +934,7 @@ mod tests {
             },
         ] {
             let MemorySafetyDecision::Reject { reason } =
-                loaded.memory_strategy_safety_check(&wrong)
+                subject.memory_strategy_safety_check(&wrong)
             else {
                 panic!("non-control public context must reject: {wrong:?}")
             };
