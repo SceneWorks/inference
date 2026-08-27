@@ -6,10 +6,10 @@
 //! ```text
 //! FLUX1_LADDER_ROOT=/path/to/snapshots/323fd12d79f78ad444e882e8d8e871914584f2b9/q4 \
 //! FLUX1_LADDER_ARM=resident cargo test -p mlx-gen-flux --release \
-//!   --test shared_memory_ladder_real_weights -- --ignored --nocapture --test-threads=1
+//!   --test integration -- shared_memory_ladder_real_weights:: --ignored --nocapture --test-threads=1
 //! FLUX1_LADDER_ROOT=/path/to/snapshots/323fd12d79f78ad444e882e8d8e871914584f2b9/q4 \
 //! FLUX1_LADDER_ARM=rung4 cargo test -p mlx-gen-flux --release \
-//!   --test shared_memory_ladder_real_weights -- --ignored --nocapture --test-threads=1
+//!   --test integration -- shared_memory_ladder_real_weights:: --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Arms: `resident`, `staged`, `tile768`, `tile640`, `tile512`, `attention`, `rung4`,

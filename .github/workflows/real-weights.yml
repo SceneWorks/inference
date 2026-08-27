@@ -3619,7 +3619,7 @@ jobs:
       # job pulls is a tripwire for whoever remembers to run it, so the story's "fails if any phase
       # regresses" acceptance needs a selection here and not only a `#[ignore]` string.
       #
-      # WHY NOT THE te/dit ARMS. `--test staged_residency`'s `a_bounded_slab_handoff_leaves_nothing_
+      # WHY NOT THE te/dit ARMS. `staged_residency.rs`'s `a_bounded_slab_handoff_leaves_nothing_
       # behind` and `a_held_component_trips_both_handoff_gates` are cheap in MEMORY (60 tensors each)
       # and not in DISK: `Weights::from_dir` opens the whole component directory, and this row's
       # `download_files` is a deliberate 11.638 GB slice carrying NO `transformer/` shards and NO

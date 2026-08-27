@@ -35,7 +35,7 @@
 //!    the predicted velocity vs the **bf16** `mochi_dit_golden.safetensors`. Q4 on a 10B DiT is lossy —
 //!    this **records** the actual residual (it does not pretend Q4 is bit-exact to bf16). Run after
 //!    building the tiers: `MOCHI_Q4_DIR=~/mochi-tiers/q4 MOCHI_Q8_DIR=~/mochi-tiers/q8 cargo test -p
-//!    mlx-gen-mochi --test quant_parity -- --ignored --nocapture`
+//!    mlx-gen-mochi --test integration -- quant_parity:: --ignored --nocapture`
 
 use std::collections::HashMap;
 use std::path::PathBuf;

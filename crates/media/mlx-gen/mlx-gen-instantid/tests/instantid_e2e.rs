@@ -7,8 +7,8 @@
 //!
 //! Run (tune size/steps via env for a quick smoke):
 //!   INSTANTID_SIZE=512 INSTANTID_STEPS=4 cargo test -p mlx-gen-instantid --release \
-//!     --test instantid_e2e -- --ignored --nocapture
-//!   cargo test -p mlx-gen-instantid --release --test integration instantid_e2e:: -- --ignored --nocapture
+//!     --test integration -- instantid_e2e:: --ignored --nocapture
+//!   cargo test -p mlx-gen-instantid --release --test integration -- instantid_e2e:: --ignored --nocapture
 //!
 //! The gate is **directional** (per epic 3109: ArcFace-cosine + coherence, NOT bit-exact): a correctly
 //! wired pipeline preserves identity (cosine well above 0), a broken one collapses to ~0.

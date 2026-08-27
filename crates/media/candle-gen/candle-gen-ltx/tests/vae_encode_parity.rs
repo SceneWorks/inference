@@ -5,8 +5,8 @@
 //! compares normalized latents with a PSNR tolerance.
 //!
 //! Run:
-//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test
-//! vae_encode_parity -- --ignored --nocapture`
+//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test integration --
+//! vae_encode_parity:: --ignored --nocapture`
 
 #![cfg(feature = "cuda")]
 

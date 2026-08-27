@@ -27,7 +27,7 @@
 //! ```text
 //! LTX25_VAE_DIR=/path/to/Lightricks--LTX-2.5/vae \
 //! LTX25_SPLIT_DIR=/tmp/ltx25-diffvae \
-//!   cargo test -p mlx-gen-ltx --release --test ltx_2_5_diffvae_parity -- --ignored --nocapture
+//!   cargo test -p mlx-gen-ltx --release --test integration -- ltx_2_5_diffvae_parity:: --ignored --nocapture
 //! ```
 
 use std::path::{Path, PathBuf};

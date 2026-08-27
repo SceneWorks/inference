@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! MLX_LLM_GEMMA2_MODEL=/path/to/gemma-2-2b-it \
-//!   cargo test --test real_breadth -- --ignored --nocapture
+//!   cargo test --test integration -- real_breadth:: --ignored --nocapture
 //! ```
 //!
 //! The synthetic-weights wiring gate (no download) is `tests/breadth.rs`; this is the parity-vs-real

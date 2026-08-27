@@ -14,8 +14,8 @@
 //! post-norm) against the reference, on the candle side.
 //!
 //! Run:
-//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test
-//! connector_parity -- --ignored --nocapture`
+//! `LTX_BASE_DIR=<snapshot>/q8 cargo test -p candle-gen-ltx --features cuda --test integration --
+//! connector_parity:: --ignored --nocapture`
 
 #![cfg(feature = "cuda")]
 
