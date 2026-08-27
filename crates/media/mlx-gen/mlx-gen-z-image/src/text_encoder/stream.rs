@@ -226,9 +226,9 @@ mod tests {
     #[test]
     fn validated_stream_rechecks_source_before_each_deferred_open() {
         let fixture = tempfile::tempdir().unwrap();
-        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), crate::ENCODER_CONTRACT)
-            .unwrap();
-        let source = crate::ENCODER_CONTRACT
+        let contract = crate::bounded_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), contract).unwrap();
+        let source = contract
             .validate_source(&WeightsSource::Dir(fixture.path().to_path_buf()))
             .unwrap();
         let stream =
@@ -246,9 +246,9 @@ mod tests {
     #[test]
     fn validated_stream_rechecks_source_after_a_lazy_view_was_opened() {
         let fixture = tempfile::tempdir().unwrap();
-        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), crate::ENCODER_CONTRACT)
-            .unwrap();
-        let source = crate::ENCODER_CONTRACT
+        let contract = crate::bounded_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(fixture.path(), contract).unwrap();
+        let source = contract
             .validate_source(&WeightsSource::Dir(fixture.path().to_path_buf()))
             .unwrap();
         let stream =

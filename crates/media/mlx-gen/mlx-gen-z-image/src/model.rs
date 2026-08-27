@@ -425,14 +425,15 @@ pub(crate) fn load_residency(
 /// request's `streamable` component form; phase-level staging is a separate argument to
 /// [`Residency::run_staged_request_scoped`].
 #[cfg(test)]
-pub(crate) fn build_residency(
+pub(crate) fn build_residency_with_contract(
     spec: &LoadSpec,
     model_id: &'static str,
     precision_msg: &'static str,
     file_msg: &'static str,
+    contract: gen_core::EncoderContract,
 ) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
     let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = contract.source_for_load(spec, root)?;
     let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
         .quant
         .map(Quant::bits);
@@ -448,7 +449,7 @@ pub(crate) fn build_residency(
     )
 }
 
-fn build_residency_with_source(
+pub(crate) fn build_residency_with_source(
     spec: &LoadSpec,
     model_id: &'static str,
     precision_msg: &'static str,
@@ -925,10 +926,10 @@ mod tests {
     fn comfyui_components_recheck_validated_text_source_before_deferred_load() {
         let fixture = tempfile::tempdir().unwrap();
         let encoder = fixture.path().join("encoder");
-        gen_core_testkit::write_encoder_contract_fixture(&encoder, crate::ENCODER_CONTRACT)
-            .unwrap();
+        let contract = crate::bounded_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, contract).unwrap();
         let encoder_file = encoder.join("model.safetensors");
-        let text_encoder = crate::ENCODER_CONTRACT
+        let text_encoder = contract
             .validate_comfyui_source(&WeightsSource::File(encoder_file.clone()))
             .unwrap();
         let transformer = fixture.path().join("transformer.safetensors");
@@ -1146,9 +1147,9 @@ mod tests {
         let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
         gen_core_testkit::write_encoder_contract_fixture(
             &snapshot.path().join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+            crate::bounded_encoder_contract(),
         )
-        .expect("validation-complete encoder and tokenizer fixture");
+        .expect("bounded validation-complete encoder and tokenizer fixture");
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
             .with_offload_policy(policy);
         (snapshot, spec)
@@ -1160,10 +1161,16 @@ mod tests {
             let (snapshot, spec) = incomplete_snapshot_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
-            let res =
-                build_residency(&spec, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap_or_else(|error| {
-                    panic!("{policy:?} must defer absent heavy components: {error}")
-                });
+            let res = build_residency_with_contract(
+                &spec,
+                MODEL_ID,
+                PRECISION_MSG,
+                FILE_MSG,
+                crate::bounded_encoder_contract(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer absent heavy components: {error}")
+            });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
@@ -1181,11 +1188,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let root = loader::packed_snapshot_fixture(&tmp, "model-load", 8);
-            gen_core_testkit::write_encoder_contract_fixture(
-                &root.join("text_encoder"),
-                crate::ENCODER_CONTRACT,
-            )
-            .unwrap();
             let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                 .with_quant(mlx_gen::Quant::Q4)
                 .with_offload_policy(policy);
@@ -1223,25 +1225,22 @@ mod tests {
     #[test]
     fn matching_packed_tier_passes_the_guard() {
         let tmp = tempfile::tempdir().unwrap();
-        // A Q8 request over a Q8-packed turnkey must get PAST the guard (and fail later on the
-        // missing component weights, not on the tier) — the guard rejects mismatches only.
+        // A Q8 request over a Q8-packed turnkey must get past the exact shared guard — the guard
+        // rejects mismatches only. The mismatch tests above exercise the production load dispatch.
         let root = loader::packed_snapshot_fixture(&tmp, "model-match", 8);
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+        assert!(!mlx_gen::quant::needs_load_time_quant(
+            &root,
+            "transformer",
+            mlx_gen::Quant::Q8.bits(),
+            MODEL_ID,
         )
-        .unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(mlx_gen::Quant::Q8);
-        let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(
-            !err.contains("pre-quantized"),
-            "a matching packed tier must not trip the mismatch guard, got: {err}"
-        );
+        .unwrap());
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn selected_encoder_quant_policy_rejects_packed_mismatch_and_accepts_dense_inheritance() {
+        let contract = crate::bounded_encoder_contract();
         let base = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(base.path().join("transformer")).unwrap();
         std::fs::write(
@@ -1249,33 +1248,30 @@ mod tests {
             r#"{"quantization":{"bits":8,"group_size":64}}"#,
         )
         .unwrap();
-        gen_core_testkit::write_encoder_contract_tokenizer_fixture(
-            base.path(),
-            crate::ENCODER_CONTRACT,
-        )
-        .unwrap();
+        gen_core_testkit::write_encoder_contract_tokenizer_fixture(base.path(), contract).unwrap();
 
         let packed_q4 = tempfile::tempdir().unwrap();
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             packed_q4.path(),
-            crate::ENCODER_CONTRACT,
+            contract,
             Some(4),
         )
         .unwrap();
         let mismatch = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
             .with_text_encoder(WeightsSource::Dir(packed_q4.path().to_path_buf()));
-        let error = build_residency(&mismatch, MODEL_ID, PRECISION_MSG, FILE_MSG)
-            .err()
-            .expect("packed encoder mismatch")
-            .to_string();
+        let error =
+            build_residency_with_contract(&mismatch, MODEL_ID, PRECISION_MSG, FILE_MSG, contract)
+                .err()
+                .expect("packed encoder mismatch")
+                .to_string();
         assert!(error.contains("pre-quantized Q4"), "{error}");
         assert!(error.contains("model policy is Q8"), "{error}");
 
         let dense = tempfile::tempdir().unwrap();
-        gen_core_testkit::write_encoder_contract_fixture(dense.path(), crate::ENCODER_CONTRACT)
-            .unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(dense.path(), contract).unwrap();
         let inherited = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
             .with_text_encoder(WeightsSource::Dir(dense.path().to_path_buf()));
-        build_residency(&inherited, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap();
+        build_residency_with_contract(&inherited, MODEL_ID, PRECISION_MSG, FILE_MSG, contract)
+            .unwrap();
     }
 }

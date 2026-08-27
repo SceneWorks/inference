@@ -630,15 +630,9 @@ fn asset_facts(
         // keep their exact stored triples; packed mismatches reject here exactly as at load.
         let load_time_quant_bits =
             selected.load_time_quant_bits(effective_quant.map(Quant::bits), provider_id)?;
-        components.text_encoder = projected_tensor_headers_bytes(
+        components.text_encoder = projected_conditioning_headers(
             &selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?,
-            |_| match load_time_quant_bits {
-                Some(bits) => ResidentProjection::GroupQuantized {
-                    bits,
-                    group_size: crate::quant::GROUP_SIZE as usize,
-                },
-                None => ResidentProjection::Stored,
-            },
+            load_time_quant_bits,
         )?;
     }
     let resident_components = match &spec.control {
@@ -649,21 +643,44 @@ fn asset_facts(
         total.saturating_add(component.resident_bytes)
     });
     Ok((
-        MemoryAssetFacts {
-            base_bytes: components
-                .text_encoder
-                .saturating_add(components.dit)
-                .saturating_add(components.vae),
-            conditioning_bytes: components.text_encoder,
-            transformer_bytes: components.dit,
-            decoder_bytes: components.vae,
-            // The load-time control checkpoint is resident for every request made by a control-provider
-            // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
-            // not mean the request selected it, so pricing it here would overstate the ordinary path.
-            overlay_bytes: control_bytes,
-        },
+        component_asset_facts(components, control_bytes),
         resident_components,
     ))
+}
+
+/// Project an already validated encoder inventory through the same load-time quantization policy
+/// used by the runtime. Artifact acquisition and sealing deliberately stay outside this arithmetic
+/// seam so production-fact matrices do not need production-logical-size test files.
+fn projected_conditioning_headers(
+    headers: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+    load_time_quant_bits: Option<i32>,
+) -> CoreResult<u64> {
+    projected_tensor_headers_bytes(headers, |_| match load_time_quant_bits {
+        Some(bits) => ResidentProjection::GroupQuantized {
+            bits,
+            group_size: crate::quant::GROUP_SIZE as usize,
+        },
+        None => ResidentProjection::Stored,
+    })
+}
+
+fn component_asset_facts(
+    components: mlx_gen::PerComponentBytes,
+    control_bytes: u64,
+) -> MemoryAssetFacts {
+    MemoryAssetFacts {
+        base_bytes: components
+            .text_encoder
+            .saturating_add(components.dit)
+            .saturating_add(components.vae),
+        conditioning_bytes: components.text_encoder,
+        transformer_bytes: components.dit,
+        decoder_bytes: components.vae,
+        // The load-time control checkpoint is resident for every request made by a control-provider
+        // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
+        // not mean the request selected it, so pricing it here would overstate the ordinary path.
+        overlay_bytes: control_bytes,
+    }
 }
 
 /// Exact post-load tensor bytes for the ControlNet at this [`LoadSpec`]'s numeric tier. Dense
@@ -1073,84 +1090,44 @@ mod tests {
         )
     }
 
-    fn expected_conditioning_bytes(bits: Option<i32>) -> u64 {
-        let contract = crate::ENCODER_CONTRACT;
-        let attention_width = contract.num_attention_heads * contract.head_dim;
-        let kv_width = contract.num_key_value_heads * contract.head_dim;
-        let matrix_elements = contract.vocab_size * contract.hidden_size
-            + contract.loaded_hidden_layers
-                * (2 * attention_width * contract.hidden_size
-                    + 2 * kv_width * contract.hidden_size
-                    + 3 * contract.intermediate_size * contract.hidden_size);
-        let matrix_elements = u64::try_from(matrix_elements).unwrap();
-        let matrix_bytes = match bits {
-            Some(bits) => {
-                matrix_elements * u64::try_from(bits).unwrap() / 8 + matrix_elements / 64 * 4
-            }
-            None => matrix_elements * 2,
-        };
-        let vector_bytes = u64::try_from(
-            contract.loaded_hidden_layers * (2 * contract.hidden_size + 2 * contract.head_dim) * 2,
+    fn exact_encoder_headers(
+        packed_bits: Option<i32>,
+    ) -> Vec<mlx_gen::gen_core::SafetensorsTensorHeader> {
+        gen_core_testkit::encoder_contract_fixture_tensor_headers(
+            crate::ENCODER_CONTRACT,
+            packed_bits,
         )
-        .unwrap();
-        matrix_bytes + vector_bytes
+        .unwrap()
     }
 
-    fn write_snapshot(root: &std::path::Path) {
+    fn projected_conditioning_bytes(
+        selected_packed_bits: Option<i32>,
+        effective_bits: Option<i32>,
+        provider_id: &str,
+    ) -> CoreResult<u64> {
+        let action = mlx_gen::gen_core::resolve_encoder_load_time_quant_bits(
+            selected_packed_bits,
+            effective_bits,
+            provider_id,
+        )?;
+        projected_conditioning_headers(&exact_encoder_headers(selected_packed_bits), action)
+    }
+
+    fn write_component_snapshot(root: &std::path::Path) {
         for component in ["transformer", "vae"] {
             let dir = root.join(component);
             std::fs::create_dir_all(&dir).unwrap();
             write_minimal_safetensors(&dir.join("model.safetensors"));
         }
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::ENCODER_CONTRACT,
-        )
-        .unwrap();
     }
 
-    fn append_sparse_f16_tensor(path: &std::path::Path, name: &str, shape: &[usize]) {
-        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let mut encoded_len = [0_u8; 8];
-        file.read_exact(&mut encoded_len).unwrap();
-        let mut encoded = vec![0_u8; u64::from_le_bytes(encoded_len) as usize];
-        file.read_exact(&mut encoded).unwrap();
-        let mut header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&encoded).unwrap();
-        let start = header
-            .values()
-            .filter_map(|entry| entry["data_offsets"][1].as_u64())
-            .max()
-            .unwrap_or(0);
-        let bytes = shape
-            .iter()
-            .try_fold(2_u64, |total, dimension| {
-                total.checked_mul(*dimension as u64)
-            })
-            .unwrap();
-        let end = start.checked_add(bytes).unwrap();
-        assert!(header
-            .insert(
-                name.to_owned(),
-                serde_json::json!({
-                    "dtype": "F16",
-                    "shape": shape,
-                    "data_offsets": [start, end],
-                }),
-            )
-            .is_none());
-        let encoded = serde_json::to_vec(&header).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(&(encoded.len() as u64).to_le_bytes())
-            .unwrap();
-        file.write_all(&encoded).unwrap();
-        file.set_len(8 + encoded.len() as u64 + end).unwrap();
+    fn write_bounded_snapshot(root: &std::path::Path) {
+        write_component_snapshot(root);
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::bounded_encoder_contract(),
+        )
+        .unwrap();
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -1167,7 +1144,7 @@ mod tests {
         selection: EncoderSelection,
     ) -> (std::path::PathBuf, LoadSpec, std::path::PathBuf) {
         let root = tmp.path().join("snapshot");
-        write_snapshot(&root);
+        write_bounded_snapshot(&root);
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         spec.quantize = quant;
         let selected = match selection {
@@ -1176,7 +1153,7 @@ mod tests {
                 let selected = tmp.path().join("selected-text-encoder");
                 gen_core_testkit::write_encoder_contract_fixture(
                     &selected,
-                    crate::ENCODER_CONTRACT,
+                    crate::bounded_encoder_contract(),
                 )
                 .unwrap();
                 spec.text_encoder = Some(match selection {
@@ -1192,7 +1169,7 @@ mod tests {
                 let selected = tmp.path().join("selected-snapshot");
                 gen_core_testkit::write_encoder_contract_fixture(
                     &selected.join("text_encoder"),
-                    crate::ENCODER_CONTRACT,
+                    crate::bounded_encoder_contract(),
                 )
                 .unwrap();
                 spec.text_encoder = Some(WeightsSource::Dir(selected.clone()));
@@ -1205,21 +1182,20 @@ mod tests {
     /// The load rung 4 is available on: a re-openable snapshot dir with deferred materialization.
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("z-image-memory-spec");
-        write_snapshot(&root);
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
     }
 
     fn contract(tmp: &tempfile::TempDir) -> MemoryProviderContract {
-        memory_strategy_contract(crate::model::MODEL_ID, &spec(tmp)).unwrap()
+        weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec(tmp)).unwrap()
     }
 
     #[test]
     fn required_component_directory_cannot_disappear_into_zero_facts() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
-        write_snapshot(&root);
-        std::fs::remove_dir_all(root.join("text_encoder")).unwrap();
+        write_component_snapshot(&root);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(memory_strategy_contract(crate::model::MODEL_ID, &spec).is_err());
         assert!(weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).is_ok());
@@ -1227,53 +1203,76 @@ mod tests {
 
     #[test]
     fn conditioning_prices_only_the_materialized_36_layer_language_surface() {
-        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-            for selection in [
-                EncoderSelection::Builtin,
-                EncoderSelection::OverrideDir,
-                EncoderSelection::OverrideFile,
-                EncoderSelection::CompleteSnapshot,
-            ] {
-                let tmp = tempfile::tempdir().unwrap();
-                let (root, spec, selected_path) =
-                    snapshot_spec_with_encoder(&tmp, quant, selection);
-                let conditioning = || {
-                    memory_strategy_contract(crate::model::MODEL_ID, &spec)
-                        .unwrap()
-                        .asset_facts
-                        .conditioning_bytes
-                };
-                let baseline = conditioning();
-                let selected = crate::ENCODER_CONTRACT
-                    .source_for_load(&spec, &root)
-                    .unwrap();
-                let names = selected
-                    .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
-                    .unwrap()
-                    .into_iter()
-                    .map(|header| header.name)
-                    .collect::<std::collections::BTreeSet<_>>();
-                assert!(names.contains("model.layers.35.self_attn.q_proj.weight"));
-                assert!(!names
-                    .iter()
-                    .any(|name| name.starts_with("model.layers.36.")));
-                assert!(!names.contains("model.norm.weight"));
+        let exact = exact_encoder_headers(None);
+        let expected = crate::ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&exact)
+            .unwrap();
+        let bounded_contract = crate::bounded_encoder_contract();
+        let mut bounded_expected = bounded_contract
+            .materialized_dense_language_tensor_headers(
+                &gen_core_testkit::encoder_contract_fixture_tensor_headers(bounded_contract, None)
+                    .unwrap(),
+            )
+            .unwrap();
+        bounded_expected.sort_by(|left, right| left.name.cmp(&right.name));
 
-                for (name, shape) in [
-                    (
-                        "model.norm.weight",
-                        vec![crate::ENCODER_CONTRACT.hidden_size],
-                    ),
-                    ("model.unrelated_projection.weight", vec![17]),
-                ] {
-                    append_sparse_f16_tensor(&selected_path, name, &shape);
-                    assert_eq!(
-                        conditioning(),
-                        baseline,
-                        "{quant:?} {selection:?} charged an unmaterialized tensor {name}"
-                    );
-                }
-            }
+        // One sealed source-admission receipt per distinct selector shape. Numeric-tier and
+        // unmaterialized-header matrices below are pure production facts, so they do not repeatedly
+        // reacquire a full SHA over the same production-logical-size sparse payload.
+        for selection in [
+            EncoderSelection::Builtin,
+            EncoderSelection::OverrideDir,
+            EncoderSelection::OverrideFile,
+            EncoderSelection::CompleteSnapshot,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (root, spec, _) = snapshot_spec_with_encoder(&tmp, None, selection);
+            let selected = bounded_contract.source_for_load(&spec, &root).unwrap();
+            let mut materialized = selected
+                .materialized_language_tensor_headers(&bounded_contract)
+                .unwrap();
+            materialized.sort_by(|left, right| left.name.cmp(&right.name));
+            assert_eq!(materialized, bounded_expected, "{selection:?}");
+        }
+
+        let names = expected
+            .iter()
+            .map(|header| header.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("model.layers.35.self_attn.q_proj.weight"));
+        assert!(!names
+            .iter()
+            .any(|name| name.starts_with("model.layers.36.")));
+        assert!(!names.contains("model.norm.weight"));
+
+        let baseline = projected_conditioning_headers(&expected, None).unwrap();
+        let mut authored = exact;
+        authored.extend([
+            mlx_gen::gen_core::SafetensorsTensorHeader {
+                name: "model.norm.weight".into(),
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape: vec![crate::ENCODER_CONTRACT.hidden_size],
+                data_bytes: (crate::ENCODER_CONTRACT.hidden_size * 2) as u64,
+            },
+            mlx_gen::gen_core::SafetensorsTensorHeader {
+                name: "model.unrelated_projection.weight".into(),
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape: vec![17],
+                data_bytes: 34,
+            },
+        ]);
+        let selected = crate::ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&authored)
+            .unwrap();
+        assert_eq!(
+            projected_conditioning_headers(&selected, None).unwrap(),
+            baseline
+        );
+        for bits in [4, 8] {
+            assert_eq!(
+                projected_conditioning_headers(&selected, Some(bits)).unwrap(),
+                projected_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap()
+            );
         }
     }
 
@@ -1282,18 +1281,26 @@ mod tests {
         base_packed_bits: Option<i32>,
         requested: Option<Quant>,
         selection: EncoderSelection,
-        selected_packed_bits: Option<i32>,
     ) -> (LoadSpec, std::path::PathBuf) {
-        let (root, spec, selected_path) = snapshot_spec_with_encoder(tmp, requested, selection);
-        install_component_tier_fixture(&root, base_packed_bits);
-        if let Some(bits) = selected_packed_bits {
-            gen_core_testkit::write_encoder_contract_fixture_with_quant(
-                selected_path.parent().unwrap(),
-                crate::ENCODER_CONTRACT,
-                Some(bits),
-            )
-            .unwrap();
+        let root = tmp.path().join("tiered-assets");
+        for component in ["transformer", "vae"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
         }
+        install_component_tier_fixture(&root, base_packed_bits);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.quantize = requested;
+        spec.text_encoder = match selection {
+            EncoderSelection::Builtin => None,
+            EncoderSelection::OverrideDir => {
+                Some(WeightsSource::Dir(tmp.path().join("selected-text-encoder")))
+            }
+            EncoderSelection::OverrideFile => Some(WeightsSource::File(
+                tmp.path().join("selected-text-encoder/model.safetensors"),
+            )),
+            EncoderSelection::CompleteSnapshot => {
+                Some(WeightsSource::Dir(tmp.path().join("selected-snapshot")))
+            }
+        };
         let control = tmp.path().join("control.safetensors");
         assert_eq!(write_dense_control_fixture(&control), 392);
         (spec, control)
@@ -1318,10 +1325,36 @@ mod tests {
         for registration in memory_registrations() {
             let control_route = is_control_registration(&registration);
             let mut route_spec = spec.clone();
-            if control_route {
+            let resident_components = if control_route {
                 route_spec.control = Some(WeightsSource::File(control.to_path_buf()));
-            }
-            let contract = (registration.contract)(&route_spec).unwrap_or_else(|error| {
+                control_resident_components(
+                    route_spec.control.as_ref().unwrap(),
+                    route_spec.quantize,
+                    false,
+                )
+                .unwrap()
+            } else {
+                Vec::new()
+            };
+            let control_bytes = resident_components
+                .iter()
+                .map(|component| component.resident_bytes)
+                .sum();
+            let contract = memory_strategy_contract_with_asset_facts(
+                registration.provider_id,
+                &route_spec,
+                false,
+                component_asset_facts(
+                    mlx_gen::PerComponentBytes {
+                        text_encoder: expected_conditioning,
+                        dit: expected_transformer,
+                        vae: expected_decoder,
+                    },
+                    control_bytes,
+                ),
+                resident_components,
+            )
+            .unwrap_or_else(|error| {
                 panic!(
                     "{} {label} memory contract failed: {error}",
                     registration.provider_id
@@ -1377,11 +1410,11 @@ mod tests {
                 EncoderSelection::OverrideFile,
             ] {
                 let tmp = tempfile::tempdir().unwrap();
-                let (spec, control) = tiered_asset_spec(&tmp, Some(bits), None, selection, None);
+                let (spec, control) = tiered_asset_spec(&tmp, Some(bits), None, selection);
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    expected_conditioning_bytes(Some(bits)),
+                    projected_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
                     quantizable_probe_bytes(bits),
                     256,
                     392,
@@ -1401,34 +1434,31 @@ mod tests {
             ] {
                 let matching = tempfile::tempdir().unwrap();
                 let (spec, control) =
-                    tiered_asset_spec(&matching, Some(base_bits), None, selection, Some(base_bits));
+                    tiered_asset_spec(&matching, Some(base_bits), None, selection);
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    expected_conditioning_bytes(Some(base_bits)),
+                    projected_conditioning_bytes(
+                        Some(base_bits),
+                        Some(base_bits),
+                        crate::model::MODEL_ID,
+                    )
+                    .unwrap(),
                     quantizable_probe_bytes(base_bits),
                     256,
                     392,
                     &format!("matching prepacked Q{base_bits} {selection:?}"),
                 );
 
-                let mismatched = tempfile::tempdir().unwrap();
                 let selected_bits = if base_bits == 4 { 8 } else { 4 };
-                let (spec, control) = tiered_asset_spec(
-                    &mismatched,
-                    Some(base_bits),
-                    None,
-                    selection,
-                    Some(selected_bits),
-                );
                 for registration in memory_registrations() {
-                    let mut route_spec = spec.clone();
-                    if is_control_registration(&registration) {
-                        route_spec.control = Some(WeightsSource::File(control.clone()));
-                    }
-                    let error = (registration.contract)(&route_spec)
-                        .expect_err("a packed selected-encoder mismatch must reject")
-                        .to_string();
+                    let error = projected_conditioning_bytes(
+                        Some(selected_bits),
+                        Some(base_bits),
+                        registration.provider_id,
+                    )
+                    .expect_err("a packed selected-encoder mismatch must reject")
+                    .to_string();
                     assert!(
                         error.contains(&format!("pre-quantized Q{selected_bits}"))
                             && error.contains(&format!("model policy is Q{base_bits}")),
@@ -1449,12 +1479,11 @@ mod tests {
                 EncoderSelection::OverrideFile,
             ] {
                 let tmp = tempfile::tempdir().unwrap();
-                let (spec, control) =
-                    tiered_asset_spec(&tmp, None, Some(requested), selection, None);
+                let (spec, control) = tiered_asset_spec(&tmp, None, Some(requested), selection);
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    expected_conditioning_bytes(Some(bits)),
+                    projected_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
                     quantizable_probe_bytes(bits),
                     quantizable_probe_bytes(bits),
                     quantizable_probe_bytes(bits) + 136,
@@ -1468,17 +1497,12 @@ mod tests {
     fn matching_request_over_a_prepacked_base_still_quantizes_dense_attachments() {
         for (bits, requested) in [(4, Quant::Q4), (8, Quant::Q8)] {
             let tmp = tempfile::tempdir().unwrap();
-            let (spec, control) = tiered_asset_spec(
-                &tmp,
-                Some(bits),
-                Some(requested),
-                EncoderSelection::Builtin,
-                None,
-            );
+            let (spec, control) =
+                tiered_asset_spec(&tmp, Some(bits), Some(requested), EncoderSelection::Builtin);
             assert_all_route_asset_facts(
                 &spec,
                 &control,
-                expected_conditioning_bytes(Some(bits)),
+                projected_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
                 quantizable_probe_bytes(bits),
                 quantizable_probe_bytes(bits),
                 quantizable_probe_bytes(bits) + 136,
@@ -1578,7 +1602,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
         ));
-        write_snapshot(&root);
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
         if let Some(bits) = packed_bits {
             std::fs::write(
                 root.join("transformer/config.json"),
@@ -1623,7 +1647,8 @@ mod tests {
         ] {
             let (root, spec) = tier_spec(&tmp, &format!("packed-{bits}"), Some(bits), None);
             for registration in memory_registrations() {
-                let contract = (registration.contract)(&spec).unwrap();
+                let contract =
+                    weights_free_memory_strategy_contract(registration.provider_id, &spec).unwrap();
                 assert_eq!(
                     loaded_tier(&spec, registration.provider_id).unwrap().quant,
                     Some(actual),
@@ -1662,7 +1687,8 @@ mod tests {
         for requested in [Quant::Q4, Quant::Q8] {
             let (root, spec) = tier_spec(&tmp, "dense-requested", None, Some(requested));
             for registration in memory_registrations() {
-                let contract = (registration.contract)(&spec).unwrap();
+                let contract =
+                    weights_free_memory_strategy_contract(registration.provider_id, &spec).unwrap();
                 assert_eq!(
                     loaded_tier(&spec, registration.provider_id).unwrap().quant,
                     Some(requested)
@@ -1805,7 +1831,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&control, bytes).unwrap();
-        write_snapshot(&root);
+        write_component_snapshot(&root);
         let base_weight = vec![0_u8; 2 * 64 * 2];
         let base = TensorView::new(Dtype::BF16, vec![2, 64], &base_weight).unwrap();
         let base_bytes = serialize([("blocks.0.attn.to_q.weight", base)], &None).unwrap();
@@ -1815,7 +1841,6 @@ mod tests {
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
             .with_quant(Quant::Q4)
             .with_control(WeightsSource::File(control));
-        let contract = memory_strategy_contract(crate::model_control::MODEL_ID, &spec).unwrap();
         assert_eq!(crate::control_transformer::CONTROL_LAYERS_PLACES.len(), 15);
 
         // The 2x64 stack Linear is packed to 64 bytes of Q4 codes plus two 2x1 bf16 tables
@@ -1823,17 +1848,40 @@ mod tests {
         const STACK_RESIDENT_BYTES: u64 = 72;
         const PERSISTENT_RESIDENT_BYTES: u64 = 136;
         const CONTROL_RESIDENT_BYTES: u64 = STACK_RESIDENT_BYTES + PERSISTENT_RESIDENT_BYTES;
-        let selected = crate::ENCODER_CONTRACT
-            .source_for_load(&spec, &root)
-            .unwrap();
-        let expected_conditioning_bytes = projected_tensor_headers_bytes(
-            &selected
-                .materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)
-                .unwrap(),
-            |_| ResidentProjection::GroupQuantized {
+        let expected_conditioning_bytes = projected_conditioning_bytes(
+            None,
+            Some(Quant::Q4.bits()),
+            crate::model_control::MODEL_ID,
+        )
+        .unwrap();
+        let transformer_bytes = projected_safetensors_bytes(root.join("transformer"), |_| {
+            ResidentProjection::GroupQuantized {
                 bits: Quant::Q4.bits(),
                 group_size: crate::quant::GROUP_SIZE as usize,
-            },
+            }
+        })
+        .unwrap();
+        let decoder_bytes =
+            projected_safetensors_bytes(root.join("vae"), |_| ResidentProjection::Stored).unwrap();
+        let resident_components =
+            control_resident_components(spec.control.as_ref().unwrap(), spec.quantize, true)
+                .unwrap();
+        let contract = memory_strategy_contract_with_asset_facts(
+            crate::model_control::MODEL_ID,
+            &spec,
+            true,
+            component_asset_facts(
+                mlx_gen::PerComponentBytes {
+                    text_encoder: expected_conditioning_bytes,
+                    dit: transformer_bytes,
+                    vae: decoder_bytes,
+                },
+                resident_components
+                    .iter()
+                    .map(|component| component.resident_bytes)
+                    .sum(),
+            ),
+            resident_components,
         )
         .unwrap();
         assert_eq!(
@@ -1961,7 +2009,8 @@ mod tests {
         let deferred = contract(&tmp);
         let mut eager_spec = spec(&tmp);
         eager_spec.load_shape = mlx_gen::LoadShape::EagerMaterialization;
-        let eager = memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
+        let eager =
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &eager_spec).unwrap();
         assert_eq!(
             deferred.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
@@ -2146,7 +2195,8 @@ mod tests {
         let mut eager = spec(&tmp);
         eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         eager.offload_policy = mlx_gen::OffloadPolicy::Resident;
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
+        let contract =
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &eager).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
@@ -2169,7 +2219,7 @@ mod tests {
         }
         // Resident+Deferred advertises rung 4: phase release is not the discriminator.
         let deferred =
-            super::memory_strategy_contract(crate::model::MODEL_ID, &spec(&tmp)).unwrap();
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec(&tmp)).unwrap();
         assert!(matches!(
             deferred
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -2181,7 +2231,7 @@ mod tests {
         staged_eager.load_shape = mlx_gen::LoadShape::EagerMaterialization;
         staged_eager.offload_policy = mlx_gen::OffloadPolicy::Sequential;
         let staged_eager =
-            super::memory_strategy_contract(crate::model::MODEL_ID, &staged_eager).unwrap();
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &staged_eager).unwrap();
         assert!(matches!(
             staged_eager
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -2198,7 +2248,8 @@ mod tests {
             "/nonexistent/z-image.safetensors".into(),
         ))
         .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        let contract =
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         assert!(matches!(
             contract
@@ -2834,7 +2885,8 @@ mod tests {
     fn registered_behavior_enforces_decode_geometry_batch_prefixes_and_terminal_request_state() {
         let tmp = tempfile::tempdir().unwrap();
         let spec = spec(&tmp).with_quant(Quant::Q4);
-        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        let contract =
+            weights_free_memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
         let mut ctx = context(MemoryStrategy::BoundedDecode);
         ctx.geometry.batch = 3;
         let mut scope =
@@ -2912,7 +2964,7 @@ mod tests {
             crate::model_control::MODEL_ID,
             crate::model_base_control::MODEL_ID,
         ] {
-            let contract = memory_strategy_contract(id, &spec(&tmp)).unwrap();
+            let contract = weights_free_memory_strategy_contract(id, &spec(&tmp)).unwrap();
             assert_eq!(contract.provider_id, id);
             assert_eq!(contract.conformance_errors(), Vec::<String>::new(), "{id}");
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();

@@ -132,6 +132,26 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         dense_storage_dtype_probe: None,
     };
 
+/// Compact Qwen3 contract for tests that need the real validated-source and artifact-seal path.
+/// Production geometry and policy remain asserted separately; the bounded tensor dimensions keep
+/// unchanged-source tests from hashing the production encoder's multi-gigabyte logical payload.
+#[cfg(test)]
+pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        max_position_embeddings: 512,
+        selected_hidden_layers: &[1],
+        ..ENCODER_CONTRACT
+    }
+}
+
 pub use adapters::apply_z_image_adapters;
 pub use context_block::ZImageContextBlock;
 pub use control_transformer::{ZImageControlTransformer, CONTROL_IN_DIM};
@@ -275,30 +295,44 @@ mod compile_glue_guard_tests {
 
 #[cfg(test)]
 mod explicit_registry_tests {
-    fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
-        while !header.len().is_multiple_of(8) {
-            header.push(b' ');
-        }
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(header);
-        bytes.extend([0_u8; 2]);
-        std::fs::write(path, bytes).unwrap();
-    }
+    #[test]
+    fn production_encoder_geometry_and_policy_are_exact() {
+        let production = super::ENCODER_CONTRACT;
+        assert_eq!(production.architecture, "qwen3");
+        assert_eq!(production.hidden_size, 2560);
+        assert_eq!(production.intermediate_size, 9728);
+        assert_eq!(production.num_hidden_layers, 36);
+        assert_eq!(production.num_attention_heads, 32);
+        assert_eq!(production.num_key_value_heads, 8);
+        assert_eq!(production.head_dim, 128);
+        assert_eq!(production.vocab_size, 151_936);
+        assert_eq!(production.output_width, 2560);
+        assert_eq!(production.loaded_hidden_layers, 36);
+        assert_eq!(production.selected_hidden_layers, &[35]);
+        assert!(!production.requires_final_norm);
+        assert!(!production.requires_lm_head);
+        assert_eq!(
+            production.attention_bias,
+            mlx_gen::gen_core::EncoderConfigBool::Required(false)
+        );
+        assert_eq!(
+            production.tie_word_embeddings,
+            mlx_gen::gen_core::EncoderConfigBool::Required(true)
+        );
+        let packing = production.packing.expect("production Qwen3 packing");
+        assert_eq!(packing.group_size, 64);
+        assert!(packing.pack_embedding);
+        assert!(!packing.pack_lm_head);
+        assert!(packing.supports_file);
 
-    fn snapshot(tmp: &tempfile::TempDir, tag: &str) -> std::path::PathBuf {
-        let root = tmp.path().join(format!("z-image-{tag}"));
-        for component in ["transformer", "vae"] {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_minimal_safetensors(&dir.join("model.safetensors"));
-        }
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            super::ENCODER_CONTRACT,
-        )
-        .unwrap();
-        root
+        let bounded = super::bounded_encoder_contract();
+        assert_eq!(bounded.architecture, production.architecture);
+        assert_eq!(bounded.attention_bias, production.attention_bias);
+        assert_eq!(bounded.tie_word_embeddings, production.tie_word_embeddings);
+        assert_eq!(bounded.tokenizer, production.tokenizer);
+        assert_eq!(bounded.prompt_executions, production.prompt_executions);
+        assert_eq!(bounded.packing, production.packing);
+        bounded.validate_definition().unwrap();
     }
 
     #[test]
@@ -338,19 +372,24 @@ mod explicit_registry_tests {
         // SC-15998: rung 4 is declared per load — a re-openable snapshot dir with deferred
         // materialization, independent from phase residency.
         // The registry must hand back the same contract the direct builder produces for that load.
-        let root = snapshot(&tmp, "registry-memory");
+        let root = tmp.path().join("registry-memory");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
-        for id in [
+        let ids = [
             "z_image_turbo",
             "z_image",
             "z_image_turbo_control",
             "z_image_control",
-        ] {
-            let contract = registry
-                .memory_strategy_contract(id, &spec)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{id} must register a memory-strategy contract"));
+        ];
+        let registered = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(registered, ids.into_iter().collect());
+        for id in ids {
+            let contract =
+                super::memory_strategy::weights_free_memory_strategy_contract(id, &spec).unwrap();
             assert_eq!(contract.provider_id, id);
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
@@ -398,6 +437,5 @@ mod explicit_registry_tests {
                 "{id}: the decode ladder must be sweepable, not a single point"
             );
         }
-        std::fs::remove_dir_all(root).ok();
     }
 }

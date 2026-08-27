@@ -492,9 +492,9 @@ mod tests {
         let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
         gen_core_testkit::write_encoder_contract_fixture(
             &snapshot.path().join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+            crate::bounded_encoder_contract(),
         )
-        .expect("validation-complete encoder and tokenizer fixture");
+        .expect("bounded validation-complete encoder and tokenizer fixture");
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
             .with_offload_policy(policy);
         (snapshot, spec)
@@ -509,11 +509,16 @@ mod tests {
             let (snapshot, spec) = incomplete_snapshot_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
-            let res =
-                crate::model::build_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
-                    .unwrap_or_else(|error| {
-                        panic!("{policy:?} must defer absent heavy components: {error}")
-                    });
+            let res = crate::model::build_residency_with_contract(
+                &spec,
+                MODEL_ID,
+                BASE_PRECISION_MSG,
+                BASE_FILE_MSG,
+                crate::bounded_encoder_contract(),
+            )
+            .unwrap_or_else(|error| {
+                panic!("{policy:?} must defer absent heavy components: {error}")
+            });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"
