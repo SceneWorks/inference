@@ -26,6 +26,7 @@ use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use mlx_gen::gen_core::ltx_checkpoint::LtxCheckpointMetadata;
+use mlx_gen::gen_core::OffloadPolicy;
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::gemma4_te::Ltx25TextEncoder;
@@ -129,8 +130,15 @@ fn tier_inputs(
 
 fn encoder(dir: &std::path::Path) -> (Ltx25TextEncoder, Ltx25Tokenizer) {
     let (checkpoint, te_path, connector_w, cfg, prec) = tier_inputs(dir);
-    let te = Ltx25TextEncoder::from_packed_av(&checkpoint, &te_path, &connector_w, &cfg, prec)
-        .expect("build the LTX-2.5 text encoder");
+    let te = Ltx25TextEncoder::from_packed_av(
+        &checkpoint,
+        &te_path,
+        &connector_w,
+        &cfg,
+        prec,
+        OffloadPolicy::Resident,
+    )
+    .expect("build the LTX-2.5 text encoder");
     let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
     (te, tok)
 }
@@ -349,8 +357,15 @@ fn the_video_only_constructor_omits_the_audio_head() {
     let dir = tier_dir();
     let (video_dim, _) = golden_connector_dims();
     let (checkpoint, te_path, connector_w, cfg, prec) = tier_inputs(&dir);
-    let te = Ltx25TextEncoder::from_packed_video(&checkpoint, &te_path, &connector_w, &cfg, prec)
-        .expect("build the video-only LTX-2.5 text encoder");
+    let te = Ltx25TextEncoder::from_packed_video(
+        &checkpoint,
+        &te_path,
+        &connector_w,
+        &cfg,
+        prec,
+        OffloadPolicy::Resident,
+    )
+    .expect("build the video-only LTX-2.5 text encoder");
     let tok = Ltx25Tokenizer::from_packed_te_file(&te_path).expect("packed tokenizer");
 
     let (input_ids, mask) = tok.encode(PROMPT, MAX_LEN).expect("tokenize");

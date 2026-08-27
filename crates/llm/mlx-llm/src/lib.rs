@@ -74,8 +74,8 @@ pub use decode::{
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
-pub use residency::{EncoderResidency, StreamObservation};
 pub use provider::LlamaProvider;
+pub use residency::{EncoderResidency, StreamObservation};
 pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
 
 /// Add every MLX LLM provider to an explicit registry builder.

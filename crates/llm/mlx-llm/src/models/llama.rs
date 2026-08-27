@@ -289,9 +289,9 @@ impl CausalLm {
             }
             // No layer is built here — that is the whole point. The plan travels to the stream and
             // each layer is materialized, run and dropped inside the forward.
-            Some(path) => Stack::Sequential(crate::residency::SequentialStack::new(
-                path, plan, quant,
-            )),
+            Some(path) => {
+                Stack::Sequential(crate::residency::SequentialStack::new(path, plan, quant))
+            }
         };
 
         // Gemma 4 resolves its RoPE per layer type; every uniform architecture builds one table and
@@ -367,7 +367,9 @@ impl CausalLm {
     /// constructed at all, so there is nothing to report — which is a different claim from "the
     /// streaming loader ran and happened to materialize nothing". Output comparison cannot tell
     /// those apart, or tell either of them from a streamed pass; this can.
-    pub fn stream_observation(&self) -> Option<&std::sync::Arc<crate::residency::StreamObservation>> {
+    pub fn stream_observation(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::residency::StreamObservation>> {
         match &self.stack {
             Stack::Resident(_) => None,
             Stack::Sequential(s) => Some(s.observation()),
@@ -1781,202 +1783,200 @@ impl LayerPlan {
                 Ok(t)
             }
         };
-            let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
-            // The per-layer attention shape. Uniform architectures resolve every layer to the same
-            // descriptor (the model's scalar `head_dim` / `num_kv_heads`, no window, no `k_eq_v`),
-            // so this is the pre-Gemma-4 behaviour verbatim; Gemma 4 resolves two.
-            let la = cfg.layer_attention(i);
-            // A uniform architecture has no `layer_types` table; the crate's convention is that its
-            // whole stack is `full_attention` (one shape, no window).
-            let kind = cfg
-                .gemma4
-                .as_ref()
-                .map_or(LayerAttentionType::Full, |g| g.layer_type(i));
-            // Uniform architectures never build a `full` table, so every layer reads `Primary`.
-            let rope_slot = match (&cfg.gemma4, kind) {
-                (Some(_), LayerAttentionType::Full) => RopeSlot::Full,
-                _ => RopeSlot::Primary,
-            };
-            let head_dim = la.head_dim;
-            let num_kv_heads = la.num_kv_heads;
-            let qd = num_heads * head_dim;
-            let kvd = num_kv_heads * head_dim;
-            let kv_shared = kv_shared_from.is_some_and(|first| i >= first);
-            let stores_kv = kv_store_at[kind_slot(kind)] == Some(i);
+        let lp = |suffix: &str| join(&decoder_root, &format!("layers.{i}.{suffix}"));
+        // The per-layer attention shape. Uniform architectures resolve every layer to the same
+        // descriptor (the model's scalar `head_dim` / `num_kv_heads`, no window, no `k_eq_v`),
+        // so this is the pre-Gemma-4 behaviour verbatim; Gemma 4 resolves two.
+        let la = cfg.layer_attention(i);
+        // A uniform architecture has no `layer_types` table; the crate's convention is that its
+        // whole stack is `full_attention` (one shape, no window).
+        let kind = cfg
+            .gemma4
+            .as_ref()
+            .map_or(LayerAttentionType::Full, |g| g.layer_type(i));
+        // Uniform architectures never build a `full` table, so every layer reads `Primary`.
+        let rope_slot = match (&cfg.gemma4, kind) {
+            (Some(_), LayerAttentionType::Full) => RopeSlot::Full,
+            _ => RopeSlot::Primary,
+        };
+        let head_dim = la.head_dim;
+        let num_kv_heads = la.num_kv_heads;
+        let qd = num_heads * head_dim;
+        let kvd = num_kv_heads * head_dim;
+        let kv_shared = kv_shared_from.is_some_and(|first| i >= first);
+        let stores_kv = kv_store_at[kind_slot(kind)] == Some(i);
 
-            // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention.
-            let attn = if cfg.architecture.is_mla() {
-                Attention::Mla(MlaAttention::load(w, &lp, &cfg, &load_proj, &req_bf16)?)
-            } else {
-                // A KV-sharing tail layer (Gemma 4's `num_kv_shared_layers`) projects no keys or
-                // values of its own — upstream builds no `k_proj` / `v_proj` / `k_norm` / `v_norm`
-                // for it at all — and reads the stored K/V of the last earlier layer of its type.
-                let q_norm = qk_norm
-                    .then(|| req_bf16(lp("self_attn.q_norm.weight")))
-                    .transpose()?;
-                let k_norm = (qk_norm && !kv_shared)
-                    .then(|| req_bf16(lp("self_attn.k_norm.weight")))
-                    .transpose()?;
-                // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v along axis 0; otherwise the
-                // separate q/k/v projections are loaded (with q/k/v bias for Qwen2 / GLM-4).
-                let packed = lp("self_attn.qkv_proj.weight");
-                let (q, kv) = if w.contains(&packed) {
-                    let qkv = req_bf16(packed)?; // [qd + 2*kvd, hidden]
-                    let parts = split_sections(&qkv, &[qd, qd + kvd], 0)?;
-                    (
-                        Projection::load(parts[0].clone(), quant)?,
-                        Some(KvProjection::separate(
-                            Projection::load(parts[1].clone(), quant)?,
-                            Projection::load(parts[2].clone(), quant)?,
-                        )),
-                    )
-                } else {
-                    let q = proj_b(lp("self_attn.q_proj.weight"))?;
-                    let kv = if kv_shared {
-                        None
-                    } else {
-                        let k = proj_b(lp("self_attn.k_proj.weight"))?;
-                        // `attention_k_eq_v`: there is **no** `v_proj` weight in the checkpoint —
-                        // the value heads come from this same key projection's raw output.
-                        Some(match la.k_eq_v {
-                            true => KvProjection::shared(k),
-                            false => {
-                                KvProjection::separate(k, proj_b(lp("self_attn.v_proj.weight"))?)
-                            }
-                        })
-                    };
-                    (q, kv)
-                };
-                Attention::Gqa(LlamaAttention {
-                    q,
-                    kv,
-                    o: proj_b(lp("self_attn.o_proj.weight"))?,
-                    q_norm,
-                    k_norm,
-                    v_norm,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    scale,
-                    eps,
-                    softcap: cfg.attn_logit_softcap,
-                    rope_interleaved: cfg.architecture.rope_interleaved(),
-                    sliding_window: la.sliding_window,
-                    kind,
-                    stores_kv,
-                })
-            };
-
-            // Feed-forward: a sparse Mixture-of-Experts bank or a dense MLP. DeepSeek keeps its leading
-            // `first_k_dense_replace` layers dense even though the model is MoE. Gemma uses GeGLU.
-            let moe_layer = cfg.moe.filter(|m| i >= m.first_k_dense_replace);
-            let ffn = if let Some(moe) = moe_layer {
-                let mut experts = Vec::with_capacity(moe.num_experts);
-                for e in 0..moe.num_experts {
-                    let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
-                    experts.push(LlamaMlp {
-                        gate: proj(ep("gate_proj.weight"))?,
-                        up: proj(ep("up_proj.weight"))?,
-                        down: proj(ep("down_proj.weight"))?,
-                        gelu: false,
-                    });
-                }
-                // Shared-expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
-                // (plural, ungated); Qwen2-MoE has a single `mlp.shared_expert` gated by a sigmoid.
-                let shared_stem = if w.contains(&lp("mlp.shared_experts.gate_proj.weight")) {
-                    "mlp.shared_experts"
-                } else {
-                    "mlp.shared_expert"
-                };
-                let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-                Ffn::Moe(MoeMlp {
-                    router: req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
-                    experts,
-                    shared: LlamaMlp {
-                        gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
-                        up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
-                        down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
-                        gelu: false,
-                    },
-                    shared_gate: if w.contains(&shared_gate_key) {
-                        Some(req_bf16(shared_gate_key)?) // [1, hidden]
-                    } else {
-                        None
-                    },
-                    experts_per_tok: moe.num_experts_per_tok,
-                    norm_topk_prob: moe.norm_topk_prob,
-                    routed_scaling_factor: moe.routed_scaling_factor,
-                })
-            } else {
-                // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
-                let (gate, up) = {
-                    let packed = lp("mlp.gate_up_proj.weight");
-                    if w.contains(&packed) {
-                        let gu = req_bf16(packed)?; // [2*inter, hidden]
-                        let parts = split_sections(&gu, &[inter], 0)?;
-                        (
-                            Projection::load(parts[0].clone(), quant)?,
-                            Projection::load(parts[1].clone(), quant)?,
-                        )
-                    } else {
-                        (
-                            proj(lp("mlp.gate_proj.weight"))?,
-                            proj(lp("mlp.up_proj.weight"))?,
-                        )
-                    }
-                };
-                Ffn::Dense(LlamaMlp {
-                    gate,
-                    up,
-                    down: proj(lp("mlp.down_proj.weight"))?,
-                    gelu: gemma,
-                })
-            };
-
-            // Gemma-2 / GLM-4 wrap the block in a 4-norm "sandwich" (pre+post for both attn and MLP);
-            // the Llama shape has only the two pre-norms. The norm key names differ per family.
-            let (post_attn_key, pre_ff_key, post_ff_key) = match cfg.architecture {
-                Architecture::Glm4 => (
-                    "post_self_attn_layernorm",
-                    "post_attention_layernorm",
-                    "post_mlp_layernorm",
-                ),
-                _ => (
-                    "post_attention_layernorm",
-                    "pre_feedforward_layernorm",
-                    "post_feedforward_layernorm",
-                ),
-            };
-            let (pre_ff_ln, post_ff_ln) = if cfg.architecture.is_sandwich() {
+        // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention.
+        let attn = if cfg.architecture.is_mla() {
+            Attention::Mla(MlaAttention::load(w, &lp, &cfg, &load_proj, &req_bf16)?)
+        } else {
+            // A KV-sharing tail layer (Gemma 4's `num_kv_shared_layers`) projects no keys or
+            // values of its own — upstream builds no `k_proj` / `v_proj` / `k_norm` / `v_norm`
+            // for it at all — and reads the stored K/V of the last earlier layer of its type.
+            let q_norm = qk_norm
+                .then(|| req_bf16(lp("self_attn.q_norm.weight")))
+                .transpose()?;
+            let k_norm = (qk_norm && !kv_shared)
+                .then(|| req_bf16(lp("self_attn.k_norm.weight")))
+                .transpose()?;
+            // A packed `qkv_proj` (Phi-3, no bias) is split into q/k/v along axis 0; otherwise the
+            // separate q/k/v projections are loaded (with q/k/v bias for Qwen2 / GLM-4).
+            let packed = lp("self_attn.qkv_proj.weight");
+            let (q, kv) = if w.contains(&packed) {
+                let qkv = req_bf16(packed)?; // [qd + 2*kvd, hidden]
+                let parts = split_sections(&qkv, &[qd, qd + kvd], 0)?;
                 (
-                    Some(norm_w(lp(&format!("{pre_ff_key}.weight")))?),
-                    Some(norm_w(lp(&format!("{post_ff_key}.weight")))?),
+                    Projection::load(parts[0].clone(), quant)?,
+                    Some(KvProjection::separate(
+                        Projection::load(parts[1].clone(), quant)?,
+                        Projection::load(parts[2].clone(), quant)?,
+                    )),
                 )
             } else {
-                (None, None)
+                let q = proj_b(lp("self_attn.q_proj.weight"))?;
+                let kv = if kv_shared {
+                    None
+                } else {
+                    let k = proj_b(lp("self_attn.k_proj.weight"))?;
+                    // `attention_k_eq_v`: there is **no** `v_proj` weight in the checkpoint —
+                    // the value heads come from this same key projection's raw output.
+                    Some(match la.k_eq_v {
+                        true => KvProjection::shared(k),
+                        false => KvProjection::separate(k, proj_b(lp("self_attn.v_proj.weight"))?),
+                    })
+                };
+                (q, kv)
             };
-
-            // Gemma 4's `layer_scalar`: a `[1]` buffer multiplying the block output after both
-            // residual adds. It is a *persistent* buffer upstream — it ships in the checkpoint with
-            // trained values, so it is read rather than assumed to be its `ones` initializer. Absent
-            // ⇒ `None` (every architecture before Gemma 4, and any Gemma 4 export that omitted it,
-            // for which the initializer is an exact identity).
-            let scalar_key = lp("layer_scalar");
-            let layer_scalar = w
-                .contains(&scalar_key)
-                .then(|| req_bf16(scalar_key))
-                .transpose()?;
-
-            Ok(LlamaLayer {
-                input_ln: norm_w(lp("input_layernorm.weight"))?,
-                post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
-                pre_ff_ln,
-                post_ff_ln,
-                attn,
-                ffn,
+            Attention::Gqa(LlamaAttention {
+                q,
+                kv,
+                o: proj_b(lp("self_attn.o_proj.weight"))?,
+                q_norm,
+                k_norm,
+                v_norm,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
                 eps,
-                layer_scalar,
-                rope_slot,
+                softcap: cfg.attn_logit_softcap,
+                rope_interleaved: cfg.architecture.rope_interleaved(),
+                sliding_window: la.sliding_window,
+                kind,
+                stores_kv,
             })
+        };
+
+        // Feed-forward: a sparse Mixture-of-Experts bank or a dense MLP. DeepSeek keeps its leading
+        // `first_k_dense_replace` layers dense even though the model is MoE. Gemma uses GeGLU.
+        let moe_layer = cfg.moe.filter(|m| i >= m.first_k_dense_replace);
+        let ffn = if let Some(moe) = moe_layer {
+            let mut experts = Vec::with_capacity(moe.num_experts);
+            for e in 0..moe.num_experts {
+                let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
+                experts.push(LlamaMlp {
+                    gate: proj(ep("gate_proj.weight"))?,
+                    up: proj(ep("up_proj.weight"))?,
+                    down: proj(ep("down_proj.weight"))?,
+                    gelu: false,
+                });
+            }
+            // Shared-expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
+            // (plural, ungated); Qwen2-MoE has a single `mlp.shared_expert` gated by a sigmoid.
+            let shared_stem = if w.contains(&lp("mlp.shared_experts.gate_proj.weight")) {
+                "mlp.shared_experts"
+            } else {
+                "mlp.shared_expert"
+            };
+            let shared_gate_key = lp("mlp.shared_expert_gate.weight");
+            Ffn::Moe(MoeMlp {
+                router: req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                experts,
+                shared: LlamaMlp {
+                    gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
+                    up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
+                    down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
+                    gelu: false,
+                },
+                shared_gate: if w.contains(&shared_gate_key) {
+                    Some(req_bf16(shared_gate_key)?) // [1, hidden]
+                } else {
+                    None
+                },
+                experts_per_tok: moe.num_experts_per_tok,
+                norm_topk_prob: moe.norm_topk_prob,
+                routed_scaling_factor: moe.routed_scaling_factor,
+            })
+        } else {
+            // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
+            let (gate, up) = {
+                let packed = lp("mlp.gate_up_proj.weight");
+                if w.contains(&packed) {
+                    let gu = req_bf16(packed)?; // [2*inter, hidden]
+                    let parts = split_sections(&gu, &[inter], 0)?;
+                    (
+                        Projection::load(parts[0].clone(), quant)?,
+                        Projection::load(parts[1].clone(), quant)?,
+                    )
+                } else {
+                    (
+                        proj(lp("mlp.gate_proj.weight"))?,
+                        proj(lp("mlp.up_proj.weight"))?,
+                    )
+                }
+            };
+            Ffn::Dense(LlamaMlp {
+                gate,
+                up,
+                down: proj(lp("mlp.down_proj.weight"))?,
+                gelu: gemma,
+            })
+        };
+
+        // Gemma-2 / GLM-4 wrap the block in a 4-norm "sandwich" (pre+post for both attn and MLP);
+        // the Llama shape has only the two pre-norms. The norm key names differ per family.
+        let (post_attn_key, pre_ff_key, post_ff_key) = match cfg.architecture {
+            Architecture::Glm4 => (
+                "post_self_attn_layernorm",
+                "post_attention_layernorm",
+                "post_mlp_layernorm",
+            ),
+            _ => (
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ),
+        };
+        let (pre_ff_ln, post_ff_ln) = if cfg.architecture.is_sandwich() {
+            (
+                Some(norm_w(lp(&format!("{pre_ff_key}.weight")))?),
+                Some(norm_w(lp(&format!("{post_ff_key}.weight")))?),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Gemma 4's `layer_scalar`: a `[1]` buffer multiplying the block output after both
+        // residual adds. It is a *persistent* buffer upstream — it ships in the checkpoint with
+        // trained values, so it is read rather than assumed to be its `ones` initializer. Absent
+        // ⇒ `None` (every architecture before Gemma 4, and any Gemma 4 export that omitted it,
+        // for which the initializer is an exact identity).
+        let scalar_key = lp("layer_scalar");
+        let layer_scalar = w
+            .contains(&scalar_key)
+            .then(|| req_bf16(scalar_key))
+            .transpose()?;
+
+        Ok(LlamaLayer {
+            input_ln: norm_w(lp("input_layernorm.weight"))?,
+            post_ln: norm_w(lp(&format!("{post_attn_key}.weight")))?,
+            pre_ff_ln,
+            post_ff_ln,
+            attn,
+            ffn,
+            eps,
+            layer_scalar,
+            rope_slot,
+        })
     }
 }

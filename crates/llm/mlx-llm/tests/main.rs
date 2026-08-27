@@ -47,6 +47,9 @@ mod gemma4_primitives;
 #[path = "gemma4_real_weights.rs"]
 mod gemma4_real_weights;
 
+#[path = "gemma4_sequential_residency.rs"]
+mod gemma4_sequential_residency;
+
 #[path = "gguf.rs"]
 mod gguf;
 

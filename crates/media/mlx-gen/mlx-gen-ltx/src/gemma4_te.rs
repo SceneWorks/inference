@@ -32,8 +32,10 @@
 //!    order so each layer is its own command buffer. See the `hidden_states_from_embeds` doc in
 //!    `mlx-llm` for the measurement.
 //! 2. **Cold mmapped weights.** `Weights::from_file` is lazy; the first graph over a cold tier drags
-//!    the whole file into one buffer and trips the watchdog. [`materialize_in_batches`] forces the
-//!    tensors resident in bounded submissions before anything builds a graph over them.
+//!    the whole file into one buffer and trips the watchdog. Under
+//!    [`OffloadPolicy::Resident`] [`materialize_in_batches`] forces the tensors resident in bounded
+//!    submissions before anything builds a graph over them. Under [`OffloadPolicy::Sequential`] it
+//!    is deliberately **not** called — see [`load_backbone`].
 //! 3. **The padding mask.** The tokenizer *left-pads* to `max_length`, and `CausalLm`'s default
 //!    masking is causal only — no padding component — so every valid token would attend the pad
 //!    run and all 49 hidden states, hence the video and audio features, would be wrong. Wrong but
@@ -41,6 +43,47 @@
 //!    oracle or an explicit pad-invariance test catches it. `causal_padding_mask` builds LTX-2.3's
 //!    `valid(i, j) = j <= i && mask01[j] != 0` rule as an additive mask and
 //!    `masked_hidden_states_in_order` threads it through `CausalLm::hidden_states_with_mask`.
+//!
+//! # Residency, and why the text phase is the one worth bounding (sc-18798)
+//!
+//! On LTX the **text phase binds the peak**, and 2.5 makes it worse: measured on 2.3 q4, the bf16
+//! TE is ≈24.6 GiB against a q4 DiT's ≈10.6 GiB, and 2.5's encoder is 26.3 GB. Bounding the DiT
+//! harder cannot move a TE-bound peak, so the levers that matter are on this side.
+//!
+//! There are **two orthogonal ones, and conflating them is the mistake**:
+//!
+//! * *Component staging* — TE and AvDiT never co-resident. LTX already does this unconditionally
+//!   (epic 10975 / sc-10976), it is not a selectable control, and this module does not change it.
+//!   The descriptor still declares `supports_sequential_offload: false` with
+//!   `unconditionally_engages_staged_residency: true`, and that stays true.
+//! * *Intra-encoder residency* — whether the 48 decoder layers are all resident **while the text
+//!   phase runs**. That is what [`OffloadPolicy::Sequential`] selects here, through
+//!   `mlx_llm::residency`. Staging bounds the peak to `max(text, everything_else)`; when the text
+//!   phase *is* the maximum, only this lever touches it. Z-Image measured the same split: streaming
+//!   the encoder at all took conditioning 8.489 → 2.718 GiB, while the tunable component scope
+//!   moved the request peak 0.0 %.
+//!
+//! ## Per-tier TE quantization, and why `q4` is where this pays most
+//!
+//! A tier's text encoder is **not** always packed at the tier's width.
+//! [`crate::tiers::TEXT_ENCODER_Q4_QUALITY`] carries the decision and sc-18775's measured numbers:
+//! over the 49 hidden states this extractor concatenates, q4 lands at worst cos 0.889414 /
+//! rel-L2 0.53488 against a cos > 0.97 / rel-L2 < 0.30 bar and **fails**; q8 lands at 0.999086 /
+//! 0.04320 against cos > 0.995 / rel-L2 < 0.10 and **passes**. Judging on the final layer alone
+//! would have wrongly passed q4 (0.99995) — worst-case over all 49 is the whole point, because the
+//! extractor per-token-RMS normalizes the concatenated stack and scales a low-norm middle layer's
+//! error straight back into the conditioning the DiT sees.
+//!
+//! So `q4` ships the encoder **dense**, declared as
+//! [`DenseReason::BelowQualityBar`](crate::tiers::DenseReason::BelowQualityBar) — a measured,
+//! declared exception to the whole-pipeline tier contract (R5) rather than an unexplained dense
+//! component. The consequence *for residency*, which is what this module has to get right:
+//!
+//! **the `q4` tier's text phase carries a bf16 encoder, so `q4` is the tier where the text phase
+//! binds hardest and where streaming buys the most** — the opposite of the intuition that the
+//! smallest tier has the smallest text phase. It is also why a `q4` tier is only ~2 % smaller than
+//! a `q8` one rather than ~40 %: the encoder it ships is the larger of the two. Exact on-disk tier
+//! sizes are sc-18781's manifest footprints, measured there rather than restated here.
 
 use std::path::Path;
 
@@ -53,6 +96,7 @@ use mlx_gen::gen_core::ltx_checkpoint::{
     LtxComponent,
 };
 use mlx_gen::gen_core::LtxBundle;
+use mlx_gen::gen_core::OffloadPolicy;
 use mlx_gen::weights::Weights as GenWeights;
 use mlx_gen::{Error, Result};
 
@@ -150,13 +194,14 @@ impl Ltx25TextEncoder {
         connector_w: &GenWeights,
         ltx_cfg: &LtxConfig,
         prec: Precision,
+        policy: OffloadPolicy,
     ) -> Result<Self> {
         let te = bundle.require(LtxComponent::TextEncoder)?;
         let checkpoint = bundle
             .require(LtxComponent::Transformer)?
             .metadata()
             .clone();
-        Self::from_packed_av(&checkpoint, te.path(), connector_w, ltx_cfg, prec)
+        Self::from_packed_av(&checkpoint, te.path(), connector_w, ltx_cfg, prec, policy)
     }
 
     /// As [`Self::from_bundle_av`] but with the checkpoint metadata and encoder path supplied
@@ -170,8 +215,9 @@ impl Ltx25TextEncoder {
         connector_w: &GenWeights,
         ltx_cfg: &LtxConfig,
         prec: Precision,
+        policy: OffloadPolicy,
     ) -> Result<Self> {
-        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg)?;
+        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg, policy)?;
         let video = load_video_head(connector_w, hidden_size, ltx_cfg, prec)?;
         let audio = load_audio_head(connector_w, hidden_size, ltx_cfg, prec)?;
         Ok(Self {
@@ -200,8 +246,9 @@ impl Ltx25TextEncoder {
         connector_w: &GenWeights,
         ltx_cfg: &LtxConfig,
         prec: Precision,
+        policy: OffloadPolicy,
     ) -> Result<Self> {
-        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg)?;
+        let (model, hidden_size) = load_backbone(checkpoint, te_path, ltx_cfg, policy)?;
         let video = load_video_head(connector_w, hidden_size, ltx_cfg, prec)?;
         Ok(Self {
             model,
@@ -281,6 +328,7 @@ fn load_backbone(
     checkpoint: &LtxCheckpointMetadata,
     te_path: &Path,
     ltx_cfg: &LtxConfig,
+    policy: OffloadPolicy,
 ) -> Result<(CausalLm, i32)> {
     // (1) The caption feature extractor must be the V2 (PER_TOKEN_RMS) one this port implements.
     // Same genuinely config-driven gate LTX-2.3 runs, reading the loaded checkpoint's config.
@@ -293,17 +341,36 @@ fn load_backbone(
     // (3) The Gemma 4 config travels inside the packed encoder's `__metadata__.gemma_config`.
     // `ModelConfig::from_json` rebinds to `text_config` for Gemma 4 (`nests_text_config`), which
     // is also where the tier's `quantization` block is stamped — a block written above it would
-    // be invisible and the packed encoder would load as if dense.
+    // be invisible and the packed encoder would load as if dense. The stream reads that same
+    // `cfg.quantization` per materialized layer, so a packed tier streams packed.
     let identity_config = gemma_config_value(te_path)?;
     let cfg = ModelConfig::from_json(&identity_config).map_err(from_llm)?;
-
-    // (4) Load through the same seam the shipped tiers were validated on (sc-18775 / PR #820):
-    // `Weights::from_file` + `CausalLm::from_weights`, with a bounded materialization between
-    // them so the cold file never becomes one command buffer.
-    let weights = LlmWeights::from_file(te_path).map_err(from_llm)?;
-    materialize_in_batches(&weights)?;
     let hidden_size = cfg.hidden_size;
-    let model = CausalLm::from_weights(&weights, "", cfg).map_err(from_llm)?;
+
+    // (4) Residency. `Sequential` (sc-18798) materializes one decoder layer at a time from
+    // `te_path` and drops it, bounding the text phase's weight peak to a single layer instead of
+    // all 48.
+    //
+    // Note what is deliberately NOT called on that branch: `materialize_in_batches` forces the
+    // *whole* file resident, which is precisely what the stream exists to avoid — running both
+    // would leave the memory exactly where it started and hide it behind a stream that looks
+    // engaged. The cold-file hazard it exists for (hazard 2 in the module docs) is handled
+    // differently under the stream, and better: the per-layer `eval` inside
+    // `mlx_llm::residency::SequentialStack::run_layer` already bounds every submission to one
+    // layer's weights, which is a tighter bound than the 512 MB batching.
+    let model = match policy {
+        OffloadPolicy::Sequential => {
+            CausalLm::from_file_sequential(te_path, "", cfg, None).map_err(from_llm)?
+        }
+        // The seam the shipped tiers were validated on (sc-18775 / PR #820): `Weights::from_file`
+        // + `CausalLm::from_weights`, with a bounded materialization between them so the cold file
+        // never becomes one command buffer.
+        OffloadPolicy::Resident => {
+            let weights = LlmWeights::from_file(te_path).map_err(from_llm)?;
+            materialize_in_batches(&weights)?;
+            CausalLm::from_weights(&weights, "", cfg).map_err(from_llm)?
+        }
+    };
     Ok((model, hidden_size))
 }
 
@@ -855,6 +922,7 @@ mod version_assertion_tests {
             &GenWeights::empty(),
             &cfg,
             Precision::quant_bf16(8, 32),
+            OffloadPolicy::Resident,
         ) {
             Ok(_) => panic!(
                 "a gemma_version mismatch must be a hard error on the bundle path too, but \
@@ -888,5 +956,91 @@ mod version_assertion_tests {
             from_llm(mlx_llm::Error::MissingTensor("k".into())),
             Error::MissingTensor(_)
         ));
+    }
+
+    /// The 4-layer `gemma4_unified` fixture `mlx-llm`'s decoder goldens are built from — a real
+    /// Gemma 4 config and a matching complete weight set, shared rather than re-invented so this
+    /// fixture cannot drift from the loader it is fed to.
+    const DECODER_GOLDENS: &str =
+        include_str!("../../../../llm/testdata/gemma4/gemma4_decoder_goldens.json");
+
+    /// Write a **complete** packed text encoder: the goldens' weights plus the `__metadata__`
+    /// `gemma_config` (with its `gemma_version` stamp) that [`gemma_config_value`] and the identity
+    /// gate read. Unlike [`write_te`] this one is loadable, which is what a residency test needs.
+    fn write_loadable_te(dir: &Path, gemma_version: &str) -> (PathBuf, serde_json::Value) {
+        let goldens: serde_json::Value =
+            serde_json::from_str(DECODER_GOLDENS).expect("parse gemma4 decoder goldens");
+        let mut cfg = goldens["config"].clone();
+        cfg["gemma_version"] = serde_json::json!(gemma_version);
+
+        let mut arrays: Vec<(String, Array)> = Vec::new();
+        for (key, entry) in goldens["weights"].as_object().expect("weights object") {
+            let shape: Vec<i32> = entry["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            let data: Vec<f32> = entry["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            arrays.push((key.clone(), Array::from_slice(&data, &shape)));
+        }
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("gemma_config".to_string(), cfg.to_string());
+
+        let path = dir.join("text_encoder.safetensors");
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(refs, Some(&metadata), &path).expect("write packed te");
+        (path, goldens["config"].clone())
+    }
+
+    /// R9 reachability: the `OffloadPolicy` a caller hands
+    /// [`Ltx25TextEncoder`](super::Ltx25TextEncoder) must actually **reach the loader selection**,
+    /// not merely be accepted and dropped.
+    ///
+    /// This is the sc-18456/18457 failure class — a rung declared, planned and even measured, but
+    /// unreachable because the engine-keyed load seam never named it. Here the seam is
+    /// [`load_backbone`]'s `match policy`, so that is where the check goes, rather than on the
+    /// encoder's output (which is identical either way, by design).
+    ///
+    /// The observation is `mlx_llm::CausalLm::stream_observation`: `Some` only when the streaming
+    /// loader was constructed. Note it distinguishes the two policies *before any forward runs* —
+    /// this is a claim about the loader, not about what a pass did.
+    ///
+    /// MUTATION: make `load_backbone` ignore `policy` and always take the `Resident` arm — the
+    /// Sequential half goes RED. Making it always take the Sequential arm reddens the Resident
+    /// half. Both halves are needed: a one-sided check passes a loader wired to one branch.
+    #[test]
+    fn offload_policy_reaches_the_backbone_loader_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (te, _cfg_json) = write_loadable_te(dir.path(), GEMMA4_VERSION);
+        let ckpt = checkpoint("2.5.0", Some(GEMMA4_VERSION));
+
+        let mut cfg = LtxConfig::video_only_defaults();
+        cfg.caption_feature_version = mlx_gen::gen_core::ltx_checkpoint::CaptionFeatureVersion::V2;
+
+        let (resident, _) = load_backbone(&ckpt, &te, &cfg, OffloadPolicy::Resident)
+            .expect("the resident backbone loads");
+        assert!(
+            resident.stream_observation().is_none(),
+            "OffloadPolicy::Resident must not construct the streaming loader"
+        );
+
+        let (streamed, _) = load_backbone(&ckpt, &te, &cfg, OffloadPolicy::Sequential)
+            .expect("the sequential backbone loads");
+        let obs = streamed.stream_observation().expect(
+            "OffloadPolicy::Sequential must reach CausalLm::from_file_sequential — a policy that \
+             is accepted and then dropped is the sc-18456 unreachable-rung class",
+        );
+        assert_eq!(
+            obs.passes(),
+            0,
+            "the loader selection is observable before any forward runs"
+        );
     }
 }

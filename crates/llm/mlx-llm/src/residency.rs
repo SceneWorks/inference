@@ -163,7 +163,10 @@ impl std::fmt::Debug for SequentialStack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SequentialStack")
             .field("source", &self.source)
-            .field("layers_materialized", &self.observation.layers_materialized())
+            .field(
+                "layers_materialized",
+                &self.observation.layers_materialized(),
+            )
             .finish()
     }
 }
