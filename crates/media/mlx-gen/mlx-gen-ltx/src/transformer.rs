@@ -2848,8 +2848,7 @@ mod tests {
             .count()
             .saturating_sub(1);
         assert_eq!(
-            production_index_uses,
-            2,
+            production_index_uses, 2,
             "resident and streamed AV-DiT loops must both apply the actual block index"
         );
         assert!(

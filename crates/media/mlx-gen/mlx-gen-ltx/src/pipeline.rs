@@ -1126,6 +1126,121 @@ pub fn denoise_av_tokens(
     ))
 }
 
+/// The non-distilled LTX-2.5 counterpart to [`denoise_av_tokens`]. This keeps the IC-LoRA and DFR
+/// token-native stage-one paths on the same thirty-transition four-pass choreography as the plain
+/// grid path: positive, negative-text, STG self-attention perturbation, and modality isolation.
+/// Appended conditioning tokens remain pinned after the denoised predictions are guided, exactly as
+/// they are in the distilled token loop.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_tokens_dev(
+    dit: &AvDiT,
+    video: &VideoTokenState,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    negative_video_ctx: &Array,
+    negative_audio_ctx: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(VideoTokenState, Array)> {
+    let dt = video.latent.dtype();
+    let a = audio.shape();
+    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
+    let mut vtok = video.latent.clone();
+    let mut alat = audio.clone();
+    let rope_epoch = Some(dit.next_rope_epoch());
+
+    for i in 0..sigmas.len() - 1 {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        let aflat = alat
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[ab, at, ac * af])?;
+        let vts = token_timesteps(&video.denoise_mask, vtok.dtype(), sigma)?;
+        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+        let forward = |vctx: &Array, actx: &Array, perturbation: AvPerturbation| {
+            dit.forward_controlled(
+                &vtok,
+                &vts,
+                vctx,
+                None,
+                &video.positions,
+                &aflat,
+                &ats,
+                actx,
+                None,
+                audio_pos,
+                video.keyframes_mask.as_ref(),
+                rope_epoch,
+                perturbation,
+            )
+        };
+        let (cond_v, cond_a) = forward(video_ctx, audio_ctx, AvPerturbation::NONE)?;
+        let (uncond_v, uncond_a) =
+            forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)?;
+        let (perturbed_v, perturbed_a) = forward(
+            video_ctx,
+            audio_ctx,
+            AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS),
+        )?;
+        let (isolated_v, isolated_a) =
+            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
+
+        let to_stream_denoised = |vvel: Array, avel: Array| -> Result<(Array, Array)> {
+            let avel = avel
+                .reshape(&[ab, at, ac, af])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let sig = scalar(sigma).as_dtype(dt)?;
+            Ok((
+                to_denoised(&vtok, &vvel, &sig)?,
+                to_denoised(&alat, &avel, &sig)?,
+            ))
+        };
+        let (cond_v, cond_a) = to_stream_denoised(cond_v, cond_a)?;
+        let (uncond_v, uncond_a) = to_stream_denoised(uncond_v, uncond_a)?;
+        let (perturbed_v, perturbed_a) = to_stream_denoised(perturbed_v, perturbed_a)?;
+        let (isolated_v, isolated_a) = to_stream_denoised(isolated_v, isolated_a)?;
+        let vden = apply_denoise_mask(
+            &crate::dev_sampler::combine_guidance(
+                &cond_v,
+                &uncond_v,
+                &perturbed_v,
+                &isolated_v,
+                crate::params::LTX_2_5_PARAMS.video_guider,
+            )?,
+            &video.clean_latent,
+            &video.denoise_mask,
+        )?;
+        let aden = crate::dev_sampler::combine_guidance(
+            &cond_a,
+            &uncond_a,
+            &perturbed_a,
+            &isolated_a,
+            crate::params::LTX_2_5_PARAMS.audio_guider,
+        )?;
+        vtok = euler_step(&vtok, &vden, sigma, sigma_next)?;
+        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
+        mlx_rs::transforms::eval([&vtok, &alat])?;
+        on_step(i + 1);
+    }
+    Ok((
+        VideoTokenState {
+            latent: vtok,
+            clean_latent: video.clean_latent.clone(),
+            denoise_mask: video.denoise_mask.clone(),
+            positions: video.positions.clone(),
+            target_tokens: video.target_tokens,
+            keyframes_mask: video.keyframes_mask.clone(),
+            generated_keyframe_layout: video.generated_keyframe_layout.clone(),
+        },
+        alat,
+    ))
+}
+
 /// The audio side of an ancestral token denoise, when the audio modality is present.
 ///
 /// Deliberately mask-free: the reference loop post-processes BOTH modalities after noise
@@ -1566,6 +1681,9 @@ pub fn generate_av_latents_iclora(
     audio_pos: &Array,
     video_ctx: &Array,
     audio_ctx: &Array,
+    negative_video_ctx: Option<&Array>,
+    negative_audio_ctx: Option<&Array>,
+    variant: crate::dev_sampler::TransformerVariant,
     latent_mean: &Array,
     latent_std: &Array,
     clips: &[StageClip],
@@ -1577,6 +1695,8 @@ pub fn generate_av_latents_iclora(
     // the render thread's prior setting on return (the shared joint denoise stays eager for parity).
     let _compile_glue = crate::CompileGlueGuard::enable();
     let (c, f, h1, w1) = grid_dims;
+    let execution_plan = crate::dev_sampler::ExecutionPlan::for_variant(variant);
+    let stage1_sigmas = execution_plan.sigmas.as_slice();
 
     // Stage 1: build the base token state from the noise grid + main positions, append each clip as
     // in-context conditioning tokens, then run the token-native joint denoise.
@@ -1593,17 +1713,46 @@ pub fn generate_av_latents_iclora(
         )?;
     }
     dit.set_lora_pass(0);
-    let (vstate, a) = denoise_av_tokens(
-        dit,
-        &vstate,
-        audio_s1_noise,
-        video_ctx,
-        audio_ctx,
-        audio_pos,
-        &STAGE1_SIGMAS,
-        cancel,
-        on_step,
-    )?;
+    let (vstate, a) = match variant {
+        crate::dev_sampler::TransformerVariant::Dev => {
+            let negative_video_ctx = negative_video_ctx.ok_or_else(|| {
+                Error::Msg(
+                    "ltx_2_5: dev IC-LoRA sampling requires staged negative video conditioning"
+                        .into(),
+                )
+            })?;
+            let negative_audio_ctx = negative_audio_ctx.ok_or_else(|| {
+                Error::Msg(
+                    "ltx_2_5: dev IC-LoRA sampling requires staged negative audio conditioning"
+                        .into(),
+                )
+            })?;
+            denoise_av_tokens_dev(
+                dit,
+                &vstate,
+                audio_s1_noise,
+                video_ctx,
+                audio_ctx,
+                negative_video_ctx,
+                negative_audio_ctx,
+                audio_pos,
+                stage1_sigmas,
+                cancel,
+                on_step,
+            )?
+        }
+        crate::dev_sampler::TransformerVariant::Distilled => denoise_av_tokens(
+            dit,
+            &vstate,
+            audio_s1_noise,
+            video_ctx,
+            audio_ctx,
+            audio_pos,
+            stage1_sigmas,
+            cancel,
+            on_step,
+        )?,
+    };
     // Read back the generated grid (the first `target_tokens` tokens) → (B, 128, f, h1, w1).
     let tgt_idx: Vec<i32> = (0..vstate.target_tokens).collect();
     let gen_tokens = vstate
@@ -1809,6 +1958,71 @@ mod tests {
         assert_eq!(*STAGE2_SIGMAS.last().unwrap(), 0.0);
         // The stage boundary: stage 2 starts at stage 1's σ index 5 (the 0.909375 re-noise anchor).
         assert_eq!(STAGE1_SIGMAS[5], STAGE2_SIGMAS[0]);
+    }
+
+    /// IC-LoRA does not get to borrow the distilled stage-one token loop when the loaded transformer
+    /// declares `dev`: this pins the actual production branch, its negative-conditioning inputs, and
+    /// the pass-1 distilled refinement. A default-only test would miss all of those seams.
+    #[test]
+    fn iclora_dev_stage_one_routes_through_four_pass_guidance_before_distilled_stage_two() {
+        let body = fn_body("generate_av_latents_iclora");
+        assert!(
+            body.contains("ExecutionPlan::for_variant(variant)"),
+            "IC-LoRA must select the loaded transformer's stage-one schedule:\n{body}"
+        );
+        let dev = body
+            .find("TransformerVariant::Dev =>")
+            .expect("IC-LoRA must branch for the dev transformer");
+        let guided = body[dev..]
+            .find("denoise_av_tokens_dev(")
+            .map(|offset| dev + offset)
+            .expect("dev IC-LoRA must execute the token-native four-pass denoiser");
+        assert!(
+            body[dev..guided].contains("negative_video_ctx")
+                && body[dev..guided].contains("negative_audio_ctx"),
+            "the dev IC-LoRA branch must consume both negative contexts"
+        );
+        let stage_two_pass = body
+            .find("dit.set_lora_pass(1)")
+            .expect("IC-LoRA must select the shipped stage-two adapter pass");
+        assert!(
+            body.find("dit.set_lora_pass(0)") < Some(guided) && guided < stage_two_pass,
+            "the guided dev loop must be stage one, after pass 0 and before pass 1"
+        );
+        assert!(
+            body[stage_two_pass..].contains("denoise_av(")
+                && body[stage_two_pass..].contains("&STAGE2_SIGMAS"),
+            "stage two must remain the simple distilled refinement on pass 1"
+        );
+        assert_eq!(
+            crate::dev_sampler::ExecutionPlan::for_variant(
+                crate::dev_sampler::TransformerVariant::Dev
+            )
+            .transitions(),
+            30,
+            "the selected dev plan must execute all thirty transitions"
+        );
+    }
+
+    /// The alternate token-native executor has to carry the same guidance semantics as the grid
+    /// executor; merely selecting its name in IC-LoRA/DFR is not enough. These are the four concrete
+    /// controlled forwards whose removal would otherwise leave a structurally valid single-pass loop.
+    #[test]
+    fn token_native_dev_denoiser_executes_negative_stg_and_modality_guidance() {
+        let body = fn_body("denoise_av_tokens_dev");
+        for required in [
+            "forward(negative_video_ctx, negative_audio_ctx, AvPerturbation::NONE)",
+            "AvPerturbation::stg(crate::dev_sampler::MLX_STG_BLOCKS)",
+            "AvPerturbation::modality_isolated()",
+            "crate::dev_sampler::combine_guidance(",
+            "crate::params::LTX_2_5_PARAMS.video_guider",
+            "crate::params::LTX_2_5_PARAMS.audio_guider",
+        ] {
+            assert!(
+                body.contains(required),
+                "token-native dev denoiser no longer executes `{required}`:\n{body}"
+            );
+        }
     }
 
     #[test]

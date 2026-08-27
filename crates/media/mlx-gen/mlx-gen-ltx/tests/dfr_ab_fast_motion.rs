@@ -30,6 +30,7 @@ use mlx_rs::Array;
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
+use mlx_gen_ltx::dev_sampler::TransformerVariant;
 use mlx_gen_ltx::dfr::{generate_dfr_av_latents, DfrComponents, DfrRequest};
 use mlx_gen_ltx::gemma4_te::Ltx25TextEncoder;
 use mlx_gen_ltx::pipeline::{generate_av_latents, to_uint8_frames};
@@ -281,6 +282,9 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         latent_std: &latent_std,
         video_ctx: &video_ctx,
         audio_ctx: &audio_ctx,
+        negative_video_ctx: None,
+        negative_audio_ctx: None,
+        variant: TransformerVariant::Distilled,
         audio_pos: &audio_pos,
     };
     let req = DfrRequest {

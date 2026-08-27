@@ -1505,6 +1505,9 @@ impl Ltx {
                     latent_std: &self.latent_std,
                     video_ctx,
                     audio_ctx,
+                    negative_video_ctx,
+                    negative_audio_ctx,
+                    variant: self.transformer_variant(),
                     audio_pos: &audio_pos,
                 },
                 &DfrRequest {
@@ -1542,6 +1545,9 @@ impl Ltx {
                     &audio_pos,
                     video_ctx,
                     audio_ctx,
+                    negative_video_ctx,
+                    negative_audio_ctx,
+                    self.transformer_variant(),
                     &self.latent_mean,
                     &self.latent_std,
                     video_clips,
@@ -2590,6 +2596,8 @@ mod tests {
     // sc-19502: the derived stage-1 step count the descriptor advertises.
     use crate::pipeline::NATIVE_STEPS;
 
+    const MODEL_SRC: &str = include_str!("model.rs");
+
     fn ltx25_request(prompt: &str) -> GenerationRequest {
         GenerationRequest {
             prompt: prompt.into(),
@@ -2624,12 +2632,7 @@ mod tests {
             ..ltx25_request("a red kite over the sea")
         };
         assert!(validate_request_for(MODEL_25_ID, &dev.capabilities, &dev_request).is_ok());
-        assert!(validate_request_for(
-            MODEL_25_ID,
-            &distilled.capabilities,
-            &dev_request
-        )
-        .is_err());
+        assert!(validate_request_for(MODEL_25_ID, &distilled.capabilities, &dev_request).is_err());
         assert!(validate_request_for(
             MODEL_25_ID,
             &dev.capabilities,
@@ -2640,6 +2643,58 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    /// Both alternate routes are ordinary provider calls, so the staged negative contexts and exact
+    /// checkpoint identity must cross the model boundary into DFR and IC-LoRA rather than only the
+    /// plain grid path. This deliberately names the two production call sites; removing either
+    /// argument or substituting a default variant makes the test fail.
+    #[test]
+    fn ltx25_provider_threads_dev_contexts_and_variant_to_dfr_and_iclora() {
+        let start = MODEL_SRC
+            .find("pub(crate) fn generate_av_from_embeddings(")
+            .expect("model.rs must define the ordinary A/V provider route");
+        let end = MODEL_SRC
+            .find("\nmlx_gen::register_generators!")
+            .expect("the provider route must precede registration");
+        let body = &MODEL_SRC[start..end];
+        let dfr_start = body
+            .find("&DfrComponents {")
+            .expect("ordinary DFR provider route must build DfrComponents");
+        let dfr_end = body[dfr_start..]
+            .find("},\n                &DfrRequest")
+            .map(|offset| dfr_start + offset)
+            .expect("DFR components must end before its request");
+        let dfr = &body[dfr_start..dfr_end];
+        for field in [
+            "negative_video_ctx,",
+            "negative_audio_ctx,",
+            "variant: self.transformer_variant(),",
+        ] {
+            assert!(
+                dfr.contains(field),
+                "ordinary DFR route no longer threads `{field}` into its stage-one executor:\n{dfr}"
+            );
+        }
+
+        let iclora_start = body
+            .find("generate_av_latents_iclora(")
+            .expect("extend_clip/video_bridge must call the IC-LoRA executor");
+        let iclora_end = body[iclora_start..]
+            .find(".map(|(video, audio)|")
+            .map(|offset| iclora_start + offset)
+            .expect("IC-LoRA call must return into the provider output mapping");
+        let iclora = &body[iclora_start..iclora_end];
+        for argument in [
+            "negative_video_ctx,",
+            "negative_audio_ctx,",
+            "self.transformer_variant(),",
+        ] {
+            assert!(
+                iclora.contains(argument),
+                "ordinary IC-LoRA route no longer forwards `{argument}` to its stage-one executor:\n{iclora}"
+            );
+        }
     }
 
     /// This reaches the same request object `generate_impl` supplies to auto-duration, DFR,
