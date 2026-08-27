@@ -94,6 +94,14 @@ enum Variant {
     Edit,
 }
 
+/// One fully admitted request conditioning contract. Constructed on the host before either resident
+/// or staged component ownership is entered, then consumed by the matching route without re-tokenizing.
+enum RequestPreflight {
+    Base(pipeline::TextPreflight),
+    Turbo(pipeline::TextPreflight),
+    Edit(pipeline::EditPreflight),
+}
+
 /// A lazily-loaded Boogu generator. `Variant` selects the sampler path. The shared T2I components
 /// load on the first `generate`; the Edit-only components (vision tower + VAE encoder) load lazily on
 /// the first edit, so the T2I paths keep their footprint.
@@ -107,9 +115,9 @@ pub struct BooguGenerator {
     pid_spec: Option<PidWeights>,
     components: Mutex<Option<Arc<Components>>>,
     edit_components: Mutex<Option<Arc<EditComponents>>>,
-    /// Tiny host tokenizer used by Edit admission before either resident or staged VAE/tower loads.
-    /// The full component bundle retains its own tokenizer for Base/Turbo and CFG-negative encoding.
-    edit_preflight_tokenizer: Mutex<Option<Arc<BooguTokenizer>>>,
+    /// Tiny host tokenizer used by every request admission before resident or staged component loads.
+    /// The full component bundle retains its own device binding to materialize the admitted ids.
+    preflight_tokenizer: Mutex<Option<Arc<BooguTokenizer>>>,
     /// Lazily-built, cached f32 VAE **encoder** for the Base/Turbo img2img latent-init path (sc-11786).
     /// Built on the **first img2img request only** — a pure txt2img (or Edit) workload never populates
     /// it. Distinct from [`EditComponents`]'s encoder so a plain img2img never loads the Edit vision
@@ -161,8 +169,8 @@ impl BooguGenerator {
         })
     }
 
-    fn edit_preflight_tokenizer(&self) -> gen_core::Result<Arc<BooguTokenizer>> {
-        candle_gen::cached(&self.edit_preflight_tokenizer, || {
+    fn preflight_tokenizer(&self) -> gen_core::Result<Arc<BooguTokenizer>> {
+        candle_gen::cached(&self.preflight_tokenizer, || {
             Ok(Arc::new(BooguTokenizer::from_snapshot(
                 &self.root,
                 &self.device,
@@ -217,7 +225,7 @@ impl BooguGenerator {
     fn generate_staged(
         &self,
         req: &GenerationRequest,
-        edit_preflight: Option<&pipeline::EditPreflight>,
+        preflight: &RequestPreflight,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<Vec<Image>> {
         // Evict every reloadable warm cache before phase A. The request lock held by `generate`
@@ -264,30 +272,48 @@ impl BooguGenerator {
                         .then(|| pipeline::load_vae_encoder(&self.root, &self.device))
                         .transpose()?;
                     if self.variant == Variant::Base {
+                        let RequestPreflight::Base(preflight) = preflight else {
+                            return Err(gen_core::Error::Msg(
+                                "boogu base: crossed request preflight".into(),
+                            ));
+                        };
                         pipeline::stage_encode_base(
                             &text,
                             encoder.as_ref(),
                             req,
+                            preflight,
                             pipeline::DEFAULT_STEPS,
                             &self.device,
                         )?
                     } else {
-                        pipeline::stage_encode_turbo(&text, encoder.as_ref(), req, &self.device)?
+                        let RequestPreflight::Turbo(preflight) = preflight else {
+                            return Err(gen_core::Error::Msg(
+                                "boogu turbo: crossed request preflight".into(),
+                            ));
+                        };
+                        pipeline::stage_encode_turbo(
+                            &text,
+                            encoder.as_ref(),
+                            req,
+                            preflight,
+                            &self.device,
+                        )?
                     }
                 }
                 Variant::Edit => {
                     let references = resolve_edit_references(req)?;
                     let edit = pipeline::load_edit_components(&self.root, &self.device)?;
+                    let RequestPreflight::Edit(preflight) = preflight else {
+                        return Err(gen_core::Error::Msg(
+                            "boogu edit: crossed request preflight".into(),
+                        ));
+                    };
                     pipeline::stage_encode_edit(
                         &text,
                         &edit,
                         req,
                         &references,
-                        edit_preflight.ok_or_else(|| {
-                            gen_core::Error::Msg(
-                                "boogu edit: staged execution omitted its preflight".into(),
-                            )
-                        })?,
+                        preflight,
                         &self.device,
                     )?
                 }
@@ -456,14 +482,27 @@ impl Generator for BooguGenerator {
             ))
         })?;
         self.validate(req)?;
-        // Edit admission is host-only and precedes memory admission plus every resident/staged VAE
-        // or vision-tower load/call. Later phases reuse these exact grids/counts/token ids.
-        let edit_preflight = if self.variant == Variant::Edit {
-            let references = resolve_edit_references(req)?;
-            let tok = self.edit_preflight_tokenizer()?;
-            Some(pipeline::preflight_edit(&tok, &references, &req.prompt)?)
-        } else {
-            None
+        // Every token-bearing leg is admitted on the host before memory admission or any resident /
+        // staged component load. Later phases consume the exact admitted ids rather than re-tokenizing.
+        let tok = self.preflight_tokenizer()?;
+        let preflight = match self.variant {
+            Variant::Base => RequestPreflight::Base(pipeline::preflight_text(
+                &tok,
+                &req.prompt,
+                req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) > 1.0,
+            )?),
+            Variant::Turbo => {
+                RequestPreflight::Turbo(pipeline::preflight_text(&tok, &req.prompt, false)?)
+            }
+            Variant::Edit => {
+                let references = resolve_edit_references(req)?;
+                RequestPreflight::Edit(pipeline::preflight_edit(
+                    &tok,
+                    &references,
+                    &req.prompt,
+                    req.guidance.unwrap_or(pipeline::DEFAULT_GUIDANCE) > 1.0,
+                )?)
+            }
         };
         self.memory_admission.consume_for_generate(req)?;
         if let Some(memory) = &self.memory_strategy {
@@ -499,19 +538,25 @@ impl Generator for BooguGenerator {
         if req.memory.is_some_and(|memory| memory.stage_residency) {
             return Ok(GenerationOutput::Images(self.generate_staged(
                 req,
-                edit_preflight.as_ref(),
+                &preflight,
                 on_progress,
             )?));
         }
         let comps = self.components()?;
         let images = match self.variant {
             Variant::Turbo => {
+                let RequestPreflight::Turbo(preflight) = &preflight else {
+                    return Err(gen_core::Error::Msg(
+                        "boogu turbo: crossed request preflight".into(),
+                    ));
+                };
                 // img2img latent-init (sc-11786): a single `Reference` seeds the few-step DMD denoise
                 // from the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
                 let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_TURBO_STEPS)?;
                 pipeline::render_turbo(
                     &comps,
                     req,
+                    preflight,
                     clean.as_ref(),
                     start_step,
                     &self.device,
@@ -519,12 +564,18 @@ impl Generator for BooguGenerator {
                 )?
             }
             Variant::Base => {
+                let RequestPreflight::Base(preflight) = &preflight else {
+                    return Err(gen_core::Error::Msg(
+                        "boogu base: crossed request preflight".into(),
+                    ));
+                };
                 // img2img latent-init (sc-11786): a single `Reference` seeds the true-CFG denoise from
                 // the VAE-encoded reference; no reference (or strength→start 0) stays pure txt2img.
                 let (clean, start_step) = self.img2img_init(req, pipeline::DEFAULT_STEPS)?;
                 pipeline::render_base(
                     &comps,
                     req,
+                    preflight,
                     clean.as_ref(),
                     start_step,
                     &self.device,
@@ -532,6 +583,11 @@ impl Generator for BooguGenerator {
                 )?
             }
             Variant::Edit => {
+                let RequestPreflight::Edit(preflight) = &preflight else {
+                    return Err(gen_core::Error::Msg(
+                        "boogu edit: crossed request preflight".into(),
+                    ));
+                };
                 let references = resolve_edit_references(req)?;
                 let edit = self.edit_components()?;
                 pipeline::render_edit(
@@ -539,9 +595,7 @@ impl Generator for BooguGenerator {
                     &edit,
                     req,
                     &references,
-                    edit_preflight.as_ref().ok_or_else(|| {
-                        gen_core::Error::Msg("boogu edit: execution omitted its preflight".into())
-                    })?,
+                    preflight,
                     &self.device,
                     on_progress,
                 )?
@@ -777,7 +831,7 @@ fn build(
         pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
-        edit_preflight_tokenizer: Mutex::new(None),
+        preflight_tokenizer: Mutex::new(None),
         img2img_encoder: Mutex::new(None),
         memory_strategy,
         memory_admission,
@@ -946,7 +1000,7 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
 
-    fn write_tiny_edit_tokenizer(root: &std::path::Path) {
+    fn write_tiny_tokenizer(root: &std::path::Path, overlong_negative: bool) {
         let mllm = root.join("mllm");
         std::fs::create_dir_all(&mllm).unwrap();
         let literals = [
@@ -975,13 +1029,21 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        vocab.insert("burst".into(), serde_json::json!(literals.len() + 1));
+        let normalizer = overlong_negative.then(|| {
+            serde_json::json!({
+                "type": "Replace",
+                "pattern": { "String": "Describe" },
+                "content": "burst ".repeat(pipeline::MAX_TEXT_TOKENS + 1)
+            })
+        });
         let fixture = serde_json::json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": null,
-            "pre_tokenizer": null,
+            "normalizer": normalizer,
+            "pre_tokenizer": { "type": "Whitespace" },
             "post_processor": null,
             "decoder": null,
             "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
@@ -991,6 +1053,10 @@ mod tests {
             serde_json::to_vec(&fixture).unwrap(),
         )
         .unwrap();
+    }
+
+    fn write_tiny_edit_tokenizer(root: &std::path::Path) {
+        write_tiny_tokenizer(root, false);
     }
 
     fn weights_free_generator_for(variant: Variant) -> BooguGenerator {
@@ -1008,7 +1074,7 @@ mod tests {
             pid_spec: None,
             components: Mutex::new(None),
             edit_components: Mutex::new(None),
-            edit_preflight_tokenizer: Mutex::new(None),
+            preflight_tokenizer: Mutex::new(None),
             img2img_encoder: Mutex::new(None),
             memory_strategy: None,
             memory_admission: memory_strategy::AdmissionRegistry::new(provider_id),
@@ -1034,6 +1100,112 @@ mod tests {
             width: 512,
             height: 512,
             ..Default::default()
+        }
+    }
+
+    fn assert_no_heavy_cache(generator: &BooguGenerator) {
+        assert!(generator.components.lock().unwrap().is_none());
+        assert!(generator.edit_components.lock().unwrap().is_none());
+        assert!(generator.img2img_encoder.lock().unwrap().is_none());
+    }
+
+    /// Mutation-sensitive production route table: ordinary positive and CFG-negative ids must be
+    /// rejected by the registered generator before either resident or staged ownership can populate
+    /// a text tower, DiT, VAE, or vision-tower cache. The synthetic tokenizer expands only the fixed
+    /// negative system prompt, so the negative rows cannot accidentally pass by rechecking positive.
+    #[test]
+    fn ordinary_text_preflight_precedes_every_component_route() {
+        for staged in [false, true] {
+            let positive_root = tempfile::tempdir().unwrap();
+            write_tiny_tokenizer(positive_root.path(), false);
+            for variant in [Variant::Base, Variant::Turbo] {
+                let mut generator = weights_free_generator_for(variant);
+                generator.root = positive_root.path().to_path_buf();
+                let request = GenerationRequest {
+                    prompt: "<|image_pad|>".repeat(pipeline::MAX_TEXT_TOKENS + 1),
+                    memory: staged.then(|| gen_core::GenerationMemory {
+                        stage_residency: true,
+                        ..Default::default()
+                    }),
+                    ..boundary_request()
+                };
+                let error = generator
+                    .generate(&request, &mut |_| {})
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("max_text_tokens=1280"),
+                    "{variant:?}: {error}"
+                );
+                assert_no_heavy_cache(&generator);
+            }
+
+            let negative_root = tempfile::tempdir().unwrap();
+            write_tiny_tokenizer(negative_root.path(), true);
+            for variant in [Variant::Base, Variant::Edit] {
+                let mut generator = weights_free_generator_for(variant);
+                generator.root = negative_root.path().to_path_buf();
+                let conditioning = (variant == Variant::Edit).then(|| Conditioning::Reference {
+                    image: boundary_image(512, 512),
+                    strength: None,
+                });
+                let request = GenerationRequest {
+                    prompt: "ordinary positive".into(),
+                    guidance: Some(4.0),
+                    conditioning: conditioning.into_iter().collect(),
+                    memory: staged.then(|| gen_core::GenerationMemory {
+                        stage_residency: true,
+                        ..Default::default()
+                    }),
+                    ..boundary_request()
+                };
+                let error = generator
+                    .generate(&request, &mut |_| {})
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("max_text_tokens=1280"),
+                    "{variant:?}: {error}"
+                );
+                assert_no_heavy_cache(&generator);
+            }
+        }
+    }
+
+    /// Production-seam boundary guard for the inclusive comparison: construct a rendered Base/Turbo
+    /// sequence of exactly 1280 ids and prove it advances past admission into the intentionally absent
+    /// component loader. Changing `len > cap` to `len >= cap` turns this into the typed budget error.
+    #[test]
+    fn ordinary_text_preflight_admits_exactly_1280_on_every_positive_route() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(root.path(), false);
+        let tok =
+            BooguTokenizer::from_snapshot(root.path(), &Device::Cpu, pipeline::MAX_TEXT_TOKENS)
+                .unwrap();
+        let template_len = tok.preflight_t2i("").unwrap().len();
+        let prompt = "<|image_pad|>".repeat(pipeline::MAX_TEXT_TOKENS - template_len);
+        assert_eq!(
+            tok.preflight_t2i(&prompt).unwrap().len(),
+            pipeline::MAX_TEXT_TOKENS
+        );
+
+        for variant in [Variant::Base, Variant::Turbo] {
+            let mut generator = weights_free_generator_for(variant);
+            generator.root = root.path().to_path_buf();
+            let error = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: prompt.clone(),
+                        ..boundary_request()
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains("max_text_tokens"),
+                "{variant:?}: exactly 1280 must pass admission: {error}"
+            );
         }
     }
 

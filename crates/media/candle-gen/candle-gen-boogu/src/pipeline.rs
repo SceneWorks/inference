@@ -37,7 +37,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::config::BooguConfig;
 use crate::loader::Weights;
 use crate::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
-use crate::tokenizer::{BooguTokenizer, EditTokenIds};
+use crate::tokenizer::{BooguTokenizer, EditTokenIds, TextTokenIds};
 use crate::transformer::BooguTransformer;
 use crate::vision::preprocess::{image_geometry, preprocess_image};
 use crate::vision::{VisionConfig, VisionTower};
@@ -51,8 +51,27 @@ const IMAGE_TOKEN_ID: u32 = 151655;
 /// and token ids checked here.
 pub(crate) struct EditPreflight {
     tokens: EditTokenIds,
+    negative: Option<TextTokenIds>,
     grids: Vec<[i32; 3]>,
     counts: Vec<usize>,
+}
+
+/// Host-only admission for the ordinary text contract shared by Base/Turbo positive conditioning
+/// and Base CFG-negative conditioning. These exact ids are converted only after component admission.
+pub(crate) struct TextPreflight {
+    positive: TextTokenIds,
+    negative: Option<TextTokenIds>,
+}
+
+/// Tokenize every ordinary text-only conditioning leg for one request before any component load.
+pub(crate) fn preflight_text(
+    tok: &BooguTokenizer,
+    prompt: &str,
+    do_cfg: bool,
+) -> Result<TextPreflight> {
+    let positive = tok.preflight_t2i(prompt)?;
+    let negative = do_cfg.then(|| tok.preflight_negative()).transpose()?;
+    Ok(TextPreflight { positive, negative })
 }
 
 /// Derive each validated reference's exact smart-resize grid and tokenize/check the combined edit on
@@ -61,6 +80,7 @@ pub(crate) fn preflight_edit(
     tok: &BooguTokenizer,
     references: &[&Image],
     instruction: &str,
+    do_cfg: bool,
 ) -> Result<EditPreflight> {
     let mut grids = Vec::with_capacity(references.len());
     let mut counts = Vec::with_capacity(references.len());
@@ -70,8 +90,10 @@ pub(crate) fn preflight_edit(
         counts.push(geometry.merged_tokens);
     }
     let tokens = tok.preflight_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
+    let negative = do_cfg.then(|| tok.preflight_negative()).transpose()?;
     Ok(EditPreflight {
         tokens,
+        negative,
         grids,
         counts,
     })
@@ -285,6 +307,7 @@ pub(crate) fn stage_encode_base(
     text: &StagedText,
     encoder: Option<&Encoder>,
     req: &GenerationRequest,
+    preflight: &TextPreflight,
     default_steps: usize,
     device: &Device,
 ) -> Result<StagedCondition> {
@@ -306,9 +329,17 @@ pub(crate) fn stage_encode_base(
         _ => None,
     };
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-    let cond = text.te.last_hidden(&text.tok.encode_t2i(&req.prompt)?)?;
+    let cond = text
+        .te
+        .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
     let uncond = if guidance > 1.0 {
-        Some(text.te.last_hidden(&text.tok.encode_negative()?)?)
+        let negative = preflight.negative.as_ref().ok_or_else(|| {
+            CandleError::Msg("boogu base: CFG-negative conditioning was not admitted".into())
+        })?;
+        Some(
+            text.te
+                .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
+        )
     } else {
         None
     };
@@ -324,6 +355,7 @@ pub(crate) fn stage_encode_turbo(
     text: &StagedText,
     encoder: Option<&Encoder>,
     req: &GenerationRequest,
+    preflight: &TextPreflight,
     device: &Device,
 ) -> Result<StagedCondition> {
     let reference = resolve_reference(req, crate::BOOGU_IMAGE_TURBO_ID)?;
@@ -343,7 +375,9 @@ pub(crate) fn stage_encode_turbo(
         )?),
         _ => None,
     };
-    let cond = text.te.last_hidden(&text.tok.encode_t2i(&req.prompt)?)?;
+    let cond = text
+        .te
+        .last_hidden(&text.tok.text_ids_to_tensor(&preflight.positive)?)?;
     Ok(StagedCondition::Turbo {
         cond,
         clean,
@@ -367,7 +401,13 @@ pub(crate) fn stage_encode_edit(
     let cond =
         encode_image_instruction_parts(&text.tok, &text.te, edit, references, preflight, device)?;
     let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
-        Some(text.te.last_hidden(&text.tok.encode_negative()?)?)
+        let negative = preflight.negative.as_ref().ok_or_else(|| {
+            CandleError::Msg("boogu edit: CFG-negative conditioning was not admitted".into())
+        })?;
+        Some(
+            text.te
+                .last_hidden(&text.tok.text_ids_to_tensor(negative)?)?,
+        )
     } else {
         None
     };
@@ -618,6 +658,7 @@ fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 pub(crate) fn render_base(
     comps: &Components,
     req: &GenerationRequest,
+    preflight: &TextPreflight,
     clean: Option<&Tensor>,
     start_step: usize,
     device: &Device,
@@ -628,10 +669,19 @@ pub(crate) fn render_base(
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
     // Condition encoding (seed-independent): positive instruction + CFG-negative (empty) instruction.
-    let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
+    let cond = comps
+        .te
+        .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
     let do_cfg = guidance > 1.0;
     let uncond = if do_cfg {
-        Some(comps.te.last_hidden(&comps.tok.encode_negative()?)?)
+        let negative = preflight.negative.as_ref().ok_or_else(|| {
+            CandleError::Msg("boogu base: CFG-negative conditioning was not admitted".into())
+        })?;
+        Some(
+            comps
+                .te
+                .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
+        )
     } else {
         None
     };
@@ -716,6 +766,7 @@ fn blend_reference(clean: Option<&Tensor>, noise: Tensor, sigma_start: f32) -> R
 pub(crate) fn render_turbo(
     comps: &Components,
     req: &GenerationRequest,
+    preflight: &TextPreflight,
     clean: Option<&Tensor>,
     start_step: usize,
     device: &Device,
@@ -723,7 +774,9 @@ pub(crate) fn render_turbo(
 ) -> Result<Vec<Image>> {
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
+    let cond = comps
+        .te
+        .last_hidden(&comps.tok.text_ids_to_tensor(&preflight.positive)?)?;
     // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
     // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
     // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
@@ -896,7 +949,14 @@ pub(crate) fn render_edit(
     let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
     let do_cfg = guidance > 1.0;
     let uncond = if do_cfg {
-        Some(comps.te.last_hidden(&comps.tok.encode_negative()?)?)
+        let negative = preflight.negative.as_ref().ok_or_else(|| {
+            CandleError::Msg("boogu edit: CFG-negative conditioning was not admitted".into())
+        })?;
+        Some(
+            comps
+                .te
+                .last_hidden(&comps.tok.text_ids_to_tensor(negative)?)?,
+        )
     } else {
         None
     };

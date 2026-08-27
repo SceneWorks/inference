@@ -339,6 +339,8 @@ impl Boogu {
         let id = self.descriptor.id;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let preflight =
+            crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, guidance > 1.0)?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from the
         // VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
         // Seed-independent — resolved above the residency lifecycle.
@@ -355,7 +357,7 @@ impl Boogu {
             on_progress,
             // ── Phase A: true-CFG mllm conditioning (Sequential loads the mllm, encodes, materializes,
             // drops it + clear_cache before the DiT/VAE load; Resident borrows the warm encoder).
-            |enc: &BooguEncoders| enc.encode_base(&self.tokenizer, &req.prompt, guidance),
+            |enc: &BooguEncoders| enc.encode_base_preflight(&preflight),
             |c: Option<&BooguBaseCond>| match c {
                 Some(c) => c.materialize(),
                 None => Ok(()),
@@ -435,12 +437,18 @@ impl Boogu {
         // Source images arrive as `Reference` / `MultiReference` (1..=MAX_EDIT_REFS); the prompt is the
         // edit instruction. Clone once into an owned slice (cheap next to the multi-step DiT denoise).
         let references: Vec<Image> = resolve_edit_references(req)?.into_iter().cloned().collect();
-        // Host-only smart-resize/token admission runs before Residency can load or call the MLX
-        // vision tower or VAE phase. The checked ids/counts are reused inside the encoder closure.
-        let preflight =
-            crate::pipeline::preflight_edit(&self.tokenizer, &references, &req.prompt, false)?;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        // Host-only smart-resize/token admission runs before Residency can load or call the MLX
+        // text/vision tower or VAE phase. Both CFG legs reuse the exact checked ids/counts.
+        let preflight = crate::pipeline::preflight_edit(
+            &self.tokenizer,
+            &references,
+            &req.prompt,
+            guidance > 1.0,
+            true,
+            false,
+        )?;
         let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
         // The faithful edit runs each reference through the vision tower (image-conditioned) and the
         // CFG-negative is the text-only empty/drop instruction — the reference defaults.
@@ -461,13 +469,7 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| {
-                enc.encode_edit_preflight(
-                    &self.tokenizer,
-                    &references,
-                    &req.prompt,
-                    &edit_opts,
-                    Some(&preflight),
-                )
+                enc.encode_edit_preflight(&references, &edit_opts, Some(&preflight))
             },
             |c: Option<&BooguBaseCond>| match c {
                 Some(c) => c.materialize(),
@@ -535,6 +537,7 @@ impl Boogu {
             )));
         }
         let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
+        let preflight = crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, false)?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise from
         // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i.
         let reference = resolve_reference(req, id)?;
@@ -546,7 +549,7 @@ impl Boogu {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |enc: &BooguEncoders| enc.encode_turbo(&self.tokenizer, &req.prompt),
+            |enc: &BooguEncoders| enc.encode_turbo_preflight(&preflight),
             |encoded: Option<&(Array, Array)>| {
                 let Some((cond, mask)) = encoded else {
                     return Ok(());
@@ -775,7 +778,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
 
-    fn write_tiny_edit_tokenizer(root: &Path) {
+    fn write_tiny_tokenizer(root: &Path, overlong_negative: bool) {
         let mllm = root.join("mllm");
         std::fs::create_dir_all(&mllm).unwrap();
         let literals = [
@@ -804,13 +807,21 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        vocab.insert("burst".into(), serde_json::json!(literals.len() + 1));
+        let normalizer = overlong_negative.then(|| {
+            serde_json::json!({
+                "type": "Replace",
+                "pattern": { "String": "Describe" },
+                "content": "burst ".repeat(crate::tokenizer::MAX_TEXT_TOKENS + 1)
+            })
+        });
         let fixture = serde_json::json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": null,
-            "pre_tokenizer": null,
+            "normalizer": normalizer,
+            "pre_tokenizer": { "type": "Whitespace" },
             "post_processor": null,
             "decoder": null,
             "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
@@ -820,6 +831,10 @@ mod tests {
             serde_json::to_vec(&fixture).unwrap(),
         )
         .unwrap();
+    }
+
+    fn write_tiny_edit_tokenizer(root: &Path) {
+        write_tiny_tokenizer(root, false);
     }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
@@ -837,6 +852,123 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    /// Registered-route mutation table: a Sequential snapshot containing only the host tokenizer
+    /// proves that every ordinary positive/negative failure happens before the text/heavy loaders.
+    /// The negative fixture expands `SYSTEM_PROMPT_DROP`; grounded Edit remains below 8192 while its
+    /// ordinary CFG-negative crosses 1280, independently discriminating that leg.
+    #[test]
+    fn ordinary_text_preflight_precedes_every_registered_component_route() {
+        let positive_root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(positive_root.path(), false);
+        let positive_spec = LoadSpec::new(WeightsSource::Dir(positive_root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for load_route in [
+            load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+            load_turbo as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+        ] {
+            let generator = load_route(&positive_spec).unwrap();
+            let request = GenerationRequest {
+                prompt: "<|image_pad|>".repeat(crate::tokenizer::MAX_TEXT_TOKENS + 1),
+                ..req(512, 512)
+            };
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_text_tokens=1280"), "{error}");
+        }
+
+        let negative_root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(negative_root.path(), true);
+        let negative_spec = LoadSpec::new(WeightsSource::Dir(negative_root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for (load_route, conditioning) in [
+            (
+                load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+                Vec::new(),
+            ),
+            (
+                load_edit as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+                vec![Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                }],
+            ),
+        ] {
+            let generator = load_route(&negative_spec).unwrap();
+            let request = GenerationRequest {
+                prompt: "ordinary positive".into(),
+                guidance: Some(4.0),
+                conditioning,
+                ..req(512, 512)
+            };
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_text_tokens=1280"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_preflight_admits_exactly_1280_on_every_positive_route() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(root.path(), false);
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        let template_len = tok.preflight_t2i("").unwrap().len();
+        let prompt = "<|image_pad|>".repeat(crate::tokenizer::MAX_TEXT_TOKENS - template_len);
+        assert_eq!(
+            tok.preflight_t2i(&prompt).unwrap().len(),
+            crate::tokenizer::MAX_TEXT_TOKENS
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for load_route in [
+            load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+            load_turbo as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+        ] {
+            let generator = load_route(&spec).unwrap();
+            let error = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: prompt.clone(),
+                        ..req(512, 512)
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains("max_text_tokens"),
+                "exactly 1280 must pass admission: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_preflight_discriminates_text_and_optional_grounded_cfg_legs() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(root.path(), false);
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        let references = vec![img(512, 512)];
+
+        let text_negative =
+            crate::pipeline::preflight_edit(&tok, &references, "edit", true, true, false).unwrap();
+        assert_eq!(text_negative.admitted_legs(), (false, true, true, false));
+
+        let grounded_negative =
+            crate::pipeline::preflight_edit(&tok, &references, "edit", true, true, true).unwrap();
+        assert_eq!(
+            grounded_negative.admitted_legs(),
+            (false, true, false, true)
+        );
+
+        let text_only =
+            crate::pipeline::preflight_edit(&tok, &references, "edit", true, false, false).unwrap();
+        assert_eq!(text_only.admitted_legs(), (true, false, true, false));
     }
 
     /// The real generator boundary must reject combined edit budgets before entering either

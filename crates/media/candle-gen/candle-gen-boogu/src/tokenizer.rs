@@ -34,6 +34,21 @@ pub(crate) struct EditTokenIds {
     ids: Vec<u32>,
 }
 
+/// Host token ids admitted under the ordinary text-only 1280-token contract. Base, Turbo, and the
+/// text-only CFG-negative edit leg retain these exact ids across component admission so no route can
+/// re-tokenize after loading the text tower, VAE, DiT, or vision tower.
+#[derive(Debug, Clone)]
+pub(crate) struct TextTokenIds {
+    ids: Vec<u32>,
+}
+
+#[cfg(test)]
+impl TextTokenIds {
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
@@ -106,21 +121,41 @@ impl BooguTokenizer {
     /// actual length, rather than an opaque tensor-shape error deep in the condition encoder (sc-9047).
     /// This path is bounded by [`crate::pipeline::MAX_TEXT_TOKENS`] — the pre-built RoPE-table size the
     /// text-only encoder narrows into. Mirrors the sibling ideogram Qwen3-VL port.
-    fn encode(&self, text: &str) -> Result<Tensor> {
+    fn preflight_text(&self, text: &str) -> Result<TextTokenIds> {
         let ids = self.raw_ids(text)?;
         check_len(ids.len(), self.max_tokens)?;
+        Ok(TextTokenIds { ids })
+    }
+
+    fn encode(&self, text: &str) -> Result<Tensor> {
+        self.text_ids_to_tensor(&self.preflight_text(text)?)
+    }
+
+    /// Admit the positive Base/Turbo instruction without allocating a backend tensor.
+    pub(crate) fn preflight_t2i(&self, prompt: &str) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_T2I, prompt))
+    }
+
+    /// Admit the fixed text-only CFG-negative instruction without allocating a backend tensor.
+    pub(crate) fn preflight_negative(&self) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_DROP, ""))
+    }
+
+    /// Convert an already-admitted ordinary text sequence to the model-device tensor.
+    pub(crate) fn text_ids_to_tensor(&self, preflight: &TextTokenIds) -> Result<Tensor> {
+        let ids = preflight.ids.clone();
         let len = ids.len();
         Ok(Tensor::from_vec(ids, (1, len), &self.device)?)
     }
 
     /// Encode the **positive** text-to-image instruction → `input_ids` `[1, L]`.
     pub fn encode_t2i(&self, prompt: &str) -> Result<Tensor> {
-        self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))
+        self.text_ids_to_tensor(&self.preflight_t2i(prompt)?)
     }
 
     /// Encode the CFG **negative** (empty instruction with the drop system prompt) → `[1, L]`.
     pub fn encode_negative(&self) -> Result<Tensor> {
-        self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))
+        self.text_ids_to_tensor(&self.preflight_negative()?)
     }
 
     /// Encode the **edit** instruction (text-only) → `input_ids` `[1, L]`. The TI2I unified system

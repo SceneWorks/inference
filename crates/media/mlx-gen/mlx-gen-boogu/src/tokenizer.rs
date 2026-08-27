@@ -52,6 +52,25 @@ impl EditTokenIds {
     }
 }
 
+/// Host token ids admitted under the ordinary 1280-token contract. The registered generators keep
+/// these ids outside MLX until after request admission, then reuse them across resident/sequential
+/// conditioning so no positive or CFG-negative leg re-tokenizes after component entry.
+#[derive(Debug, Clone)]
+pub(crate) struct TextTokenIds {
+    ids: Vec<i32>,
+}
+
+impl TextTokenIds {
+    pub(crate) fn to_arrays(&self) -> Result<(Array, Array)> {
+        ids_to_arrays(&self.ids)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
@@ -100,9 +119,13 @@ impl BooguTokenizer {
     /// Encode a rendered text-only chat string to ids (`add_special_tokens=false`, matching the
     /// reference), rejecting an over-budget prompt before condition-encoder attention allocation.
     fn encode(&self, text: &str) -> Result<Vec<i32>> {
+        Ok(self.preflight_text(text)?.ids)
+    }
+
+    fn preflight_text(&self, text: &str) -> Result<TextTokenIds> {
         let ids = self.raw_ids(text)?;
         check_len(ids.len(), MAX_TEXT_TOKENS)?;
-        Ok(ids)
+        Ok(TextTokenIds { ids })
     }
 
     /// Tokenize without applying a path-specific length ceiling. The caller immediately applies
@@ -113,12 +136,22 @@ impl BooguTokenizer {
 
     /// Encode the **positive** text-to-image instruction → `(input_ids, attention_mask)` `[1, L]`.
     pub fn encode_t2i(&self, prompt: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))?)
+        self.preflight_t2i(prompt)?.to_arrays()
+    }
+
+    /// Admit the positive Base/Turbo instruction without creating MLX arrays.
+    pub(crate) fn preflight_t2i(&self, prompt: &str) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_T2I, prompt))
     }
 
     /// Encode the CFG **negative** (empty instruction with the drop system prompt) → `[1, L]`.
     pub fn encode_negative(&self) -> Result<(Array, Array)> {
-        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))?)
+        self.preflight_negative()?.to_arrays()
+    }
+
+    /// Admit the fixed text-only CFG-negative instruction without creating MLX arrays.
+    pub(crate) fn preflight_negative(&self) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_DROP, ""))
     }
 
     /// Encode the **edit** instruction → `(input_ids, attention_mask)` `[1, L]`. The TI2I system
@@ -130,7 +163,12 @@ impl BooguTokenizer {
     /// the reference image through the Qwen3-VL vision tower (deepstack) so the MLLM "sees" it; that
     /// semantic path is tracked separately (E7b). The DiT's spatial reference path is fully wired.
     pub fn encode_edit(&self, instruction: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
+        self.preflight_edit(instruction)?.to_arrays()
+    }
+
+    /// Admit a text-only Edit positive instruction under the ordinary 1280-token contract.
+    pub(crate) fn preflight_edit(&self, instruction: &str) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_DROP, instruction))
     }
 
     /// Encode a **multi-image** edit instruction → `(input_ids, attention_mask)` `[1, L]`, with one

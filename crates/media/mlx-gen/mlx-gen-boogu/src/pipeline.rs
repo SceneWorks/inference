@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 use crate::loader::{load_text_encoder, load_transformer, load_vae, load_vision_tower};
 use crate::text_encoder::BooguTextEncoder;
-use crate::tokenizer::{BooguTokenizer, EditTokenIds};
+use crate::tokenizer::{BooguTokenizer, EditTokenIds, TextTokenIds};
 use crate::transformer::BooguTransformer;
 use crate::vision::preprocess::{image_geometry, preprocess_image};
 use crate::vision::VisionTower;
@@ -61,10 +61,41 @@ const IMAGE_TOKEN_ID: i32 = 151655;
 /// either heavy phase and then reused by the real vision/text encode, making the smart-resize grids,
 /// placeholder counts, and exact checked token ids one canonical request contract.
 pub(crate) struct EditPreflight {
-    tokens: EditTokenIds,
-    negative_tokens: Option<EditTokenIds>,
+    positive_text: Option<TextTokenIds>,
+    positive_grounded: Option<EditTokenIds>,
+    negative_text: Option<TextTokenIds>,
+    negative_grounded: Option<EditTokenIds>,
     grids: Vec<[i32; 3]>,
     counts: Vec<usize>,
+}
+
+#[cfg(test)]
+impl EditPreflight {
+    pub(crate) fn admitted_legs(&self) -> (bool, bool, bool, bool) {
+        (
+            self.positive_text.is_some(),
+            self.positive_grounded.is_some(),
+            self.negative_text.is_some(),
+            self.negative_grounded.is_some(),
+        )
+    }
+}
+
+/// Host-only admission for ordinary positive and optional CFG-negative text conditioning.
+pub(crate) struct TextPreflight {
+    positive: TextTokenIds,
+    negative: Option<TextTokenIds>,
+}
+
+/// Tokenize every ordinary 1280-limited leg before entering component residency.
+pub(crate) fn preflight_text(
+    tok: &BooguTokenizer,
+    prompt: &str,
+    do_cfg: bool,
+) -> Result<TextPreflight> {
+    let positive = tok.preflight_t2i(prompt)?;
+    let negative = do_cfg.then(|| tok.preflight_negative()).transpose()?;
+    Ok(TextPreflight { positive, negative })
 }
 
 /// Derive every reference's exact smart-resize geometry and tokenize/check the combined edit before
@@ -73,8 +104,15 @@ pub(crate) fn preflight_edit(
     tok: &BooguTokenizer,
     references: &[Image],
     instruction: &str,
+    do_cfg: bool,
+    condition_on_image: bool,
     image_conditioned_negative: bool,
 ) -> Result<EditPreflight> {
+    if image_conditioned_negative && !condition_on_image {
+        return Err(Error::Msg(
+            "boogu edit: image-conditioned CFG-negative requires image-conditioned positive".into(),
+        ));
+    }
     let mut grids = Vec::with_capacity(references.len());
     let mut counts = Vec::with_capacity(references.len());
     for reference in references {
@@ -82,13 +120,23 @@ pub(crate) fn preflight_edit(
         grids.push(geometry.grid);
         counts.push(geometry.merged_tokens);
     }
-    let tokens = tok.preflight_edit_with_images(instruction, &counts)?;
-    let negative_tokens = image_conditioned_negative
+    let positive_text = (!condition_on_image)
+        .then(|| tok.preflight_edit(instruction))
+        .transpose()?;
+    let positive_grounded = condition_on_image
+        .then(|| tok.preflight_edit_with_images(instruction, &counts))
+        .transpose()?;
+    let negative_text = (do_cfg && !image_conditioned_negative)
+        .then(|| tok.preflight_negative())
+        .transpose()?;
+    let negative_grounded = (do_cfg && image_conditioned_negative)
         .then(|| tok.preflight_edit_with_images("", &counts))
         .transpose()?;
     Ok(EditPreflight {
-        tokens,
-        negative_tokens,
+        positive_text,
+        positive_grounded,
+        negative_text,
+        negative_grounded,
         grids,
         counts,
     })
@@ -273,16 +321,11 @@ impl BooguEncoders {
 
     /// Base / img2img true-CFG conditioning: the positive instruction, plus (when `guidance > 1`) the
     /// empty/drop CFG-negative instruction. Byte-identical to the pre-split inline encode.
-    pub(crate) fn encode_base(
-        &self,
-        tok: &BooguTokenizer,
-        prompt: &str,
-        guidance: f32,
-    ) -> Result<BooguBaseCond> {
-        let (cond_ids, cond_mask) = tok.encode_t2i(prompt)?;
+    pub(crate) fn encode_base_preflight(&self, preflight: &TextPreflight) -> Result<BooguBaseCond> {
+        let (cond_ids, cond_mask) = preflight.positive.to_arrays()?;
         let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
-        let uncond = if guidance > 1.0 {
-            let (u_ids, u_mask) = tok.encode_negative()?;
+        let uncond = if let Some(negative) = &preflight.negative {
+            let (u_ids, u_mask) = negative.to_arrays()?;
             Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
         } else {
             None
@@ -296,12 +339,11 @@ impl BooguEncoders {
 
     /// Turbo (CFG-free DMD student) conditioning: the positive instruction only (no unconditional
     /// branch — the guided velocity is distilled into the weights).
-    pub(crate) fn encode_turbo(
+    pub(crate) fn encode_turbo_preflight(
         &self,
-        tok: &BooguTokenizer,
-        prompt: &str,
+        preflight: &TextPreflight,
     ) -> Result<(Array, Array)> {
-        let (ids, mask) = tok.encode_t2i(prompt)?;
+        let (ids, mask) = preflight.positive.to_arrays()?;
         let cond = self.te.last_hidden(&ids, &mask)?;
         Ok((cond, mask))
     }
@@ -314,9 +356,7 @@ impl BooguEncoders {
     /// preflight occurs before [`mlx_gen::Residency`] can load or call either tower/VAE phase.
     pub(crate) fn encode_edit_preflight(
         &self,
-        tok: &BooguTokenizer,
         references: &[Image],
-        instruction: &str,
         opts: &EditOptions,
         preflight: Option<&EditPreflight>,
     ) -> Result<BooguBaseCond> {
@@ -324,9 +364,17 @@ impl BooguEncoders {
             let preflight = preflight.ok_or_else(|| {
                 Error::Msg("boogu edit: image conditioning omitted its preflight".into())
             })?;
-            self.encode_image_instruction_preflight(references, preflight, &preflight.tokens)?
+            let tokens = preflight.positive_grounded.as_ref().ok_or_else(|| {
+                Error::Msg("boogu edit: positive image conditioning was not admitted".into())
+            })?;
+            self.encode_image_instruction_preflight(references, preflight, tokens)?
         } else {
-            let (ids, mask) = tok.encode_edit(instruction)?;
+            let tokens = preflight
+                .and_then(|preflight| preflight.positive_text.as_ref())
+                .ok_or_else(|| {
+                    Error::Msg("boogu edit: positive text conditioning was not admitted".into())
+                })?;
+            let (ids, mask) = tokens.to_arrays()?;
             (self.te.last_hidden(&ids, &mask)?, mask)
         };
         let uncond = if opts.text_guidance_scale > 1.0 {
@@ -336,12 +384,17 @@ impl BooguEncoders {
                         "boogu edit: negative image conditioning omitted its preflight".into(),
                     )
                 })?;
-                let tokens = preflight.negative_tokens.as_ref().ok_or_else(|| {
+                let tokens = preflight.negative_grounded.as_ref().ok_or_else(|| {
                     Error::Msg("boogu edit: negative image conditioning was not admitted".into())
                 })?;
                 Some(self.encode_image_instruction_preflight(references, preflight, tokens)?)
             } else {
-                let (u_ids, u_mask) = tok.encode_negative()?;
+                let negative = preflight
+                    .and_then(|preflight| preflight.negative_text.as_ref())
+                    .ok_or_else(|| {
+                        Error::Msg("boogu edit: CFG-negative conditioning was not admitted".into())
+                    })?;
+                let (u_ids, u_mask) = negative.to_arrays()?;
                 Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
             }
         } else {
@@ -865,9 +918,8 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let cond = self
-            .enc
-            .encode_base(&self.tok, prompt, opts.text_guidance_scale)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale > 1.0)?;
+        let cond = self.enc.encode_base_preflight(&preflight)?;
         self.heavy
             .render_base_t2i(&cond, opts, sigmas, decoder, cancel, on_progress)
     }
@@ -888,9 +940,8 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let cond = self
-            .enc
-            .encode_base(&self.tok, prompt, opts.text_guidance_scale)?;
+        let preflight = preflight_text(&self.tok, prompt, opts.text_guidance_scale > 1.0)?;
+        let cond = self.enc.encode_base_preflight(&preflight)?;
         let clean = self
             .heavy
             .encode_init_clean(init, opts.width, opts.height)?;
@@ -922,7 +973,8 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let (cond, mask) = self.enc.encode_turbo(&self.tok, prompt)?;
+        let preflight = preflight_text(&self.tok, prompt, false)?;
+        let (cond, mask) = self.enc.encode_turbo_preflight(&preflight)?;
         self.heavy
             .render_turbo_t2i(&cond, &mask, opts, decoder, cancel, on_progress)
     }
@@ -940,7 +992,8 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let (cond, mask) = self.enc.encode_turbo(&self.tok, prompt)?;
+        let preflight = preflight_text(&self.tok, prompt, false)?;
+        let (cond, mask) = self.enc.encode_turbo_preflight(&preflight)?;
         let clean = self
             .heavy
             .encode_init_clean(init, opts.width, opts.height)?;
@@ -1003,24 +1056,17 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let preflight = opts
-            .condition_on_image
-            .then(|| {
-                preflight_edit(
-                    &self.tok,
-                    references,
-                    instruction,
-                    opts.text_guidance_scale > 1.0 && opts.use_input_images_4_neg_instruct,
-                )
-            })
-            .transpose()?;
-        let cond = self.enc.encode_edit_preflight(
+        let preflight = preflight_edit(
             &self.tok,
             references,
             instruction,
-            opts,
-            preflight.as_ref(),
+            opts.text_guidance_scale > 1.0,
+            opts.condition_on_image,
+            opts.condition_on_image && opts.use_input_images_4_neg_instruct,
         )?;
+        let cond = self
+            .enc
+            .encode_edit_preflight(references, opts, Some(&preflight))?;
         let ref_latents = self.heavy.encode_ref_latents(references)?;
         self.heavy.render_edit(
             &cond,
