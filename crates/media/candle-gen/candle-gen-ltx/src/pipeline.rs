@@ -359,6 +359,7 @@ pub fn denoise_av_conditioned(
             audio_ctx,
             &state.positions,
             audio_grid,
+            state.keyframes_mask.as_ref(),
             &prepared_rope,
         )?;
         let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
@@ -380,6 +381,142 @@ pub fn denoise_av_conditioned(
             let step = (((&alat - &aden)? * sigma_next as f64)? / sigma as f64)?;
             (&aden + step)?
         };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok((state, alat))
+}
+
+/// The audio side of an ancestral token denoise, when the audio modality is present.
+pub struct AncestralAudio<'a> {
+    /// `(B, 8, T, 16)` audio latent grid.
+    pub latent: &'a Tensor,
+    pub ctx: &'a Tensor,
+    pub grid: &'a Tensor,
+    pub audio_frames: usize,
+}
+
+/// Token-native **rectified-flow ancestral** denoise (sc-18789) — the twin of
+/// `mlx-gen-ltx::pipeline::denoise_tokens_rf_ancestral`; see that doc comment for the step
+/// semantics (mask-corrected x0, terminal short-circuit, RF-ancestral update with the
+/// post-noise conditioning re-pin, video-only forward when `audio` is `None`, and
+/// per-(seed, step, modality) noise keys).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_tokens_rf_ancestral(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    video_ctx: &Tensor,
+    audio: Option<AncestralAudio<'_>>,
+    sigmas: &[f32],
+    eta: f32,
+    s_noise: f32,
+    noise_seed: u64,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Option<Tensor>)> {
+    let mut state = video.clone();
+    let mut alat = audio.as_ref().map(|a| a.latent.clone());
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    let device = state.latent.device().clone();
+    let seeded_normal = |shape: &[usize], step: usize, modality: u64| -> Result<Tensor> {
+        let mut rng = StdRng::seed_from_u64(
+            noise_seed
+                .wrapping_add(2 * step as u64)
+                .wrapping_add(modality),
+        );
+        let n: usize = shape.iter().product();
+        let data = candle_gen::seeded_normal_vec(&mut rng, n);
+        Tensor::from_vec(data, shape, &device)?.to_dtype(DType::F32)
+    };
+
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        on_model_forward()?;
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let timesteps = state.token_timesteps(sigma)?;
+        let (vvel, avel) = match (&alat, &audio) {
+            (Some(al), Some(a)) => {
+                let aflat = flatten_audio_latent(al)?;
+                let (vv, av) = dit.forward_conditioned(
+                    &state.latent,
+                    &aflat,
+                    &timesteps,
+                    sigma as f64,
+                    video_ctx,
+                    a.ctx,
+                    &state.positions,
+                    a.grid,
+                    state.keyframes_mask.as_ref(),
+                )?;
+                let av = unflatten_audio_latent(&av.to_dtype(DType::F32)?, a.audio_frames)?;
+                (vv, Some(av))
+            }
+            _ => (
+                dit.forward_video_only_conditioned(
+                    &state.latent,
+                    &timesteps,
+                    video_ctx,
+                    &state.positions,
+                    state.keyframes_mask.as_ref(),
+                )?,
+                None,
+            ),
+        };
+
+        // Mask-corrected x0 (reference `post_process_latent`).
+        let vden = conditioning::apply_denoise_mask(
+            &(&state.latent - (&vvel.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let aden = match (&alat, &avel) {
+            (Some(al), Some(av)) => Some((al - (av * sigma as f64)?)?),
+            _ => None,
+        };
+
+        if sigma_next <= 0.0 {
+            state.latent = vden;
+            if let Some(ad) = aden {
+                alat = Some(ad);
+            }
+        } else {
+            let coeffs = candle_gen::gen_core::ltx_dfr::RfAncestralCoeffs::new(
+                sigma, sigma_next, eta, s_noise,
+            )
+            .map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+            let ratio = coeffs.sigma_down_ratio as f64;
+            let step_rf = |x: &Tensor, x0: &Tensor, modality: u64| -> Result<Tensor> {
+                let mut next = ((x * ratio)? + (x0 * (1.0 - ratio))?)?;
+                if eta > 0.0 {
+                    // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 —
+                    // the reference does not fall back to the noise-free branch when eta > 0).
+                    next = (next * coeffs.alpha_ratio as f64)?;
+                    if coeffs.renoise_coeff > 0.0 {
+                        let noise = seeded_normal(next.dims(), step, modality)?;
+                        next = (next + (noise * coeffs.renoise_coeff as f64)?)?;
+                    }
+                }
+                Ok(next)
+            };
+            let mut vnext = step_rf(&state.latent, &vden, 0)?;
+            if eta > 0.0 {
+                // Injected noise reached the conditioning tokens; re-pin them.
+                vnext = conditioning::apply_denoise_mask(
+                    &vnext,
+                    &state.clean_latent,
+                    &state.denoise_mask,
+                )?;
+            }
+            state.latent = vnext;
+            if let (Some(al), Some(ad)) = (&alat, &aden) {
+                alat = Some(step_rf(al, ad, 1)?);
+            }
+        }
         on_progress(Progress::Step {
             current: step as u32 + 1,
             total,

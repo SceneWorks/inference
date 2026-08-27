@@ -47,6 +47,7 @@ pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
+pub mod dfr;
 pub mod diff_vae;
 pub mod dit_train;
 pub mod duration_head;
