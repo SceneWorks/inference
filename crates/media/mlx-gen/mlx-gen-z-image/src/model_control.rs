@@ -296,7 +296,7 @@ fn build_control_residency_with_source(
 
 /// The per-id precision-override rejection message for the turbo control variant, shared by
 /// [`load_control_residency`]'s eager guard and its `Sequential` per-phase loaders.
-const PRECISION_MSG: &str =
+const PRECISION_ERROR: &str =
     "z_image_turbo_control: only dense bf16 is wired (the text encoder runs \
      f32 internally); drop the precision override";
 
@@ -312,7 +312,7 @@ const PRECISION_MSG: &str =
 /// `Sequential` re-loads per generate in phase order to bound peak memory — routed through the shared
 /// `load_control_residency` builder.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
+    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_ERROR)?;
     let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageTurboControl {
         memory_strategy: crate::memory_strategy::memory_strategy_contract(MODEL_ID, spec)?,
@@ -690,7 +690,7 @@ mod tests {
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
             assert!(!snapshot.path().join("control.safetensors").exists());
-            let (_tokenizer, res) = load_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+            let (_tokenizer, res) = load_control_residency(&spec, MODEL_ID, PRECISION_ERROR)
                 .unwrap_or_else(|error| {
                     panic!("{policy:?} must defer absent heavy components: {error}")
                 });

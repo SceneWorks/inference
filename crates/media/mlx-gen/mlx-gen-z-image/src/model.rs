@@ -181,7 +181,7 @@ impl StagedHeavy for ZImageHeavyOwned {
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, residency) = load_residency(spec, MODEL_ID, PRECISION_MSG, FILE_MSG)?;
+    let (tokenizer, residency) = load_residency(spec, MODEL_ID, PRECISION_ERROR, FILE_ERROR)?;
     let loaded_tier = crate::memory_strategy::loaded_tier(spec, MODEL_ID)?;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
@@ -446,9 +446,9 @@ fn build_residency_with_source(
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the
 /// [`build_residency`] dispatch and the `Sequential` [`resolve_precision_and_root`] guard.
-const PRECISION_MSG: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
+const PRECISION_ERROR: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
      encoder already runs f32 internally (drop the precision override)";
-const FILE_MSG: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+const FILE_ERROR: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
      transformer/ vae/), not a single .safetensors file";
 
 /// Precision guard + snapshot-dir resolution (rejecting a single-file source), shared by
@@ -1137,7 +1137,7 @@ mod tests {
             let (snapshot, spec) = incomplete_snapshot_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
-            let (_tokenizer, res) = load_residency(&spec, MODEL_ID, PRECISION_MSG, FILE_MSG)
+            let (_tokenizer, res) = load_residency(&spec, MODEL_ID, PRECISION_ERROR, FILE_ERROR)
                 .unwrap_or_else(|error| {
                     panic!("{policy:?} must defer absent heavy components: {error}")
                 });
@@ -1230,7 +1230,7 @@ mod tests {
         .unwrap();
         let mismatch = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
             .with_text_encoder(WeightsSource::Dir(packed_q4.path().to_path_buf()));
-        let error = load_residency(&mismatch, MODEL_ID, PRECISION_MSG, FILE_MSG)
+        let error = load_residency(&mismatch, MODEL_ID, PRECISION_ERROR, FILE_ERROR)
             .err()
             .expect("packed encoder mismatch")
             .to_string();
@@ -1241,6 +1241,6 @@ mod tests {
         gen_core_testkit::write_encoder_contract_fixture(dense.path(), contract).unwrap();
         let inherited = LoadSpec::new(WeightsSource::Dir(base.path().to_path_buf()))
             .with_text_encoder(WeightsSource::Dir(dense.path().to_path_buf()));
-        load_residency(&inherited, MODEL_ID, PRECISION_MSG, FILE_MSG).unwrap();
+        load_residency(&inherited, MODEL_ID, PRECISION_ERROR, FILE_ERROR).unwrap();
     }
 }
