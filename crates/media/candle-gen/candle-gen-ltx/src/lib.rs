@@ -60,6 +60,7 @@ pub mod memory_strategy_2_5;
 pub mod params;
 pub mod pipeline;
 pub mod quant;
+pub mod quant_eval;
 pub mod rope;
 pub mod text_encoder;
 pub mod tier;
@@ -95,6 +96,7 @@ use config::{
 use diff_vae::{NaDiffusionDecoder, NaDiffusionDecoderConfig};
 use duration_head::DurationHead;
 use gemma4_te::Ltx25TextEncoder;
+use quant_eval::{Ltx25GpuGeneration, Ltx25QuantAdmission, Ltx25QuantMode};
 use text_encoder::LtxTextEncoder;
 use tokenizer::{ensure_single_leading_bos_u32, gemma_bos_id, Ltx25Tokenizer};
 use transformer::AvDiT;
@@ -232,7 +234,12 @@ impl Pipeline {
         bundle: LtxBundle,
         device: &Device,
         use_diffusion_decoder: bool,
+        quant_mode: Ltx25QuantMode,
     ) -> gen_core::Result<Self> {
+        // Re-bind the selected precision when materialization begins. This is deliberately not just
+        // a load-time descriptor check: replacing a staged component between construction and the
+        // lazy request load must refuse rather than render its bf16/q4 numerics under another label.
+        quant_mode.validate_bundle_source(&bundle)?;
         let av_cfg = AvConfig::from_bundle(&bundle)?;
         let conn_cfg = ConnectorConfig::from_bundle(&bundle)?;
         let audio_conn_cfg = ConnectorConfig::audio_from_bundle(&bundle)?;
@@ -1902,6 +1909,9 @@ pub struct Ltx25Generator {
     bundle: LtxBundle,
     device: Device,
     use_diffusion_decoder: bool,
+    /// Exact selected source mode; retained by the ordinary provider so a later load cannot
+    /// silently report q4/bf16 after a distinct selector was requested.
+    quant_mode: Ltx25QuantMode,
     components: Mutex<Option<Components>>,
 }
 
@@ -1915,10 +1925,14 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "ltx_2_5_distilled: LoRA/LoKr adapters are not supported by the split route".into(),
         ));
     }
-    if spec.quantize.is_some() && spec.quantize != Some(Quant::Q4) {
-        return Err(gen_core::Error::Unsupported(
-            "ltx_2_5_distilled: only the released q4 component tier is supported".into(),
-        ));
+    let quant_mode = Ltx25QuantMode::from_load_spec(spec)?;
+    let device = candle_gen::default_device()?;
+    let gpu = Ltx25GpuGeneration::from_device(&device)?;
+    match quant_eval::admit(quant_mode, gpu, quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS) {
+        Ltx25QuantAdmission::Admitted => {}
+        Ltx25QuantAdmission::Refused { reason } => {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
     }
     let resolved = bundle::resolve_split_bundle(spec)?;
     if resolved.layout() != LtxCheckpointLayout::Split {
@@ -1933,15 +1947,21 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         .contains_key(LtxComponent::DiffusionVideoVae.id());
     // Validate every production component/config now.  The actual constructors are deliberately
     // deferred until generation so normal provider/catalog construction is weights-free.
-    let pipe = Pipeline::load_split(resolved.clone(), &Device::Cpu, use_diffusion_decoder)?;
+    let pipe = Pipeline::load_split(
+        resolved.clone(),
+        &Device::Cpu,
+        use_diffusion_decoder,
+        quant_mode,
+    )?;
     resolved.require(LtxComponent::DurationHead)?;
     resolved.require(LtxComponent::TemporalUpsampler)?;
     drop(pipe);
     Ok(Box::new(Ltx25Generator {
         descriptor: descriptor_25(),
         bundle: resolved,
-        device: candle_gen::default_device()?,
+        device,
         use_diffusion_decoder,
+        quant_mode,
         components: Mutex::new(None),
     }))
 }
@@ -1987,6 +2007,7 @@ impl Generator for Ltx25Generator {
             self.bundle.clone(),
             &self.device,
             self.use_diffusion_decoder,
+            self.quant_mode,
         )?;
         let mut slot = candle_gen::lock_recover(&self.components);
         let want_encoder = needs_ltx_vae_encoder(req);
@@ -2093,6 +2114,7 @@ mod tests {
                 .expect("empty validation-only bundle"),
             device: Device::Cpu,
             use_diffusion_decoder: false,
+            quant_mode: Ltx25QuantMode::Bf16,
             components: Mutex::new(None),
         };
         let request = GenerationRequest {
@@ -2126,6 +2148,32 @@ mod tests {
         Generator::validate(&generator, &temporal).expect("declared temporal-DFR axis must pass");
 
         assert!(generator.descriptor.capabilities.supports_diffusion_decoder);
+        assert_eq!(
+            generator.descriptor.capabilities.supported_quants,
+            &[Quant::Q4],
+            "unmeasured int8-convrot/nvfp4 must stay out of the catalog surface"
+        );
+    }
+
+    #[test]
+    fn ltx25_catalog_route_reaches_the_quant_policy_before_bundle_loading() {
+        // This is intentionally an ordinary registry load, not a selector helper. The nonexistent
+        // root proves that Q8 is parsed as the LTX ConvRot option at the provider boundary before
+        // file discovery could accidentally select a different precision.
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx25".into())).with_quant(Quant::Q8);
+        let result = crate::provider_registry()
+            .expect("provider registry")
+            .load(MODEL_25_ID, &spec);
+        let error = match result {
+            Ok(_) => panic!("unmeasured ConvRot must fail closed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("int8-convrot"), "got: {error}");
+        assert!(
+            error.contains("terminal measurement case") || error.contains("not catalog-adopted"),
+            "quant policy must run before missing-bundle discovery, got: {error}"
+        );
     }
 
     #[test]
@@ -2146,6 +2194,25 @@ mod tests {
         assert!(renderer.contains("resolve_request_num_frames("));
         assert!(renderer.contains("self.render_dfr("));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
+    }
+
+    #[test]
+    fn ltx25_provider_path_cannot_bypass_selected_quant_mode() {
+        // Mutation-sensitive companion to the real registry-load witness above: a future refactor
+        // cannot remove the materialization-time binding and accidentally load bf16 components
+        // after an advanced selection has passed the policy gate.
+        let source = include_str!("lib.rs");
+        let loader = source
+            .split("pub fn load_25")
+            .nth(1)
+            .expect("LTX-2.5 registry loader exists");
+        assert!(loader.contains("Ltx25QuantMode::from_load_spec(spec)"));
+        assert!(loader.contains("quant_eval::admit(quant_mode"));
+        let split_loader = source
+            .split("fn load_split(")
+            .nth(1)
+            .expect("split materializer exists");
+        assert!(split_loader.contains("quant_mode.validate_bundle_source(&bundle)"));
     }
 
     #[test]
