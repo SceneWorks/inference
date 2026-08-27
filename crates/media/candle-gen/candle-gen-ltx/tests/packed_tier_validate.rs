@@ -1333,18 +1333,56 @@ mod ltx25_validation {
     /// A SceneWorks-converted **2.3** tree also ships a `split_model.json`. It must not be picked up
     /// as a 2.5 bundle, or the 2.3 path this story is required to leave alone would stop being
     /// reachable.
+    ///
+    /// Read from the **committed real** 2.3 manifest
+    /// (`mlx-gen-ltx/tests/fixtures/ltx_2_3_split_model.json`), not from this file's own generator
+    /// with the version flipped. That distinction is the whole test: the generator emits the 2.5
+    /// schema, so a synthetic "2.3" manifest still carries `component_detail` and `tier` and would
+    /// pass a `detect` that parsed the 2.5 schema before gating on the version. The real 2.3
+    /// manifest carries **neither** — it is `format` / `model_version` / `components` / `source` /
+    /// `variant` / `quantized` / `quantization_*` and nothing else — so it is the only fixture that
+    /// can tell the two orderings apart.
     #[test]
-    fn a_2_3_manifest_is_not_detected_as_a_2_5_tier() {
-        let mut spec = BundleSpec::q4();
-        spec.model_version = "2.3.0";
-        let root = tempfile::tempdir().expect("tempdir");
-        let dir = spec.build(root.path());
+    fn the_committed_real_2_3_manifest_is_not_detected_as_a_2_5_tier() {
+        const REAL_2_3_MANIFEST: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mlx-gen/mlx-gen-ltx/tests/fixtures/ltx_2_3_split_model.json"
+        );
+        let manifest = std::fs::read_to_string(REAL_2_3_MANIFEST)
+            .unwrap_or_else(|e| panic!("read {REAL_2_3_MANIFEST}: {e}"));
+        // Guard the fixture itself: if a future 2.3 manifest grows these keys, this test would
+        // silently stop distinguishing the two parse orders.
+        let value: serde_json::Value = serde_json::from_str(&manifest).expect("fixture is JSON");
         assert!(
-            Ltx25Tier::detect(&dir)
-                .expect("a 2.3 manifest parses")
+            value.get("component_detail").is_none() && value.get("tier").is_none(),
+            "the real 2.3 manifest must carry neither `component_detail` nor `tier`, or this test \
+             no longer discriminates the parse order"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("split_model.json"), &manifest).expect("write");
+        assert!(
+            Ltx25Tier::detect(root.path())
+                .expect("a real 2.3 manifest is `not mine`, never a hard error")
                 .is_none(),
             "a 2.3 tree must keep taking the 2.3 path"
         );
+    }
+
+    /// A manifest that declares no `model_version` at all — pre-`model_version` trees exist, and
+    /// the shared resolver reads an undeclared version as the oldest layout. `Ok(None)`, not an
+    /// error, and in particular not a demand for the 2.5 schema.
+    #[test]
+    fn a_manifest_without_a_model_version_is_not_a_2_5_tier() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("split_model.json"),
+            r#"{"format":"split","components":["transformer"]}"#,
+        )
+        .expect("write");
+        assert!(Ltx25Tier::detect(root.path())
+            .expect("an undeclared version is `not mine`, never a hard error")
+            .is_none());
     }
 
     /// A directory with no manifest is not a 2.5 tier, and that is not an error.

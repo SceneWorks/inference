@@ -616,14 +616,15 @@ impl Ltx25TierManifest {
         self.quantized.then_some(self.quant)
     }
 
-    /// Parse `<dir>/split_model.json`.
+    /// Parse `<dir>/split_model.json` as a **2.5** manifest.
+    ///
+    /// Every key of the 2.5 schema is required. Callers that do not already know the manifest is a
+    /// 2.5 one must go through [`Ltx25Tier::detect`], which gates on the declared `model_version`
+    /// first — an LTX-**2.3** converted tree ships a `split_model.json` too, and it carries none of
+    /// the keys below.
     pub fn from_dir(dir: &Path) -> CResult<Self> {
         let path = dir.join(TIER_MANIFEST_FILE);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| CandleError::Msg(format!("ltx 2.5 tier: read {}: {e}", path.display())))?;
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            CandleError::Msg(format!("ltx 2.5 tier: parse {}: {e}", path.display()))
-        })?;
+        let json = read_manifest_json(&path)?;
         Self::from_value(&path, &json)
     }
 
@@ -672,21 +673,42 @@ pub struct Ltx25Tier {
 impl Ltx25Tier {
     /// Detect an LTX-2.5 tier at `dir`.
     ///
-    /// * `Ok(None)` — `dir` ships no [`TIER_MANIFEST_FILE`], or the manifest's declared
-    ///   `model_version` is not one that ships split (a SceneWorks-converted **2.3** tree also
-    ///   carries a `split_model.json`, and must keep taking the 2.3 path).
-    /// * `Err` — the manifest is present but unreadable or malformed. Never `Ok(None)`: a broken
-    ///   manifest that silently reported "not a 2.5 tier" would fall through to a loader that picks
-    ///   files by name.
+    /// * `Ok(None)` — `dir` ships no [`TIER_MANIFEST_FILE`], or its manifest does not declare a
+    ///   `model_version` that ships split.
+    /// * `Err` — the manifest declares a split version and is then unreadable or malformed. A
+    ///   broken 2.5 manifest reported as `Ok(None)` would fall through to a loader that picks files
+    ///   by name.
+    ///
+    /// # The order of these two steps is the contract
+    ///
+    /// The `model_version` gate runs **alone, and first** — before a single key of the 2.5 schema
+    /// is required. A SceneWorks-converted LTX-**2.3** tree ships a `split_model.json` too, and it
+    /// carries `format` / `model_version` / `components` / `quantized` / `quantization_*` but
+    /// **no** `component_detail` and **no** `tier` (see
+    /// `mlx-gen-ltx/tests/fixtures/ltx_2_3_split_model.json`, the committed real one). Parsing the
+    /// 2.5 schema before gating would turn every 2.3 tier into a hard error here instead of a clean
+    /// "not mine" — and the caller that error reaches is a dispatcher whose whole job is to fall
+    /// through to [`TierPaths`].
+    ///
+    /// A manifest with **no** `model_version` key at all is likewise `Ok(None)`, not an error:
+    /// [`layout_for_declared_version`] reads an undeclared version as the oldest layout, and
+    /// pre-`model_version` trees exist.
     pub fn detect(dir: &Path) -> CResult<Option<Self>> {
-        if !dir.join(TIER_MANIFEST_FILE).is_file() {
+        let path = dir.join(TIER_MANIFEST_FILE);
+        if !path.is_file() {
             return Ok(None);
         }
-        let manifest = Ltx25TierManifest::from_dir(dir)?;
-        if layout_for_declared_version(Some(&manifest.model_version)) != LtxCheckpointLayout::Split
-        {
+        let json = read_manifest_json(&path)?;
+        // Step 1: the version gate, on `model_version` and nothing else.
+        let declared = json
+            .get(candle_gen::gen_core::ltx_checkpoint::MODEL_VERSION_METADATA_KEY)
+            .and_then(serde_json::Value::as_str);
+        if layout_for_declared_version(declared) != LtxCheckpointLayout::Split {
             return Ok(None);
         }
+        // Step 2: this manifest says it is a split-layout release, so the 2.5 schema is now
+        // required and anything missing from it is a real fault.
+        let manifest = Ltx25TierManifest::from_value(&path, &json)?;
         Ok(Some(Ltx25Tier {
             dir: dir.to_path_buf(),
             manifest,
@@ -715,7 +737,7 @@ impl Ltx25Tier {
     ) -> Result<&Ltx25ManifestComponent, Ltx25TierError> {
         self.manifest.component(component.id()).ok_or_else(|| {
             Ltx25TierError::MissingComponentEntry {
-                component: component.id(),
+                component: component.id().to_string(),
                 tier: self.manifest.tier.clone(),
                 manifest: self.dir.join(TIER_MANIFEST_FILE),
             }
@@ -731,7 +753,7 @@ impl Ltx25Tier {
         let path = self.dir.join(&row.file);
         if !path.is_file() {
             return Err(Ltx25TierError::MissingComponentFile {
-                component: component.id(),
+                component: component.id().to_string(),
                 path,
             });
         }
@@ -806,7 +828,9 @@ impl Ltx25Tier {
     /// 3. a file whose packed-Linear count disagrees with the manifest (a bf16 file dropped into a
     ///    quantized tier, or the reverse);
     /// 4. a packed triple whose shapes disagree with the declared `bits`/`group` — the check that
-    ///    catches a **q8 file inside a q4 tier**, which every count above passes unchanged;
+    ///    catches a **q8 file inside a q4 tier**, which every count above passes unchanged. It pins
+    ///    the *product* `bits·group` rather than each independently; check 9 pinning `group` is
+    ///    what makes it decisive for the shipped tiers (see the note at the check itself);
     /// 5. an incomplete packed triple, or packed codes stored at a float dtype;
     /// 6. a component stamped with a different `sceneworks_tier` or `model_version`;
     /// 7. a component that is dense inside a quantized tier without declaring why;
@@ -842,13 +866,13 @@ impl Ltx25Tier {
             let path = self.dir.join(&row.file);
             if !path.is_file() {
                 return Err(Ltx25TierError::MissingComponentFile {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path,
                 });
             }
             let headers = safetensors_path_tensor_headers(&path).map_err(|error| {
                 Ltx25TierError::UnreadableComponent {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.clone(),
                     detail: error.to_string(),
                 }
@@ -857,7 +881,7 @@ impl Ltx25Tier {
             // does not (q4 and q8 transformers hold the same 6779), check (4) still catches it.
             if headers.len() != row.tensors {
                 return Err(Ltx25TierError::TensorCountMismatch {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path,
                     declared: row.tensors,
                     actual: headers.len(),
@@ -867,7 +891,7 @@ impl Ltx25Tier {
             // (3) Packed-Linear count.
             if packed != row.quantized_linears {
                 return Err(Ltx25TierError::PackedCountMismatch {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path,
                     declared: row.quantized_linears,
                     actual: packed,
@@ -881,7 +905,7 @@ impl Ltx25Tier {
                     .zip(row.dense_reason_detail.as_deref());
                 if declared.is_none() {
                     return Err(Ltx25TierError::UndeclaredDenseComponent {
-                        component: leaked_id(&row.name),
+                        component: row.name.clone(),
                         tier: manifest.tier.clone(),
                     });
                 }
@@ -918,7 +942,7 @@ impl Ltx25Tier {
             // (8) The dense tier packs nothing, anywhere.
             let Some(quant) = self.manifest.quant() else {
                 return Err(Ltx25TierError::PackedTensorInDenseTier {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     tensor: header.name.clone(),
                 });
@@ -931,7 +955,7 @@ impl Ltx25Tier {
             let biases = by_name.get(format!("{base}.biases").as_str()).copied();
             let (Some(weight), Some(biases)) = (weight, biases) else {
                 return Err(Ltx25TierError::IncompletePackedTriple {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     base: base.to_string(),
                     has_weight: weight.is_some(),
@@ -942,7 +966,7 @@ impl Ltx25Tier {
             // *readable* — and every value would be wrong.
             if weight.dtype != Dtype::U32 {
                 return Err(Ltx25TierError::PackedWeightDtype {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     tensor: weight.name.clone(),
                     dtype: weight.dtype.as_str(),
@@ -950,7 +974,7 @@ impl Ltx25Tier {
             }
             if biases.shape != header.shape {
                 return Err(Ltx25TierError::PackedTripleShape {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     base: base.to_string(),
                     shapes: PackedShapes::boxed(&header.shape, &biases.shape),
@@ -959,12 +983,22 @@ impl Ltx25Tier {
             // (4) The declared geometry, asserted against this triple's own shapes.
             //
             // `weight` is `[out, in·bits/32]` and `scales` is `[out, in/group]`, so
-            // `32·weight_cols == bits·group·scales_cols` for every packed weight in the tier —
-            // an exact integer identity, no tolerance and no inference. A q8 file inside a q4 tier
-            // doubles the left side alone and is refused here, having passed every count above.
+            // `32·weight_cols == bits·group·scales_cols` for every packed weight in the tier — an
+            // exact integer identity, no tolerance and no inference.
+            //
+            // What it pins, precisely: the **product** `bits·group`, not `bits` and `group`
+            // independently. A q8/group-32 triple satisfies a q4/group-64 declaration exactly
+            // (8·32 == 4·64), and this check alone would pass it. What makes it decisive for every
+            // tier this loader will actually see is check (9), which already ran and pinned
+            // `group` to `crate::quant::GROUP_SIZE`: with `group` fixed, the product determines
+            // `bits`. A future tier at a different group has to widen (9) first, and the pairing
+            // must be re-argued there rather than inherited from here.
+            //
+            // Within that pinned group, a q8 file inside a q4 tier doubles the left side alone and
+            // is refused here, having passed every count above.
             let (Some(&out_w), Some(&cols_w)) = (weight.shape.first(), weight.shape.get(1)) else {
                 return Err(Ltx25TierError::PackedTripleShape {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     base: base.to_string(),
                     shapes: PackedShapes::boxed(&header.shape, &weight.shape),
@@ -972,7 +1006,7 @@ impl Ltx25Tier {
             };
             let (Some(&out_s), Some(&cols_s)) = (header.shape.first(), header.shape.get(1)) else {
                 return Err(Ltx25TierError::PackedTripleShape {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     base: base.to_string(),
                     shapes: PackedShapes::boxed(&header.shape, &biases.shape),
@@ -980,7 +1014,7 @@ impl Ltx25Tier {
             };
             if out_w != out_s || 32 * cols_w != quant.bits * quant.group * cols_s {
                 return Err(Ltx25TierError::PackedGeometryMismatch {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     base: base.to_string(),
                     declared: quant,
@@ -1000,7 +1034,7 @@ impl Ltx25Tier {
     ) -> Result<(), Ltx25TierError> {
         let metadata = LtxCheckpointMetadata::from_file(path).map_err(|error| {
             Ltx25TierError::UnreadableComponent {
-                component: leaked_id(&row.name),
+                component: row.name.clone(),
                 path: path.to_path_buf(),
                 detail: error.to_string(),
             }
@@ -1008,14 +1042,14 @@ impl Ltx25Tier {
         match metadata.raw().get(TIER_METADATA_KEY) {
             None => {
                 return Err(Ltx25TierError::TierStampMissing {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     expected: self.manifest.tier.clone(),
                 })
             }
             Some(stamped) if *stamped != self.manifest.tier => {
                 return Err(Ltx25TierError::TierStampMismatch {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     expected: self.manifest.tier.clone(),
                     stamped: stamped.clone(),
@@ -1026,7 +1060,7 @@ impl Ltx25Tier {
         match metadata.model_version() {
             Some(version) if version != self.manifest.model_version => {
                 return Err(Ltx25TierError::ModelVersionMismatch {
-                    component: leaked_id(&row.name),
+                    component: row.name.clone(),
                     path: path.to_path_buf(),
                     expected: self.manifest.model_version.clone(),
                     declared: version.to_string(),
@@ -1120,7 +1154,7 @@ pub enum Ltx25TierError {
     /// The manifest lists no row for a component this engine needs.
     MissingComponentEntry {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The tier that is missing it.
         tier: String,
         /// The manifest that should have listed it.
@@ -1129,14 +1163,14 @@ pub enum Ltx25TierError {
     /// The manifest lists the component, and the file it names is not there.
     MissingComponentFile {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The path the manifest named.
         path: PathBuf,
     },
     /// A component file exists and its safetensors header could not be read.
     UnreadableComponent {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The underlying reader's message.
@@ -1145,7 +1179,7 @@ pub enum Ltx25TierError {
     /// The file holds a different number of tensors than the manifest declares.
     TensorCountMismatch {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// What the manifest declared.
@@ -1156,7 +1190,7 @@ pub enum Ltx25TierError {
     /// The file holds a different number of packed Linears than the manifest declares.
     PackedCountMismatch {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// What the manifest declared.
@@ -1167,7 +1201,7 @@ pub enum Ltx25TierError {
     /// A packed triple is missing its weight or its biases.
     IncompletePackedTriple {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The triple's base key.
@@ -1180,7 +1214,7 @@ pub enum Ltx25TierError {
     /// A packed weight is stored at a dtype other than `U32`.
     PackedWeightDtype {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The tensor.
@@ -1191,7 +1225,7 @@ pub enum Ltx25TierError {
     /// A packed triple's legs disagree on shape, or are not rank 2.
     PackedTripleShape {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The triple's base key.
@@ -1202,7 +1236,7 @@ pub enum Ltx25TierError {
     /// A packed triple's shapes do not match the tier's declared bits/group.
     PackedGeometryMismatch {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The triple's base key.
@@ -1215,7 +1249,7 @@ pub enum Ltx25TierError {
     /// A packed tensor was found inside a tier the manifest declares dense.
     PackedTensorInDenseTier {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The packed tensor.
@@ -1224,7 +1258,7 @@ pub enum Ltx25TierError {
     /// A component carries no `sceneworks_tier` stamp.
     TierStampMissing {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The tier it should have been stamped with.
@@ -1233,7 +1267,7 @@ pub enum Ltx25TierError {
     /// A component is stamped with a different tier than the one it sits in.
     TierStampMismatch {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The tier the manifest declares.
@@ -1244,7 +1278,7 @@ pub enum Ltx25TierError {
     /// A component declares a different `model_version` than the rest of the bundle.
     ModelVersionMismatch {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The file.
         path: PathBuf,
         /// The manifest's version.
@@ -1255,7 +1289,7 @@ pub enum Ltx25TierError {
     /// A component is dense inside a quantized tier and does not say why.
     UndeclaredDenseComponent {
         /// The component id.
-        component: &'static str,
+        component: String,
         /// The tier it is dense in.
         tier: String,
     },
@@ -1456,17 +1490,13 @@ fn remap_diff_vae_stat_key(key: &str) -> String {
     }
 }
 
-/// The `&'static str` id for a manifest row's name.
-///
-/// Rows this reader names resolve to their own `'static` id; a row it does not name keeps its text
-/// by leaking it. Validation runs a bounded number of times over a bounded manifest, and the
-/// alternative — an owned `String` in every error variant — would make the common case (a known
-/// component) carry an allocation to describe a case that does not occur in a shipped tier.
-fn leaked_id(name: &str) -> &'static str {
-    match Ltx25Component::from_id(name) {
-        Some(component) => component.id(),
-        None => Box::leak(name.to_string().into_boxed_str()),
-    }
+/// Read and JSON-parse a tier manifest. Errors only on "cannot read" / "not JSON" — every schema
+/// question is the caller's, so [`Ltx25Tier::detect`] can ask the version question first.
+fn read_manifest_json(path: &Path) -> CResult<serde_json::Value> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CandleError::Msg(format!("ltx 2.5 tier: read {}: {e}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|e| CandleError::Msg(format!("ltx 2.5 tier: parse {}: {e}", path.display())))
 }
 
 /// A required string field. Present-but-not-a-string is an error, never a default.

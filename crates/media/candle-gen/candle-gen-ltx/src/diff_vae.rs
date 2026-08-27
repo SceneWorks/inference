@@ -576,6 +576,22 @@ fn affine(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
 /// 834 MB → 235 MB actually comes from. The packed arm keeps the compact
 /// [`QTensor`](candle_gen::candle_core::quantized::QTensor) resident and materialises a dense weight
 /// only for the duration of a forward — the same trade the DiT's [`crate::quant::qlinear`] makes.
+///
+/// # The trade this makes, stated rather than implied
+///
+/// The dense weight is **not cached**. Every [`Weight::materialize`] decodes the full `[out, in]`
+/// matrix again, so a q4 decode pays the dequant of all 137 packed Linears **once per forward** —
+/// and `NaDiffusionDecoder::decode_tiled` runs the decoder body per tile, so it pays it once per
+/// tile, not once per decode. (Upstream's `default_num_inference_steps` for this decoder is 1, so
+/// the multi-*step* multiplier is normally absent; the per-tile one is not.)
+///
+/// Caching would trade that back for resident memory, and the trade is bad here in exactly the way
+/// that matters: the dense forms of this component's weights are 834 MB against the 235 MB the q4
+/// tier ships, so a full cache gives back the entire reason the tier packs this component at all.
+/// A bounded or per-decode cache is a real option, but it is a *budget* decision about how much
+/// transient the decode may hold — which is sc-18799's (`Memory ladder: budget the DiffVAE decode
+/// for LTX-2.5`). Until that lands, this stays on the side that cannot silently blow a VRAM
+/// budget.
 enum Weight {
     /// `[out, in]`, read verbatim.
     Dense(Tensor),
@@ -619,6 +635,9 @@ impl Weight {
     }
 
     /// The dense `[out, in]` weight at `dtype`, for one forward.
+    ///
+    /// Recomputed on every call by design — see the trade at [`Weight`]. A caller in a loop that
+    /// reuses the same weight should hoist this out of the loop the way [`SwiGlu::forward`] does.
     fn materialize(&self, dtype: DType, device: &Device) -> Result<Tensor> {
         match self {
             Weight::Dense(w) => w.to_dtype(dtype),
@@ -676,6 +695,14 @@ impl RawWeight {
         // repacked under it. `q` is `[out, in·bits/32]` and `scales` is `[out, in/group]`, so
         // `32·q_cols == bits·group·scales_cols` exactly. Without this a q8 triple repacked under a
         // q4 declaration would produce plausible-looking, entirely wrong weights.
+        //
+        // Note what this pins: the **product** `bits·group`, not each independently — a
+        // q8/group-32 triple satisfies a q4/group-64 declaration (8·32 == 4·64). That is not a
+        // hole in practice, because the repack this feeds
+        // (`candle_gen::quant::repack_packed_weight`) derives its own width from the same product
+        // and bails on anything that is not 4 or 8, and because `Ltx25Tier::validate` refuses a
+        // manifest whose group is not `crate::quant::GROUP_SIZE` before any of this runs. A tier
+        // at a new group has to re-argue both.
         let (q_out, q_cols) = q.dims2()?;
         let (s_out, s_cols) = scales.dims2()?;
         if q_out != s_out || 32 * q_cols != quant.bits * quant.group * s_cols {
