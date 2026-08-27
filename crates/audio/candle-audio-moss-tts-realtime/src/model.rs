@@ -216,19 +216,6 @@ impl Loaded {
     }
 }
 
-/// Default RVQ frames per streaming block (≈ 0.64 s at 12.5 fps). Sized down per request so a short
-/// clip still yields ≥ 2 chunks (the streaming incrementality law).
-const DEFAULT_FRAMES_PER_BLOCK: usize = 8;
-
-/// The streaming block size for a clip of `budget_frames` (the AR frame budget): at most
-/// [`DEFAULT_FRAMES_PER_BLOCK`], but never more than half the budget, so a budget-reaching run of
-/// `≥ 2` frames always streams `≥ 2` chunks.
-fn frames_per_block(budget_frames: usize) -> usize {
-    DEFAULT_FRAMES_PER_BLOCK
-        .min(budget_frames.div_ceil(2))
-        .max(1)
-}
-
 /// A loaded (lazy) MOSS-TTS-Realtime generator.
 pub struct MossTtsRealtimeGenerator {
     descriptor: ModelDescriptor,
@@ -457,7 +444,7 @@ impl MossTtsRealtimeGenerator {
         // per *turn* (not per block as the single-turn `StreamingChunker` path is): first-chunk latency
         // is one whole turn, not one block — the multi-turn session trades intra-turn streaming for the
         // per-turn independence that keeps A (batch) and B (session) byte-identical.
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * codec.samples_per_frame();
+        let block_samples = crate::codec::DECODE_FRAMES_PER_BLOCK * codec.samples_per_frame();
         let mut all: Vec<f32> = Vec::new();
         let mut chunk_index = 0usize;
         for frames in &rendered.turns {
@@ -597,15 +584,13 @@ impl MossTtsRealtimeGenerator {
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
         // so the gen-core reproducibility law holds and generate/generate_streaming agree.
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
-        // Block sizing is driven by the frame budget (known up front, before the loop): at most
-        // DEFAULT_FRAMES_PER_BLOCK and never more than half the budget, so a budget-reaching run
-        // always streams >= 2 chunks.
-        let block = frames_per_block(budget);
-
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), block);
+        let mut chunker = crate::chunk::StreamingChunker::new(
+            codec.as_ref(),
+            crate::codec::DECODE_FRAMES_PER_BLOCK,
+        );
         let mut canceled = false;
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
@@ -801,7 +786,7 @@ impl ConversationSession for MossConversationSession {
                 ..Default::default()
             });
         }
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
+        let block_samples = crate::codec::DECODE_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
         let pcm = self
             .codec
             .decode_frames(&frames, &probe)

@@ -68,6 +68,10 @@ pub const DOWNSAMPLE_RATE: usize = 1920;
 pub const CODEBOOK_SIZE: usize = 1024;
 /// Per-code latent dimension (the `Embedding` width).
 pub const CODEBOOK_DIM: usize = 8;
+/// Canonical RVQ-frame partition for every production decode route. Keeping one fixed partition is
+/// load-bearing for exact one-shot/streaming identity: attention reductions over different widths
+/// are numerically equivalent but not byte-identical.
+pub(crate) const DECODE_FRAMES_PER_BLOCK: usize = 8;
 
 fn resample_for_encode(samples: &[f32], sample_rate: u32, native_rate: u32) -> Result<Vec<f32>> {
     candle_audio::dsp::resample(samples, sample_rate, native_rate, 1)
@@ -785,25 +789,6 @@ impl CodecStage {
         state.position = next_position;
         h.transpose(1, 2)?.contiguous()
     }
-
-    /// Decode with a bounded attention working set. Short inputs retain the historical single-shot
-    /// path exactly; longer inputs use the stage's causal-context window as the chunk size. That
-    /// keeps each attention score/mask allocation bounded by the model's fixed context instead of
-    /// the request's (potentially 40-minute) duration.
-    fn forward_decode_bounded(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let t = x.dim(2)?;
-        match bounded_decode_chunk_len(t, self.context) {
-            Some(chunk_len) => self.forward_chunked(x, chunk_len),
-            None => self.forward(x),
-        }
-    }
-}
-
-/// Select the bounded decoder path only once a sequence exceeds the stage's fixed causal context.
-/// Keeping this decision separate makes the advertised-duration work bound directly testable without
-/// loading codec weights or constructing a large tensor.
-fn bounded_decode_chunk_len(sequence_len: usize, context: usize) -> Option<usize> {
-    (sequence_len > context).then_some(context.max(1))
 }
 
 /// `PatchedPretransform.decode`: `[b, d·h, l] → [b, d, l·h]` (channels→time upsample by `h`).
@@ -1161,12 +1146,11 @@ impl MossAudioCodec {
         Ok(Some(wav))
     }
 
-    /// Decode a block of RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into an
-    /// interleaved mono PCM `Vec<f32>` of `frames.len() * downsample_rate` samples. Each decoder
-    /// stage keeps its historical single-shot path through one causal-context window, then streams
-    /// longer inputs through bounded windows; consequently no stage materializes a duration-sized
-    /// quadratic attention mask or score tensor. `cancel` is polled once up front (each stage is a
-    /// bounded matmul; the AR loop is where cancellation primarily lands).
+    /// Decode RVQ frames (`frames[f][q]` = codebook `q`'s code at frame `f`) into interleaved mono
+    /// PCM. This one-shot entry point deliberately drives the same request-local incremental decoder
+    /// in `DECODE_FRAMES_PER_BLOCK`-frame partitions as live synthesis. The shared partition makes
+    /// the returned samples byte-identical to concatenated streaming blocks while preserving the
+    /// bounded attention/state guarantees of [`decode_incremental`](Self::decode_incremental).
     pub fn decode_frames(
         &self,
         frames: &[Vec<u32>],
@@ -1175,40 +1159,21 @@ impl MossAudioCodec {
         if frames.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        if cancel() {
-            return Ok(None);
-        }
-        // Transpose frames [T][nq] → per-quantizer rows [nq][T] for the RLFQ decode.
-        let nq = self.num_code_quantizers;
-        let t = frames.len();
-        let mut rows: Vec<Vec<u32>> = vec![Vec::with_capacity(t); nq];
-        for frame in frames {
-            for (q, row) in rows.iter_mut().enumerate() {
-                // A frame shorter than nq (shouldn't happen) is padded with code 0.
-                row.push(frame.get(q).copied().unwrap_or(0));
-            }
-        }
-        let debug = std::env::var_os("MOSS_CODEC_DEBUG").is_some();
-        let mut x = self.quantizer.decode(&rows, &self.device)?; // [1, code_dim, T]
-        if debug {
-            eprintln!("[codec] after quantizer: {:?} rms={:.5}", x.dims(), rms(&x));
-        }
-        for (si, stage) in self.stages.iter().enumerate() {
-            if cancel() {
+        let capacity = frames
+            .len()
+            .checked_mul(self.config.downsample_rate)
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg("codec output length overflow".to_owned())
+            })?;
+        let mut state = self.new_decode_state();
+        let mut wav = Vec::with_capacity(capacity);
+        for block in frames.chunks(DECODE_FRAMES_PER_BLOCK) {
+            let Some(pcm) = self.decode_incremental(&mut state, block, cancel)? else {
                 return Ok(None);
-            }
-            x = stage.forward_decode_bounded(&x)?;
-            if debug {
-                eprintln!(
-                    "[codec] after stage {si} (before unpatch): {:?} rms={:.5}",
-                    x.dims(),
-                    rms(&x)
-                );
-            }
-            x = patched_unpatch(&x, PATCH_SIZES[si])?;
+            };
+            wav.extend(pcm);
         }
-        // x is [1, 1, T*downsample_rate].
-        let wav = x.i((0, 0))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        debug_assert_eq!(wav.len(), capacity);
         Ok(Some(wav))
     }
 
@@ -1638,6 +1603,121 @@ mod tests {
         CodecStage::load(spec, context, module, &vb).unwrap()
     }
 
+    fn synthetic_conv1d(
+        out_channels: usize,
+        in_channels: usize,
+        seed: u64,
+        dev: &Device,
+    ) -> Conv1d {
+        Conv1d::new(
+            lcg_tensor(&[out_channels, in_channels, 1], seed, 0.15, dev),
+            Some(lcg_tensor(&[out_channels], seed + 1, 0.02, dev)),
+            Conv1dConfig::default(),
+        )
+    }
+
+    /// A small deterministic codec that preserves the production topology: RLFQ decode, all four
+    /// causal transformer stages, and the real `[2, 2, 2, 240]` patch cascade. Dimensions and layer
+    /// counts are reduced so the complete production decode seams remain cheap on CPU.
+    fn synthetic_four_stage_codec(dev: &Device) -> MossAudioCodec {
+        const NQ: usize = 2;
+        const SYNTH_CODEBOOK_SIZE: usize = 32;
+        const SYNTH_CODEBOOK_DIM: usize = 3;
+        const SYNTH_RVQ_DIM: usize = 6;
+        const SYNTH_CODE_DIM: usize = 8;
+
+        let quantizer = RlfqDecoder {
+            codebooks: (0..NQ)
+                .map(|q| {
+                    lcg_tensor(
+                        &[SYNTH_CODEBOOK_SIZE, SYNTH_CODEBOOK_DIM],
+                        0xA000 + q as u64,
+                        0.2,
+                        dev,
+                    )
+                })
+                .collect(),
+            out_projs: (0..NQ)
+                .map(|q| {
+                    synthetic_conv1d(
+                        SYNTH_RVQ_DIM,
+                        SYNTH_CODEBOOK_DIM,
+                        0xB000 + 2 * q as u64,
+                        dev,
+                    )
+                })
+                .collect(),
+            output_proj: synthetic_conv1d(SYNTH_CODE_DIM, SYNTH_RVQ_DIM, 0xC000, dev),
+            rvq_dim: SYNTH_RVQ_DIM,
+            codebook_size: SYNTH_CODEBOOK_SIZE,
+        };
+
+        // Each stage emits `next_input_dim * patch` channels, exactly as the production graph does.
+        let specs = [
+            StageSpec {
+                index: 0,
+                input_dim: SYNTH_CODE_DIM,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 2,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 4,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 8,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+            StageSpec {
+                index: 6,
+                input_dim: 4,
+                d_model: 16,
+                output_dim: 240,
+                num_heads: 4,
+                num_layers: 2,
+                dim_feedforward: 32,
+            },
+        ];
+        let contexts = [5, 10, 20, 40];
+        let stages = specs
+            .iter()
+            .zip(contexts)
+            .map(|(spec, context)| synthetic_stage(spec, "decoder", context, dev))
+            .collect();
+
+        MossAudioCodec {
+            config: CodecConfig {
+                sample_rate: SAMPLE_RATE,
+                downsample_rate: DOWNSAMPLE_RATE,
+                context_duration: CONTEXT_DURATION_SECS,
+                num_quantizers: NQ,
+                codebook_size: SYNTH_CODEBOOK_SIZE,
+                codebook_dim: SYNTH_CODEBOOK_DIM,
+                rvq_dim: SYNTH_RVQ_DIM,
+                output_dim: SYNTH_CODE_DIM,
+            },
+            quantizer,
+            stages,
+            num_code_quantizers: NQ,
+            device: dev.clone(),
+            shards: Vec::new(),
+            encoder: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Largest absolute elementwise difference between two same-shaped tensors.
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
         let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1791,16 +1871,10 @@ mod tests {
 
         let single = stage.forward(&x).unwrap();
         let chunked = stage.forward_chunked(&x, context).unwrap();
-        let bounded = stage.forward_decode_bounded(&x).unwrap();
         assert_eq!(
             chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             "a one-window chunk must preserve the prior single-shot bytes"
-        );
-        assert_eq!(
-            bounded.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            single.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            "the bounded decode entrypoint must preserve short-fixture bytes"
         );
     }
 
@@ -1859,10 +1933,76 @@ mod tests {
         );
     }
 
-    /// The model advertises a 40-minute (30,000-frame) realtime surface. Every decoder stage must
-    /// choose its fixed context window beyond that duration, so score/mask work is bounded by
-    /// `context * (2 * context - 1)` per head rather than the stage's full sequence square. This is
-    /// a structural allocation seam: it proves the dispatch decision without allocating the
+    /// Production-level identity gate for sc-21686. Both sides traverse the actual codec entrypoints,
+    /// including RLFQ, four retained transformer states, every patch expansion, and the streaming
+    /// chunker. The alternate-partition guard is load-bearing: the old one-shot path reduced attention
+    /// at context-sized widths and therefore matched that mutation rather than the live 8-frame path.
+    #[test]
+    fn one_shot_and_streaming_share_the_canonical_four_stage_partition() {
+        let dev = Device::Cpu;
+        let codec = synthetic_four_stage_codec(&dev);
+        let frames: Vec<Vec<u32>> = (0..(2 * DECODE_FRAMES_PER_BLOCK + 3))
+            .map(|frame| {
+                vec![
+                    ((frame * 7 + 3) % 32) as u32,
+                    ((frame * 11 + 5) % 32) as u32,
+                ]
+            })
+            .collect();
+        let no_cancel = || false;
+
+        let one_shot = codec.decode_frames(&frames, &no_cancel).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        let mut chunker = crate::chunk::StreamingChunker::new(&codec, DECODE_FRAMES_PER_BLOCK);
+        for frame in &frames {
+            chunker
+                .push(frame.clone(), &no_cancel, &mut |chunk| chunks.push(chunk))
+                .unwrap()
+                .unwrap();
+        }
+        let streamed = chunker
+            .finish(&no_cancel, &mut |chunk| chunks.push(chunk))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunks.len(), 3, "two canonical blocks plus one remainder");
+        assert_eq!(streamed.samples, one_shot);
+
+        // Mutation/discrimination guard: changing only the request partition must change exact bytes.
+        // A context-sized partition of five recreates the old one-shot stage schedule [5,10,20,40].
+        let mut alternate = crate::chunk::StreamingChunker::new(&codec, 5);
+        for frame in &frames {
+            alternate
+                .push(frame.clone(), &no_cancel, &mut |_| {})
+                .unwrap()
+                .unwrap();
+        }
+        let alternate = alternate.finish(&no_cancel, &mut |_| {}).unwrap().unwrap();
+        assert_ne!(
+            alternate.samples, one_shot,
+            "different attention reduction widths must not satisfy the exact-partition oracle"
+        );
+
+        // State mutation guard: resetting all four stage histories per canonical block must diverge.
+        let mut reset_state_output = Vec::new();
+        for block in frames.chunks(DECODE_FRAMES_PER_BLOCK) {
+            let mut reset = codec.new_decode_state();
+            reset_state_output.extend(
+                codec
+                    .decode_incremental(&mut reset, block, &no_cancel)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_ne!(
+            reset_state_output, one_shot,
+            "dropping the four-stage causal state must fail the identity gate"
+        );
+    }
+
+    /// The model advertises a 40-minute (30,000-frame) realtime surface. The canonical production
+    /// partition expands through the four decoder stages but remains request-length-independent, so
+    /// each score/mask allocation is bounded by `block * (block + context - 1)` per head rather than
+    /// the stage's full sequence square. This proves the dispatch bound without allocating the
     /// advertised-duration tensors in a host-only test.
     #[test]
     fn advertised_duration_decode_selects_bounded_attention_work() {
@@ -1874,18 +2014,17 @@ mod tests {
         );
 
         let mut sequence_len = advertised_frames;
+        let mut block_len = DECODE_FRAMES_PER_BLOCK;
         let mut frame_rate = SAMPLE_RATE as f64 / DOWNSAMPLE_RATE as f64;
         for (stage_index, patch) in PATCH_SIZES.into_iter().enumerate() {
             let context = (frame_rate * CONTEXT_DURATION_SECS).floor() as usize;
-            let chunk_len = bounded_decode_chunk_len(sequence_len, context)
-                .expect("advertised-duration stage must not use single-shot attention");
-            assert_eq!(chunk_len, context);
-            let max_scores_per_head = chunk_len * (chunk_len + context - 1);
+            let max_scores_per_head = block_len * (block_len + context - 1);
             assert!(
                 max_scores_per_head < sequence_len * sequence_len,
                 "stage {stage_index}: bounded score work must be sub-quadratic in advertised length"
             );
             sequence_len *= patch;
+            block_len *= patch;
             frame_rate *= patch as f64;
         }
     }
