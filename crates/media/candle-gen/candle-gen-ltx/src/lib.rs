@@ -1194,6 +1194,13 @@ pub fn descriptor() -> ModelDescriptor {
             // loadable compatibility paths but are deliberately not advertised as this provider's
             // request-scoped I2V memory surface.
             supported_quants: &[Quant::Q4],
+            // sc-18764 / R2 (per-backend capability honesty). Stated EXPLICITLY rather than left to
+            // `Default`, because it is a load-bearing negative: this crate has no `enhance` module
+            // on either checkpoint generation, so `enhance_prompt` must be refused by the shared
+            // floor, never silently ignored. `ltx_2_5_enhance_capability.rs` asserts both the flag
+            // and the refusal it produces; flipping this literal to `true` is the mutation that
+            // must make that test fail.
+            supports_prompt_enhancement: false,
             ..Default::default()
         },
     }

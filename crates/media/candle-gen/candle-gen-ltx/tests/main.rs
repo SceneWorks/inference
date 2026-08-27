@@ -23,6 +23,9 @@ mod duration_head_golden;
 #[path = "ltx_2_5_diffvae_parity.rs"]
 mod ltx_2_5_diffvae_parity;
 
+#[path = "ltx_2_5_enhance_capability.rs"]
+mod ltx_2_5_enhance_capability;
+
 #[path = "ltx_2_5_te_connector_inputs.rs"]
 mod ltx_2_5_te_connector_inputs;
 
