@@ -38,6 +38,20 @@ pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
 /// 8192-token bound mirrors Candle and still serves every advertised single-reference geometry.
 pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
+/// Host token ids admitted for one image-grounded edit. The ids are kept on the host during
+/// preflight and converted to MLX arrays only after the combined reference+instruction budget has
+/// passed, so the vision path consumes exactly the sequence admission checked.
+#[derive(Debug, Clone)]
+pub(crate) struct EditTokenIds {
+    ids: Vec<i32>,
+}
+
+impl EditTokenIds {
+    pub(crate) fn to_arrays(&self) -> Result<(Array, Array)> {
+        ids_to_arrays(&self.ids)
+    }
+}
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
@@ -99,12 +113,12 @@ impl BooguTokenizer {
 
     /// Encode the **positive** text-to-image instruction → `(input_ids, attention_mask)` `[1, L]`.
     pub fn encode_t2i(&self, prompt: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))?)
+        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))?)
     }
 
     /// Encode the CFG **negative** (empty instruction with the drop system prompt) → `[1, L]`.
     pub fn encode_negative(&self) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))?)
+        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))?)
     }
 
     /// Encode the **edit** instruction → `(input_ids, attention_mask)` `[1, L]`. The TI2I system
@@ -116,7 +130,7 @@ impl BooguTokenizer {
     /// the reference image through the Qwen3-VL vision tower (deepstack) so the MLLM "sees" it; that
     /// semantic path is tracked separately (E7b). The DiT's spatial reference path is fully wired.
     pub fn encode_edit(&self, instruction: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
+        ids_to_arrays(&self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
     }
 
     /// Encode a **multi-image** edit instruction → `(input_ids, attention_mask)` `[1, L]`, with one
@@ -132,6 +146,18 @@ impl BooguTokenizer {
         instruction: &str,
         num_image_tokens: &[usize],
     ) -> Result<(Array, Array)> {
+        self.preflight_edit_with_images(instruction, num_image_tokens)?
+            .to_arrays()
+    }
+
+    /// Tokenize and validate a complete image-grounded edit while retaining the exact host ids for
+    /// the later text-tower call. This is deliberately array-free: callers run it before loading or
+    /// forwarding the MLX vision tower.
+    pub(crate) fn preflight_edit_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<EditTokenIds> {
         let ids = self.raw_ids(&render_chat_with_images(
             SYSTEM_PROMPT_DROP,
             instruction,
@@ -143,7 +169,7 @@ impl BooguTokenizer {
             num_image_tokens.len(),
             MAX_EDIT_TOKENS,
         )?;
-        ids_to_arrays(ids)
+        Ok(EditTokenIds { ids })
     }
 
     /// Raw id vector for the positive instruction (parity testing against the golden).
@@ -153,11 +179,11 @@ impl BooguTokenizer {
 }
 
 /// `Vec<i32>` ids → `(input_ids, attention_mask)` `[1, L]` int32 arrays (mask all-ones: no padding).
-fn ids_to_arrays(ids: Vec<i32>) -> Result<(Array, Array)> {
+fn ids_to_arrays(ids: &[i32]) -> Result<(Array, Array)> {
     let len = ids.len() as i32;
     let mask = vec![1i32; ids.len()];
     Ok((
-        Array::from_slice(&ids, &[1, len]),
+        Array::from_slice(ids, &[1, len]),
         Array::from_slice(&mask, &[1, len]),
     ))
 }
@@ -179,7 +205,7 @@ fn check_len(len: usize, max_tokens: usize) -> Result<()> {
 /// Reject an over-budget image-grounded edit before the Qwen3-VL text attention allocation. The
 /// diagnostic separates reference placeholders from instruction/template tokens so callers know
 /// whether to reduce reference geometry/count rather than being told only that the prompt is long.
-fn check_edit_len(
+pub(crate) fn check_edit_len(
     total: usize,
     ref_tokens: usize,
     num_refs: usize,

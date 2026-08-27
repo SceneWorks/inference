@@ -26,6 +26,14 @@ const VISION_START: &str = "<|vision_start|>";
 const VISION_END: &str = "<|vision_end|>";
 const IMAGE_PAD: &str = "<|image_pad|>";
 
+/// Host token ids admitted for one image-grounded edit. Keeping them off-device through preflight
+/// lets the generator reject the combined reference+instruction budget before loading a VAE or
+/// vision tower, and the later encoder consumes this exact checked sequence.
+#[derive(Debug, Clone)]
+pub(crate) struct EditTokenIds {
+    ids: Vec<u32>,
+}
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
@@ -152,6 +160,22 @@ impl BooguTokenizer {
         num_image_tokens: &[usize],
         max_tokens: usize,
     ) -> Result<Tensor> {
+        self.edit_ids_to_tensor(&self.preflight_edit_with_images(
+            instruction,
+            num_image_tokens,
+            max_tokens,
+        )?)
+    }
+
+    /// Tokenize and validate a complete image-grounded edit without allocating a backend tensor.
+    /// The returned ids are reused after VAE/tower admission so execution cannot drift from the
+    /// sequence whose inclusive 8192-token budget passed.
+    pub(crate) fn preflight_edit_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+        max_tokens: usize,
+    ) -> Result<EditTokenIds> {
         let ids = self.raw_ids(&render_chat_with_images(
             SYSTEM_PROMPT_DROP,
             instruction,
@@ -159,6 +183,11 @@ impl BooguTokenizer {
         ))?;
         let ref_tokens: usize = num_image_tokens.iter().sum();
         check_edit_len(ids.len(), ref_tokens, num_image_tokens.len(), max_tokens)?;
+        Ok(EditTokenIds { ids })
+    }
+
+    pub(crate) fn edit_ids_to_tensor(&self, preflight: &EditTokenIds) -> Result<Tensor> {
+        let ids = preflight.ids.clone();
         let len = ids.len();
         Ok(Tensor::from_vec(ids, (1, len), &self.device)?)
     }
@@ -187,7 +216,7 @@ fn check_len(len: usize, max_tokens: usize) -> Result<()> {
 /// their prompt. The grounded encoder builds a fresh MRoPE table sized to the sequence, so the cap is a
 /// guard against a pathologically large reference set, not the RoPE-table size. Pure so it is
 /// unit-testable without a real snapshot tokenizer.
-fn check_edit_len(
+pub(crate) fn check_edit_len(
     total: usize,
     ref_tokens: usize,
     num_refs: usize,

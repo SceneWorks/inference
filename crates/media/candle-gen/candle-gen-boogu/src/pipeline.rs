@@ -37,14 +37,45 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::config::BooguConfig;
 use crate::loader::Weights;
 use crate::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
-use crate::tokenizer::BooguTokenizer;
+use crate::tokenizer::{BooguTokenizer, EditTokenIds};
 use crate::transformer::BooguTransformer;
-use crate::vision::preprocess::preprocess_image;
+use crate::vision::preprocess::{image_geometry, preprocess_image};
 use crate::vision::{VisionConfig, VisionTower};
 
 /// Qwen3-VL image placeholder token (`mllm/config.json::image_token_id`) — the position the vision
 /// tower's merged embeds are spliced into for image-conditioned editing.
 const IMAGE_TOKEN_ID: u32 = 151655;
+
+/// Host-only admission result for one image-grounded edit. The generator creates it before loading
+/// any resident/staged VAE or vision tower, and both execution modes reuse the exact grids, counts,
+/// and token ids checked here.
+pub(crate) struct EditPreflight {
+    tokens: EditTokenIds,
+    grids: Vec<[i32; 3]>,
+    counts: Vec<usize>,
+}
+
+/// Derive each validated reference's exact smart-resize grid and tokenize/check the combined edit on
+/// the host. No backend tensor, VAE, or vision-tower work occurs here.
+pub(crate) fn preflight_edit(
+    tok: &BooguTokenizer,
+    references: &[&Image],
+    instruction: &str,
+) -> Result<EditPreflight> {
+    let mut grids = Vec::with_capacity(references.len());
+    let mut counts = Vec::with_capacity(references.len());
+    for reference in references {
+        let geometry = image_geometry(reference.height as usize, reference.width as usize)?;
+        grids.push(geometry.grid);
+        counts.push(geometry.merged_tokens);
+    }
+    let tokens = tok.preflight_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
+    Ok(EditPreflight {
+        tokens,
+        grids,
+        counts,
+    })
+}
 
 /// Base/Edit default steps + guidance (reference `__call__`: 50-step true-CFG, guidance 4.0).
 pub(crate) const DEFAULT_STEPS: usize = 50;
@@ -325,6 +356,7 @@ pub(crate) fn stage_encode_edit(
     edit: &EditComponents,
     req: &GenerationRequest,
     references: &[&Image],
+    preflight: &EditPreflight,
     device: &Device,
 ) -> Result<StagedCondition> {
     validate_edit_reference_dims(references)?;
@@ -333,7 +365,7 @@ pub(crate) fn stage_encode_edit(
         .map(|reference| vae_encode(&edit.vae_encoder, reference, device))
         .collect::<Result<Vec<_>>>()?;
     let cond =
-        encode_image_instruction_parts(&text.tok, &text.te, edit, references, &req.prompt, device)?;
+        encode_image_instruction_parts(&text.tok, &text.te, edit, references, preflight, device)?;
     let uncond = if req.guidance.unwrap_or(DEFAULT_GUIDANCE) > 1.0 {
         Some(text.te.last_hidden(&text.tok.encode_negative()?)?)
     } else {
@@ -840,6 +872,7 @@ pub(crate) fn render_edit(
     edit: &EditComponents,
     req: &GenerationRequest,
     references: &[&Image],
+    preflight: &EditPreflight,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
@@ -860,7 +893,7 @@ pub(crate) fn render_edit(
     // Condition encoding (seed-independent): image-conditioned edit instruction (the MLLM sees every
     // reference) + text-only CFG-negative (empty/drop instruction). Both DiT passes carry the same
     // reference latents.
-    let cond = encode_image_instruction(comps, edit, references, &req.prompt, device)?;
+    let cond = encode_image_instruction(comps, edit, references, preflight, device)?;
     let do_cfg = guidance > 1.0;
     let uncond = if do_cfg {
         Some(comps.te.last_hidden(&comps.tok.encode_negative()?)?)
@@ -942,10 +975,10 @@ fn encode_image_instruction(
     comps: &Components,
     edit: &EditComponents,
     references: &[&Image],
-    instruction: &str,
+    preflight: &EditPreflight,
     device: &Device,
 ) -> Result<Tensor> {
-    encode_image_instruction_parts(&comps.tok, &comps.te, edit, references, instruction, device)
+    encode_image_instruction_parts(&comps.tok, &comps.te, edit, references, preflight, device)
 }
 
 fn encode_image_instruction_parts(
@@ -953,27 +986,46 @@ fn encode_image_instruction_parts(
     te: &BooguTextEncoder,
     edit: &EditComponents,
     references: &[&Image],
-    instruction: &str,
+    preflight: &EditPreflight,
     device: &Device,
 ) -> Result<Tensor> {
+    if references.len() != preflight.grids.len() || references.len() != preflight.counts.len() {
+        return Err(CandleError::Msg(
+            "boogu edit: reference set changed after preflight".into(),
+        ));
+    }
     let mut image_embeds = Vec::with_capacity(references.len());
     let mut deepstacks = Vec::with_capacity(references.len());
-    let mut grids = Vec::with_capacity(references.len());
-    let mut counts = Vec::with_capacity(references.len());
-    for r in references {
+    for (index, r) in references.iter().enumerate() {
         let (pixel_values, grid) =
             preprocess_image(&r.pixels, r.height as usize, r.width as usize, device)?;
+        if grid != preflight.grids[index] {
+            return Err(CandleError::Msg(format!(
+                "boogu edit: reference {index} smart-resize grid changed after preflight"
+            )));
+        }
         let (embeds, deepstack) = edit.vision.forward(&pixel_values, &[grid])?;
-        counts.push(embeds.dim(0)?);
+        let actual = embeds.dim(0)?;
+        if actual != preflight.counts[index] {
+            return Err(CandleError::Msg(format!(
+                "boogu edit: reference {index} vision tower returned {actual} tokens; preflight admitted {}",
+                preflight.counts[index]
+            )));
+        }
         image_embeds.push(embeds);
         deepstacks.push(deepstack);
-        grids.push(grid);
     }
 
     // Chat template with one block of merged vision tokens (`<|image_pad|>`) per reference, then the
     // multi-image MLLM forward (per-block vision splice + 3-D MRoPE + deepstack injection).
-    let ids = tok.encode_edit_with_images(instruction, &counts, MAX_EDIT_TOKENS)?;
-    Ok(te.last_hidden_with_images(&ids, &image_embeds, &deepstacks, &grids, IMAGE_TOKEN_ID)?)
+    let ids = tok.edit_ids_to_tensor(&preflight.tokens)?;
+    Ok(te.last_hidden_with_images(
+        &ids,
+        &image_embeds,
+        &deepstacks,
+        &preflight.grids,
+        IMAGE_TOKEN_ID,
+    )?)
 }
 
 /// VAE-encode an RGB8 reference [`Image`] → clean latent `[1, 16, H/8, W/8]` (f32). Takes the latent

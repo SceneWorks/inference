@@ -435,6 +435,10 @@ impl Boogu {
         // Source images arrive as `Reference` / `MultiReference` (1..=MAX_EDIT_REFS); the prompt is the
         // edit instruction. Clone once into an owned slice (cheap next to the multi-step DiT denoise).
         let references: Vec<Image> = resolve_edit_references(req)?.into_iter().cloned().collect();
+        // Host-only smart-resize/token admission runs before Residency can load or call the MLX
+        // vision tower or VAE phase. The checked ids/counts are reused inside the encoder closure.
+        let preflight =
+            crate::pipeline::preflight_edit(&self.tokenizer, &references, &req.prompt, false)?;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
@@ -457,7 +461,13 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| {
-                enc.encode_edit(&self.tokenizer, &references, &req.prompt, &edit_opts)
+                enc.encode_edit_preflight(
+                    &self.tokenizer,
+                    &references,
+                    &req.prompt,
+                    &edit_opts,
+                    Some(&preflight),
+                )
             },
             |c: Option<&BooguBaseCond>| match c {
                 Some(c) => c.materialize(),
@@ -601,37 +611,55 @@ impl Boogu {
 /// [`MAX_EDIT_REFS`] (the DiT's `image_index_embedding` slot count); none, or more than the cap, is an
 /// error.
 fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
-    let mut refs: Vec<&Image> = Vec::new();
+    // Preserve the typed strength failure independently of cardinality: scan the whole request for
+    // the edit-inert field before performing the bounded count pass.
     for c in &req.conditioning {
-        match c {
-            Conditioning::Reference { image, strength } => {
-                // Edit does not define the Base/Turbo denoise-start semantics carried by this field.
-                // Reject it with a typed capability failure rather than silently discarding it.
-                if strength.is_some() {
-                    return Err(Error::Unsupported(
-                        "boogu_image_edit: per-reference strength is not supported for instruction \
-                         edit; omit conditioning.reference.strength"
-                            .into(),
-                    ));
-                }
-                refs.push(image);
-            }
-            Conditioning::MultiReference { images } => refs.extend(images.iter()),
-            _ => {}
+        if let Conditioning::Reference {
+            strength: Some(_), ..
+        } = c
+        {
+            return Err(Error::Unsupported(
+                "boogu_image_edit: per-reference strength is not supported for instruction edit; \
+                 omit conditioning.reference.strength"
+                    .into(),
+            ));
         }
     }
-    if refs.is_empty() {
+
+    // Count first, checking every cumulative MultiReference length before allocating/extending the
+    // flattened vector. A pathological list can therefore never cause a large pointer allocation.
+    let mut count = 0usize;
+    for c in &req.conditioning {
+        let add = match c {
+            Conditioning::Reference { .. } => 1,
+            Conditioning::MultiReference { images } => images.len(),
+            _ => 0,
+        };
+        count = count
+            .checked_add(add)
+            .ok_or_else(|| Error::Msg("boogu_image_edit: reference image count overflow".into()))?;
+        if count > MAX_EDIT_REFS {
+            return Err(Error::Msg(format!(
+                "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {count})"
+            )));
+        }
+    }
+    if count == 0 {
         return Err(Error::Msg(
             "boogu_image_edit: an instruction edit requires at least one source reference image"
                 .into(),
         ));
     }
-    if refs.len() > MAX_EDIT_REFS {
-        return Err(Error::Msg(format!(
-            "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {})",
-            refs.len()
-        )));
+
+    let mut refs: Vec<&Image> = Vec::with_capacity(count);
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::MultiReference { images } => refs.extend(images.iter()),
+            _ => {}
+        }
     }
+    debug_assert_eq!(refs.len(), count);
     for (index, image) in refs.iter().enumerate() {
         validate_edit_reference(index, image)?;
     }
@@ -747,6 +775,53 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
 
+    fn write_tiny_edit_tokenizer(root: &Path) {
+        let mllm = root.join("mllm");
+        std::fs::create_dir_all(&mllm).unwrap();
+        let literals = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|image_pad|>",
+        ];
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<unk>".into(), serde_json::json!(0));
+        let added = literals
+            .iter()
+            .enumerate()
+            .map(|(index, literal)| {
+                let id = index + 1;
+                vocab.insert((*literal).into(), serde_json::json!(id));
+                serde_json::json!({
+                    "id": id,
+                    "content": literal,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let fixture = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
+        });
+        std::fs::write(
+            mllm.join("tokenizer.json"),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
@@ -762,6 +837,49 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    /// The real generator boundary must reject combined edit budgets before entering either
+    /// sequential component loader. The snapshot contains only a tokenizer: reaching the MLX tower
+    /// or VAE loader would therefore replace the declared budget error with a missing-weight error.
+    #[test]
+    fn edit_overbudget_preflight_never_enters_tower_or_vae_loaders() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_edit_tokenizer(root.path());
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let generator = load_edit(&spec).unwrap();
+
+        let two_max = GenerationRequest {
+            prompt: "edit".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![img(2048, 2048), img(2048, 2048)],
+            }],
+            ..Default::default()
+        };
+        let error = generator
+            .generate(&two_max, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_edit_tokens=8192"), "{error}");
+
+        let prompt_over = GenerationRequest {
+            prompt: "<|image_pad|>".repeat(crate::tokenizer::MAX_EDIT_TOKENS),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let error = generator
+            .generate(&prompt_over, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_edit_tokens=8192"), "{error}");
     }
 
     #[test]
@@ -1058,6 +1176,23 @@ mod tests {
             ..req(512, 512)
         };
         assert!(validate_request(&descriptor_edit(), &multi_over).is_err());
+
+        // Mutation guard: the cap is cumulative across multiple carriers, not per conditioning.
+        let split_over = GenerationRequest {
+            conditioning: vec![
+                Conditioning::MultiReference {
+                    images: (0..3).map(|_| img(16, 16)).collect(),
+                },
+                Conditioning::MultiReference {
+                    images: (0..3).map(|_| img(16, 16)).collect(),
+                },
+            ],
+            ..req(512, 512)
+        };
+        let error = resolve_edit_references(&split_over)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most 5"), "{error}");
     }
 
     #[test]
@@ -1142,6 +1277,25 @@ mod tests {
             error.to_string().contains("per-reference strength"),
             "{error}"
         );
+
+        // Preserve the typed field failure even when an earlier carrier is independently over the
+        // cardinality cap.
+        let strength_after_over_cap = GenerationRequest {
+            conditioning: vec![
+                Conditioning::MultiReference {
+                    images: (0..6).map(|_| img(16, 16)).collect(),
+                },
+                Conditioning::Reference {
+                    image: img(16, 16),
+                    strength: Some(0.6),
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(matches!(
+            resolve_edit_references(&strength_after_over_cap),
+            Err(Error::Unsupported(_))
+        ));
 
         // Base/Turbo consume this field as img2img start strength; the edit-only guard must not
         // narrow either supported route.

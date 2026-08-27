@@ -47,15 +47,52 @@ use std::path::{Path, PathBuf};
 
 use crate::loader::{load_text_encoder, load_transformer, load_vae, load_vision_tower};
 use crate::text_encoder::BooguTextEncoder;
-use crate::tokenizer::BooguTokenizer;
+use crate::tokenizer::{BooguTokenizer, EditTokenIds};
 use crate::transformer::BooguTransformer;
-use crate::vision::preprocess::preprocess_image;
+use crate::vision::preprocess::{image_geometry, preprocess_image};
 use crate::vision::VisionTower;
 use mlx_gen_z_image::vae::Vae;
 
 /// Qwen3-VL image placeholder token (`mllm/config.json::image_token_id`) — the position the vision
 /// tower's merged embeds are spliced into for image-conditioned editing.
 const IMAGE_TOKEN_ID: i32 = 151655;
+
+/// Host-only admission result for one image-grounded edit. It is produced before residency enters
+/// either heavy phase and then reused by the real vision/text encode, making the smart-resize grids,
+/// placeholder counts, and exact checked token ids one canonical request contract.
+pub(crate) struct EditPreflight {
+    tokens: EditTokenIds,
+    negative_tokens: Option<EditTokenIds>,
+    grids: Vec<[i32; 3]>,
+    counts: Vec<usize>,
+}
+
+/// Derive every reference's exact smart-resize geometry and tokenize/check the combined edit before
+/// any vision-tower or VAE work. Reference carriers have already passed the generator boundary.
+pub(crate) fn preflight_edit(
+    tok: &BooguTokenizer,
+    references: &[Image],
+    instruction: &str,
+    image_conditioned_negative: bool,
+) -> Result<EditPreflight> {
+    let mut grids = Vec::with_capacity(references.len());
+    let mut counts = Vec::with_capacity(references.len());
+    for reference in references {
+        let geometry = image_geometry(reference.height as i64, reference.width as i64)?;
+        grids.push(geometry.grid);
+        counts.push(geometry.merged_tokens);
+    }
+    let tokens = tok.preflight_edit_with_images(instruction, &counts)?;
+    let negative_tokens = image_conditioned_negative
+        .then(|| tok.preflight_edit_with_images("", &counts))
+        .transpose()?;
+    Ok(EditPreflight {
+        tokens,
+        negative_tokens,
+        grids,
+        counts,
+    })
+}
 
 /// Static-v1 time-shift parameters from the snapshot `scheduler/scheduler_config.json`
 /// (`base_shift 0.5`, `max_shift 1.15`, `seq_len 4096`). The linear map saturates at `seq_len=4096`,
@@ -273,22 +310,36 @@ impl BooguEncoders {
     /// references through the Qwen3-VL vision tower so the MLLM sees them (image-conditioned instruction
     /// features); otherwise the instruction is encoded text-only. The CFG-negative is the empty/drop
     /// instruction, optionally image-conditioned (`use_input_images_4_neg_instruct`).
-    pub(crate) fn encode_edit(
+    /// Consume a previously admitted image-grounded edit. The generator uses this entry so the
+    /// preflight occurs before [`mlx_gen::Residency`] can load or call either tower/VAE phase.
+    pub(crate) fn encode_edit_preflight(
         &self,
         tok: &BooguTokenizer,
         references: &[Image],
         instruction: &str,
         opts: &EditOptions,
+        preflight: Option<&EditPreflight>,
     ) -> Result<BooguBaseCond> {
         let (cond, cond_mask) = if opts.condition_on_image {
-            self.encode_image_instruction(tok, references, instruction)?
+            let preflight = preflight.ok_or_else(|| {
+                Error::Msg("boogu edit: image conditioning omitted its preflight".into())
+            })?;
+            self.encode_image_instruction_preflight(references, preflight, &preflight.tokens)?
         } else {
             let (ids, mask) = tok.encode_edit(instruction)?;
             (self.te.last_hidden(&ids, &mask)?, mask)
         };
         let uncond = if opts.text_guidance_scale > 1.0 {
             if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
-                Some(self.encode_image_instruction(tok, references, "")?)
+                let preflight = preflight.ok_or_else(|| {
+                    Error::Msg(
+                        "boogu edit: negative image conditioning omitted its preflight".into(),
+                    )
+                })?;
+                let tokens = preflight.negative_tokens.as_ref().ok_or_else(|| {
+                    Error::Msg("boogu edit: negative image conditioning was not admitted".into())
+                })?;
+                Some(self.encode_image_instruction_preflight(references, preflight, tokens)?)
             } else {
                 let (u_ids, u_mask) = tok.encode_negative()?;
                 Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
@@ -309,12 +360,17 @@ impl BooguEncoders {
     /// `(features [1, L, 4096], mask [1, L])` — the same `(hidden, mask)` shape the DiT
     /// `forward_edit_multi` consumes, but with each `<|image_pad|>` run carrying its reference's merged
     /// embeds + deepstack injections. A single reference is the `references.len() == 1` case.
-    fn encode_image_instruction(
+    fn encode_image_instruction_preflight(
         &self,
-        tok: &BooguTokenizer,
         references: &[Image],
-        instruction: &str,
+        preflight: &EditPreflight,
+        tokens: &EditTokenIds,
     ) -> Result<(Array, Array)> {
+        if references.len() != preflight.grids.len() || references.len() != preflight.counts.len() {
+            return Err(Error::Msg(
+                "boogu edit: reference set changed after preflight".into(),
+            ));
+        }
         self.ensure_vision()?;
         let vision = self.vision.borrow();
         let tower = vision
@@ -325,29 +381,37 @@ impl BooguEncoders {
         // per-image embeds / deepstack / grid + the merged-token count that drives the chat template.
         let mut image_embeds: Vec<Array> = Vec::with_capacity(references.len());
         let mut deepstacks: Vec<Vec<Array>> = Vec::with_capacity(references.len());
-        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(references.len());
-        let mut counts: Vec<usize> = Vec::with_capacity(references.len());
-        for r in references {
+        for (index, r) in references.iter().enumerate() {
             let rgb = image::RgbImage::from_raw(r.width, r.height, r.pixels.clone()).ok_or_else(
                 || Error::Msg("boogu edit: reference pixels != width·height·3".into()),
             )?;
             let (pixel_values, grid) = preprocess_image(&rgb)?;
+            if grid != preflight.grids[index] {
+                return Err(Error::Msg(format!(
+                    "boogu edit: reference {index} smart-resize grid changed after preflight"
+                )));
+            }
             let (embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
-            counts.push(embeds.shape()[0] as usize);
+            let actual = embeds.shape()[0] as usize;
+            if actual != preflight.counts[index] {
+                return Err(Error::Msg(format!(
+                    "boogu edit: reference {index} vision tower returned {actual} tokens; preflight admitted {}",
+                    preflight.counts[index]
+                )));
+            }
             image_embeds.push(embeds);
             deepstacks.push(deepstack);
-            grids.push(grid);
         }
 
         // Chat template with one `<|image_pad|>` block per reference, then the multi-image-conditioned
         // MLLM forward (per-image vision splice + 3-D MRoPE advancing per image + deepstack injection).
-        let (ids, mask) = tok.encode_edit_with_images(instruction, &counts)?;
+        let (ids, mask) = tokens.to_arrays()?;
         let feats = self.te.last_hidden_with_image_multi(
             &ids,
             &mask,
             &image_embeds,
             &deepstacks,
-            &grids,
+            &preflight.grids,
             IMAGE_TOKEN_ID,
         )?;
         Ok((feats, mask))
@@ -939,9 +1003,24 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let cond = self
-            .enc
-            .encode_edit(&self.tok, references, instruction, opts)?;
+        let preflight = opts
+            .condition_on_image
+            .then(|| {
+                preflight_edit(
+                    &self.tok,
+                    references,
+                    instruction,
+                    opts.text_guidance_scale > 1.0 && opts.use_input_images_4_neg_instruct,
+                )
+            })
+            .transpose()?;
+        let cond = self.enc.encode_edit_preflight(
+            &self.tok,
+            references,
+            instruction,
+            opts,
+            preflight.as_ref(),
+        )?;
         let ref_latents = self.heavy.encode_ref_latents(references)?;
         self.heavy.render_edit(
             &cond,
