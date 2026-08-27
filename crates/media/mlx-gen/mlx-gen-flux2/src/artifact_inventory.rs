@@ -1244,6 +1244,9 @@ mod tests {
             encoded.push(b' ');
         }
         let mut file = std::fs::File::create(path).unwrap();
+        // The tensor inventory deliberately carries production geometry. Keep the logical extent
+        // exact without allocating it on Windows, matching gen-core-testkit's contract fixtures.
+        gen_core_testkit::mark_sparse(path);
         file.write_all(&(encoded.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(&encoded).unwrap();
@@ -1371,13 +1374,59 @@ mod tests {
             })
     }
 
+    struct ImmutableTurnkeyFixture {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        inventory: KleinArtifactInventory,
+    }
+
+    fn immutable_turnkey_fixture(
+        family: TurnkeyFamily,
+        tier: Option<Quant>,
+    ) -> &'static ImmutableTurnkeyFixture {
+        static BASE_BF16: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+        static BASE_Q4: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+        static BASE_Q8: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+        static KV_BF16: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+        static KV_Q4: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+        static KV_Q8: OnceLock<ImmutableTurnkeyFixture> = OnceLock::new();
+
+        let fixture = match (family, tier) {
+            (TurnkeyFamily::Base, None) => &BASE_BF16,
+            (TurnkeyFamily::Base, Some(Quant::Q4)) => &BASE_Q4,
+            (TurnkeyFamily::Base, Some(Quant::Q8)) => &BASE_Q8,
+            (TurnkeyFamily::Kv, None) => &KV_BF16,
+            (TurnkeyFamily::Kv, Some(Quant::Q4)) => &KV_Q4,
+            (TurnkeyFamily::Kv, Some(Quant::Q8)) => &KV_Q8,
+            (_, Some(Quant::Nvfp4)) => unreachable!(),
+        };
+        fixture.get_or_init(|| {
+            let tmp = turnkey_fixture(family, tier);
+            let root = fixture_root(&tmp, family, tier);
+            let provider_id = match family {
+                TurnkeyFamily::Base => crate::FLUX2_KLEIN_9B_ID,
+                TurnkeyFamily::Kv => crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            };
+            let inventory = KleinArtifactInventory::verify_for_provider(
+                provider_id,
+                &LoadSpec::new(WeightsSource::Dir(root.clone())),
+            )
+            .unwrap()
+            .expect("exact immutable turnkey inventory");
+            ImmutableTurnkeyFixture {
+                _tmp: tmp,
+                root,
+                inventory,
+            }
+        })
+    }
+
     #[test]
     fn turnkey_inventory_binds_family_tier_provider_and_production_quantize_none() {
         for family in [TurnkeyFamily::Base, TurnkeyFamily::Kv] {
             for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-                let tmp = turnkey_fixture(family, tier);
-                let root = fixture_root(&tmp, family, tier);
-                let spec = LoadSpec::new(WeightsSource::Dir(root));
+                let fixture = immutable_turnkey_fixture(family, tier);
+                let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
                 let allowed = match family {
                     TurnkeyFamily::Base => {
                         [crate::FLUX2_KLEIN_9B_ID, crate::FLUX2_KLEIN_9B_EDIT_ID]
@@ -1387,22 +1436,18 @@ mod tests {
                     }
                 };
                 for provider_id in allowed {
-                    let inventory = KleinArtifactInventory::verify_for_provider(provider_id, &spec)
-                        .unwrap()
-                        .expect("exact turnkey inventory");
-                    assert_eq!(inventory.resolved_quant(), tier);
-                    assert!(inventory.calibration_tag().is_none());
+                    fixture.inventory.validate_provider(provider_id).unwrap();
                 }
+                assert_eq!(fixture.inventory.resolved_quant(), tier);
+                assert!(fixture.inventory.calibration_tag().is_none());
                 let resolved_route = match family {
                     TurnkeyFamily::Base => "flux2_klein_9b",
                     TurnkeyFamily::Kv => "flux2_klein_9b_kv",
                 };
-                assert!(KleinArtifactInventory::verify_for_provider(
-                    crate::FLUX2_KLEIN_9B_ID,
-                    &spec.clone().with_resolved_route(resolved_route),
-                )
-                .unwrap()
-                .is_some());
+                fixture
+                    .inventory
+                    .validate_resolved_route(Some(resolved_route))
+                    .unwrap();
                 for wrong_route in [
                     "flux2_klein_9b",
                     "flux2_klein_9b_kv",
@@ -1411,22 +1456,22 @@ mod tests {
                 .into_iter()
                 .filter(|route| *route != resolved_route)
                 {
-                    assert!(KleinArtifactInventory::verify_for_provider(
-                        crate::FLUX2_KLEIN_9B_ID,
-                        &spec.clone().with_resolved_route(wrong_route),
-                    )
-                    .is_err());
+                    assert!(fixture
+                        .inventory
+                        .validate_resolved_route(Some(wrong_route))
+                        .is_err());
                 }
                 let refused = match family {
                     TurnkeyFamily::Base => crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
                     TurnkeyFamily::Kv => crate::FLUX2_KLEIN_9B_EDIT_ID,
                 };
-                assert!(KleinArtifactInventory::verify_for_provider(refused, &spec).is_err());
+                assert!(fixture.inventory.validate_provider(refused).is_err());
                 assert!(KleinArtifactInventory::verify_for_provider(
                     crate::FLUX2_KLEIN_9B_ID,
                     &spec.clone().with_quant(Quant::Q4),
                 )
                 .is_err());
+                fixture.inventory.ensure_unchanged().unwrap();
             }
         }
     }
@@ -1436,19 +1481,24 @@ mod tests {
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-        let inventory =
-            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec)
-                .unwrap()
-                .unwrap();
+        let transformer_dir = root.join("transformer");
+        let (transformer, membership) = single_safetensors(&transformer_dir).unwrap();
+        let inventory = KleinArtifactInventory {
+            root: root.clone(),
+            entries: vec![pinned_entry(transformer.clone()).unwrap()],
+            visible_safetensors: vec![(transformer_dir, membership)],
+            kind: KleinArtifactKind::BaseRehost(Some(Quant::Q4)),
+        };
+        inventory.ensure_unchanged().unwrap();
 
         write_safetensors(&root.join("transformer/extra.safetensors"), true);
         assert!(inventory.ensure_unchanged().is_err());
         std::fs::remove_file(root.join("transformer/extra.safetensors")).unwrap();
-        write_safetensors(&root.join("transformer/model.safetensors"), true);
-        assert!(
-            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec,).is_err()
-        );
-        write_transformer_safetensors(&root.join("transformer/model.safetensors"), Some(Quant::Q4));
+        inventory.ensure_unchanged().unwrap();
+        write_safetensors(&transformer, true);
+        assert!(inventory.ensure_unchanged().is_err());
+        assert!(validate_transformer_headers(&transformer, Some(Quant::Q4)).is_err());
+        write_transformer_safetensors(&transformer, Some(Quant::Q4));
         std::fs::write(
             root.join("transformer/config.json"),
             r#"{"quantization":{"bits":8,"group_size":64}}"#,
@@ -1489,13 +1539,6 @@ mod tests {
 
     #[test]
     fn turnkey_inventory_rejects_transformer_vae_and_encoder_shape_mutations() {
-        let query = |root: PathBuf| {
-            KleinArtifactInventory::verify_for_provider(
-                crate::FLUX2_KLEIN_9B_ID,
-                &LoadSpec::new(WeightsSource::Dir(root)),
-            )
-        };
-
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
         let mut transformer = transformer_tensors(Some(Quant::Q4));
@@ -1504,8 +1547,9 @@ mod tests {
             .find(|(name, _, _)| name == "transformer_blocks.0.attn.to_q.weight")
             .unwrap()
             .2[0] = 1;
-        write_tensor_file(&root.join("transformer/model.safetensors"), transformer);
-        assert!(query(root).is_err());
+        let transformer_file = root.join("transformer/model.safetensors");
+        write_tensor_file(&transformer_file, transformer);
+        assert!(validate_transformer_headers(&transformer_file, Some(Quant::Q4)).is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
         let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
@@ -1514,14 +1558,17 @@ mod tests {
             .find(|(name, _, _)| name == "decoder.conv_out.weight")
             .unwrap()
             .2[1] = 1;
-        write_tensor_file(&root.join("vae/model.safetensors"), vae);
-        assert!(query(root).is_err());
+        let vae_file = root.join("vae/model.safetensors");
+        write_tensor_file(&vae_file, vae);
+        assert!(validate_vae_headers(&vae_file).is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
         let encoder_file = single_safetensors(&root.join("text_encoder")).unwrap().0;
         write_safetensors(&encoder_file, false);
-        assert!(query(root).is_err());
+        assert!(crate::config::KLEIN_ENCODER_CONTRACT
+            .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))
+            .is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
@@ -1537,8 +1584,9 @@ mod tests {
                 },
             ));
         }
-        write_tensor_file(&root.join("transformer/model.safetensors"), transformer);
-        assert!(query(root).is_err());
+        let transformer_file = root.join("transformer/model.safetensors");
+        write_tensor_file(&transformer_file, transformer);
+        assert!(validate_transformer_headers(&transformer_file, Some(Quant::Q8)).is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
         let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
@@ -1553,8 +1601,9 @@ mod tests {
             "BF16",
             vec![128],
         ));
-        write_tensor_file(&root.join("vae/model.safetensors"), vae);
-        assert!(query(root).is_err());
+        let vae_file = root.join("vae/model.safetensors");
+        write_tensor_file(&vae_file, vae);
+        assert!(validate_vae_headers(&vae_file).is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
         let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
@@ -1565,8 +1614,9 @@ mod tests {
             .unwrap();
         counter.1 = "BF16";
         counter.2 = vec![1];
-        write_tensor_file(&root.join("vae/model.safetensors"), vae);
-        assert!(query(root).is_err());
+        let vae_file = root.join("vae/model.safetensors");
+        write_tensor_file(&vae_file, vae);
+        assert!(validate_vae_headers(&vae_file).is_err());
     }
 
     #[test]
@@ -1587,14 +1637,23 @@ mod tests {
             ),
         ] {
             for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-                let tmp = turnkey_fixture(family, tier);
-                let root = fixture_root(&tmp, family, tier);
-                let spec = LoadSpec::new(WeightsSource::Dir(root))
+                let fixture = immutable_turnkey_fixture(family, tier);
+                let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()))
                     .with_resolved_route(resolved_route)
                     .with_offload_policy(OffloadPolicy::Sequential)
                     .with_load_shape(LoadShape::DeferredMaterialization);
-                let contract = crate::memory_strategy::klein_contract_for(provider_id, &spec)
-                    .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
+                fixture.inventory.validate_provider(provider_id).unwrap();
+                fixture
+                    .inventory
+                    .validate_resolved_route(Some(resolved_route))
+                    .unwrap();
+                assert_eq!(fixture.inventory.resolved_quant(), tier);
+                assert!(crate::memory_strategy::klein_streamable(&spec));
+                // The sealed inventory above owns artifact admission. Exercise the same contract
+                // builder without resealing its production-logical-size encoder a second time.
+                let contract =
+                    crate::memory_strategy::weights_free_klein_contract(provider_id, &spec)
+                        .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
                 assert_eq!(
                     contract
                         .capability(MemoryStrategy::BoundedTransformerResidency)
