@@ -360,16 +360,40 @@ fn load_flux2_heavy(
 fn build_residency(
     variant: Flux2Variant,
     spec: &LoadSpec,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let root = resolve_root(variant, spec)?;
-    let text_encoder_source = variant.encoder_contract().source_for_load(spec, root)?;
-    build_residency_with_source(variant, spec, text_encoder_source)
+    let text_encoder_source = language_contract.source_for_load(spec, root)?;
+    build_residency_with_source_and_multimodal_contracts(
+        variant,
+        spec,
+        text_encoder_source,
+        language_contract,
+        vision_contract,
+    )
 }
 
 fn build_residency_with_source(
     variant: Flux2Variant,
     spec: &LoadSpec,
     text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
+    build_residency_with_source_and_multimodal_contracts(
+        variant,
+        spec,
+        text_encoder_source,
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+fn build_residency_with_source_and_multimodal_contracts(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+    multimodal_language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let root = resolve_root(variant, spec)?;
     // Klein artifacts intentionally keep Qwen3 dense in every Q4/Q8 tier. Dev applies the
@@ -383,13 +407,9 @@ fn build_residency_with_source(
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, variant.id())?;
     let multimodal_encoder_source = if variant.is_dev() {
-        let source = variant
-            .encoder_contract()
+        let source = multimodal_language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        source.validate_vision(
-            &crate::config::DEV_VISION_ENCODER_CONTRACT,
-            &crate::config::DEV_ENCODER_CONTRACT,
-        )?;
+        source.validate_vision(&vision_contract, &multimodal_language_contract)?;
         source
     } else {
         text_encoder_source.clone()
@@ -2923,16 +2943,22 @@ mod tests {
 
     #[test]
     fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
-        // One sparse fixture represents a logical production-size multimodal checkpoint. Reuse it
-        // across the route/load-shape matrix: recreating the same ~45 GiB logical sparse file for
-        // every case is unnecessary and can trip hosted-runner resource accounting even though no
-        // payload is ever materialized.
         let fixture = tempfile::tempdir().unwrap();
-        let base_spec = production_multimodal_snapshot_spec(fixture.path());
+        let language = crate::config::bounded_dev_encoder_contract();
+        let vision = crate::config::bounded_dev_vision_encoder_contract();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            language,
+            vision,
+        )
+        .unwrap();
+        let base_spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential);
         let config_path = fixture.path().join("text_encoder/config.json");
         let valid_config = std::fs::read(&config_path).unwrap();
         let mut invalid_config: serde_json::Value = serde_json::from_slice(&valid_config).unwrap();
-        invalid_config["vision_config"]["num_hidden_layers"] = serde_json::json!(23);
+        invalid_config["vision_config"]["num_hidden_layers"] =
+            serde_json::json!(vision.num_hidden_layers + 1);
         std::fs::write(&config_path, serde_json::to_vec(&invalid_config).unwrap()).unwrap();
 
         for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
@@ -2942,7 +2968,7 @@ mod tests {
             ] {
                 let mut spec = base_spec.clone();
                 spec.load_shape = shape;
-                let error = build_residency(variant, &spec)
+                let error = build_residency(variant, &spec, language, vision)
                     .err()
                     .expect("deferred construction must still load-admit Pixtral config")
                     .to_string();
@@ -2954,21 +2980,29 @@ mod tests {
         rewrite_tensor_shape(
             fixture.path(),
             "multi_modal_projector.linear_2.weight",
-            5121,
+            vision.output_width + 1,
         );
         for error in [
-            crate::loader::load_vision_tower_dev(fixture.path())
+            crate::loader::load_vision_tower_dev_with_contracts(fixture.path(), language, vision)
                 .err()
                 .expect("vision loader must validate the paired projector")
                 .to_string(),
-            crate::loader::load_multimodal_projector_dev(fixture.path())
-                .err()
-                .expect("projector loader must validate its exact header")
-                .to_string(),
-            crate::loader::load_dev_text_encoder_group(fixture.path())
-                .err()
-                .expect("group loader must validate the whole multimodal source")
-                .to_string(),
+            crate::loader::load_multimodal_projector_dev_with_contracts(
+                fixture.path(),
+                language,
+                vision,
+            )
+            .err()
+            .expect("projector loader must validate its exact header")
+            .to_string(),
+            crate::loader::load_dev_text_encoder_group_with_contracts(
+                fixture.path(),
+                language,
+                vision,
+            )
+            .err()
+            .expect("group loader must validate the whole multimodal source")
+            .to_string(),
         ] {
             assert!(error.contains("vision_tensor_shape"), "{error}");
             assert!(
@@ -3554,13 +3588,15 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum DevEncoderSelection {
-        DefaultDir,
-        OverrideDir,
-        OverrideFile,
+        Builtin,
+        ComponentDir,
+        ComponentFile,
+        CompleteSnapshot,
     }
 
     fn dev_encoder_spec_with_sidecars(
         fixture: &Path,
+        contract: mlx_gen::gen_core::EncoderContract,
         bits: i32,
         selection: DevEncoderSelection,
         sidecars: &[&str],
@@ -3568,19 +3604,27 @@ mod tests {
         let base = fixture.join("base");
         let selected = fixture.join("selected");
         let selected_root = match selection {
-            DevEncoderSelection::DefaultDir => base.join("text_encoder"),
-            DevEncoderSelection::OverrideDir | DevEncoderSelection::OverrideFile => {
+            DevEncoderSelection::Builtin => base.join("text_encoder"),
+            DevEncoderSelection::ComponentDir | DevEncoderSelection::ComponentFile => {
                 gen_core_testkit::write_encoder_contract_fixture(
                     &base.join("text_encoder"),
-                    crate::config::DEV_ENCODER_CONTRACT,
+                    contract,
                 )
                 .unwrap();
                 selected.clone()
             }
+            DevEncoderSelection::CompleteSnapshot => {
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &base.join("text_encoder"),
+                    contract,
+                )
+                .unwrap();
+                selected.join("text_encoder")
+            }
         };
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &selected_root,
-            crate::config::DEV_ENCODER_CONTRACT,
+            contract,
             Some(bits),
         )
         .unwrap();
@@ -3593,29 +3637,37 @@ mod tests {
         }
         let mut spec = LoadSpec::new(WeightsSource::Dir(base));
         spec.text_encoder = match selection {
-            DevEncoderSelection::DefaultDir => None,
-            DevEncoderSelection::OverrideDir => Some(WeightsSource::Dir(selected_root)),
-            DevEncoderSelection::OverrideFile => {
+            DevEncoderSelection::Builtin => None,
+            DevEncoderSelection::ComponentDir => Some(WeightsSource::Dir(selected_root)),
+            DevEncoderSelection::ComponentFile => {
                 Some(WeightsSource::File(selected_root.join("model.safetensors")))
             }
+            DevEncoderSelection::CompleteSnapshot => Some(WeightsSource::Dir(selected)),
         };
         spec
     }
 
     #[test]
     fn packed_dev_rejects_lm_head_sidecars_on_every_selection_surface() {
+        let contract = crate::config::bounded_dev_encoder_contract();
         for bits in [4, 8] {
             for selection in [
-                DevEncoderSelection::DefaultDir,
-                DevEncoderSelection::OverrideDir,
-                DevEncoderSelection::OverrideFile,
+                DevEncoderSelection::Builtin,
+                DevEncoderSelection::ComponentDir,
+                DevEncoderSelection::ComponentFile,
+                DevEncoderSelection::CompleteSnapshot,
             ] {
                 for sidecars in [&["scales"][..], &["biases"][..], &["scales", "biases"][..]] {
                     let fixture = tempfile::tempdir().unwrap();
-                    let spec =
-                        dev_encoder_spec_with_sidecars(fixture.path(), bits, selection, sidecars);
+                    let spec = dev_encoder_spec_with_sidecars(
+                        fixture.path(),
+                        contract,
+                        bits,
+                        selection,
+                        sidecars,
+                    );
                     let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
-                    let error = crate::config::DEV_ENCODER_CONTRACT
+                    let error = contract
                         .source_for_load(&spec, base)
                         .expect_err("Dev's dense LM head must reject every packed sidecar")
                         .to_string();
@@ -3707,8 +3759,9 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let spec = dev_encoder_spec_with_sidecars(
             fixture.path(),
+            crate::config::DEV_ENCODER_CONTRACT,
             4,
-            DevEncoderSelection::OverrideFile,
+            DevEncoderSelection::ComponentFile,
             &[],
         );
         let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
