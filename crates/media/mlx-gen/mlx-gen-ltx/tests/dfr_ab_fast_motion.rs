@@ -121,7 +121,9 @@ fn decode_frames(vae: &LtxVideoVae, latent: &Array) -> (Vec<Vec<u8>>, usize, usi
     let flat: Vec<u8> = frames.as_slice::<u8>().to_vec();
     let per = h * w * 3;
     (
-        (0..f).map(|i| flat[i * per..(i + 1) * per].to_vec()).collect(),
+        (0..f)
+            .map(|i| flat[i * per..(i + 1) * per].to_vec())
+            .collect(),
         h,
         w,
     )
@@ -191,8 +193,8 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         .clone();
     drop(dec_w);
     drop(enc_w);
-    let spatial =
-        LatentUpsampler::from_checkpoint(dir.join("spatial_upsampler.safetensors")).expect("spatial");
+    let spatial = LatentUpsampler::from_checkpoint(dir.join("spatial_upsampler.safetensors"))
+        .expect("spatial");
     let temporal = LatentUpsampler::from_checkpoint(dir.join("temporal_upsampler.safetensors"))
         .expect("temporal");
 
@@ -233,7 +235,10 @@ fn dfr_ab_fast_motion_records_detail_retention() {
     )
     .expect("baseline two-stage");
     eval([&v_base]).expect("materialize baseline");
-    eprintln!("\n[A/B] baseline denoise: {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "\n[A/B] baseline denoise: {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     // --- Arm B: DFR (canvas slots + detailing re-denoise + temporal rounds) ---------------------
     let (canvas_frames, _segment, keyframe_positions) =
@@ -259,7 +264,10 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         detailing_downscale: None,
         video_keyframes: &[],
     };
-    eprintln!("[A/B] DFR ({} keyframe slots, {rounds} temporal rounds)", keyframe_positions.len());
+    eprintln!(
+        "[A/B] DFR ({} keyframe slots, {rounds} temporal rounds)",
+        keyframe_positions.len()
+    );
     let t0 = std::time::Instant::now();
     let dfr = generate_dfr_av_latents(
         &parts,
@@ -304,12 +312,23 @@ fn dfr_ab_fast_motion_records_detail_retention() {
         base_hf += hf_energy(b, bh, bw);
         dfr_hf += hf_energy(d, dh, dw);
         write_ppm(&out_dir.join(format!("base_f{t:03}_{i}.ppm")), b, bh, bw);
-        write_ppm(&out_dir.join(format!("dfr_f{:03}_{i}.ppm", t * stride)), d, dh, dw);
+        write_ppm(
+            &out_dir.join(format!("dfr_f{:03}_{i}.ppm", t * stride)),
+            d,
+            dh,
+            dw,
+        );
     }
     base_hf /= samples.len() as f64;
     dfr_hf /= samples.len() as f64;
-    assert!(base_hf.is_finite() && base_hf > 0.0, "baseline decoded to a degenerate clip");
-    assert!(dfr_hf.is_finite() && dfr_hf > 0.0, "dfr decoded to a degenerate clip");
+    assert!(
+        base_hf.is_finite() && base_hf > 0.0,
+        "baseline decoded to a degenerate clip"
+    );
+    assert!(
+        dfr_hf.is_finite() && dfr_hf > 0.0,
+        "dfr decoded to a degenerate clip"
+    );
 
     let summary = format!(
         "{{\"prompt\":{PROMPT:?},\"seed\":{SEED},\"size\":\"{WIDTH}x{HEIGHT}\",\

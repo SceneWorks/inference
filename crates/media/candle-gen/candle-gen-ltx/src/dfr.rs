@@ -19,7 +19,7 @@ use crate::conditioning::{
     append_generated_keyframe_slots, append_single_frame_keyframes, VideoTokenState,
 };
 use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE, TEMPORAL_SIGMAS};
-use crate::pipeline::{denoise_tokens_rf_ancestral, flatten_latent, unflatten_latent};
+use crate::pipeline::{denoise_tokens_rf_ancestral, unflatten_latent};
 use crate::transformer::AvDiT;
 
 /// Gather latent frames (axis 2) by index.
@@ -131,7 +131,7 @@ pub fn merge_carry_forward_keyframes(
     }
     let ordered: Vec<i64> = by_position.keys().copied().collect();
     let mut frames = Vec::with_capacity(ordered.len());
-    for (_, (which, index)) in &by_position {
+    for (which, index) in by_position.values() {
         let src = if *which == 0 {
             anchor_latents.expect("checked above")
         } else {
@@ -139,10 +139,7 @@ pub fn merge_carry_forward_keyframes(
         };
         frames.push(take_frames(src, &[*index])?);
     }
-    Ok((
-        ordered,
-        Tensor::cat(&frames.iter().collect::<Vec<_>>(), 2)?,
-    ))
+    Ok((ordered, Tensor::cat(&frames.iter().collect::<Vec<_>>(), 2)?))
 }
 
 /// One tile's denoise inputs, in tile-local coordinates (twin of the MLX `DfrTileJob`).
@@ -393,8 +390,12 @@ pub fn noise_slot_tokens(state: &VideoTokenState, sigma: f32, seed: u64) -> Resu
     let dims = state.latent.dims();
     let n: usize = dims.iter().product();
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise = Tensor::from_vec(candle_gen::seeded_normal_vec(&mut rng, n), dims, state.latent.device())?
-        .to_dtype(state.latent.dtype())?;
+    let noise = Tensor::from_vec(
+        candle_gen::seeded_normal_vec(&mut rng, n),
+        dims,
+        state.latent.device(),
+    )?
+    .to_dtype(state.latent.dtype())?;
     let gate = (mask.to_dtype(state.latent.dtype())? * sigma as f64)?
         .broadcast_as(state.latent.shape())?;
     let keep = (Tensor::ones_like(&gate)? - &gate)?;
@@ -582,13 +583,12 @@ pub fn generate_dfr_av_latents(
         )));
     }
     let device = parts.video_ctx.device().clone();
-    let normalize_upsample = |up: &crate::upsampler::LatentUpsampler,
-                              x: &Tensor|
-     -> Result<Tensor> {
-        parts
-            .vae
-            .normalize_latents(&up.forward(&parts.vae.denormalize_latents(x)?)?)
-    };
+    let normalize_upsample =
+        |up: &crate::upsampler::LatentUpsampler, x: &Tensor| -> Result<Tensor> {
+            parts
+                .vae
+                .normalize_latents(&up.forward(&parts.vae.denormalize_latents(x)?)?)
+        };
 
     // --- Stage 1: half-res base + keyframe slots -------------------------------------------------
     let vnoise1 = create_noise(req.seed, g.t, g.h1, g.w1, &device)?;
@@ -788,10 +788,7 @@ mod tests {
     }
 
     fn frame_value(x: &Tensor, t: usize) -> f32 {
-        x.flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()[t]
+        x.flatten_all().unwrap().to_vec1::<f32>().unwrap()[t]
     }
 
     fn fake_upsample(x: &Tensor) -> Result<Tensor> {
@@ -843,9 +840,11 @@ mod tests {
                 ))
             };
             Ok(DfrTileResult {
-                latent: const_latent(c, t, (100 * job.round as i32) as f32
-                    + job.tile_index as f32
-                    + 1.0),
+                latent: const_latent(
+                    c,
+                    t,
+                    (100 * job.round as i32) as f32 + job.tile_index as f32 + 1.0,
+                ),
                 generated_keyframes,
             })
         }
@@ -958,7 +957,10 @@ mod tests {
         let mid_derived: Vec<i64> = vec![48, 144, 240, 336, 432];
         let mut seen_mid_derived = false;
         for call in &round2 {
-            assert!(!call.anchors_global.is_empty(), "round-2 tiles are anchored");
+            assert!(
+                !call.anchors_global.is_empty(),
+                "round-2 tiles are anchored"
+            );
             for a in &call.anchors_global {
                 assert_eq!(a % 48, 0, "round-2 anchor {a} must be a merged-bag seam");
             }
@@ -1044,8 +1046,12 @@ mod tests {
     /// conditioning assertions, at the same seams).
     #[test]
     fn slot_and_keyframe_appends_mark_correctly() {
-        let noise = Tensor::ones((1usize, 2, 2, 1, 1), candle_gen::candle_core::DType::F32, &dev())
-            .unwrap();
+        let noise = Tensor::ones(
+            (1usize, 2, 2, 1, 1),
+            candle_gen::candle_core::DType::F32,
+            &dev(),
+        )
+        .unwrap();
         let positions = Tensor::zeros(
             (1usize, 3, 2, 2),
             candle_gen::candle_core::DType::F32,
@@ -1068,8 +1074,7 @@ mod tests {
         // Read the (still-initial) slots back through the layout.
         let init = Tensor::from_vec(vec![3.0f32, 4.0, 5.0, 6.0], (1, 2, 2, 1, 1), &dev()).unwrap();
         let seeded =
-            append_generated_keyframe_slots(&st, &[5, 9], Some(&init), 17, 1, 1, 32, 24.0)
-                .unwrap();
+            append_generated_keyframe_slots(&st, &[5, 9], Some(&init), 17, 1, 1, 32, 24.0).unwrap();
         let back = crate::conditioning::take_generated_keyframes(&seeded, 1, 1).unwrap();
         assert_eq!(back.dims(), &[1, 2, 2, 1, 1]);
         assert_eq!(
@@ -1082,8 +1087,12 @@ mod tests {
         assert!(given.keyframes_mask.is_none());
         assert!(given.generated_keyframe_layout.is_none());
         // And the reference latent never marks either.
-        let refl = Tensor::ones((1usize, 2, 1, 1, 1), candle_gen::candle_core::DType::F32, &dev())
-            .unwrap();
+        let refl = Tensor::ones(
+            (1usize, 2, 1, 1, 1),
+            candle_gen::candle_core::DType::F32,
+            &dev(),
+        )
+        .unwrap();
         let with_ref =
             crate::conditioning::append_reference_latent(&st, &refl, 2, 1.0, 24.0).unwrap();
         assert!(with_ref.keyframes_mask.is_none());

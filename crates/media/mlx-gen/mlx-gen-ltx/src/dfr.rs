@@ -93,7 +93,11 @@ pub fn stitch_tile_latents(tile_latents: &[Array], ranges: &[DfrTileRange]) -> R
                 tile.drop_latent_prefix, sh[2]
             )));
         }
-        pieces.push(frame_window(latent, tile.drop_latent_prefix, sh[2] as usize)?);
+        pieces.push(frame_window(
+            latent,
+            tile.drop_latent_prefix,
+            sh[2] as usize,
+        )?);
     }
     concatenate_axis(&pieces.iter().collect::<Vec<_>>(), 2).map_err(Into::into)
 }
@@ -144,7 +148,7 @@ pub fn merge_carry_forward_keyframes(
     }
     let ordered: Vec<i64> = by_position.keys().copied().collect();
     let mut frames = Vec::with_capacity(ordered.len());
-    for (_, (which, index)) in &by_position {
+    for (which, index) in by_position.values() {
         let src = if *which == 0 {
             anchor_latents.expect("checked above")
         } else {
@@ -417,7 +421,10 @@ pub fn trim_to_target_frames(
     }
     let temporal_scale = TEMPORAL_SCALE;
     let keep_latents = (target - 1) / temporal_scale + 1;
-    Ok((frame_window(video_latent, 0, keep_latents as usize)?, target))
+    Ok((
+        frame_window(video_latent, 0, keep_latents as usize)?,
+        target,
+    ))
 }
 
 /// The production tile denoise (`dfr_pipeline`'s per-tile stage call): re-noise the window at
@@ -495,13 +502,8 @@ pub fn denoise_dfr_tile(
     let grid = state
         .latent
         .take_axis(Array::from_slice(&grid_tokens, &[state.target_tokens]), 1)?;
-    let latent = crate::conditioning::unpatchify_grid(
-        &grid,
-        state.latent.shape()[2],
-        sh[2],
-        sh[3],
-        sh[4],
-    )?;
+    let latent =
+        crate::conditioning::unpatchify_grid(&grid, state.latent.shape()[2], sh[2], sh[3], sh[4])?;
     let generated_keyframes = if has_slots {
         Some(crate::conditioning::take_generated_keyframes(
             &state, sh[3], sh[4],
@@ -542,7 +544,11 @@ pub fn noise_slot_tokens(state: &VideoTokenState, sigma: f32, seed: u64) -> Resu
 /// exposed for tests that pin the conditioning-token timestep contract (anchors at
 /// `σ·(1 − strength)`, slots at `σ`).
 pub fn tile_entry_timesteps(state: &VideoTokenState) -> Result<Array> {
-    token_timesteps(&state.denoise_mask, state.latent.dtype(), TEMPORAL_SIGMAS[0])
+    token_timesteps(
+        &state.denoise_mask,
+        state.latent.dtype(),
+        TEMPORAL_SIGMAS[0],
+    )
 }
 
 /// Everything [`generate_dfr_av_latents`] needs beyond the request-shaped parameters: the loaded
@@ -650,14 +656,14 @@ pub fn generate_dfr_av_latents(
 
     // --- Stage 1: half-res base + keyframe slots ------------------------------------------------
     let zeros1 = Array::zeros::<f32>(video_s1_noise.shape())?.as_dtype(video_s1_noise.dtype())?;
-    let mut state =
-        match crate::pipeline::stage_keyframe_state(&zeros1, req.video_keyframes, true)? {
-            Some(i2v) => {
-                let noised = i2v.noised(video_s1_noise, STAGE1_SIGMAS[0])?;
-                VideoTokenState::from_i2v(&noised, video_pos1)?
-            }
-            None => VideoTokenState::base(video_s1_noise, video_pos1)?,
-        };
+    let mut state = match crate::pipeline::stage_keyframe_state(&zeros1, req.video_keyframes, true)?
+    {
+        Some(i2v) => {
+            let noised = i2v.noised(video_s1_noise, STAGE1_SIGMAS[0])?;
+            VideoTokenState::from_i2v(&noised, video_pos1)?
+        }
+        None => VideoTokenState::base(video_s1_noise, video_pos1)?,
+    };
     state = append_generated_keyframe_slots(
         &state,
         req.keyframe_positions,
@@ -688,13 +694,8 @@ pub fn generate_dfr_av_latents(
     let grid = state
         .latent
         .take_axis(Array::from_slice(&grid_tokens, &[state.target_tokens]), 1)?;
-    let reserved_half_res = crate::conditioning::unpatchify_grid(
-        &grid,
-        state.latent.shape()[2],
-        s1[2],
-        s1[3],
-        s1[4],
-    )?;
+    let reserved_half_res =
+        crate::conditioning::unpatchify_grid(&grid, state.latent.shape()[2], s1[2], s1[3], s1[4])?;
     let slot_keyframes = crate::conditioning::take_generated_keyframes(&state, s1[3], s1[4])?;
 
     // Spatial x2: video and slots ride the same upsampler (slots' K sits on the frame axis, which
@@ -715,21 +716,18 @@ pub fn generate_dfr_av_latents(
 
     // --- Stage 2: full-res detailing --------------------------------------------------------------
     let s2_entry = STAGE2_SIGMAS[0];
-    let mut state2 = match crate::pipeline::stage_keyframe_state(
-        &upscaled_video,
-        req.video_keyframes,
-        false,
-    )? {
-        Some(i2v) => {
-            // Replace-latent conditioning over the upscaled base, then the stage noiser.
-            let noised = i2v.noised(video_s2_noise, s2_entry)?;
-            VideoTokenState::from_i2v(&noised, video_pos2)?
-        }
-        None => {
-            let renoised = renoise(&upscaled_video, video_s2_noise, s2_entry)?;
-            VideoTokenState::base(&renoised, video_pos2)?
-        }
-    };
+    let mut state2 =
+        match crate::pipeline::stage_keyframe_state(&upscaled_video, req.video_keyframes, false)? {
+            Some(i2v) => {
+                // Replace-latent conditioning over the upscaled base, then the stage noiser.
+                let noised = i2v.noised(video_s2_noise, s2_entry)?;
+                VideoTokenState::from_i2v(&noised, video_pos2)?
+            }
+            None => {
+                let renoised = renoise(&upscaled_video, video_s2_noise, s2_entry)?;
+                VideoTokenState::base(&renoised, video_pos2)?
+            }
+        };
     state2 = append_generated_keyframe_slots(
         &state2,
         req.keyframe_positions,
@@ -789,12 +787,7 @@ pub fn generate_dfr_av_latents(
         // stage.
         parts.dit.set_lora_pass(0);
         let mut upsample = |v: &Array| {
-            crate::upsampler::upsample_latents(
-                v,
-                upsampler,
-                parts.latent_mean,
-                parts.latent_std,
-            )
+            crate::upsampler::upsample_latents(v, upsampler, parts.latent_mean, parts.latent_std)
         };
         let mut denoise_tile = |job: &DfrTileJob| {
             let t_tile = job.tile.latent_frames();
@@ -901,9 +894,7 @@ mod tests {
         seed: u64,
         cond_fps: f32,
         anchors_global: Vec<i64>,
-        slots_global: Vec<i64>,
         anchor_first_value: Option<f32>,
-        window_t: i32,
     }
 
     /// Recording fake denoiser: returns the window filled with the constant
@@ -923,13 +914,7 @@ mod tests {
                     .iter()
                     .map(|p| p + job.tile.pixel_start)
                     .collect(),
-                slots_global: job
-                    .slot_positions_local
-                    .iter()
-                    .map(|p| p + job.tile.pixel_start)
-                    .collect(),
                 anchor_first_value: job.anchor_latents.as_ref().map(|a| frame_value(a, 0)),
-                window_t: sh[2],
             });
             let generated_keyframes = if job.slot_positions_local.is_empty() {
                 None
@@ -941,9 +926,11 @@ mod tests {
                 ))
             };
             Ok(DfrTileResult {
-                latent: const_latent(sh[1], sh[2], (100 * job.round as i32) as f32
-                    + job.tile_index as f32
-                    + 1.0),
+                latent: const_latent(
+                    sh[1],
+                    sh[2],
+                    (100 * job.round as i32) as f32 + job.tile_index as f32 + 1.0,
+                ),
                 generated_keyframes,
             })
         }
@@ -1076,7 +1063,10 @@ mod tests {
         let mid_derived: Vec<i64> = vec![48, 144, 240, 336, 432];
         let mut seen_mid_derived = false;
         for call in &round2 {
-            assert!(!call.anchors_global.is_empty(), "round-2 tiles are anchored");
+            assert!(
+                !call.anchors_global.is_empty(),
+                "round-2 tiles are anchored"
+            );
             for a in &call.anchors_global {
                 assert_eq!(a % 48, 0, "round-2 anchor {a} must be a merged-bag seam");
             }

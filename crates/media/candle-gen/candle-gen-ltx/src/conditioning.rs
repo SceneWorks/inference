@@ -426,7 +426,9 @@ pub fn append_generated_keyframe_slots(
         ));
     }
     if pixel_frame_indices.is_empty() {
-        return Err(Error::Msg("ltx dfr: pixel_frame_indices must be non-empty".into()));
+        return Err(Error::Msg(
+            "ltx dfr: pixel_frame_indices must be non-empty".into(),
+        ));
     }
     if pixel_frame_indices.windows(2).any(|p| p[1] <= p[0]) || pixel_frame_indices[0] < 0 {
         return Err(Error::Msg(format!(
@@ -481,7 +483,14 @@ pub fn append_generated_keyframe_slots(
 
     let mut position_blocks = Vec::with_capacity(k);
     for &pixel_frame in pixel_frame_indices {
-        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps, dev)?);
+        position_blocks.push(single_frame_positions(
+            h,
+            w,
+            pixel_frame,
+            spatial_scale,
+            fps,
+            dev,
+        )?);
     }
     let positions = Tensor::cat(&position_blocks.iter().collect::<Vec<_>>(), 2)?;
     let positions = broadcast_positions(positions, b, num_new)?;
@@ -493,7 +502,10 @@ pub fn append_generated_keyframe_slots(
     Ok(VideoTokenState {
         latent: Tensor::cat(&[&state.latent, &slot_tokens], 1)?,
         clean_latent: Tensor::cat(
-            &[&state.clean_latent, &Tensor::zeros((b, num_new, c), dt, dev)?],
+            &[
+                &state.clean_latent,
+                &Tensor::zeros((b, num_new, c), dt, dev)?,
+            ],
             1,
         )?,
         denoise_mask: Tensor::cat(&[&state.denoise_mask, &denoise_mask], 1)?,
@@ -539,7 +551,14 @@ pub fn append_single_frame_keyframes(
         token_blocks.push(crate::pipeline::flatten_latent(
             &frame_slice(keyframes, index)?.to_dtype(dt)?,
         )?);
-        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps, dev)?);
+        position_blocks.push(single_frame_positions(
+            h,
+            w,
+            pixel_frame,
+            spatial_scale,
+            fps,
+            dev,
+        )?);
     }
     let tokens = Tensor::cat(&token_blocks.iter().collect::<Vec<_>>(), 1)?;
     let positions = Tensor::cat(&position_blocks.iter().collect::<Vec<_>>(), 2)?;

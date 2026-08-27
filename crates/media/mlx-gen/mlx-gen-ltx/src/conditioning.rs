@@ -636,7 +636,13 @@ pub fn append_generated_keyframe_slots(
 
     let mut position_blocks = Vec::with_capacity(k);
     for &pixel_frame in pixel_frame_indices {
-        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps));
+        position_blocks.push(single_frame_positions(
+            h,
+            w,
+            pixel_frame,
+            spatial_scale,
+            fps,
+        ));
     }
     let positions = concatenate_axis(&position_blocks.iter().collect::<Vec<_>>(), 2)?;
     let positions = broadcast_positions(positions, b, num_new)?;
@@ -649,7 +655,10 @@ pub fn append_generated_keyframe_slots(
     Ok(VideoTokenState {
         latent: concatenate_axis(&[&state.latent, &slot_tokens], 1)?,
         clean_latent: concatenate_axis(
-            &[&state.clean_latent, &Array::zeros::<f32>(&[b, num_new, c])?.as_dtype(dt)?],
+            &[
+                &state.clean_latent,
+                &Array::zeros::<f32>(&[b, num_new, c])?.as_dtype(dt)?,
+            ],
             1,
         )?,
         denoise_mask: concatenate_axis(&[&state.denoise_mask, &denoise_mask], 1)?,
@@ -705,8 +714,16 @@ pub fn append_single_frame_keyframes(
     let mut token_blocks = Vec::with_capacity(pixel_frame_indices.len());
     let mut position_blocks = Vec::with_capacity(pixel_frame_indices.len());
     for (index, &pixel_frame) in pixel_frame_indices.iter().enumerate() {
-        token_blocks.push(patchify_grid(&frame(keyframes, index as i32)?.as_dtype(dt)?)?);
-        position_blocks.push(single_frame_positions(h, w, pixel_frame, spatial_scale, fps));
+        token_blocks.push(patchify_grid(
+            &frame(keyframes, index as i32)?.as_dtype(dt)?,
+        )?);
+        position_blocks.push(single_frame_positions(
+            h,
+            w,
+            pixel_frame,
+            spatial_scale,
+            fps,
+        ));
     }
     let tokens = concatenate_axis(&token_blocks.iter().collect::<Vec<_>>(), 1)?;
     let positions = concatenate_axis(&position_blocks.iter().collect::<Vec<_>>(), 2)?;
@@ -1119,14 +1136,16 @@ mod tests {
     #[test]
     fn generated_slots_mark_exactly_their_run() {
         let st = tiny_base(2, 2, 2);
-        let out =
-            append_generated_keyframe_slots(&st, &[5, 9], None, 17, 2, 2, 32, 24.0).unwrap();
+        let out = append_generated_keyframe_slots(&st, &[5, 9], None, 17, 2, 2, 32, 24.0).unwrap();
         assert_eq!(out.latent.shape(), &[1, 8 + 8, 2]);
         let layout = out.generated_keyframe_layout.as_ref().unwrap();
         assert_eq!(layout.first_token, 8);
         assert_eq!(layout.tokens_per_keyframe, 4);
         assert_eq!(layout.pixel_frame_indices, vec![5, 9]);
-        let mask = out.keyframes_mask.as_ref().expect("slots must mark the keyframes mask");
+        let mask = out
+            .keyframes_mask
+            .as_ref()
+            .expect("slots must mark the keyframes mask");
         assert_eq!(mask.shape(), &[1, 16, 1]);
         let m = mask.as_slice::<f32>();
         assert!(
@@ -1139,9 +1158,7 @@ mod tests {
         );
         let dm = out.denoise_mask.as_slice::<f32>();
         assert!(dm[8..].iter().all(|&v| v == 1.0));
-        assert!(
-            append_generated_keyframe_slots(&out, &[3], None, 17, 2, 2, 32, 24.0).is_err()
-        );
+        assert!(append_generated_keyframe_slots(&out, &[3], None, 17, 2, 2, 32, 24.0).is_err());
         assert!(append_generated_keyframe_slots(&st, &[17], None, 17, 2, 2, 32, 24.0).is_err());
         assert!(append_generated_keyframe_slots(&st, &[9, 5], None, 17, 2, 2, 32, 24.0).is_err());
     }
@@ -1165,8 +1182,8 @@ mod tests {
     fn slot_initials_seed_latent_not_clean() {
         let st = tiny_base(2, 1, 1);
         let init = Array::from_slice(&[3.0f32, 4.0], &[1, 2, 1, 1, 1]);
-        let out = append_generated_keyframe_slots(&st, &[5], Some(&init), 17, 1, 1, 32, 24.0)
-            .unwrap();
+        let out =
+            append_generated_keyframe_slots(&st, &[5], Some(&init), 17, 1, 1, 32, 24.0).unwrap();
         let lat = out.latent.as_slice::<f32>();
         assert_eq!(&lat[4..6], &[3.0, 4.0], "slot latent seeded from initials");
         let clean = out.clean_latent.as_slice::<f32>();
@@ -1187,12 +1204,19 @@ mod tests {
         let out = append_single_frame_keyframes(&st, &kf, &[6, 11], 0.95, 32, 24.0).unwrap();
         assert_eq!(out.latent.shape(), &[1, 4, 2]);
         let lat = out.latent.as_slice::<f32>();
-        assert_eq!(&lat[2 * 2..], &[0.0, 0.0, 0.0, 0.0], "noisy side gets zeros");
+        assert_eq!(
+            &lat[2 * 2..],
+            &[0.0, 0.0, 0.0, 0.0],
+            "noisy side gets zeros"
+        );
         let clean = out.clean_latent.as_slice::<f32>();
         assert_eq!(&clean[2 * 2..], &[7.0, 9.0, 8.0, 10.0]);
         let dm = out.denoise_mask.as_slice::<f32>();
         assert!((dm[2] - 0.05).abs() < 1e-6 && (dm[3] - 0.05).abs() < 1e-6);
-        assert!(out.keyframes_mask.is_none(), "given keyframes must not mark");
+        assert!(
+            out.keyframes_mask.is_none(),
+            "given keyframes must not mark"
+        );
         assert!(out.generated_keyframe_layout.is_none());
         assert!(append_single_frame_keyframes(&st, &kf, &[0, 11], 0.95, 32, 24.0).is_err());
     }
@@ -1227,4 +1251,3 @@ mod tests {
         assert!(take_generated_keyframes(&tiny_base(1, 1, 1), 1, 1).is_err());
     }
 }
-

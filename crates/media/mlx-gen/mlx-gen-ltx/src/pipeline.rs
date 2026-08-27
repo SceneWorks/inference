@@ -1077,7 +1077,9 @@ pub fn denoise_tokens_rf_ancestral(
 
         let (vvel, avel) = match (&alat, &audio, audio_dims) {
             (Some(al), Some(a), Some((ab, ac, at, af))) => {
-                let aflat = al.transpose_axes(&[0, 2, 1, 3])?.reshape(&[ab, at, ac * af])?;
+                let aflat = al
+                    .transpose_axes(&[0, 2, 1, 3])?
+                    .reshape(&[ab, at, ac * af])?;
                 let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
                 let (vv, av) = dit.forward(
                     &vtok,
@@ -1093,7 +1095,9 @@ pub fn denoise_tokens_rf_ancestral(
                     video.keyframes_mask.as_ref(),
                     rope_epoch,
                 )?;
-                let av = av.reshape(&[ab, at, ac, af])?.transpose_axes(&[0, 2, 1, 3])?;
+                let av = av
+                    .reshape(&[ab, at, ac, af])?
+                    .transpose_axes(&[0, 2, 1, 3])?;
                 (vv, Some(av))
             }
             _ => (
@@ -1132,21 +1136,22 @@ pub fn denoise_tokens_rf_ancestral(
             )?;
             let ratio = scalar(coeffs.sigma_down_ratio).as_dtype(dt)?;
             let one_minus = scalar(1.0 - coeffs.sigma_down_ratio).as_dtype(dt)?;
-            let step_rf = |x: &Array, x0: &Array, step_idx: usize, modality: u64| -> Result<Array> {
-                let mut next = add(&multiply(x, &ratio)?, &multiply(x0, &one_minus)?)?;
-                if eta > 0.0 {
-                    // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 — the
-                    // reference does not fall back to the noise-free branch when eta > 0).
-                    let ar = scalar(coeffs.alpha_ratio).as_dtype(dt)?;
-                    next = multiply(&next, &ar)?;
-                    if coeffs.renoise_coeff > 0.0 {
-                        let noise = seeded_normal(next.shape(), step_idx, modality)?;
-                        let rc = scalar(coeffs.renoise_coeff).as_dtype(dt)?;
-                        next = add(&next, &multiply(&noise, &rc)?)?;
+            let step_rf =
+                |x: &Array, x0: &Array, step_idx: usize, modality: u64| -> Result<Array> {
+                    let mut next = add(&multiply(x, &ratio)?, &multiply(x0, &one_minus)?)?;
+                    if eta > 0.0 {
+                        // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 — the
+                        // reference does not fall back to the noise-free branch when eta > 0).
+                        let ar = scalar(coeffs.alpha_ratio).as_dtype(dt)?;
+                        next = multiply(&next, &ar)?;
+                        if coeffs.renoise_coeff > 0.0 {
+                            let noise = seeded_normal(next.shape(), step_idx, modality)?;
+                            let rc = scalar(coeffs.renoise_coeff).as_dtype(dt)?;
+                            next = add(&next, &multiply(&noise, &rc)?)?;
+                        }
                     }
-                }
-                Ok(next)
-            };
+                    Ok(next)
+                };
             let mut vnext = step_rf(&vtok, &vden, i, 0)?;
             if eta > 0.0 {
                 // Injected noise reached the conditioning tokens; re-pin them (the reference

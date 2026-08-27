@@ -132,7 +132,9 @@ pub fn resolve_canvas(num_frames: i64, temporal_scale: i64) -> Result<(i64, i64,
     }
     let segment = choose_segment_length(content)?;
     let content_padded = content + (segment - content % segment) % segment;
-    let positions: Vec<i64> = (1..=content_padded / segment).map(|i| segment * i).collect();
+    let positions: Vec<i64> = (1..=content_padded / segment)
+        .map(|i| segment * i)
+        .collect();
     Ok((content_padded + 1, segment, positions))
 }
 
@@ -214,7 +216,9 @@ pub fn tile_ranges(
         )));
     }
     if seam_positions.is_empty() {
-        return Err(Error::Msg("ltx dfr: seam_positions must be non-empty".into()));
+        return Err(Error::Msg(
+            "ltx dfr: seam_positions must be non-empty".into(),
+        ));
     }
     if *seam_positions.last().expect("non-empty") != num_frames - 1 {
         return Err(Error::Msg(format!(
@@ -439,7 +443,11 @@ mod tests {
             (28, 32),
             (40, 24),
         ] {
-            assert_eq!(choose_segment_length(content).unwrap(), want, "content={content}");
+            assert_eq!(
+                choose_segment_length(content).unwrap(),
+                want,
+                "content={content}"
+            );
         }
     }
 
