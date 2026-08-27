@@ -3,7 +3,8 @@
 //!
 //! **Scope (sc-2684):** the production path is the full **synchronized audio+video** generation
 //! (`generate_av.py`) — prompt → Gemma-3 tokenizer → [`LtxTextEncoder::encode_av`] (video 4096 +
-//! audio 2048 embeddings) → seeded noise → the joint 2-stage distilled denoise ([`generate_av_latents`]:
+//! audio 2048 embeddings) → seeded noise → the joint 2-stage distilled denoise
+//! ([`crate::pipeline::generate_av_latents`]:
 //! both streams through the dual-modality [`AvDiT`] with cross-modal attention every step; the video is
 //! 2× upsampled between stages, the audio is not) → [`LtxVideoVae`] decode → uint8 RGB frames **plus**
 //! [`AudioDecoder`] → [`LtxVocoder`] → an [`mlx_gen::media::AudioTrack`]. The audio is always denoised
@@ -64,6 +65,7 @@ use mlx_gen::{
 
 use crate::audio_vae::AudioDecoder;
 use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
+use crate::dev_sampler::TransformerVariant;
 use crate::dfr::{generate_dfr_av_latents, DfrComponents, DfrRequest};
 use crate::diff_vae::{DiffVaeMode, DiffVaeQuant, NaDiffusionDecoder, NaDiffusionDecoderConfig};
 use crate::duration_head::DurationHead;
@@ -72,7 +74,7 @@ use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::gemma4_te::Ltx25TextEncoder;
 use crate::image_crf::{condition_image_for_checkpoint, default_image_recompress};
 use crate::pipeline::{
-    decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
+    decode_audio_track, decode_to_frames_with_tiling, generate_av_latents_for_variant,
     generate_av_latents_iclora, preprocess_conditioning_clip, to_uint8_frames, StageClip,
     StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
@@ -94,6 +96,11 @@ pub const MODEL_25_ID: &str = "ltx_2_5";
 /// The stock, locally staged Gemma-4 instruction snapshot used only for opt-in LTX-2.5 prompt
 /// enhancement.  It lives below the single LTX rehost rather than in a job-time HF cache.
 const LTX25_ENHANCER_COMPONENT: &str = "enhancer";
+
+/// Upstream LTX-2 default negative conditioning for the non-distilled guided pipeline.  A caller's
+/// explicit `negative_prompt` replaces this text; an omitted field does not mean an all-zero or
+/// positive-conditioning branch.
+const DEFAULT_NEGATIVE_PROMPT: &str = "has_subtitles, has_blurbox, transition from black, transition to black, speech_ending_short, blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
 
 /// The supported DiffVAE execution recipe.  The planner still chooses untiled versus tiled from
 /// the live process budget; this is the upstream semantic mode fed into that planner.
@@ -330,6 +337,31 @@ pub fn descriptor_25() -> ModelDescriptor {
     out.capabilities.max_temporal_upsample_rounds =
         mlx_gen::gen_core::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
     out.capabilities.supports_diffusion_decoder = true;
+    // The catalog entry spans both packed transformer variants.  The loaded provider narrows this
+    // union to the exact checkpoint identity in `descriptor_25_for_variant`, so a distilled load
+    // still rejects dev-only negative conditioning and a 30-step request.
+    out.capabilities.supports_negative_prompt = true;
+    out.capabilities.supported_steps = StepSupport::Exact(vec![crate::pipeline::NATIVE_STEPS, 30]);
+    out
+}
+
+fn descriptor_25_for_variant(variant: TransformerVariant) -> ModelDescriptor {
+    let mut out = descriptor_25();
+    match variant {
+        TransformerVariant::Distilled => {
+            out.capabilities.supports_negative_prompt = false;
+            out.capabilities.supported_steps =
+                StepSupport::Exact(vec![crate::pipeline::NATIVE_STEPS]);
+        }
+        TransformerVariant::Dev => {
+            out.capabilities.supports_negative_prompt = true;
+            out.capabilities.supported_steps = StepSupport::Exact(vec![30]);
+            // The non-distilled checkpoint has one native 30-step guided Euler pipeline.  The
+            // curated menu swaps integrators over the baked distilled waypoints and is therefore
+            // not a valid dev-checkpoint control.
+            out.capabilities.samplers.clear();
+        }
+    }
     out
 }
 
@@ -367,6 +399,14 @@ enum StagedTextEncoder {
     Gemma4(Box<Ltx25TextEncoder>),
 }
 
+struct StagedTextConditioning {
+    enhanced_prompt: Option<String>,
+    video: Array,
+    audio: Array,
+    negative_video: Option<Array>,
+    negative_audio: Option<Array>,
+}
+
 /// The LTX-2.5-only components which turn the shared 2.3 A/V shell into the declared 2.5
 /// provider.  Keeping the choice here means all three advanced axes flow through the ordinary
 /// `Generator::generate` route instead of being descriptor-only capability claims.
@@ -376,6 +416,7 @@ enum LtxExecution {
 }
 
 struct Ltx25Execution {
+    variant: TransformerVariant,
     duration_head: DurationHead,
     temporal_upsampler: LatentUpsampler,
     decoder: Ltx25Decoder,
@@ -786,6 +827,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 pub struct Ltx25 {
     descriptor: ModelDescriptor,
     spec: LoadSpec,
+    variant: TransformerVariant,
 }
 
 /// Resolve the LTX-2.5 split layout through the ordinary provider registration. The actual tensor
@@ -796,6 +838,7 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     known.push(LTX25_ENHANCER_COMPONENT);
     reject_unknown_components(spec, &known, MODEL_25_ID)?;
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
+    let variant = crate::dev_sampler::from_bundle(&bundle)?;
     if bundle.layout() != LtxCheckpointLayout::Split {
         return Err(Error::Msg(format!(
             "ltx_2_5: expected an LTX-2.5 split-component bundle, got {}",
@@ -826,8 +869,9 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     bundle.require(ltx25_video_component(spec))?;
     Ok(Box::new(Ltx25 {
-        descriptor: descriptor_25(),
+        descriptor: descriptor_25_for_variant(variant),
         spec: spec.clone(),
+        variant,
     }))
 }
 
@@ -905,6 +949,7 @@ fn ltx25_encoder_path(
 
 fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
+    let variant = crate::dev_sampler::from_bundle(&bundle)?;
     let config = LtxConfig::from_bundle(&bundle)?;
     crate::bundle::assert_gemma_version(&bundle)?;
     let root = match &spec.weights {
@@ -993,7 +1038,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
         LatentUpsampler::from_checkpoint(bundle.require(LtxComponent::TemporalUpsampler)?.path())?;
 
     Ok(Ltx {
-        descriptor: descriptor_25(),
+        descriptor: descriptor_25_for_variant(variant),
         memory_strategy: None,
         memory_tier: None,
         memory_overlay: None,
@@ -1012,6 +1057,7 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             enhancer,
         },
         execution: LtxExecution::Ltx25(Box::new(Ltx25Execution {
+            variant,
             duration_head,
             temporal_upsampler,
             decoder,
@@ -1105,7 +1151,7 @@ impl Ltx {
     /// video/audio encode inside its scope, `eval` so the encode completes, then let the TE drop at
     /// end of scope. Returns the (optional) enhanced prompt + the `(video_ctx, audio_ctx)` embeddings.
     /// The caller `clear_cache()`s and proceeds to the DiT, which now loads into the freed footprint.
-    fn stage_text_phase(&self, req: &GenerationRequest) -> Result<(Option<String>, Array, Array)> {
+    fn stage_text_phase(&self, req: &GenerationRequest) -> Result<StagedTextConditioning> {
         let te = self.build_text_encoder()?;
         // Prompt enhancement (sc-2845) reuses the just-built Gemma backbone (the censored path); the
         // uncensored path loads its own. Running it here keeps BOTH TE uses inside one staged load.
@@ -1119,10 +1165,36 @@ impl Ltx {
         let prompt = enhanced.as_deref().unwrap_or(req.prompt.as_str());
         let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = te.encode_av(&ids, &mask)?;
+        let negative = if self.transformer_variant().is_dev() {
+            let prompt = req
+                .negative_prompt
+                .as_deref()
+                .unwrap_or(DEFAULT_NEGATIVE_PROMPT);
+            let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
+            let (video, audio) = te.encode_av(&ids, &mask)?;
+            Some((video, audio))
+        } else {
+            None
+        };
         // Force the encode to complete before `te` (the ~24 GB Gemma) drops at end of scope — otherwise
         // the lazy graph would keep the TE weights alive into the DiT phase, defeating the staging.
-        mlx_rs::transforms::eval([&video_ctx, &audio_ctx])?;
-        Ok((enhanced, video_ctx, audio_ctx))
+        match &negative {
+            Some((negative_video, negative_audio)) => {
+                mlx_rs::transforms::eval([&video_ctx, &audio_ctx, negative_video, negative_audio])?
+            }
+            None => mlx_rs::transforms::eval([&video_ctx, &audio_ctx])?,
+        }
+        let (negative_video, negative_audio) = match negative {
+            Some((video, audio)) => (Some(video), Some(audio)),
+            None => (None, None),
+        };
+        Ok(StagedTextConditioning {
+            enhanced_prompt: enhanced,
+            video: video_ctx,
+            audio: audio_ctx,
+            negative_video,
+            negative_audio,
+        })
     }
 
     fn ltx25_execution(&self) -> Result<&Ltx25Execution> {
@@ -1132,6 +1204,13 @@ impl Ltx {
                 "ltx_2_3: the LTX-2.5 duration/DFR/DiffVAE execution components are unavailable"
                     .into(),
             )),
+        }
+    }
+
+    fn transformer_variant(&self) -> TransformerVariant {
+        match &self.execution {
+            LtxExecution::Ltx23 => TransformerVariant::Distilled,
+            LtxExecution::Ltx25(execution) => execution.variant,
         }
     }
 
@@ -1254,6 +1333,8 @@ impl Ltx {
         req: &GenerationRequest,
         video_ctx: &Array,
         audio_ctx: &Array,
+        negative_video_ctx: Option<&Array>,
+        negative_audio_ctx: Option<&Array>,
         video_s1: &Array,
         video_s2: &Array,
         audio_s1: &Array,
@@ -1303,6 +1384,8 @@ impl Ltx {
             req,
             video_ctx,
             audio_ctx,
+            negative_video_ctx,
+            negative_audio_ctx,
             video_s1,
             video_s2,
             audio_s1,
@@ -1323,6 +1406,8 @@ impl Ltx {
         req: &GenerationRequest,
         video_ctx: &Array,
         audio_ctx: &Array,
+        negative_video_ctx: Option<&Array>,
+        negative_audio_ctx: Option<&Array>,
         video_s1: &Array,
         video_s2: &Array,
         audio_s1: &Array,
@@ -1388,12 +1473,18 @@ impl Ltx {
         // (>100% overrun). `StageProgressFold` detects the per-stage restart, folds prior stages in,
         // dedupes the multi-eval repeats, and clamps — so the bar stays monotone non-decreasing,
         // reaches `total`, and never overruns.
-        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let total_steps = match self.transformer_variant() {
+            TransformerVariant::Distilled => TOTAL_STEPS,
+            TransformerVariant::Dev => {
+                crate::params::LTX_2_5_PARAMS.num_inference_steps + (STAGE2_SIGMAS.len() as u32 - 1)
+            }
+        };
+        let mut fold = StageProgressFold::new(total_steps);
         let mut on_step = |cur: usize| {
             if let Some(current) = fold.observe(cur as u32) {
                 on_progress(Progress::Step {
                     current,
-                    total: TOTAL_STEPS,
+                    total: total_steps,
                 });
             }
         };
@@ -1460,7 +1551,7 @@ impl Ltx {
                 )
                 .map(|(video, audio)| (video, audio, req.fps.unwrap_or(24)))
             } else {
-                generate_av_latents(
+                generate_av_latents_for_variant(
                     &transformer,
                     &self.upsampler,
                     video_s1,
@@ -1472,6 +1563,9 @@ impl Ltx {
                     &audio_pos,
                     video_ctx,
                     audio_ctx,
+                    negative_video_ctx,
+                    negative_audio_ctx,
+                    self.transformer_variant(),
                     &self.latent_mean,
                     &self.latent_std,
                     video_keyframes,
@@ -2048,6 +2142,7 @@ impl Generator for Ltx25 {
         // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
         // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
         let route = build_ltx25(&self.spec).map_err(mlx_gen::gen_core::Error::from)?;
+        debug_assert_eq!(route.transformer_variant(), self.variant);
         route.generate(req, on_progress)
     }
 }
@@ -2416,14 +2511,14 @@ impl Ltx {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let (enhanced, video_ctx, audio_ctx) =
+        let conditioning =
             finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Conditioning, || {
                 self.stage_text_phase(req)
             })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();
-        let prompted = request_with_effective_prompt(req, enhanced);
-        let owned = self.apply_auto_frames(&prompted, &video_ctx, &audio_ctx)?;
+        let prompted = request_with_effective_prompt(req, conditioning.enhanced_prompt.clone());
+        let owned = self.apply_auto_frames(&prompted, &conditioning.video, &conditioning.audio)?;
         // Auto-duration supplies `frames` only after the text phase.  Re-run the ordinary provider
         // floor on that concrete request so its maximum/stride and DFR geometry bounds apply to the
         // prediction before any noise allocation.
@@ -2466,8 +2561,10 @@ impl Ltx {
         )?;
         self.generate_with_noise(
             req,
-            &video_ctx,
-            &audio_ctx,
+            &conditioning.video,
+            &conditioning.audio,
+            conditioning.negative_video.as_ref(),
+            conditioning.negative_audio.as_ref(),
             &video_s1,
             &video_s2,
             &audio_s1,
@@ -2502,6 +2599,47 @@ mod tests {
             seed: Some(0x5eed),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn ltx25_loaded_variant_narrows_steps_and_negative_conditioning() {
+        let distilled = descriptor_25_for_variant(TransformerVariant::Distilled);
+        assert_eq!(
+            distilled.capabilities.supported_steps,
+            StepSupport::Exact(vec![NATIVE_STEPS])
+        );
+        assert!(!distilled.capabilities.supports_negative_prompt);
+
+        let dev = descriptor_25_for_variant(TransformerVariant::Dev);
+        assert_eq!(
+            dev.capabilities.supported_steps,
+            StepSupport::Exact(vec![30])
+        );
+        assert!(dev.capabilities.supports_negative_prompt);
+        assert!(dev.capabilities.samplers.is_empty());
+
+        let dev_request = GenerationRequest {
+            steps: Some(30),
+            negative_prompt: Some("blurred motion".into()),
+            ..ltx25_request("a red kite over the sea")
+        };
+        assert!(validate_request_for(MODEL_25_ID, &dev.capabilities, &dev_request).is_ok());
+        assert!(validate_request_for(
+            MODEL_25_ID,
+            &distilled.capabilities,
+            &dev_request
+        )
+        .is_err());
+        assert!(validate_request_for(
+            MODEL_25_ID,
+            &dev.capabilities,
+            &GenerationRequest {
+                steps: Some(NATIVE_STEPS),
+                negative_prompt: None,
+                ..ltx25_request("a red kite over the sea")
+            }
+        )
+        .is_err());
     }
 
     /// This reaches the same request object `generate_impl` supplies to auto-duration, DFR,
@@ -2546,8 +2684,9 @@ mod tests {
     #[test]
     fn ltx25_provider_enhancement_is_registered_and_refuses_the_unlicensed_axis() {
         let generator = Ltx25 {
-            descriptor: descriptor_25(),
+            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
+            variant: TransformerVariant::Distilled,
         };
         let enhanced = GenerationRequest {
             enhance_prompt: true,
@@ -2580,8 +2719,9 @@ mod tests {
     #[test]
     fn ltx25_registered_route_enforces_geometry_and_temporal_constraints() {
         let generator = Ltx25 {
-            descriptor: descriptor_25(),
+            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
+            variant: TransformerVariant::Distilled,
         };
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),
@@ -2610,8 +2750,9 @@ mod tests {
     #[test]
     fn ltx25_provider_admits_only_advanced_axes_it_executes() {
         let generator = Ltx25 {
-            descriptor: descriptor_25(),
+            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
+            variant: TransformerVariant::Distilled,
         };
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),

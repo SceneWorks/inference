@@ -2841,8 +2841,14 @@ mod tests {
         // per-block calls from the materialized/enumerated `index`, not a fixed
         // STG layer or a mode that silently becomes a whole-block skip.
         let source = include_str!("transformer.rs");
+        // The literal appears once in this assertion itself; subtract that self-reference so the
+        // production count remains exact even though this file has multiple earlier test modules.
+        let production_index_uses = source
+            .matches("perturbation.attention_plan(index)")
+            .count()
+            .saturating_sub(1);
         assert_eq!(
-            source.matches("perturbation.attention_plan(index)").count(),
+            production_index_uses,
             2,
             "resident and streamed AV-DiT loops must both apply the actual block index"
         );
