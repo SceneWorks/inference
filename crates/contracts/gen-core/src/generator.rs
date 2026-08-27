@@ -2971,7 +2971,8 @@ impl Capabilities {
         // A provider that wants a MORE actionable message (naming the checkpoint generation that
         // does support the axis, say) runs its own check BEFORE calling the floor — that is what
         // `ltx_2_3` does, and why its typed refusals still name 2.5.
-        if req.num_generated_keyframes.is_some_and(|n| n > 0) && !self.supports_generated_keyframes {
+        if req.num_generated_keyframes.is_some_and(|n| n > 0) && !self.supports_generated_keyframes
+        {
             return Err(Error::Unsupported(format!(
                 "{id}: num_generated_keyframes is not supported by this engine (it requires a \
                  checkpoint whose transformer carries the learned generated-keyframe slot marker)"

@@ -63,14 +63,17 @@ use mlx_gen::{
 
 use crate::audio_vae::AudioDecoder;
 use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
+use crate::dfr::{generate_dfr_av_latents, DfrComponents, DfrRequest};
+use crate::diff_vae::{DiffVaeMode, DiffVaeQuant, NaDiffusionDecoder, NaDiffusionDecoderConfig};
+use crate::duration_head::DurationHead;
 use crate::enhance::{self, EnhanceConfig, SampleParams};
 use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::gemma4_te::Ltx25TextEncoder;
 use crate::image_crf::{condition_image_for_checkpoint, default_image_recompress};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames_with_tiling, generate_av_latents,
-    generate_av_latents_iclora, preprocess_conditioning_clip, StageClip, StageKeyframe,
-    STAGE1_SIGMAS, STAGE2_SIGMAS,
+    generate_av_latents_iclora, preprocess_conditioning_clip, to_uint8_frames, StageClip,
+    StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -85,11 +88,13 @@ pub const MODEL_ID: &str = "ltx_2_3";
 /// Public provider id for the split-component Gemma-4 LTX-2.5 route.
 pub const MODEL_25_ID: &str = "ltx_2_5";
 
-/// The `model_version` this engine's checkpoints declare, used to resolve generation params
-/// (sc-18759 — see [`crate::params`]). This crate loads only `ltx_2_3` checkpoints today (the
-/// `ltx_2_5` engine descriptor is sc-18778), so the literal is correct as written, not a
-/// placeholder: once split-checkpoint loading (sc-18757) threads a loaded checkpoint's declared
-/// `model_version` onto [`Ltx`], swap this constant for that field.
+/// The supported DiffVAE execution recipe.  The planner still chooses untiled versus tiled from
+/// the live process budget; this is the upstream semantic mode fed into that planner.
+const DEFAULT_DIFFVAE_MODE: DiffVaeMode = DiffVaeMode::ChunkedEager;
+
+/// The `model_version` declared by the all-in-one LTX-2.3 checkpoint layout, used to resolve its
+/// generation params (sc-18759 — see [`crate::params`]). The split LTX-2.5 route resolves its
+/// version from the bundle instead of this legacy-layout constant.
 const CHECKPOINT_MODEL_VERSION: &str = "2.3.0";
 
 /// Neutral gray the replace_person mask blends toward (reference `_apply_replacement_mask`).
@@ -303,20 +308,21 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// Stable identity and the deliberately conservative capability surface of the LTX-2.5 MLX
-/// route.  The ordinary 2.3 conditioning paths are shared by the two execution shells; advanced
-/// DFR controls are left closed until their separately loaded temporal/duration components are
-/// consumed by this route rather than being accepted as inert metadata.
+/// Stable identity and capability surface of the LTX-2.5 MLX route.  The ordinary 2.3
+/// conditioning paths are shared by the two execution shells; the advanced axes below are open
+/// only because the split route binds the duration head, temporal upsampler, and alternate decoder
+/// into its request execution path.
 pub fn descriptor_25() -> ModelDescriptor {
     let mut out = descriptor();
     out.id = MODEL_25_ID;
     out.capabilities.supports_lora = false;
     out.capabilities.supports_lokr = false;
     out.capabilities.supports_prompt_enhancement = false;
-    out.capabilities.supports_auto_duration = false;
-    out.capabilities.supports_generated_keyframes = false;
-    out.capabilities.max_temporal_upsample_rounds = 0;
-    out.capabilities.supports_diffusion_decoder = false;
+    out.capabilities.supports_auto_duration = true;
+    out.capabilities.supports_generated_keyframes = true;
+    out.capabilities.max_temporal_upsample_rounds =
+        mlx_gen::gen_core::ltx_dfr::MAX_TEMPORAL_UPSAMPLE_ROUNDS;
+    out.capabilities.supports_diffusion_decoder = true;
     out
 }
 
@@ -352,6 +358,42 @@ enum StagedTextEncoder {
     Gemma4(Box<Ltx25TextEncoder>),
 }
 
+/// The LTX-2.5-only components which turn the shared 2.3 A/V shell into the declared 2.5
+/// provider.  Keeping the choice here means all three advanced axes flow through the ordinary
+/// `Generator::generate` route instead of being descriptor-only capability claims.
+enum LtxExecution {
+    Ltx23,
+    Ltx25(Box<Ltx25Execution>),
+}
+
+struct Ltx25Execution {
+    duration_head: DurationHead,
+    temporal_upsampler: LatentUpsampler,
+    decoder: Ltx25Decoder,
+}
+
+enum Ltx25Decoder {
+    Conv,
+    Diffusion {
+        decoder: Box<NaDiffusionDecoder>,
+        mode: DiffVaeMode,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ltx25DecoderSelection {
+    Conv,
+    DiffusionBudgeted(DiffVaeMode),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DfrPlan {
+    canvas_frames: u32,
+    requested_frames: u32,
+    keyframe_positions: Vec<i64>,
+    temporal_upsample_rounds: u32,
+}
+
 impl StagedTextEncoder {
     fn encode_av(&self, ids: &Array, mask: &Array) -> Result<(Array, Array)> {
         match self {
@@ -381,6 +423,7 @@ pub struct Ltx {
     dit_prec: Precision,
     adapters: Vec<AdapterSpec>,
     text_assets: TextAssets,
+    execution: LtxExecution,
     /// The optional **uncensored** 4-bit Gemma enhancer snapshot dir (the amoral
     /// `TheCluster/amoral-gemma-3-12B-v2-mlx-4bit`, sc-2845), staged by the caller in the
     /// `uncensored_enhancer` [`LoadSpec::components`] entry (sc-13664). `None` unless the caller
@@ -397,6 +440,87 @@ pub struct Ltx {
     latent_std: Array,
     audio_sample_rate: u32,
     stat_dt: Dtype,
+}
+
+/// Apply the shared frame-count resolver to the actual provider request.  The predictor is injected
+/// solely so the provider-path test can prove that its result changes the allocated-frame plan;
+/// production supplies [`DurationHead::predict_seconds`] above.
+fn apply_predicted_frames(
+    req: &GenerationRequest,
+    fps: f32,
+    predict_seconds: &mut dyn FnMut() -> Result<f32>,
+) -> Result<GenerationRequest> {
+    let mut core_predict = || predict_seconds().map_err(mlx_gen::gen_core::Error::from);
+    let frames = mlx_gen::gen_core::duration_head::resolve_request_num_frames(
+        req.frames,
+        req.auto_duration,
+        fps,
+        TEMPORAL_SCALE,
+        &mut core_predict,
+    )?;
+    let mut resolved = req.clone();
+    if let Some(frames) = frames {
+        resolved.frames = Some(frames);
+    }
+    Ok(resolved)
+}
+
+/// Map the two declared LTX-2.5 DFR controls onto the concrete latent pipeline shape.  A positive
+/// generated-keyframe count inserts exactly that many evenly spaced slots; a temporal request
+/// additionally pads to the shared DFR segment canvas so each temporal round has its real tile
+/// anchors.  The same plan drives noise allocation and the actual `generate_dfr_av_latents` call.
+fn plan_dfr_request(req: &GenerationRequest) -> Result<Option<DfrPlan>> {
+    let requested_frames = req.frames.unwrap_or(1);
+    let generated_count = req.num_generated_keyframes.unwrap_or(0);
+    let temporal_upsample_rounds = req.temporal_upsample_rounds.unwrap_or(0);
+    if generated_count == 0 && temporal_upsample_rounds == 0 {
+        return Ok(None);
+    }
+
+    let (canvas_frames, automatic_positions) = if temporal_upsample_rounds > 0 {
+        let (canvas, _, positions) = mlx_gen::gen_core::ltx_dfr::resolve_canvas(
+            i64::from(requested_frames),
+            i64::from(TEMPORAL_SCALE),
+        )?;
+        (canvas as u32, positions)
+    } else {
+        (requested_frames, Vec::new())
+    };
+    let keyframe_positions = if generated_count > 0 {
+        mlx_gen::gen_core::ltx_dfr::evenly_spaced_keyframe_positions(
+            generated_count,
+            i64::from(canvas_frames),
+        )
+    } else {
+        automatic_positions
+    };
+    if keyframe_positions.is_empty() {
+        return Err(Error::Msg(
+            "ltx_2_5: DFR needs at least two requested frames to place a generated-keyframe slot"
+                .into(),
+        ));
+    }
+    Ok(Some(DfrPlan {
+        canvas_frames,
+        requested_frames,
+        keyframe_positions,
+        temporal_upsample_rounds,
+    }))
+}
+
+/// Choose the provider's real DFR denoise branch or its established two-stage branch.  Progress is
+/// passed into the selected callback so the branch decision stays observable in a synthetic test
+/// without constructing multi-gigabyte Gemma/DiT fixtures.
+fn dispatch_dfr<T>(
+    plan: Option<&DfrPlan>,
+    on_step: &mut dyn FnMut(usize),
+    dfr: impl FnOnce(&DfrPlan, &mut dyn FnMut(usize)) -> Result<T>,
+    plain: impl FnOnce(&mut dyn FnMut(usize)) -> Result<T>,
+) -> Result<T> {
+    match plan {
+        Some(plan) => dfr(plan, on_step),
+        None => plain(on_step),
+    }
 }
 
 /// Locate the Gemma-3-12B text-encoder snapshot from the **required** `LoadSpec::text_encoder` slot
@@ -634,6 +758,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             dir: gemma_dir,
             quant: gemma_quant,
         },
+        execution: LtxExecution::Ltx23,
         uncensored_enhancer,
         upsampler,
         vae,
@@ -654,9 +779,9 @@ pub struct Ltx25 {
     spec: LoadSpec,
 }
 
-/// Resolve the LTX-2.5 split layout through the ordinary provider registration.  The actual tensor
-/// assembly lives in [`build_ltx25`] and is invoked by [`Generator::generate`], not hidden behind a
-/// filename convention or a separate loader entry point.
+/// Resolve the LTX-2.5 split layout through the ordinary provider registration. The actual tensor
+/// assembly is request-scoped and invoked by [`Generator::generate`], not hidden behind a filename
+/// convention or a separate loader entry point.
 pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let known = crate::bundle::split_component_ids();
     reject_unknown_components(spec, &known, MODEL_25_ID)?;
@@ -674,13 +799,82 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     // These are intentional load-path checks, not descriptor-only declarations.  In particular,
     // `from_bundle` selects the transformer's own 2.5 config and the Gemma check ties that DiT to
-    // the packed encoder before a generation can allocate noise.
-    let _ = LtxConfig::from_bundle(&bundle)?;
+    // the packed encoder before a generation can allocate noise.  The duration and temporal
+    // components are required here because the advertised request controls execute through them.
+    let config = LtxConfig::from_bundle(&bundle)?;
+    if !config.use_keyframes_abs_pos_embedding {
+        return Err(Error::Msg(
+            "ltx_2_5: transformer lacks use_keyframes_abs_pos_embedding, so generated-keyframe \
+             slots must not be advertised or executed"
+                .into(),
+        ));
+    }
     crate::bundle::assert_gemma_version(&bundle)?;
+    for component in [
+        LtxComponent::TextEncoder,
+        LtxComponent::AudioVae,
+        LtxComponent::DurationHead,
+        LtxComponent::SpatialUpsampler,
+        LtxComponent::TemporalUpsampler,
+    ] {
+        bundle.require(component)?;
+    }
+    bundle.require(ltx25_video_component(spec))?;
     Ok(Box::new(Ltx25 {
         descriptor: descriptor_25(),
         spec: spec.clone(),
     }))
+}
+
+/// Staging the diffusion-video-VAE component is the alternate-decoder selection contract.  A
+/// bundle may contain both VAE variants for catalog discovery; only an explicit component choice
+/// switches the provider away from its ordinary convolutional decoder.
+fn ltx25_video_component(spec: &LoadSpec) -> LtxComponent {
+    match ltx25_decoder_selection(spec) {
+        Ltx25DecoderSelection::Conv => LtxComponent::ConvVideoVae,
+        Ltx25DecoderSelection::DiffusionBudgeted(_) => LtxComponent::DiffusionVideoVae,
+    }
+}
+
+fn ltx25_decoder_selection(spec: &LoadSpec) -> Ltx25DecoderSelection {
+    if spec
+        .components
+        .contains_key(LtxComponent::DiffusionVideoVae.id())
+    {
+        Ltx25DecoderSelection::DiffusionBudgeted(DEFAULT_DIFFVAE_MODE)
+    } else {
+        Ltx25DecoderSelection::Conv
+    }
+}
+
+/// Invoke the decoder's declared budget/mode route.  This tiny dispatch is intentionally shared
+/// by the provider and its synthetic test, so replacing a DiffVAE decode with the conv path (or
+/// dropping the budgeted call) cannot leave its selected mode unobserved.
+fn decode_diffvae_budgeted<T>(
+    mode: DiffVaeMode,
+    decode: impl FnOnce(DiffVaeMode) -> Result<T>,
+) -> Result<T> {
+    decode(mode)
+}
+
+/// Converted LTX-2.5 tiers split each VAE encoder into its own file, while raw split bundles keep
+/// the encoder beside its decoder. The bundle resolver owns component discovery; after it has
+/// selected a component, prefer that component's documented tier encoder half when present.
+fn ltx25_encoder_path(
+    root: &std::path::Path,
+    component: LtxComponent,
+    fallback: &std::path::Path,
+) -> PathBuf {
+    let half = match component {
+        LtxComponent::ConvVideoVae => root.join("vae_encoder.safetensors"),
+        LtxComponent::DiffusionVideoVae => root.join("diffusion_vae_encoder.safetensors"),
+        _ => return fallback.to_path_buf(),
+    };
+    if half.is_file() {
+        half
+    } else {
+        fallback.to_path_buf()
+    }
 }
 
 fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
@@ -706,10 +900,10 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             Dtype::Float32,
         ),
     };
-    let conv = bundle
-        .require(LtxComponent::ConvVideoVae)?
-        .path()
-        .to_path_buf();
+    let decoder_selection = ltx25_decoder_selection(spec);
+    let video_component = ltx25_video_component(spec);
+    let video_path = bundle.require(video_component)?.path().to_path_buf();
+    let encoder_path = ltx25_encoder_path(root, video_component, &video_path);
     let audio = bundle.require(LtxComponent::AudioVae)?.path().to_path_buf();
     let connector = bundle
         .require(LtxComponent::Transformer)?
@@ -723,23 +917,53 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
             bundle.require(LtxComponent::Transformer)?.path().display()
         )));
     }
-    let conv_w = Weights::from_file(&conv)?;
+    let video_w = Weights::from_file(&video_path)?;
     let audio_w = Weights::from_file(&audio)?;
-    let vae_cfg = LtxVaeConfig::from_bundle(&bundle, LtxComponent::ConvVideoVae)?;
+    let vae_cfg = LtxVaeConfig::from_bundle(&bundle, video_component)?;
     let audio_cfg = AudioVaeConfig::from_bundle(&bundle)?;
     let vocoder_cfg = VocoderConfig::from_bundle(&bundle)?;
-    let vae = LtxVideoVae::from_weights_lazy_encoder(&conv_w, conv.clone(), &vae_cfg)?;
+    let (vae, decoder) = match (video_component, decoder_selection) {
+        (LtxComponent::ConvVideoVae, Ltx25DecoderSelection::Conv) => (
+            LtxVideoVae::from_weights_lazy_encoder(&video_w, encoder_path, &vae_cfg)?,
+            Ltx25Decoder::Conv,
+        ),
+        (LtxComponent::DiffusionVideoVae, Ltx25DecoderSelection::DiffusionBudgeted(mode)) => {
+            let diff_cfg = NaDiffusionDecoderConfig::from_embedded_vae(
+                bundle.require(LtxComponent::DiffusionVideoVae)?.config()?,
+            )?;
+            let quant = split.quantized.then_some(DiffVaeQuant {
+                bits: split.bits,
+                group: split.group,
+            });
+            let decoder = NaDiffusionDecoder::from_weights(&video_w, &diff_cfg, quant)?;
+            // The diffusion VAE carries the same causal encoder used for image conditioning, but
+            // no convolutional decoder.  Keeping it encoder-only prevents a staged DiffVAE route
+            // from materialising and then accidentally decoding through the conv sibling.
+            (
+                LtxVideoVae::encoder_only_lazy(encoder_path, &vae_cfg)?,
+                Ltx25Decoder::Diffusion {
+                    decoder: Box::new(decoder),
+                    mode,
+                },
+            )
+        }
+        _ => unreachable!("the staged LTX-2.5 decoder selection and component must agree"),
+    };
     let audio_decoder = AudioDecoder::from_weights(&audio_w, &audio_cfg)?;
     let vocoder = LtxVocoder::from_weights(&audio_w, &vocoder_cfg)?;
     let spatial = bundle.require(LtxComponent::SpatialUpsampler)?.path();
     let upsampler = LatentUpsampler::from_checkpoint(spatial)?;
-    let latent_mean = to_dtype(conv_w.require("per_channel_statistics.mean")?, stat_dt)?;
-    let latent_std = to_dtype(conv_w.require("per_channel_statistics.std")?, stat_dt)?;
+    let latent_mean = to_dtype(video_w.require("per_channel_statistics.mean")?, stat_dt)?;
+    let latent_std = to_dtype(video_w.require("per_channel_statistics.std")?, stat_dt)?;
     let te_path = bundle
         .require(LtxComponent::TextEncoder)?
         .path()
         .to_path_buf();
     let tokenizer = Ltx25Tokenizer::from_packed_te_file(&te_path)?;
+    let duration_w = Weights::from_file(bundle.require(LtxComponent::DurationHead)?.path())?;
+    let duration_head = DurationHead::from_weights(&duration_w)?;
+    let temporal_upsampler =
+        LatentUpsampler::from_checkpoint(bundle.require(LtxComponent::TemporalUpsampler)?.path())?;
 
     Ok(Ltx {
         descriptor: descriptor_25(),
@@ -755,6 +979,11 @@ fn build_ltx25(spec: &LoadSpec) -> Result<Ltx> {
         dit_prec,
         adapters: Vec::new(),
         text_assets: TextAssets::Gemma4 { bundle, connector },
+        execution: LtxExecution::Ltx25(Box::new(Ltx25Execution {
+            duration_head,
+            temporal_upsampler,
+            decoder,
+        })),
         uncensored_enhancer: None,
         upsampler,
         vae,
@@ -847,6 +1076,42 @@ impl Ltx {
         Ok((enhanced, video_ctx, audio_ctx))
     }
 
+    fn ltx25_execution(&self) -> Result<&Ltx25Execution> {
+        match &self.execution {
+            LtxExecution::Ltx25(execution) => Ok(execution),
+            LtxExecution::Ltx23 => Err(Error::Unsupported(
+                "ltx_2_3: the LTX-2.5 duration/DFR/DiffVAE execution components are unavailable"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Apply an opt-in automatic frame prediction **after** the ordinary staged text encode, where the
+    /// real DurationHead receives the connector outputs it was trained on.  The returned request
+    /// carries the concrete frame count, so noise allocation and every downstream plan see the
+    /// prediction rather than the original empty `frames` field.
+    fn apply_auto_frames(
+        &self,
+        req: &GenerationRequest,
+        video_ctx: &Array,
+        audio_ctx: &Array,
+    ) -> Result<GenerationRequest> {
+        if req.auto_duration.is_none() {
+            return Ok(req.clone());
+        }
+        let duration_head = &self.ltx25_execution()?.duration_head;
+        apply_predicted_frames(req, req.fps.unwrap_or(24) as f32, &mut || {
+            duration_head.predict_seconds(Some(video_ctx), Some(audio_ctx))
+        })
+    }
+
+    fn dfr_plan(&self, req: &GenerationRequest) -> Result<Option<DfrPlan>> {
+        match &self.execution {
+            LtxExecution::Ltx23 => Ok(None),
+            LtxExecution::Ltx25(_) => plan_dfr_request(req),
+        }
+    }
+
     /// Latent dims `(frames, stage1_h, stage1_w, stage2_h, stage2_w)` for a request.
     pub(crate) fn latent_dims(req: &GenerationRequest) -> (usize, usize, usize, usize, usize) {
         // Precondition: `validate_request`'s `SIZE_MULTIPLE`-divisibility check runs before any generate, so the
@@ -886,6 +1151,46 @@ impl Ltx {
             req.video_mode.as_deref(),
             Some("no_audio") | Some("video_only")
         )
+    }
+
+    /// Decode through the component selected at provider load.  The DiffVAE arm deliberately
+    /// calls its memory-budgeted decoder with the declared mode rather than borrowing the conv
+    /// VAE's tiling selector: these are different planners over different intermediate shapes.
+    fn decode_video(&self, req: &GenerationRequest, latents: &Array, seed: u64) -> Result<Array> {
+        let decode_conv = || {
+            let selected_tiling = crate::memory_strategy::decode_tiling(req)?;
+            decode_to_frames_with_tiling(&self.vae, latents, &req.cancel, selected_tiling.as_ref())
+        };
+        match &self.execution {
+            LtxExecution::Ltx23 => decode_conv(),
+            LtxExecution::Ltx25(execution) => match &execution.decoder {
+                Ltx25Decoder::Conv => decode_conv(),
+                Ltx25Decoder::Diffusion { decoder, mode } => {
+                    if req.cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    let shape = latents.shape();
+                    let noise_shape = decoder.config().noise_shape(shape[2], shape[3], shape[4]);
+                    let key = random::key(seed.wrapping_add(4))?;
+                    let noise = random::normal::<f32>(
+                        &[
+                            shape[0],
+                            decoder.config().out_channels,
+                            noise_shape[0],
+                            noise_shape[1],
+                            noise_shape[2],
+                        ],
+                        None,
+                        None,
+                        Some(&key),
+                    )?;
+                    let pixels = decode_diffvae_budgeted(*mode, |mode| {
+                        decoder.decode_budgeted(latents, &noise, mode)
+                    })?;
+                    to_uint8_frames(&pixels)
+                }
+            },
+        }
     }
 
     /// The A/V path from **staged** text embeddings + injected stage noise (the deterministic seam
@@ -977,10 +1282,27 @@ impl Ltx {
         video_clips: &[StageClip],
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
+        let dfr_plan = self.dfr_plan(req)?;
+        // A temporal DFR request pads the canvas before the request's public trim point, so its
+        // injected noises carry the authoritative latent geometry.  Ordinary LTX keeps the
+        // historical request-derived dimensions exactly.
+        let (lf, h1, w1, h2, w2) = match dfr_plan.as_ref() {
+            Some(_) => (
+                video_s1.shape()[2] as usize,
+                video_s1.shape()[3] as usize,
+                video_s1.shape()[4] as usize,
+                video_s2.shape()[3] as usize,
+                video_s2.shape()[4] as usize,
+            ),
+            None => Self::latent_dims(req),
+        };
         let pos1 = create_position_grid(1, lf, h1, w1);
         let pos2 = create_position_grid(1, lf, h2, w2);
-        let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
+        let audio_frames = match dfr_plan.as_ref() {
+            Some(_) => audio_s1.shape()[2] as usize,
+            None => Self::audio_frames(req),
+        };
+        let audio_pos = create_audio_position_grid(1, audio_frames);
 
         // Curated unified solver (epic 7114, sc-7122): a curated solver name routes the joint two-stream
         // T2V+A denoise through `generate_av_latents`' `denoise_av_curated` branch (LTX keeps its baked
@@ -999,6 +1321,13 @@ impl Ltx {
                 "ltx: curated samplers apply to text-to-video only; the image/keyframe (I2V) and \
                  in-context-clip paths use per-token-σ conditioning that stays on the native distilled \
                  Euler"
+                    .into(),
+            ));
+        }
+        if dfr_plan.is_some() && (!video_clips.is_empty() || curated.is_some()) {
+            return Err(Error::Msg(
+                "ltx_2_5: DFR generated-keyframe and temporal requests do not accept \
+                 in-context clips or curated samplers"
                     .into(),
             ));
         }
@@ -1025,48 +1354,88 @@ impl Ltx {
         // TE and the DiT never co-reside. Built past the curated-sampler validation above so a rejected
         // request doesn't pay the DiT load. Dropped + `clear_cache()`d below before the VAE decode.
         let transformer = self.build_transformer()?;
-        let (video_latents, audio_latents) = if !video_clips.is_empty() {
-            generate_av_latents_iclora(
-                &transformer,
-                &self.upsampler,
+        let run_dfr = |plan: &DfrPlan, on_step: &mut dyn FnMut(usize)| {
+            let execution = self.ltx25_execution()?;
+            let dfr = generate_dfr_av_latents(
+                &DfrComponents {
+                    dit: &transformer,
+                    spatial_upsampler: &self.upsampler,
+                    temporal_upsampler: Some(&execution.temporal_upsampler),
+                    latent_mean: &self.latent_mean,
+                    latent_std: &self.latent_std,
+                    video_ctx,
+                    audio_ctx,
+                    audio_pos: &audio_pos,
+                },
+                &DfrRequest {
+                    canvas_frames: i64::from(plan.canvas_frames),
+                    requested_frames: i64::from(plan.requested_frames),
+                    keyframe_positions: &plan.keyframe_positions,
+                    fps: req.fps.unwrap_or(24) as f32,
+                    seed,
+                    temporal_upsample_rounds: plan.temporal_upsample_rounds,
+                    detailing_downscale: None,
+                    video_keyframes,
+                },
                 video_s1,
                 &pos1,
                 video_s2,
                 &pos2,
                 audio_s1,
                 audio_s2,
-                &audio_pos,
-                video_ctx,
-                audio_ctx,
-                &self.latent_mean,
-                &self.latent_std,
-                video_clips,
-                (LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32),
                 &req.cancel,
-                &mut on_step,
-            )?
-        } else {
-            generate_av_latents(
-                &transformer,
-                &self.upsampler,
-                video_s1,
-                &pos1,
-                video_s2,
-                &pos2,
-                audio_s1,
-                audio_s2,
-                &audio_pos,
-                video_ctx,
-                audio_ctx,
-                &self.latent_mean,
-                &self.latent_std,
-                video_keyframes,
-                curated,
-                seed,
-                &req.cancel,
-                &mut on_step,
-            )?
+                on_step,
+            )?;
+            Ok((dfr.video_latent, dfr.audio_latent, dfr.playback_fps as u32))
         };
+        let run_plain = |on_step: &mut dyn FnMut(usize)| {
+            if !video_clips.is_empty() {
+                generate_av_latents_iclora(
+                    &transformer,
+                    &self.upsampler,
+                    video_s1,
+                    &pos1,
+                    video_s2,
+                    &pos2,
+                    audio_s1,
+                    audio_s2,
+                    &audio_pos,
+                    video_ctx,
+                    audio_ctx,
+                    &self.latent_mean,
+                    &self.latent_std,
+                    video_clips,
+                    (LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32),
+                    &req.cancel,
+                    on_step,
+                )
+                .map(|(video, audio)| (video, audio, req.fps.unwrap_or(24)))
+            } else {
+                generate_av_latents(
+                    &transformer,
+                    &self.upsampler,
+                    video_s1,
+                    &pos1,
+                    video_s2,
+                    &pos2,
+                    audio_s1,
+                    audio_s2,
+                    &audio_pos,
+                    video_ctx,
+                    audio_ctx,
+                    &self.latent_mean,
+                    &self.latent_std,
+                    video_keyframes,
+                    curated,
+                    seed,
+                    &req.cancel,
+                    on_step,
+                )
+                .map(|(video, audio)| (video, audio, req.fps.unwrap_or(24)))
+            }
+        };
+        let (video_latents, audio_latents, playback_fps) =
+            dispatch_dfr(dfr_plan.as_ref(), &mut on_step, run_dfr, run_plain)?;
 
         // sc-10976: force the denoise output to materialize, then drop the DiT + free the allocator
         // cache so the VAE + audio decode run in the freed footprint (the AvDiT is the denoise peak and
@@ -1077,13 +1446,7 @@ impl Ltx {
         mlx_rs::memory::clear_cache();
 
         on_progress(Progress::Decoding);
-        let selected_tiling = crate::memory_strategy::decode_tiling(req)?;
-        let frames = decode_to_frames_with_tiling(
-            &self.vae,
-            &video_latents,
-            &req.cancel,
-            selected_tiling.as_ref(),
-        )?;
+        let frames = self.decode_video(req, &video_latents, seed)?;
         let images = frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
@@ -1100,7 +1463,7 @@ impl Ltx {
         finish_calibration_phase(req, mlx_gen::gen_core::MemoryPhase::Decode, || Ok(()))?;
         Ok(GenerationOutput::Video {
             frames: images,
-            fps: req.fps.unwrap_or(24),
+            fps: playback_fps,
             audio,
         })
     }
@@ -1415,7 +1778,7 @@ impl Generator for Ltx25 {
         // Reuse the full conditioning/index validation that owns the LTX request surface.  The
         // descriptor supplied here is the 2.5 descriptor, so shared capability gates stay closed
         // for any axis not yet consumed by the assembled execution route.
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        validate_request_for(MODEL_25_ID, &self.descriptor.capabilities, req).map_err(Into::into)
     }
 
     fn generate(
@@ -1423,6 +1786,7 @@ impl Generator for Ltx25 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
+        self.validate(req)?;
         // The load-time metadata checks above prove the provider is a split 2.5 route; this is the
         // matching runtime reachability seam, where its Gemma-4, split DiT, component VAE/audio and
         // spatial-upscaler are actually materialised and driven through the ordinary LTX pipeline.
@@ -1437,8 +1801,16 @@ impl Generator for Ltx25 {
 /// model-specific constraints: non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32),
 /// `num_frames = 1 + 8·k`, and all weight-free conditioning cardinality/shape/index constraints.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    validate_request_for(MODEL_ID, caps, req)
+}
+
+fn validate_request_for(
+    model_id: &str,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
     if req.prompt.is_empty() {
-        return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
+        return Err(Error::Msg(format!("{model_id}: prompt must not be empty")));
     }
     // DFR knobs (sc-18789): the 2.3 checkpoint has no learned keyframe-slot marker
     // (`use_keyframes_abs_pos_embedding: false`), so generated keyframe slots would be denoised as
@@ -1452,21 +1824,21 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     // first is what keeps the more actionable message: the floor can only say "this engine does
     // not support it", while these name the checkpoint generation that does, which is what a
     // caller needs to act. Deleting them would not un-refuse the knobs, only blur the reason.
-    if req.num_generated_keyframes.is_some_and(|n| n > 0) {
+    if model_id == MODEL_ID && req.num_generated_keyframes.is_some_and(|n| n > 0) {
         return Err(Error::Unsupported(
             "ltx_2_3: num_generated_keyframes requires a generated-keyframe checkpoint \
              (use_keyframes_abs_pos_embedding, LTX >= 2.5)"
                 .into(),
         ));
     }
-    if req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
+    if model_id == MODEL_ID && req.temporal_upsample_rounds.is_some_and(|r| r > 0) {
         return Err(Error::Unsupported(
             "ltx_2_3: temporal_upsample_rounds requires the LTX-2.5 DFR pipeline (generated \
              keyframe slots + the temporal latent upsampler)"
                 .into(),
         ));
     }
-    caps.validate_request(MODEL_ID, req)?;
+    caps.validate_request(model_id, req)?;
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "ltx_2_3: width/height must be divisible by {SIZE_MULTIPLE} (got {}x{})",
@@ -1484,6 +1856,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
                 "ltx_2_3: num_frames {frames} exceeds the maximum {MAX_FRAMES}"
             )));
         }
+    }
+    // The 2.5 provider's DFR plan is the execution geometry consumed after the staged duration
+    // prediction.  Validate the explicit-frame shape now so a malformed keyframe/temporal request
+    // never pays for Gemma; auto-duration requests are resolved and planned at generation time.
+    if model_id == MODEL_25_ID && req.frames.is_some() {
+        let _ = plan_dfr_request(req)?;
     }
     let latent_frames = Ltx::latent_dims(req).0 as i32;
     let resolve_latent_index = |label: &str, idx: i32| -> Result<()> {
@@ -1686,7 +2064,12 @@ impl Generator for Ltx {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        if self.descriptor.id == MODEL_ID {
+            validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        } else {
+            validate_request_for(self.descriptor.id, &self.descriptor.capabilities, req)
+                .map_err(Into::into)
+        }
     }
 
     fn generate(
@@ -1765,19 +2148,32 @@ impl Ltx {
             })?;
         // The TE is dropped; free the allocator cache so the DiT loads into the low-water footprint.
         mlx_rs::memory::clear_cache();
-        let owned;
-        let req = match enhanced {
-            Some(prompt) => {
-                owned = GenerationRequest {
-                    prompt,
-                    ..req.clone()
-                };
-                &owned
-            }
-            None => req,
+        let prompted = match enhanced {
+            Some(prompt) => GenerationRequest {
+                prompt,
+                ..req.clone()
+            },
+            None => req.clone(),
         };
-        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
-        let af = Self::audio_frames(req) as i32;
+        let owned = self.apply_auto_frames(&prompted, &video_ctx, &audio_ctx)?;
+        // Auto-duration supplies `frames` only after the text phase.  Re-run the ordinary provider
+        // floor on that concrete request so its maximum/stride and DFR geometry bounds apply to the
+        // prediction before any noise allocation.
+        self.validate(&owned)?;
+        let req = &owned;
+        // DFR may pad the latent canvas before its temporal rounds, while the public request's
+        // frame count remains the trim contract.  Allocate the four ordinary provider noises for
+        // that execution canvas; `generate_av_from_embeddings` consumes the same plan below.
+        let dfr_plan = self.dfr_plan(req)?;
+        let noise_request = match dfr_plan.as_ref() {
+            Some(plan) if plan.canvas_frames != req.frames.unwrap_or(1) => GenerationRequest {
+                frames: Some(plan.canvas_frames),
+                ..req.clone()
+            },
+            _ => req.clone(),
+        };
+        let (lf, h1, w1, h2, w2) = Self::latent_dims(&noise_request);
+        let af = Self::audio_frames(&noise_request) as i32;
         let seed = req.seed.unwrap_or_else(default_seed);
         // Seeded noise at the path dtype (the reference seeds `normal(...).astype(model_dtype)`). RNG
         // is not portable to mlx-python, so the pixel/waveform parity gate injects the reference
@@ -1860,7 +2256,7 @@ mod tests {
     }
 
     #[test]
-    fn ltx25_descriptor_closes_unwired_advanced_axes() {
+    fn ltx25_provider_admits_only_advanced_axes_it_executes() {
         let generator = Ltx25 {
             descriptor: descriptor_25(),
             spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
@@ -1873,18 +2269,165 @@ mod tests {
             num_generated_keyframes: Some(1),
             ..Default::default()
         };
-        assert!(Generator::validate(&generator, &request).is_err());
+        assert!(Generator::validate(&generator, &request).is_ok());
         let mut temporal = request.clone();
         temporal.num_generated_keyframes = None;
         temporal.temporal_upsample_rounds = Some(1);
-        assert!(Generator::validate(&generator, &temporal).is_err());
+        assert!(Generator::validate(&generator, &temporal).is_ok());
         let mut automatic = request;
         automatic.num_generated_keyframes = None;
         automatic.auto_duration = Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
             min_seconds: 1.0,
             max_seconds: 2.0,
         });
-        assert!(Generator::validate(&generator, &automatic).is_err());
+        assert!(Generator::validate(&generator, &automatic).is_ok());
+        assert!(
+            generator
+                .descriptor()
+                .capabilities
+                .supports_diffusion_decoder
+        );
+    }
+
+    /// The DurationHead predictor is not merely admitted by the descriptor: its value becomes the
+    /// request's actual frame plan before the provider allocates video/audio noise.  The injected
+    /// spy is the production seam (`DurationHead::predict_seconds`) and makes a deleted/bypassed
+    /// call fail this test instead of leaving a default-frame false green.
+    #[test]
+    fn ltx25_auto_duration_prediction_drives_the_provider_frame_plan() {
+        let request = GenerationRequest {
+            prompt: "a slow orbit around a lighthouse".into(),
+            width: 512,
+            height: 512,
+            fps: Some(24),
+            auto_duration: Some(mlx_gen::gen_core::duration_head::AutoDurationRange {
+                min_seconds: 2.0,
+                max_seconds: 8.0,
+            }),
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let planned = apply_predicted_frames(&request, 24.0, &mut || {
+            calls.set(calls.get() + 1);
+            Ok(3.0)
+        })
+        .expect("duration head result must resolve to provider frames");
+        assert_eq!(
+            calls.get(),
+            1,
+            "the real predictor seam must be called once"
+        );
+        assert_ne!(
+            planned.frames, request.frames,
+            "prediction must affect the plan"
+        );
+        assert_eq!(planned.frames, Some(65));
+        assert_ne!(Ltx::latent_dims(&planned).0, Ltx::latent_dims(&request).0);
+
+        let explicit = GenerationRequest {
+            frames: Some(17),
+            ..request
+        };
+        let explicit_plan = apply_predicted_frames(&explicit, 24.0, &mut || {
+            panic!("explicit frames must bypass the duration-head predictor")
+        })
+        .expect("explicit frame count wins");
+        assert_eq!(explicit_plan.frames, Some(17));
+    }
+
+    /// This is the request-side DFR plan consumed by the ordinary provider's
+    /// `generate_dfr_av_latents` branch.  A temporal request changes both the noise canvas and the
+    /// trim contract; a count request changes the actual slot positions.  Either call being
+    /// deleted or replaced with the plain two-stage plan makes one of these assertions fail.
+    #[test]
+    fn ltx25_dfr_request_plan_drives_temporal_and_generated_slot_execution() {
+        let temporal = GenerationRequest {
+            prompt: "fast tracking shot through a market".into(),
+            width: 512,
+            height: 512,
+            frames: Some(153),
+            temporal_upsample_rounds: Some(2),
+            ..Default::default()
+        };
+        let temporal_plan = plan_dfr_request(&temporal)
+            .expect("DFR temporal plan")
+            .expect("temporal request must select DFR");
+        assert_eq!(temporal_plan.requested_frames, 153);
+        assert_eq!(
+            temporal_plan.canvas_frames, 161,
+            "DFR must pad before denoise"
+        );
+        assert_eq!(temporal_plan.temporal_upsample_rounds, 2);
+        assert_eq!(temporal_plan.keyframe_positions, vec![32, 64, 96, 128, 160]);
+
+        let dfr_calls = std::cell::Cell::new(0usize);
+        let plain_calls = std::cell::Cell::new(0usize);
+        let mut ignored_progress = |_| {};
+        let branch = dispatch_dfr(
+            Some(&temporal_plan),
+            &mut ignored_progress,
+            |plan, _| {
+                dfr_calls.set(dfr_calls.get() + 1);
+                Ok((plan.canvas_frames, plan.temporal_upsample_rounds))
+            },
+            |_| {
+                plain_calls.set(plain_calls.get() + 1);
+                Ok((0, 0))
+            },
+        )
+        .expect("a DFR plan must dispatch to the DFR execution branch");
+        assert_eq!(branch, (161, 2));
+        assert_eq!(dfr_calls.get(), 1);
+        assert_eq!(plain_calls.get(), 0);
+
+        let generated = GenerationRequest {
+            num_generated_keyframes: Some(3),
+            frames: Some(121),
+            ..temporal
+        };
+        let generated_plan = plan_dfr_request(&generated)
+            .expect("generated-slot plan")
+            .expect("generated keyframes must select DFR");
+        assert_eq!(generated_plan.keyframe_positions, vec![30, 60, 90]);
+        assert_eq!(
+            mlx_gen::gen_core::ltx_dfr::dfr_target_frames(
+                i64::from(temporal_plan.requested_frames),
+                temporal_plan.temporal_upsample_rounds,
+            ),
+            609,
+            "the DFR trim contract must survive two real temporal rounds"
+        );
+    }
+
+    /// A staged diffusion VAE is a provider execution choice, not an extra file the conv path may
+    /// quietly ignore.  The spy observes the exact budget/mode passed into the same dispatch that
+    /// `decode_video` uses, so deleting that call or replacing it with `decode_seeded` goes red.
+    #[test]
+    fn ltx25_staged_diffvae_executes_the_budgeted_decoder_mode() {
+        let conv = LoadSpec::new(WeightsSource::Dir(PathBuf::from(".")));
+        assert_eq!(ltx25_decoder_selection(&conv), Ltx25DecoderSelection::Conv);
+
+        let diffusion = conv.with_component(
+            LtxComponent::DiffusionVideoVae.id(),
+            WeightsSource::File(PathBuf::from("/tmp/vae_diffusion_decoder.safetensors")),
+        );
+        assert_eq!(
+            ltx25_decoder_selection(&diffusion),
+            Ltx25DecoderSelection::DiffusionBudgeted(DEFAULT_DIFFVAE_MODE)
+        );
+        assert_eq!(
+            ltx25_video_component(&diffusion),
+            LtxComponent::DiffusionVideoVae
+        );
+
+        let observed = std::cell::Cell::new(None);
+        let output = decode_diffvae_budgeted(DEFAULT_DIFFVAE_MODE, |mode| {
+            observed.set(Some(mode));
+            Ok("budgeted-diffvae")
+        })
+        .expect("the selected decoder must be invoked");
+        assert_eq!(output, "budgeted-diffvae");
+        assert_eq!(observed.get(), Some(DiffVaeMode::ChunkedEager));
     }
 
     #[test]
