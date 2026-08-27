@@ -7,6 +7,11 @@ dumping the intermediate video_features and the final video_embeddings. The Rust
 `LtxTextEncoder::encode` (tests/te_parity.rs) must reproduce these (it runs the real Gemma forward
 itself, so this is the end-to-end S1 gate).
 
+The connector runs with **ltx_core (training) semantics** — `2·sigmoid` attention gate and
+tanh-approximate GELU — patched over the mlx_video port below (sc-21663): a golden dumped from
+stock mlx_video would re-encode the two connector bugs the Rust ports just fixed, and
+`te_parity.rs` would go red against a correct port. Re-dump this golden after sc-21663.
+
 Weights come from a converted BASE model's connector.safetensors (NOT eros). Run:
     MLX_VIDEO_SRC=~/.cache/uv/archive-v0/DtG1XO51ABFxUGHg \
       ~/Repos/mflux/.venv/bin/python tools/dump_ltx_te_golden.py
@@ -43,11 +48,55 @@ sys.modules["mlx_vlm.models.gemma3.config"] = _cfg
 
 import mlx.core as mx  # noqa: E402
 
+import mlx.nn as nn  # noqa: E402
+
 from mlx_video.models.ltx.text_encoder import (  # noqa: E402
+    ConnectorAttention,
+    ConnectorFeedForward,
     Embeddings1DConnector,
     norm_and_concat_per_token_rms,
     rescale_norm,
 )
+
+# --- sc-21663: restore ltx_core (training) connector semantics over the mlx_video port. --------
+# mlx_video's connector drops the `2 *` in the per-head attention gate (its own DiT attention
+# applies `2 * sigmoid` with a comment saying upstream does, but `text_encoder.py`'s connector
+# forgot it) and uses exact erf-GELU where ltx_core's `GELUApprox` is tanh-approximate. The Rust
+# ports follow ltx_core (the stack the checkpoints were trained with), so this golden's oracle
+# must too. See `ltx_core/model/transformer/ops.py::PytorchGatedAttention` and
+# `gelu_approx.py::GELUApprox` at the pinned Lightricks/LTX-2 reference commit.
+
+
+def _ff_call_tanh_gelu(self, x):
+    x = nn.gelu_approx(self.proj_in(x))
+    x = self.dropout(x)
+    return self.proj_out(x)
+
+
+def _attn_call_2sigmoid(self, x, attention_mask=None, pe=None):
+    batch_size, seq_len, _ = x.shape
+    q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
+    q, k = self.q_norm(q), self.k_norm(k)
+    q = mx.reshape(q, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
+    k = mx.reshape(k, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
+    v = mx.reshape(v, (batch_size, seq_len, self.num_heads, self.head_dim)).transpose(0, 2, 1, 3)
+    if pe is not None:
+        q = self._apply_split_rope(q, pe[0], pe[1])
+        k = self._apply_split_rope(k, pe[0], pe[1])
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+    out = out.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+    if self.to_gate_logits is not None:
+        gates = 2.0 * nn.sigmoid(self.to_gate_logits(x))  # ltx_core: 2·sigmoid, zero-init identity
+        gates = mx.expand_dims(gates, axis=-1)
+        out = mx.reshape(out, (batch_size, seq_len, self.num_heads, self.head_dim))
+        out = out * gates
+        out = mx.reshape(out, (batch_size, seq_len, -1))
+    return self.to_out(out)
+
+
+ConnectorFeedForward.__call__ = _ff_call_tanh_gelu
+ConnectorAttention.__call__ = _attn_call_2sigmoid
+# -----------------------------------------------------------------------------------------------
 
 BASE = Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/ltx_2_3_base_q8"
 HIDDEN, OUT_DIM = 3840, 4096
