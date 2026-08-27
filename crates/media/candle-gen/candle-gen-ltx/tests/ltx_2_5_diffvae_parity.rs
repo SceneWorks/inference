@@ -36,7 +36,14 @@ use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+#[cfg(feature = "cuda")]
+use candle_gen::testkit::PeakSampler;
 use candle_gen_ltx::config::LATENT_CHANNELS;
+#[cfg(feature = "cuda")]
+use candle_gen_ltx::diff_vae::budget::{
+    estimated_diffvae_decode_peak_bytes, plan_diffvae_tiling, DecodeGeometry, DecodePlan,
+    DiffVaeMode, HostNaSupport,
+};
 use candle_gen_ltx::diff_vae::{
     expected_weight_keys, looks_like_diffusion_decoder, DiffVaeTiling, NaDiffusionDecoder,
     NaDiffusionDecoderConfig, DECODER_PREFIX, STAT_MEAN_KEY, STAT_STD_KEY, UNUSED_DECODER_KEYS,
@@ -647,5 +654,72 @@ fn tiled_decode_keeps_its_seams_and_its_temporal_continuity() {
     assert!(
         (a - b).abs() < 0.01,
         "the blend changed the picture's mean level"
+    );
+}
+
+/// CUDA-only acceptance substrate for sc-18783.  This story deliberately does not run the
+/// campaign or promote coefficients: it makes the production-latent measurement reject the exact
+/// one-byte-under-observed edge, so an under-predicting future coefficient cannot look green.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "sc-18783: needs an idle CUDA host plus LTX25_VAE_DIR; terminal coefficient campaign"]
+fn budgeted_diffvae_estimate_never_under_predicts_the_measured_peak() {
+    let device = Device::new_cuda(0).expect("CUDA device");
+    let (decoder, cfg) = decoder(&device);
+    // 1280x704x25 — the normal LTX-2.5 production latent, rather than a tiny fixture which would
+    // leave every accumulator and halo arm unexercised.
+    let (lt, lh, lw) = (4usize, 22, 40);
+    let latent = probe(&[1, cfg.in_channels, lt, lh, lw], 18799, &device);
+    let shape5 = cfg.noise_shape(lt, lh, lw);
+    let noise = probe(
+        &[1, cfg.out_channels, shape5[0], shape5[1], shape5[2]],
+        18800,
+        &device,
+    );
+    let resolved = DiffVaeMode::ChunkedEager
+        .resolve_for_host(HostNaSupport::detect(&device))
+        .expect("Candle's eager DiffVAE mode runs on CUDA");
+    let geometry = DecodeGeometry::new(&cfg, lt, lh, lw);
+
+    // The exact, untiled decode is the measured reference.  Sampling begins after construction so
+    // the peak covers the construction the estimator declares (resident weights/context) and the
+    // decode, but no unrelated loading activity.  Run on an otherwise idle GPU.
+    let sampler = PeakSampler::start(0);
+    let t = Instant::now();
+    let untiled = decoder
+        .decode(&latent, &noise)
+        .expect("exact untiled decode");
+    device.synchronize().expect("synchronize untiled decode");
+    let measured = (sampler.stop() as u64) * 1024 * 1024;
+    let estimated =
+        estimated_diffvae_decode_peak_bytes(&geometry, DecodePlan::SinglePass, &resolved);
+    assert!(
+        estimated >= measured,
+        "under-predicts exact 1280x704x25 untiled peak: estimated {estimated} < measured {measured} bytes"
+    );
+
+    // This is the important edge: subtracting one byte from the observed peak must not leave the
+    // single-pass arm selectable.  `Some` exercises a bounded tiled plan; an `Err` would also be
+    // safe, but this production geometry has legal tiles and must take the bounded path.
+    let edge_gib =
+        (measured + resolved.budget_safety_bytes - 1) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let tiling = plan_diffvae_tiling(&cfg, lt, lh, lw, edge_gib, &resolved)
+        .expect("the one-byte-under edge still has a legal bounded tile")
+        .expect("the one-byte-under edge must not select the untiled decode");
+    assert!(
+        (0..3).any(|axis| tiling.tile[axis] < geometry.stage4[axis]),
+        "the edge plan must actually tile: {tiling:?} vs {:?}",
+        geometry.stage4
+    );
+
+    let tiled = decoder
+        .decode_tiled(&latent, &noise, &tiling)
+        .expect("bounded decode at the under-peak edge");
+    device.synchronize().expect("synchronize bounded decode");
+    let drift = mean_abs_err(&tiled, &untiled);
+    assert!(
+        drift < 0.02,
+        "bounded decode drifted from exact untiled decode by mean {drift:.3e} after {:.1}s",
+        t.elapsed().as_secs_f64()
     );
 }
