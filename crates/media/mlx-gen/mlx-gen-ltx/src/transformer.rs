@@ -2354,6 +2354,38 @@ impl AvDiT {
 mod tests {
     use super::*;
 
+    /// sc-18789: the keyframe absolute-position marker lands on exactly the tokens the mask
+    /// marks — marked tokens shift by the embedding, unmarked tokens are bit-identical, and an
+    /// absent mask (or absent embedding) is an exact no-op.
+    #[test]
+    fn keyframes_embedding_applies_only_to_marked_tokens() {
+        use mlx_rs::ops::indexing::IndexOp;
+        struct CpuGuard(mlx_rs::Device);
+        impl Drop for CpuGuard {
+            fn drop(&mut self) {
+                mlx_rs::Device::set_default(&self.0);
+            }
+        }
+        let _cpu = CpuGuard(mlx_rs::Device::try_default().expect("default device"));
+        mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
+        let x = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 3, 2]);
+        let emb = Array::from_slice(&[10.0f32, 20.0], &[1, 2]);
+        let mask = Array::from_slice(&[0.0f32, 1.0, 0.0], &[1, 3, 1]);
+        let out = apply_keyframes_embedding(&x, Some(&emb), Some(&mask)).unwrap();
+        let got: Vec<f32> = (0..3)
+            .flat_map(|t| (0..2).map(move |c| (t, c)))
+            .map(|(t, c)| out.index((0, t, c)).item::<f32>())
+            .collect();
+        assert_eq!(got, vec![1.0, 2.0, 13.0, 24.0, 5.0, 6.0]);
+        for out in [
+            apply_keyframes_embedding(&x, Some(&emb), None).unwrap(),
+            apply_keyframes_embedding(&x, None, Some(&mask)).unwrap(),
+        ] {
+            let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&out, &x).unwrap()).unwrap();
+            assert_eq!(mlx_rs::ops::max(&d, None).unwrap().item::<f32>(), 0.0);
+        }
+    }
+
     #[test]
     fn rms_norm_noweight_matches_fresh_ones_and_caches() {
         // F-057: the cached `(dim, dtype)` ones must give bit-identical results to a freshly built

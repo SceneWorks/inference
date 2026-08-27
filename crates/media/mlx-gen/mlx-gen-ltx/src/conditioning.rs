@@ -1105,4 +1105,126 @@ mod tests {
             "3 leaves only lower-right empty"
         );
     }
+
+    // ============================ DFR slot / keyframe appends (sc-18789) =========================
+
+    fn tiny_base(f: i32, h: i32, w: i32) -> VideoTokenState {
+        let noise = Array::ones::<f32>(&[1, 2, f, h, w]).unwrap();
+        let positions = Array::zeros::<f32>(&[1, 3, f * h * w, 2]).unwrap();
+        VideoTokenState::base(&noise, &positions).unwrap()
+    }
+
+    /// Slots append h·w tokens per position with denoise_mask 1, zero clean, a marked keyframes
+    /// mask covering exactly the slot run, and a layout locating it. Base tokens stay unmarked.
+    #[test]
+    fn generated_slots_mark_exactly_their_run() {
+        let st = tiny_base(2, 2, 2);
+        let out =
+            append_generated_keyframe_slots(&st, &[5, 9], None, 17, 2, 2, 32, 24.0).unwrap();
+        assert_eq!(out.latent.shape(), &[1, 8 + 8, 2]);
+        let layout = out.generated_keyframe_layout.as_ref().unwrap();
+        assert_eq!(layout.first_token, 8);
+        assert_eq!(layout.tokens_per_keyframe, 4);
+        assert_eq!(layout.pixel_frame_indices, vec![5, 9]);
+        let mask = out.keyframes_mask.as_ref().expect("slots must mark the keyframes mask");
+        assert_eq!(mask.shape(), &[1, 16, 1]);
+        let m = mask.as_slice::<f32>();
+        assert!(
+            m[..8].iter().all(|&v| v == 0.0),
+            "base tokens must stay unmarked: {m:?}"
+        );
+        assert!(
+            m[8..].iter().all(|&v| v > 0.0),
+            "every slot token must be marked: {m:?}"
+        );
+        let dm = out.denoise_mask.as_slice::<f32>();
+        assert!(dm[8..].iter().all(|&v| v == 1.0));
+        assert!(
+            append_generated_keyframe_slots(&out, &[3], None, 17, 2, 2, 32, 24.0).is_err()
+        );
+        assert!(append_generated_keyframe_slots(&st, &[17], None, 17, 2, 2, 32, 24.0).is_err());
+        assert!(append_generated_keyframe_slots(&st, &[9, 5], None, 17, 2, 2, 32, 24.0).is_err());
+    }
+
+    /// Slot RoPE positions span exactly one pixel frame — `[t, t+1)/fps` — which is what
+    /// distinguishes a slot from a regular latent frame (8-frame span) in RoPE space.
+    #[test]
+    fn slot_positions_span_one_pixel_frame() {
+        let fps = 24.0;
+        let pos = single_frame_positions(1, 2, 9, 32, fps);
+        assert_eq!(pos.shape(), &[1, 3, 2, 2]);
+        let v = pos.as_slice::<f32>();
+        assert_eq!(&v[0..4], &[9.0 / fps, 10.0 / fps, 9.0 / fps, 10.0 / fps]);
+        assert_eq!(&v[4..8], &[0.0, 32.0, 0.0, 32.0]);
+        assert_eq!(&v[8..12], &[0.0, 32.0, 32.0, 64.0]);
+    }
+
+    /// Slot initial content seeds the noisy latent (not the clean), per the reference: the noiser
+    /// lerps from it at mask 1 while clean stays zero.
+    #[test]
+    fn slot_initials_seed_latent_not_clean() {
+        let st = tiny_base(2, 1, 1);
+        let init = Array::from_slice(&[3.0f32, 4.0], &[1, 2, 1, 1, 1]);
+        let out = append_generated_keyframe_slots(&st, &[5], Some(&init), 17, 1, 1, 32, 24.0)
+            .unwrap();
+        let lat = out.latent.as_slice::<f32>();
+        assert_eq!(&lat[4..6], &[3.0, 4.0], "slot latent seeded from initials");
+        let clean = out.clean_latent.as_slice::<f32>();
+        assert_eq!(&clean[4..6], &[0.0, 0.0], "slot clean stays zero");
+        let bad = Array::from_slice(&[0.0f32; 8], &[1, 2, 1, 2, 2]);
+        assert!(
+            append_generated_keyframe_slots(&st, &[5], Some(&bad), 17, 1, 1, 32, 24.0).is_err()
+        );
+    }
+
+    /// Given single-frame keyframes append clean content at 1 − strength and stay UNMARKED — the
+    /// reference marks only generated slots, and a marker here would hand ordinary image guidance
+    /// the keyframe embedding.
+    #[test]
+    fn single_frame_keyframes_are_clean_unmarked_guidance() {
+        let st = tiny_base(2, 1, 1);
+        let kf = Array::from_slice(&[7.0f32, 8.0, 9.0, 10.0], &[1, 2, 2, 1, 1]);
+        let out = append_single_frame_keyframes(&st, &kf, &[6, 11], 0.95, 32, 24.0).unwrap();
+        assert_eq!(out.latent.shape(), &[1, 4, 2]);
+        let lat = out.latent.as_slice::<f32>();
+        assert_eq!(&lat[2 * 2..], &[0.0, 0.0, 0.0, 0.0], "noisy side gets zeros");
+        let clean = out.clean_latent.as_slice::<f32>();
+        assert_eq!(&clean[2 * 2..], &[7.0, 9.0, 8.0, 10.0]);
+        let dm = out.denoise_mask.as_slice::<f32>();
+        assert!((dm[2] - 0.05).abs() < 1e-6 && (dm[3] - 0.05).abs() < 1e-6);
+        assert!(out.keyframes_mask.is_none(), "given keyframes must not mark");
+        assert!(out.generated_keyframe_layout.is_none());
+        assert!(append_single_frame_keyframes(&st, &kf, &[0, 11], 0.95, 32, 24.0).is_err());
+    }
+
+    /// The detailing reference latent rides along clean at strength with spatial positions scaled
+    /// by the downscale factor into the target frame.
+    #[test]
+    fn reference_latent_scales_spatial_positions() {
+        let st = tiny_base(1, 2, 2);
+        let refl = Array::ones::<f32>(&[1, 2, 1, 1, 1]).unwrap();
+        let out = append_reference_latent(&st, &refl, 2, 1.0, 8, 32, 24.0).unwrap();
+        assert_eq!(out.latent.shape(), &[1, 5, 2]);
+        let dm = out.denoise_mask.as_slice::<f32>();
+        assert_eq!(dm[4], 0.0, "strength 1.0 pins the reference fully");
+        assert!(out.keyframes_mask.is_none(), "reference tokens never mark");
+        let pos = out.positions.as_slice::<f32>();
+        let h_start = pos[5 * 2 + 4 * 2];
+        let h_end = pos[5 * 2 + 4 * 2 + 1];
+        assert_eq!((h_start, h_end), (0.0, 64.0));
+    }
+
+    /// The slots denoised in place read back through the layout as (B, C, K, H, W), in slot order.
+    #[test]
+    fn take_generated_keyframes_roundtrips_slot_content() {
+        let st = tiny_base(2, 1, 1);
+        let init = Array::from_slice(&[3.0f32, 4.0, 5.0, 6.0], &[1, 2, 2, 1, 1]);
+        let out = append_generated_keyframe_slots(&st, &[5, 11], Some(&init), 17, 1, 1, 32, 24.0)
+            .unwrap();
+        let back = take_generated_keyframes(&out, 1, 1).unwrap();
+        assert_eq!(back.shape(), &[1, 2, 2, 1, 1]);
+        assert_eq!(back.as_slice::<f32>(), &[3.0, 4.0, 5.0, 6.0]);
+        assert!(take_generated_keyframes(&tiny_base(1, 1, 1), 1, 1).is_err());
+    }
 }
+

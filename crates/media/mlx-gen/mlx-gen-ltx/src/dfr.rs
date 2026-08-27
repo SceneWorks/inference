@@ -844,9 +844,20 @@ mod tests {
     use std::cell::RefCell;
 
     /// All orchestration tests run on the CPU stream — the gpu-local lane is queued and nothing
-    /// here needs Metal.
-    fn cpu() {
-        Device::set_default(&Device::cpu());
+    /// here needs Metal. RAII-restored so the process-global default device does not leak into
+    /// other tests in this binary (the vocoder STFT test is bit-exact and device-sensitive).
+    struct CpuGuard(Device);
+    impl CpuGuard {
+        fn new() -> Self {
+            let previous = Device::try_default().expect("default device");
+            Device::set_default(&Device::cpu());
+            Self(previous)
+        }
+    }
+    impl Drop for CpuGuard {
+        fn drop(&mut self) {
+            Device::set_default(&self.0);
+        }
     }
 
     /// `(1, C, T, 1, 1)` latent whose frame t is the constant `base + t`.
@@ -951,7 +962,7 @@ mod tests {
     /// shape — cannot pass this: rounds=2 must produce the deeper canvas AND the round-2 calls.
     #[test]
     fn round_count_is_honoured_not_inert_above_1() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let video = ramp_latent(2, 16, 0.0); // 121 frames → 16 latents
         let (carry_pos, carry_kf) = stage2_carry(2);
 
@@ -1004,7 +1015,7 @@ mod tests {
     /// the exact tensor positions where a wrong `drop_latent_prefix` would double-write or gap.
     #[test]
     fn stitch_hands_over_exactly_at_the_seam_latent() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let video = ramp_latent(1, 16, 0.0);
         let (carry_pos, carry_kf) = stage2_carry(1);
         let calls = RefCell::new(Vec::new());
@@ -1040,7 +1051,7 @@ mod tests {
     /// content — both fail here.
     #[test]
     fn round2_anchors_carry_round1_slot_content() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let video = ramp_latent(1, 16, 0.0);
         let (carry_pos, carry_kf) = stage2_carry(1);
         let calls = RefCell::new(Vec::new());
@@ -1092,7 +1103,7 @@ mod tests {
     /// Slot seeds pick the nearest latent frame of the window, tile-locally.
     #[test]
     fn slot_initials_pick_nearest_latent_frame() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let window = ramp_latent(1, 19, 0.0);
         let init = slot_initials_from_video(&window, &[24, 72, 120], 8).unwrap();
         assert_eq!(init.shape(), &[1, 1, 3, 1, 1]);
@@ -1104,7 +1115,7 @@ mod tests {
     /// Carry-forward merge orders by position and errors when a latent bag is missing.
     #[test]
     fn carry_forward_merge_orders_and_validates() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let anchors = const_latent(1, 2, 5.0);
         let slots = const_latent(1, 1, 9.0);
         let (positions, latents) =
@@ -1120,7 +1131,7 @@ mod tests {
     /// A tile that was asked for slots but returns none is a hard error, not a silent skip.
     #[test]
     fn missing_slot_keyframes_is_a_hard_error() {
-        cpu();
+        let _cpu = CpuGuard::new();
         let video = ramp_latent(1, 16, 0.0);
         let (carry_pos, carry_kf) = stage2_carry(1);
         let mut no_slots = |job: &DfrTileJob| {
@@ -1151,7 +1162,7 @@ mod tests {
     /// The padded-canvas trim honours the caller's frame contract on a latent boundary.
     #[test]
     fn trim_to_target_frames_lands_on_latent_boundary() {
-        cpu();
+        let _cpu = CpuGuard::new();
         // 153 requested → canvas 161 (21 latents); 0 rounds → keep (153−1)/8+1 = 20 latents.
         let canvas = ramp_latent(1, 21, 0.0);
         let (trimmed, frames) = trim_to_target_frames(&canvas, 161, 153, 0).unwrap();
