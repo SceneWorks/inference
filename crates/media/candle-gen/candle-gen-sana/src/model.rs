@@ -874,10 +874,116 @@ mod tests {
         crate::preview::base_hook(sink)
     }
 
+    /// Return one Rust item beginning at `marker`, including its balanced outer braces. The guarded
+    /// production adapters contain no brace-bearing string literals, so this deliberately small
+    /// parser is stricter and easier to audit than a whole-file substring count.
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn replace_in_item(source: &str, marker: &str, from: &str, to: &str) -> String {
+        let start = source.find(marker).unwrap();
+        let item = braced_item(source, marker);
+        let replaced = item.replacen(from, to, 1);
+        assert_ne!(item, replaced, "mutation target must exist in {marker}");
+        format!(
+            "{}{}{}",
+            &source[..start],
+            replaced,
+            &source[start + item.len()..]
+        )
+    }
+
+    fn check_registered_reference_adapters(source: &str) -> Result<(), String> {
+        for marker in [
+            "impl BaseBatchPipeline for SanaPipeline {",
+            "impl SprintBatchPipeline for SanaSprintPipeline {",
+        ] {
+            let adapter = braced_item(source, marker);
+            if adapter
+                .matches("self.generate_with_conditioning_and_reference_memory(")
+                .count()
+                != 1
+                || adapter.contains("self.generate_with_conditioning_memory(")
+            {
+                return Err(format!(
+                    "{marker} must select only the typed prepared-reference render tail"
+                ));
+            }
+        }
+
+        for marker in ["fn generate_base_images(", "fn generate_sprint_images("] {
+            let batch = braced_item(source, marker);
+            let fanout = batch
+                .find("candle_gen::for_each_image_seed(")
+                .ok_or_else(|| format!("{marker} lost the production seed fanout"))?;
+            let (request_preamble, seed_tail) = batch.split_at(fanout);
+            if request_preamble.matches(".prepare_reference(").count() != 1
+                || seed_tail.contains(".prepare_reference(")
+                || seed_tail.matches("prepared_reference.as_ref(),").count() != 1
+            {
+                return Err(format!(
+                    "{marker} must prepare once before fanout and borrow that value into every tail"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_adapters_are_bound_to_the_prepared_reference_tail() {
+        let shipped = include_str!("model.rs");
+        check_registered_reference_adapters(shipped).unwrap();
+
+        for marker in [
+            "impl BaseBatchPipeline for SanaPipeline {",
+            "impl SprintBatchPipeline for SanaSprintPipeline {",
+        ] {
+            let reverted = replace_in_item(
+                shipped,
+                marker,
+                "self.generate_with_conditioning_and_reference_memory(",
+                "self.generate_with_conditioning_memory(",
+            );
+            assert!(
+                check_registered_reference_adapters(&reverted).is_err(),
+                "{marker}: reverting the real adapter to per-seed preparation must fail"
+            );
+        }
+
+        for marker in ["fn generate_base_images(", "fn generate_sprint_images("] {
+            let dropped = replace_in_item(shipped, marker, "prepared_reference.as_ref(),", "None,");
+            assert!(
+                check_registered_reference_adapters(&dropped).is_err(),
+                "{marker}: dropping the request-prepared value must fail"
+            );
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq)]
     struct RenderedInputs {
         has_reference: bool,
-        has_prepared_reference: bool,
+        prepared_reference: Option<Vec<u8>>,
         strength: Option<f32>,
         guidance_scale: Option<f32>,
     }
@@ -914,9 +1020,9 @@ mod tests {
             _cancel: &gen_core::CancelFlag,
         ) -> candle_gen::Result<Option<Self::PreparedReference>> {
             if req.init_image.is_some() && req.strength.unwrap_or(0.0) > 0.0 {
-                self.reference_encoder_calls
-                    .set(self.reference_encoder_calls.get() + 1);
-                Ok(Some(b"base-reference-latent".to_vec()))
+                let call = self.reference_encoder_calls.get() + 1;
+                self.reference_encoder_calls.set(call);
+                Ok(Some(vec![call as u8]))
             } else {
                 Ok(None)
             }
@@ -937,7 +1043,7 @@ mod tests {
             self.rendered_seeds.borrow_mut().push(seed);
             self.rendered_inputs.borrow_mut().push(RenderedInputs {
                 has_reference: req.init_image.is_some(),
-                has_prepared_reference: prepared_reference.is_some(),
+                prepared_reference: prepared_reference.cloned(),
                 strength: req.strength,
                 guidance_scale: req.guidance_scale,
             });
@@ -949,7 +1055,7 @@ mod tests {
         encoder_calls: Cell<usize>,
         reference_encoder_calls: Cell<usize>,
         rendered_seeds: RefCell<Vec<u64>>,
-        rendered_references: RefCell<Vec<bool>>,
+        rendered_references: RefCell<Vec<Option<Vec<u8>>>>,
     }
 
     impl SprintBatchPipeline for SprintFixturePipeline {
@@ -968,9 +1074,9 @@ mod tests {
             _cancel: &gen_core::CancelFlag,
         ) -> candle_gen::Result<Option<Self::PreparedReference>> {
             if req.init_image.is_some() && req.strength.unwrap_or(0.0) > 0.0 {
-                self.reference_encoder_calls
-                    .set(self.reference_encoder_calls.get() + 1);
-                Ok(Some(b"sprint-reference-latent".to_vec()))
+                let call = self.reference_encoder_calls.get() + 1;
+                self.reference_encoder_calls.set(call);
+                Ok(Some(vec![call as u8]))
             } else {
                 Ok(None)
             }
@@ -991,7 +1097,7 @@ mod tests {
             self.rendered_seeds.borrow_mut().push(seed);
             self.rendered_references
                 .borrow_mut()
-                .push(prepared_reference.is_some());
+                .push(prepared_reference.cloned());
             Ok(fixture_image(conditioning, seed))
         }
     }
@@ -1044,7 +1150,7 @@ mod tests {
             vec![
                 RenderedInputs {
                     has_reference: true,
-                    has_prepared_reference: true,
+                    prepared_reference: Some(vec![1]),
                     strength: Some(0.6),
                     guidance_scale: Some(4.5),
                 };
@@ -1088,7 +1194,7 @@ mod tests {
             vec![
                 RenderedInputs {
                     has_reference: false,
-                    has_prepared_reference: false,
+                    prepared_reference: None,
                     strength: None,
                     guidance_scale: Some(1.0),
                 };
@@ -1134,8 +1240,119 @@ mod tests {
         assert_eq!(pipeline.encoder_calls.get(), 1);
         assert_eq!(pipeline.reference_encoder_calls.get(), 1);
         assert_eq!(*pipeline.rendered_seeds.borrow(), vec![11, 12, 13]);
-        assert_eq!(*pipeline.rendered_references.borrow(), vec![true; 3]);
+        assert_eq!(
+            *pipeline.rendered_references.borrow(),
+            vec![Some(vec![1]); 3]
+        );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn both_registered_batch_seams_are_request_local_and_skip_txt2img_encode() {
+        let base = BaseFixturePipeline {
+            encoder_calls: Cell::new(0),
+            reference_encoder_calls: Cell::new(0),
+            rendered_seeds: RefCell::new(Vec::new()),
+            rendered_inputs: RefCell::new(Vec::new()),
+        };
+        let sprint = SprintFixturePipeline {
+            encoder_calls: Cell::new(0),
+            reference_encoder_calls: Cell::new(0),
+            rendered_seeds: RefCell::new(Vec::new()),
+            rendered_references: RefCell::new(Vec::new()),
+        };
+        let inert = PreviewSink::default();
+
+        let reference_request = |seed, count| GenerationRequest {
+            seed: Some(seed),
+            count,
+            conditioning: vec![Conditioning::Reference {
+                image: reference_image(),
+                strength: Some(0.6),
+            }],
+            ..req(256, 256)
+        };
+        let text_request = |seed, count| GenerationRequest {
+            seed: Some(seed),
+            count,
+            ..req(256, 256)
+        };
+
+        generate_base_images(
+            &base,
+            &reference_request(20, 3),
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
+        generate_base_images(
+            &base,
+            &text_request(30, 2),
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
+        generate_base_images(
+            &base,
+            &reference_request(40, 2),
+            &Device::Cpu,
+            &mut |_| {},
+            &inert_hook(&inert),
+        )
+        .unwrap();
+        assert_eq!(base.reference_encoder_calls.get(), 2);
+        assert_eq!(
+            base.rendered_inputs
+                .borrow()
+                .iter()
+                .map(|input| input.prepared_reference.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![Some(vec![1]); 3],
+                vec![None; 2],
+                vec![Some(vec![2]); 2],
+            ]
+            .concat(),
+            "base must share one latent per img2img request, retain none across requests, and encode none for txt2img"
+        );
+
+        generate_sprint_images(
+            &sprint,
+            &reference_request(50, 3),
+            &Device::Cpu,
+            &mut |_| {},
+            &crate::preview::sprint_hook(&inert),
+        )
+        .unwrap();
+        generate_sprint_images(
+            &sprint,
+            &text_request(60, 2),
+            &Device::Cpu,
+            &mut |_| {},
+            &crate::preview::sprint_hook(&inert),
+        )
+        .unwrap();
+        generate_sprint_images(
+            &sprint,
+            &reference_request(70, 2),
+            &Device::Cpu,
+            &mut |_| {},
+            &crate::preview::sprint_hook(&inert),
+        )
+        .unwrap();
+        assert_eq!(sprint.reference_encoder_calls.get(), 2);
+        assert_eq!(
+            *sprint.rendered_references.borrow(),
+            [
+                vec![Some(vec![1]); 3],
+                vec![None; 2],
+                vec![Some(vec![2]); 2],
+            ]
+            .concat(),
+            "Sprint must share one latent per img2img request, retain none across requests, and encode none for txt2img"
+        );
     }
 
     fn fixture_image(conditioning: &[u8], seed: u64) -> Image {

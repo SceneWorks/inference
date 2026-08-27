@@ -1416,6 +1416,146 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn replace_in_item(source: &str, marker: &str, from: &str, to: &str) -> String {
+        let start = source.find(marker).unwrap();
+        let item = braced_item(source, marker);
+        let replaced = item.replacen(from, to, 1);
+        assert_ne!(item, replaced, "mutation target must exist in {marker}");
+        format!(
+            "{}{}{}",
+            &source[..start],
+            replaced,
+            &source[start + item.len()..]
+        )
+    }
+
+    fn call_arguments(source: &str, marker: &str) -> Vec<String> {
+        let start = source
+            .find(marker)
+            .map(|offset| offset + marker.len())
+            .unwrap_or_else(|| panic!("missing production call {marker}"));
+        let mut depth = 0usize;
+        let mut current = String::new();
+        let mut arguments = Vec::new();
+        for ch in source[start..].chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => {
+                    if !current.trim().is_empty() {
+                        arguments.push(current.trim().to_owned());
+                    }
+                    return arguments;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    arguments.push(current.trim().to_owned());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        panic!("production call {marker} has no closing parenthesis")
+    }
+
+    fn check_registered_mask_routes(source: &str) -> Result<()> {
+        let encode = braced_item(source, "pub fn encode_conditioning(");
+        if encode
+            .matches("text_encoder.encode_with_mask(prompt)?")
+            .count()
+            != 1
+            || encode
+                .matches("text_encoder.encode_with_mask(negative_prompt.unwrap_or(\"\"))?")
+                .count()
+                != 1
+        {
+            return Err(Error::Msg(
+                "SANA conditioning must obtain positive and CFG-negative masks beside their selected embeddings"
+                    .into(),
+            ));
+        }
+
+        let base = braced_item(source, "    fn denoise_cfg(\n        &self,");
+        let base_args = call_arguments(base, "denoise_cfg_with_memory(");
+        if base_args.len() != 15
+            || base_args[6] != "&cond.cond"
+            || base_args[7] != "Some(&cond.cond_mask)"
+            || base_args[8] != "uncond"
+            || base_args[9] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base CFG-on/off must route each selected embedding with its own gathered mask"
+                    .into(),
+            ));
+        }
+
+        let sprint = braced_item(source, "    fn denoise_sprint(\n        &self,");
+        let sprint_args = call_arguments(sprint, "denoise_sprint_from_with_memory(");
+        if sprint_args.len() != 13
+            || sprint_args[5] != "&cond.cond"
+            || sprint_args[6] != "Some(&cond.cond_mask)"
+        {
+            return Err(Error::Msg(
+                "Sprint must route the selected positive embedding with its gathered mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_mask_route_table_is_positional_and_mutation_sensitive() {
+        let shipped = include_str!("pipeline.rs");
+        check_registered_mask_routes(shipped).unwrap();
+
+        let base_marker = "    fn denoise_cfg(\n        &self,";
+        let sprint_marker = "    fn denoise_sprint(\n        &self,";
+        for mutated in [
+            replace_in_item(shipped, base_marker, "Some(&cond.cond_mask),", "None,"),
+            replace_in_item(shipped, base_marker, "uncond_mask,", "None,"),
+            replace_in_item(
+                shipped,
+                base_marker,
+                "Some(&cond.cond_mask),\n            uncond,\n            uncond_mask,",
+                "uncond_mask,\n            uncond,\n            Some(&cond.cond_mask),",
+            ),
+            replace_in_item(shipped, sprint_marker, "Some(&cond.cond_mask),", "None,"),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping or swapping any Base/Sprint production mask must fail"
+            );
+        }
+    }
+
     #[test]
     fn decode_default_is_the_measured_192_at_fixed_48_overlap() {
         let _lock = env_lock();
