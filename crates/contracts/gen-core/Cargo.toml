@@ -42,3 +42,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 # Self-removing fixture roots for the test suites (sc-17755).
 tempfile = { workspace = true }
+# Already a normal dependency; integration tests are separate crates and need it declared here
+# too, to AUTHOR the odd channel layouts the reader must cope with (a luminance-only `Y` plate).
+exr = { workspace = true }

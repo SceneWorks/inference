@@ -132,7 +132,8 @@ pub use generator::{
     StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
 };
 pub use hdr::{
-    from_vae_range, hlg_inverse_oetf, hlg_oetf, to_vae_range, working_frame_to_exr_payload,
+    exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
+    rgb_signal_to_yuv420p10, to_vae_range, working_frame_to_exr_payload,
     working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
     Primaries, Yuv420p10, HLG_MASTER_TAGS,
 };

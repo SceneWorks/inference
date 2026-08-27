@@ -437,7 +437,17 @@ impl HlgConverter {
     /// Map one scene-linear Rec.2020 sample through the diffuse-white anchor + highlight
     /// roll-off, then the HLG OETF.
     fn signal_from_rec2020_linear(&self, lin: f32) -> f32 {
-        let lin = if lin.is_finite() { lin.max(0.0) } else { 0.0 };
+        // Upstream's `nan_to_num(nan=0.0, neginf=0.0)` leaves POSITIVE infinity alone, so it flows
+        // through the roll-off below and lands on peak white. Flushing it to zero instead — as an
+        // `is_finite()` guard does — turns a blown highlight into a black hole, which is both
+        // wrong and the more alarming failure on screen.
+        let lin = if lin.is_nan() {
+            0.0
+        } else if lin == f32::INFINITY {
+            f32::MAX
+        } else {
+            lin.max(0.0)
+        };
         let x = if lin <= 1.0 {
             lin * self.white_x
         } else {
@@ -447,8 +457,8 @@ impl HlgConverter {
     }
 
     /// Convert interleaved scene-linear RGB (in the converter's source primaries) to an HLG
-    /// signal in `[0, 1]`, in place. Non-finite samples are flushed to zero rather than poisoning
-    /// the encode (upstream `nan_to_num`).
+    /// signal in `[0, 1]`, in place. NaN and negative infinity are flushed to zero; positive
+    /// infinity rolls off to peak white (upstream `nan_to_num` semantics).
     pub fn to_hlg_signal_in_place(&self, rgb: &mut [f32]) {
         apply_matrix_in_place(&self.prim_mat, rgb);
         for v in rgb.iter_mut() {
@@ -472,7 +482,7 @@ impl HlgConverter {
         }
         let mut rgb = frame.rgb.clone();
         self.to_hlg_signal_in_place(&mut rgb);
-        Ok(rgb_signal_to_yuv420p10(&rgb, w, h))
+        Ok(rgb_signal_to_yuv420p10_unchecked(&rgb, w, h))
     }
 }
 
@@ -501,9 +511,40 @@ const KG_2020: f32 = 0.6780;
 const KB_2020: f32 = 0.0593;
 
 /// RGB **signal** (already transfer-encoded, `[0, 1]`) → planar 10-bit YUV 4:2:0, BT.2020 NCL,
-/// limited range. Chroma is box-averaged over 2×2 before the code-level scale (the scale is
-/// affine, so averaging before or after is identical — this matches upstream's `avg_pool2d`).
-fn rgb_signal_to_yuv420p10(rgb: &[f32], w: usize, h: usize) -> Yuv420p10 {
+/// **limited ("tv") range**. Chroma is box-averaged over 2×2 before the code-level scale (the
+/// scale is affine, so averaging before or after is identical — this matches upstream's
+/// `avg_pool2d`).
+///
+/// Public because the code-level scaling is a distinct, independently-wrong-able stage: it is what
+/// puts `E' = 0` on luma **64** and `E' = 1` on luma **940** rather than on 0 and 1023. A payload
+/// written full-range but tagged `tv` — the tags in [`HLG_MASTER_TAGS`] say limited — is re-stretched
+/// by every player, crushing blacks and clipping highlights. `ffprobe` cannot catch that: it reads
+/// container tags, not sample values. So the scaling is exposed here and asserted at the extremes
+/// directly, on the signal, without the HLG curve in the way.
+///
+/// `Err` on odd dimensions (4:2:0 needs even edges) or a buffer inconsistent with them.
+pub fn rgb_signal_to_yuv420p10(
+    signal_rgb: &[f32],
+    width: u32,
+    height: u32,
+) -> crate::Result<Yuv420p10> {
+    let (w, h) = (width as usize, height as usize);
+    if width == 0 || height == 0 || w % 2 != 0 || h % 2 != 0 {
+        return Err(Error::Msg(format!(
+            "rgb_signal_to_yuv420p10: 4:2:0 chroma subsampling needs non-zero even dimensions, got {width}×{height}"
+        )));
+    }
+    if signal_rgb.len() != w * h * 3 {
+        return Err(Error::Msg(format!(
+            "rgb_signal_to_yuv420p10: buffer length {} disagrees with {width}×{height} RGB (need {})",
+            signal_rgb.len(),
+            w * h * 3
+        )));
+    }
+    Ok(rgb_signal_to_yuv420p10_unchecked(signal_rgb, w, h))
+}
+
+fn rgb_signal_to_yuv420p10_unchecked(rgb: &[f32], w: usize, h: usize) -> Yuv420p10 {
     let (cw, ch) = (w / 2, h / 2);
     let mut y_plane = vec![0u16; w * h];
     // Full-resolution chroma, averaged into the subsampled planes below.

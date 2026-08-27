@@ -128,31 +128,39 @@ pub fn write_rgb_exr(
 /// Decode OpenEXR bytes into an [`ExrImage`].
 ///
 /// Reads the largest resolution level of the first valid layer. Alpha is read but discarded
-/// (scene-linear conditioning has no use for it); a file with no `B`/`G` channel — a luminance-
-/// only render pass — is broadcast to three channels rather than rejected.
+/// (scene-linear conditioning has no use for it).
+///
+/// **Single-channel files are broadcast to three.** A luminance-only render pass (a depth, matte or
+/// AOV plate) names its channel `Y` — not `R` — so every channel here is optional and `Y` is
+/// accepted as the grey source. Requiring `R` would have made the "broadcast a 1-channel EXR"
+/// promise unreachable for exactly the files that need it. A file carrying none of `R`/`G`/`B`/`Y`
+/// is a typed error, not a silent black frame.
 pub fn read_rgb_exr(bytes: &[u8]) -> crate::Result<ExrImage> {
+    // NaN is the "channel absent" marker: `optional` needs a default, and no legitimate sample is
+    // NaN (the writer never emits one, and a file that did would read as absent — an acceptable
+    // trade for supporting the channel layouts that actually occur).
+    const ABSENT: f32 = f32::NAN;
     let image = read()
         .no_deep_data()
         .largest_resolution_level()
         .specific_channels()
-        .required("R")
-        // A luminance-only EXR has no G/B; default them to the red sample so the frame comes back
-        // grey rather than red-tinted (upstream broadcasts a 1-channel file to three).
-        .optional("G", f32::NAN)
-        .optional("B", f32::NAN)
+        .optional("R", ABSENT)
+        .optional("G", ABSENT)
+        .optional("B", ABSENT)
+        .optional("Y", ABSENT)
         .collect_pixels(
             // `set_pixel` receives only the buffer and a position, so carry the row stride
             // alongside the samples rather than trying to recover it from the buffer length.
             |resolution, _| {
                 (
                     resolution.width(),
-                    vec![(0f32, 0f32, 0f32); resolution.width() * resolution.height()],
+                    vec![(0f32, 0f32, 0f32, 0f32); resolution.width() * resolution.height()],
                 )
             },
-            |(width, pixels): &mut (usize, Vec<(f32, f32, f32)>),
+            |(width, pixels): &mut (usize, Vec<(f32, f32, f32, f32)>),
              position: Vec2<usize>,
-             (r, g, b): (f32, f32, f32)| {
-                pixels[position.y() * *width + position.x()] = (r, g, b);
+             (r, g, b, y): (f32, f32, f32, f32)| {
+                pixels[position.y() * *width + position.x()] = (r, g, b, y);
             },
         )
         .first_valid_layer()
@@ -162,12 +170,31 @@ pub fn read_rgb_exr(bytes: &[u8]) -> crate::Result<ExrImage> {
 
     let size = image.layer_data.size;
     let (w, h) = (size.width(), size.height());
+    let pixels = &image.layer_data.channel_data.pixels.1;
+    if pixels
+        .iter()
+        .all(|(r, g, b, y)| r.is_nan() && g.is_nan() && b.is_nan() && y.is_nan())
+    {
+        return Err(Error::Msg(
+            "read_rgb_exr: file carries none of the R/G/B/Y channels — nothing to read as colour"
+                .to_owned(),
+        ));
+    }
     let mut out = Vec::with_capacity(w * h * 3);
-    for (r, g, b) in image.layer_data.channel_data.pixels.1.iter() {
-        // A missing G/B arrives as NaN (the `optional` default) — broadcast red into it.
-        out.push(*r);
-        out.push(if g.is_nan() { *r } else { *g });
-        out.push(if b.is_nan() { *r } else { *b });
+    for (r, g, b, y) in pixels.iter() {
+        // Grey source for a single-channel plate: `Y` when present, else whichever of R/G/B is.
+        let grey = if !y.is_nan() {
+            *y
+        } else if !r.is_nan() {
+            *r
+        } else if !g.is_nan() {
+            *g
+        } else {
+            *b
+        };
+        out.push(if r.is_nan() { grey } else { *r });
+        out.push(if g.is_nan() { grey } else { *g });
+        out.push(if b.is_nan() { grey } else { *b });
     }
 
     let frame = HdrFrame {

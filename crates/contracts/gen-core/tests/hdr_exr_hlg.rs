@@ -635,3 +635,171 @@ fn hdr_is_opt_in_and_gated_on_the_advertised_capability() {
         .validate_request("m", &sdr)
         .expect("advertising HDR must not make SDR requests invalid");
 }
+
+// -------------------------------------------------------------------------------------------
+// Limited ("tv") range code-level scaling
+// -------------------------------------------------------------------------------------------
+
+/// Build a uniform signal frame (every pixel the same RGB signal triple) and pack it.
+fn packed_signal(rgb: [f32; 3]) -> gen_core::Yuv420p10 {
+    let mut buf = Vec::with_capacity(2 * 2 * 3);
+    for _ in 0..4 {
+        buf.extend_from_slice(&rgb);
+    }
+    gen_core::hdr::rgb_signal_to_yuv420p10(&buf, 2, 2).expect("pack signal")
+}
+
+/// The limited-range code levels, asserted at the exact extremes.
+///
+/// `ffprobe` cannot check this: it reads the container's `color_range` tag, not the samples. A
+/// payload written FULL-range but tagged `tv` is re-stretched by every player — crushed blacks,
+/// clipped highlights — and every tag assertion still passes. So the mapping is pinned here on the
+/// numbers themselves: BT.709/2020 limited 10-bit puts `E' = 0` on **64** and `E' = 1` on **940**
+/// (`219·E'·4 + 16·4`), never on 0 and 1023.
+///
+/// A flat mid-grey frame is deliberately NOT used — it satisfies `64 ≤ y ≤ 1023` under full-range
+/// scaling too, which is exactly how the original version of this test passed while the scaling
+/// was wrong.
+#[test]
+fn luma_uses_limited_range_code_levels_at_both_extremes() {
+    let black = packed_signal([0.0, 0.0, 0.0]);
+    for &y in &black.y {
+        assert_eq!(
+            y, 64,
+            "signal 0.0 must land on the limited-range luma floor 64, not 0 (full-range)"
+        );
+    }
+    let white = packed_signal([1.0, 1.0, 1.0]);
+    for &y in &white.y {
+        assert_eq!(
+            y, 940,
+            "signal 1.0 must land on the limited-range luma ceiling 940, not 1023 (full-range)"
+        );
+    }
+    // The span is what the scale factor actually is: 940 - 64 = 876 = 219 · 4.
+    assert_eq!(u32::from(white.y[0]) - u32::from(black.y[0]), 876);
+}
+
+/// Achromatic input sits on the chroma centre at both luma extremes — so the centre is a real
+/// constant, not something that drifts with brightness.
+#[test]
+fn achromatic_signal_is_centred_at_both_luma_extremes() {
+    for signal in [0.0f32, 0.5, 1.0] {
+        let packed = packed_signal([signal, signal, signal]);
+        for (&u, &v) in packed.u.iter().zip(&packed.v) {
+            assert_eq!(u, 512, "achromatic signal {signal} drifted U off centre");
+            assert_eq!(v, 512, "achromatic signal {signal} drifted V off centre");
+        }
+    }
+}
+
+/// Saturated primaries reach the limited-range chroma excursions **64 and 960**, which pins the
+/// chroma scale (`224·E'·4 + 128·4`) independently of the luma scale.
+///
+/// This is the assertion that separates the two scales. If the luma factors were reused for chroma
+/// — an easy and invisible slip, since both are "limited range" — a full-amplitude ±0.5 chroma
+/// would land on 502/-374 instead of 960/64, while every luma assertion above still passed.
+#[test]
+fn saturated_primaries_reach_the_limited_range_chroma_excursions() {
+    // Cb is (B' − Y')/1.8814 and 1.8814 == 2·(1 − Kb), so pure blue is exactly +0.5 and pure
+    // yellow exactly −0.5. Likewise Cr for red/cyan through 1.4746 == 2·(1 − Kr).
+    let blue = packed_signal([0.0, 0.0, 1.0]);
+    assert_eq!(blue.u[0], 960, "pure blue must reach the Cb ceiling 960");
+    let yellow = packed_signal([1.0, 1.0, 0.0]);
+    assert_eq!(yellow.u[0], 64, "pure yellow must reach the Cb floor 64");
+
+    let red = packed_signal([1.0, 0.0, 0.0]);
+    assert_eq!(red.v[0], 960, "pure red must reach the Cr ceiling 960");
+    let cyan = packed_signal([0.0, 1.0, 1.0]);
+    assert_eq!(cyan.v[0], 64, "pure cyan must reach the Cr floor 64");
+
+    // The chroma span is 960 - 64 = 896 = 224 · 4 — distinct from luma's 876.
+    assert_eq!(u32::from(blue.u[0]) - u32::from(yellow.u[0]), 896);
+    assert_ne!(
+        896, 876,
+        "chroma and luma scales must not be interchangeable"
+    );
+}
+
+/// Odd or inconsistent input is rejected rather than silently truncated.
+#[test]
+fn signal_packer_rejects_bad_geometry() {
+    assert!(gen_core::hdr::rgb_signal_to_yuv420p10(&[0.0; 9], 3, 1).is_err());
+    assert!(gen_core::hdr::rgb_signal_to_yuv420p10(&[0.0; 6], 2, 2).is_err());
+}
+
+/// Positive infinity rolls off to peak white; NaN and negative infinity go to black.
+///
+/// Upstream's `nan_to_num(nan=0.0, neginf=0.0)` deliberately leaves `+inf` alone so a blown
+/// highlight saturates. Flushing it to zero turns the brightest possible sample into the darkest.
+#[test]
+fn non_finite_linear_samples_follow_upstream_nan_to_num() {
+    let converter = HlgConverter::new(Primaries::Rec709);
+    let signal_of = |v: f32| {
+        let mut rgb = vec![v, v, v];
+        converter.to_hlg_signal_in_place(&mut rgb);
+        rgb[0]
+    };
+    assert_eq!(signal_of(f32::NAN), 0.0, "NaN must go to black");
+    assert_eq!(
+        signal_of(f32::NEG_INFINITY),
+        0.0,
+        "negative infinity must go to black"
+    );
+    let inf = signal_of(f32::INFINITY);
+    assert!(
+        inf > 0.999,
+        "positive infinity must roll off to peak white, got {inf}"
+    );
+}
+
+/// A luminance-only EXR (a single `Y` channel — how render passes name a matte/depth/AOV plate)
+/// reads back as neutral grey rather than erroring.
+///
+/// Authored with the `exr` crate directly, because our own writer only emits R/G/B and so could
+/// never produce the layout this is about. The reader's doc promises single-channel broadcast; a
+/// `required("R")` would have made that promise unreachable for every file that actually needs it.
+#[test]
+fn luminance_only_exr_broadcasts_to_grey() {
+    use exr::prelude::*;
+
+    let (w, h) = (4usize, 2usize);
+    let value = |x: usize, y: usize| 0.25 + (x as f32) + (y as f32) * 10.0;
+    let channel = AnyChannel::new(
+        "Y",
+        FlatSamples::F32(
+            (0..w * h)
+                .map(|i| value(i % w, i / w))
+                .collect::<Vec<f32>>(),
+        ),
+    );
+    let layer = Layer::new(
+        (w, h),
+        LayerAttributes::default(),
+        Encoding::FAST_LOSSLESS,
+        AnyChannels::sort(vec![channel].into()),
+    );
+    let mut bytes = std::io::Cursor::new(Vec::<u8>::new());
+    Image::from_layer(layer)
+        .write()
+        .to_buffered(&mut bytes)
+        .expect("write Y-only EXR");
+
+    let decoded = read_rgb_exr(&bytes.into_inner()).expect("read Y-only EXR");
+    assert_eq!((decoded.frame.width, decoded.frame.height), (4, 2));
+    for y in 0..h {
+        for x in 0..w {
+            let px = (y * w + x) * 3;
+            let want = value(x, y);
+            let (r, g, b) = (
+                decoded.frame.rgb[px],
+                decoded.frame.rgb[px + 1],
+                decoded.frame.rgb[px + 2],
+            );
+            assert!(
+                (r - want).abs() < 1e-6 && r == g && g == b,
+                "Y sample {want} must broadcast to neutral grey, got ({r}, {g}, {b})"
+            );
+        }
+    }
+}
