@@ -174,7 +174,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
     let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageControl {
@@ -613,65 +613,43 @@ mod tests {
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Control's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent base snapshot *directory* (with a
-    // control checkpoint present so `resolve_base_and_control`'s up-front precision/single-file/missing-
-    // control guards all pass) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL text encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn dispatch_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/qwen-control-dispatch".into(),
-        ))
-        .with_control(WeightsSource::Dir(
-            "/nonexistent/qwen-control-overlay".into(),
-        ))
-        .with_offload_policy(policy)
+    fn sealed_then_mutated_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let component = fixture.path().join("text_encoder");
+        let contract = crate::active_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&component, contract).unwrap();
+        let control = fixture.path().join("control.safetensors");
+        std::fs::write(&control, b"bounded control probe").unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_control(WeightsSource::File(control))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(component.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let text_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let heavy_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let text_probe = text_calls.clone();
-        let heavy_probe = heavy_calls.clone();
-        let residency = crate::model::residency_from_spec(
-            &dispatch_spec(OffloadPolicy::Sequential),
-            move || {
-                text_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-            move |_| {
-                heavy_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-        )
-        .unwrap();
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
         assert!(residency.is_sequential());
-        assert_eq!(text_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(heavy_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
     fn build_residency_resident_eagerly_invokes_the_text_loader() {
-        let text_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let text_probe = text_calls.clone();
-        let error = crate::model::residency_from_spec::<(), ()>(
-            &dispatch_spec(OffloadPolicy::Resident),
-            move || {
-                text_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(Error::Msg("bounded eager control text probe".into()))
-            },
-            |_| Ok(()),
-        )
-        .err()
-        .expect("Resident must eagerly invoke the text loader");
-        assert!(error
-            .to_string()
-            .contains("bounded eager control text probe"));
-        assert_eq!(text_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
+            .err()
+            .expect("Resident must eagerly invoke the production control text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

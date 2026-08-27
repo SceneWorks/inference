@@ -502,6 +502,7 @@ mod tests {
 
     #[test]
     fn build_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
         for policy in [
             mlx_gen::OffloadPolicy::Resident,
             mlx_gen::OffloadPolicy::Sequential,
@@ -509,16 +510,11 @@ mod tests {
             let (snapshot, spec) = incomplete_snapshot_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
-            let res = crate::model::build_residency_with_contract(
-                &spec,
-                MODEL_ID,
-                BASE_PRECISION_MSG,
-                BASE_FILE_MSG,
-                crate::bounded_encoder_contract(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer absent heavy components: {error}")
-            });
+            let (_tokenizer, res) =
+                crate::model::load_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
+                    .unwrap_or_else(|error| {
+                        panic!("{policy:?} must defer absent heavy components: {error}")
+                    });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

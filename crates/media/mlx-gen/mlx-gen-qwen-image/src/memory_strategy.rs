@@ -144,15 +144,15 @@ pub fn memory_strategy_contract(
             "qwen-image memory facts require a snapshot directory".to_owned(),
         ));
     };
-    let selected_text_encoder = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let language =
-        selected_text_encoder.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
+    let encoder_contract = crate::active_encoder_contract();
+    let selected_text_encoder = encoder_contract.source_for_load(spec, root)?;
+    let language = selected_text_encoder.materialized_language_tensor_headers(&encoder_contract)?;
     let vision = if provider_id == crate::model_edit::MODEL_ID {
-        let vision_source = crate::ENCODER_CONTRACT
+        let vision_source = encoder_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
         Some(vision_source.materialized_vision_tensor_headers(
-            &crate::VISION_ENCODER_CONTRACT,
-            &crate::ENCODER_CONTRACT,
+            &crate::active_vision_encoder_contract(),
+            &encoder_contract,
         )?)
     } else {
         None

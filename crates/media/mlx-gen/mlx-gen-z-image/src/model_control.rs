@@ -240,7 +240,7 @@ pub(crate) fn load_control_residency(
     } else {
         None
     };
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
         .quant
         .map(Quant::bits);
@@ -267,30 +267,7 @@ pub(crate) fn load_control_residency(
 
 /// Request-scoped builder shared by both Z-Image control variants. Construction touches no component
 /// weights. The pose branch carries no PiD overlay, so the seam's `use_pid` argument is unused.
-#[cfg(test)]
-pub(crate) fn build_control_residency_with_contract(
-    spec: &LoadSpec,
-    model_id: &'static str,
-    precision_msg: &'static str,
-    contract: gen_core::EncoderContract,
-) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
-    let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-    let text_encoder_source = contract.source_for_load(spec, root)?;
-    let effective_quant_bits = crate::memory_strategy::loaded_tier(spec, model_id)?
-        .quant
-        .map(Quant::bits);
-    let text_encoder_quant_bits =
-        text_encoder_source.load_time_quant_bits(effective_quant_bits, model_id)?;
-    build_control_residency_with_source(
-        spec,
-        model_id,
-        precision_msg,
-        text_encoder_source,
-        text_encoder_quant_bits,
-    )
-}
-
-pub(crate) fn build_control_residency_with_source(
+fn build_control_residency_with_source(
     spec: &LoadSpec,
     model_id: &'static str,
     precision_msg: &'static str,
@@ -707,20 +684,16 @@ mod tests {
 
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let (snapshot, spec) = incomplete_control_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
             assert!(!snapshot.path().join("control.safetensors").exists());
-            let res = build_control_residency_with_contract(
-                &spec,
-                MODEL_ID,
-                PRECISION_MSG,
-                crate::bounded_encoder_contract(),
-            )
-            .unwrap_or_else(|error| {
-                panic!("{policy:?} must defer absent heavy components: {error}")
-            });
+            let (_tokenizer, res) = load_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+                .unwrap_or_else(|error| {
+                    panic!("{policy:?} must defer absent heavy components: {error}")
+                });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

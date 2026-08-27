@@ -175,7 +175,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
     let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImageEdit {
@@ -203,10 +203,11 @@ fn build_residency_with_source(
     text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
     let root = resolve_root(spec)?;
-    let vision_encoder_source = crate::ENCODER_CONTRACT
+    let encoder_contract = crate::active_encoder_contract();
+    let vision_encoder_source = encoder_contract
         .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
     vision_encoder_source
-        .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)?;
+        .validate_vision(&crate::active_vision_encoder_contract(), &encoder_contract)?;
     let spec_heavy = spec.clone();
     crate::model::residency_from_spec(
         spec,
@@ -787,57 +788,48 @@ mod tests {
         assert_eq!(got.last().unwrap().width, 24);
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Edit's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the up-front
-    // precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL vision-language encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn dispatch_spec(policy: OffloadPolicy) -> LoadSpec {
-        LoadSpec::new(WeightsSource::Dir("/nonexistent/qwen-edit-dispatch".into()))
-            .with_offload_policy(policy)
+    fn sealed_then_mutated_language_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let contract = crate::active_encoder_contract();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            contract,
+            crate::active_vision_encoder_contract(),
+        )
+        .unwrap();
+        let alternate = fixture.path().join("alternate-language");
+        gen_core_testkit::write_encoder_contract_fixture(&alternate, contract).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_text_encoder(WeightsSource::Dir(alternate.clone()))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(alternate.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let text_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let heavy_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let text_probe = text_calls.clone();
-        let heavy_probe = heavy_calls.clone();
-        let residency = crate::model::residency_from_spec(
-            &dispatch_spec(OffloadPolicy::Sequential),
-            move || {
-                text_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-            move |_| {
-                heavy_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            },
-        )
-        .unwrap();
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) =
+            sealed_then_mutated_language_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
         assert!(residency.is_sequential());
-        assert_eq!(text_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(heavy_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
     fn build_residency_resident_eagerly_invokes_the_text_loader() {
-        let text_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let text_probe = text_calls.clone();
-        let error = crate::model::residency_from_spec::<(), ()>(
-            &dispatch_spec(OffloadPolicy::Resident),
-            move || {
-                text_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Err(Error::Msg("bounded eager edit text probe".into()))
-            },
-            |_| Ok(()),
-        )
-        .err()
-        .expect("Resident must eagerly invoke the text loader");
-        assert!(error.to_string().contains("bounded eager edit text probe"));
-        assert_eq!(text_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_language_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
+            .err()
+            .expect("Resident must eagerly invoke the production edit text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

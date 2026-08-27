@@ -132,6 +132,23 @@ pub const ENCODER_CONTRACT: mlx_gen::gen_core::EncoderContract =
         dense_storage_dtype_probe: None,
     };
 
+/// Encoder contract used by source admission and load-exact fact discovery. Production always
+/// returns [`ENCODER_CONTRACT`]; tests may install a thread-local bounded receipt while executing
+/// the unchanged production callback/wiring.
+pub(crate) fn active_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    #[cfg(test)]
+    if let Some(contract) = TEST_ENCODER_CONTRACT.get() {
+        return contract;
+    }
+    ENCODER_CONTRACT
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ENCODER_CONTRACT: std::cell::Cell<Option<mlx_gen::gen_core::EncoderContract>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Compact Qwen3 contract for tests that need the real validated-source and artifact-seal path.
 /// Production geometry and policy remain asserted separately; the bounded tensor dimensions keep
 /// unchanged-source tests from hashing the production encoder's multi-gigabyte logical payload.
@@ -149,6 +166,27 @@ pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
         max_position_embeddings: 512,
         selected_hidden_layers: &[1],
         ..ENCODER_CONTRACT
+    }
+}
+
+/// Scoped, thread-local bounded contract override for tests that must execute production source
+/// admission, registry callbacks, or residency builders. Nested guards restore their predecessor.
+#[cfg(test)]
+pub(crate) struct BoundedEncoderContractGuard {
+    previous: Option<mlx_gen::gen_core::EncoderContract>,
+}
+
+#[cfg(test)]
+impl Drop for BoundedEncoderContractGuard {
+    fn drop(&mut self) {
+        TEST_ENCODER_CONTRACT.set(self.previous);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_bounded_encoder_contract() -> BoundedEncoderContractGuard {
+    BoundedEncoderContractGuard {
+        previous: TEST_ENCODER_CONTRACT.replace(Some(bounded_encoder_contract())),
     }
 }
 
@@ -295,6 +333,32 @@ mod compile_glue_guard_tests {
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn bounded_snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = tmp.path().join("registry-memory");
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            super::bounded_encoder_contract(),
+        )
+        .unwrap();
+        root
+    }
+
     #[test]
     fn production_encoder_geometry_and_policy_are_exact() {
         let production = super::ENCODER_CONTRACT;
@@ -336,6 +400,30 @@ mod explicit_registry_tests {
     }
 
     #[test]
+    fn bounded_contract_override_is_thread_local_and_scoped() {
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            {
+                let _guard = super::scoped_bounded_encoder_contract();
+                worker_barrier.wait();
+                worker_barrier.wait();
+                assert_eq!(
+                    super::active_encoder_contract(),
+                    super::bounded_encoder_contract()
+                );
+            }
+            assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+        });
+        barrier.wait();
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+        barrier.wait();
+        worker.join().unwrap();
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+    }
+
+    #[test]
     fn explicit_catalog_has_stable_surface() {
         let registry = super::provider_registry().unwrap();
         let mut explicit_generators: Vec<String> = registry
@@ -368,12 +456,12 @@ mod explicit_registry_tests {
         let tmp = tempfile::tempdir().unwrap();
         use mlx_gen::gen_core::{LoadSpec, MemoryStrategy, MemoryStrategySupport, WeightsSource};
 
+        let _guard = super::scoped_bounded_encoder_contract();
         let registry = super::provider_registry().unwrap();
         // SC-15998: rung 4 is declared per load — a re-openable snapshot dir with deferred
         // materialization, independent from phase residency.
         // The registry must hand back the same contract the direct builder produces for that load.
-        let root = tmp.path().join("registry-memory");
-        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let root = bounded_snapshot(&tmp);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
         let ids = [
@@ -388,8 +476,10 @@ mod explicit_registry_tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(registered, ids.into_iter().collect());
         for id in ids {
-            let contract =
-                super::memory_strategy::weights_free_memory_strategy_contract(id, &spec).unwrap();
+            let contract = registry
+                .memory_strategy_contract(id, &spec)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must register a memory-strategy contract"));
             assert_eq!(contract.provider_id, id);
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
