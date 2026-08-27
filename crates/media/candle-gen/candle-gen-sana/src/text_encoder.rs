@@ -25,11 +25,9 @@
 //!
 //! ## Mask handling
 //! `_get_gemma_prompt_embeds` returns `(prompt_embeds, prompt_attention_mask)` and `encode_prompt`
-//! gathers the **same** `select_index` from both. But the SANA *transformer*
-//! ([`crate::transformer::SanaTransformer::forward`]) consumes only the `[1, 300, 2304]` embedding —
-//! its `attn2` cross-attention is plain full attention over all 300 caption tokens with **no** mask
-//! (same as PiD's inference net, which discards `emb_masks`). So the 300-token attention mask is
-//! exposed here for completeness/parity ([`SanaTextEncoder::token_ids`]) but is not fed to the trunk.
+//! gathers the **same** `select_index` from both. [`SanaTextEncoder::encode_with_mask`] preserves that
+//! paired `[1, 300, 2304]` / `[1, 300]` result for every Base and Sprint cross-attention route. This
+//! intentionally differs from PiD's inference net, which discards `emb_masks`.
 
 use std::path::Path;
 
@@ -106,5 +104,12 @@ impl SanaTextEncoder {
     /// [`crate::transformer::SanaTransformer::forward`]'s `caption` argument.
     pub fn encode(&self, caption: &str) -> Result<Tensor> {
         self.inner.encode(caption)
+    }
+
+    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. Both tensors
+    /// use the same released `select_index`; SANA's Base and Sprint transformer routes apply the mask
+    /// to cross-attention while PiD's mask-free consumer continues to use [`Self::encode`].
+    pub fn encode_with_mask(&self, caption: &str) -> Result<(Tensor, Tensor)> {
+        self.inner.encode_with_mask(caption)
     }
 }

@@ -598,7 +598,7 @@ trait SprintBatchPipeline {
 }
 
 impl SprintBatchPipeline for SanaSprintPipeline {
-    type Conditioning = candle_gen::candle_core::Tensor;
+    type Conditioning = crate::pipeline::SanaSprintConditioning;
     type PreparedReference = candle_gen::candle_core::Tensor;
 
     fn encode_batch(&self, prompt: &str) -> candle_gen::Result<Self::Conditioning> {
