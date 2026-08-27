@@ -2353,15 +2353,10 @@ impl NaDiffusionDecoder {
         out.contiguous()
     }
 
-    /// [`Self::decode`] / [`Self::decode_tiled`] with the stage-5 noise drawn from `seed` on CPU
-    /// (`candle_gen::seed`'s `StdRng` + `StandardNormal`, the crate's own reproducible draw) and
-    /// moved to the weights' device.
-    pub fn decode_seeded(
-        &self,
-        latent: &Tensor,
-        seed: u64,
-        tiling: Option<&DiffVaeTiling>,
-    ) -> Result<Tensor> {
+    /// Draw the full stage-5 noise canvas from `seed` on CPU (`candle_gen::seed`'s `StdRng` +
+    /// `StandardNormal`) and move it to the decoder's device.  Both explicit and budgeted decode
+    /// routes share this exact canvas so a tiled result remains comparable to its untiled peer.
+    fn seeded_noise(&self, latent: &Tensor, seed: u64) -> Result<Tensor> {
         use rand::rngs::StdRng;
         use rand::SeedableRng;
 
@@ -2378,7 +2373,17 @@ impl NaDiffusionDecoder {
         let n = shape.0 * shape.1 * shape.2 * shape.3 * shape.4;
         let mut rng = StdRng::seed_from_u64(seed);
         let values = candle_gen::seed::seeded_normal_vec(&mut rng, n);
-        let noise = Tensor::from_vec(values, shape, &self.device)?;
+        Tensor::from_vec(values, shape, &self.device)
+    }
+
+    /// [`Self::decode`] / [`Self::decode_tiled`] with the stage-5 noise drawn from `seed`.
+    pub fn decode_seeded(
+        &self,
+        latent: &Tensor,
+        seed: u64,
+        tiling: Option<&DiffVaeTiling>,
+    ) -> Result<Tensor> {
+        let noise = self.seeded_noise(latent, seed)?;
         match tiling {
             Some(t) => self.decode_tiled(latent, &noise, t),
             None => self.decode(latent, &noise),
@@ -2412,6 +2417,19 @@ impl NaDiffusionDecoder {
             Some(tiling) => self.decode_tiled(latent, noise, &tiling),
             None => self.decode(latent, noise),
         }
+    }
+
+    /// The ordinary-provider entry point for a reproducible memory-budgeted decode.  It preserves
+    /// [`Self::decode_seeded`]'s full-canvas noise identity while making the DiffVAE selector
+    /// load-bearing instead of accepting an unbounded seeded fallback.
+    pub fn decode_budgeted_seeded(
+        &self,
+        latent: &Tensor,
+        seed: u64,
+        mode: budget::DiffVaeMode,
+    ) -> Result<Tensor> {
+        let noise = self.seeded_noise(latent, seed)?;
+        self.decode_budgeted(latent, &noise, mode)
     }
 }
 

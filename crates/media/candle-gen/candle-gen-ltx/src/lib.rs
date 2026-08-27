@@ -95,7 +95,7 @@ use config::{
     TEXT_MAX_LENGTH,
 };
 use dev_sampler::{ExecutionPlan, TransformerVariant};
-use diff_vae::{NaDiffusionDecoder, NaDiffusionDecoderConfig};
+use diff_vae::{DiffVaeMode, NaDiffusionDecoder, NaDiffusionDecoderConfig};
 use duration_head::DurationHead;
 use gemma4_te::Ltx25TextEncoder;
 use quant_eval::{Ltx25GpuGeneration, Ltx25QuantAdmission, Ltx25QuantMode};
@@ -110,6 +110,10 @@ use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
+
+/// The supported DiffVAE execution recipe.  Its selector still chooses untiled versus tiled from
+/// the live budget; this is the upstream semantic mode the ordinary provider supplies to it.
+const DEFAULT_DIFFVAE_MODE: DiffVaeMode = DiffVaeMode::ChunkedEager;
 
 /// Public provider id for the split-component Gemma-4 LTX-2.5 distilled route.
 pub const MODEL_25_ID: &str = "ltx_2_5_distilled";
@@ -859,9 +863,11 @@ impl Pipeline {
         let output = dfr::generate_dfr_av_latents(&parts, &dfr_req, &req.cancel, on_progress)?;
         on_progress(Progress::Decoding);
         let decoded = match &comps.diffusion_decoder {
-            Some(decoder) => {
-                decoder.decode_seeded(&output.video_latent, seed.wrapping_add(4), None)?
-            }
+            Some(decoder) => decoder.decode_budgeted_seeded(
+                &output.video_latent,
+                seed.wrapping_add(4),
+                DEFAULT_DIFFVAE_MODE,
+            )?,
             None => comps.vae.decode_budgeted(&output.video_latent)?,
         };
         let images = pipeline::frames_to_images(&decoded)?;
@@ -1283,7 +1289,9 @@ impl Pipeline {
         let decoded = match &comps.diffusion_decoder {
             // The explicit `diffusion_video_vae` LoadSpec component is an alternate decoder, not a
             // second denoise route.  It consumes the same final normalized latent as the conv VAE.
-            Some(decoder) => decoder.decode_seeded(&vlat, seed.wrapping_add(4), None)?,
+            Some(decoder) => {
+                decoder.decode_budgeted_seeded(&vlat, seed.wrapping_add(4), DEFAULT_DIFFVAE_MODE)?
+            }
             None => match memory_strategy::selected_decode_cap(req)? {
                 Some((edge, overlap)) => comps
                     .vae
@@ -2225,6 +2233,30 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
 
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("lib.rs no longer defines `{name}`"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .expect("function has an opening brace");
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while slicing `{name}`")
+    }
+
     #[test]
     fn ltx25_ordinary_provider_validation_enforces_declared_geometry_and_closed_axes() {
         let generator = Ltx25Generator {
@@ -2356,6 +2388,29 @@ mod tests {
         assert!(renderer.contains("denoise_av_dev_conditioned("));
         assert!(renderer.contains("negative_context"));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
+    }
+
+    #[test]
+    fn ltx25_diffvae_provider_paths_execute_the_budgeted_seeded_decoder() {
+        // The normal render and DFR render are distinct ordinary request paths.  Assert their exact
+        // bodies so deleting the budgeted call, replacing it with `decode_seeded(..., None)`, or
+        // changing its mode leaves a concrete production seam red rather than only a planner test.
+        let source = include_str!("lib.rs");
+        for name in ["render_dfr", "render"] {
+            let body = function_body(source, name);
+            assert!(
+                body.contains("decoder.decode_budgeted_seeded("),
+                "{name} bypasses the DiffVAE budgeted decode:\n{body}"
+            );
+            assert!(
+                body.contains("DEFAULT_DIFFVAE_MODE"),
+                "{name} no longer passes the declared DiffVAE mode:\n{body}"
+            );
+            assert!(
+                !body.contains("decoder.decode_seeded("),
+                "{name} retained an unbounded DiffVAE seeded decode:\n{body}"
+            );
+        }
     }
 
     #[test]
