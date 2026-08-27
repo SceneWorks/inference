@@ -84,8 +84,12 @@ pub fn precompute_connector_freqs(
     } else {
         1.0 / (num_indices - 1) as f64
     };
-    let indices: Vec<f64> = (0..num_indices)
-        .map(|i| theta.powf(i as f64 * step) * (PI / 2.0))
+    // f64 exponentials rounded to f32 BEFORE the position multiply — exactly upstream ltx_core's
+    // `generate_freq_grid_np` (its "double precision" covers only the log-spaced grid; the angles
+    // are formed in f32). Keeping f64 through cos/sin perturbs the top frequencies by ~1e-3 rad,
+    // which the connector's 2·sigmoid gates amplify coherently (sc-21663; mirrors the mlx port).
+    let indices: Vec<f32> = (0..num_indices)
+        .map(|i| (theta.powf(i as f64 * step) * (PI / 2.0)) as f32)
         .collect();
     let current = num_indices * n_pos_dims;
     let expected = dim / 2;
@@ -97,7 +101,7 @@ pub fn precompute_connector_freqs(
     let mut sin_out = vec![0f32; total];
     for t in 0..seq {
         // position = raw index t, scaled by max_pos, *2-1 (mlx connector `rope`).
-        let scaled = t as f64 / max_pos as f64 * 2.0 - 1.0;
+        let scaled = (t as f64 / max_pos as f64 * 2.0 - 1.0) as f32;
         for h in 0..num_heads {
             for p in 0..head_half {
                 let flat = h * head_half + p;
@@ -107,7 +111,7 @@ pub fn precompute_connector_freqs(
                     let k = flat - pad_size;
                     let i = k / n_pos_dims;
                     let ang = scaled * indices[i];
-                    (ang.cos() as f32, ang.sin() as f32)
+                    (ang.cos(), ang.sin())
                 };
                 let o = (h * seq + t) * head_half + p;
                 cos_out[o] = c;

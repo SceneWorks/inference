@@ -1,9 +1,28 @@
-//! S1 connector parity vs the reference `Embeddings1DConnector` (sc-2679 S1).
+//! S1 connector parity vs the reference `Embeddings1DConnector` (sc-2679 S1; re-derived sc-21663).
 //!
-//! `#[ignore]`d: needs the real eros `connector.safetensors` (~6.3 GB). The committed golden
+//! `#[ignore]`d: needs the real 2.3 `connector.safetensors` (~6.3 GB; the `SceneWorks/ltx-2.3-mlx`
+//! bf16 tier carries the identical tensors). The committed golden
 //! (`tests/fixtures/ltx_connector_golden.safetensors`, from `tools/dump_ltx_connector_golden.py`)
-//! holds the reference f32 input/mask/output; this test loads the SAME connector weights and
-//! checks the Rust `Connector` reproduces the video embeddings.
+//! holds the reference f32 input/mask/output — **ltx_core semantics** (`2·sigmoid` gate,
+//! tanh-GELU, f32-quantized RoPE indices) since sc-21663; this test loads the SAME connector
+//! weights and checks the Rust `Connector` reproduces the video/audio embeddings.
+//!
+//! # Bars (sc-21663)
+//!
+//! The correct `2·sigmoid` gates make the 8-layer stack expansive (~2x/layer), so per-op
+//! implementation differences between the port and any oracle are amplified coherently at the
+//! output. Measured floors on these weights+inputs against the same-framework (patched-MLX)
+//! oracle, all f32:
+//!
+//! * video: `2.76e-3` global — the historical `5e-3` bar still holds.
+//! * audio: `1.64e-2` over the valid rows, `8.09e-2` over the register rows / globally. The audio
+//!   stack amplifies far harder (even the oracle's own f64-vs-f32-quantized rope tables alone move
+//!   its output by `1.2e-2`, and stock-torch-vs-patched-MLX sits at `6.4e-2`), so a `5e-3` audio
+//!   bar is unattainable for ANY cross-implementation comparison under the correct semantics —
+//!   the old bar passed only because the σ-gated (bugged) stack was contractive. The audio
+//!   assertions are therefore split: valid rows at `3e-2` (the conditioning that reaches the DiT
+//!   from real tokens), global at `1.2e-1` (register rows — model constants, no prompt
+//!   information, maximally amplified).
 //!
 //! Run: `LTX_EROS_DIR=… cargo test -p mlx-gen-ltx --test integration connector_parity:: -- --ignored --nocapture`
 
@@ -33,6 +52,15 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
     let diff = abs(subtract(got, want).unwrap()).unwrap();
     let denom = max(abs(want).unwrap(), None).unwrap().item::<f32>();
     max(&diff, None).unwrap().item::<f32>() / denom.max(1e-12)
+}
+
+/// [`peak_rel`] over token rows `[lo, hi)`, denominator taken over the same slice — so the audio
+/// valid-row bar cannot hide behind (or be drowned by) the register rows (see the module docs).
+fn peak_rel_rows(got: &Array, want: &Array, lo: i32, hi: i32) -> f32 {
+    let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
+    let g = got.take_axis(idx.clone(), 1).expect("slice got");
+    let w = want.take_axis(idx, 1).expect("slice want");
+    peak_rel(&g, &w)
 }
 
 #[test]
@@ -93,7 +121,16 @@ fn audio_connector_matches_reference() {
 
     let got = conn.forward(features, mask01).expect("forward");
     assert_eq!(got.shape(), want.shape());
+    // The connector reorders its input, so the valid rows are the PREFIX (`0..nv`).
+    let nv = mlx_rs::ops::sum(mask01, None).unwrap().item::<i32>();
     let pr = peak_rel(&got, want);
-    eprintln!("audio connector peak_rel = {pr:.3e}");
-    assert!(pr < 5e-3, "audio connector peak_rel {pr:.3e} too high");
+    let pr_valid = peak_rel_rows(&got, want, 0, nv);
+    eprintln!("audio connector peak_rel = {pr:.3e} (valid rows {pr_valid:.3e})");
+    // Split bars — measured cross-implementation floors of the expansive gated audio stack; see
+    // the module docs for the derivation (valid floor 1.64e-2, register/global floor 8.09e-2).
+    assert!(
+        pr_valid < 3e-2,
+        "audio connector valid-row peak_rel {pr_valid:.3e} too high"
+    );
+    assert!(pr < 1.2e-1, "audio connector peak_rel {pr:.3e} too high");
 }
