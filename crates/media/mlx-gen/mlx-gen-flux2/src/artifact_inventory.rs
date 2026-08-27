@@ -343,8 +343,10 @@ fn pinned_entry(source: PathBuf) -> CoreResult<Entry> {
     })
 }
 
-fn validate_dense_headers(path: &Path, component: &str) -> CoreResult<()> {
-    let headers = safetensors_path_tensor_headers(path)?;
+fn validate_dense_tensor_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    component: &str,
+) -> CoreResult<()> {
     if headers.is_empty()
         || headers.iter().any(|header| {
             header.dtype == Dtype::U32
@@ -390,10 +392,13 @@ fn validate_exact_tensor_names(
     )))
 }
 
-fn validate_vae_headers(path: &Path) -> CoreResult<()> {
-    validate_dense_headers(path, "vae")?;
-    let observed = safetensors_path_tensor_headers(path)?
-        .into_iter()
+fn validate_vae_tensor_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+) -> CoreResult<()> {
+    validate_dense_tensor_headers(headers, "vae")?;
+    let observed = headers
+        .iter()
+        .cloned()
         .map(|header| (header.name.clone(), header))
         .collect::<BTreeMap<_, _>>();
     let required = klein_required_vae_weights();
@@ -426,6 +431,10 @@ fn validate_vae_headers(path: &Path) -> CoreResult<()> {
         validate_exact_shape("VAE", header, &shape)?;
     }
     Ok(())
+}
+
+fn validate_vae_headers(path: &Path) -> CoreResult<()> {
+    validate_vae_tensor_headers(&safetensors_path_tensor_headers(path)?)
 }
 
 fn klein_required_vae_weights() -> BTreeMap<String, Vec<usize>> {
@@ -593,8 +602,10 @@ fn klein_required_vae_weights() -> BTreeMap<String, Vec<usize>> {
     required
 }
 
-fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
-    let headers = safetensors_path_tensor_headers(path)?;
+fn validate_transformer_tensor_headers(
+    headers: &[mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader],
+    quant: Option<Quant>,
+) -> CoreResult<()> {
     if headers.is_empty() {
         return Err(CoreError::Unsupported(
             "flux2 Klein transformer inventory is empty".to_owned(),
@@ -620,7 +631,7 @@ fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult
     }
     match quant {
         None => {
-            validate_dense_headers(path, "transformer")?;
+            validate_dense_tensor_headers(headers, "transformer")?;
             validate_exact_tensor_names(
                 "dense transformer",
                 by_name.keys().map(|name| (*name).to_owned()),
@@ -661,7 +672,7 @@ fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult
                 expected,
             )?;
             let mut packed = 0_usize;
-            for header in &headers {
+            for header in headers {
                 if let Some(base) = header.name.strip_suffix(".weight") {
                     if header.dtype == Dtype::U32 {
                         let scales = format!("{base}.scales");
@@ -743,6 +754,10 @@ fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult
             "flux2 Klein MLX does not support an NVFP4 artifact tier".to_owned(),
         )),
     }
+}
+
+fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
+    validate_transformer_tensor_headers(&safetensors_path_tensor_headers(path)?, quant)
 }
 
 fn klein_required_transformer_weights(
@@ -946,6 +961,26 @@ impl KleinArtifactInventory {
         tier: Option<Quant>,
         spec: &LoadSpec,
     ) -> CoreResult<Self> {
+        Self::verify_turnkey_with_contracts(
+            root,
+            family,
+            tier,
+            spec,
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            validate_transformer_headers,
+            validate_vae_headers,
+        )
+    }
+
+    fn verify_turnkey_with_contracts(
+        root: PathBuf,
+        family: TurnkeyFamily,
+        tier: Option<Quant>,
+        spec: &LoadSpec,
+        encoder_contract: mlx_gen::gen_core::EncoderContract,
+        validate_transformer: impl Fn(&Path, Option<Quant>) -> CoreResult<()>,
+        validate_vae: impl Fn(&Path) -> CoreResult<()>,
+    ) -> CoreResult<Self> {
         if spec.precision != mlx_gen::Precision::Bf16 || spec.quantize.is_some() {
             return Err(CoreError::Unsupported(
                 "flux2 Klein turnkey tiers require BF16 execution with LoadSpec.quantize=None"
@@ -987,7 +1022,7 @@ impl KleinArtifactInventory {
             }
         }
 
-        crate::config::KLEIN_ENCODER_CONTRACT
+        encoder_contract
             .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))?;
 
         let tokenizer = root.join("tokenizer/tokenizer.json");
@@ -1002,8 +1037,8 @@ impl KleinArtifactInventory {
             let directory = root.join(component);
             let (weights, membership) = single_safetensors(&directory)?;
             match component {
-                "transformer" => validate_transformer_headers(&weights, tier)?,
-                "vae" => validate_vae_headers(&weights)?,
+                "transformer" => validate_transformer(&weights, tier)?,
+                "vae" => validate_vae(&weights)?,
                 "text_encoder" => {}
                 _ => unreachable!("turnkey component list is exhaustive"),
             }
@@ -1244,13 +1279,44 @@ mod tests {
             encoded.push(b' ');
         }
         let mut file = std::fs::File::create(path).unwrap();
-        // The tensor inventory deliberately carries production geometry. Keep the logical extent
-        // exact without allocating it on Windows, matching gen-core-testkit's contract fixtures.
-        gen_core_testkit::mark_sparse(path);
         file.write_all(&(encoded.len() as u64).to_le_bytes())
             .unwrap();
         file.write_all(&encoded).unwrap();
         file.set_len(8 + encoded.len() as u64 + offset).unwrap();
+    }
+
+    fn tensor_headers(
+        tensors: Vec<(String, &'static str, Vec<usize>)>,
+    ) -> Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader> {
+        tensors
+            .into_iter()
+            .map(|(name, dtype, shape)| {
+                let dtype = match dtype {
+                    "U32" => Dtype::U32,
+                    "BF16" => Dtype::BF16,
+                    "I64" => Dtype::I64,
+                    _ => unreachable!("fixture dtypes are exhaustive"),
+                };
+                let width = match dtype {
+                    Dtype::U32 => 4_u64,
+                    Dtype::BF16 => 2_u64,
+                    Dtype::I64 => 8_u64,
+                    _ => unreachable!("fixture dtypes are exhaustive"),
+                };
+                let data_bytes = shape
+                    .iter()
+                    .try_fold(width, |bytes, dimension| {
+                        bytes.checked_mul(*dimension as u64)
+                    })
+                    .expect("fixture tensor extent");
+                mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader {
+                    name,
+                    dtype,
+                    shape,
+                    data_bytes,
+                }
+            })
+            .collect()
     }
 
     fn write_safetensors(path: &Path, packed: bool) {
@@ -1294,8 +1360,25 @@ mod tests {
         tensors
     }
 
+    fn bounded_transformer_tensors(
+        quant: Option<Quant>,
+    ) -> Vec<(String, &'static str, Vec<usize>)> {
+        match quant {
+            None => vec![("block.weight".to_owned(), "BF16", vec![8, 8])],
+            Some(Quant::Q4 | Quant::Q8) => {
+                let bits = quant.expect("packed tier").bits() as usize;
+                vec![
+                    ("block.weight".to_owned(), "U32", vec![8, 8 * bits / 32]),
+                    ("block.scales".to_owned(), "BF16", vec![8, 1]),
+                    ("block.biases".to_owned(), "BF16", vec![8, 1]),
+                ]
+            }
+            Some(Quant::Nvfp4) => unreachable!(),
+        }
+    }
+
     fn write_transformer_safetensors(path: &Path, quant: Option<Quant>) {
-        write_tensor_file(path, transformer_tensors(quant));
+        write_tensor_file(path, bounded_transformer_tensors(quant));
     }
 
     fn vae_tensors() -> Vec<(String, &'static str, Vec<usize>)> {
@@ -1307,8 +1390,33 @@ mod tests {
         tensors
     }
 
+    fn bounded_vae_tensors() -> Vec<(String, &'static str, Vec<usize>)> {
+        vec![("probe".to_owned(), "BF16", vec![1])]
+    }
+
     fn write_vae_safetensors(path: &Path) {
-        write_tensor_file(path, vae_tensors());
+        write_tensor_file(path, bounded_vae_tensors());
+    }
+
+    fn validate_bounded_transformer(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
+        let headers = safetensors_path_tensor_headers(path)?;
+        let expected = tensor_headers(bounded_transformer_tensors(quant));
+        if headers != expected {
+            return Err(CoreError::Unsupported(
+                "bounded transformer inventory is not exact".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_bounded_vae(path: &Path) -> CoreResult<()> {
+        let headers = safetensors_path_tensor_headers(path)?;
+        if headers != tensor_headers(bounded_vae_tensors()) {
+            return Err(CoreError::Unsupported(
+                "bounded VAE inventory is not exact".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn turnkey_fixture(family: TurnkeyFamily, tier: Option<Quant>) -> tempfile::TempDir {
@@ -1334,7 +1442,7 @@ mod tests {
         }
         gen_core_testkit::write_encoder_contract_fixture(
             &root.join("text_encoder"),
-            crate::config::KLEIN_ENCODER_CONTRACT,
+            crate::config::bounded_klein_encoder_contract(),
         )
         .unwrap();
         std::fs::write(root.join("vae/config.json"), "{}").unwrap();
@@ -1374,6 +1482,23 @@ mod tests {
             })
     }
 
+    fn verify_bounded_turnkey(
+        root: PathBuf,
+        family: TurnkeyFamily,
+        tier: Option<Quant>,
+        spec: &LoadSpec,
+    ) -> CoreResult<KleinArtifactInventory> {
+        KleinArtifactInventory::verify_turnkey_with_contracts(
+            root,
+            family,
+            tier,
+            spec,
+            crate::config::bounded_klein_encoder_contract(),
+            validate_bounded_transformer,
+            validate_bounded_vae,
+        )
+    }
+
     struct ImmutableTurnkeyFixture {
         _tmp: tempfile::TempDir,
         root: PathBuf,
@@ -1407,12 +1532,14 @@ mod tests {
                 TurnkeyFamily::Base => crate::FLUX2_KLEIN_9B_ID,
                 TurnkeyFamily::Kv => crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
             };
-            let inventory = KleinArtifactInventory::verify_for_provider(
-                provider_id,
+            let inventory = verify_bounded_turnkey(
+                root.clone(),
+                family,
+                tier,
                 &LoadSpec::new(WeightsSource::Dir(root.clone())),
             )
-            .unwrap()
-            .expect("exact immutable turnkey inventory");
+            .unwrap();
+            inventory.validate_provider(provider_id).unwrap();
             ImmutableTurnkeyFixture {
                 _tmp: tmp,
                 root,
@@ -1423,6 +1550,12 @@ mod tests {
 
     #[test]
     fn turnkey_inventory_binds_family_tier_provider_and_production_quantize_none() {
+        for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            validate_transformer_tensor_headers(&tensor_headers(transformer_tensors(tier)), tier)
+                .unwrap();
+        }
+        validate_vae_tensor_headers(&tensor_headers(vae_tensors())).unwrap();
+
         for family in [TurnkeyFamily::Base, TurnkeyFamily::Kv] {
             for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
                 let fixture = immutable_turnkey_fixture(family, tier);
@@ -1466,8 +1599,10 @@ mod tests {
                     TurnkeyFamily::Kv => crate::FLUX2_KLEIN_9B_EDIT_ID,
                 };
                 assert!(fixture.inventory.validate_provider(refused).is_err());
-                assert!(KleinArtifactInventory::verify_for_provider(
-                    crate::FLUX2_KLEIN_9B_ID,
+                assert!(verify_bounded_turnkey(
+                    fixture.root.clone(),
+                    family,
+                    tier,
                     &spec.clone().with_quant(Quant::Q4),
                 )
                 .is_err());
@@ -1505,7 +1640,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec,).is_err()
+            verify_bounded_turnkey(root, TurnkeyFamily::Base, Some(Quant::Q4), &spec,).is_err()
         );
 
         let tmp = turnkey_fixture(TurnkeyFamily::Kv, Some(Quant::Q8));
@@ -1515,11 +1650,8 @@ mod tests {
             r#"{"quantization":{"bits":8,"group_size":32}}"#,
         )
         .unwrap();
-        assert!(KleinArtifactInventory::verify_for_provider(
-            crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
-            &LoadSpec::new(WeightsSource::Dir(root)),
-        )
-        .is_err());
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert!(verify_bounded_turnkey(root, TurnkeyFamily::Kv, Some(Quant::Q8), &spec,).is_err());
 
         for malformed in [
             r#"{"quantization":{}}"#,
@@ -1529,38 +1661,32 @@ mod tests {
             let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
             let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
             std::fs::write(root.join("transformer/config.json"), malformed).unwrap();
-            assert!(KleinArtifactInventory::verify_for_provider(
-                crate::FLUX2_KLEIN_9B_ID,
-                &LoadSpec::new(WeightsSource::Dir(root)),
-            )
-            .is_err());
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            assert!(
+                verify_bounded_turnkey(root, TurnkeyFamily::Base, Some(Quant::Q4), &spec,).is_err()
+            );
         }
     }
 
     #[test]
     fn turnkey_inventory_rejects_transformer_vae_and_encoder_shape_mutations() {
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
         let mut transformer = transformer_tensors(Some(Quant::Q4));
         transformer
             .iter_mut()
             .find(|(name, _, _)| name == "transformer_blocks.0.attn.to_q.weight")
             .unwrap()
             .2[0] = 1;
-        let transformer_file = root.join("transformer/model.safetensors");
-        write_tensor_file(&transformer_file, transformer);
-        assert!(validate_transformer_headers(&transformer_file, Some(Quant::Q4)).is_err());
+        assert!(
+            validate_transformer_tensor_headers(&tensor_headers(transformer), Some(Quant::Q4),)
+                .is_err()
+        );
 
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
         let mut vae = vae_tensors();
         vae.iter_mut()
             .find(|(name, _, _)| name == "decoder.conv_out.weight")
             .unwrap()
             .2[1] = 1;
-        let vae_file = root.join("vae/model.safetensors");
-        write_tensor_file(&vae_file, vae);
-        assert!(validate_vae_headers(&vae_file).is_err());
+        assert!(validate_vae_tensor_headers(&tensor_headers(vae)).is_err());
 
         let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
@@ -1570,8 +1696,6 @@ mod tests {
             .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))
             .is_err());
 
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
         let mut transformer = transformer_tensors(Some(Quant::Q8));
         for suffix in ["weight", "scales", "biases"] {
             transformer.push((
@@ -1584,12 +1708,11 @@ mod tests {
                 },
             ));
         }
-        let transformer_file = root.join("transformer/model.safetensors");
-        write_tensor_file(&transformer_file, transformer);
-        assert!(validate_transformer_headers(&transformer_file, Some(Quant::Q8)).is_err());
+        assert!(
+            validate_transformer_tensor_headers(&tensor_headers(transformer), Some(Quant::Q8),)
+                .is_err()
+        );
 
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
         let mut vae = vae_tensors();
         vae.push((
             "encoder.down_blocks.0.resnets.0.conv_shortcut.weight".to_owned(),
@@ -1601,12 +1724,8 @@ mod tests {
             "BF16",
             vec![128],
         ));
-        let vae_file = root.join("vae/model.safetensors");
-        write_tensor_file(&vae_file, vae);
-        assert!(validate_vae_headers(&vae_file).is_err());
+        assert!(validate_vae_tensor_headers(&tensor_headers(vae)).is_err());
 
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
         let mut vae = vae_tensors();
         let counter = vae
             .iter_mut()
@@ -1614,9 +1733,7 @@ mod tests {
             .unwrap();
         counter.1 = "BF16";
         counter.2 = vec![1];
-        let vae_file = root.join("vae/model.safetensors");
-        write_tensor_file(&vae_file, vae);
-        assert!(validate_vae_headers(&vae_file).is_err());
+        assert!(validate_vae_tensor_headers(&tensor_headers(vae)).is_err());
     }
 
     #[test]
@@ -1649,8 +1766,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(fixture.inventory.resolved_quant(), tier);
                 assert!(crate::memory_strategy::klein_streamable(&spec));
-                // The sealed inventory above owns artifact admission. Exercise the same contract
-                // builder without resealing its production-logical-size encoder a second time.
+                // The bounded sealed inventory above owns source/identity admission. Exercise the
+                // same production contract builder without resealing the fixture a second time.
                 let contract =
                     crate::memory_strategy::weights_free_klein_contract(provider_id, &spec)
                         .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
