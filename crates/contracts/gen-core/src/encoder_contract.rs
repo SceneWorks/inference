@@ -8,6 +8,7 @@
 //! rather than a late matmul-shape failure (or, worse, a plausible render with the wrong conditioning).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -18,6 +19,12 @@ use crate::{
     safetensors_path_tensor_headers, Error, PinnedWeightsFile, Result, SafetensorsTensorHeader,
     VisionEncoderContract, WeightsSource,
 };
+
+/// Selected-encoder behavior configs are metadata, not model payloads. Both bounded discovery and
+/// executable validation apply this same limit so a candidate cannot pass one admission seam and
+/// fail the other. Executable validation still seals the complete accepted config and every weights
+/// shard through [`PinnedEncoderSource`].
+const MAX_SELECTED_ENCODER_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The architecture and output shape a generator requires from its text encoder.
 ///
@@ -219,6 +226,48 @@ pub struct ValidatedEncoderSource {
     packed_quant_bits: Option<i32>,
     pinned: PinnedEncoderSource,
     tokenizer: Option<ValidatedTokenizerSource>,
+}
+
+/// Non-authorizing compatibility facts captured from bounded config/header inspection.
+///
+/// These values are suitable for catalog and memory projection only. They contain no paths, pins,
+/// or artifact receipt and therefore cannot be used to open or materialize a source. Executable
+/// preparation must still acquire a [`ValidatedEncoderSource`] and retain its complete seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncoderDiscoveryFacts {
+    materialized_language_tensor_headers: Vec<SafetensorsTensorHeader>,
+    source_bytes: u64,
+}
+
+impl EncoderDiscoveryFacts {
+    /// Exact language tensor surface consumed by the validated contract, excluding unused tails
+    /// and unrelated tensors in a shared multimodal checkpoint.
+    pub fn materialized_language_tensor_headers(&self) -> &[SafetensorsTensorHeader] {
+        &self.materialized_language_tensor_headers
+    }
+
+    /// Current direct-shard bytes for the source inventory inspected by discovery.
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+}
+
+/// Non-authorizing direct-shard metadata for source classification and weights-free fallback
+/// pricing. Unlike [`EncoderDiscoveryFacts`], this inventory has not asserted an architecture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEncoderDiscoveryInventory {
+    tensor_headers: Vec<SafetensorsTensorHeader>,
+    source_bytes: u64,
+}
+
+impl TextEncoderDiscoveryInventory {
+    pub fn tensor_headers(&self) -> &[SafetensorsTensorHeader] {
+        &self.tensor_headers
+    }
+
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
 }
 
 /// Exact selected-encoder source shape and direct-shard inventory exported onto a prepared
@@ -689,21 +738,11 @@ impl PinnedEncoderSource {
     }
 
     fn headers(&self) -> Result<Vec<SafetensorsTensorHeader>> {
-        let mut headers = BTreeMap::new();
-        for pin in &self.shard_pins {
-            for header in pin.read_unchanged(|path| safetensors_path_tensor_headers(path))? {
-                if headers
-                    .insert(header.name.clone(), header.clone())
-                    .is_some()
-                {
-                    return Err(Error::Unsupported(format!(
-                        "text encoder source contains duplicate tensor key {:?} across direct shards; selected encoders must be accepted identically by the strict MLX and Candle loaders",
-                        header.name
-                    )));
-                }
-            }
-        }
-        Ok(headers.into_values().collect())
+        collect_unique_encoder_headers(
+            self.shard_pins
+                .iter()
+                .map(|pin| pin.read_unchanged(|path| safetensors_path_tensor_headers(path))),
+        )
     }
 
     fn direct_shard_bytes(&self) -> Result<u64> {
@@ -734,6 +773,26 @@ impl PinnedEncoderSource {
         self.ensure_unchanged()?;
         Ok(result)
     }
+}
+
+fn collect_unique_encoder_headers(
+    inventories: impl IntoIterator<Item = Result<Vec<SafetensorsTensorHeader>>>,
+) -> Result<Vec<SafetensorsTensorHeader>> {
+    let mut headers = BTreeMap::new();
+    for inventory in inventories {
+        for header in inventory? {
+            if headers
+                .insert(header.name.clone(), header.clone())
+                .is_some()
+            {
+                return Err(Error::Unsupported(format!(
+                    "text encoder source contains duplicate tensor key {:?} across direct shards; selected encoders must be accepted identically by the strict MLX and Candle loaders",
+                    header.name
+                )));
+            }
+        }
+    }
+    Ok(headers.into_values().collect())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -900,6 +959,21 @@ pub fn text_encoder_source_tensor_headers(
     let headers = pinned.headers()?;
     pinned.ensure_unchanged()?;
     Ok(headers)
+}
+
+/// Inspect one encoder source's direct shards for catalog classification or weights-free pricing
+/// without acquiring an executable artifact seal. The returned inventory is non-authorizing and
+/// has not asserted a particular [`EncoderContract`]; callers that have behavior config must prefer
+/// [`EncoderContract::validate_source_for_discovery`].
+pub fn text_encoder_source_inventory_for_discovery(
+    source: &WeightsSource,
+    allowed_roots: &[PathBuf],
+) -> Result<TextEncoderDiscoveryInventory> {
+    let inspected = inspect_encoder_source_for_discovery(source, allowed_roots, false)?;
+    Ok(TextEncoderDiscoveryInventory {
+        tensor_headers: inspected.headers,
+        source_bytes: inspected.source_bytes,
+    })
 }
 
 impl EncoderContract {
@@ -1180,6 +1254,95 @@ impl EncoderContract {
         Ok(validated)
     }
 
+    /// Validate one catalog/discovery candidate without acquiring a reusable source receipt.
+    ///
+    /// This path is intentionally limited to direct-file inventory, bounded behavior config, and
+    /// safetensors headers. It never acquires an [`crate::ArtifactSeal`] or reads tensor payloads.
+    /// Every lexical loader entry and its current canonical target must remain under one of
+    /// `allowed_roots`; callers cannot use discovery as an authorization bypass. The result is only
+    /// compatibility information for the current call. Executable load/worker preparation must use
+    /// [`Self::validate_source_against_base`] (or [`Self::source_for_load`]) to acquire the complete
+    /// retained seal.
+    pub fn validate_source_for_discovery(
+        &self,
+        source: &WeightsSource,
+        allowed_roots: &[PathBuf],
+    ) -> Result<EncoderDiscoveryFacts> {
+        self.validate_source_for_discovery_with_policy(
+            source,
+            allowed_roots,
+            EncoderDtypePolicy::Native,
+            EncoderConfigPolicy::Required,
+        )
+    }
+
+    /// Bounded discovery counterpart to [`Self::validate_comfyui_source`]. Only a direct File is
+    /// accepted, and the same provider-owned-config and FP8 normalization policy is applied without
+    /// acquiring an executable artifact receipt.
+    pub fn validate_comfyui_source_for_discovery(
+        &self,
+        source: &WeightsSource,
+        allowed_roots: &[PathBuf],
+    ) -> Result<EncoderDiscoveryFacts> {
+        if !matches!(source, WeightsSource::File(_)) {
+            return Err(Error::Unsupported(
+                "ComfyUI text encoder validation requires one File source".into(),
+            ));
+        }
+        self.validate_source_for_discovery_with_policy(
+            source,
+            allowed_roots,
+            EncoderDtypePolicy::ComfyUiFp8,
+            EncoderConfigPolicy::ProviderOwnedComfyUi,
+        )
+    }
+
+    fn validate_source_for_discovery_with_policy(
+        &self,
+        source: &WeightsSource,
+        allowed_roots: &[PathBuf],
+        dtype_policy: EncoderDtypePolicy,
+        config_policy: EncoderConfigPolicy,
+    ) -> Result<EncoderDiscoveryFacts> {
+        self.validate_definition()?;
+        let inspected = inspect_encoder_source_for_discovery(
+            source,
+            allowed_roots,
+            config_policy == EncoderConfigPolicy::Required,
+        )?;
+        let packed_quant = self.validate_inspected_source(
+            source,
+            &inspected.weights,
+            inspected
+                .config_path
+                .as_deref()
+                .zip(inspected.config.as_ref()),
+            &inspected.headers,
+            dtype_policy,
+            config_policy,
+        )?;
+        let packing = packed_quant
+            .map(|_| {
+                self.packing.ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "validated packed encoder has no packing contract for architecture {}",
+                        self.architecture
+                    ))
+                })
+            })
+            .transpose()?;
+        let expected = self.materialized_language_tensor_names(packing)?;
+        let materialized_language_tensor_headers = inspected
+            .headers
+            .into_iter()
+            .filter(|header| expected.contains(&header.name))
+            .collect();
+        Ok(EncoderDiscoveryFacts {
+            materialized_language_tensor_headers,
+            source_bytes: inspected.source_bytes,
+        })
+    }
+
     /// Resolve and validate the effective text-encoder component for metadata-only planning.
     /// Unlike [`Self::source_for_load`], this deliberately does not require or retain a tokenizer:
     /// memory admission prices tensor materialization, while the executable load remains the seam
@@ -1308,56 +1471,32 @@ impl EncoderContract {
             WeightsSource::Dir(path) => Some(path.join("config.json")),
         });
         let pinned = PinnedEncoderSource::pin(&weights, config_candidate)?;
-        let declared_quant = if let Some(config_path) = &config_path {
+        let config = if let Some(config_path) = &config_path {
             let config_pin = pinned.config_pin.as_ref().ok_or_else(|| {
                 Error::Unsupported(format!(
                     "text encoder config disappeared during validation: {}",
                     config_path.display()
                 ))
             })?;
-            let text = config_pin.read_unchanged(|path| {
-                std::fs::read_to_string(path).map_err(|error| {
-                    Error::Msg(format!(
-                        "text encoder contract: read {}: {error}",
-                        path.display()
-                    ))
-                })
-            })?;
-            let config: Value = serde_json::from_str(&text).map_err(|error| {
-                Error::Msg(format!(
-                    "text encoder contract: parse {}: {error}",
-                    config_path.display()
-                ))
-            })?;
-            self.validate_config(&config, config_path)?;
-            parse_packed_quantization(&config, config_path)?
-        } else if config_policy == EncoderConfigPolicy::Required {
-            return Err(Error::Msg(format!(
-                "text encoder substitution has no config.json (source {}); exact behavior, tokenizer, head-topology, and precision compatibility cannot be proven from tensor shapes alone",
-                source_path(source).display()
-            )));
+            let config = config_pin.read_unchanged(read_selected_encoder_config)?;
+            Some(config)
         } else {
             None
         };
-
         let headers = pinned.headers().map_err(|error| {
             Error::Msg(format!(
                 "text encoder contract: inspect {}: {error}",
                 source_path(&weights).display()
             ))
         })?;
-        let language_headers = language_quantization_evidence_headers(&headers);
-        let packed_quant = validate_quantization_evidence(
-            &language_headers,
-            source_path(&weights),
-            declared_quant,
+        let packed_quant = self.validate_inspected_source(
+            source,
+            &weights,
+            config_path.as_deref().zip(config.as_ref()),
+            &headers,
+            dtype_policy,
+            config_policy,
         )?;
-        self.validate_packing_config(
-            source_path(&weights),
-            packed_quant,
-            matches!(weights, WeightsSource::File(_)),
-        )?;
-        self.validate_headers(&headers, source_path(&weights), packed_quant, dtype_policy)?;
         pinned.ensure_unchanged()?;
         Ok(ValidatedEncoderSource {
             requested_source: source.clone(),
@@ -1367,6 +1506,42 @@ impl EncoderContract {
             pinned,
             tokenizer,
         })
+    }
+
+    fn validate_inspected_source(
+        &self,
+        requested_source: &WeightsSource,
+        weights: &WeightsSource,
+        config: Option<(&Path, &Value)>,
+        headers: &[SafetensorsTensorHeader],
+        dtype_policy: EncoderDtypePolicy,
+        config_policy: EncoderConfigPolicy,
+    ) -> Result<Option<PackedQuantization>> {
+        let declared_quant = if let Some((config_path, config)) = config {
+            self.validate_config(config, config_path)?;
+            parse_packed_quantization(config, config_path)?
+        } else if config_policy == EncoderConfigPolicy::Required {
+            return Err(Error::Msg(format!(
+                "text encoder substitution has no config.json (source {}); exact behavior, tokenizer, head-topology, and precision compatibility cannot be proven from tensor shapes alone",
+                source_path(requested_source).display()
+            )));
+        } else {
+            None
+        };
+
+        let language_headers = language_quantization_evidence_headers(headers);
+        let packed_quant = validate_quantization_evidence(
+            &language_headers,
+            source_path(weights),
+            declared_quant,
+        )?;
+        self.validate_packing_config(
+            source_path(weights),
+            packed_quant,
+            matches!(weights, WeightsSource::File(_)),
+        )?;
+        self.validate_headers(headers, source_path(weights), packed_quant, dtype_policy)?;
+        Ok(packed_quant)
     }
 
     /// Validate an encoder embedded inside a fused safetensors checkpoint. `component_prefixes`
@@ -3028,6 +3203,231 @@ fn source_path(source: &WeightsSource) -> &Path {
     }
 }
 
+#[derive(Debug)]
+struct DiscoveryInspection {
+    weights: WeightsSource,
+    config_path: Option<PathBuf>,
+    config: Option<Value>,
+    headers: Vec<SafetensorsTensorHeader>,
+    source_bytes: u64,
+}
+
+fn inspect_encoder_source_for_discovery(
+    source: &WeightsSource,
+    allowed_roots: &[PathBuf],
+    require_config: bool,
+) -> Result<DiscoveryInspection> {
+    // Confinement of the caller's original entry is deliberately first. In particular, do not ask
+    // whether nested configs exist or enumerate a directory until the entry itself is authorized.
+    ensure_discovery_paths_confined(&[source_path(source).to_path_buf()], allowed_roots)?;
+    let (weights, config_path) = resolve_source_for_discovery(source, allowed_roots)?;
+    let mut preflight = vec![source_path(&weights).to_path_buf()];
+    preflight.extend(config_path.iter().cloned());
+    ensure_discovery_paths_confined(&preflight, allowed_roots)?;
+
+    if require_config && config_path.is_none() {
+        return Err(missing_encoder_config_error(source));
+    }
+
+    let shard_paths = encoder_shard_paths_for_discovery(&weights, allowed_roots)?;
+    ensure_discovery_paths_confined(&shard_paths, allowed_roots)?;
+    let source_bytes = discovery_direct_shard_bytes(&shard_paths)?;
+    let config = config_path
+        .as_deref()
+        .map(read_selected_encoder_config)
+        .transpose()?;
+    let headers =
+        collect_unique_encoder_headers(shard_paths.iter().map(safetensors_path_tensor_headers))
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "text encoder contract: inspect {}: {error}",
+                    source_path(&weights).display()
+                ))
+            })?;
+
+    let (current_weights, current_config) = resolve_source_for_discovery(source, allowed_roots)?;
+    if require_config && current_config.is_none() {
+        return Err(missing_encoder_config_error(source));
+    }
+    let current_shards = encoder_shard_paths_for_discovery(&current_weights, allowed_roots)?;
+    let current_bytes = discovery_direct_shard_bytes(&current_shards)?;
+    if current_weights != weights
+        || current_config != config_path
+        || current_shards != shard_paths
+        || current_bytes != source_bytes
+    {
+        return Err(Error::Unsupported(
+            "text encoder discovery source shape changed during validation".into(),
+        ));
+    }
+    let mut postflight = vec![source_path(&current_weights).to_path_buf()];
+    postflight.extend(current_config.iter().cloned());
+    postflight.extend(current_shards);
+    ensure_discovery_paths_confined(&postflight, allowed_roots)?;
+
+    Ok(DiscoveryInspection {
+        weights,
+        config_path,
+        config,
+        headers,
+        source_bytes,
+    })
+}
+
+fn missing_encoder_config_error(source: &WeightsSource) -> Error {
+    Error::Msg(format!(
+        "text encoder substitution has no config.json (source {}); exact behavior, tokenizer, head-topology, and precision compatibility cannot be proven from tensor shapes alone",
+        source_path(source).display()
+    ))
+}
+
+fn resolve_source_for_discovery(
+    source: &WeightsSource,
+    allowed_roots: &[PathBuf],
+) -> Result<(WeightsSource, Option<PathBuf>)> {
+    match source {
+        WeightsSource::File(path) => {
+            ensure_discovery_paths_confined(std::slice::from_ref(path), allowed_roots)?;
+            let config = match path.parent().map(|parent| parent.join("config.json")) {
+                Some(candidate) if discovery_regular_file_candidate(&candidate, allowed_roots)? => {
+                    Some(candidate)
+                }
+                _ => None,
+            };
+            Ok((WeightsSource::File(path.clone()), config))
+        }
+        WeightsSource::Dir(path) => {
+            ensure_discovery_paths_confined(std::slice::from_ref(path), allowed_roots)?;
+            let nested = path.join("text_encoder");
+            // Authorize the intermediate component directory itself before appending or inspecting
+            // its config path. `symlink_metadata(nested/config.json)` would otherwise traverse an
+            // untrusted `text_encoder` directory symlink before its target was root-confined.
+            if discovery_directory_candidate(&nested, allowed_roots)? {
+                let nested_config = nested.join("config.json");
+                if discovery_regular_file_candidate(&nested_config, allowed_roots)? {
+                    return Ok((WeightsSource::Dir(nested), Some(nested_config)));
+                }
+            }
+            let direct = path.join("config.json");
+            let config =
+                discovery_regular_file_candidate(&direct, allowed_roots)?.then_some(direct);
+            Ok((WeightsSource::Dir(path.clone()), config))
+        }
+    }
+}
+
+fn discovery_directory_candidate(path: &Path, allowed_roots: &[PathBuf]) -> Result<bool> {
+    ensure_discovery_paths_lexically_confined(
+        std::slice::from_ref(&path.to_path_buf()),
+        allowed_roots,
+    )?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            ensure_discovery_paths_confined(
+                std::slice::from_ref(&path.to_path_buf()),
+                allowed_roots,
+            )?;
+            Ok(std::fs::metadata(path)?.is_dir())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn discovery_regular_file_candidate(path: &Path, allowed_roots: &[PathBuf]) -> Result<bool> {
+    ensure_discovery_paths_lexically_confined(
+        std::slice::from_ref(&path.to_path_buf()),
+        allowed_roots,
+    )?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            ensure_discovery_paths_confined(
+                std::slice::from_ref(&path.to_path_buf()),
+                allowed_roots,
+            )?;
+            Ok(std::fs::metadata(path)?.is_file())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_discovery_paths_lexically_confined(
+    paths: &[PathBuf],
+    allowed_roots: &[PathBuf],
+) -> Result<()> {
+    let roots = allowed_roots
+        .iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if roots.is_empty() {
+        return Err(Error::Unsupported(
+            "validated text encoder has no authorized model roots".into(),
+        ));
+    }
+    for path in paths {
+        let loader_path = std::path::absolute(path)?;
+        if !roots.iter().any(|root| loader_path.starts_with(root)) {
+            return Err(Error::Unsupported(format!(
+                "validated text encoder loader entry escapes authorized model roots: {}",
+                loader_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_discovery_paths_confined(paths: &[PathBuf], allowed_roots: &[PathBuf]) -> Result<()> {
+    ensure_discovery_paths_lexically_confined(paths, allowed_roots)?;
+    let roots = allowed_roots
+        .iter()
+        .map(std::path::absolute)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for path in paths {
+        let canonical_target_path = std::fs::canonicalize(std::path::absolute(path)?)?;
+        if !roots
+            .iter()
+            .any(|root| canonical_target_path.starts_with(root))
+        {
+            return Err(Error::Unsupported(format!(
+                "validated text encoder canonical target escapes authorized model roots: {}",
+                canonical_target_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_selected_encoder_config(path: &Path) -> Result<Value> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::Msg(format!(
+            "text encoder contract: read {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SELECTED_ENCODER_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            Error::Msg(format!(
+                "text encoder contract: read {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_SELECTED_ENCODER_CONFIG_BYTES {
+        return Err(Error::Unsupported(format!(
+            "text encoder config {} exceeds the {MAX_SELECTED_ENCODER_CONFIG_BYTES}-byte maximum",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        Error::Msg(format!(
+            "text encoder contract: parse {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 fn json_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter()
         .try_fold(value, |current, segment| current.get(*segment))
@@ -3076,6 +3476,82 @@ fn encoder_shard_paths(source: &WeightsSource) -> Result<Vec<PathBuf>> {
         )));
     }
     Ok(paths)
+}
+
+fn encoder_shard_paths_for_discovery(
+    source: &WeightsSource,
+    allowed_roots: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    ensure_discovery_paths_confined(&[source_path(source).to_path_buf()], allowed_roots)?;
+    let mut paths = match source {
+        WeightsSource::File(path) => {
+            let absolute = std::path::absolute(path)?;
+            ensure_discovery_paths_confined(std::slice::from_ref(&absolute), allowed_roots)?;
+            if !std::fs::metadata(&absolute)?.is_file() {
+                return Err(Error::Unsupported(format!(
+                    "text encoder direct shard candidate is not a regular file: {}",
+                    absolute.display()
+                )));
+            }
+            vec![absolute]
+        }
+        WeightsSource::Dir(path) => {
+            let mut paths = Vec::new();
+            for entry in std::fs::read_dir(path)? {
+                let candidate = entry?.path();
+                if candidate
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("safetensors")
+                    || crate::weightsmeta::is_hidden_file(&candidate)
+                {
+                    continue;
+                }
+                let absolute = std::path::absolute(candidate)?;
+                // Do not follow a shard symlink for metadata until both its lexical loader entry and
+                // current canonical target have passed the caller's root authorization.
+                ensure_discovery_paths_confined(std::slice::from_ref(&absolute), allowed_roots)?;
+                let metadata = std::fs::metadata(&absolute).map_err(|error| {
+                    Error::Msg(format!(
+                        "text encoder direct shard candidate {} cannot be inspected: {error}",
+                        absolute.display()
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(Error::Unsupported(format!(
+                        "text encoder direct shard candidate is not a regular file: {}",
+                        absolute.display()
+                    )));
+                }
+                paths.push(absolute);
+            }
+            paths
+        }
+    };
+    paths.sort();
+    if paths.is_empty() {
+        return Err(Error::Msg(format!(
+            "no direct .safetensors shards in text encoder source {}",
+            source_path(source).display()
+        )));
+    }
+    Ok(paths)
+}
+
+fn discovery_direct_shard_bytes(paths: &[PathBuf]) -> Result<u64> {
+    paths.iter().try_fold(0u64, |total, path| {
+        let bytes = std::fs::metadata(path)
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "text encoder contract: stat direct shard {}: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        total.checked_add(bytes).ok_or_else(|| {
+            Error::Unsupported("text encoder direct-shard byte total overflowed u64".into())
+        })
+    })
 }
 
 fn validate_quantization_evidence(
@@ -3552,6 +4028,51 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
 
+    fn authorized_test_roots(root: &Path) -> Vec<PathBuf> {
+        let mut roots = vec![
+            std::path::absolute(root).unwrap(),
+            std::fs::canonicalize(root).unwrap(),
+        ];
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DiscoverySourceShape {
+        File,
+        DirectDirectory,
+        CompleteSnapshot,
+    }
+
+    fn write_discovery_source(
+        root: &Path,
+        shape: DiscoverySourceShape,
+        embedding_hidden: usize,
+    ) -> (WeightsSource, PathBuf) {
+        match shape {
+            DiscoverySourceShape::File => {
+                let component = root.join("file");
+                write_fixture(&component, embedding_hidden);
+                (
+                    WeightsSource::File(component.join("model.safetensors")),
+                    component,
+                )
+            }
+            DiscoverySourceShape::DirectDirectory => {
+                let component = root.join("direct");
+                write_fixture(&component, embedding_hidden);
+                (WeightsSource::Dir(component.clone()), component)
+            }
+            DiscoverySourceShape::CompleteSnapshot => {
+                let snapshot = root.join("snapshot");
+                let component = snapshot.join("text_encoder");
+                write_fixture(&component, embedding_hidden);
+                (WeightsSource::Dir(snapshot), component)
+            }
+        }
+    }
+
     #[test]
     fn validates_config_and_headers_before_load() {
         let temp = tempfile::tempdir().unwrap();
@@ -3568,6 +4089,302 @@ mod tests {
                 ))),
             })
             .unwrap();
+    }
+
+    #[test]
+    fn discovery_validation_does_no_full_hash_work_while_load_validation_still_seals() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let selected = temp.path().join("selected");
+        write_tokenizer_fixture(&base);
+        write_fixture(&selected, 8);
+        let source = WeightsSource::Dir(selected);
+        let allowed_roots = authorized_test_roots(temp.path());
+
+        let before_discovery = crate::runtime::test_full_hash_work_count();
+        let facts = CONTRACT
+            .validate_source_for_discovery(&source, &allowed_roots)
+            .unwrap();
+        assert!(!facts.materialized_language_tensor_headers().is_empty());
+        assert!(facts.source_bytes() > 0);
+        let inventory =
+            text_encoder_source_inventory_for_discovery(&source, &allowed_roots).unwrap();
+        assert!(!inventory.tensor_headers().is_empty());
+        assert_eq!(inventory.source_bytes(), facts.source_bytes());
+        let comfyui_source = WeightsSource::File(match &source {
+            WeightsSource::Dir(path) => path.join("model.safetensors"),
+            WeightsSource::File(_) => unreachable!("the fixture source is a directory"),
+        });
+        let comfyui = CONTRACT
+            .validate_comfyui_source_for_discovery(&comfyui_source, &allowed_roots)
+            .unwrap();
+        assert_eq!(comfyui.source_bytes(), facts.source_bytes());
+        assert_eq!(
+            crate::runtime::test_full_hash_work_count(),
+            before_discovery,
+            "catalog discovery must not acquire and discard a full-content artifact seal"
+        );
+
+        let before_load = crate::runtime::test_full_hash_work_count();
+        let _sealed = CONTRACT
+            .validate_source_against_base(&source, &base)
+            .unwrap();
+        assert!(
+            crate::runtime::test_full_hash_work_count() > before_load,
+            "executable validation must retain full acquisition sealing"
+        );
+    }
+
+    #[test]
+    fn discovery_and_sealed_validation_have_source_shape_and_contract_parity() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            None,
+            Config,
+            Header,
+            Quantization,
+        }
+
+        for shape in [
+            DiscoverySourceShape::File,
+            DiscoverySourceShape::DirectDirectory,
+            DiscoverySourceShape::CompleteSnapshot,
+        ] {
+            for mutation in [
+                Mutation::None,
+                Mutation::Config,
+                Mutation::Header,
+                Mutation::Quantization,
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let header_width = if matches!(mutation, Mutation::Header) {
+                    7
+                } else {
+                    8
+                };
+                let (source, component) = write_discovery_source(temp.path(), shape, header_width);
+                match mutation {
+                    Mutation::None | Mutation::Header => {}
+                    Mutation::Config => rewrite_config_field(&component, "hidden_size", 7),
+                    Mutation::Quantization => rewrite_config_quantization(&component, 4),
+                }
+
+                let discovery = CONTRACT
+                    .validate_source_for_discovery(&source, &authorized_test_roots(temp.path()));
+                let sealed = CONTRACT.validate_source_for_planning(&source);
+                match mutation {
+                    Mutation::None => {
+                        let facts = discovery.unwrap_or_else(|error| {
+                            panic!("{shape:?} discovery unexpectedly failed: {error}")
+                        });
+                        let sealed = sealed.unwrap_or_else(|error| {
+                            panic!("{shape:?} sealed validation unexpectedly failed: {error}")
+                        });
+                        assert_eq!(facts.source_bytes(), sealed.source_bytes().unwrap());
+                        assert_eq!(
+                            facts.materialized_language_tensor_headers(),
+                            sealed
+                                .materialized_language_tensor_headers(&CONTRACT)
+                                .unwrap()
+                        );
+                    }
+                    Mutation::Config => {
+                        let discovery = discovery.unwrap_err().to_string();
+                        let sealed = sealed.unwrap_err().to_string();
+                        assert!(discovery.contains("field hidden_size"), "{discovery}");
+                        assert!(sealed.contains("field hidden_size"), "{sealed}");
+                    }
+                    Mutation::Header => {
+                        let discovery = discovery.unwrap_err().to_string();
+                        let sealed = sealed.unwrap_err().to_string();
+                        assert!(discovery.contains("field hidden_size"), "{discovery}");
+                        assert!(sealed.contains("field hidden_size"), "{sealed}");
+                    }
+                    Mutation::Quantization => {
+                        let discovery = discovery.unwrap_err().to_string();
+                        let sealed = sealed.unwrap_err().to_string();
+                        assert!(discovery.contains("quantization mismatch"), "{discovery}");
+                        assert!(sealed.contains("quantization mismatch"), "{sealed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_config_is_rejected_before_shard_enumeration() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("selected");
+        std::fs::create_dir_all(source.join("broken.safetensors")).unwrap();
+        let error = CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(source),
+                &authorized_test_roots(temp.path()),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no config.json"), "{error}");
+        assert!(!error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn discovery_validation_rejects_config_header_and_source_shape_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed_roots = authorized_test_roots(temp.path());
+
+        let config_mutation = temp.path().join("config-mutation");
+        write_fixture(&config_mutation, 8);
+        rewrite_config_field(&config_mutation, "hidden_size", 7);
+        let error = CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(config_mutation), &allowed_roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+
+        let header_mutation = temp.path().join("header-mutation");
+        write_fixture(&header_mutation, 7);
+        let error = CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(header_mutation), &allowed_roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("field hidden_size"), "{error}");
+
+        let source_shape_mutation = temp.path().join("source-shape-mutation");
+        write_fixture(&source_shape_mutation, 8);
+        CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(source_shape_mutation.clone()),
+                &allowed_roots,
+            )
+            .unwrap();
+        let nested = source_shape_mutation.join("text_encoder");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::copy(
+            source_shape_mutation.join("config.json"),
+            nested.join("config.json"),
+        )
+        .unwrap();
+        let error = CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(source_shape_mutation),
+                &allowed_roots,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no direct .safetensors shards"), "{error}");
+    }
+
+    #[test]
+    fn discovery_and_sealed_validation_share_the_config_size_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        write_fixture(temp.path(), 8);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path().join("config.json"))
+            .unwrap()
+            .set_len(MAX_SELECTED_ENCODER_CONFIG_BYTES + 1)
+            .unwrap();
+        let source = WeightsSource::Dir(temp.path().to_path_buf());
+        let discovery_error = CONTRACT
+            .validate_source_for_discovery(&source, &authorized_test_roots(temp.path()))
+            .unwrap_err()
+            .to_string();
+        let sealed_error = CONTRACT
+            .validate_source_for_planning(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            discovery_error.contains("exceeds the 4194304-byte maximum"),
+            "{discovery_error}"
+        );
+        assert!(
+            sealed_error.contains("exceeds the 4194304-byte maximum"),
+            "{sealed_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_validation_rejects_canonical_target_outside_authorized_roots() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let outside = temp.path().join("outside");
+        write_fixture(&outside, 8);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::copy(outside.join("config.json"), allowed.join("config.json")).unwrap();
+        symlink(
+            outside.join("model.safetensors"),
+            allowed.join("model.safetensors"),
+        )
+        .unwrap();
+
+        let allowed_roots = authorized_test_roots(&allowed);
+        let error = CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(allowed.clone()), &allowed_roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical target"), "{error}");
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_confinement_covers_file_direct_directory_and_complete_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        for shape in [
+            DiscoverySourceShape::File,
+            DiscoverySourceShape::DirectDirectory,
+            DiscoverySourceShape::CompleteSnapshot,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let allowed = temp.path().join("allowed");
+            let outside = temp.path().join("outside");
+            let (source, component) = write_discovery_source(&allowed, shape, 8);
+            write_fixture(&outside, 8);
+            std::fs::remove_file(component.join("model.safetensors")).unwrap();
+            symlink(
+                outside.join("model.safetensors"),
+                component.join("model.safetensors"),
+            )
+            .unwrap();
+
+            let error = CONTRACT
+                .validate_source_for_discovery(&source, &authorized_test_roots(&allowed))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("canonical target"), "{shape:?}: {error}");
+            assert!(
+                error.contains("escapes authorized model roots"),
+                "{shape:?}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_snapshot_component_symlink_before_inspecting_its_config() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let snapshot = allowed.join("snapshot");
+        let outside_component = temp.path().join("outside/text_encoder");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        write_fixture(&outside_component, 8);
+        symlink(&outside_component, snapshot.join("text_encoder")).unwrap();
+
+        let error = CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(snapshot),
+                &authorized_test_roots(&allowed),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical target"), "{error}");
+        assert!(error.contains("escapes authorized model roots"), "{error}");
     }
 
     #[test]
