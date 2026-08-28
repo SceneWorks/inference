@@ -22,6 +22,13 @@ const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-m
 const TRUE_V2_TRANSFORMER_SHA256: &str =
     "72ae74528050cd97bf056568000fcb7915012b4d0fd0807de205513e0fdc64b9";
 
+fn discovery_roots(root: &Path) -> CoreResult<Vec<PathBuf>> {
+    let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 const FILES: &[(&str, &str)] = &[
     (
         "model_index.json",
@@ -1022,8 +1029,10 @@ impl KleinArtifactInventory {
             }
         }
 
-        encoder_contract
-            .validate_source_for_planning(&WeightsSource::Dir(root.join("text_encoder")))?;
+        encoder_contract.validate_source_for_discovery(
+            &WeightsSource::Dir(root.join("text_encoder")),
+            &discovery_roots(&root)?,
+        )?;
 
         let tokenizer = root.join("tokenizer/tokenizer.json");
         let mut entries = vec![
