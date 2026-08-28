@@ -270,6 +270,38 @@ impl TextEncoderDiscoveryInventory {
     }
 }
 
+/// Path-free source shape used only for selected-encoder memory planning.
+///
+/// This classification lets a caller preserve the loader's complete-snapshot deduplication rule
+/// without receiving a resolved path or any artifact authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEncoderSourceLayout {
+    File,
+    DirectDirectory,
+    CompleteSnapshot,
+}
+
+/// Non-authorizing selected-encoder facts for memory planning.
+///
+/// A prepared [`crate::LoadSpec`] derives these values from its retained acquisition receipt;
+/// compatibility callers may derive them from bounded discovery. The fact contains no paths, pins,
+/// hashes, or reopen capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEncoderPlanningFacts {
+    source_layout: TextEncoderSourceLayout,
+    direct_shard_bytes: u64,
+}
+
+impl TextEncoderPlanningFacts {
+    pub fn source_layout(&self) -> TextEncoderSourceLayout {
+        self.source_layout
+    }
+
+    pub fn direct_shard_bytes(&self) -> u64 {
+        self.direct_shard_bytes
+    }
+}
+
 /// Exact selected-encoder source shape and direct-shard inventory exported onto a prepared
 /// [`crate::LoadSpec`]. File pins guard every accepted object; this companion receipt preserves the
 /// directory-enumeration invariant so a later shard addition, removal, rename, or type change cannot
@@ -633,6 +665,32 @@ impl PreparedEncoderLoadReceipt {
         }
         Ok(())
     }
+
+    pub(crate) fn planning_facts_for(
+        &self,
+        selected_source: Option<&WeightsSource>,
+    ) -> Result<TextEncoderPlanningFacts> {
+        self.ensure_unchanged_for(selected_source)?;
+        let direct_shard_bytes = self
+            .pinned
+            .shard_pins
+            .iter()
+            .try_fold(0_u64, |total, pin| {
+                total
+                    .checked_add(pin.target_fingerprint().size)
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "text encoder direct-shard byte total overflowed u64".into(),
+                        )
+                    })
+            })?;
+        let facts = TextEncoderPlanningFacts {
+            source_layout: resolved_source_layout(&self.requested_source, &self.pinned.weights)?,
+            direct_shard_bytes,
+        };
+        self.ensure_unchanged_for(selected_source)?;
+        Ok(facts)
+    }
 }
 
 impl ValidatedTokenizerSource {
@@ -969,10 +1027,24 @@ pub fn text_encoder_source_inventory_for_discovery(
     source: &WeightsSource,
     allowed_roots: &[PathBuf],
 ) -> Result<TextEncoderDiscoveryInventory> {
-    let inspected = inspect_encoder_source_for_discovery(source, allowed_roots, false)?;
+    let inspected = inspect_encoder_source_for_discovery(source, allowed_roots, false, true)?;
     Ok(TextEncoderDiscoveryInventory {
         tensor_headers: inspected.headers,
         source_bytes: inspected.source_bytes,
+    })
+}
+
+/// Inspect path-free selected-encoder planning facts without acquiring an executable artifact
+/// seal. `allowed_roots` confines every lexical entry and canonical target before traversal; the
+/// returned value deliberately cannot authorize a later load.
+pub fn text_encoder_planning_facts_for_discovery(
+    source: &WeightsSource,
+    allowed_roots: &[PathBuf],
+) -> Result<TextEncoderPlanningFacts> {
+    let inspected = inspect_encoder_source_for_discovery(source, allowed_roots, false, false)?;
+    Ok(TextEncoderPlanningFacts {
+        source_layout: resolved_source_layout(source, &inspected.weights)?,
+        direct_shard_bytes: inspected.source_bytes,
     })
 }
 
@@ -1309,6 +1381,7 @@ impl EncoderContract {
             source,
             allowed_roots,
             config_policy == EncoderConfigPolicy::Required,
+            true,
         )?;
         let packed_quant = self.validate_inspected_source(
             source,
@@ -3203,6 +3276,30 @@ fn source_path(source: &WeightsSource) -> &Path {
     }
 }
 
+fn resolved_source_layout(
+    requested: &WeightsSource,
+    resolved: &WeightsSource,
+) -> Result<TextEncoderSourceLayout> {
+    match (requested, resolved) {
+        (WeightsSource::File(requested), WeightsSource::File(resolved))
+            if requested == resolved =>
+        {
+            Ok(TextEncoderSourceLayout::File)
+        }
+        (WeightsSource::Dir(requested), WeightsSource::Dir(resolved)) if requested == resolved => {
+            Ok(TextEncoderSourceLayout::DirectDirectory)
+        }
+        (WeightsSource::Dir(requested), WeightsSource::Dir(resolved))
+            if requested.join("text_encoder") == *resolved =>
+        {
+            Ok(TextEncoderSourceLayout::CompleteSnapshot)
+        }
+        _ => Err(Error::Unsupported(
+            "text encoder resolved source shape is inconsistent with its requested source".into(),
+        )),
+    }
+}
+
 #[derive(Debug)]
 struct DiscoveryInspection {
     weights: WeightsSource,
@@ -3216,6 +3313,7 @@ fn inspect_encoder_source_for_discovery(
     source: &WeightsSource,
     allowed_roots: &[PathBuf],
     require_config: bool,
+    inspect_content: bool,
 ) -> Result<DiscoveryInspection> {
     // Confinement of the caller's original entry is deliberately first. In particular, do not ask
     // whether nested configs exist or enumerate a directory until the entry itself is authorized.
@@ -3232,18 +3330,23 @@ fn inspect_encoder_source_for_discovery(
     let shard_paths = encoder_shard_paths_for_discovery(&weights, allowed_roots)?;
     ensure_discovery_paths_confined(&shard_paths, allowed_roots)?;
     let source_bytes = discovery_direct_shard_bytes(&shard_paths)?;
-    let config = config_path
-        .as_deref()
-        .map(read_selected_encoder_config)
-        .transpose()?;
-    let headers =
-        collect_unique_encoder_headers(shard_paths.iter().map(safetensors_path_tensor_headers))
-            .map_err(|error| {
-                Error::Msg(format!(
-                    "text encoder contract: inspect {}: {error}",
-                    source_path(&weights).display()
-                ))
-            })?;
+    let (config, headers) = if inspect_content {
+        let config = config_path
+            .as_deref()
+            .map(read_selected_encoder_config)
+            .transpose()?;
+        let headers =
+            collect_unique_encoder_headers(shard_paths.iter().map(safetensors_path_tensor_headers))
+                .map_err(|error| {
+                    Error::Msg(format!(
+                        "text encoder contract: inspect {}: {error}",
+                        source_path(&weights).display()
+                    ))
+                })?;
+        (config, headers)
+    } else {
+        (None, Vec::new())
+    };
 
     let (current_weights, current_config) = resolve_source_for_discovery(source, allowed_roots)?;
     if require_config && current_config.is_none() {
@@ -4111,6 +4214,16 @@ mod tests {
             text_encoder_source_inventory_for_discovery(&source, &allowed_roots).unwrap();
         assert!(!inventory.tensor_headers().is_empty());
         assert_eq!(inventory.source_bytes(), facts.source_bytes());
+        let discovery_planning =
+            text_encoder_planning_facts_for_discovery(&source, &allowed_roots).unwrap();
+        assert_eq!(
+            discovery_planning.source_layout(),
+            TextEncoderSourceLayout::DirectDirectory
+        );
+        assert_eq!(
+            discovery_planning.direct_shard_bytes(),
+            facts.source_bytes()
+        );
         let comfyui_source = WeightsSource::File(match &source {
             WeightsSource::Dir(path) => path.join("model.safetensors"),
             WeightsSource::File(_) => unreachable!("the fixture source is a directory"),
@@ -4126,13 +4239,39 @@ mod tests {
         );
 
         let before_load = crate::runtime::test_full_hash_work_count();
-        let _sealed = CONTRACT
+        let sealed = CONTRACT
             .validate_source_against_base(&source, &base)
             .unwrap();
         assert!(
             crate::runtime::test_full_hash_work_count() > before_load,
             "executable validation must retain full acquisition sealing"
         );
+
+        let mut spec = crate::LoadSpec::new(WeightsSource::Dir(base));
+        sealed.prepare_load_spec(&mut spec).unwrap();
+        let before_prepared_planning = crate::runtime::test_full_hash_work_count();
+        let prepared_planning = spec
+            .prepared_text_encoder_planning_facts()
+            .unwrap()
+            .expect("validated source installed a receipt");
+        assert_eq!(prepared_planning, discovery_planning);
+        assert_eq!(
+            crate::runtime::test_full_hash_work_count(),
+            before_prepared_planning,
+            "prepared planning must reuse the retained seal instead of hashing content again"
+        );
+
+        let selected_shard = match &source {
+            WeightsSource::Dir(path) => path.join("model.safetensors"),
+            WeightsSource::File(_) => unreachable!("the fixture source is a directory"),
+        };
+        let shard_len = std::fs::metadata(&selected_shard).unwrap().len();
+        std::fs::write(&selected_shard, vec![1_u8; shard_len as usize]).unwrap();
+        let error = spec
+            .prepared_text_encoder_planning_facts()
+            .expect_err("prepared planning must reject a mutated selected source")
+            .to_string();
+        assert!(error.contains("receipt changed"), "{error}");
     }
 
     #[test]

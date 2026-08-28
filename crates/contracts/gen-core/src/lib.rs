@@ -107,11 +107,12 @@ pub use control::{
 };
 pub use encoder_contract::{
     read_text_encoder_source_unchanged, resolve_encoder_load_time_quant_bits,
-    text_encoder_packed_quant_bits, text_encoder_source_bytes, EncoderConfigBool,
-    EncoderConfigFloat, EncoderContract, EncoderPackingContract, EncoderPromptExecutionContract,
-    EncoderPromptLengthPolicy, EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken,
-    EncoderTokenizerBinding, EncoderTokenizerContract, EncoderTokenizerDisposition,
-    ValidatedEncoderSource, ValidatedTokenizerSource,
+    text_encoder_packed_quant_bits, text_encoder_planning_facts_for_discovery,
+    text_encoder_source_bytes, EncoderConfigBool, EncoderConfigFloat, EncoderContract,
+    EncoderPackingContract, EncoderPromptExecutionContract, EncoderPromptLengthPolicy,
+    EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding,
+    EncoderTokenizerContract, EncoderTokenizerDisposition, TextEncoderPlanningFacts,
+    TextEncoderSourceLayout, ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
 pub use execution_domains::{

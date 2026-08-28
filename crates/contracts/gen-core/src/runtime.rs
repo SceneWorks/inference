@@ -1364,6 +1364,21 @@ impl LoadSpec {
         self.validate_prepared_file_pin_set_for(&self.prepared_file_pins)
     }
 
+    /// Return path-free planning facts from the retained selected-encoder acquisition receipt.
+    ///
+    /// Stable receipts are checked through their metadata identity only; this never acquires a new
+    /// artifact seal or repeats full-content hashing. A changed source still fails closed before
+    /// facts are returned. `None` means this spec has no crate-validated encoder receipt and a
+    /// compatibility planner must use bounded discovery instead.
+    pub fn prepared_text_encoder_planning_facts(
+        &self,
+    ) -> crate::Result<Option<crate::encoder_contract::TextEncoderPlanningFacts>> {
+        self.prepared_encoder_receipt
+            .as_ref()
+            .map(|receipt| receipt.planning_facts_for(self.text_encoder.as_ref()))
+            .transpose()
+    }
+
     fn validate_prepared_file_pin_set_for(&self, prepared: &PreparedFilePins) -> crate::Result<()> {
         if let Some(receipt) = &self.prepared_encoder_receipt {
             receipt.ensure_unchanged_for(self.text_encoder.as_ref())?;
