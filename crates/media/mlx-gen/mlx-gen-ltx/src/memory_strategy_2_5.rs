@@ -1060,8 +1060,8 @@ mod tests {
     /// once a generator exists, so the failure would surface in sc-18778 rather than here.
     #[test]
     fn the_registration_names_the_two_five_engine_id() {
-        assert_eq!(MEMORY_REGISTRATION.provider_id, "ltx_2_5");
-        assert_ne!(MEMORY_REGISTRATION.provider_id, crate::MODEL_ID);
+        assert_eq!(LTX_2_5_MEMORY_REGISTRATION.provider_id, "ltx_2_5");
+        assert_ne!(LTX_2_5_MEMORY_REGISTRATION.provider_id, crate::MODEL_ID);
         let contract =
             weights_free_memory_strategy_contract(&spec(LoadShape::DeferredMaterialization))
                 .unwrap();
