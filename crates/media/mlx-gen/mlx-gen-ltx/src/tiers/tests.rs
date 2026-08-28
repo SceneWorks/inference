@@ -103,6 +103,17 @@ fn write_transformer(root: &Path) -> PathBuf {
 /// weight the converter's quant list and expected-dense allowlist have never heard of. Keys are
 /// written under the checkpoint's `model.diffusion_model.` prefix, exactly as the real file's are.
 fn write_transformer_with(root: &Path, extra: &[(&str, Array)]) -> PathBuf {
+    write_transformer_with_variant(root, extra, None)
+}
+
+/// [`write_transformer_with`] with an optional source identity. Real upstream LTX-2.5 files omit
+/// this tag; the converter must stamp an explicitly selected identity, while a pre-stamped source
+/// must not be relabelled as a different checkpoint family.
+fn write_transformer_with_variant(
+    root: &Path,
+    extra: &[(&str, Array)],
+    source_variant: Option<&str>,
+) -> PathBuf {
     let mut t: Vec<(String, Array)> = Vec::new();
     let p = "model.diffusion_model.";
     for (key, value) in extra {
@@ -216,29 +227,27 @@ fn write_transformer_with(root: &Path, extra: &[(&str, Array)]) -> PathBuf {
     }
 
     let path = root.join("diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors");
-    write_file(
-        &path,
-        t,
-        &[
-            ("model_version", LTX_2_5_MODEL_VERSION),
-            (
-                "gemma_source_checkpoint",
-                r#"{"ltx_version":"2.5.0","gemma_version":"gemma4-12b-ltx-v1"}"#,
-            ),
-            (
-                "config",
-                &serde_json::json!({
-                    "transformer": serde_json::from_str::<serde_json::Value>(&transformer_config()).unwrap(),
-                    "scheduler": {"_class_name": "RectifiedFlowScheduler", "sampler": "LinearQuadratic"},
-                    "vae": null,
-                    "audio_vae": null,
-                    "vocoder": null,
-                })
-                .to_string(),
-            ),
-            ("license", "LTX-2.x Community License Agreement (fixture)"),
-        ],
-    );
+    let config = serde_json::json!({
+        "transformer": serde_json::from_str::<serde_json::Value>(&transformer_config()).unwrap(),
+        "scheduler": {"_class_name": "RectifiedFlowScheduler", "sampler": "LinearQuadratic"},
+        "vae": null,
+        "audio_vae": null,
+        "vocoder": null,
+    })
+    .to_string();
+    let mut metadata = vec![
+        ("model_version", LTX_2_5_MODEL_VERSION),
+        (
+            "gemma_source_checkpoint",
+            r#"{"ltx_version":"2.5.0","gemma_version":"gemma4-12b-ltx-v1"}"#,
+        ),
+        ("config", config.as_str()),
+        ("license", "LTX-2.x Community License Agreement (fixture)"),
+    ];
+    if let Some(source_variant) = source_variant {
+        metadata.push((TransformerVariant::METADATA_KEY, source_variant));
+    }
+    write_file(&path, t, &metadata);
     path
 }
 
@@ -688,8 +697,14 @@ fn every_quantizable_segment_lands_at_the_tier_precision() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("tiers");
-    let reports =
-        convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).expect("build tiers");
+    let reports = convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .expect("build tiers");
     assert_eq!(reports.len(), 3);
 
     // Counts derived from the fixture's declared geometry, not pinned literals: 6 attentions x 4
@@ -785,8 +800,14 @@ fn tier_sizes_are_ordered_and_the_exempt_components_do_not_move() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("tiers");
-    let reports =
-        convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).expect("build tiers");
+    let reports = convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .expect("build tiers");
     let by_tier: BTreeMap<LtxTier, &LtxTierReport> = reports.iter().map(|r| (r.tier, r)).collect();
 
     let q4 = by_tier[&LtxTier::Q4];
@@ -859,7 +880,14 @@ fn the_diff_vae_decoder_is_packed_except_the_linear_no_affine_group_divides() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("tiers");
-    convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+    convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     let component = crate::diff_vae::DIFFUSION_DECODER_COMPONENT;
     let dense = tier_header(&out, LtxTier::Bf16, component);
@@ -926,7 +954,14 @@ fn q4_ships_the_text_encoder_dense_on_measured_evidence_and_q8_packs_it() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("tiers");
-    let reports = convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+    let reports = convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     for report in &reports {
         let te = report.component("text_encoder").expect("a text encoder");
@@ -977,7 +1012,14 @@ fn dense_components_declare_a_reason_and_the_structural_one_is_verified() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("q4");
-    let report = convert_2_5_tier(&bundle, &out, LtxTier::Q4, DEFAULT_GROUP_SIZE).unwrap();
+    let report = convert_2_5_tier(
+        &bundle,
+        &out,
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     for entry in &report.components {
         if entry.quantized_linears > 0 {
@@ -1071,6 +1113,7 @@ fn a_no_linear_weights_exemption_is_refused_when_the_component_has_linears() {
         tmp.path().join("q4"),
         LtxTier::Q4,
         DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
     )
     .expect_err("a VAE with a Linear must not pass the `no-linear-weights` exemption");
     let text = err.to_string();
@@ -1086,7 +1129,14 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("tiers");
-    convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+    convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     for tier in LtxTier::ALL {
         let transformer = tier_header(&out, *tier, "transformer");
@@ -1114,6 +1164,14 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
             "{tier}: 2.5 nulls the sibling sections"
         );
         assert_eq!(transformer.metadata[TIER_METADATA_KEY], tier.id());
+        assert_eq!(
+            transformer
+                .metadata
+                .get(TransformerVariant::METADATA_KEY)
+                .map(String::as_str),
+            Some(TransformerVariant::Distilled.id()),
+            "{tier}: the default converter source remains explicitly distilled"
+        );
 
         // The connector is split out of the transformer file and must NOT re-declare
         // `config.transformer` — two files claiming the transformer component makes the directory
@@ -1162,6 +1220,122 @@ fn component_metadata_travels_and_the_gemma_quantization_block_is_tier_scoped() 
     }
 }
 
+/// A raw dev checkpoint is selected by the caller's typed source identity, then stamped into both
+/// the component the loader reads and the portable split manifest. This reads the generated header
+/// and rebuilds a bundle rather than trusting the converter report, so deleting either stamp fails.
+#[test]
+fn a_dev_tier_stamps_portable_identity_and_the_loader_resolves_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let bundle = fixture_bundle(&source);
+    let raw_transformer = bundle
+        .require(LtxComponent::Transformer)
+        .unwrap()
+        .path()
+        .to_path_buf();
+    let out = tmp.path().join("dev-q4");
+
+    let report = convert_2_5_tier(
+        &bundle,
+        &out,
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Dev,
+    )
+    .expect("convert a typed dev tier");
+    assert_eq!(report.variant, TransformerVariant::Dev);
+
+    let transformer = FileHeader::read(&out.join("transformer.safetensors"));
+    assert_eq!(
+        transformer
+            .metadata
+            .get(TransformerVariant::METADATA_KEY)
+            .map(String::as_str),
+        Some(TransformerVariant::Dev.id()),
+        "the loader identity must live in the safetensors header, not only a sidecar"
+    );
+
+    let produced = LtxBundleBuilder::new()
+        .with_component(
+            LtxComponent::Transformer,
+            out.join("transformer.safetensors"),
+        )
+        .build()
+        .expect("build a bundle from the emitted transformer");
+    assert_eq!(
+        crate::dev_sampler::from_bundle(&produced).expect("resolve emitted variant"),
+        TransformerVariant::Dev
+    );
+
+    let manifest_text = std::fs::read_to_string(out.join(TIER_MANIFEST_FILE)).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["variant"], TransformerVariant::Dev.id());
+    assert!(
+        manifest.get("source").is_none(),
+        "release manifests must not expose converter-local source paths"
+    );
+    assert!(
+        !manifest_text.contains(&tmp.path().display().to_string()),
+        "release manifests must not carry an absolute local path"
+    );
+    for component in manifest["component_detail"]
+        .as_array()
+        .expect("a split manifest has component detail entries")
+    {
+        let file = component["file"]
+            .as_str()
+            .expect("a component has a relative filename");
+        let path = Path::new(file);
+        let mut parts = path.components();
+        assert!(
+            matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none(),
+            "component entry {file:?} must be a publication-relative filename"
+        );
+    }
+
+    let unstamped_source = LtxBundleBuilder::new()
+        .with_component(LtxComponent::Transformer, raw_transformer)
+        .build()
+        .expect("build a raw source bundle");
+    let error = crate::dev_sampler::from_bundle(&unstamped_source)
+        .expect_err("a raw/missing variant must not default to distilled");
+    assert!(error.to_string().contains("missing required 'variant'"));
+}
+
+/// A source that already carries identity may not be relabelled by a mismatched typed request.
+#[test]
+fn a_mismatched_source_variant_is_refused_before_tier_emission() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("source");
+    let out = tmp.path().join("dev-q4");
+    let bundle = LtxBundleBuilder::new()
+        .with_component(
+            LtxComponent::Transformer,
+            write_transformer_with_variant(&root, &[], Some(TransformerVariant::Distilled.id())),
+        )
+        .with_component(LtxComponent::TextEncoder, write_text_encoder(&root))
+        .with_component(LtxComponent::ConvVideoVae, write_conv_vae(&root))
+        .build()
+        .unwrap();
+
+    let error = convert_2_5_tier(
+        &bundle,
+        &out,
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Dev,
+    )
+    .expect_err("a declared distilled source must not be emitted as dev");
+    let text = error.to_string();
+    assert!(text.contains("declares variant"), "{text}");
+    assert!(text.contains("distilled"), "{text}");
+    assert!(text.contains("dev"), "{text}");
+    assert!(
+        !out.exists(),
+        "identity must be checked before creating a potentially publishable tier directory"
+    );
+}
+
 /// The Gemma 4 shapes the loader depends on survive the repack: the 48 (here 4) per-layer
 /// `layer_scalar` buffers, the missing `v_proj` on the `full_attention` layers, the embedding table
 /// left dense, and the `U8` packed HF assets byte-identical.
@@ -1171,7 +1345,14 @@ fn the_gemma_checkpoints_load_bearing_shapes_survive_the_repack() {
     let src = tmp.path().join("src");
     let bundle = fixture_bundle(&src);
     let out = tmp.path().join("tiers");
-    convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE).unwrap();
+    convert_2_5_tiers(
+        &bundle,
+        &out,
+        LtxTier::ALL,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     let source =
         FileHeader::read(&src.join("text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"));
@@ -1239,7 +1420,14 @@ fn a_tier_directory_resolves_and_its_sidecars_parse() {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let out = tmp.path().join("q8");
-    convert_2_5_tier(&bundle, &out, LtxTier::Q8, DEFAULT_GROUP_SIZE).unwrap();
+    convert_2_5_tier(
+        &bundle,
+        &out,
+        LtxTier::Q8,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
 
     // The manifest declares 2.5, so the tree keeps the split layout.
     assert_eq!(
@@ -1329,8 +1517,22 @@ fn two_conversions_agree_on_content_not_necessarily_on_bytes() {
     let bundle = fixture_bundle(&tmp.path().join("src"));
     let a = tmp.path().join("a");
     let b = tmp.path().join("b");
-    let ra = convert_2_5_tier(&bundle, &a, LtxTier::Q4, DEFAULT_GROUP_SIZE).unwrap();
-    let rb = convert_2_5_tier(&bundle, &b, LtxTier::Q4, DEFAULT_GROUP_SIZE).unwrap();
+    let ra = convert_2_5_tier(
+        &bundle,
+        &a,
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
+    let rb = convert_2_5_tier(
+        &bundle,
+        &b,
+        LtxTier::Q4,
+        DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
+    )
+    .unwrap();
     assert_eq!(ra.quantized_linears(), rb.quantized_linears());
     for entry in &ra.components {
         let ha = FileHeader::read(&entry.file);
@@ -1449,6 +1651,7 @@ fn an_unlisted_rank2_linear_is_refused_rather_than_shipped_dense() {
         tmp.path().join("q4"),
         LtxTier::Q4,
         DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
     )
     .expect_err("an unlisted rank-2 Linear must fail the conversion");
     let text = err.to_string();
@@ -1469,6 +1672,7 @@ fn an_unlisted_rank2_linear_is_refused_rather_than_shipped_dense() {
         tmp.path().join("q4-clean"),
         LtxTier::Q4,
         DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
     )
     .expect("the same bundle minus the unlisted Linear must convert");
 }
@@ -1529,11 +1733,19 @@ fn a_diffusion_vae_with_no_decoder_is_an_error_not_a_silent_skip() {
         )
         .build()
         .unwrap();
+    let out = tmp.path().join("q4");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        out.join(TIER_MANIFEST_FILE),
+        br#"{"variant":"dev","stale":true}"#,
+    )
+    .unwrap();
     let err = convert_2_5_tier(
         &bundle,
-        tmp.path().join("q4"),
+        &out,
         LtxTier::Q4,
         DEFAULT_GROUP_SIZE,
+        TransformerVariant::Distilled,
     )
     .expect_err("a diffusion VAE with no decoder tensors must fail the conversion");
     let text = err.to_string();
@@ -1542,6 +1754,10 @@ fn a_diffusion_vae_with_no_decoder_is_an_error_not_a_silent_skip() {
         "{text}"
     );
     assert!(text.contains("det_stages"), "{text}");
+    assert!(
+        !out.join(TIER_MANIFEST_FILE).exists(),
+        "a failed conversion must not leave a stale completeness/reuse marker"
+    );
 }
 
 /// A selected weight whose input axis does not divide the group size is a hard error, never a

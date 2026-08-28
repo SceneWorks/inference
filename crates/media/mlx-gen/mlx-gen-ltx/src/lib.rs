@@ -82,6 +82,7 @@ pub use conditioning::{
 pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
+pub use dev_sampler::TransformerVariant;
 pub use diff_vae::{
     auto_diffvae_tiling_budgeted_ltx, DiffVaeMode, DiffVaeTiling, HostNaSupport, ModelOutputType,
     NaDiffusionDecoder, NaDiffusionDecoderConfig, NaKind, DIFFUSION_DECODER_COMPONENT,

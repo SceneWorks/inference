@@ -24,13 +24,30 @@ pub enum TransformerVariant {
 impl TransformerVariant {
     pub const METADATA_KEY: &'static str = "variant";
 
-    pub fn from_metadata(metadata: &BTreeMap<String, String>) -> Result<Self> {
-        match metadata.get(Self::METADATA_KEY).map(String::as_str) {
-            Some("distilled") => Ok(Self::Distilled),
-            Some("dev") => Ok(Self::Dev),
-            Some(other) => Err(Error::Msg(format!(
+    /// Stable identity emitted into a converted split transformer and its tier manifest.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Distilled => "distilled",
+            Self::Dev => "dev",
+        }
+    }
+
+    /// Parse an explicit converter/input identity.  The raw upstream checkpoints do not carry this
+    /// tag, so the converter receives it from its typed caller and stamps the emitted transformer.
+    /// Once emitted, however, every loader consumes this exact value and never invents a default.
+    pub fn from_id(value: &str) -> Result<Self> {
+        match value {
+            "distilled" => Ok(Self::Distilled),
+            "dev" => Ok(Self::Dev),
+            other => Err(Error::Msg(format!(
                 "ltx_2_5: unsupported transformer variant {other:?}; expected 'distilled' or 'dev'"
             ))),
+        }
+    }
+
+    pub fn from_metadata(metadata: &BTreeMap<String, String>) -> Result<Self> {
+        match metadata.get(Self::METADATA_KEY).map(String::as_str) {
+            Some(value) => Self::from_id(value),
             None => Err(Error::Msg(
                 "ltx_2_5: split transformer metadata is missing required 'variant'; refusing to default a checkpoint identity".into(),
             )),

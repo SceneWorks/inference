@@ -17,8 +17,9 @@
 //! # Running
 //!
 //! ```text
-//! LTX25_BUNDLE_DIR=/path/to/a/curated/ltx-2.5-distilled-bf16 \
+//! LTX25_BUNDLE_DIR=/path/to/a/curated/ltx-2.5-transformer-bf16 \
 //! LTX25_TIER_DIR=/path/to/scratch/ltx25-tiers \
+//! LTX25_SOURCE_VARIANT=distilled \
 //!   cargo test -p mlx-gen-ltx --release --test integration -- ltx_2_5_tiers_real_weights:: --ignored --nocapture
 //! ```
 //!
@@ -26,9 +27,10 @@
 //! classified by its own metadata — never by name. It is deliberately *not* the raw upstream
 //! snapshot root: that ships five transformers (distilled/dev × bf16/int8/nvfp4) and two text
 //! encoders, and [`discover_split_bundle`] refuses an ambiguous component rather than guessing which
-//! variant a tier should be built from. Point this at a directory of symlinks selecting the
-//! **distilled bf16** variant (the epic's tier source — the 42 GB dev variant is open decision #5 and
-//! is deliberately not converted here, though nothing in the converter precludes it).
+//! variant a tier should be built from. Point this at a directory of symlinks selecting exactly one
+//! bf16 transformer variant, then set `LTX25_SOURCE_VARIANT=distilled` or `LTX25_SOURCE_VARIANT=dev`.
+//! The upstream transformer does not declare this identity itself, so the explicit typed selection
+//! is stamped into the emitted transformer and manifest; it is never inferred from a filename.
 //!
 //! `LTX25_TIER_DIR` is where the tiers are written and is **required**: three tiers are ~50 GB and
 //! must not land in a temp dir by accident. Paths are supplied by the caller; this crate never names
@@ -48,12 +50,14 @@ use mlx_rs::ops::{abs, max as max_op, mean, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::gen_core::ltx_checkpoint::{
-    discover_split_bundle, LatentUpsamplerMode, LtxBundle, LtxCheckpointLayout, LtxComponent,
+    discover_split_bundle, LatentUpsamplerMode, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
+    LtxComponent,
 };
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
 use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use mlx_gen_ltx::connector::Connector;
+use mlx_gen_ltx::dev_sampler::TransformerVariant;
 use mlx_gen_ltx::diff_vae::{
     DiffVaeQuant, NaDiffusionDecoder, NaDiffusionDecoderConfig, DIFFUSION_DECODER_COMPONENT,
 };
@@ -76,6 +80,39 @@ fn tier_root() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("LTX25_TIER_DIR")?))
 }
 
+/// The upstream source bundle itself has no transformer variant metadata.  Require the calling
+/// release lane to bind the selected source explicitly, then hand the typed value to the converter
+/// for every tier; a missing or misspelled value must not create a plausibly labelled checkpoint.
+fn source_variant() -> TransformerVariant {
+    let value = std::env::var("LTX25_SOURCE_VARIANT").unwrap_or_else(|_| {
+        panic!(
+            "set LTX25_SOURCE_VARIANT to the explicitly selected `distilled` or `dev` transformer"
+        )
+    });
+    TransformerVariant::from_id(&value).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn manifest_variant(dir: &Path) -> Option<String> {
+    let path = dir.join("split_model.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("variant")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn transformer_variant(dir: &Path) -> Option<TransformerVariant> {
+    let bundle = LtxBundleBuilder::new()
+        .with_component(
+            LtxComponent::Transformer,
+            dir.join("transformer.safetensors"),
+        )
+        .build()
+        .ok()?;
+    mlx_gen_ltx::dev_sampler::from_bundle(&bundle).ok()
+}
+
 /// Resolve the upstream bundle and build (or reuse) all three tiers under `LTX25_TIER_DIR`.
 ///
 /// Reuse is keyed on every tier's manifest existing: rebuilding 135 GB to run a second assertion
@@ -89,10 +126,36 @@ fn tiers() -> Option<PathBuf> {
         eprintln!("skip: set LTX25_TIER_DIR to a writable directory with ~135 GB free");
         return None;
     };
+    let variant = source_variant();
     let built = LtxTier::ALL
         .iter()
         .all(|t| out.join(t.id()).join("split_model.json").is_file());
     if built {
+        for tier in LtxTier::ALL {
+            let dir = out.join(tier.id());
+            let manifest = manifest_variant(&dir);
+            let transformer = transformer_variant(&dir);
+            assert_eq!(
+                manifest.as_deref(),
+                Some(variant.id()),
+                "refusing to reuse {}: manifest does not match requested {} source variant",
+                dir.display(),
+                variant.id(),
+            );
+            assert_eq!(
+                transformer,
+                Some(variant),
+                "refusing to reuse {}: transformer header does not match requested {} source variant",
+                dir.display(),
+                variant.id(),
+            );
+            assert_eq!(
+                manifest.as_deref(),
+                transformer.map(TransformerVariant::id),
+                "refusing to reuse {}: manifest and transformer identities disagree",
+                dir.display(),
+            );
+        }
         eprintln!("[tiers] reusing {}", out.display());
         return Some(out);
     }
@@ -102,7 +165,7 @@ fn tiers() -> Option<PathBuf> {
     assert_eq!(bundle.model_version(), Some("2.5.0"));
 
     let t = Instant::now();
-    let reports = convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE)
+    let reports = convert_2_5_tiers(&bundle, &out, LtxTier::ALL, DEFAULT_GROUP_SIZE, variant)
         .expect("build the LTX-2.5 tiers");
     eprintln!(
         "[tiers] built {} tiers in {:.1} min",
