@@ -613,11 +613,14 @@ impl KreaTrainDit {
     ) -> candle_gen::Result<(Tensor, MainCtx)> {
         let (_, channels, h, w) = latent.dims4()?;
         let p = self.cfg.patch_size;
-        if channels != prepared.latent_ch
+        let latent_ch = self.cfg.in_channels / (p * p);
+        if prepared.latent_ch != latent_ch
+            || channels != prepared.latent_ch
             || (h / p, w / p) != (prepared.ht, prepared.wt)
             || h % p != 0
             || w % p != 0
-            || latent.dtype() != prepared.dtype
+            || self.dtype != prepared.dtype
+            || self.device.location() != prepared.device
             || latent.device().location() != prepared.device
         {
             return Err(candle_gen::CandleError::Msg(
@@ -849,6 +852,55 @@ mod tests {
     use crate::adapters::{install_additive, AdditiveDit};
     use candle_gen::gen_core::{AdapterKind, AdapterSpec};
     use std::cell::Cell;
+
+    #[test]
+    fn prepared_control_accepts_a_normalizable_sampler_dtype_and_binds_model_dtype() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dit, cfg, _) = crate::testfix::tiny_dit(&tmp);
+        let latent_ch = cfg.in_channels / (cfg.patch_size * cfg.patch_size);
+        let latent = crate::testfix::rnd(&[1, latent_ch, 4, 4])
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let control = crate::testfix::rnd(&[1, latent_ch, 4, 4])
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let context = crate::testfix::rnd(&[1, 3, cfg.num_text_layers, cfg.text_hidden_dim]);
+        let timestep = Tensor::from_vec(vec![0.5_f32], 1, &Device::Cpu).unwrap();
+
+        let (expected, _) = dit
+            .forward_pre_main(&latent, &timestep, &context)
+            .expect("the base control seam normalizes the sampler dtype");
+        let prepared = dit
+            .prepare_control_conditioning(&context, &control)
+            .unwrap();
+        let (got, _) = dit
+            .forward_pre_main_prepared(&latent, &timestep, &prepared)
+            .expect("prepared control accepts the same normalizable sampler dtype");
+        let max = (&got - &expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec0::<f32>()
+            .unwrap();
+        assert_eq!(max, 0.0, "mixed-dtype prepared control parity");
+
+        let mut wrong_model = dit
+            .prepare_control_conditioning(&context, &control)
+            .unwrap();
+        wrong_model.dtype = DType::BF16;
+        let error = match dit.forward_pre_main_prepared(&latent, &timestep, &wrong_model) {
+            Ok(_) => panic!("prepared control dtype must stay bound to the model"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, candle_gen::CandleError::Msg(ref message) if message.contains("prepared conditioning request identity")),
+            "expected control model-identity rejection, got {error:?}"
+        );
+    }
 
     /// sc-18477: the strict-control DiT must expose the same canonical adapter surface as the base DiT,
     /// including native Krea's `tproj.1` target after it normalizes to `time_mod_proj`. This deliberately
