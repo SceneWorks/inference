@@ -615,14 +615,15 @@ fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {
 }
 
 /// The production Candle LTX-2.5 memory registration.
-pub(crate) const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
-    provider_id: LTX_2_5_DISTILLED_MODEL_ID,
-    contract: memory_strategy_contract,
-    safety_check: registered_safety_check,
-};
+pub(crate) const LTX_2_5_DISTILLED_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: LTX_2_5_DISTILLED_MODEL_ID,
+        contract: memory_strategy_contract,
+        safety_check: registered_safety_check,
+    };
 
 /// Complete weights-free BF16/Q4 load surface for the registered Candle route.
-pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+pub(crate) const LTX_2_5_DISTILLED_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: LTX_2_5_DISTILLED_MODEL_ID,
         contract: weights_free_contract,
@@ -630,7 +631,7 @@ pub(crate) const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     };
 
 /// Executable weights-free request-scope behavior for every implemented optimized rung.
-pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+pub(crate) const LTX_2_5_DISTILLED_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: LTX_2_5_DISTILLED_MODEL_ID,
         valid_fixtures: registered_valid_fixtures,
@@ -944,11 +945,23 @@ mod tests {
 
     #[test]
     fn registration_and_weights_free_surfaces_name_the_distilled_two_five_engine() {
-        assert_eq!(MEMORY_REGISTRATION.provider_id, LTX_2_5_DISTILLED_MODEL_ID);
-        assert_eq!(MEMORY_FIXTURE.provider_id, LTX_2_5_DISTILLED_MODEL_ID);
-        assert_eq!(MEMORY_BEHAVIOR.provider_id, LTX_2_5_DISTILLED_MODEL_ID);
-        assert_ne!(MEMORY_REGISTRATION.provider_id, crate::MODEL_ID);
-        let surfaces = (MEMORY_FIXTURE.surface_specs)();
+        assert_eq!(
+            LTX_2_5_DISTILLED_MEMORY_REGISTRATION.provider_id,
+            LTX_2_5_DISTILLED_MODEL_ID
+        );
+        assert_eq!(
+            LTX_2_5_DISTILLED_MEMORY_FIXTURE.provider_id,
+            LTX_2_5_DISTILLED_MODEL_ID
+        );
+        assert_eq!(
+            LTX_2_5_DISTILLED_MEMORY_BEHAVIOR.provider_id,
+            LTX_2_5_DISTILLED_MODEL_ID
+        );
+        assert_ne!(
+            LTX_2_5_DISTILLED_MEMORY_REGISTRATION.provider_id,
+            crate::MODEL_ID
+        );
+        let surfaces = (LTX_2_5_DISTILLED_MEMORY_FIXTURE.surface_specs)();
         assert_eq!(
             surfaces.len(),
             8,
@@ -1239,8 +1252,8 @@ mod tests {
 
     #[test]
     fn every_declared_surface_conforms_and_behavior_is_executable() {
-        for surface in (MEMORY_FIXTURE.surface_specs)() {
-            let contract = (MEMORY_FIXTURE.contract)(&surface.spec).unwrap();
+        for surface in (LTX_2_5_DISTILLED_MEMORY_FIXTURE.surface_specs)() {
+            let contract = (LTX_2_5_DISTILLED_MEMORY_FIXTURE.contract)(&surface.spec).unwrap();
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
         }
         let registry = crate::register_memory_contract_surfaces(

@@ -2343,9 +2343,9 @@ pub fn register_providers(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR);
+        .register_memory_strategy(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_BEHAVIOR);
     registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
@@ -2360,9 +2360,9 @@ pub fn register_memory_contract_surfaces(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
-        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR)
+        .register_memory_strategy(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy_2_5::LTX_2_5_DISTILLED_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle LTX provider catalog.

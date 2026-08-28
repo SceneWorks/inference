@@ -159,15 +159,15 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_generator(model::REGISTRATION_25)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
-        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
+        .register_memory_strategy(memory_strategy_2_5::LTX_2_5_MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
             contract: memory_strategy::weights_free_memory_strategy_contract,
             surface_specs: memory_strategy::memory_contract_surface_specs,
         })
-        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
+        .register_memory_contract_fixture(memory_strategy_2_5::LTX_2_5_MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
-        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR)
+        .register_memory_behavior(memory_strategy_2_5::LTX_2_5_MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
 }

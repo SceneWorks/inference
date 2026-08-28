@@ -860,20 +860,21 @@ fn registered_valid_fixtures(
 }
 
 /// The production LTX-2.5 MLX memory registration.
-pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration = gen_core::MemoryRegistration {
-    provider_id: LTX_2_5_MODEL_ID,
-    contract: memory_strategy_contract,
-    safety_check: registered_safety_check,
-};
+pub const LTX_2_5_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+    gen_core::MemoryRegistration {
+        provider_id: LTX_2_5_MODEL_ID,
+        contract: memory_strategy_contract,
+        safety_check: registered_safety_check,
+    };
 
-pub const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+pub const LTX_2_5_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: LTX_2_5_MODEL_ID,
         contract: weights_free_memory_strategy_contract,
         surface_specs: gen_core::mlx_memory_contract_surface_specs,
     };
 
-pub const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+pub const LTX_2_5_MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
     gen_core::MemoryBehaviorRegistration {
         provider_id: LTX_2_5_MODEL_ID,
         valid_fixtures: registered_valid_fixtures,
