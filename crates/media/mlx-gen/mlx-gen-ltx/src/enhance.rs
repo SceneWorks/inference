@@ -24,7 +24,11 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
-use mlx_llm::CausalLm;
+use mlx_llm::decode::{
+    generate_cached_with, generate_from_prefill, ConstraintMask, GenerationConfig, StreamEvent,
+};
+use mlx_llm::primitives::sampler::SamplingParams;
+use mlx_llm::{CausalLm, PrefixCache};
 // The token sampler (temperature / top-k / top-p / repetition penalty) + seeded PRNG live in the core
 // crate's shared `text_sample` module (sc-9561 / F-105) so the lens PromptReasoner reuses them rather
 // than cloning. `SampleParams` stays part of this crate's public API via the re-export.
@@ -39,12 +43,22 @@ use crate::tokenizer::LtxTokenizer;
 /// canonical `ltx_core` copies, identical across the SceneWorks venv and the upstream git checkout).
 pub const T2V_SYSTEM_PROMPT: &str = include_str!("prompts/gemma_t2v_system_prompt.txt");
 pub const I2V_SYSTEM_PROMPT: &str = include_str!("prompts/gemma_i2v_system_prompt.txt");
+/// LTX-2 v1.2.0 Gemma-4 prompt contracts. These are separate assets: the Gemma-3 text and sampling
+/// policy are not interchangeable with the Gemma-4 instruct enhancer.
+pub const GEMMA4_T2V_SYSTEM_PROMPT: &str = include_str!("prompts/gemma4_t2v_system_prompt.txt");
+pub const GEMMA4_I2V_SYSTEM_PROMPT: &str = include_str!("prompts/gemma4_i2v_system_prompt.txt");
 
 /// Reference enhancement defaults (`generate_av.py` CLI).
 pub const DEFAULT_MAX_TOKENS: usize = 512;
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 /// Reference enhancement default seed (`enhance_t2v(..., seed=42)`).
 pub const DEFAULT_SEED: u64 = 42;
+/// Upstream `GEMMA4_ENHANCE_GENERATION_KWARGS.max_new_tokens`.
+pub const GEMMA4_DEFAULT_MAX_TOKENS: usize = 600;
+/// Upstream Gemma-4 enhancer method default (`seed=10`; greedy makes it deterministic today).
+pub const GEMMA4_DEFAULT_SEED: u64 = 10;
+/// Upstream `GEMMA4_ENHANCE_GENERATION_KWARGS.no_repeat_ngram_size`.
+pub const GEMMA4_NO_REPEAT_NGRAM: usize = 5;
 
 /// Hard ceiling on enhance decode length (F-012 twin of the flux2 cap). Each decode step is a full
 /// Gemma forward over a growing KV cache, so a request-supplied `enhance_max_tokens` must be capped
@@ -62,6 +76,13 @@ pub fn clamp_max_tokens(requested: Option<u32>) -> usize {
     requested
         .map(|m| (m as usize).min(MAX_TOKENS_CAP))
         .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+/// Resolve Gemma-4's distinct 600-token default while preserving the common request hard cap.
+pub fn clamp_gemma4_max_tokens(requested: Option<u32>) -> usize {
+    requested
+        .map(|m| (m as usize).min(MAX_TOKENS_CAP))
+        .unwrap_or(GEMMA4_DEFAULT_MAX_TOKENS)
 }
 
 /// Stop tokens: `<eos>` (1) and `<end_of_turn>` (106) — see the module note on the reference's `107`.
@@ -166,61 +187,160 @@ pub fn enhance(
     Ok(clean_response(&text))
 }
 
-/// Run the same seeded enhancement decode over the stock Gemma-4 causal decoder used by the
-/// LTX-2.5 rehost.  The caller owns rendering the snapshot's own Jinja chat template; keeping
-/// that rendering beside snapshot validation prevents the old Gemma-3 turn markers from leaking
-/// into a Gemma-4 request.
+/// The already-tokenized Gemma-4 prefill. T2V can reuse a cached textual prefix; I2V must prefill
+/// the embeddings after the reference image's projected patch rows replace its soft-token span.
+pub enum Gemma4EnhancePrefill {
+    Text(Vec<i32>),
+    Multimodal { input_ids: Vec<i32>, embeds: Array },
+}
+
+/// Preserve contract-bearing `mlx-llm` errors across the media-crate boundary. In particular, a
+/// cancellation observed by the shared decode loop must remain `Canceled` all the way to the
+/// worker instead of becoming an ordinary string error.
+fn from_gemma4_decode(e: mlx_llm::Error) -> Error {
+    match e {
+        mlx_llm::Error::Unsupported(message) => Error::Unsupported(message),
+        mlx_llm::Error::Canceled => Error::Canceled,
+        mlx_llm::Error::MissingTensor(key) => Error::MissingTensor(key),
+        mlx_llm::Error::Io(error) => Error::Io(error),
+        other => Error::Msg(format!("ltx_2_5 enhancer decode: {other}")),
+    }
+}
+
+/// Hugging Face `NoRepeatNGramLogitsProcessor`, expressed through the shared decode constraint seam.
+/// Before each greedy draw it bans the token that would complete any already-seen N-token gram.
+struct NoRepeatNgram {
+    n: usize,
+    history: Vec<i32>,
+    allowed: Vec<bool>,
+}
+
+impl NoRepeatNgram {
+    fn new(n: usize, history: Vec<i32>, vocab_size: usize) -> Self {
+        Self {
+            n,
+            history,
+            allowed: vec![true; vocab_size],
+        }
+    }
+
+    fn rebuild(&mut self) {
+        self.allowed.fill(true);
+        if self.n < 2 || self.history.len() < self.n - 1 {
+            return;
+        }
+        let prefix = &self.history[self.history.len() - (self.n - 1)..];
+        if self.history.len() < self.n {
+            return;
+        }
+        for start in 0..=self.history.len() - self.n {
+            if self.history[start..start + self.n - 1] == *prefix {
+                let token = self.history[start + self.n - 1];
+                if let Some(slot) = usize::try_from(token)
+                    .ok()
+                    .and_then(|index| self.allowed.get_mut(index))
+                {
+                    *slot = false;
+                }
+            }
+        }
+    }
+}
+
+impl ConstraintMask for NoRepeatNgram {
+    fn allowed(&mut self) -> &[bool] {
+        self.rebuild();
+        &self.allowed
+    }
+
+    fn accept(&mut self, token: i32) {
+        self.history.push(token);
+    }
+}
+
+/// Run the v1.2.0 Gemma-4 enhancement generation policy over the shared decoder stack: greedy
+/// decoding, five-gram suppression, final-logit soft-capping from `ModelConfig`, cancellation, and
+/// the shared streaming loop. Text prefills use the reusable prefix cache; image prefills enter the
+/// same loop after the caller's vision splice.
 #[allow(clippy::too_many_arguments)]
 pub fn enhance_gemma4(
     gemma: &CausalLm,
     tokenizer: &TextTokenizer,
-    formatted: &str,
+    prefill: Gemma4EnhancePrefill,
     cfg: &EnhanceConfig,
-    sampler: &SampleParams,
-    cancel: Option<&CancelFlag>,
+    vocab_size: usize,
+    cancel: &CancelFlag,
+    prefix_cache: &mut PrefixCache,
 ) -> Result<String> {
-    if cancel.is_some_and(CancelFlag::is_cancelled) {
+    if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let prompt_ids = tokenizer.encode_ids(formatted, false)?;
-    if prompt_ids.is_empty() {
+    let history = match &prefill {
+        Gemma4EnhancePrefill::Text(ids) => ids,
+        Gemma4EnhancePrefill::Multimodal { input_ids, .. } => input_ids,
+    };
+    if history.is_empty() {
         return Ok(String::new());
     }
-
-    let mut history = prompt_ids.clone();
-    let mut cache = gemma.new_cache();
-    let mut rng = SplitMix64::new(cfg.seed);
-    let prompt_len = prompt_ids.len() as i32;
-    let ids = Array::from_slice(&prompt_ids, &[1, prompt_len]);
-    let mut logits = gemma
-        .decode_logits(&ids, &mut cache, 0)
-        .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer decode prefill: {e}")))?;
-
-    let mut generated = Vec::new();
-    for step in 0..cfg.max_tokens {
-        if cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
+    let generation = GenerationConfig {
+        max_new_tokens: cfg.max_tokens,
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        },
+        seed: Some(cfg.seed),
+        stop_tokens: STOP_TOKENS.to_vec(),
+    };
+    let mut no_repeat = NoRepeatNgram::new(GEMMA4_NO_REPEAT_NGRAM, history.clone(), vocab_size);
+    let decode_cancel = mlx_llm::CancelFlag::new();
+    let bridged_cancel = decode_cancel.clone();
+    let mut on_event = |_event: StreamEvent| {
+        if cancel.is_cancelled() {
+            bridged_cancel.cancel();
         }
-        let logits_host = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let next = sample_token(&logits_host, &history, sampler, &mut rng);
-        generated.push(next);
-        history.push(next);
-        if STOP_TOKENS.contains(&next) {
-            break;
+    };
+    let output = match prefill {
+        Gemma4EnhancePrefill::Text(prompt_ids) => generate_cached_with(
+            gemma,
+            &prompt_ids,
+            &generation,
+            &decode_cancel,
+            &mut on_event,
+            prefix_cache,
+            Some(&mut no_repeat),
+            None,
+        ),
+        Gemma4EnhancePrefill::Multimodal { input_ids, embeds } => {
+            let mut cache = gemma.new_cache();
+            let logits = gemma
+                .decode_logits_from_embeds(&embeds, &mut cache, 0)
+                .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer multimodal prefill: {e}")))?;
+            generate_from_prefill(
+                gemma,
+                &mut cache,
+                logits,
+                input_ids,
+                &generation,
+                &decode_cancel,
+                &mut on_event,
+                Some(&mut no_repeat),
+                None,
+            )
         }
-        let nxt = Array::from_slice(&[next], &[1, 1]);
-        logits = gemma
-            .decode_logits(&nxt, &mut cache, prompt_len + step as i32)
-            .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer decode token: {e}")))?;
+    }
+    .map_err(from_gemma4_decode)?;
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
     }
 
-    let ids: Vec<u32> = generated.iter().map(|&id| id as u32).collect();
+    let ids: Vec<u32> = output.tokens.iter().map(|&id| id as u32).collect();
     Ok(clean_response(&tokenizer.decode(&ids, true)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     #[test]
     fn clean_response_strips_leading_punctuation_and_whitespace() {
@@ -256,6 +376,8 @@ mod tests {
             MAX_TOKENS_CAP
         );
         assert_eq!(clamp_max_tokens(Some(u32::MAX)), MAX_TOKENS_CAP);
+        assert_eq!(clamp_gemma4_max_tokens(None), GEMMA4_DEFAULT_MAX_TOKENS);
+        assert_eq!(clamp_gemma4_max_tokens(Some(64)), 64);
     }
 
     #[test]
@@ -273,6 +395,46 @@ mod tests {
     fn vendored_prompts_are_present_and_nonempty() {
         assert!(T2V_SYSTEM_PROMPT.contains("Creative Assistant"));
         assert!(I2V_SYSTEM_PROMPT.contains("image-to-video"));
+        assert!(GEMMA4_T2V_SYSTEM_PROMPT.contains("audio-visual caption"));
+        assert!(GEMMA4_I2V_SYSTEM_PROMPT.contains("REFERENCE IMAGE"));
+        assert_ne!(GEMMA4_T2V_SYSTEM_PROMPT, T2V_SYSTEM_PROMPT);
+        assert_ne!(GEMMA4_I2V_SYSTEM_PROMPT, I2V_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn gemma4_v120_prompts_are_exact_pinned_upstream_bytes() {
+        let sha256 = |bytes: &[u8]| format!("{:x}", sha2::Sha256::digest(bytes));
+        assert_eq!(GEMMA4_T2V_SYSTEM_PROMPT.len(), 3_769);
+        assert_eq!(
+            sha256(GEMMA4_T2V_SYSTEM_PROMPT.as_bytes()),
+            "0cddf69456bcd51e65430f848386295d9ac4d17d5df3ea65d5f3d8a9ad842f3c"
+        );
+        assert_eq!(GEMMA4_I2V_SYSTEM_PROMPT.len(), 4_708);
+        assert_eq!(
+            sha256(GEMMA4_I2V_SYSTEM_PROMPT.as_bytes()),
+            "15992bfb757d3bbd83f2d27ad86e450fc4caffa0f7cb7523772a60e346ef3fee"
+        );
+    }
+
+    #[test]
+    fn gemma4_no_repeat_ngram_bans_only_the_repeated_completion() {
+        let mut constraint = NoRepeatNgram::new(5, vec![1, 2, 3, 4, 9, 7, 1, 2, 3, 4], 16);
+        let mask = constraint.allowed();
+        assert!(!mask[9], "token 9 would repeat [1,2,3,4,9]");
+        assert!(mask[8]);
+        constraint.accept(8);
+        assert!(
+            constraint.allowed()[9],
+            "the suffix changed after accepting 8"
+        );
+    }
+
+    #[test]
+    fn gemma4_shared_decode_cancellation_stays_typed() {
+        assert!(matches!(
+            from_gemma4_decode(mlx_llm::Error::Canceled),
+            Error::Canceled
+        ));
     }
 
     // `SampleParams` presets + `SplitMix64` determinism are covered in the shared

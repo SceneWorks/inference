@@ -28,6 +28,8 @@ mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 # embedded_config.json / config.json / split_model.json reading (config-driven loader).
 serde_json = { workspace = true }
+# Fail-closed content identity for the separately rehosted stock Gemma-4 enhancer snapshot.
+sha2 = { workspace = true }
 # Decode training-dataset images (LoRA training, sc-3047). PNG + JPEG cover the SceneWorks dataset
 # formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { workspace = true }

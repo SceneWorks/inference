@@ -22,6 +22,14 @@ reimplemented — is recorded under "Ported third-party source" below.)
 Ported third-party source (IN the shipped Rust crates)
 -----------------------------------------------------
 
+  * LTX-2.5 Gemma 4 system prompts             (LTX-2.x Community License Agreement)
+    Copyright Lightricks Ltd.
+    `mlx-gen-ltx/src/prompts/gemma4_{t2v,i2v}_system_prompt.txt` are copied verbatim from
+    Lightricks/LTX-2 v1.2.0 at commit
+    d151147788a9284cca791edc6ce898007e727fe6. Provenance and the applicable license pointer are
+    recorded beside the assets in `mlx-gen-ltx/src/prompts/README.md`; the containing crate's
+    Apache-2.0 declaration does not relicense them.
+
   * Cephes Math Library Release 2.8          (BSD 3-Clause)
     Copyright 1984, 1987, 1988, 1992, 2000 by Stephen L. Moshier.
     Grant text states: Copyright (c) 2018, Steven Moshier. All rights reserved.
