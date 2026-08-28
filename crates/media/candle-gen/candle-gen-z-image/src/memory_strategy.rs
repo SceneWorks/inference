@@ -302,8 +302,8 @@ fn validated_materialized_text_encoder_bytes(
     source: &WeightsSource,
     comfyui_file: bool,
 ) -> gen_core::Result<Option<u64>> {
-    let roots = selected_encoder_discovery_roots(source)?;
     let selected = if comfyui_file && matches!(source, WeightsSource::File(_)) {
+        let roots = selected_encoder_discovery_roots(source)?;
         let inventory = gen_core::encoder_contract::text_encoder_source_inventory_for_discovery(
             source, &roots,
         )?;
@@ -319,6 +319,7 @@ fn validated_materialized_text_encoder_bytes(
             return Ok(None);
         }
     } else if selected_encoder_has_authoritative_config(source) {
+        let roots = selected_encoder_discovery_roots(source)?;
         crate::ENCODER_CONTRACT.validate_source_for_discovery(source, &roots)?
     } else {
         return Ok(None);
@@ -1440,6 +1441,21 @@ mod tests {
             .expect_err("the executable load seam must reject a missing selected encoder")
             .to_string();
         assert!(error.contains("text encoder"), "got: {error}");
+    }
+
+    #[test]
+    fn weights_free_contract_does_not_require_a_builtin_encoder_to_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nonexistent");
+        let spec = LoadSpec::new(WeightsSource::Dir(missing.clone()));
+
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap_or_else(|error| {
+            panic!(
+                "weights-free catalog construction must not require or canonicalize {}: {error}",
+                missing.join("text_encoder").display()
+            )
+        });
+        assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
     }
 
     #[test]
