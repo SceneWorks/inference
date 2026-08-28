@@ -89,6 +89,7 @@ use candle_gen::gen_core::{
 use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
 use audio_vae::AudioDecoder;
+use block_stream::LtxBlockStream;
 use config::{
     compute_audio_frames, AudioVaeConfig, AvConfig, ConnectorConfig, GemmaConfig, VocoderConfig,
     DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, STAGE2_SIGMAS,
@@ -216,7 +217,44 @@ struct Pipeline {
     use_diffusion_decoder: bool,
 }
 
+fn ltx25_video_component(use_diffusion_decoder: bool) -> LtxComponent {
+    if use_diffusion_decoder {
+        LtxComponent::DiffusionVideoVae
+    } else {
+        LtxComponent::ConvVideoVae
+    }
+}
+
+/// Converted tiers split the causal video encoder from the selected decoder. Raw upstream bundles
+/// keep the encoder beside that decoder, so the selected component remains the compatibility
+/// fallback. DiffVAE conversions have used both explicit and shared encoder names; neither may be
+/// confused with the diffusion decoder itself when a real encoder half is present.
+pub(crate) fn ltx25_encoder_path(root: &Path, component: LtxComponent, fallback: &Path) -> PathBuf {
+    let candidates: &[&str] = match component {
+        LtxComponent::ConvVideoVae => &["vae_encoder.safetensors"],
+        LtxComponent::DiffusionVideoVae => &[
+            "diffusion_vae_encoder.safetensors",
+            "vae_encoder.safetensors",
+        ],
+        _ => return fallback.to_path_buf(),
+    };
+    candidates
+        .iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
 impl Pipeline {
+    fn selected_decode_cap(&self, request: &GenerationRequest) -> CResult<Option<(u32, u32)>> {
+        if self.split_bundle.is_some() {
+            memory_strategy_2_5::selected_decode_cap(request, self.use_diffusion_decoder)
+                .map_err(|error| CandleError::Msg(error.to_string()))
+        } else {
+            memory_strategy::selected_decode_cap(request)
+        }
+    }
+
     fn load(
         root: &Path,
         device: &Device,
@@ -324,7 +362,11 @@ impl Pipeline {
         with_vae_encoder: bool,
     ) -> CResult<Components> {
         if self.split_bundle.is_some() {
-            return self.load_components_split(adapters, with_vae_encoder);
+            return self.load_components_split(
+                adapters,
+                with_vae_encoder,
+                memory_strategy_2_5::TransformerExecution::default(),
+            );
         }
         // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
         // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
@@ -404,25 +446,46 @@ impl Pipeline {
         &self,
         adapters: &[AdapterSpec],
         with_vae_encoder: bool,
+        execution: memory_strategy_2_5::TransformerExecution,
     ) -> CResult<Components> {
         let bundle = self.split_bundle.as_ref().expect("split route has bundle");
         let transformer = bundle
             .require(LtxComponent::Transformer)
             .map_err(|e| CandleError::Msg(e.to_string()))?
             .path();
-        let conv = bundle
-            .require(LtxComponent::ConvVideoVae)
+        let connector = transformer.with_file_name("connector.safetensors");
+        let video_component = ltx25_video_component(self.use_diffusion_decoder);
+        let video = bundle
+            .require(video_component)
             .map_err(|e| CandleError::Msg(e.to_string()))?
             .path();
         let audio = bundle
             .require(LtxComponent::AudioVae)
             .map_err(|e| CandleError::Msg(e.to_string()))?
             .path();
-        let dit_all =
-            candle_gen::mmap_var_builder(&[transformer.to_path_buf()], DIT_DTYPE, &self.device)?;
+        // Converted tiers split the text projections/connectors out of the transformer so the
+        // conditioning stage can load them without materializing the DiT. Raw upstream bundles
+        // keep those keys in the transformer file, so the sibling is optional rather than a naming
+        // requirement on that route.
+        let mut dit_files = vec![transformer.to_path_buf()];
+        if connector.is_file() {
+            dit_files.push(connector);
+        }
+        let dit_all = candle_gen::mmap_var_builder(&dit_files, DIT_DTYPE, &self.device)?;
         let dit_vb = dit_all.pp("model.diffusion_model");
-        let mut avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
+        let mut avdit = if execution.is_streamed() {
+            let stream = LtxBlockStream::new(dit_vb.clone(), self.av_cfg.clone(), adapters)?;
+            AvDiT::new_block_streamed(dit_vb.clone(), &self.av_cfg, stream)?
+        } else {
+            AvDiT::new(dit_vb.clone(), &self.av_cfg)?
+        };
         adapters::install_ltx25_adapters(&mut avdit, adapters)?;
+        if let Some(chunk) = execution.attention_chunk_size {
+            avdit.set_attention_budget(chunk as usize);
+        }
+        if let Some(window) = execution.transformer_window_size {
+            avdit.set_transformer_window(window as usize)?;
+        }
         let te = Ltx25TextEncoder::from_bundle_av(
             bundle,
             dit_all.clone(),
@@ -431,16 +494,37 @@ impl Pipeline {
             &self.conn_cfg,
             &self.audio_conn_cfg,
         )?;
-        let conv_vb = candle_gen::mmap_var_builder(&[conv.to_path_buf()], VAE_DTYPE, &self.device)?;
-        let vae = if with_vae_encoder {
+        let video_vb =
+            candle_gen::mmap_var_builder(&[video.to_path_buf()], VAE_DTYPE, &self.device)?;
+        let encoder_path = ltx25_encoder_path(&self.root, video_component, video);
+        let encoder_is_split = encoder_path != video;
+        let vae = if self.use_diffusion_decoder {
+            if with_vae_encoder {
+                let encoder_vb =
+                    candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?;
+                let encoder_root = if encoder_is_split {
+                    encoder_vb.pp("vae")
+                } else {
+                    encoder_vb
+                };
+                LtxVideoVae::new_encoder_only(encoder_root, config::LATENT_CHANNELS, 4)?
+            } else {
+                LtxVideoVae::new_statistics_only(video_vb.clone(), config::LATENT_CHANNELS, 4)?
+            }
+        } else if with_vae_encoder {
+            let encoder_vb = if encoder_is_split {
+                candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?.pp("vae")
+            } else {
+                video_vb.pp("vae")
+            };
             LtxVideoVae::new_with_encoder(
-                conv_vb.pp("vae"),
-                conv_vb.pp("vae"),
+                video_vb.pp("vae"),
+                encoder_vb,
                 config::LATENT_CHANNELS,
                 4,
             )?
         } else {
-            LtxVideoVae::new(conv_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
+            LtxVideoVae::new(video_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
         };
         let upsampler = LatentUpsampler::from_checkpoint(
             bundle
@@ -868,7 +952,14 @@ impl Pipeline {
                 seed.wrapping_add(4),
                 DEFAULT_DIFFVAE_MODE,
             )?,
-            None => comps.vae.decode_budgeted(&output.video_latent)?,
+            None => match self.selected_decode_cap(req)? {
+                Some((edge, overlap)) => comps.vae.decode_budgeted_with_spatial_cap(
+                    &output.video_latent,
+                    edge,
+                    overlap,
+                )?,
+                None => comps.vae.decode_budgeted(&output.video_latent)?,
+            },
         };
         let images = pipeline::frames_to_images(&decoded)?;
         let audio = match &comps.audio {
@@ -1292,7 +1383,7 @@ impl Pipeline {
             Some(decoder) => {
                 decoder.decode_budgeted_seeded(&vlat, seed.wrapping_add(4), DEFAULT_DIFFVAE_MODE)?
             }
-            None => match memory_strategy::selected_decode_cap(req)? {
+            None => match self.selected_decode_cap(req)? {
                 Some((edge, overlap)) => comps
                     .vae
                     .decode_budgeted_with_spatial_cap(&vlat, edge, overlap)?,
@@ -2025,6 +2116,12 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// Lazy LTX-2.5 split-bundle provider.  Metadata/configuration is resolved at ordinary catalog
 /// load time; multi-gigabyte tensors remain request-scoped in the existing LTX renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ltx25ComponentsKey {
+    with_vae_encoder: bool,
+    execution: memory_strategy_2_5::TransformerExecution,
+}
+
 pub struct Ltx25Generator {
     descriptor: ModelDescriptor,
     bundle: LtxBundle,
@@ -2039,7 +2136,14 @@ pub struct Ltx25Generator {
     /// Selected LoRA stack retained through the lazy provider boundary and installed while the
     /// request-scoped split transformer is materialised.
     adapters: Vec<AdapterSpec>,
-    components: Mutex<Option<Components>>,
+    /// Exact loaded-route declaration and numeric tier. CUDA installs these from the same
+    /// `LoadSpec` that selected the component bundle; non-CUDA builds expose no executable ladder.
+    memory_strategy: Option<gen_core::MemoryProviderContract>,
+    memory_tier: Option<gen_core::MemoryNumericTier>,
+    /// Request-local transformer controls are part of the cache identity. Reusing components from
+    /// a prior resident/windowed request would otherwise truthfully validate a rung and then run the
+    /// wrong loader.
+    components: Mutex<Option<(Ltx25ComponentsKey, Components)>>,
 }
 
 /// Load the split LTX-2.5 route through the standard generator registry.  The selected decoder is
@@ -2081,6 +2185,13 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     resolved.require(LtxComponent::DurationHead)?;
     resolved.require(LtxComponent::TemporalUpsampler)?;
     drop(pipe);
+    #[cfg(feature = "cuda")]
+    let (memory_strategy, memory_tier) = {
+        let (contract, tier) = memory_strategy_2_5::contract_for_loaded(spec, &resolved)?;
+        (Some(contract), Some(tier))
+    };
+    #[cfg(not(feature = "cuda"))]
+    let (memory_strategy, memory_tier) = (None, None);
     Ok(Box::new(Ltx25Generator {
         descriptor: descriptor_25_for_variant(transformer_variant),
         bundle: resolved,
@@ -2089,6 +2200,8 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         transformer_variant,
         quant_mode,
         adapters: spec.adapters.clone(),
+        memory_strategy,
+        memory_tier,
         components: Mutex::new(None),
     }))
 }
@@ -2121,6 +2234,11 @@ impl Generator for Ltx25Generator {
                 )));
             }
         }
+        memory_strategy_2_5::transformer_execution(
+            req,
+            self.memory_strategy.as_ref(),
+            self.use_diffusion_decoder,
+        )?;
         Ok(())
     }
 
@@ -2137,19 +2255,70 @@ impl Generator for Ltx25Generator {
             self.quant_mode,
             self.transformer_variant,
         )?;
+        let execution = memory_strategy_2_5::transformer_execution(
+            req,
+            self.memory_strategy.as_ref(),
+            self.use_diffusion_decoder,
+        )?;
         let mut slot = candle_gen::lock_recover(&self.components);
-        let want_encoder = needs_ltx_vae_encoder(req);
+        let key = Ltx25ComponentsKey {
+            with_vae_encoder: needs_ltx_vae_encoder(req),
+            execution,
+        };
         if slot
             .as_ref()
-            .is_none_or(|components| components.vae_has_encoder != want_encoder)
+            .is_none_or(|(cached_key, _)| *cached_key != key)
         {
             *slot = None;
-            *slot = Some(pipe.load_components(&self.adapters, want_encoder)?);
+            *slot = Some((
+                key,
+                pipe.load_components_split(&self.adapters, key.with_vae_encoder, execution)?,
+            ));
         }
-        let components = slot.as_ref().expect("split components populated").clone();
+        let components = slot.as_ref().expect("split components populated").1.clone();
         drop(slot);
         let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video { frames, fps, audio })
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&gen_core::MemoryProviderContract> {
+        self.memory_strategy.as_ref()
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::MemorySafetyDecision {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return if context.selection.strategy == gen_core::MemoryStrategy::Resident {
+                gen_core::MemorySafetyDecision::Accept
+            } else {
+                gen_core::MemorySafetyDecision::Reject {
+                    reason: format!(
+                        "{MODEL_25_ID}: loaded route has no CUDA memory-strategy contract"
+                    ),
+                }
+            };
+        };
+        let overlay = gen_core::adapter_stack_identity(&self.adapters);
+        memory_strategy_2_5::safety_check(contract, tier, overlay.as_deref(), context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &gen_core::MemoryRunContext,
+    ) -> gen_core::Result<Option<Box<dyn gen_core::MemoryRequestScope + '_>>> {
+        let (Some(contract), Some(tier)) = (self.memory_strategy.as_ref(), self.memory_tier) else {
+            return Ok(None);
+        };
+        let overlay = gen_core::adapter_stack_identity(&self.adapters);
+        memory_strategy_2_5::begin_request(
+            contract,
+            tier,
+            overlay.as_deref(),
+            self.device.clone(),
+            context,
+        )
     }
 }
 
@@ -2173,13 +2342,17 @@ pub fn register_providers(
     let registry = registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR);
     registry
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
 }
 
-/// Register the weights-free Candle/CUDA q4 I2V memory surface without requiring CUDA or weights.
+/// Register the weights-free Candle/CUDA LTX-2.3 q4 I2V and LTX-2.5 BF16/Q4 memory surfaces
+/// without requiring CUDA or weights.
 pub fn register_memory_contract_surfaces(
     registry: candle_gen::gen_core::ProviderRegistryBuilder,
 ) -> candle_gen::gen_core::ProviderRegistryBuilder {
@@ -2187,6 +2360,9 @@ pub fn register_memory_contract_surfaces(
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
+        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit Candle LTX provider catalog.
@@ -2226,6 +2402,32 @@ mod explicit_registry_tests {
 
         assert_eq!(generators, ["ltx_2_3_distilled", "ltx_2_5_distilled"]);
         assert_eq!(trainers, ["ltx_2_3", "ltx_2_5_distilled"]);
+    }
+
+    #[test]
+    fn weights_free_catalog_reaches_both_memory_registrations_and_behaviors() {
+        let registry = super::register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(super::REGISTRATION)
+                .register_generator(super::REGISTRATION_25),
+        )
+        .build()
+        .unwrap();
+        let memory_ids: Vec<_> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let fixture_ids: Vec<_> = registry
+            .memory_contract_fixture_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        let behavior_ids: Vec<_> = registry
+            .memory_behavior_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
+        assert_eq!(memory_ids, [super::MODEL_ID, super::MODEL_25_ID]);
+        assert_eq!(fixture_ids, [super::MODEL_ID, super::MODEL_25_ID]);
+        assert_eq!(behavior_ids, [super::MODEL_ID, super::MODEL_25_ID]);
     }
 }
 
@@ -2271,6 +2473,8 @@ mod tests {
             transformer_variant: TransformerVariant::Distilled,
             quant_mode: Ltx25QuantMode::Bf16,
             adapters: Vec::new(),
+            memory_strategy: None,
+            memory_tier: None,
             components: Mutex::new(None),
         };
         let request = GenerationRequest {
@@ -2388,6 +2592,69 @@ mod tests {
         assert!(renderer.contains("denoise_av_dev_conditioned("));
         assert!(renderer.contains("negative_context"));
         assert!(source.contains("dfr::generate_dfr_av_latents("));
+    }
+
+    #[test]
+    fn ltx25_memory_selection_reaches_the_exact_split_loader_and_cache_identity() {
+        // Rung 4 is output-preserving, so output comparison cannot catch an accidentally resident
+        // loader. Pin the ordinary provider's construction seam and cache identity as a
+        // mutation-sensitive companion to `AvDiT::is_block_streamed`'s behavioral tests.
+        let source = include_str!("lib.rs");
+        let loader = function_body(source, "load_components_split");
+        assert!(loader.contains("LtxBlockStream::new("));
+        assert!(loader.contains("AvDiT::new_block_streamed("));
+        assert!(loader.contains("AvDiT::new("));
+        assert!(loader.contains("avdit.set_attention_budget("));
+        assert!(loader.contains("avdit.set_transformer_window("));
+
+        let provider = source
+            .split("impl Generator for Ltx25Generator")
+            .nth(1)
+            .expect("LTX-2.5 provider implementation exists");
+        assert!(provider.contains("memory_strategy_2_5::transformer_execution("));
+        assert!(provider.contains("let key = Ltx25ComponentsKey"));
+        assert!(provider.contains("pipe.load_components_split("));
+        assert!(provider.contains("memory_strategy_2_5::safety_check("));
+        assert!(provider.contains("memory_strategy_2_5::begin_request("));
+    }
+
+    #[test]
+    fn ltx25_converted_loader_selects_the_real_encoder_and_does_not_force_conv_for_diffvae() {
+        let directory = tempfile::tempdir().unwrap();
+        let decoder = directory.path().join("vae_decoder.safetensors");
+        let encoder = directory.path().join("vae_encoder.safetensors");
+        std::fs::write(&decoder, b"decoder").unwrap();
+        std::fs::write(&encoder, b"encoder").unwrap();
+        assert_eq!(
+            ltx25_encoder_path(directory.path(), LtxComponent::ConvVideoVae, &decoder),
+            encoder
+        );
+
+        let source = include_str!("lib.rs");
+        let loader = function_body(source, "load_components_split");
+        assert!(loader.contains("ltx25_video_component(self.use_diffusion_decoder)"));
+        assert!(loader.contains("ltx25_encoder_path(&self.root, video_component, video)"));
+        assert!(loader.contains("transformer.with_file_name(\"connector.safetensors\")"));
+        assert!(loader.contains("dit_files.push(connector)"));
+        assert!(loader.contains("LtxVideoVae::new_encoder_only("));
+        assert!(loader.contains("LtxVideoVae::new_statistics_only("));
+        assert!(
+            !loader.contains(".require(LtxComponent::ConvVideoVae)"),
+            "an explicit DiffVAE selection must not require an unrelated conv decoder"
+        );
+    }
+
+    #[test]
+    fn ltx25_conv_decode_selection_reaches_normal_and_dfr_production_routes() {
+        let source = include_str!("lib.rs");
+        for name in ["render_dfr", "render"] {
+            let body = function_body(source, name);
+            assert!(
+                body.contains("self.selected_decode_cap(req)?"),
+                "{name} bypasses request-selected LTX-2.5 conv decode geometry"
+            );
+            assert!(body.contains("decode_budgeted_with_spatial_cap("));
+        }
     }
 
     #[test]

@@ -159,12 +159,15 @@ pub fn register_providers(
         .register_generator(model::REGISTRATION)
         .register_generator(model::REGISTRATION_25)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
+        .register_memory_strategy(memory_strategy_2_5::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
             contract: memory_strategy::weights_free_memory_strategy_contract,
             surface_specs: memory_strategy::memory_contract_surface_specs,
         })
+        .register_memory_contract_fixture(memory_strategy_2_5::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        .register_memory_behavior(memory_strategy_2_5::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
         .register_trainer(training::TRAINER_REGISTRATION_25)
 }
@@ -172,6 +175,18 @@ pub fn register_providers(
 /// Build the complete explicit MLX LTX provider catalog.
 pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::ProviderRegistry> {
     register_providers(mlx_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// Resolve the physical LTX-2.5 packing tier used by video-memory admission. The legacy 2.3 route
+/// is not part of this calibration surface and returns `None` rather than borrowing 2.5 evidence.
+pub fn resolved_video_memory_numeric_tier(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::gen_core::MemoryNumericTier>> {
+    if provider_id != MODEL_25_ID {
+        return Ok(None);
+    }
+    memory_strategy_2_5::resolved_numeric_tier(spec).map(Some)
 }
 
 /// Resolve the load-bearing VAE geometry for an MLX LTX generator id.
@@ -192,8 +207,10 @@ pub fn conservative_video_decode_memory_profile(
 
 #[cfg(test)]
 mod explicit_registry_tests {
-    use mlx_gen::gen_core::{MemoryStrategy, MemoryStrategySupport, ProviderRegistryBuilder};
-    use mlx_gen::{LoadSpec, WeightsSource};
+    use mlx_gen::gen_core::{
+        LoadShape, MemoryStrategy, MemoryStrategySupport, OffloadPolicy, ProviderRegistryBuilder,
+    };
+    use mlx_gen::{LoadSpec, Quant, WeightsSource};
 
     fn write_named_safetensors(
         path: &std::path::Path,
@@ -256,6 +273,71 @@ mod explicit_registry_tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(root));
         spec.text_encoder = Some(WeightsSource::Dir(gemma));
         spec
+    }
+
+    fn ltx25_memory_spec(tmp: &tempfile::TempDir, quantized: bool, bits: i32) -> LoadSpec {
+        use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
+
+        let root = tmp.path().join(if quantized {
+            format!("q{bits}")
+        } else {
+            "bf16".to_owned()
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("split_model.json"),
+            serde_json::json!({
+                "quantized": quantized,
+                "quantization_bits": bits,
+                "quantization_group_size": 64
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for name in [
+            "transformer.safetensors",
+            "connector.safetensors",
+            "text_encoder.safetensors",
+            "vae_decoder.safetensors",
+            "vae_encoder.safetensors",
+            "audio_vae.safetensors",
+            "duration.safetensors",
+            "spatial.safetensors",
+            "temporal.safetensors",
+        ] {
+            write_safetensors(&root.join(name), "F32", 1, 4);
+        }
+        LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization)
+            .with_component(
+                LtxComponent::Transformer.id(),
+                WeightsSource::File(root.join("transformer.safetensors")),
+            )
+            .with_component(
+                LtxComponent::TextEncoder.id(),
+                WeightsSource::File(root.join("text_encoder.safetensors")),
+            )
+            .with_component(
+                LtxComponent::ConvVideoVae.id(),
+                WeightsSource::File(root.join("vae_decoder.safetensors")),
+            )
+            .with_component(
+                LtxComponent::AudioVae.id(),
+                WeightsSource::File(root.join("audio_vae.safetensors")),
+            )
+            .with_component(
+                LtxComponent::DurationHead.id(),
+                WeightsSource::File(root.join("duration.safetensors")),
+            )
+            .with_component(
+                LtxComponent::SpatialUpsampler.id(),
+                WeightsSource::File(root.join("spatial.safetensors")),
+            )
+            .with_component(
+                LtxComponent::TemporalUpsampler.id(),
+                WeightsSource::File(root.join("temporal.safetensors")),
+            )
     }
 
     #[test]
@@ -335,6 +417,76 @@ mod explicit_registry_tests {
             .memory_strategy_contract(super::MODEL_ID, &spec)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn ltx25_registry_and_catalog_resolve_the_physical_packed_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = ltx25_memory_spec(&tmp, true, 4);
+        let registry = super::provider_registry().unwrap();
+        let contract = registry
+            .memory_strategy_contract(super::MODEL_25_ID, &spec)
+            .unwrap()
+            .expect("LTX-2.5 generator must have a reachable memory registration");
+        assert!(matches!(
+            contract
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        ));
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier(super::MODEL_25_ID, &spec)
+                .unwrap()
+                .unwrap()
+                .quant,
+            Some(Quant::Q4)
+        );
+        assert!(registry
+            .memory_behavior_registrations()
+            .any(|registration| registration.provider_id == super::MODEL_25_ID));
+
+        let without_contract = ProviderRegistryBuilder::new()
+            .register_generator(super::model::REGISTRATION_25)
+            .build()
+            .unwrap();
+        assert!(without_contract
+            .memory_strategy_contract(super::MODEL_25_ID, &spec)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn ltx25_tier_resolution_distinguishes_q8_dense_and_mismatched_assertions() {
+        let q8_tmp = tempfile::tempdir().unwrap();
+        let q8 = ltx25_memory_spec(&q8_tmp, true, 8);
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier(super::MODEL_25_ID, &q8)
+                .unwrap()
+                .unwrap()
+                .quant,
+            Some(Quant::Q8)
+        );
+
+        let dense_tmp = tempfile::tempdir().unwrap();
+        let dense = ltx25_memory_spec(&dense_tmp, false, 4);
+        assert_eq!(
+            super::resolved_video_memory_numeric_tier(super::MODEL_25_ID, &dense)
+                .unwrap()
+                .unwrap()
+                .quant,
+            None
+        );
+
+        let mut mismatch = q8;
+        mismatch.quantize = Some(Quant::Q4);
+        let error = super::resolved_video_memory_numeric_tier(super::MODEL_25_ID, &mismatch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("disagrees with split_model.json tier"),
+            "{error}"
+        );
     }
 
     #[test]

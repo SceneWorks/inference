@@ -385,9 +385,9 @@ impl VideoEncoder {
 }
 
 pub struct LtxVideoVae {
-    conv_in: CausalConv3d,
+    conv_in: Option<CausalConv3d>,
     up_blocks: Vec<UpLayer>,
-    conv_out: CausalConv3d,
+    conv_out: Option<CausalConv3d>,
     mean: Tensor, // [1, 128, 1, 1, 1]
     std: Tensor,  // [1, 128, 1, 1, 1]
     patch_size: usize,
@@ -423,6 +423,61 @@ impl LtxVideoVae {
         patch_size: usize,
     ) -> Result<Self> {
         Self::build(decoder_vb, Some(encoder_vb), latent_channels, patch_size)
+    }
+
+    /// Build only the causal encoder and latent-normalization surface. DiffVAE owns final decode,
+    /// so forcing its route to materialize a convolutional decoder is both unnecessary and wrong
+    /// for converted tiers that deliberately ship no `vae_decoder.safetensors`.
+    pub fn new_encoder_only(
+        encoder_vb: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        Self::build_without_decoder(encoder_vb, true, latent_channels, patch_size)
+    }
+
+    /// Build only latent normalization. Pure T2V on the DiffVAE route needs the statistics for the
+    /// learned upsampler hand-off but never loads or calls a convolutional encoder/decoder.
+    pub fn new_statistics_only(
+        stats_vb: VarBuilder,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        Self::build_without_decoder(stats_vb, false, latent_channels, patch_size)
+    }
+
+    fn build_without_decoder(
+        vb: VarBuilder,
+        with_encoder: bool,
+        latent_channels: usize,
+        patch_size: usize,
+    ) -> Result<Self> {
+        let stats = vb.pp("per_channel_statistics");
+        let mean = stats
+            .get_unchecked("mean-of-means")?
+            .reshape((1, latent_channels, 1, 1, 1))?;
+        let std = stats
+            .get_unchecked("std-of-means")?
+            .reshape((1, latent_channels, 1, 1, 1))?;
+        let encoder = with_encoder
+            .then(|| {
+                VideoEncoder::load(
+                    vb.pp("encoder"),
+                    vb.pp("per_channel_statistics"),
+                    latent_channels,
+                    patch_size,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            conv_in: None,
+            up_blocks: Vec::new(),
+            conv_out: None,
+            mean,
+            std,
+            patch_size,
+            encoder,
+        })
     }
 
     fn build(
@@ -468,9 +523,9 @@ impl LtxVideoVae {
             None => None,
         };
         Ok(Self {
-            conv_in: CausalConv3d::load(dec.clone(), "conv_in.conv")?,
+            conv_in: Some(CausalConv3d::load(dec.clone(), "conv_in.conv")?),
             up_blocks,
-            conv_out: CausalConv3d::load(dec, "conv_out.conv")?,
+            conv_out: Some(CausalConv3d::load(dec, "conv_out.conv")?),
             mean,
             std,
             patch_size,
@@ -516,10 +571,17 @@ impl LtxVideoVae {
 
     /// Decode a normalized latent `[B, 128, F', H', W']` → video `[B, 3, F, 32·H', 32·W']` in ~[-1,1].
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        let conv_in = self.conv_in.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "ltx vae decode: convolutional decoder weights were not loaded on the DiffVAE route"
+                    .into(),
+            )
+        })?;
+        let conv_out = self.conv_out.as_ref().expect("decoder fields are atomic");
         // Denormalize: x · std + mean.
         let x =
             (latent.broadcast_mul(&self.std)? + self.mean.broadcast_as(latent.shape())?.clone())?;
-        let mut x = self.conv_in.forward(&x, false)?;
+        let mut x = conv_in.forward(&x, false)?;
         for layer in &self.up_blocks {
             x = match layer {
                 UpLayer::Res(blocks) => {
@@ -534,7 +596,7 @@ impl LtxVideoVae {
         }
         let x = pixel_norm(&x)?;
         let x = candle_gen::candle_nn::ops::silu(&x)?;
-        let x = self.conv_out.forward(&x, false)?;
+        let x = conv_out.forward(&x, false)?;
         unpatchify(&x, self.patch_size)
     }
 
