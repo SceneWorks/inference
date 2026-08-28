@@ -95,6 +95,7 @@ use crate::convert::{
     sanitize_transformer_component, sanitize_vae_decoder_component, sanitize_vae_encoder_component,
     sanitize_vocoder_component, CONNECTOR_QUANT_SUFFIXES, TRANSFORMER_QUANT_SUFFIXES,
 };
+use crate::dev_sampler::TransformerVariant;
 
 /// The affine-quant group width every shipped LTX tier uses (the reference `convert.py` default).
 pub const DEFAULT_GROUP_SIZE: i32 = 64;
@@ -429,6 +430,8 @@ pub struct LtxTierComponentReport {
 pub struct LtxTierReport {
     /// Which tier this is.
     pub tier: LtxTier,
+    /// Which upstream transformer checkpoint was explicitly selected for this tier build.
+    pub variant: TransformerVariant,
     /// The tier directory.
     pub dir: PathBuf,
     /// Bits per quantized weight (`None` for `bf16`).
@@ -452,8 +455,12 @@ impl LtxTierReport {
         self.components.iter().map(|c| c.quantized_linears).sum()
     }
 
-    /// The manifest value this report serializes to (also written to `split_model.json`).
-    pub fn manifest(&self, source: &BTreeMap<String, PathBuf>) -> serde_json::Value {
+    /// The portable manifest value this report serializes to (also written to `split_model.json`).
+    ///
+    /// A release manifest must be independent of the converting host. In particular, this deliberately
+    /// contains no source paths: the per-component files and all model identity needed by loaders are
+    /// declared inside the tier itself.
+    pub fn manifest(&self) -> serde_json::Value {
         let components: Vec<serde_json::Value> = self
             .components
             .iter()
@@ -474,14 +481,10 @@ impl LtxTierReport {
                 entry
             })
             .collect();
-        let sources: serde_json::Map<String, serde_json::Value> = source
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::from(v.display().to_string())))
-            .collect();
         serde_json::json!({
             "format": "split",
             "model_version": LTX_2_5_MODEL_VERSION,
-            "variant": "distilled",
+            "variant": self.variant.id(),
             "tier": self.tier.id(),
             // `quantized` / `quantization_bits` / `quantization_group_size` are the fields
             // `crate::config::SplitModel` reads; the tier detail rides alongside them.
@@ -497,7 +500,6 @@ impl LtxTierReport {
             // `LtxTierReport::bytes` (which adds them) is deliberately the larger number, and it is
             // the one sc-18781's `footprint.diskSizeBytes` should carry.
             "total_bytes": self.bytes,
-            "source": serde_json::Value::Object(sources),
         })
     }
 }
@@ -812,6 +814,34 @@ fn component_metadata(resolved: &LtxResolvedComponent, tier: LtxTier) -> BTreeMa
     metadata
 }
 
+/// Copy the source transformer metadata, bind it to the caller's typed variant, and stamp the
+/// generated transformer with that identity. Raw LTX-2.5 checkpoints do not publish `variant`, so
+/// its absence is expected at conversion time; a source that does carry it must agree with the
+/// selected type rather than being silently relabelled.
+fn transformer_metadata(
+    resolved: &LtxResolvedComponent,
+    tier: LtxTier,
+    variant: TransformerVariant,
+) -> Result<BTreeMap<String, String>> {
+    let mut metadata = component_metadata(resolved, tier);
+    if let Some(declared) = metadata.get(TransformerVariant::METADATA_KEY) {
+        let declared = TransformerVariant::from_id(declared)?;
+        if declared != variant {
+            return Err(Error::Msg(format!(
+                "ltx tiers: transformer at {} declares variant {:?}, but the converter was asked for {:?}",
+                resolved.path().display(),
+                declared.id(),
+                variant.id(),
+            )));
+        }
+    }
+    metadata.insert(
+        TransformerVariant::METADATA_KEY.to_string(),
+        variant.id().to_string(),
+    );
+    Ok(metadata)
+}
+
 /// Metadata for the **secondary** half of a source file the tier splits in two — the connector out
 /// of the transformer, the encoder out of each video VAE, the vocoder out of the audio VAE.
 ///
@@ -931,25 +961,41 @@ fn stamp_gemma_quantization(
 /// Components are processed **one at a time and dropped**, with the MLX cache cleared between them:
 /// the source transformer alone is 42 GB and the text encoder 26 GB, and holding two resident is
 /// the difference between a conversion that runs on a 128 GB machine and one that does not.
+///
+/// `variant` is deliberately typed: raw upstream transformers do not carry this identity. The
+/// converter stamps it into the emitted transformer and portable manifest; it is never inferred
+/// from a local directory or filename.
 pub fn convert_2_5_tier(
     bundle: &LtxBundle,
     out_dir: impl AsRef<Path>,
     tier: LtxTier,
     group_size: i32,
+    variant: TransformerVariant,
 ) -> Result<LtxTierReport> {
     let out = out_dir.as_ref();
-    std::fs::create_dir_all(out)?;
     if group_size <= 0 {
         return Err(Error::Msg(format!(
             "ltx tiers: group size must be positive, got {group_size}"
         )));
     }
+    // Bind a pre-stamped source before allocating output or reading its 42 GB tensor payload. Raw
+    // upstream sources intentionally omit the tag; an already-labelled checkpoint must agree.
+    let transformer_metadata =
+        transformer_metadata(bundle.require(LtxComponent::Transformer)?, tier, variant)?;
+    // The manifest is the reuse/complete marker. Remove a previous one before mutating any output
+    // component so an interrupted cross-variant rebuild cannot leave a new transformer behind an
+    // old, apparently complete manifest.
+    match std::fs::remove_file(out.join(TIER_MANIFEST_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::create_dir_all(out)?;
     // Everything below runs on the CPU stream and the caller's device is restored on the way out.
     let _cpu = CpuConversion::enter()?;
 
     let mut components: Vec<LtxTierComponentReport> = Vec::new();
     let mut embedded = serde_json::Map::new();
-    let mut sources: BTreeMap<String, PathBuf> = BTreeMap::new();
     // Assembled from two source files (the connector towers from the transformer, the text-embedding
     // projection from the text encoder) and written once both are in hand.
     let mut connector: HashMap<String, Array>;
@@ -958,7 +1004,6 @@ pub fn convert_2_5_tier(
     // ---- transformer + the two embeddings connectors -------------------------------------------
     {
         let resolved = bundle.require(LtxComponent::Transformer)?;
-        sources.insert("transformer".into(), resolved.path().to_path_buf());
         let raw = Weights::from_file(resolved.path())?;
         embedded.insert("transformer".into(), resolved.config()?.clone());
         if let Some(scheduler) = resolved.optional_section("scheduler") {
@@ -970,7 +1015,7 @@ pub fn convert_2_5_tier(
             Emit {
                 name: "transformer",
                 weights: sanitize_transformer_component(&raw),
-                metadata: component_metadata(resolved, tier),
+                metadata: transformer_metadata,
                 exempt: None,
             },
             tier,
@@ -1010,7 +1055,6 @@ pub fn convert_2_5_tier(
     // text-stage weight either way, and this keeps every LTX bundle, 2.3 and 2.5, one shape.
     {
         let resolved = bundle.require(LtxComponent::TextEncoder)?;
-        sources.insert("text_encoder".into(), resolved.path().to_path_buf());
         if resolved.path().is_dir() {
             return Err(Error::Msg(format!(
                 "ltx tiers: the text encoder at {} is an HuggingFace snapshot directory; an LTX-2.5 \
@@ -1079,7 +1123,6 @@ pub fn convert_2_5_tier(
     // ---- conv video VAE (encoder + decoder) -----------------------------------------------------
     {
         let resolved = bundle.require(LtxComponent::ConvVideoVae)?;
-        sources.insert("conv_video_vae".into(), resolved.path().to_path_buf());
         let raw = Weights::from_file(resolved.path())?;
         let vae_block = resolved.config()?.clone();
         // Parse through the real reader so an unknown `latent_log_var` or an unsupported padding
@@ -1130,7 +1173,6 @@ pub fn convert_2_5_tier(
 
     // ---- diffusion video VAE ---------------------------------------------------------------------
     if let Some(resolved) = bundle.get(LtxComponent::DiffusionVideoVae) {
-        sources.insert("diffusion_video_vae".into(), resolved.path().to_path_buf());
         let raw = Weights::from_file(resolved.path())?;
         let vae_block = resolved.config()?.clone();
         embedded.insert("diffusion_vae".into(), vae_block);
@@ -1198,7 +1240,6 @@ pub fn convert_2_5_tier(
 
     // ---- audio VAE + vocoder ---------------------------------------------------------------------
     if let Some(resolved) = bundle.get(LtxComponent::AudioVae) {
-        sources.insert("audio_vae".into(), resolved.path().to_path_buf());
         let raw = Weights::from_file(resolved.path())?;
         for section in ["audio_vae", "vocoder"] {
             embedded.insert(section.into(), resolved.config_section(section)?.clone());
@@ -1264,7 +1305,6 @@ pub fn convert_2_5_tier(
         let Some(resolved) = bundle.get(component) else {
             continue;
         };
-        sources.insert(name.into(), resolved.path().to_path_buf());
         let raw = Weights::from_file(resolved.path())?;
         embedded.insert(name.into(), resolved.config()?.clone());
         components.push(emit_component(
@@ -1288,6 +1328,7 @@ pub fn convert_2_5_tier(
     let mut bytes: u64 = components.iter().map(|c| c.bytes).sum();
     let report = LtxTierReport {
         tier,
+        variant,
         dir: out.to_path_buf(),
         bits: tier.bits(),
         group_size,
@@ -1298,7 +1339,7 @@ pub fn convert_2_5_tier(
         out.join(EMBEDDED_CONFIG_FILE),
         &serde_json::Value::Object(embedded),
     )?;
-    write_json(out.join(TIER_MANIFEST_FILE), &report.manifest(&sources))?;
+    write_json(out.join(TIER_MANIFEST_FILE), &report.manifest())?;
     for sidecar in [EMBEDDED_CONFIG_FILE, TIER_MANIFEST_FILE] {
         bytes += std::fs::metadata(out.join(sidecar))?.len();
     }
@@ -1310,17 +1351,19 @@ pub fn convert_2_5_tier(
 /// Tiers are built **sequentially** and each one's arrays are released before the next starts. The
 /// source components are re-read per tier rather than held: re-reading 42 GB from a memory-mapped
 /// file costs page cache, holding it costs resident RAM, and this conversion runs beside nothing
-/// else on a machine that has to survive it.
+/// else on a machine that has to survive it. Every tier receives the same explicit `variant`, so a
+/// single publication cannot accidentally mix dev and distilled transformers.
 pub fn convert_2_5_tiers(
     bundle: &LtxBundle,
     out_root: impl AsRef<Path>,
     tiers: &[LtxTier],
     group_size: i32,
+    variant: TransformerVariant,
 ) -> Result<Vec<LtxTierReport>> {
     let root = out_root.as_ref();
     let mut reports = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let report = convert_2_5_tier(bundle, root.join(tier.id()), *tier, group_size)?;
+        let report = convert_2_5_tier(bundle, root.join(tier.id()), *tier, group_size, variant)?;
         mlx_rs::memory::clear_cache();
         reports.push(report);
     }
