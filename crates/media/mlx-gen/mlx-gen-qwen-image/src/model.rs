@@ -9,11 +9,12 @@
 //! proven against the frozen Python fork (slices 1–3); the e2e bf16 path is gated by
 //! `tests/e2e_real_weights.rs`.
 
+use mlx_gen::img2img::resolve_reference;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
+    gen_core, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result, WeightsSource, VAE_COMPONENT,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_wan::OwnedWanSingleFrameDecoder;
@@ -166,7 +167,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let text_encoder_source = crate::active_encoder_contract().source_for_load(spec, root)?;
     text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
     let tokenizer = loader::load_validated_tokenizer(&text_encoder_source)?;
     Ok(Box::new(QwenImage {
@@ -188,26 +189,24 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// pre-seam one. The deferral is weight-free-testable: under `Sequential` this touches no component
 /// weights, so a dispatch that ignored `offload_policy` would eager-load and fail the "Sequential
 /// defers" unit test.
-#[cfg(test)]
-pub(crate) fn build_residency(
-    spec: &LoadSpec,
-) -> Result<Residency<QwenTextEncoder, QwenHeavyOwned>> {
-    let root = resolve_root(spec)?;
-    let text_encoder_source = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    text_encoder_source.load_time_quant_bits(None, MODEL_ID)?;
-    build_residency_with_source(spec, text_encoder_source)
-}
-
 fn build_residency_with_source(
     spec: &LoadSpec,
     text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
 ) -> Result<Residency<QwenTextEncoder, QwenHeavyOwned>> {
     let spec_heavy = spec.clone();
-    Residency::from_policy(
-        spec.offload_policy,
+    residency_from_spec(
+        spec,
         move || load_text_encoder_only(&text_encoder_source),
         move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
     )
+}
+
+pub(crate) fn residency_from_spec<Text: Send + 'static, Heavy: Send + 'static>(
+    spec: &LoadSpec,
+    load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+    load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+) -> Result<Residency<Text, Heavy>> {
+    Residency::from_policy(spec.offload_policy, load_text, load_heavy)
 }
 
 /// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
@@ -294,32 +293,6 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     })
 }
 
-impl QwenImage {
-    /// Extract the single img2img init image + its strength from the request's conditioning. The
-    /// per-reference strength wins over `req.strength`. Qwen-Image T2I img2img conditions on exactly
-    /// one init image, so more than one `Reference` is an error (the multi-image edit path is
-    /// `qwen_image_edit` + `MultiReference`, sc-2529). Returns `None` for pure txt2img.
-    fn resolve_reference<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Result<Option<(&'a Image, Option<f32>)>> {
-        let mut reference = None;
-        for c in &req.conditioning {
-            if let Conditioning::Reference { image, strength } = c {
-                if reference.is_some() {
-                    return Err(Error::Msg(
-                        "qwen_image: multiple reference images are not supported (single img2img \
-                         init only)"
-                            .into(),
-                    ));
-                }
-                reference = Some((image, strength.or(req.strength)));
-            }
-        }
-        Ok(reference)
-    }
-}
-
 impl Generator for QwenImage {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -393,7 +366,7 @@ impl QwenImage {
         let params = resolve_run_params(req, req.width, req.height);
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
-        let reference = self.resolve_reference(req)?;
+        let reference = resolve_reference(req, MODEL_ID)?;
         let start_step = match reference {
             Some((_, strength)) => init_time_step(params.steps, strength),
             None => 0,
@@ -592,20 +565,20 @@ pub(crate) fn component_footprint_for(
             ))
         }
     };
-    let selected = crate::ENCODER_CONTRACT.source_for_load(spec, root)?;
-    let mut conditioning =
-        selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
-    if provider_id == crate::model_edit::MODEL_ID {
-        let builtin = crate::ENCODER_CONTRACT
+    let encoder_contract = crate::active_encoder_contract();
+    let selected = encoder_contract.source_for_load(spec, root)?;
+    let language = selected.materialized_language_tensor_headers(&encoder_contract)?;
+    let vision = if provider_id == crate::model_edit::MODEL_ID {
+        let builtin = encoder_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        conditioning.extend(builtin.materialized_vision_tensor_headers(
-            &crate::VISION_ENCODER_CONTRACT,
-            &crate::ENCODER_CONTRACT,
-        )?);
-    }
-    let text_encoder = mlx_gen::asset_facts::projected_tensor_headers_bytes(&conditioning, |_| {
-        mlx_gen::asset_facts::ResidentProjection::Stored
-    })?;
+        Some(builtin.materialized_vision_tensor_headers(
+            &crate::active_vision_encoder_contract(),
+            &encoder_contract,
+        )?)
+    } else {
+        None
+    };
+    let text_encoder = projected_conditioning_headers(&language, vision.as_deref())?;
     let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
@@ -614,6 +587,23 @@ pub(crate) fn component_footprint_for(
     )?;
     footprint.text_encoder = text_encoder;
     Ok(footprint)
+}
+
+pub(crate) fn projected_conditioning_headers(
+    language: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+    vision: Option<&[mlx_gen::gen_core::SafetensorsTensorHeader]>,
+) -> mlx_gen::gen_core::Result<u64> {
+    let language = mlx_gen::asset_facts::projected_tensor_headers_bytes(language, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Stored
+    })?;
+    let vision = vision.map_or(Ok(0), |headers| {
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+    })?;
+    language.checked_add(vision).ok_or_else(|| {
+        mlx_gen::gen_core::Error::Msg("qwen-image conditioning byte sum overflow".into())
+    })
 }
 
 pub(crate) fn component_footprint(
@@ -657,6 +647,7 @@ pub const MEMORY_BEHAVIOR_REGISTRATION: mlx_gen::gen_core::MemoryBehaviorRegistr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::Conditioning;
 
     /// Documents + guards the PiD `from_ldm` capture-index policy (sc-7993) on the **production
     /// flow-match** schedule — the 50-step trajectory the sc-7843 runB validation captured. A σ ceiling
@@ -908,46 +899,43 @@ mod tests {
         );
     }
 
-    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image's dispatch HONORS
-    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the
-    // up-front precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
-    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
-    //   * `Resident` eager-loads the Qwen2.5-VL text encoder from the missing dir → `Err`.
-    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
-    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
-    // default.
-    fn validation_complete_snapshot_spec(root: &Path, policy: OffloadPolicy) -> LoadSpec {
-        gen_core_testkit::write_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            crate::ENCODER_CONTRACT,
-        )
-        .expect("validation-complete text encoder fixture");
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
+    // F-180 (sc-11126): exercise the real Qwen-Image residency builder with a bounded sealed
+    // encoder. Mutating the source after admission makes eager loading fail at ArtifactSeal before
+    // MLX/Metal, while Sequential must retain the same production loader without opening it.
+    fn sealed_then_mutated_source(
+        policy: OffloadPolicy,
+    ) -> (
+        tempfile::TempDir,
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let component = fixture.path().join("text_encoder");
+        let contract = crate::active_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&component, contract).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_offload_policy(policy);
+        let source = contract.source_for_load(&spec, fixture.path()).unwrap();
+        std::fs::write(component.join("config.json"), b"{}\n").unwrap();
+        (fixture, spec, source)
     }
 
     #[test]
     fn build_residency_sequential_defers_all_component_loads() {
-        let fixture = tempfile::tempdir().expect("snapshot fixture");
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Sequential);
-        let res = build_residency(&spec)
-            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
-        assert!(
-            res.is_sequential(),
-            "Sequential policy must build a Sequential (deferred) residency"
-        );
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Sequential);
+        let residency = build_residency_with_source(&spec, source).unwrap();
+        assert!(residency.is_sequential());
     }
 
     #[test]
-    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
-        let fixture = tempfile::tempdir().expect("snapshot fixture");
-        let spec = validation_complete_snapshot_spec(fixture.path(), OffloadPolicy::Resident);
-        let err = build_residency(&spec)
+    fn build_residency_resident_eagerly_invokes_the_text_loader() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let (_fixture, spec, source) = sealed_then_mutated_source(OffloadPolicy::Resident);
+        let error = build_residency_with_source(&spec, source)
             .err()
-            .expect("Resident must eager-load and fail on a missing snapshot dir");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
-            "expected an eager-load failure, not the up-front guard: {msg}"
-        );
+            .expect("Resident must eagerly invoke the production text loader")
+            .to_string();
+        assert!(error.contains("changed after load"), "{error}");
     }
 }

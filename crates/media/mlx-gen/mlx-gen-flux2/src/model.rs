@@ -360,16 +360,40 @@ fn load_flux2_heavy(
 fn build_residency(
     variant: Flux2Variant,
     spec: &LoadSpec,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let root = resolve_root(variant, spec)?;
-    let text_encoder_source = variant.encoder_contract().source_for_load(spec, root)?;
-    build_residency_with_source(variant, spec, text_encoder_source)
+    let text_encoder_source = language_contract.source_for_load(spec, root)?;
+    build_residency_with_source_and_multimodal_contracts(
+        variant,
+        spec,
+        text_encoder_source,
+        language_contract,
+        vision_contract,
+    )
 }
 
 fn build_residency_with_source(
     variant: Flux2Variant,
     spec: &LoadSpec,
     text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
+    build_residency_with_source_and_multimodal_contracts(
+        variant,
+        spec,
+        text_encoder_source,
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+fn build_residency_with_source_and_multimodal_contracts(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    text_encoder_source: mlx_gen::gen_core::ValidatedEncoderSource,
+    multimodal_language_contract: mlx_gen::gen_core::EncoderContract,
+    vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let root = resolve_root(variant, spec)?;
     // Klein artifacts intentionally keep Qwen3 dense in every Q4/Q8 tier. Dev applies the
@@ -383,13 +407,9 @@ fn build_residency_with_source(
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, variant.id())?;
     let multimodal_encoder_source = if variant.is_dev() {
-        let source = variant
-            .encoder_contract()
+        let source = multimodal_language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        source.validate_vision(
-            &crate::config::DEV_VISION_ENCODER_CONTRACT,
-            &crate::config::DEV_ENCODER_CONTRACT,
-        )?;
+        source.validate_vision(&vision_contract, &multimodal_language_contract)?;
         source
     } else {
         text_encoder_source.clone()
@@ -529,6 +549,37 @@ impl Flux2 {
                 },
             ),
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests_with_spec(variant: Flux2Variant, spec: &LoadSpec) -> Result<Self> {
+        let root = resolve_root(variant, spec)?;
+        Ok(Self {
+            descriptor: variant.descriptor(),
+            variant,
+            config: variant.config(),
+            memory_strategy: crate::memory_strategy::contract_for_variant(variant, spec)?,
+            memory_numeric_tier: Some(effective_memory_numeric_tier(
+                variant,
+                spec,
+                root,
+                variant.id(),
+            )?),
+            loaded_spec: spec.clone(),
+            tokenizer: None,
+            residency: Residency::sequential(
+                || {
+                    Err(Error::Msg(
+                        "flux2: text encoder not loadable in a test-only instance".into(),
+                    ))
+                },
+                |_use_pid| {
+                    Err(Error::Msg(
+                        "flux2: heavy bundle not loadable in a test-only instance".into(),
+                    ))
+                },
+            ),
+        })
     }
 
     /// Encode a prompt → `(prompt_embeds [1,512,joint], text_ids [1,512,4])`.
@@ -1454,6 +1505,56 @@ pub(crate) fn validate_request(
 
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`.
+/// Project already validated FLUX.2 conditioning header facts through the loader's exact residency
+/// policy. Source resolution and artifact sealing stay outside this pure arithmetic seam.
+fn projected_conditioning_bytes(
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    language_headers: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+    language_load_time_quant_bits: Option<i32>,
+    multimodal_headers: Option<&[mlx_gen::gen_core::SafetensorsTensorHeader]>,
+    provider_id: &str,
+) -> mlx_gen::gen_core::Result<u64> {
+    let group_size = match language_load_time_quant_bits {
+        Some(_) => Some(
+            language_contract
+                .packing
+                .ok_or_else(|| {
+                    mlx_gen::gen_core::Error::Unsupported(format!(
+                        "{provider_id}: selected language projection requests quantization without a packing contract"
+                    ))
+                })?
+                .group_size,
+        ),
+        None => None,
+    };
+    let language_bytes =
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(language_headers, |tensor| {
+            if let (Some(bits), Some(group_size)) = (language_load_time_quant_bits, group_size) {
+                if tensor
+                    .name
+                    .strip_suffix(".weight")
+                    .is_some_and(crate::convert::is_te_quant_target)
+                {
+                    return mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                        bits,
+                        group_size,
+                    };
+                }
+            }
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })?;
+    let multimodal_bytes = multimodal_headers.map_or(Ok(0), |headers| {
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(headers, |_| {
+            mlx_gen::asset_facts::ResidentProjection::Stored
+        })
+    })?;
+    language_bytes.checked_add(multimodal_bytes).ok_or_else(|| {
+        mlx_gen::gen_core::Error::Msg(format!(
+            "{provider_id}: selected language plus builtin multimodal resident byte overflow"
+        ))
+    })
+}
+
 /// Load-exact conditioning footprint for the staged-residency split. The selected source contributes
 /// only its materialized language tower. Dev and DevEdit additionally retain the builtin Pixtral +
 /// projector surface for caption upsampling; Klein and dev-control do not.
@@ -1462,6 +1563,26 @@ pub(crate) fn component_footprint_for(
     provider_id: &str,
     include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    component_footprint_for_with_contracts(
+        variant,
+        provider_id,
+        include_builtin_multimodal,
+        spec,
+        variant.encoder_contract(),
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+fn component_footprint_for_with_contracts(
+    variant: Flux2Variant,
+    provider_id: &str,
+    include_builtin_multimodal: bool,
+    spec: &mlx_gen::LoadSpec,
+    language_contract: mlx_gen::gen_core::EncoderContract,
+    dev_language_contract: mlx_gen::gen_core::EncoderContract,
+    dev_vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     if matches!(
         variant,
@@ -1478,7 +1599,6 @@ pub(crate) fn component_footprint_for(
             ))
         }
     };
-    let language_contract = variant.encoder_contract();
     let selected = language_contract.source_for_load(spec, root)?;
     // Dev's selected language tower follows the transformer tier exactly, including a pre-packed
     // base selected without `LoadSpec::quantize`. Klein intentionally keeps Qwen dense. Resolve and
@@ -1497,46 +1617,23 @@ pub(crate) fn component_footprint_for(
     let language_load_time_quant_bits =
         selected.load_time_quant_bits(expected_language_bits, provider_id)?;
     let language = selected.materialized_language_tensor_headers(&language_contract)?;
-    let language_bytes =
-        mlx_gen::asset_facts::projected_tensor_headers_bytes(&language, |tensor| {
-            if let Some(bits) = language_load_time_quant_bits.filter(|_| {
-                tensor
-                    .name
-                    .strip_suffix(".weight")
-                    .is_some_and(crate::convert::is_te_quant_target)
-            }) {
-                mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
-                    bits,
-                    group_size: language_contract
-                        .packing
-                        .expect("Dev's validated packed language policy has a packing contract")
-                        .group_size,
-                }
-            } else {
-                mlx_gen::asset_facts::ResidentProjection::Stored
-            }
-        })?;
-    let mut multimodal_bytes = 0;
-    if include_builtin_multimodal {
-        let builtin = crate::config::DEV_ENCODER_CONTRACT
+    let multimodal = if include_builtin_multimodal {
+        let builtin = dev_language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-        let multimodal = builtin.materialized_vision_tensor_headers(
-            &crate::config::DEV_VISION_ENCODER_CONTRACT,
-            &crate::config::DEV_ENCODER_CONTRACT,
-        )?;
-        multimodal_bytes =
-            mlx_gen::asset_facts::projected_tensor_headers_bytes(&multimodal, |_| {
-                mlx_gen::asset_facts::ResidentProjection::Stored
-            })?;
-    }
-    let conditioning_bytes = language_bytes
-        .checked_add(multimodal_bytes)
-        .ok_or_else(|| {
-            mlx_gen::gen_core::Error::Msg(format!(
-                "{}: selected language plus builtin multimodal resident byte overflow",
-                provider_id
-            ))
-        })?;
+        Some(
+            builtin
+                .materialized_vision_tensor_headers(&dev_vision_contract, &dev_language_contract)?,
+        )
+    } else {
+        None
+    };
+    let conditioning_bytes = projected_conditioning_bytes(
+        language_contract,
+        &language,
+        language_load_time_quant_bits,
+        multimodal.as_deref(),
+        provider_id,
+    )?;
     let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder"],
@@ -1645,27 +1742,43 @@ pub(crate) fn dev_control_component_footprint(
     )
 }
 
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_REGISTRATION = descriptor_klein_9b => load_klein_9b;
-    footprint = component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_EDIT_REGISTRATION = descriptor_klein_9b_edit => load_klein_9b_edit;
-    footprint = klein_edit_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const KLEIN_KV_EDIT_REGISTRATION =
-        descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit;
-    footprint = klein_kv_edit_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const DEV_REGISTRATION = descriptor_dev => load_dev;
-    footprint = dev_component_footprint
-}
-mlx_gen::register_generators! {
-    pub(crate) const DEV_EDIT_REGISTRATION = descriptor_dev_edit => load_dev_edit;
-    footprint = dev_edit_component_footprint
-}
+// Keep footprint callbacks as direct function pointers so the public production catalog mapping
+// can be verified without opening or hashing a model artifact. The load closures retain the same
+// backend-error conversion supplied by `register_generators!`.
+pub(crate) const KLEIN_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b,
+        load: |spec| load_klein_9b(spec).map_err(Into::into),
+        footprint: Some(component_footprint),
+    };
+
+pub(crate) const KLEIN_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b_edit,
+        load: |spec| load_klein_9b_edit(spec).map_err(Into::into),
+        footprint: Some(klein_edit_component_footprint),
+    };
+
+pub(crate) const KLEIN_KV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_klein_9b_kv_edit,
+        load: |spec| load_klein_9b_kv_edit(spec).map_err(Into::into),
+        footprint: Some(klein_kv_edit_component_footprint),
+    };
+
+pub(crate) const DEV_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_dev,
+        load: |spec| load_dev(spec).map_err(Into::into),
+        footprint: Some(dev_component_footprint),
+    };
+
+pub(crate) const DEV_EDIT_REGISTRATION: mlx_gen::gen_core::ModelRegistration =
+    mlx_gen::gen_core::ModelRegistration {
+        descriptor: descriptor_dev_edit,
+        load: |spec| load_dev_edit(spec).map_err(Into::into),
+        footprint: Some(dev_edit_component_footprint),
+    };
 
 pub(crate) const DEV_EDIT_MEMORY_REGISTRATION: mlx_gen::gen_core::MemoryRegistration =
     mlx_gen::gen_core::MemoryRegistration {
@@ -2065,13 +2178,7 @@ mod tests {
         assert!(reason.contains("does not match loaded tier"), "{reason}");
     }
 
-    fn dev_tier_spec(
-        root: &Path,
-        variant: Flux2Variant,
-        packed_bits: Option<i32>,
-        requested: Option<Quant>,
-    ) -> LoadSpec {
-        let mut spec = validation_complete_snapshot_spec(root, variant, OffloadPolicy::Sequential);
+    fn dev_tier_spec(root: &Path, packed_bits: Option<i32>, requested: Option<Quant>) -> LoadSpec {
         std::fs::create_dir_all(root.join("transformer")).unwrap();
         std::fs::write(
             root.join("transformer/config.json"),
@@ -2081,6 +2188,8 @@ mod tests {
             ),
         )
         .unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential);
         spec.quantize = requested;
         spec
     }
@@ -2130,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_loaded_and_registered_safety_use_the_effective_transformer_tier() {
+    fn dev_numeric_tier_and_registered_safety_use_the_effective_transformer_tier() {
         let registry = crate::provider_registry().unwrap();
         for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
             for prepacked in [false, true] {
@@ -2146,18 +2255,13 @@ mod tests {
                     let fixture = tempfile::tempdir().unwrap();
                     let spec = dev_tier_spec(
                         fixture.path(),
-                        variant,
                         prepacked.then_some(bits),
                         (!prepacked).then_some(quant),
                     );
-                    let generator = match variant {
-                        Flux2Variant::Dev => load_dev(&spec),
-                        Flux2Variant::DevEdit => load_dev_edit(&spec),
-                        _ => unreachable!(),
-                    }
-                    .unwrap_or_else(|error| {
-                        panic!("Q{bits} prepacked={prepacked} {provider_id}: {error}")
-                    });
+                    let generator =
+                        Flux2::new_for_tests_with_spec(variant, &spec).unwrap_or_else(|error| {
+                            panic!("Q{bits} prepacked={prepacked} {provider_id}: {error}")
+                        });
                     assert_eq!(
                         generator.memory_strategy_contract().unwrap().provider_id,
                         provider_id
@@ -2167,11 +2271,11 @@ mod tests {
                         quant: Some(quant),
                         component_precision_floors: &[],
                     };
-                    let context = public_dev_context(generator.as_ref(), mode, references, tier);
+                    let context = public_dev_context(&generator, mode, references, tier);
                     assert_eq!(
                         generator.memory_strategy_safety_check(&context),
                         MemorySafetyDecision::Accept,
-                        "loaded Q{bits} prepacked={prepacked} {provider_id}"
+                        "test generator Q{bits} prepacked={prepacked} {provider_id}"
                     );
 
                     let registration = registry
@@ -2206,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_load_and_registered_safety_reject_requested_vs_packed_tier_mismatches() {
+    fn dev_numeric_tier_and_registered_safety_reject_requested_vs_packed_mismatches() {
         let registry = crate::provider_registry().unwrap();
         for (stored_bits, requested) in [(4, Quant::Q8), (8, Quant::Q4)] {
             for (variant, provider_id, mode, references) in [
@@ -2219,19 +2323,14 @@ mod tests {
                 ),
             ] {
                 let fixture = tempfile::tempdir().unwrap();
-                let spec =
-                    dev_tier_spec(fixture.path(), variant, Some(stored_bits), Some(requested));
-                let load_error = match variant {
-                    Flux2Variant::Dev => load_dev(&spec),
-                    Flux2Variant::DevEdit => load_dev_edit(&spec),
-                    _ => unreachable!(),
-                }
-                .err()
-                .expect("packed/requested mismatch must reject load")
-                .to_string();
+                let spec = dev_tier_spec(fixture.path(), Some(stored_bits), Some(requested));
+                let tier_error =
+                    effective_memory_numeric_tier(variant, &spec, fixture.path(), provider_id)
+                        .expect_err("packed/requested mismatch must reject the effective load tier")
+                        .to_string();
                 assert!(
-                    load_error.contains(provider_id) && load_error.contains("pre-quantized"),
-                    "{load_error}"
+                    tier_error.contains(provider_id) && tier_error.contains("pre-quantized"),
+                    "{tier_error}"
                 );
 
                 let registration = registry
@@ -2708,33 +2807,51 @@ mod tests {
         assert_eq!(descriptor_klein_9b_edit().id, FLUX2_KLEIN_9B_EDIT_ID);
     }
 
-    // ── sc-10840: weight-free, default-run proof that FLUX.2's dispatch HONORS `offload_policy`.
-    // `build_residency` at a validation-complete sparse snapshot: `Sequential` admits the encoder
-    // contract but defers payload materialization (`is_sequential`); `Resident` immediately enters
-    // the unchanged payload bracket, proven without materializing the sparse production-size file.
-    // Runs for a klein (Qwen3)
-    // and a dev (Mistral-3 group) variant, so both text-loader arms are exercised. The real-weight A/B
-    // is deferred (weights not on disk).
-    fn validation_complete_snapshot_spec(
+    // ── sc-10840: weight-free proof that FLUX.2's dispatch retains the sealed encoder receipt in
+    // both residency policies. Structural production header coverage is asserted separately; these
+    // bounded fixtures keep the real seal, tokenizer binding, multimodal validation, and unchanged
+    // checks without hashing logical multi-gigabyte sparse payloads.
+    fn bounded_admitted_sources(
         root: &Path,
         variant: Flux2Variant,
         policy: OffloadPolicy,
-    ) -> LoadSpec {
+    ) -> (
+        LoadSpec,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+        mlx_gen::gen_core::ValidatedEncoderSource,
+    ) {
+        let contract = if variant.is_dev() {
+            crate::config::bounded_dev_encoder_contract()
+        } else {
+            crate::config::bounded_klein_encoder_contract()
+        };
         if variant.is_dev() {
             gen_core_testkit::write_multimodal_encoder_contract_fixture(
                 &root.join("text_encoder"),
-                variant.encoder_contract(),
-                crate::config::DEV_VISION_ENCODER_CONTRACT,
+                contract,
+                crate::config::bounded_dev_vision_encoder_contract(),
             )
             .unwrap();
         } else {
-            gen_core_testkit::write_encoder_contract_fixture(
-                &root.join("text_encoder"),
-                variant.encoder_contract(),
+            gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), contract)
+                .unwrap();
+        }
+        let spec =
+            LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy);
+        let text = contract
+            .source_for_load(&spec, root)
+            .expect("bounded source must exercise real sealed-source admission");
+        let multimodal = if variant.is_dev() {
+            text.validate_vision(
+                &crate::config::bounded_dev_vision_encoder_contract(),
+                &contract,
             )
             .unwrap();
-        }
-        LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_offload_policy(policy)
+            text.clone()
+        } else {
+            text.clone()
+        };
+        (spec, text, multimodal)
     }
 
     #[test]
@@ -2745,14 +2862,15 @@ mod tests {
                 mlx_gen::LoadShape::DeferredMaterialization,
             ] {
                 let fixture = tempfile::tempdir().unwrap();
-                let mut spec = validation_complete_snapshot_spec(
-                    fixture.path(),
-                    variant,
-                    OffloadPolicy::Sequential,
-                );
+                let (mut spec, text, multimodal) =
+                    bounded_admitted_sources(fixture.path(), variant, OffloadPolicy::Sequential);
                 spec.load_shape = shape;
-                let res = build_residency(variant, &spec)
-                    .expect("Sequential must admit every consumed encoder surface before deferring payload loads");
+                let res = build_residency_from_admitted_sources(
+                    variant, &spec, text, multimodal, None,
+                )
+                .expect(
+                    "Sequential must retain every admitted source while deferring payload loads",
+                );
                 assert!(
                     res.is_sequential(),
                     "{} {shape:?}: Sequential policy must build a deferred residency",
@@ -2847,26 +2965,24 @@ mod tests {
         file.set_len(8 + encoded.len() as u64 + end).unwrap();
     }
 
-    fn append_sparse_f16_tensor(root: &Path, name: &str, shape: &[usize]) {
-        append_sparse_f16_tensor_to(&root.join("text_encoder/model.safetensors"), name, shape);
-    }
-
     #[test]
     fn dev_multimodal_contract_fails_closed_for_deferred_routes_and_public_loaders() {
-        // One sparse fixture represents a logical production-size multimodal checkpoint. Reuse it
-        // across the route/load-shape matrix: recreating the same ~45 GiB logical sparse file for
-        // every case is unnecessary and can trip hosted-runner resource accounting even though no
-        // payload is ever materialized.
         let fixture = tempfile::tempdir().unwrap();
-        let base_spec = validation_complete_snapshot_spec(
-            fixture.path(),
-            Flux2Variant::Dev,
-            OffloadPolicy::Sequential,
-        );
+        let language = crate::config::bounded_dev_encoder_contract();
+        let vision = crate::config::bounded_dev_vision_encoder_contract();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &fixture.path().join("text_encoder"),
+            language,
+            vision,
+        )
+        .unwrap();
+        let base_spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential);
         let config_path = fixture.path().join("text_encoder/config.json");
         let valid_config = std::fs::read(&config_path).unwrap();
         let mut invalid_config: serde_json::Value = serde_json::from_slice(&valid_config).unwrap();
-        invalid_config["vision_config"]["num_hidden_layers"] = serde_json::json!(23);
+        invalid_config["vision_config"]["num_hidden_layers"] =
+            serde_json::json!(vision.num_hidden_layers + 1);
         std::fs::write(&config_path, serde_json::to_vec(&invalid_config).unwrap()).unwrap();
 
         for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
@@ -2876,7 +2992,7 @@ mod tests {
             ] {
                 let mut spec = base_spec.clone();
                 spec.load_shape = shape;
-                let error = build_residency(variant, &spec)
+                let error = build_residency(variant, &spec, language, vision)
                     .err()
                     .expect("deferred construction must still load-admit Pixtral config")
                     .to_string();
@@ -2888,21 +3004,29 @@ mod tests {
         rewrite_tensor_shape(
             fixture.path(),
             "multi_modal_projector.linear_2.weight",
-            5121,
+            vision.output_width + 1,
         );
         for error in [
-            crate::loader::load_vision_tower_dev(fixture.path())
+            crate::loader::load_vision_tower_dev_with_contracts(fixture.path(), language, vision)
                 .err()
                 .expect("vision loader must validate the paired projector")
                 .to_string(),
-            crate::loader::load_multimodal_projector_dev(fixture.path())
-                .err()
-                .expect("projector loader must validate its exact header")
-                .to_string(),
-            crate::loader::load_dev_text_encoder_group(fixture.path())
-                .err()
-                .expect("group loader must validate the whole multimodal source")
-                .to_string(),
+            crate::loader::load_multimodal_projector_dev_with_contracts(
+                fixture.path(),
+                language,
+                vision,
+            )
+            .err()
+            .expect("projector loader must validate its exact header")
+            .to_string(),
+            crate::loader::load_dev_text_encoder_group_with_contracts(
+                fixture.path(),
+                language,
+                vision,
+            )
+            .err()
+            .expect("group loader must validate the whole multimodal source")
+            .to_string(),
         ] {
             assert!(error.contains("vision_tensor_shape"), "{error}");
             assert!(
@@ -2913,72 +3037,56 @@ mod tests {
     }
 
     #[test]
-    fn dev_registry_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
-        let tmp = tempfile::tempdir().unwrap();
-        let registry = crate::provider_registry().unwrap();
-        let base_spec = validation_complete_snapshot_spec(
-            tmp.path(),
-            Flux2Variant::Dev,
-            OffloadPolicy::Sequential,
-        );
-        let footprint =
-            |id: &str, spec: &LoadSpec| registry.footprint(id, spec).unwrap().unwrap().text_encoder;
-        let dev = footprint(crate::config::FLUX2_DEV_ID, &base_spec);
-        let edit = footprint(crate::config::FLUX2_DEV_EDIT_ID, &base_spec);
-        let control = footprint(crate::config::FLUX2_DEV_CONTROL_ID, &base_spec);
+    fn dev_projection_footprints_dedup_builtin_multimodal_and_ignore_override_visuals() {
+        let language = exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, None);
+        let multimodal = exact_dev_multimodal_header_facts();
+        let projected = |id: &str, language: &[mlx_gen::gen_core::SafetensorsTensorHeader]| {
+            projected_conditioning_bytes(
+                crate::config::DEV_ENCODER_CONTRACT,
+                language,
+                None,
+                (id != crate::config::FLUX2_DEV_CONTROL_ID).then_some(multimodal.as_slice()),
+                id,
+            )
+            .unwrap()
+        };
+        let dev = projected(crate::config::FLUX2_DEV_ID, &language);
+        let edit = projected(crate::config::FLUX2_DEV_EDIT_ID, &language);
+        let control = projected(crate::config::FLUX2_DEV_CONTROL_ID, &language);
         assert_eq!(dev, edit);
         assert!(dev > control, "Dev routes add Pixtral + projector once");
 
-        let language_only = tmp.path().join("alternate-language");
-        gen_core_testkit::write_encoder_contract_fixture(
-            &language_only,
-            crate::config::DEV_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        let complete = tmp.path().join("alternate-complete");
-        gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &complete.join("text_encoder"),
-            crate::config::DEV_ENCODER_CONTRACT,
-            crate::config::DEV_VISION_ENCODER_CONTRACT,
-        )
-        .unwrap();
-        let language_spec = base_spec
-            .clone()
-            .with_text_encoder(WeightsSource::Dir(language_only));
-        let complete_spec = base_spec
-            .clone()
-            .with_text_encoder(WeightsSource::Dir(complete));
+        let mut complete_override = language.clone();
+        complete_override.extend(multimodal.iter().cloned());
+        let selected_language = crate::config::DEV_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&complete_override)
+            .unwrap();
+        assert_eq!(
+            selected_language, language,
+            "a complete override must project only its language constructor surface"
+        );
         for id in [
             crate::config::FLUX2_DEV_ID,
             crate::config::FLUX2_DEV_EDIT_ID,
             crate::config::FLUX2_DEV_CONTROL_ID,
         ] {
             assert_eq!(
-                footprint(id, &language_spec),
-                footprint(id, &complete_spec),
+                projected(id, &language),
+                projected(id, &selected_language),
                 "{id}: alternate visual/projector tensors are not consumed"
             );
         }
         assert_eq!(
-            footprint(crate::config::FLUX2_DEV_ID, &language_spec)
-                - footprint(crate::config::FLUX2_DEV_CONTROL_ID, &language_spec),
             dev - control,
+            expected_stored_header_bytes(&multimodal),
             "builtin Pixtral + projector must be counted exactly once"
         );
-
-        let estimated = mlx_gen::PerComponentBytes::from_spec_subdirs(
-            &base_spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .expect("the generic estimated-fallback path remains available");
-        assert!(estimated.text_encoder > 0);
+        // Real registry/source selection and generic transformer/VAE accounting remain bounded in
+        // `dev_estimated_fallback_projects_each_effective_language_tier_for_every_route`.
     }
 
     #[derive(Clone, Copy, Debug)]
     enum DevFootprintSelection {
-        Builtin,
         ComponentDir,
         ComponentFile,
         CompleteSnapshot,
@@ -3000,11 +3108,13 @@ mod tests {
         requested_quant: Option<Quant>,
         selected_quant: Option<i32>,
     ) -> LoadSpec {
+        let language_contract = crate::config::bounded_dev_encoder_contract();
+        let vision_contract = crate::config::bounded_dev_vision_encoder_contract();
         let base = fixture.join("base");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &base.join("text_encoder"),
-            crate::config::DEV_ENCODER_CONTRACT,
-            crate::config::DEV_VISION_ENCODER_CONTRACT,
+            language_contract,
+            vision_contract,
         )
         .unwrap();
         write_tiny_component(&base.join("transformer"));
@@ -3022,11 +3132,10 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(base));
         spec.quantize = requested_quant;
         spec.text_encoder = match selection {
-            DevFootprintSelection::Builtin => None,
             DevFootprintSelection::ComponentDir => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    crate::config::DEV_ENCODER_CONTRACT,
+                    language_contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3035,7 +3144,7 @@ mod tests {
             DevFootprintSelection::ComponentFile => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    crate::config::DEV_ENCODER_CONTRACT,
+                    language_contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3044,7 +3153,7 @@ mod tests {
             DevFootprintSelection::CompleteSnapshot => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected.join("text_encoder"),
-                    crate::config::DEV_ENCODER_CONTRACT,
+                    language_contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3061,14 +3170,12 @@ mod tests {
         requested_quant: Option<Quant>,
         selected_quant: Option<i32>,
     ) -> LoadSpec {
+        let contract = crate::config::bounded_klein_encoder_contract();
         let base = fixture.join("base");
-        let builtin_quant = matches!(selection, DevFootprintSelection::Builtin)
-            .then_some(selected_quant)
-            .flatten();
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &base.join("text_encoder"),
-            crate::config::KLEIN_ENCODER_CONTRACT,
-            builtin_quant,
+            contract,
+            None,
         )
         .unwrap();
         write_tiny_component(&base.join("transformer"));
@@ -3086,11 +3193,10 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(base));
         spec.quantize = requested_quant;
         spec.text_encoder = match selection {
-            DevFootprintSelection::Builtin => None,
             DevFootprintSelection::ComponentDir => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3099,7 +3205,7 @@ mod tests {
             DevFootprintSelection::ComponentFile => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected,
-                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3108,7 +3214,7 @@ mod tests {
             DevFootprintSelection::CompleteSnapshot => {
                 gen_core_testkit::write_encoder_contract_fixture_with_quant(
                     &selected.join("text_encoder"),
-                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    contract,
                     selected_quant,
                 )
                 .unwrap();
@@ -3118,34 +3224,48 @@ mod tests {
         spec
     }
 
-    fn expected_stored_language_bytes(
-        spec: &LoadSpec,
+    fn exact_encoder_header_facts(
         contract: mlx_gen::gen_core::EncoderContract,
-        provider_id: &str,
-    ) -> u64 {
-        let root = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
-        let selected = contract.source_for_load(spec, root).unwrap();
-        selected.load_time_quant_bits(None, provider_id).unwrap();
-        let headers = selected
-            .materialized_language_tensor_headers(&contract)
-            .unwrap();
-        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
+        packed_bits: Option<i32>,
+    ) -> Vec<mlx_gen::gen_core::SafetensorsTensorHeader> {
+        gen_core_testkit::encoder_contract_fixture_tensor_headers(contract, packed_bits).unwrap()
+    }
+
+    fn exact_dev_multimodal_header_facts() -> Vec<mlx_gen::gen_core::SafetensorsTensorHeader> {
+        crate::config::DEV_VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| {
+                let data_bytes = shape
+                    .iter()
+                    .try_fold(2_u64, |bytes, &dimension| {
+                        bytes.checked_mul(dimension as u64)
+                    })
+                    .unwrap();
+                mlx_gen::gen_core::SafetensorsTensorHeader {
+                    name,
+                    dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                    shape,
+                    data_bytes,
+                }
+            })
+            .collect()
+    }
+
+    fn expected_stored_header_bytes(headers: &[mlx_gen::gen_core::SafetensorsTensorHeader]) -> u64 {
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(headers, |_| {
             mlx_gen::asset_facts::ResidentProjection::Stored
         })
         .unwrap()
     }
 
-    fn expected_dev_language_bytes(spec: &LoadSpec, bits: Option<i32>, provider_id: &str) -> u64 {
-        let root = mlx_gen::require_base_snapshot(spec, provider_id).unwrap();
-        let selected = crate::config::DEV_ENCODER_CONTRACT
-            .source_for_load(spec, root)
-            .unwrap();
-        let action = selected.load_time_quant_bits(bits, provider_id).unwrap();
-        let headers = selected
-            .materialized_language_tensor_headers(&crate::config::DEV_ENCODER_CONTRACT)
-            .unwrap();
-        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |tensor| {
-            if let Some(bits) = action.filter(|_| {
+    fn expected_dev_language_bytes(
+        headers: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+        bits: Option<i32>,
+    ) -> u64 {
+        mlx_gen::asset_facts::projected_tensor_headers_bytes(headers, |tensor| {
+            if let Some(bits) = bits.filter(|_| {
                 tensor
                     .name
                     .strip_suffix(".weight")
@@ -3162,264 +3282,437 @@ mod tests {
         .unwrap()
     }
 
-    fn expected_dev_multimodal_bytes(spec: &LoadSpec) -> u64 {
-        let root = mlx_gen::require_base_snapshot(spec, FLUX2_DEV_ID).unwrap();
-        let builtin = crate::config::DEV_ENCODER_CONTRACT
-            .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)
-            .unwrap();
-        let headers = builtin
-            .materialized_vision_tensor_headers(
-                &crate::config::DEV_VISION_ENCODER_CONTRACT,
-                &crate::config::DEV_ENCODER_CONTRACT,
-            )
-            .unwrap();
-        mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
-            mlx_gen::asset_facts::ResidentProjection::Stored
-        })
-        .unwrap()
+    fn projected_conditioning_from_exact_facts(
+        contract: mlx_gen::gen_core::EncoderContract,
+        headers: &[mlx_gen::gen_core::SafetensorsTensorHeader],
+        packed_bits: Option<i32>,
+        expected_bits: Option<i32>,
+        multimodal: Option<&[mlx_gen::gen_core::SafetensorsTensorHeader]>,
+        provider_id: &str,
+    ) -> mlx_gen::gen_core::Result<u64> {
+        let action = mlx_gen::gen_core::resolve_encoder_load_time_quant_bits(
+            packed_bits,
+            expected_bits,
+            provider_id,
+        )?;
+        projected_conditioning_bytes(contract, headers, action, multimodal, provider_id)
+    }
+
+    fn bounded_component_footprint_for(
+        variant: Flux2Variant,
+        provider_id: &str,
+        include_builtin_multimodal: bool,
+        spec: &LoadSpec,
+    ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+        let language_contract = if variant.is_dev() {
+            crate::config::bounded_dev_encoder_contract()
+        } else {
+            crate::config::bounded_klein_encoder_contract()
+        };
+        component_footprint_for_with_contracts(
+            variant,
+            provider_id,
+            include_builtin_multimodal,
+            spec,
+            language_contract,
+            crate::config::bounded_dev_encoder_contract(),
+            crate::config::bounded_dev_vision_encoder_contract(),
+        )
+    }
+
+    fn bounded_dev_control_registry_footprint(
+        spec: &LoadSpec,
+    ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+        bounded_component_footprint_for(
+            Flux2Variant::Dev,
+            crate::config::FLUX2_DEV_CONTROL_ID,
+            false,
+            spec,
+        )
+    }
+
+    fn bounded_dev_control_registry() -> mlx_gen::gen_core::ProviderRegistry {
+        let mut registration = crate::model_control::DEV_CONTROL_REGISTRATION;
+        registration.footprint = Some(bounded_dev_control_registry_footprint);
+        mlx_gen::gen_core::ProviderRegistryBuilder::new()
+            .register_generator(registration)
+            .build()
+            .unwrap()
     }
 
     #[test]
-    fn dev_estimated_fallback_prices_effective_language_tier_for_every_route_and_selector() {
+    fn production_registry_keeps_every_flux2_footprint_callback_mapping() {
+        type FootprintCallback =
+            fn(&LoadSpec) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes>;
+
         let registry = crate::provider_registry().unwrap();
-        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
-            for prepacked_base in [false, true] {
-                for selection in [
-                    DevFootprintSelection::Builtin,
-                    DevFootprintSelection::ComponentDir,
-                    DevFootprintSelection::ComponentFile,
-                    DevFootprintSelection::CompleteSnapshot,
-                ] {
-                    let tmp = tempfile::tempdir().unwrap();
-                    let spec = dev_footprint_spec(
-                        tmp.path(),
-                        selection,
-                        prepacked_base.then_some(bits),
-                        (!prepacked_base).then_some(quant),
-                        None,
-                    );
-                    let language = expected_dev_language_bytes(&spec, Some(bits), FLUX2_DEV_ID);
-                    let multimodal = expected_dev_multimodal_bytes(&spec);
-                    let generic_stored = mlx_gen::PerComponentBytes::from_spec_subdirs(
-                        &spec,
-                        &["text_encoder"],
-                        &["transformer"],
-                        &["vae"],
-                    )
-                    .unwrap();
-                    for id in [
-                        FLUX2_DEV_ID,
-                        FLUX2_DEV_EDIT_ID,
-                        crate::config::FLUX2_DEV_CONTROL_ID,
-                    ] {
-                        let footprint = registry.footprint(id, &spec).unwrap().unwrap();
-                        let expected = if id == crate::config::FLUX2_DEV_CONTROL_ID {
-                            language
-                        } else {
-                            language + multimodal
-                        };
-                        assert_eq!(
-                            footprint.text_encoder, expected,
-                            "Q{bits} prepacked={prepacked_base} {selection:?} {id}"
-                        );
-                        assert_eq!(footprint.dit, generic_stored.dit);
-                        assert_eq!(footprint.vae, generic_stored.vae);
-                    }
-                    assert!(
-                        generic_stored.text_encoder > language,
-                        "the registry estimate must replace raw shards with the effective language projection"
-                    );
-                }
-            }
-        }
-    }
+        let mappings: [(&str, FootprintCallback); 6] = [
+            (FLUX2_KLEIN_9B_ID, component_footprint),
+            (FLUX2_KLEIN_9B_EDIT_ID, klein_edit_component_footprint),
+            (
+                crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                klein_kv_edit_component_footprint,
+            ),
+            (FLUX2_DEV_ID, dev_component_footprint),
+            (FLUX2_DEV_EDIT_ID, dev_edit_component_footprint),
+            (
+                crate::config::FLUX2_DEV_CONTROL_ID,
+                dev_control_component_footprint,
+            ),
+        ];
 
-    #[test]
-    fn dev_estimated_fallback_preserves_matching_packs_rejects_mismatches_and_keeps_klein_stored() {
-        let registry = crate::provider_registry().unwrap();
-        for bits in [4, 8] {
-            for selection in [
-                DevFootprintSelection::ComponentDir,
-                DevFootprintSelection::ComponentFile,
-                DevFootprintSelection::CompleteSnapshot,
-            ] {
-                let matching_tmp = tempfile::tempdir().unwrap();
-                let matching = dev_footprint_spec(
-                    matching_tmp.path(),
-                    selection,
-                    Some(bits),
-                    None,
-                    Some(bits),
-                );
-                for id in [
-                    FLUX2_DEV_ID,
-                    FLUX2_DEV_EDIT_ID,
-                    crate::config::FLUX2_DEV_CONTROL_ID,
-                ] {
-                    assert!(
-                        registry.footprint(id, &matching).unwrap().is_some(),
-                        "Q{bits} {selection:?} {id}"
-                    );
-                }
-
-                let mismatch_tmp = tempfile::tempdir().unwrap();
-                let mismatch = dev_footprint_spec(
-                    mismatch_tmp.path(),
-                    selection,
-                    Some(bits),
-                    None,
-                    Some(if bits == 4 { 8 } else { 4 }),
-                );
-                for id in [
-                    FLUX2_DEV_ID,
-                    FLUX2_DEV_EDIT_ID,
-                    crate::config::FLUX2_DEV_CONTROL_ID,
-                ] {
-                    let error = registry.footprint(id, &mismatch).unwrap_err().to_string();
-                    assert!(
-                        error.contains("pre-quantized") && error.contains("model policy"),
-                        "Q{bits} {selection:?} {id}: {error}"
-                    );
-                    assert!(
-                        error.contains(id),
-                        "route-specific fallback error branding for {id}: {error}"
-                    );
-                }
-            }
-
-            let klein_tmp = tempfile::tempdir().unwrap();
-            gen_core_testkit::write_encoder_contract_fixture_with_quant(
-                &klein_tmp.path().join("text_encoder"),
-                crate::config::KLEIN_ENCODER_CONTRACT,
-                None,
-            )
-            .unwrap();
-            write_tiny_component(&klein_tmp.path().join("transformer"));
-            write_tiny_component(&klein_tmp.path().join("vae"));
-            let mut klein = LoadSpec::new(WeightsSource::Dir(klein_tmp.path().to_path_buf()));
-            let stored = registry
-                .footprint(FLUX2_KLEIN_9B_ID, &klein)
-                .unwrap()
-                .unwrap();
-            klein.quantize = Some(if bits == 4 { Quant::Q4 } else { Quant::Q8 });
-            assert_eq!(
-                registry
-                    .footprint(FLUX2_KLEIN_9B_ID, &klein)
-                    .unwrap()
-                    .unwrap(),
-                stored,
-                "Klein keeps its selected Qwen bytes exactly Stored"
+        for (provider_id, expected) in mappings {
+            let registration = registry
+                .generators()
+                .find(|registration| (registration.descriptor)().id == provider_id)
+                .unwrap_or_else(|| panic!("missing production registration for {provider_id}"));
+            let actual = registration
+                .footprint
+                .unwrap_or_else(|| panic!("{provider_id} must declare a footprint callback"));
+            assert!(
+                std::ptr::fn_addr_eq(actual, expected),
+                "{provider_id} is wired to the wrong production footprint callback"
             );
         }
     }
 
     #[test]
-    fn klein_registry_footprint_keeps_dense_language_stored_and_rejects_every_packed_selector() {
-        let registry = crate::provider_registry().unwrap();
+    fn dev_estimated_fallback_projects_each_effective_language_tier_for_every_route() {
+        let language_headers =
+            exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, None);
+        let multimodal_headers = exact_dev_multimodal_header_facts();
+        for (quant, bits) in [(Quant::Q4, 4), (Quant::Q8, 8)] {
+            let language = expected_dev_language_bytes(&language_headers, Some(bits));
+            let multimodal = expected_stored_header_bytes(&multimodal_headers);
+            for id in [
+                FLUX2_DEV_ID,
+                FLUX2_DEV_EDIT_ID,
+                crate::config::FLUX2_DEV_CONTROL_ID,
+            ] {
+                let include_multimodal = id != crate::config::FLUX2_DEV_CONTROL_ID;
+                let footprint = projected_conditioning_from_exact_facts(
+                    crate::config::DEV_ENCODER_CONTRACT,
+                    &language_headers,
+                    None,
+                    Some(bits),
+                    include_multimodal.then_some(multimodal_headers.as_slice()),
+                    id,
+                )
+                .unwrap();
+                let expected = if id == crate::config::FLUX2_DEV_CONTROL_ID {
+                    language
+                } else {
+                    language + multimodal
+                };
+                assert_eq!(footprint, expected, "{quant:?}/Q{bits} {id}");
+            }
+            assert!(
+                expected_stored_header_bytes(&language_headers) > language,
+                "the registry estimate must replace raw shards with the effective language projection"
+            );
+        }
+
+        // This bounded ComponentFile smoke retains real selected-source admission and generic
+        // transformer/VAE accounting. Requested-vs-prepacked base-tier resolution is independently
+        // covered by
+        // `dev_loaded_and_registered_safety_use_the_effective_transformer_tier` and the control
+        // module's corresponding registration test. Keep only distinct projection facts above.
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = dev_footprint_spec(
+            tmp.path(),
+            DevFootprintSelection::ComponentFile,
+            None,
+            Some(Quant::Q4),
+            None,
+        );
+        let generic_stored = mlx_gen::PerComponentBytes::from_spec_subdirs(
+            &spec,
+            &["text_encoder"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap();
+        let bounded_language_contract = crate::config::bounded_dev_encoder_contract();
+        let bounded_language = exact_encoder_header_facts(bounded_language_contract, None);
+        let footprint = bounded_dev_control_registry()
+            .footprint(crate::config::FLUX2_DEV_CONTROL_ID, &spec)
+            .unwrap()
+            .expect("the bounded public registration must expose its footprint callback");
+        assert_eq!(
+            footprint.text_encoder,
+            projected_conditioning_from_exact_facts(
+                bounded_language_contract,
+                &bounded_language,
+                None,
+                Some(4),
+                None,
+                crate::config::FLUX2_DEV_CONTROL_ID,
+            )
+            .unwrap(),
+        );
+        assert_eq!(footprint.dit, generic_stored.dit);
+        assert_eq!(footprint.vae, generic_stored.vae);
+    }
+
+    #[test]
+    fn dev_estimated_fallback_preserves_matching_packs_rejects_mismatches_and_keeps_klein_stored() {
+        let multimodal_headers = exact_dev_multimodal_header_facts();
+        let klein_headers = exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, None);
+        for bits in [4, 8] {
+            let matching_headers =
+                exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, Some(bits));
+            let mismatched_bits = if bits == 4 { 8 } else { 4 };
+            let mismatched_headers = exact_encoder_header_facts(
+                crate::config::DEV_ENCODER_CONTRACT,
+                Some(mismatched_bits),
+            );
+            for id in [
+                FLUX2_DEV_ID,
+                FLUX2_DEV_EDIT_ID,
+                crate::config::FLUX2_DEV_CONTROL_ID,
+            ] {
+                let multimodal = (id != crate::config::FLUX2_DEV_CONTROL_ID)
+                    .then_some(multimodal_headers.as_slice());
+                let matching = projected_conditioning_from_exact_facts(
+                    crate::config::DEV_ENCODER_CONTRACT,
+                    &matching_headers,
+                    Some(bits),
+                    Some(bits),
+                    multimodal,
+                    id,
+                )
+                .unwrap();
+                assert_eq!(
+                    matching,
+                    expected_stored_header_bytes(&matching_headers)
+                        + multimodal.map_or(0, expected_stored_header_bytes),
+                    "matching Q{bits} {id}"
+                );
+                let error = projected_conditioning_from_exact_facts(
+                    crate::config::DEV_ENCODER_CONTRACT,
+                    &mismatched_headers,
+                    Some(mismatched_bits),
+                    Some(bits),
+                    multimodal,
+                    id,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("pre-quantized") && error.contains("model policy"),
+                    "Q{bits} {id}: {error}"
+                );
+                assert!(
+                    error.contains(id),
+                    "route-specific fallback error branding for {id}: {error}"
+                );
+            }
+
+            for route in [
+                FLUX2_KLEIN_9B_ID,
+                FLUX2_KLEIN_9B_EDIT_ID,
+                crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            ] {
+                assert_eq!(
+                    projected_conditioning_from_exact_facts(
+                        crate::config::KLEIN_ENCODER_CONTRACT,
+                        &klein_headers,
+                        None,
+                        None,
+                        None,
+                        route,
+                    )
+                    .unwrap(),
+                    expected_stored_header_bytes(&klein_headers),
+                    "Klein {route} keeps its selected Qwen bytes Stored despite Q{bits} request"
+                );
+            }
+        }
+
+        // Bound the real packed-source rejection to one component-directory receipt. The complete
+        // route × tier branding matrix above uses the same production resolver without repeatedly
+        // SHA-reading sparse logical payloads.
+        let mismatch_tmp = tempfile::tempdir().unwrap();
+        let mismatch = dev_footprint_spec(
+            mismatch_tmp.path(),
+            DevFootprintSelection::ComponentDir,
+            Some(4),
+            None,
+            Some(8),
+        );
+        let error = bounded_component_footprint_for(
+            Flux2Variant::DevEdit,
+            FLUX2_DEV_EDIT_ID,
+            true,
+            &mismatch,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(FLUX2_DEV_EDIT_ID)
+                && error.contains("pre-quantized")
+                && error.contains("model policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn klein_projection_policy_keeps_dense_language_stored_and_rejects_packed_facts() {
         let routes = [
             FLUX2_KLEIN_9B_ID,
             FLUX2_KLEIN_9B_EDIT_ID,
             crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
         ];
-        let selections = [
-            DevFootprintSelection::Builtin,
-            DevFootprintSelection::ComponentDir,
-            DevFootprintSelection::ComponentFile,
-            DevFootprintSelection::CompleteSnapshot,
+        let dense_headers = exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, None);
+        let packed_headers = [
+            (
+                4,
+                exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, Some(4)),
+            ),
+            (
+                8,
+                exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, Some(8)),
+            ),
         ];
+        let expected_dense = expected_stored_header_bytes(&dense_headers);
 
-        for base_quant in [None, Some(4), Some(8)] {
-            for requested in [None, Some(Quant::Q4), Some(Quant::Q8)] {
-                for selection in selections {
-                    let dense_tmp = tempfile::tempdir().unwrap();
-                    let dense = klein_footprint_spec(
-                        dense_tmp.path(),
-                        selection,
-                        base_quant,
-                        requested,
-                        None,
-                    );
-                    let expected = expected_stored_language_bytes(
-                        &dense,
-                        crate::config::KLEIN_ENCODER_CONTRACT,
-                        FLUX2_KLEIN_9B_ID,
-                    );
-                    for route in routes {
-                        assert_eq!(
-                            registry
-                                .footprint(route, &dense)
-                                .unwrap()
-                                .unwrap()
-                                .text_encoder,
-                            expected,
-                            "dense {selection:?} base={base_quant:?} request={requested:?} {route}"
-                        );
-                    }
-
-                    for packed_bits in [4, 8] {
-                        let packed_tmp = tempfile::tempdir().unwrap();
-                        let packed = klein_footprint_spec(
-                            packed_tmp.path(),
-                            selection,
-                            base_quant,
-                            requested,
-                            Some(packed_bits),
-                        );
-                        for route in routes {
-                            let error = registry.footprint(route, &packed).unwrap_err().to_string();
-                            assert!(
-                                error.contains(route)
-                                    && error.contains("pre-quantized")
-                                    && error.contains("model policy"),
-                                "packed Q{packed_bits} {selection:?} base={base_quant:?} request={requested:?} {route}: {error}"
-                            );
-                        }
-                    }
-                }
+        for route in routes {
+            assert_eq!(
+                projected_conditioning_from_exact_facts(
+                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    &dense_headers,
+                    None,
+                    None,
+                    None,
+                    route,
+                )
+                .unwrap(),
+                expected_dense,
+                "dense {route}"
+            );
+            for (packed_bits, headers) in &packed_headers {
+                let error = projected_conditioning_from_exact_facts(
+                    crate::config::KLEIN_ENCODER_CONTRACT,
+                    headers,
+                    Some(*packed_bits),
+                    None,
+                    None,
+                    route,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains(route)
+                        && error.contains("pre-quantized")
+                        && error.contains("model policy"),
+                    "packed Q{packed_bits} {route}: {error}"
+                );
             }
         }
+
+        // One complete-snapshot packed source proves the registry still feeds selected-source
+        // quantization evidence into the pure Klein policy. The exhaustive assertions above keep
+        // all three routes and both packed tiers covered from distinct in-memory policy facts.
+        let packed_tmp = tempfile::tempdir().unwrap();
+        let packed = klein_footprint_spec(
+            packed_tmp.path(),
+            DevFootprintSelection::CompleteSnapshot,
+            Some(8),
+            Some(Quant::Q4),
+            Some(4),
+        );
+        let error = bounded_component_footprint_for(
+            Flux2Variant::Klein9bKvEdit,
+            crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            false,
+            &packed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID)
+                && error.contains("pre-quantized")
+                && error.contains("model policy"),
+            "{error}"
+        );
     }
 
     #[test]
     fn registry_footprint_excludes_unrelated_loaded_layer_namespace_tensors() {
+        let headers = exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, None);
+        let selected = crate::config::KLEIN_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&headers)
+            .unwrap();
+        let baseline = projected_conditioning_bytes(
+            crate::config::KLEIN_ENCODER_CONTRACT,
+            &selected,
+            None,
+            None,
+            FLUX2_KLEIN_9B_ID,
+        )
+        .unwrap();
+
+        let mut with_unused = headers;
+        with_unused.push(mlx_gen::gen_core::SafetensorsTensorHeader {
+            name: "model.layers.0.unused_projection.weight".into(),
+            dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+            shape: vec![257],
+            data_bytes: 514,
+        });
+        let selected_with_unused = crate::config::KLEIN_ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&with_unused)
+            .unwrap();
+        assert_eq!(selected_with_unused, selected);
+        assert_eq!(
+            projected_conditioning_bytes(
+                crate::config::KLEIN_ENCODER_CONTRACT,
+                &selected_with_unused,
+                None,
+                None,
+                FLUX2_KLEIN_9B_ID,
+            )
+            .unwrap(),
+            baseline,
+            "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
+        );
+
+        // Retain one real dense builtin source receipt; the unused-namespace contrast above is pure
+        // because its subject is the contract's exact materialized-name projection.
         let fixture = tempfile::tempdir().unwrap();
+        let bounded_contract = crate::config::bounded_klein_encoder_contract();
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &fixture.path().join("text_encoder"),
-            crate::config::KLEIN_ENCODER_CONTRACT,
+            bounded_contract,
             None,
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
-        let footprint = || {
-            crate::provider_registry()
-                .unwrap()
-                .footprint(crate::config::FLUX2_KLEIN_9B_ID, &spec)
-                .unwrap()
-                .unwrap()
-                .text_encoder
-        };
-        let baseline = footprint();
-        append_sparse_f16_tensor(
-            fixture.path(),
-            "model.layers.0.unused_projection.weight",
-            &[257],
-        );
+        let bounded_headers = exact_encoder_header_facts(bounded_contract, None);
+        let bounded_baseline = expected_stored_header_bytes(&bounded_headers);
         assert_eq!(
-            footprint(),
-            baseline,
-            "a valid but unconsumed tensor sharing a loaded-layer prefix must not affect staged-fit bytes"
+            bounded_component_footprint_for(
+                Flux2Variant::Klein9b,
+                crate::config::FLUX2_KLEIN_9B_ID,
+                false,
+                &spec,
+            )
+            .unwrap()
+            .text_encoder,
+            bounded_baseline
         );
     }
 
     #[derive(Clone, Copy, Debug)]
     enum DevEncoderSelection {
-        DefaultDir,
-        OverrideDir,
-        OverrideFile,
+        Builtin,
+        ComponentDir,
+        ComponentFile,
+        CompleteSnapshot,
     }
 
     fn dev_encoder_spec_with_sidecars(
         fixture: &Path,
+        contract: mlx_gen::gen_core::EncoderContract,
         bits: i32,
         selection: DevEncoderSelection,
         sidecars: &[&str],
@@ -3427,19 +3720,27 @@ mod tests {
         let base = fixture.join("base");
         let selected = fixture.join("selected");
         let selected_root = match selection {
-            DevEncoderSelection::DefaultDir => base.join("text_encoder"),
-            DevEncoderSelection::OverrideDir | DevEncoderSelection::OverrideFile => {
+            DevEncoderSelection::Builtin => base.join("text_encoder"),
+            DevEncoderSelection::ComponentDir | DevEncoderSelection::ComponentFile => {
                 gen_core_testkit::write_encoder_contract_fixture(
                     &base.join("text_encoder"),
-                    crate::config::DEV_ENCODER_CONTRACT,
+                    contract,
                 )
                 .unwrap();
                 selected.clone()
             }
+            DevEncoderSelection::CompleteSnapshot => {
+                gen_core_testkit::write_encoder_contract_fixture(
+                    &base.join("text_encoder"),
+                    contract,
+                )
+                .unwrap();
+                selected.join("text_encoder")
+            }
         };
         gen_core_testkit::write_encoder_contract_fixture_with_quant(
             &selected_root,
-            crate::config::DEV_ENCODER_CONTRACT,
+            contract,
             Some(bits),
         )
         .unwrap();
@@ -3452,29 +3753,37 @@ mod tests {
         }
         let mut spec = LoadSpec::new(WeightsSource::Dir(base));
         spec.text_encoder = match selection {
-            DevEncoderSelection::DefaultDir => None,
-            DevEncoderSelection::OverrideDir => Some(WeightsSource::Dir(selected_root)),
-            DevEncoderSelection::OverrideFile => {
+            DevEncoderSelection::Builtin => None,
+            DevEncoderSelection::ComponentDir => Some(WeightsSource::Dir(selected_root)),
+            DevEncoderSelection::ComponentFile => {
                 Some(WeightsSource::File(selected_root.join("model.safetensors")))
             }
+            DevEncoderSelection::CompleteSnapshot => Some(WeightsSource::Dir(selected)),
         };
         spec
     }
 
     #[test]
     fn packed_dev_rejects_lm_head_sidecars_on_every_selection_surface() {
+        let contract = crate::config::bounded_dev_encoder_contract();
         for bits in [4, 8] {
             for selection in [
-                DevEncoderSelection::DefaultDir,
-                DevEncoderSelection::OverrideDir,
-                DevEncoderSelection::OverrideFile,
+                DevEncoderSelection::Builtin,
+                DevEncoderSelection::ComponentDir,
+                DevEncoderSelection::ComponentFile,
+                DevEncoderSelection::CompleteSnapshot,
             ] {
                 for sidecars in [&["scales"][..], &["biases"][..], &["scales", "biases"][..]] {
                     let fixture = tempfile::tempdir().unwrap();
-                    let spec =
-                        dev_encoder_spec_with_sidecars(fixture.path(), bits, selection, sidecars);
+                    let spec = dev_encoder_spec_with_sidecars(
+                        fixture.path(),
+                        contract,
+                        bits,
+                        selection,
+                        sidecars,
+                    );
                     let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
-                    let error = crate::config::DEV_ENCODER_CONTRACT
+                    let error = contract
                         .source_for_load(&spec, base)
                         .expect_err("Dev's dense LM head must reject every packed sidecar")
                         .to_string();
@@ -3491,46 +3800,48 @@ mod tests {
 
     #[test]
     fn packed_dev_materialized_surface_keeps_the_dense_lm_head_only() {
+        let mut expected_matrix_bases = std::collections::BTreeSet::from([
+            "language_model.model.embed_tokens".to_owned(),
+            "language_model.lm_head".to_owned(),
+        ]);
+        for layer in 0..crate::config::DEV_ENCODER_CONTRACT.loaded_hidden_layers {
+            for suffix in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                expected_matrix_bases
+                    .insert(format!("language_model.model.layers.{layer}.{suffix}"));
+            }
+        }
+
         for bits in [4, 8] {
-            let fixture = tempfile::tempdir().unwrap();
-            let spec = dev_encoder_spec_with_sidecars(
-                fixture.path(),
-                bits,
-                DevEncoderSelection::OverrideFile,
-                &[],
-            );
-            let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
-            let selected = crate::config::DEV_ENCODER_CONTRACT
-                .source_for_load(&spec, base)
-                .unwrap();
-            let names = selected
-                .materialized_language_tensor_headers(&crate::config::DEV_ENCODER_CONTRACT)
-                .unwrap()
-                .into_iter()
-                .map(|header| header.name)
+            let headers =
+                exact_encoder_header_facts(crate::config::DEV_ENCODER_CONTRACT, Some(bits));
+            let names = headers
+                .iter()
+                .map(|header| header.name.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             assert!(names.contains("language_model.lm_head.weight"));
             assert!(!names.contains("language_model.lm_head.scales"));
             assert!(!names.contains("language_model.lm_head.biases"));
+            let lm_head = headers
+                .iter()
+                .find(|header| header.name == "language_model.lm_head.weight")
+                .unwrap();
+            assert_eq!(lm_head.dtype, mlx_gen::gen_core::weightsmeta::Dtype::F16);
+            assert_eq!(
+                lm_head.shape,
+                [
+                    crate::config::DEV_ENCODER_CONTRACT.vocab_size,
+                    crate::config::DEV_ENCODER_CONTRACT.hidden_size,
+                ]
+            );
 
-            let mut expected_matrix_bases = std::collections::BTreeSet::from([
-                "language_model.model.embed_tokens".to_owned(),
-                "language_model.lm_head".to_owned(),
-            ]);
-            for layer in 0..crate::config::DEV_ENCODER_CONTRACT.loaded_hidden_layers {
-                for suffix in [
-                    "self_attn.q_proj",
-                    "self_attn.k_proj",
-                    "self_attn.v_proj",
-                    "self_attn.o_proj",
-                    "mlp.gate_proj",
-                    "mlp.up_proj",
-                    "mlp.down_proj",
-                ] {
-                    expected_matrix_bases
-                        .insert(format!("language_model.model.layers.{layer}.{suffix}"));
-                }
-            }
             let actual_matrix_bases = names
                 .iter()
                 .filter_map(|name| {
@@ -3556,30 +3867,56 @@ mod tests {
                 .map(str::to_owned)
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(actual_matrix_bases, expected_matrix_bases);
+        }
 
-            let runtime = [
-                include_str!("text_encoder/attention.rs"),
-                include_str!("text_encoder/mlp.rs"),
-                include_str!("text_encoder/encoder.rs"),
-                include_str!("text_encoder/mod.rs"),
-            ]
-            .join("\n");
-            for suffix in [
-                "q_proj.weight",
-                "k_proj.weight",
-                "v_proj.weight",
-                "o_proj.weight",
-                "gate_proj.weight",
-                "up_proj.weight",
-                "down_proj.weight",
-                "embed_tokens",
-                "lm_head.weight",
-            ] {
-                assert!(
-                    runtime.contains(suffix),
-                    "contract matrix surface has no matching runtime constructor for {suffix}"
-                );
-            }
+        // One real packed OverrideFile receipt proves the validated-source materialization matches
+        // the exact Q4 facts shared with the sparse writer. Q8 differs only in the in-memory packed
+        // shapes and is covered above without another production-sized acquisition hash.
+        let fixture = tempfile::tempdir().unwrap();
+        let bounded_contract = crate::config::bounded_dev_encoder_contract();
+        let spec = dev_encoder_spec_with_sidecars(
+            fixture.path(),
+            bounded_contract,
+            4,
+            DevEncoderSelection::ComponentFile,
+            &[],
+        );
+        let base = mlx_gen::require_base_snapshot(&spec, FLUX2_DEV_ID).unwrap();
+        let selected = bounded_contract.source_for_load(&spec, base).unwrap();
+        let actual = selected
+            .materialized_language_tensor_headers(&bounded_contract)
+            .unwrap()
+            .into_iter()
+            .map(|header| (header.name, header.dtype, header.shape, header.data_bytes))
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = exact_encoder_header_facts(bounded_contract, Some(4))
+            .into_iter()
+            .map(|header| (header.name, header.dtype, header.shape, header.data_bytes))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+
+        let runtime = [
+            include_str!("text_encoder/attention.rs"),
+            include_str!("text_encoder/mlp.rs"),
+            include_str!("text_encoder/encoder.rs"),
+            include_str!("text_encoder/mod.rs"),
+        ]
+        .join("\n");
+        for suffix in [
+            "q_proj.weight",
+            "k_proj.weight",
+            "v_proj.weight",
+            "o_proj.weight",
+            "gate_proj.weight",
+            "up_proj.weight",
+            "down_proj.weight",
+            "embed_tokens",
+            "lm_head.weight",
+        ] {
+            assert!(
+                runtime.contains(suffix),
+                "contract matrix surface has no matching runtime constructor for {suffix}"
+            );
         }
     }
 
@@ -3587,47 +3924,13 @@ mod tests {
     fn build_residency_resident_enters_payload_bracket_after_admission() {
         for variant in [Flux2Variant::Klein9b, Flux2Variant::Dev] {
             let fixture = tempfile::tempdir().unwrap();
-            let spec =
-                validation_complete_snapshot_spec(fixture.path(), variant, OffloadPolicy::Resident);
-            let root = resolve_root(variant, &spec).unwrap();
-            let text_encoder_source = variant
-                .encoder_contract()
-                .source_for_load(&spec, root)
-                .unwrap();
-            let effective_quant_bits = variant
-                .is_dev()
-                .then(|| effective_base_quant(&spec, root, variant.id()))
-                .transpose()
-                .unwrap()
-                .flatten()
-                .map(mlx_gen::gen_core::Quant::bits);
-            let text_encoder_load_time_quant_bits = text_encoder_source
-                .load_time_quant_bits(effective_quant_bits, variant.id())
-                .unwrap();
-            let multimodal_encoder_source = if variant.is_dev() {
-                let source = variant
-                    .encoder_contract()
-                    .validate_source_against_base(
-                        &WeightsSource::Dir(root.join("text_encoder")),
-                        root,
-                    )
-                    .unwrap();
-                source
-                    .validate_vision(
-                        &crate::config::DEV_VISION_ENCODER_CONTRACT,
-                        &crate::config::DEV_ENCODER_CONTRACT,
-                    )
-                    .unwrap();
-                source
-            } else {
-                text_encoder_source.clone()
-            };
+            let (spec, text_encoder_source, multimodal_encoder_source) =
+                bounded_admitted_sources(fixture.path(), variant, OffloadPolicy::Resident);
 
-            // The contract fixtures are sparse production-shape files and must never be
-            // materialized. Mutate the admitted shard inventory instead: Sequential leaves this
-            // check deferred, while Resident must invoke the real text-loader closure immediately.
             std::fs::write(
-                root.join("text_encoder/added-after-admission.safetensors"),
+                fixture
+                    .path()
+                    .join("text_encoder/added-after-admission.safetensors"),
                 [],
             )
             .unwrap();
@@ -3636,7 +3939,7 @@ mod tests {
                 &spec,
                 text_encoder_source,
                 multimodal_encoder_source,
-                text_encoder_load_time_quant_bits,
+                None,
             )
             .err()
             .expect("Resident must immediately enter the admitted payload-load bracket");

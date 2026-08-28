@@ -339,6 +339,8 @@ impl Boogu {
         let id = self.descriptor.id;
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let preflight =
+            crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, guidance > 1.0)?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from the
         // VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
         // Seed-independent — resolved above the residency lifecycle.
@@ -355,7 +357,7 @@ impl Boogu {
             on_progress,
             // ── Phase A: true-CFG mllm conditioning (Sequential loads the mllm, encodes, materializes,
             // drops it + clear_cache before the DiT/VAE load; Resident borrows the warm encoder).
-            |enc: &BooguEncoders| enc.encode_base(&self.tokenizer, &req.prompt, guidance),
+            |enc: &BooguEncoders| enc.encode_base_preflight(&preflight),
             |c: Option<&BooguBaseCond>| match c {
                 Some(c) => c.materialize(),
                 None => Ok(()),
@@ -437,6 +439,16 @@ impl Boogu {
         let references: Vec<Image> = resolve_edit_references(req)?.into_iter().cloned().collect();
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        // Host-only smart-resize/token admission runs before Residency can load or call the MLX
+        // text/vision tower or VAE phase. Both CFG legs reuse the exact checked ids/counts.
+        let preflight = crate::pipeline::preflight_edit(
+            &self.tokenizer,
+            &references,
+            &req.prompt,
+            guidance > 1.0,
+            true,
+            false,
+        )?;
         let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
         // The faithful edit runs each reference through the vision tower (image-conditioned) and the
         // CFG-negative is the text-only empty/drop instruction — the reference defaults.
@@ -457,7 +469,7 @@ impl Boogu {
             req.use_pid,
             on_progress,
             |enc: &BooguEncoders| {
-                enc.encode_edit(&self.tokenizer, &references, &req.prompt, &edit_opts)
+                enc.encode_edit_preflight(&references, &edit_opts, Some(&preflight))
             },
             |c: Option<&BooguBaseCond>| match c {
                 Some(c) => c.materialize(),
@@ -525,6 +537,7 @@ impl Boogu {
             )));
         }
         let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
+        let preflight = crate::pipeline::preflight_text(&self.tokenizer, &req.prompt, false)?;
         // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise from
         // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i.
         let reference = resolve_reference(req, id)?;
@@ -536,7 +549,7 @@ impl Boogu {
             &req.cancel,
             req.use_pid,
             on_progress,
-            |enc: &BooguEncoders| enc.encode_turbo(&self.tokenizer, &req.prompt),
+            |enc: &BooguEncoders| enc.encode_turbo_preflight(&preflight),
             |encoded: Option<&(Array, Array)>| {
                 let Some((cond, mask)) = encoded else {
                     return Ok(());
@@ -601,7 +614,38 @@ impl Boogu {
 /// [`MAX_EDIT_REFS`] (the DiT's `image_index_embedding` slot count); none, or more than the cap, is an
 /// error.
 fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
-    let mut refs: Vec<&Image> = Vec::new();
+    // Preserve the typed strength failure independently of cardinality: scan the whole request for
+    // the edit-inert field before performing the bounded count pass.
+    for c in &req.conditioning {
+        if let Conditioning::Reference {
+            strength: Some(_), ..
+        } = c
+        {
+            return Err(Error::Unsupported(
+                "boogu_image_edit: per-reference strength is not supported for instruction edit; \
+                 omit conditioning.reference.strength"
+                    .into(),
+            ));
+        }
+    }
+
+    // Count first, checking every cumulative MultiReference length before allocating/extending the
+    // flattened vector. A pathological list can therefore never cause a large pointer allocation.
+    let mut count = 0usize;
+    for c in &req.conditioning {
+        let add = match c {
+            Conditioning::Reference { .. } => 1,
+            Conditioning::MultiReference { images } => images.len(),
+            _ => 0,
+        };
+        count = count
+            .checked_add(add)
+            .ok_or_else(|| Error::Msg("boogu_image_edit: reference image count overflow".into()))?;
+        validate_max_edit_reference_count(count)?;
+    }
+    validate_edit_reference_count(count)?;
+
+    let mut refs: Vec<&Image> = Vec::with_capacity(count);
     for c in &req.conditioning {
         match c {
             Conditioning::Reference { image, .. } => refs.push(image),
@@ -609,19 +653,89 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
             _ => {}
         }
     }
-    if refs.is_empty() {
+    debug_assert_eq!(refs.len(), count);
+    for (index, image) in refs.iter().enumerate() {
+        validate_edit_reference(index, image)?;
+    }
+    Ok(refs)
+}
+
+/// Reject an over-cap reference count before any flattened or per-reference admission vectors can
+/// be allocated. Kept separate from the final non-empty check because registered requests may carry
+/// unrelated conditioning entries before their first reference.
+fn validate_max_edit_reference_count(count: usize) -> Result<()> {
+    if count > MAX_EDIT_REFS {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {count})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_edit_reference_count(count: usize) -> Result<()> {
+    validate_max_edit_reference_count(count)?;
+    if count == 0 {
         return Err(Error::Msg(
             "boogu_image_edit: an instruction edit requires at least one source reference image"
                 .into(),
         ));
     }
-    if refs.len() > MAX_EDIT_REFS {
+    Ok(())
+}
+
+/// Apply the registered generator's complete raw-reference carrier contract to a direct resident
+/// pipeline slice. This is allocation-free and must run before token/grid admission or component
+/// entry so the public [`crate::BooguPipeline`] route cannot bypass the generator boundary.
+pub(crate) fn validate_raw_edit_references(references: &[Image]) -> Result<()> {
+    validate_edit_reference_count(references.len())?;
+    for (index, image) in references.iter().enumerate() {
+        validate_edit_reference(index, image)?;
+    }
+    Ok(())
+}
+
+/// Validate one Edit source at the public generator boundary, before the request can enter either
+/// the vision encoder or the raw-resolution VAE/DiT spatial path. References retain their own
+/// geometry but must fit the advertised Boogu envelope, the patch/VAE stride, and the RGB8 carrier
+/// contract.
+fn validate_edit_reference(index: usize, image: &Image) -> Result<()> {
+    if image.width == 0 || image.height == 0 {
         return Err(Error::Msg(format!(
-            "boogu_image_edit: at most {MAX_EDIT_REFS} reference images are supported (got {})",
-            refs.len()
+            "boogu_image_edit: reference {index} must have non-zero dimensions (got {}x{})",
+            image.width, image.height
         )));
     }
-    Ok(refs)
+    if image.width > RES_MAX || image.height > RES_MAX {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} {}x{} exceeds the {RES_MAX}x{RES_MAX} reference envelope",
+            image.width, image.height
+        )));
+    }
+    if !image.width.is_multiple_of(RES_MULTIPLE) || !image.height.is_multiple_of(RES_MULTIPLE) {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} dimensions must be multiples of {RES_MULTIPLE} (got {}x{})",
+            image.width, image.height
+        )));
+    }
+    let expected = mlx_gen::gen_core::imageops::checked_image_buffer_len(
+        image.width as usize,
+        image.height as usize,
+        3,
+    )
+    .ok_or_else(|| {
+        Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 dimensions overflow host size"
+        ))
+    })?;
+    if image.pixels.len() != expected {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: reference {index} RGB8 buffer has {} bytes; expected {expected} for {}x{}x3",
+            image.pixels.len(),
+            image.width,
+            image.height
+        )));
+    }
+    Ok(())
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -645,28 +759,11 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    // The Edit variant needs 1..=MAX_EDIT_REFS source references (Reference and/or MultiReference);
-    // the floor already rejects any reference conditioning on Base/Turbo (their surface is empty).
+    // The Edit variant needs 1..=MAX_EDIT_REFS bounded RGB8 source references. Resolve the same
+    // production boundary generate uses so validate cannot accept a request that later fails only
+    // after vision/VAE allocation, and so edit-only per-reference strength is never discarded.
     if id == BOOGU_IMAGE_EDIT_ID {
-        let refs: usize = req
-            .conditioning
-            .iter()
-            .map(|c| match c {
-                Conditioning::Reference { .. } => 1,
-                Conditioning::MultiReference { images } => images.len(),
-                _ => 0,
-            })
-            .sum();
-        if refs == 0 {
-            return Err(Error::Msg(format!(
-                "{id}: instruction edit requires at least one source reference image"
-            )));
-        }
-        if refs > MAX_EDIT_REFS {
-            return Err(Error::Msg(format!(
-                "{id}: at most {MAX_EDIT_REFS} source reference images are supported (got {refs})"
-            )));
-        }
+        resolve_edit_references(req)?;
     }
     Ok(())
 }
@@ -706,6 +803,65 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
 
+    fn write_tiny_tokenizer(root: &Path, overlong_negative: bool) {
+        let mllm = root.join("mllm");
+        std::fs::create_dir_all(&mllm).unwrap();
+        let literals = [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|image_pad|>",
+        ];
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<unk>".into(), serde_json::json!(0));
+        let added = literals
+            .iter()
+            .enumerate()
+            .map(|(index, literal)| {
+                let id = index + 1;
+                vocab.insert((*literal).into(), serde_json::json!(id));
+                serde_json::json!({
+                    "id": id,
+                    "content": literal,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true
+                })
+            })
+            .collect::<Vec<_>>();
+        vocab.insert("burst".into(), serde_json::json!(literals.len() + 1));
+        let normalizer = overlong_negative.then(|| {
+            serde_json::json!({
+                "type": "Replace",
+                "pattern": { "String": "Describe" },
+                "content": "burst ".repeat(crate::tokenizer::MAX_TEXT_TOKENS + 1)
+            })
+        });
+        let fixture = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": normalizer,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" }
+        });
+        std::fs::write(
+            mllm.join("tokenizer.json"),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_tiny_edit_tokenizer(root: &Path) {
+        write_tiny_tokenizer(root, false);
+    }
+
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: "a red apple on a wooden table".into(),
@@ -721,6 +877,249 @@ mod tests {
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
         }
+    }
+
+    /// Registered-route mutation table: a Sequential snapshot containing only the host tokenizer
+    /// proves that every ordinary positive/negative failure happens before the text/heavy loaders.
+    /// The negative fixture expands `SYSTEM_PROMPT_DROP`; grounded Edit remains below 8192 while its
+    /// ordinary CFG-negative crosses 1280, independently discriminating that leg.
+    #[test]
+    fn ordinary_text_preflight_precedes_every_registered_component_route() {
+        let positive_root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(positive_root.path(), false);
+        let positive_spec = LoadSpec::new(WeightsSource::Dir(positive_root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for load_route in [
+            load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+            load_turbo as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+        ] {
+            let generator = load_route(&positive_spec).unwrap();
+            let request = GenerationRequest {
+                prompt: "<|image_pad|>".repeat(crate::tokenizer::MAX_TEXT_TOKENS + 1),
+                ..req(512, 512)
+            };
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_text_tokens=1280"), "{error}");
+        }
+
+        let negative_root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(negative_root.path(), true);
+        let negative_spec = LoadSpec::new(WeightsSource::Dir(negative_root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for (load_route, conditioning) in [
+            (
+                load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+                Vec::new(),
+            ),
+            (
+                load_edit as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+                vec![Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                }],
+            ),
+        ] {
+            let generator = load_route(&negative_spec).unwrap();
+            let request = GenerationRequest {
+                prompt: "ordinary positive".into(),
+                guidance: Some(4.0),
+                conditioning,
+                ..req(512, 512)
+            };
+            let error = generator
+                .generate(&request, &mut |_| {})
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_text_tokens=1280"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_preflight_admits_exactly_1280_on_every_positive_route() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(root.path(), false);
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        let template_len = tok.preflight_t2i("").unwrap().len();
+        let prompt = "<|image_pad|>".repeat(crate::tokenizer::MAX_TEXT_TOKENS - template_len);
+        assert_eq!(
+            tok.preflight_t2i(&prompt).unwrap().len(),
+            crate::tokenizer::MAX_TEXT_TOKENS
+        );
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        for load_route in [
+            load as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+            load_turbo as fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+        ] {
+            let generator = load_route(&spec).unwrap();
+            let error = generator
+                .generate(
+                    &GenerationRequest {
+                        prompt: prompt.clone(),
+                        ..req(512, 512)
+                    },
+                    &mut |_| {},
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !error.contains("max_text_tokens"),
+                "exactly 1280 must pass admission: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_preflight_discriminates_text_and_optional_grounded_cfg_legs() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_tokenizer(root.path(), false);
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        // Exercise the direct resident seam at the inclusive five-reference boundary while each
+        // conditioning/CFG mode proves that the exact admitted leg set reaches component entry.
+        let references = (0..MAX_EDIT_REFS).map(|_| img(16, 16)).collect::<Vec<_>>();
+
+        for (condition_on_image, grounded_negative, expected) in [
+            (true, false, (false, true, true, false)),
+            (true, true, (false, true, false, true)),
+            (false, false, (true, false, true, false)),
+        ] {
+            let opts = crate::pipeline::EditOptions {
+                condition_on_image,
+                use_input_images_4_neg_instruct: grounded_negative,
+                ..Default::default()
+            };
+            let admitted = crate::pipeline::with_resident_edit_preflight(
+                &tok,
+                &references,
+                "edit",
+                &opts,
+                |preflight| Ok(preflight.admitted_legs()),
+            )
+            .unwrap();
+            assert_eq!(admitted, expected);
+        }
+    }
+
+    /// The exported resident `BooguPipeline` seam must reject every raw-reference boundary before
+    /// it enters the closure that owns text/vision/VAE work. Each row is independently
+    /// mutation-sensitive: weakening count, geometry, alignment, or RGB8 admission makes its entry
+    /// counter non-zero instead of returning the named typed diagnostic.
+    #[test]
+    fn resident_edit_reference_preflight_has_zero_component_entry_on_every_invalid_carrier() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_edit_tokenizer(root.path());
+        let tok = BooguTokenizer::from_snapshot(root.path()).unwrap();
+        let opts = crate::pipeline::EditOptions::default();
+        let invalid = [
+            ("zero references", Vec::new(), "at least one"),
+            (
+                "six references",
+                (0..=MAX_EDIT_REFS).map(|_| img(16, 16)).collect(),
+                "at most 5",
+            ),
+            (
+                "zero geometry",
+                vec![Image {
+                    width: 0,
+                    height: 16,
+                    pixels: Vec::new(),
+                }],
+                "non-zero",
+            ),
+            (
+                "oversized geometry",
+                vec![img(RES_MAX + RES_MULTIPLE, 16)],
+                "reference envelope",
+            ),
+            (
+                "misaligned geometry",
+                vec![img(RES_MULTIPLE + 1, RES_MULTIPLE)],
+                "multiples of 16",
+            ),
+            (
+                "malformed RGB8",
+                vec![Image {
+                    width: 16,
+                    height: 16,
+                    pixels: vec![0; 16 * 16 * 3 - 1],
+                }],
+                "RGB8 buffer",
+            ),
+        ];
+
+        for (case, references, expected) in invalid {
+            let component_entries = Cell::new(0usize);
+            let error = crate::pipeline::with_resident_edit_preflight(
+                &tok,
+                &references,
+                "edit",
+                &opts,
+                |_| {
+                    component_entries.set(component_entries.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(expected),
+                "{case}: expected {expected:?}, got {error}"
+            );
+            assert_eq!(
+                component_entries.get(),
+                0,
+                "{case}: invalid carrier entered resident components"
+            );
+        }
+    }
+
+    /// The real generator boundary must reject combined edit budgets before entering either
+    /// sequential component loader. The snapshot contains only a tokenizer: reaching the MLX tower
+    /// or VAE loader would therefore replace the declared budget error with a missing-weight error.
+    #[test]
+    fn edit_overbudget_preflight_never_enters_tower_or_vae_loaders() {
+        let root = tempfile::tempdir().unwrap();
+        write_tiny_edit_tokenizer(root.path());
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        let generator = load_edit(&spec).unwrap();
+
+        let two_max = GenerationRequest {
+            prompt: "edit".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![img(2048, 2048), img(2048, 2048)],
+            }],
+            ..Default::default()
+        };
+        let error = generator
+            .generate(&two_max, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_edit_tokens=8192"), "{error}");
+
+        let prompt_over = GenerationRequest {
+            prompt: "<|image_pad|>".repeat(crate::tokenizer::MAX_EDIT_TOKENS),
+            width: 512,
+            height: 512,
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let error = generator
+            .generate(&prompt_over, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_edit_tokens=8192"), "{error}");
     }
 
     #[test]
@@ -1017,6 +1416,138 @@ mod tests {
             ..req(512, 512)
         };
         assert!(validate_request(&descriptor_edit(), &multi_over).is_err());
+
+        // Mutation guard: the cap is cumulative across multiple carriers, not per conditioning.
+        let split_over = GenerationRequest {
+            conditioning: vec![
+                Conditioning::MultiReference {
+                    images: (0..3).map(|_| img(16, 16)).collect(),
+                },
+                Conditioning::MultiReference {
+                    images: (0..3).map(|_| img(16, 16)).collect(),
+                },
+            ],
+            ..req(512, 512)
+        };
+        let error = resolve_edit_references(&split_over)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at most 5"), "{error}");
+    }
+
+    #[test]
+    fn edit_reference_geometry_and_rgb8_are_rejected_at_validation_boundary() {
+        let edit_request = |image| GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: None,
+            }],
+            ..req(512, 512)
+        };
+
+        // Small-but-aligned sources remain supported; the output minimum is not imposed on source
+        // geometry. This guards against accidentally narrowing Edit while adding the upper bound.
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(16, 16))).is_ok());
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(RES_MAX, 16))).is_ok());
+        assert!(validate_request(&descriptor_edit(), &edit_request(img(16, RES_MAX))).is_ok());
+
+        let cases = [
+            (
+                Image {
+                    width: 0,
+                    height: 16,
+                    pixels: vec![],
+                },
+                "non-zero",
+            ),
+            (img(RES_MAX + RES_MULTIPLE, 16), "reference envelope"),
+            (img(RES_MAX - 1, 512), "multiples of 16"),
+            (
+                Image {
+                    width: 512,
+                    height: 512,
+                    pixels: vec![0; 512 * 512 * 3 - 1],
+                },
+                "RGB8 buffer",
+            ),
+        ];
+        for (image, expected) in cases {
+            let error = validate_request(&descriptor_edit(), &edit_request(image))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} from early edit validation, got: {error}"
+            );
+        }
+
+        // Every ordered member is validated, including images carried by MultiReference. Checking
+        // only the first item would let this malformed second source reach the vision/VAE path.
+        let malformed_second = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![
+                    img(512, 512),
+                    Image {
+                        width: 512,
+                        height: 512,
+                        pixels: vec![0; 12],
+                    },
+                ],
+            }],
+            ..req(512, 512)
+        };
+        let error = validate_request(&descriptor_edit(), &malformed_second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reference 1 RGB8 buffer"), "{error}");
+    }
+
+    #[test]
+    fn edit_rejects_per_reference_strength_as_typed_unsupported_only_on_edit() {
+        let request = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: Some(0.6),
+            }],
+            ..req(512, 512)
+        };
+        let error = validate_request(&descriptor_edit(), &request).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert!(
+            error.to_string().contains("per-reference strength"),
+            "{error}"
+        );
+
+        // Preserve the typed field failure even when an earlier carrier is independently over the
+        // cardinality cap.
+        let strength_after_over_cap = GenerationRequest {
+            conditioning: vec![
+                Conditioning::MultiReference {
+                    images: (0..6).map(|_| img(16, 16)).collect(),
+                },
+                Conditioning::Reference {
+                    image: img(16, 16),
+                    strength: Some(0.6),
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(matches!(
+            resolve_edit_references(&strength_after_over_cap),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Base/Turbo consume this field as img2img start strength; the edit-only guard must not
+        // narrow either supported route.
+        assert!(validate_request(&descriptor(), &request).is_ok());
+        assert!(validate_request(&descriptor_turbo(), &request).is_ok());
+        assert_eq!(
+            resolve_reference(&request, BOOGU_IMAGE_ID)
+                .unwrap()
+                .unwrap()
+                .1,
+            0.6
+        );
     }
 
     #[test]

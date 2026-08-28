@@ -16,7 +16,6 @@ LANES = (
     "candle_cpu",
     "macos_metal",
     "windows_cuda",
-    "supply_chain",
     "docs",
     "release",
     "real_weights",
@@ -88,8 +87,7 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
             lanes["docs"] = True
             continue
 
-        if path == "LICENSE" or path == "deny.toml":
-            lanes["supply_chain"] = True
+        if path in {"LICENSE", "advisory-ignores.toml", "deny.toml"}:
             lanes["release"] = True
             continue
 
@@ -186,7 +184,6 @@ def select_lanes(paths: Iterable[str], force_all: bool = False) -> dict[str, boo
         _all(lanes)
 
     if any(path.endswith("Cargo.toml") for path in normalized):
-        lanes["supply_chain"] = True
         lanes["release"] = True
     return lanes
 

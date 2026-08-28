@@ -1523,9 +1523,15 @@ mod tests {
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result
             .err()
-            .expect("mid-load replacement must invalidate the production Qwen File entrypoint")
-            .to_string();
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+            .expect("mid-load replacement must invalidate the production Qwen File entrypoint");
+        assert!(
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected: {error:?}"
+        );
     }
 
     struct DecodeSpy {
@@ -1730,10 +1736,16 @@ mod tests {
         spec.prepare_file_sources().unwrap();
 
         std::fs::write(&vae, b"replacement vae bytes").unwrap();
-        let error = validate_load_spec(&spec)
-            .expect_err("provider must reject a changed prepared VAE")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+        let error =
+            validate_load_spec(&spec).expect_err("provider must reject a changed prepared VAE");
+        assert!(
+            matches!(
+                error,
+                gen_core::Error::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10867). ONE probed generation whose

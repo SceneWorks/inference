@@ -96,6 +96,9 @@ pub mod grounding;
 pub mod decoder;
 pub use decoder::{ensure_decoder_compatible, ensure_decoder_layout, LatentDecoder};
 
+// Canonical SDXL-family `scaled_linear` schedule parameters shared by inference and training.
+pub mod diffusion_schedule;
+
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
 // `Command::new("nvidia-smi")` that Windows resolves via the process search order (a PATH-hijack

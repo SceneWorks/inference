@@ -994,6 +994,39 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_scope_rejects_zero_fps_before_installing_controls() {
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let contract = weights_free_contract(&generic).unwrap();
+        let fixture = registered_valid_fixtures(&generic, &contract, MemoryStrategy::BoundedDecode)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the calibrated LTX fixture");
+        let exact = fixture
+            .load_spec
+            .as_ref()
+            .expect("the provider-owned calibrated load spec");
+        let mut scope = registered_begin_request(exact, &contract, &fixture.context)
+            .unwrap()
+            .expect("the calibrated LTX request scope");
+        let mut zero_fps = GenerationRequest {
+            fps: Some(0),
+            ..fixture.request
+        };
+        let error = scope
+            .configure_request(&mut zero_fps)
+            .expect_err("calibrated Candle LTX admission must reject zero fps");
+        assert!(
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "got: {error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("conditioning/FPS/strength identity"));
+        assert_eq!(zero_fps.memory, None);
+    }
+
+    #[test]
     fn catalog_fixture_normalizes_and_binds_the_exact_q4_route() {
         let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let contract = weights_free_contract(&generic).unwrap();

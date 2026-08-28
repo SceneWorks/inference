@@ -25,7 +25,7 @@ use crate::model_vace::ProviderVae;
 use crate::pipeline::cfg;
 use crate::quant::QLinear;
 use crate::scheduler::{FlowScheduler, Sampler};
-use crate::transformer::{ln_no_affine, timestep_sinusoid, Block};
+use crate::transformer::{ln_no_affine, timestep_sinusoid, Block, PreparedBlockCrossKv};
 
 /// The z16 VAE temporal/spatial strides (Wan2.1; VACE is Wan2.1-based).
 const VAE_T: usize = ProviderVae::VAE_TILING.temporal_scale as usize;
@@ -62,6 +62,12 @@ struct VaceBlock {
     proj_out: QLinear,
 }
 
+/// Request-scoped text K/V for both VACE's control-stack blocks and its base Wan blocks.
+struct PreparedVaceCrossKv {
+    vace_blocks: Vec<PreparedBlockCrossKv>,
+    main_blocks: Vec<PreparedBlockCrossKv>,
+}
+
 impl VaceBlock {
     fn new(cfg: &WanVaceConfig, vb: VarBuilder, has_proj_in: bool) -> Result<Self> {
         let dim = cfg.base.dim;
@@ -80,12 +86,16 @@ impl VaceBlock {
     /// `control`/`hidden_tokens`: `[B,L,dim]` (bf16). Returns `(hint, new_control)` both bf16: the hint
     /// added to the main stream at the matching vace layer, and the control stream threaded forward.
     /// `proj_in` (block 0 only) injects the main noisy-latent tokens into the control stream once.
-    fn forward(
+    fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        self.core.prepare_cross_kv(context)
+    }
+
+    fn forward_prepared(
         &self,
         control: &Tensor,
         hidden_tokens: &Tensor,
         temb6: &Tensor,
-        context: &Tensor,
+        cross_kv: &PreparedBlockCrossKv,
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
@@ -93,7 +103,9 @@ impl VaceBlock {
             Some(p) => p.forward(control)?.broadcast_add(hidden_tokens)?,
             None => control.clone(),
         };
-        let new_control = self.core.forward(&control, temb6, context, cos, sin)?;
+        let new_control = self
+            .core
+            .forward_prepared(&control, temb6, cross_kv, cos, sin)?;
         let hint = self.proj_out.forward(&new_control)?;
         Ok((hint, new_control))
     }
@@ -188,6 +200,23 @@ impl WanVaceTransformer {
     pub fn embed_text(&self, prompt_embeds: &Tensor) -> Result<Tensor> {
         let x = prompt_embeds.to_dtype(self.dtype)?;
         self.text_l2.forward(&self.text_l1.forward(&x)?.gelu()?)
+    }
+
+    /// Prepare the K/V heads which are invariant for one projected conditioning payload. This cache
+    /// belongs to the caller's request scope and covers both VACE control and main Wan block stacks.
+    fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedVaceCrossKv> {
+        Ok(PreparedVaceCrossKv {
+            vace_blocks: self
+                .vace_blocks
+                .iter()
+                .map(|block| block.prepare_cross_kv(context))
+                .collect::<Result<Vec<_>>>()?,
+            main_blocks: self
+                .blocks
+                .iter()
+                .map(|block| block.prepare_cross_kv(context))
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     /// Per-frame strided conv2d patchify of a `[B,C,F,Hl,Wl]` latent → tokens `[B, L, dim]` (bf16).
@@ -294,12 +323,35 @@ impl WanVaceTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let cross_kv = self.prepare_cross_kv(context)?;
+        self.forward_cached_prepared(latents, t, control_emb, &cross_kv, scales, cos, sin)
+    }
+
+    /// VACE forward against request-scoped prepared text K/V.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_cached_prepared(
+        &self,
+        latents: &Tensor,
+        t: f64,
+        control_emb: &Tensor,
+        cross_kv: &PreparedVaceCrossKv,
+        scales: &[f32],
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
         if scales.len() != self.cfg.vace_layers.len() {
             return Err(CoreError::Msg(format!(
                 "wan-vace: control scales len {} != vace_layers len {}",
                 scales.len(),
                 self.cfg.vace_layers.len()
             )));
+        }
+        if cross_kv.vace_blocks.len() != self.vace_blocks.len()
+            || cross_kv.main_blocks.len() != self.blocks.len()
+        {
+            return Err(CoreError::Msg(
+                "wan-vace: prepared cross K/V does not match transformer".into(),
+            ));
         }
         let (b, _c, f, hl, wl) = latents.dims5()?;
         let (pt, ph, pw) = self.cfg.base.patch;
@@ -321,9 +373,14 @@ impl WanVaceTransformer {
         // VACE hint prep: thread the control stream through every vace block, collect (hint, scale).
         let mut control_hs = control_emb.clone();
         let mut hints: Vec<(Tensor, f32)> = Vec::with_capacity(self.vace_blocks.len());
-        for (vb, &scale) in self.vace_blocks.iter().zip(scales.iter()) {
+        for ((vb, kv), &scale) in self
+            .vace_blocks
+            .iter()
+            .zip(&cross_kv.vace_blocks)
+            .zip(scales.iter())
+        {
             let (hint, new_control) =
-                vb.forward(&control_hs, &x_tokens, &temb6, context, cos, sin)?;
+                vb.forward_prepared(&control_hs, &x_tokens, &temb6, kv, cos, sin)?;
             hints.push((hint, scale));
             control_hs = new_control;
         }
@@ -331,8 +388,8 @@ impl WanVaceTransformer {
 
         // Main blocks with hint injection at each layer in vace_layers.
         let mut x = x_tokens;
-        for (i, blk) in self.blocks.iter().enumerate() {
-            x = blk.forward(&x, &temb6, context, cos, sin)?;
+        for (i, (blk, kv)) in self.blocks.iter().zip(&cross_kv.main_blocks).enumerate() {
+            x = blk.forward_prepared(&x, &temb6, kv, cos, sin)?;
             if self.cfg.vace_layers.contains(&i) {
                 let (hint, scale) = hints
                     .pop()
@@ -519,6 +576,10 @@ pub fn denoise_vace(
     );
     let l = (f / pt) * (hl / ph) * (wl / ph); // width uses `ph` too (square patch)
     let control_emb = transformer.embed_control(control, l)?;
+    let pos_kv = transformer.prepare_cross_kv(ctx_pos)?;
+    let neg_kv = ctx_neg
+        .map(|context| transformer.prepare_cross_kv(context))
+        .transpose()?;
 
     let mut latents = init_noise.clone();
     let mut sched = FlowScheduler::new(sampler, steps, shift);
@@ -527,12 +588,26 @@ pub fn denoise_vace(
             return Err(CandleError::Canceled);
         }
         let t = sched.timestep(i);
-        let cond =
-            transformer.forward_cached(&latents, t, &control_emb, ctx_pos, scales, cos, sin)?;
-        let v = match ctx_neg {
-            Some(neg) => {
-                let uncond =
-                    transformer.forward_cached(&latents, t, &control_emb, neg, scales, cos, sin)?;
+        let cond = transformer.forward_cached_prepared(
+            &latents,
+            t,
+            &control_emb,
+            &pos_kv,
+            scales,
+            cos,
+            sin,
+        )?;
+        let v = match &neg_kv {
+            Some(neg_kv) => {
+                let uncond = transformer.forward_cached_prepared(
+                    &latents,
+                    t,
+                    &control_emb,
+                    neg_kv,
+                    scales,
+                    cos,
+                    sin,
+                )?;
                 cfg(&cond, &uncond, guidance)?
             }
             None => cond,
@@ -575,27 +650,31 @@ pub fn denoise_vace_range(
     let (pt, ph, pw) = transformer.cfg.base.patch;
     let l = (f / pt) * (hl / ph) * (wl / pw);
     let control_emb = transformer.embed_control(control, l)?;
+    let pos_kv = transformer.prepare_cross_kv(ctx_pos)?;
+    let neg_kv = ctx_neg
+        .map(|context| transformer.prepare_cross_kv(context))
+        .transpose()?;
     for i in range {
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
         let timestep = timesteps[i];
-        let cond = transformer.forward_cached(
+        let cond = transformer.forward_cached_prepared(
             latents,
             timestep,
             &control_emb,
-            ctx_pos,
+            &pos_kv,
             scales,
             cos,
             sin,
         )?;
-        let velocity = match ctx_neg {
-            Some(negative) => {
-                let uncond = transformer.forward_cached(
+        let velocity = match &neg_kv {
+            Some(neg_kv) => {
+                let uncond = transformer.forward_cached_prepared(
                     latents,
                     timestep,
                     &control_emb,
-                    negative,
+                    neg_kv,
                     scales,
                     cos,
                     sin,
@@ -838,6 +917,83 @@ mod tests {
                 .unwrap();
             assert_eq!(out.dims(), &[1, 16, 1, 2, 2]);
         }
+    }
+
+    /// VACE has two cross-attention stacks (control and main). This CPU probe proves each CFG payload
+    /// projects K/V once for both stacks, then survives repeated denoise forwards without reprojecting.
+    #[test]
+    fn prepared_cross_kv_reuses_vace_and_main_stacks_with_pinned_output() {
+        use crate::transformer::{
+            cross_kv_preparation_pairs, lock_cross_kv_probe, reset_cross_kv_preparation_pairs,
+        };
+
+        let _probe_lock = lock_cross_kv_probe();
+        let (transformer, cfg) = tiny_packed_transformer(4);
+        let dev = Device::Cpu;
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 1, 2, 2), &dev).unwrap();
+        let control = Tensor::randn(0f32, 1f32, (1, 96, 1, 2, 2), &dev).unwrap();
+        let control_emb = transformer.embed_control(&control, 1).unwrap();
+        let pos = Tensor::randn(0f32, 1f32, (1, 1, cfg.base.dim), &dev).unwrap();
+        let neg = Tensor::randn(0f32, 1f32, (1, 1, cfg.base.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg.base).cos_sin(1, 1, 1, &dev).unwrap();
+        let prior = transformer
+            .forward_cached(&latents, 500.0, &control_emb, &pos, &[1.0], &cos, &sin)
+            .unwrap();
+
+        reset_cross_kv_preparation_pairs();
+        let pos_kv = transformer.prepare_cross_kv(&pos).unwrap();
+        let neg_kv = transformer.prepare_cross_kv(&neg).unwrap();
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            4,
+            "two stacks times one K/V pair times two conditioning payloads"
+        );
+        let prepared = transformer
+            .forward_cached_prepared(&latents, 500.0, &control_emb, &pos_kv, &[1.0], &cos, &sin)
+            .unwrap();
+        let max_abs = (&prior - &prepared)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            max_abs, 0.0,
+            "prepared VACE output must match the prior fixture"
+        );
+        for timestep in [400.0, 250.0] {
+            transformer
+                .forward_cached_prepared(
+                    &latents,
+                    timestep,
+                    &control_emb,
+                    &pos_kv,
+                    &[1.0],
+                    &cos,
+                    &sin,
+                )
+                .unwrap();
+            transformer
+                .forward_cached_prepared(
+                    &latents,
+                    timestep,
+                    &control_emb,
+                    &neg_kv,
+                    &[1.0],
+                    &cos,
+                    &sin,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            cross_kv_preparation_pairs(),
+            4,
+            "VACE denoise repetition must not reproject text K/V"
+        );
     }
 
     #[test]

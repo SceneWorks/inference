@@ -525,14 +525,19 @@ mod tests {
             Ok(_) => {
                 panic!("replacement during MLX evaluation must invalidate the native file pin")
             }
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
 
         assert!(
             final_evaluated.load(Ordering::SeqCst),
             "the final MLX array map must be evaluated before the post-check rejects the mutation"
         );
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     fn write_native_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], Vec<u8>)]) {

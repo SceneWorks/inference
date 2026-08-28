@@ -121,7 +121,7 @@ pub struct SanaLoadSeal {
     variant: SanaVariant,
     root: PathBuf,
     paths: Vec<PathBuf>,
-    files: Vec<(gen_core::PinnedWeightsFile, [u8; 32])>,
+    files: Vec<gen_core::PinnedWeightsFile>,
     contract: MemoryProviderContract,
 }
 
@@ -136,11 +136,7 @@ impl SanaLoadSeal {
         validate_loader_tensor_formats(variant, root)?;
         let files = paths
             .iter()
-            .map(|path| {
-                let pin = gen_core::PinnedWeightsFile::pin(path)?;
-                let digest = pin.read_unchanged(sha256_file)?;
-                Ok((pin, digest))
-            })
+            .map(gen_core::PinnedWeightsFile::pin)
             .collect::<gen_core::Result<Vec<_>>>()?;
         let contract = build_contract(variant, spec, root, &files)?;
         let seal = Self {
@@ -166,15 +162,8 @@ impl SanaLoadSeal {
                 self.variant.provider_id()
             )));
         }
-        for (pin, digest) in &self.files {
-            pin.ensure_unchanged()?;
-            if pin.read_unchanged(sha256_file)? != *digest {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{}: immutable snapshot content changed after admission: {}",
-                    self.variant.provider_id(),
-                    pin.loader_path().display()
-                )));
-            }
+        for pin in &self.files {
+            pin.verify_unchanged()?;
         }
         validate_loader_tensor_formats(self.variant, &self.root)
     }
@@ -386,7 +375,7 @@ fn build_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
     root: &Path,
-    files: &[(gen_core::PinnedWeightsFile, [u8; 32])],
+    files: &[gen_core::PinnedWeightsFile],
 ) -> gen_core::Result<MemoryProviderContract> {
     let (conditioning, transformer, decoder) = selected_component_bytes(variant, root)?;
     let mut assembly = Sha256::new();
@@ -396,9 +385,9 @@ fn build_contract(
         SanaVariant::Base => b"true-cfg-negative-prompt" as &[u8],
         SanaVariant::Sprint => b"cfg-free-embedded-guidance" as &[u8],
     });
-    for (pin, digest) in files {
+    for pin in files {
         assembly.update(pin.loader_path().to_string_lossy().as_bytes());
-        assembly.update(digest);
+        assembly.update(pin.content_sha256());
     }
     Ok(assemble_contract(
         variant,

@@ -5,7 +5,7 @@
 //! sigma-gate I/O (exp(log_alpha)·σ broadcast + sigmoid), (3) the full gate-injected forward.
 
 use mlx_gen::weights::Weights;
-use mlx_gen_pid::{ConvPadding, PidConfig, PidNet, RopeMode};
+use mlx_gen_pid::{ConvPadding, PidConfig, PidNet};
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
 
@@ -30,12 +30,9 @@ fn tiny_cfg() -> PidConfig {
         patch_size: 2,
         txt_embed_dim: 12,
         txt_max_length: 5,
-        use_text_rope: true,
         text_rope_theta: 10000.0,
-        rope_mode: RopeMode::NtkAware,
         rope_ref_h: 16,
         rope_ref_w: 16,
-        lq_in_channels: 0,
         lq_latent_channels: 4,
         lq_hidden_dim: 8,
         lq_num_res_blocks: 2,

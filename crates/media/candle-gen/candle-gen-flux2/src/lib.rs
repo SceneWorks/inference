@@ -2056,9 +2056,15 @@ mod tests {
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result
             .err()
-            .expect("mid-load replacement must invalidate the production FLUX.2 File entrypoint")
-            .to_string();
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+            .expect("mid-load replacement must invalidate the production FLUX.2 File entrypoint");
+        assert!(
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected: {error:?}"
+        );
     }
 
     #[test]
@@ -2904,9 +2910,15 @@ mod tests {
 
         std::fs::write(&dit, b"replacement dit bytes").unwrap();
         let error = validate_load_spec(Flux2Variant::Dev, &spec)
-            .expect_err("provider must reject a changed prepared DiT")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("provider must reject a changed prepared DiT");
+        assert!(
+            matches!(
+                error,
+                gen_core::Error::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// A klein single file still requires the companion base snapshot (the file has no TE / VAE /

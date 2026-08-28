@@ -11,7 +11,7 @@
 //! anchor-centre decode below).
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::Result;
+use candle_gen::{CandleError, Result};
 use candle_nn::ops::sigmoid;
 
 use crate::common::{Conv, Weights};
@@ -102,10 +102,7 @@ impl Head {
         Ok(Self {
             // The learned per-level reg scale is a single-element tensor — stored 0-d or `[1]`
             // depending on the converter, so flatten before reading rather than assume rank 0.
-            scale: w
-                .require(&format!("{p}.scale"))?
-                .flatten_all()?
-                .to_vec1::<f32>()?[0] as f64,
+            scale: read_reg_scale(w.require(&format!("{p}.scale"))?, &p)?,
             stem: [
                 Conv::load(w, &format!("{p}.stem0"))?,
                 Conv::load(w, &format!("{p}.stem1"))?,
@@ -132,6 +129,18 @@ impl Head {
             kps,
         })
     }
+}
+
+/// Read SCRFD's learned per-head regression scale, which must be a scalar or one-element vector.
+fn read_reg_scale(scale: Tensor, head: &str) -> Result<f64> {
+    let values = scale.flatten_all()?.to_vec1::<f32>()?;
+    let [value] = values.as_slice() else {
+        return Err(CandleError::Msg(format!(
+            "scrfd: {head}.scale must contain exactly one element, got {}",
+            values.len()
+        )));
+    };
+    Ok(*value as f64)
 }
 
 /// SCRFD-10g detector.
@@ -343,6 +352,7 @@ fn nms(mut dets: Vec<Detection>, thresh: f32) -> Vec<Detection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::{DType, Device};
 
     fn det(score: f32, x: f32) -> Detection {
         Detection {
@@ -369,5 +379,15 @@ mod tests {
             .filter(|s| s.is_finite())
             .collect();
         assert_eq!(finite, vec![0.9, 0.7, 0.5]);
+    }
+
+    #[test]
+    fn reg_scale_rejects_empty_tensor_with_typed_error() {
+        let empty = Tensor::zeros((0,), DType::F32, &Device::Cpu).unwrap();
+        let error = read_reg_scale(empty, "head8").unwrap_err().to_string();
+        assert!(
+            error.contains("head8.scale must contain exactly one element, got 0"),
+            "unexpected error: {error}"
+        );
     }
 }

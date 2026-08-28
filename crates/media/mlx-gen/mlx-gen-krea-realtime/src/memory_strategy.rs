@@ -392,7 +392,7 @@ fn canonical_artifact_identity_for_source(
     }
     for adapter in &spec.adapters {
         let pin = spec.file_pin_for(&adapter.path)?;
-        pin.ensure_unchanged()?;
+        pin.verify_unchanged()?;
         let physical = inspect_safetensors(&adapter.path)?;
         digest.update(pin.loader_path().to_string_lossy().as_bytes());
         digest.update(physical.content_digest.as_bytes());

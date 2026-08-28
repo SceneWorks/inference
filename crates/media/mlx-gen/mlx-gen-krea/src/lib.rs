@@ -294,8 +294,8 @@ mod explicit_registry_tests {
         }
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
-            crate::model::VISION_ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
+            crate::model::test_vision_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         root
@@ -363,7 +363,8 @@ mod explicit_registry_tests {
                 .footprint(id, &base_spec)
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must expose a footprint"));
-            let selected = crate::model::ENCODER_CONTRACT
+            let language_contract = crate::model::test_encoder_contract();
+            let selected = language_contract
                 .source_for_load(&base_spec, &base)
                 .unwrap();
             let language = crate::model::selected_language_resident_bytes(
@@ -373,7 +374,7 @@ mod explicit_registry_tests {
             )
             .unwrap();
             let vision = if matches!(id, "krea_2_edit" | "krea_2_turbo_edit") {
-                let builtin = crate::model::ENCODER_CONTRACT
+                let builtin = language_contract
                     .validate_source_against_base(
                         &mlx_gen::WeightsSource::Dir(base.join("text_encoder")),
                         &base,
@@ -381,8 +382,8 @@ mod explicit_registry_tests {
                     .unwrap();
                 let headers = builtin
                     .materialized_vision_tensor_headers(
-                        &crate::model::VISION_ENCODER_CONTRACT,
-                        &crate::model::ENCODER_CONTRACT,
+                        &crate::model::test_vision_encoder_contract(),
+                        &language_contract,
                     )
                     .unwrap();
                 mlx_gen::asset_facts::projected_tensor_headers_bytes(&headers, |_| {
@@ -468,7 +469,7 @@ mod explicit_registry_tests {
         let external_text_encoder = tmp.path().join("external-text-encoder");
         gen_core_testkit::write_encoder_contract_fixture(
             &external_text_encoder,
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete selected text encoder fixture");
         let base_spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::File(dit))
@@ -592,7 +593,7 @@ mod explicit_registry_tests {
         let external_text_encoder = tmp.path().join("raw-external-text-encoder");
         gen_core_testkit::write_encoder_contract_fixture(
             &external_text_encoder,
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete selected text encoder fixture");
         let mut selected_encoder = base.clone();

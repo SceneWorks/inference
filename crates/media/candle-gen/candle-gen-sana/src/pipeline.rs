@@ -247,6 +247,48 @@ pub fn denoise_cfg_from_memory(
     preview: &candle_gen::preview::PreviewHook<'_>,
     memory: Option<candle_gen::gen_core::GenerationMemory>,
 ) -> Result<Tensor> {
+    denoise_cfg_from_masked_memory(
+        transformer,
+        sigmas,
+        sampler_name,
+        start_step,
+        seed,
+        latents,
+        cond,
+        None,
+        uncond,
+        None,
+        guidance_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        memory,
+    )
+}
+
+/// Base SANA denoise with the gathered positive and optional CFG-negative caption masks. Production
+/// resident and staged routes use this entrypoint; the mask-free public wrapper above is retained for
+/// low-level compatibility.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_cfg_from_masked_memory(
+    transformer: &SanaTransformer,
+    sigmas: &[f32],
+    sampler_name: Option<&str>,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    cond_mask: Option<&Tensor>,
+    uncond: Option<&Tensor>,
+    uncond_mask: Option<&Tensor>,
+    guidance_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
     let attention_budget = memory
         .filter(|memory| memory.chunk_attention)
         .and_then(|memory| memory.attention_chunk_size)
@@ -254,12 +296,24 @@ pub fn denoise_cfg_from_memory(
     let predict = |x: &Tensor, timestep: f32| -> Result<Tensor> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Tensor::from_vec(vec![timestep * NUM_TRAIN_TIMESTEPS], (1,), device)?;
-        let pred_cond =
-            transformer.forward_with_guidance_memory(x, cond, &t, None, attention_budget)?;
+        let pred_cond = transformer.forward_with_guidance_mask_memory(
+            x,
+            cond,
+            &t,
+            None,
+            cond_mask,
+            attention_budget,
+        )?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
-                let pred_uncond =
-                    transformer.forward_with_guidance_memory(x, uc, &t, None, attention_budget)?;
+                let pred_uncond = transformer.forward_with_guidance_mask_memory(
+                    x,
+                    uc,
+                    &t,
+                    None,
+                    uncond_mask,
+                    attention_budget,
+                )?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = (&pred_cond - &pred_uncond)?;
                 Ok((&pred_uncond + (delta * guidance_scale as f64)?)?)
@@ -354,7 +408,16 @@ pub struct SanaGenerateRequest<'a> {
 /// Seed-independent base-SANA prompt conditioning, prepared once for a whole image batch.
 pub(crate) struct SanaConditioning {
     cond: Tensor,
+    cond_mask: Tensor,
     uncond: Option<Tensor>,
+    uncond_mask: Option<Tensor>,
+}
+
+/// Seed-independent Sprint caption conditioning, including the gathered padding mask applied by
+/// every CFG-free transformer call.
+pub(crate) struct SanaSprintConditioning {
+    cond: Tensor,
+    cond_mask: Tensor,
 }
 
 impl<'a> SanaGenerateRequest<'a> {
@@ -442,16 +505,50 @@ impl SanaPipeline {
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
     ) -> Result<SanaConditioning> {
-        let cond = self.text_encoder.encode(req.prompt)?;
-        let uncond = if guidance > 1.0 {
-            Some(
-                self.text_encoder
-                    .encode(req.negative_prompt.unwrap_or(""))?,
-            )
+        let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
+        let (uncond, uncond_mask) = if guidance > 1.0 {
+            let (uncond, uncond_mask) = self
+                .text_encoder
+                .encode_with_mask(req.negative_prompt.unwrap_or(""))?;
+            (Some(uncond), Some(uncond_mask))
         } else {
-            None
+            (None, None)
         };
-        Ok(SanaConditioning { cond, uncond })
+        Ok(SanaConditioning {
+            cond,
+            cond_mask,
+            uncond,
+            uncond_mask,
+        })
+    }
+
+    /// Encode the seed-independent base-SANA img2img reference once for a whole `count` batch.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Tensor>> {
+        let start_step = resolve_init_start(
+            req.init_image,
+            req.steps.unwrap_or(DEFAULT_STEPS),
+            req.strength,
+        );
+        if start_step == 0 {
+            return Ok(None);
+        }
+        let image = req.init_image.ok_or_else(|| {
+            CandleError::Msg("SANA positive img2img start requires an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            &self.encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?))
     }
 
     /// Run the seed-dependent sampling and decode tail with precomputed conditioning.
@@ -486,6 +583,31 @@ impl SanaPipeline {
         preview: &candle_gen::preview::PreviewHook<'_>,
         memory: Option<candle_gen::gen_core::GenerationMemory>,
     ) -> Result<Image> {
+        let prepared_reference = self.prepare_reference(req, device, cancel)?;
+        self.generate_with_conditioning_and_reference_memory(
+            req,
+            conditioning,
+            prepared_reference.as_ref(),
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_and_reference_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &SanaConditioning,
+        prepared_reference: Option<&Tensor>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -497,20 +619,14 @@ impl SanaPipeline {
         let noise = create_noise(device, seed, req.width, req.height)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
         let latents = if start_step > 0 {
-            let clean = encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                req.init_image.expect("positive start requires init image"),
-                req.width,
-                req.height,
-                device,
-                cancel,
-            )?;
-            blend_flow_init(&clean, &noise, &sigmas, start_step)?
+            let clean = prepared_reference.ok_or_else(|| {
+                CandleError::Msg("SANA img2img denoise requires a prepared reference latent".into())
+            })?;
+            blend_flow_init(clean, &noise, &sigmas, start_step)?
         } else {
             noise
         };
-        let latents = denoise_cfg_from_memory(
+        let latents = denoise_cfg_from_masked_memory(
             &self.transformer,
             &sigmas,
             req.sampler,
@@ -518,7 +634,9 @@ impl SanaPipeline {
             seed,
             latents,
             &conditioning.cond,
+            Some(&conditioning.cond_mask),
             conditioning.uncond.as_ref(),
+            conditioning.uncond_mask.as_ref(),
             guidance,
             device,
             cancel,
@@ -597,13 +715,18 @@ pub(crate) fn generate_base_staged(
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
     let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
+    let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
+    let (uncond, uncond_mask) = if guidance > 1.0 {
+        let (uncond, uncond_mask) = text.encode_with_mask(req.negative_prompt.unwrap_or(""))?;
+        (Some(uncond), Some(uncond_mask))
+    } else {
+        (None, None)
+    };
     let conditioning = SanaConditioning {
-        cond: text.encode(req.prompt)?,
-        uncond: if guidance > 1.0 {
-            Some(text.encode(req.negative_prompt.unwrap_or(""))?)
-        } else {
-            None
-        },
+        cond,
+        cond_mask,
+        uncond,
+        uncond_mask,
     };
     device.synchronize()?;
     drop(text);
@@ -647,7 +770,7 @@ pub(crate) fn generate_base_staged(
             Some(clean) => blend_flow_init(clean, &noise, &sigmas, start_step)?,
             None => noise,
         };
-        latents.push(denoise_cfg_from_memory(
+        latents.push(denoise_cfg_from_masked_memory(
             &transformer,
             &sigmas,
             req.sampler,
@@ -655,7 +778,9 @@ pub(crate) fn generate_base_staged(
             *seed,
             initial,
             &conditioning.cond,
+            Some(&conditioning.cond_mask),
             conditioning.uncond.as_ref(),
+            conditioning.uncond_mask.as_ref(),
             guidance,
             device,
             cancel,
@@ -851,6 +976,39 @@ pub fn denoise_sprint_memory(
     preview: &candle_gen::preview::PreviewHook<'_>,
     memory: Option<candle_gen::gen_core::GenerationMemory>,
 ) -> Result<Tensor> {
+    denoise_sprint_masked_memory(
+        transformer,
+        scheduler,
+        seed,
+        latents,
+        cond,
+        None,
+        guidance_scale,
+        guidance_embeds_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        memory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_sprint_masked_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    cond_mask: Option<&Tensor>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
     // The embedded guidance scalar (CFG-free): guidance_scale · guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
     let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
@@ -863,7 +1021,7 @@ pub fn denoise_sprint_memory(
             .and_then(|memory| memory.attention_chunk_size)
             .map(|value| value as usize);
         transformer
-            .forward_with_guidance_memory(lat_in, cond, &t, Some(&guidance), budget)
+            .forward_with_guidance_mask_memory(lat_in, cond, &t, Some(&guidance), cond_mask, budget)
             .map_err(CandleError::from)
     };
     run_scm_sampler(
@@ -955,20 +1113,50 @@ impl SanaSprintPipeline {
         on_progress: &mut dyn FnMut(Progress),
         preview: &candle_gen::preview::PreviewHook<'_>,
     ) -> Result<Image> {
-        let cond = self.encode_conditioning(req.prompt)?;
-        self.generate_with_conditioning(req, &cond, device, cancel, on_progress, preview)
+        let conditioning = self.encode_conditioning(req.prompt)?;
+        self.generate_with_conditioning(req, &conditioning, device, cancel, on_progress, preview)
     }
 
     /// Encode the seed-independent Sprint prompt once for a whole `count` batch.
-    pub(crate) fn encode_conditioning(&self, prompt: &str) -> Result<Tensor> {
-        self.text_encoder.encode(prompt)
+    pub(crate) fn encode_conditioning(&self, prompt: &str) -> Result<SanaSprintConditioning> {
+        let (cond, cond_mask) = self.text_encoder.encode_with_mask(prompt)?;
+        Ok(SanaSprintConditioning { cond, cond_mask })
+    }
+
+    /// Encode the seed-independent Sprint img2img reference once for a whole `count` batch.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Tensor>> {
+        let start_step = resolve_init_start(
+            req.init_image,
+            req.steps.unwrap_or(SPRINT_DEFAULT_STEPS),
+            req.strength,
+        );
+        if start_step == 0 {
+            return Ok(None);
+        }
+        let image = req.init_image.ok_or_else(|| {
+            CandleError::Msg("SANA-Sprint positive img2img start requires an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            &self.encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            device,
+            cancel,
+        )?))
     }
 
     /// Run the seed-dependent Sprint sampling and decode tail with precomputed conditioning.
     pub(crate) fn generate_with_conditioning(
         &self,
         req: &SanaGenerateRequest<'_>,
-        cond: &Tensor,
+        conditioning: &SanaSprintConditioning,
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -976,7 +1164,7 @@ impl SanaSprintPipeline {
     ) -> Result<Image> {
         self.generate_with_conditioning_memory(
             req,
-            cond,
+            conditioning,
             device,
             cancel,
             on_progress,
@@ -989,7 +1177,32 @@ impl SanaSprintPipeline {
     pub(crate) fn generate_with_conditioning_memory(
         &self,
         req: &SanaGenerateRequest<'_>,
-        cond: &Tensor,
+        conditioning: &SanaSprintConditioning,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &candle_gen::preview::PreviewHook<'_>,
+        memory: Option<candle_gen::gen_core::GenerationMemory>,
+    ) -> Result<Image> {
+        let prepared_reference = self.prepare_reference(req, device, cancel)?;
+        self.generate_with_conditioning_and_reference_memory(
+            req,
+            conditioning,
+            prepared_reference.as_ref(),
+            device,
+            cancel,
+            on_progress,
+            preview,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_with_conditioning_and_reference_memory(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        conditioning: &SanaSprintConditioning,
+        prepared_reference: Option<&Tensor>,
         device: &Device,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -1004,26 +1217,23 @@ impl SanaSprintPipeline {
         let noise = create_noise(device, seed, req.width, req.height)?;
         let start_step = resolve_init_start(req.init_image, steps, req.strength);
         let latents = if start_step > 0 {
-            let clean = encode_init_latents(
-                &self.encoder,
-                &self.dc_ae_cfg,
-                req.init_image.expect("positive start requires init image"),
-                req.width,
-                req.height,
-                device,
-                cancel,
-            )?;
-            renoise_sprint_init(&clean, &noise, &scheduler, start_step)?
+            let clean = prepared_reference.ok_or_else(|| {
+                CandleError::Msg(
+                    "SANA-Sprint img2img denoise requires a prepared reference latent".into(),
+                )
+            })?;
+            renoise_sprint_init(clean, &noise, &scheduler, start_step)?
         } else {
             noise.affine(scheduler.sigma_data as f64, 0.0)?
         };
-        let latents = denoise_sprint_from_memory(
+        let latents = denoise_sprint_from_masked_memory(
             &self.transformer,
             &scheduler,
             start_step,
             seed,
             latents,
-            cond,
+            &conditioning.cond,
+            Some(&conditioning.cond_mask),
             guidance,
             self.guidance_embeds_scale,
             device,
@@ -1065,7 +1275,8 @@ pub(crate) fn generate_sprint_staged(
 ) -> Result<Vec<Image>> {
     revalidate_before_load(&mut check)?;
     let text = load_text_encoder(root, device)?;
-    let conditioning = text.encode(req.prompt)?;
+    let (cond, cond_mask) = text.encode_with_mask(req.prompt)?;
+    let conditioning = SanaSprintConditioning { cond, cond_mask };
     device.synchronize()?;
     drop(text);
     if cancel.is_cancelled() {
@@ -1110,13 +1321,14 @@ pub(crate) fn generate_sprint_staged(
             Some(clean) => renoise_sprint_init(clean, &noise, &scheduler, start_step)?,
             None => noise.affine(scheduler.sigma_data as f64, 0.0)?,
         };
-        latents.push(denoise_sprint_from_memory(
+        latents.push(denoise_sprint_from_masked_memory(
             &transformer,
             &scheduler,
             start_step,
             *seed,
             initial,
-            &conditioning,
+            &conditioning.cond,
+            Some(&conditioning.cond_mask),
             guidance,
             embedded_scale,
             device,
@@ -1253,6 +1465,41 @@ pub fn denoise_sprint_from_memory(
     preview: &candle_gen::preview::PreviewHook<'_>,
     memory: Option<candle_gen::gen_core::GenerationMemory>,
 ) -> Result<Tensor> {
+    denoise_sprint_from_masked_memory(
+        transformer,
+        scheduler,
+        start_step,
+        seed,
+        latents,
+        cond,
+        None,
+        guidance_scale,
+        guidance_embeds_scale,
+        device,
+        cancel,
+        on_progress,
+        preview,
+        memory,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_sprint_from_masked_memory(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    cond_mask: Option<&Tensor>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &candle_gen::preview::PreviewHook<'_>,
+    memory: Option<candle_gen::gen_core::GenerationMemory>,
+) -> Result<Tensor> {
     let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
     let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
         let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
@@ -1261,7 +1508,7 @@ pub fn denoise_sprint_from_memory(
             .and_then(|memory| memory.attention_chunk_size)
             .map(|value| value as usize);
         transformer
-            .forward_with_guidance_memory(lat_in, cond, &t, Some(&guidance), budget)
+            .forward_with_guidance_mask_memory(lat_in, cond, &t, Some(&guidance), cond_mask, budget)
             .map_err(CandleError::from)
     };
     run_scm_sampler_from(
@@ -1280,6 +1527,265 @@ pub fn denoise_sprint_from_memory(
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    fn braced_item_nth<'a>(source: &'a str, marker: &str, nth: usize) -> &'a str {
+        let mut cursor = 0usize;
+        let mut start = None;
+        for _ in 0..=nth {
+            let offset = source[cursor..]
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing production item {marker} occurrence {nth}"));
+            let found = cursor + offset;
+            start = Some(found);
+            cursor = found + marker.len();
+        }
+        let start = start.unwrap();
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn replace_in_item_nth(source: &str, marker: &str, nth: usize, from: &str, to: &str) -> String {
+        let item = braced_item_nth(source, marker, nth);
+        let start = item.as_ptr() as usize - source.as_ptr() as usize;
+        let replaced = item.replacen(from, to, 1);
+        assert_ne!(item, replaced, "mutation target must exist in {marker}");
+        format!(
+            "{}{}{}",
+            &source[..start],
+            replaced,
+            &source[start + item.len()..]
+        )
+    }
+
+    fn compact(item: &str) -> String {
+        item.split_whitespace().collect()
+    }
+
+    fn check_registered_mask_routes(source: &str) -> std::result::Result<(), String> {
+        let base_encode = compact(braced_item_nth(
+            source,
+            "pub(crate) fn encode_conditioning(",
+            0,
+        ));
+        if !base_encode.contains("self.text_encoder.encode_with_mask(req.prompt)?")
+            || !base_encode.contains(".encode_with_mask(req.negative_prompt.unwrap_or(\"\"))?")
+        {
+            return Err("Base conditioning must gather positive and CFG-negative masks".into());
+        }
+        let sprint_encode = compact(braced_item_nth(
+            source,
+            "pub(crate) fn encode_conditioning(",
+            1,
+        ));
+        if !sprint_encode.contains("self.text_encoder.encode_with_mask(prompt)?") {
+            return Err("Sprint conditioning must gather its positive mask".into());
+        }
+
+        let base_tail = compact(braced_item_nth(
+            source,
+            "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+            0,
+        ));
+        let base_masks = "&conditioning.cond,Some(&conditioning.cond_mask),conditioning.uncond.as_ref(),conditioning.uncond_mask.as_ref(),";
+        if !base_tail.contains("denoise_cfg_from_masked_memory(") || !base_tail.contains(base_masks)
+        {
+            return Err(
+                "resident Base tail must deliver cond and uncond masks positionally".into(),
+            );
+        }
+        let sprint_tail = compact(braced_item_nth(
+            source,
+            "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+            1,
+        ));
+        let sprint_masks = "&conditioning.cond,Some(&conditioning.cond_mask),guidance,";
+        if !sprint_tail.contains("denoise_sprint_from_masked_memory(")
+            || !sprint_tail.contains(sprint_masks)
+        {
+            return Err("resident Sprint tail must deliver its cond mask positionally".into());
+        }
+
+        let staged_base = compact(braced_item_nth(
+            source,
+            "pub(crate) fn generate_base_staged(",
+            0,
+        ));
+        if staged_base.matches("text.encode_with_mask(").count() != 2
+            || !staged_base.contains(base_masks)
+        {
+            return Err("staged Base must gather and deliver both masks".into());
+        }
+        let staged_sprint = compact(braced_item_nth(
+            source,
+            "pub(crate) fn generate_sprint_staged(",
+            0,
+        ));
+        if staged_sprint.matches("text.encode_with_mask(").count() != 1
+            || !staged_sprint.contains(sprint_masks)
+        {
+            return Err("staged Sprint must gather and deliver its mask".into());
+        }
+
+        let base_denoise = compact(braced_item_nth(
+            source,
+            "pub(crate) fn denoise_cfg_from_masked_memory(",
+            0,
+        ));
+        if base_denoise
+            .matches("forward_with_guidance_mask_memory(")
+            .count()
+            != 2
+            || !base_denoise.contains("x,cond,&t,None,cond_mask,attention_budget,")
+            || !base_denoise.contains("x,uc,&t,None,uncond_mask,attention_budget,")
+        {
+            return Err("Base CFG-on/off transformer calls must receive the matching masks".into());
+        }
+        let sprint_denoise = compact(braced_item_nth(
+            source,
+            "pub(crate) fn denoise_sprint_from_masked_memory(",
+            0,
+        ));
+        if sprint_denoise
+            .matches("forward_with_guidance_mask_memory(")
+            .count()
+            != 1
+            || !sprint_denoise.contains("Some(&guidance),cond_mask,budget)")
+        {
+            return Err("Sprint transformer call must receive its gathered mask".into());
+        }
+        Ok(())
+    }
+
+    fn check_transformer_mask_propagation(source: &str) -> std::result::Result<(), String> {
+        let forward = compact(braced_item_nth(
+            source,
+            "pub fn forward_with_guidance_mask_memory(",
+            0,
+        ));
+        let masked_block_call =
+            "block.forward(&hidden,&caption,caption_mask,&temb,ph,pw,attention_budget,)?";
+        if forward.matches(masked_block_call).count() != 2 {
+            return Err(
+                "resident and streamed Candle block routes must both preserve caption_mask".into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_base_and_sprint_routes_are_mask_bound_and_mutation_sensitive() {
+        let shipped = include_str!("pipeline.rs");
+        check_registered_mask_routes(shipped).unwrap();
+
+        for (marker, nth) in [
+            (
+                "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+                0,
+            ),
+            (
+                "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+                1,
+            ),
+            ("pub(crate) fn generate_base_staged(", 0),
+            ("pub(crate) fn generate_sprint_staged(", 0),
+        ] {
+            let dropped = replace_in_item_nth(
+                shipped,
+                marker,
+                nth,
+                "Some(&conditioning.cond_mask),",
+                "None,",
+            );
+            assert!(
+                check_registered_mask_routes(&dropped).is_err(),
+                "{marker} occurrence {nth}: dropping the positive mask must fail"
+            );
+        }
+
+        for (marker, nth) in [
+            (
+                "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+                0,
+            ),
+            ("pub(crate) fn generate_base_staged(", 0),
+        ] {
+            let dropped = replace_in_item_nth(
+                shipped,
+                marker,
+                nth,
+                "conditioning.uncond_mask.as_ref(),",
+                "None,",
+            );
+            assert!(
+                check_registered_mask_routes(&dropped).is_err(),
+                "{marker}: dropping the CFG-negative mask must fail"
+            );
+        }
+
+        let swapped = replace_in_item_nth(
+            shipped,
+            "pub(crate) fn generate_with_conditioning_and_reference_memory(",
+            0,
+            "Some(&conditioning.cond_mask),",
+            "conditioning.uncond_mask.as_ref(),",
+        );
+        assert!(
+            check_registered_mask_routes(&swapped).is_err(),
+            "swapping the Base positive and negative mask positions must fail"
+        );
+
+        let unmasked = replace_in_item_nth(
+            shipped,
+            "pub(crate) fn denoise_cfg_from_masked_memory(",
+            0,
+            "cond_mask,\n            attention_budget,",
+            "None,\n            attention_budget,",
+        );
+        assert!(
+            check_registered_mask_routes(&unmasked).is_err(),
+            "dropping the mask at the real transformer call must fail"
+        );
+
+        let transformer = include_str!("transformer.rs");
+        check_transformer_mask_propagation(transformer).unwrap();
+        for mutated in [
+            replace_in_item_nth(
+                transformer,
+                "pub fn forward_with_guidance_mask_memory(",
+                0,
+                "                        caption_mask,\n                        &temb,",
+                "                        None,\n                        &temb,",
+            ),
+            replace_in_item_nth(
+                transformer,
+                "pub fn forward_with_guidance_mask_memory(",
+                0,
+                "                    caption_mask,\n                    &temb,",
+                "                    None,\n                    &temb,",
+            ),
+        ] {
+            assert!(
+                check_transformer_mask_propagation(&mutated).is_err(),
+                "dropping caption_mask from streamed/resident Candle blocks must fail"
+            );
+        }
+    }
 
     #[test]
     fn noise_shape_is_batch1_32ch() {

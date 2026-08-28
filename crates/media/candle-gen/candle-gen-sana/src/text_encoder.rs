@@ -25,11 +25,9 @@
 //!
 //! ## Mask handling
 //! `_get_gemma_prompt_embeds` returns `(prompt_embeds, prompt_attention_mask)` and `encode_prompt`
-//! gathers the **same** `select_index` from both. But the SANA *transformer*
-//! ([`crate::transformer::SanaTransformer::forward`]) consumes only the `[1, 300, 2304]` embedding —
-//! its `attn2` cross-attention is plain full attention over all 300 caption tokens with **no** mask
-//! (same as PiD's inference net, which discards `emb_masks`). So the 300-token attention mask is
-//! exposed here for completeness/parity ([`SanaTextEncoder::token_ids`]) but is not fed to the trunk.
+//! gathers the **same** `select_index` from both. [`SanaTextEncoder::encode_with_mask`] preserves that
+//! paired `[1, 300, 2304]` / `[1, 300]` result for every Base and Sprint cross-attention route. This
+//! intentionally differs from PiD's inference net, which discards `emb_masks`.
 
 use std::path::Path;
 
@@ -94,17 +92,114 @@ impl SanaTextEncoder {
     }
 
     /// The padded `(input_ids, attention_mask)` for a caption (length `num_chi_tokens + 300 − 2`,
-    /// pre token-selection). Exposed so the tokenizer + CHI-prompt + length policy can be
-    /// parity-checked against the reference without the gemma weights, and so the attention mask is
-    /// available even though the trunk does not consume it.
+    /// before token selection). This is Gemma's input mask, exposed for tokenizer/CHI parity. The
+    /// public render contract is [`Self::encode_with_mask`]: it gathers the released `select_index`
+    /// from both last-hidden states and this mask, then every Base and Sprint route threads the
+    /// returned `[1, 300]` mask into transformer `attn2`.
     pub fn token_ids(&self, caption: &str) -> Result<(Vec<i32>, Vec<i32>)> {
-        self.inner.token_ids(caption)
+        self.inner.token_ids(&preprocess(caption))
     }
 
     /// Encode one caption to the SANA caption embedding `[1, 300, 2304]` (gemma last-hidden,
     /// `select_index`-gathered). Byte/shape-compatible with
     /// [`crate::transformer::SanaTransformer::forward`]'s `caption` argument.
     pub fn encode(&self, caption: &str) -> Result<Tensor> {
-        self.inner.encode(caption)
+        self.inner.encode(&preprocess(caption))
+    }
+
+    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. Both tensors
+    /// use the same released `select_index`; SANA's Base and Sprint transformer routes apply the mask
+    /// to cross-attention while PiD's mask-free consumer continues to use [`Self::encode`].
+    pub fn encode_with_mask(&self, caption: &str) -> Result<(Tensor, Tensor)> {
+        self.inner.encode_with_mask(&preprocess(caption))
+    }
+}
+
+/// SANA prompt preprocessing — diffusers `SanaPipeline._text_preprocessing(clean_caption=False)` runs
+/// `text.lower().strip()` on the user prompt before prepending the CHI instruction. Keep this local to
+/// SANA: the shared PiD encoder intentionally preserves raw case for its own checkpoint contract.
+fn preprocess(caption: &str) -> String {
+    caption.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preprocess;
+
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source.find(marker).unwrap();
+        let open = source[start..].find('{').unwrap() + start;
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced item {marker}")
+    }
+
+    fn check_public_preprocessing(source: &str) -> Result<(), String> {
+        for (marker, call) in [
+            (
+                "pub fn token_ids(",
+                "self.inner.token_ids(&preprocess(caption))",
+            ),
+            ("pub fn encode(", "self.inner.encode(&preprocess(caption))"),
+            (
+                "pub fn encode_with_mask(",
+                "self.inner.encode_with_mask(&preprocess(caption))",
+            ),
+        ] {
+            if !braced_item(source, marker).contains(call) {
+                return Err(format!("{marker} must apply canonical SANA preprocessing"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preprocess_lowercases_and_trims() {
+        // Keep this fixture byte-for-byte aligned with mlx-gen-sana's sibling test: both backends
+        // must feed identical user text into their shared PiD-derived caption encoder.
+        assert_eq!(
+            preprocess("  Fox Watching From The Edge  "),
+            "fox watching from the edge"
+        );
+        assert_eq!(preprocess("A FOX"), "a fox");
+        assert_eq!(preprocess("already lower"), "already lower");
+        assert_eq!(preprocess(""), "");
+
+        let candle = include_str!("text_encoder.rs");
+        let mlx = include_str!("../../../mlx-gen/mlx-gen-sana/src/text_encoder.rs");
+        check_public_preprocessing(candle).unwrap();
+        check_public_preprocessing(mlx).unwrap();
+
+        for marker in [
+            "pub fn token_ids(",
+            "pub fn encode(",
+            "pub fn encode_with_mask(",
+        ] {
+            let item = braced_item(candle, marker);
+            let mutated = item.replacen("&preprocess(caption)", "caption", 1);
+            assert_ne!(item, mutated);
+            let start = candle.find(marker).unwrap();
+            let source = format!(
+                "{}{}{}",
+                &candle[..start],
+                mutated,
+                &candle[start + item.len()..]
+            );
+            assert!(
+                check_public_preprocessing(&source).is_err(),
+                "{marker}: bypassing SANA preprocessing must fail"
+            );
+        }
     }
 }

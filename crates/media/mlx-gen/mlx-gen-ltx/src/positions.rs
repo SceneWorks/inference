@@ -53,6 +53,41 @@ pub fn create_position_grid_with(
     fps: f32,
     causal_fix: bool,
 ) -> Array {
+    let data = create_position_grid_data_with(
+        batch_size,
+        num_frames,
+        height,
+        width,
+        temporal_scale,
+        spatial_scale,
+        fps,
+        causal_fix,
+    );
+    Array::from_slice(
+        &data,
+        &[
+            batch_size as i32,
+            3,
+            (num_frames * height * width) as i32,
+            2,
+        ],
+    )
+}
+
+/// Host-only position-grid values in the same C-order layout as [`create_position_grid_with`].
+/// Keeping the time-base construction free of MLX allocation lets the request-clock contract be
+/// tested without initializing Metal or loading model weights.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_position_grid_data_with(
+    batch_size: usize,
+    num_frames: usize,
+    height: usize,
+    width: usize,
+    temporal_scale: i64,
+    spatial_scale: i64,
+    fps: f32,
+    causal_fix: bool,
+) -> Vec<f32> {
     let hw = height * width;
     let num_patches = num_frames * hw;
     // C-order (batch, 3, num_patches, 2).
@@ -86,7 +121,7 @@ pub fn create_position_grid_with(
         }
     }
 
-    Array::from_slice(&data, &[batch_size as i32, 3, num_patches as i32, 2])
+    data
 }
 
 // --- Audio (sc-2684) ---------------------------------------------------------------------------
@@ -106,6 +141,12 @@ pub const AUDIO_LATENTS_PER_SECOND: f64 = 25.0;
 
 /// Python `round()` (round-half-to-even) — matches `compute_audio_frames`'s `round(...)`.
 fn py_round(x: f64) -> i64 {
+    // Request validation rejects zero fps before the render path derives duration. Keep this helper
+    // fail-closed for direct/internal callers too: casting an infinite or NaN duration to an integer
+    // would otherwise produce a platform-dependent saturated frame count.
+    if !x.is_finite() {
+        return 0;
+    }
     let f = x.floor();
     let diff = x - f;
     if diff < 0.5 {
@@ -251,5 +292,12 @@ mod tests {
         assert_eq!(compute_audio_frames(1, 24.0), 1);
         // 121f@24fps: 121/24·25 = 126.04 → 126.
         assert_eq!(compute_audio_frames(121, 24.0), 126);
+    }
+
+    #[test]
+    fn compute_audio_frames_rejects_non_finite_duration_mutations() {
+        for fps in [0.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(compute_audio_frames(33, fps), 0, "fps={fps:?}");
+        }
     }
 }

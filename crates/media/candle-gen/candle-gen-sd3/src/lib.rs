@@ -324,7 +324,9 @@ impl Generator for Sd3Generator {
             .map(|s| s as usize)
             .unwrap_or_else(|| self.variant.default_steps());
         let start_step = match &reference {
-            Some((_, strength)) => pipeline::init_time_step(steps, *strength),
+            Some((_, strength)) => {
+                pipeline::init_time_step(steps, Some(pipeline::resolve_img2img_strength(*strength)))
+            }
             None => 0,
         };
         let clean = if start_step > 0 {

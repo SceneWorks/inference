@@ -28,7 +28,7 @@ use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use crate::backbone::Backbone;
-use crate::codec::MossAudioCodec;
+use crate::codec::{DecodePartitionSchedule, MossAudioCodec};
 use crate::config::MossTtsRealtimeConfig;
 use crate::conversation::{self, ConvState, PreparedTurn, Role};
 use crate::decode::{build_prompt_frames, Decoder};
@@ -216,19 +216,6 @@ impl Loaded {
     }
 }
 
-/// Default RVQ frames per streaming block (≈ 0.64 s at 12.5 fps). Sized down per request so a short
-/// clip still yields ≥ 2 chunks (the streaming incrementality law).
-const DEFAULT_FRAMES_PER_BLOCK: usize = 8;
-
-/// The streaming block size for a clip of `budget_frames` (the AR frame budget): at most
-/// [`DEFAULT_FRAMES_PER_BLOCK`], but never more than half the budget, so a budget-reaching run of
-/// `≥ 2` frames always streams `≥ 2` chunks.
-fn frames_per_block(budget_frames: usize) -> usize {
-    DEFAULT_FRAMES_PER_BLOCK
-        .min(budget_frames.div_ceil(2))
-        .max(1)
-}
-
 /// A loaded (lazy) MOSS-TTS-Realtime generator.
 pub struct MossTtsRealtimeGenerator {
     descriptor: ModelDescriptor,
@@ -317,19 +304,25 @@ fn prepare_turn(
 fn emit_pcm_as_chunks(
     pcm: &[f32],
     sample_rate: u32,
-    block_samples: usize,
+    samples_per_frame: usize,
+    schedule: DecodePartitionSchedule,
     chunk_index: &mut usize,
     on_chunk: &mut dyn FnMut(AudioChunk),
 ) {
-    let block = block_samples.max(1);
-    for slice in pcm.chunks(block) {
+    let mut offset = 0usize;
+    let mut block_index = 0usize;
+    while offset < pcm.len() {
+        let block_samples = schedule.block_frames(block_index) * samples_per_frame;
+        let end = (offset + block_samples).min(pcm.len());
         on_chunk(AudioChunk {
-            samples: slice.to_vec(),
+            samples: pcm[offset..end].to_vec(),
             sample_rate,
             channels: 1,
             index: *chunk_index,
         });
         *chunk_index += 1;
+        block_index += 1;
+        offset = end;
     }
 }
 
@@ -414,6 +407,7 @@ impl MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let synth_turns = turns
             .iter()
             .filter(|t| t.role == Role::Assistant && t.audio_codes.is_none())
@@ -457,7 +451,6 @@ impl MossTtsRealtimeGenerator {
         // per *turn* (not per block as the single-turn `StreamingChunker` path is): first-chunk latency
         // is one whole turn, not one block — the multi-turn session trades intra-turn streaming for the
         // per-turn independence that keeps A (batch) and B (session) byte-identical.
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * codec.samples_per_frame();
         let mut all: Vec<f32> = Vec::new();
         let mut chunk_index = 0usize;
         for frames in &rendered.turns {
@@ -465,10 +458,17 @@ impl MossTtsRealtimeGenerator {
                 continue;
             }
             let pcm = codec
-                .decode_frames(frames, &probe)
+                .decode_frames(frames, decode_schedule, &probe)
                 .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
                 .ok_or(gen_core::Error::Canceled)?;
-            emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+            emit_pcm_as_chunks(
+                &pcm,
+                SAMPLE_RATE,
+                codec.samples_per_frame(),
+                decode_schedule,
+                &mut chunk_index,
+                on_chunk,
+            );
             all.extend_from_slice(&pcm);
         }
         if all.is_empty() {
@@ -553,16 +553,15 @@ impl MossTtsRealtimeGenerator {
 
     /// The single deterministic synthesis path shared by [`generate`](Self::generate) and
     /// [`generate_streaming`](Self::generate_streaming): drive the AR brain and, **from inside the AR
-    /// loop**, decode the codec block-wise over the growing RVQ-frame prefix — emitting one
-    /// [`AudioChunk`] per newly-revealed PCM block *while later frames are still being generated*
+    /// loop**, decode each newly available RVQ-frame block with request-local bounded codec state —
+    /// emitting one [`AudioChunk`] per new PCM block *while later frames are still being generated*
     /// ([`crate::chunk::StreamingChunker`]).
     ///
-    /// Because the codec decode graph is fully causal, decoding a growing prefix reproduces the
-    /// earlier samples byte-for-byte — so the concatenated chunks equal the returned track exactly
-    /// (the reassembly law), and the two entry points return byte-identical audio for the same
-    /// request+seed (they call this one function). The first chunk is emitted after the first block
-    /// of AR frames rather than after the whole track, so first-chunk latency is proportional to one
-    /// block of AR frames, not the full synthesis time.
+    /// Because the codec decode graph is fully causal, each stage can carry its absolute position and
+    /// fixed-window KV history without replaying earlier frames. The concatenated chunks equal the
+    /// returned track exactly (the reassembly law), and the two entry points return byte-identical
+    /// audio for the same request+seed because they call this one function. The first chunk is emitted
+    /// after the first block of AR frames rather than after the whole track.
     ///
     /// The AR backbone runs a KV cache (sc-13417): the prompt is prefilled once and each emitted
     /// frame is a single-token step, so per-frame cost is O(1) amortized rather than O(seq). This is
@@ -598,15 +597,11 @@ impl MossTtsRealtimeGenerator {
         // Deterministic token sampling seeded by the request (a `None` seed maps to a fixed constant),
         // so the gen-core reproducibility law holds and generate/generate_streaming agree.
         let seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
-        // Block sizing is driven by the frame budget (known up front, before the loop): at most
-        // DEFAULT_FRAMES_PER_BLOCK and never more than half the budget, so a budget-reaching run
-        // always streams >= 2 chunks.
-        let block = frames_per_block(budget);
-
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let cancel = req.cancel.clone();
         let probe = move || cancel.is_cancelled();
 
-        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), block);
+        let mut chunker = crate::chunk::StreamingChunker::new(codec.as_ref(), decode_schedule);
         let mut canceled = false;
         let run = {
             // The AR loop hands each emitted frame here; the chunker decodes + streams block-wise.
@@ -699,6 +694,7 @@ impl Generator for MossTtsRealtimeGenerator {
         let voice_clone = self.reference_codes(req)?;
         let base_seed = req.seed.unwrap_or(DEFAULT_SAMPLING_SEED);
         let budget = frame_budget(req);
+        let decode_schedule = crate::codec::decode_partition_schedule(budget);
         let state = ConvState::new(&pipeline.decoder);
         Ok(Box::new(MossConversationSession {
             loaded: pipeline,
@@ -706,6 +702,7 @@ impl Generator for MossTtsRealtimeGenerator {
             voice_clone,
             base_seed,
             budget,
+            decode_schedule,
             state,
             cancel: req.cancel.clone(),
             turn_index: 0,
@@ -723,6 +720,7 @@ struct MossConversationSession {
     voice_clone: Option<Vec<Vec<u32>>>,
     base_seed: u64,
     budget: usize,
+    decode_schedule: DecodePartitionSchedule,
     state: ConvState,
     cancel: CancelFlag,
     turn_index: usize,
@@ -802,14 +800,20 @@ impl ConversationSession for MossConversationSession {
                 ..Default::default()
             });
         }
-        let block_samples = DEFAULT_FRAMES_PER_BLOCK * self.codec.samples_per_frame();
         let pcm = self
             .codec
-            .decode_frames(&frames, &probe)
+            .decode_frames(&frames, self.decode_schedule, &probe)
             .map_err(|e| gen_core::Error::Msg(format!("{MODEL_ID}: codec decode: {e}")))?
             .ok_or(gen_core::Error::Canceled)?;
         let mut chunk_index = 0usize;
-        emit_pcm_as_chunks(&pcm, SAMPLE_RATE, block_samples, &mut chunk_index, on_chunk);
+        emit_pcm_as_chunks(
+            &pcm,
+            SAMPLE_RATE,
+            self.codec.samples_per_frame(),
+            self.decode_schedule,
+            &mut chunk_index,
+            on_chunk,
+        );
         Ok(AudioTrack {
             samples: pcm,
             sample_rate: SAMPLE_RATE,
@@ -1000,12 +1004,18 @@ mod tests {
             Err(gen_core::Error::Unsupported(_))
         ));
 
-        // Duration above the advertised cap rejected.
+        // Duration above the advertised cap is a typed range error before any model/codec load or
+        // duration-sized allocation can occur.
         let bad = audio_req(AudioParams {
             target_duration: Some(MAX_DURATION_SECS + 1.0),
             ..Default::default()
         });
-        assert!(validate_request(&d, &bad).is_err());
+        assert!(matches!(
+            validate_request(&d, &bad),
+            Err(gen_core::Error::Msg(message))
+                if message.contains("audio.target_duration")
+                    && message.contains("supported maximum")
+        ));
 
         // A multi-speaker script → typed Unsupported (we do not advertise multi-speaker).
         let bad = audio_req(AudioParams {
@@ -1043,6 +1053,45 @@ mod tests {
             frame_budget(&r),
             (DEFAULT_SECONDS * FRAME_RATE_HZ).ceil() as usize
         );
+    }
+
+    /// Conversation and session both use `emit_pcm_as_chunks` after the shared scheduled codec
+    /// decode. Pin the actual-EOS/request-budget cross product at that production seam so neither
+    /// route can regress to slicing with one scalar budget-derived block.
+    #[test]
+    fn early_eos_conversation_chunks_follow_the_decode_schedule() {
+        const SAMPLES_PER_FRAME: usize = 3;
+        for actual_frames in 2usize..=7 {
+            let pcm: Vec<f32> = (0..actual_frames * SAMPLES_PER_FRAME)
+                .map(|sample| sample as f32)
+                .collect();
+            for requested_budget in [actual_frames, 19] {
+                let schedule = crate::codec::decode_partition_schedule(requested_budget);
+                let mut chunks = Vec::new();
+                let mut chunk_index = 0usize;
+                emit_pcm_as_chunks(
+                    &pcm,
+                    SAMPLE_RATE,
+                    SAMPLES_PER_FRAME,
+                    schedule,
+                    &mut chunk_index,
+                    &mut |chunk| chunks.push(chunk),
+                );
+                assert!(
+                    chunks.len() >= 2,
+                    "actual {actual_frames}, requested budget {requested_budget}"
+                );
+                assert!(chunks.iter().all(|chunk| chunk.samples.len() < pcm.len()));
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.samples.iter().copied())
+                        .collect::<Vec<_>>(),
+                    pcm
+                );
+                assert_eq!(chunk_index, chunks.len());
+            }
+        }
     }
 
     #[test]

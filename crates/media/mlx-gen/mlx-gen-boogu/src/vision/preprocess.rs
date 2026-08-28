@@ -32,6 +32,18 @@ pub const FACTOR: i64 = PATCH_SIZE * MERGE_SIZE;
 pub const MIN_PIXELS: i64 = 65_536;
 pub const MAX_PIXELS: i64 = 16_777_216;
 
+/// Host-only image geometry shared by edit admission and the real preprocessor. Computing this before
+/// the vision tower runs makes the `<|image_pad|>` budget exact without allocating pixels or MLX
+/// arrays, while reusing it in [`preprocess_image`] prevents the admission and execution paths from
+/// drifting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGeometry {
+    pub resized_height: i64,
+    pub resized_width: i64,
+    pub grid: [i32; 3],
+    pub merged_tokens: usize,
+}
+
 /// Python `round` (round half to **even**) — banker's rounding.
 pub(crate) fn py_round(x: f64) -> i64 {
     let f = x.floor();
@@ -72,6 +84,31 @@ pub fn smart_resize(
         w_bar = (wf * beta / ff).ceil() as i64 * factor;
     }
     (h_bar, w_bar)
+}
+
+/// Derive the exact smart-resized patch grid and merged-token count without touching the image
+/// pixels. Callers validate the public RGB8 carrier first; the local non-zero guard keeps this helper
+/// safe for direct use as well.
+pub fn image_geometry(height: i64, width: i64) -> Result<ImageGeometry> {
+    if height <= 0 || width <= 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "boogu vision: zero dimension ({width}x{height})"
+        )));
+    }
+    let (resized_height, resized_width) =
+        smart_resize(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
+    let grid_h = resized_height / PATCH_SIZE;
+    let grid_w = resized_width / PATCH_SIZE;
+    let merged_h = grid_h / MERGE_SIZE;
+    let merged_w = grid_w / MERGE_SIZE;
+    let merged_tokens = usize::try_from(merged_h * merged_w)
+        .map_err(|_| mlx_gen::Error::Msg("boogu vision: merged-token count overflow".into()))?;
+    Ok(ImageGeometry {
+        resized_height,
+        resized_width,
+        grid: [1, grid_h as i32, grid_w as i32],
+        merged_tokens,
+    })
 }
 
 /// Pack normalized frames `[F, C, H, W]` into `pixel_values [seq, C·T·patch²]` + `grid_thw (t, h, w)`,
@@ -141,14 +178,17 @@ fn normalized_frame(pixels_hwc: &[u8], h: i64, w: i64, mean: [f32; 3], std: [f32
 /// Full Qwen3-VL preprocessing of one RGB image → `pixel_values [seq, 1536]` + `grid_thw`.
 pub fn preprocess_image(img: &RgbImage) -> Result<(Array, [i32; 3])> {
     let (w, h) = (img.width() as i64, img.height() as i64);
-    let (rh, rw) = smart_resize(h, w, FACTOR, MIN_PIXELS, MAX_PIXELS);
+    let geometry = image_geometry(h, w)?;
+    let (rh, rw) = (geometry.resized_height, geometry.resized_width);
     let resized = if (rh, rw) == (h, w) {
         img.clone()
     } else {
         image::imageops::resize(img, rw as u32, rh as u32, FilterType::CatmullRom)
     };
     let frame = normalized_frame(resized.as_raw(), rh, rw, IMAGE_MEAN, IMAGE_STD);
-    pack_patches(&frame, PATCH_SIZE, TEMPORAL_PATCH_SIZE, MERGE_SIZE)
+    let (pixels, grid) = pack_patches(&frame, PATCH_SIZE, TEMPORAL_PATCH_SIZE, MERGE_SIZE)?;
+    debug_assert_eq!(grid, geometry.grid);
+    Ok((pixels, grid))
 }
 
 #[cfg(test)]
@@ -161,6 +201,15 @@ mod tests {
         assert_eq!(
             smart_resize(512, 512, 32, MIN_PIXELS, MAX_PIXELS),
             (512, 512)
+        );
+        assert_eq!(
+            image_geometry(2048, 2048).unwrap(),
+            ImageGeometry {
+                resized_height: 2048,
+                resized_width: 2048,
+                grid: [1, 128, 128],
+                merged_tokens: 4096,
+            }
         );
     }
 

@@ -429,6 +429,23 @@ pub struct MainCtx {
     patch: usize,
 }
 
+/// Request-owned base/control conditioning. The text-fusion projection, joint RoPE, and encoded
+/// control-image tokens do not vary with Euler time or seed, so the control provider prepares them
+/// once before entering its denoise loop.
+pub(crate) struct PreparedControlConditioning {
+    context: Tensor,
+    pub(crate) ctrl_tokens: Tensor,
+    cap_len: usize,
+    img_len: usize,
+    ht: usize,
+    wt: usize,
+    latent_ch: usize,
+    dtype: DType,
+    device: candle_gen::candle_core::DeviceLocation,
+    rcos: Tensor,
+    rsin: Tensor,
+}
+
 /// The trainable Krea 2 single-stream DiT. Built from the same mmap'd `transformer/` `Weights` the
 /// inference path loads — the frozen base is shared; only the attention projections grow a `Var`-backed
 /// LoRA residual (installed by [`build_lora_targets`](candle_gen::train::lora::build_lora_targets)).
@@ -548,6 +565,88 @@ impl KreaTrainDit {
             )?;
             Ok(rope.joint())
         })
+    }
+
+    /// Prepare the seed/step-invariant text/control state for a strict-pose request.
+    pub(crate) fn prepare_control_conditioning(
+        &self,
+        context: &Tensor,
+        ctrl_latent: &Tensor,
+    ) -> candle_gen::Result<PreparedControlConditioning> {
+        let (_, channels, h, w) = ctrl_latent.dims4()?;
+        let p = self.cfg.patch_size;
+        if channels != self.cfg.in_channels / (p * p) || h == 0 || w == 0 {
+            return Err(candle_gen::CandleError::Msg(
+                "krea control: prepared conditioning has an invalid control latent geometry".into(),
+            ));
+        }
+        let (ht, wt) = (h / p, w / p);
+        let cap_len = context.dim(1)?;
+        let context = context.to_dtype(self.dtype)?;
+        let context = self.text_fusion.forward(&context)?;
+        let context = self.txt_in_norm.forward(&context)?;
+        let context = self
+            .txt_in_l2
+            .forward(&self.txt_in_l1.forward(&context)?.gelu()?)?;
+        let ctrl_tokens = self.embed_latent(ctrl_latent)?;
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
+        Ok(PreparedControlConditioning {
+            context,
+            ctrl_tokens,
+            cap_len,
+            img_len: ht * wt,
+            ht,
+            wt,
+            latent_ch: channels,
+            dtype: self.dtype,
+            device: self.device.location(),
+            rcos,
+            rsin,
+        })
+    }
+
+    pub(crate) fn forward_pre_main_prepared(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        prepared: &PreparedControlConditioning,
+    ) -> candle_gen::Result<(Tensor, MainCtx)> {
+        let (_, channels, h, w) = latent.dims4()?;
+        let p = self.cfg.patch_size;
+        if channels != prepared.latent_ch
+            || (h / p, w / p) != (prepared.ht, prepared.wt)
+            || h % p != 0
+            || w % p != 0
+            || latent.dtype() != prepared.dtype
+            || latent.device().location() != prepared.device
+        {
+            return Err(candle_gen::CandleError::Msg(
+                "krea control: prepared conditioning request identity, geometry, dtype, or device does not match latent".into(),
+            ));
+        }
+        let dt = self.dtype;
+        let img = self.img_in.forward(&patchify(&latent.to_dtype(dt)?, p)?)?;
+        let t_sin = temb(timestep, self.cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?;
+        let t = self
+            .time_embed_l2
+            .forward(&self.time_embed_l1.forward(&t_sin)?.gelu()?)?;
+        let tvec = self.time_mod_proj.forward(&t.gelu()?)?;
+        let combined = Tensor::cat(&[&prepared.context, &img], 1)?;
+        Ok((
+            combined,
+            MainCtx {
+                tvec,
+                rcos: prepared.rcos.clone(),
+                rsin: prepared.rsin.clone(),
+                t,
+                cap_len: prepared.cap_len,
+                img_len: prepared.img_len,
+                ht: prepared.ht,
+                wt: prepared.wt,
+                latent_ch: prepared.latent_ch,
+                patch: p,
+            },
+        ))
     }
 
     /// Run the frozen front-end: patch-embed the latent, build the shared modulation, aggregate +

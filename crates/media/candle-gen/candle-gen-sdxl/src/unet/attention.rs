@@ -778,15 +778,31 @@ impl Module for AttentionBlock {
             .transpose_for_scores(value_proj)?
             .to_dtype(DType::F32)?;
 
-        // scale is applied twice, hence the -0.25 here rather than -0.5.
+        // Diffusers applies the head-dimension scale to both q and k (hence -0.25 rather than
+        // -0.5). Keep that operation order, then let the shared seam split only independent query
+        // rows. The SDXL VAE encoder and decoder both construct this block at their 256x256
+        // bottleneck for an accepted 2048-square request: an unguarded one-head score tensor would
+        // be 65536^2 elements, over candle CUDA's i32 indexing envelope.
         // https://github.com/huggingface/diffusers/blob/d3d22ce5a894becb951eec03e663951b28d45135/src/diffusers/models/attention.py#L87
         let scale = f64::powf(self.channels as f64 / self.num_heads as f64, -0.25);
-        let attention_scores = (query_states * scale)?.matmul(&(key_states.t()? * scale)?)?;
-        let attention_probs = nn::ops::softmax(&attention_scores, D::Minus1)?;
+        let query_states = (query_states * scale)?;
+        let key_states = (key_states * scale)?;
+        // `sdpa_budgeted_bhsd` is a single pass for normal shapes, preserving the previous
+        // arithmetic. At the advertised 2048-square VAE geometry it bounds each scores/probs
+        // allocation below the shared i32-safe budget without changing the all-key softmax for any
+        // query row.
+        let xs = candle_gen::sdpa_budgeted_bhsd(
+            &query_states,
+            &key_states,
+            &value_states,
+            1.,
+            None,
+            |scores| nn::ops::softmax(scores, D::Minus1),
+            crate::request_attention_budget(),
+        )?;
 
         // TODO: revert the call to force_contiguous once the three matmul kernels have been
         // adapted to handle layout with some dims set to 1.
-        let xs = attention_probs.matmul(&value_states)?;
         let xs = xs.to_dtype(in_dtype)?;
         let xs = xs.transpose(1, 2)?.contiguous()?;
         let xs = xs.flatten_from(D::Minus2)?;
@@ -796,6 +812,172 @@ impl Module for AttentionBlock {
             .t()?
             .reshape((batch, channel, height, width))?;
         (xs + residual)? / self.config.rescale_output_factor
+    }
+}
+
+#[cfg(test)]
+mod vae_attention_budget_tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_gen::attention::{attention_budget_from_usize, chunk_probe, ATTN_SCORES_BUDGET};
+    use candle_gen::gen_core::{GenerationMemory, GenerationRequest};
+    use candle_nn::{VarBuilder, VarMap};
+
+    /// The prior, unguarded VAE attention arithmetic. This is deliberately kept only in the test
+    /// oracle: production must route both VAE mid-block sites through `sdpa_budgeted_bhsd`.
+    fn pre_budget_attention_forward(attn: &AttentionBlock, xs: &Tensor) -> Result<Tensor> {
+        let in_dtype = xs.dtype();
+        let residual = xs;
+        let (batch, channel, height, width) = xs.dims4()?;
+        let xs = attn
+            .group_norm
+            .forward(xs)?
+            .reshape((batch, channel, height * width))?
+            .transpose(1, 2)?;
+
+        let query_states = attn
+            .transpose_for_scores(attn.query.forward(&xs)?)?
+            .to_dtype(DType::F32)?;
+        let key_states = attn
+            .transpose_for_scores(attn.key.forward(&xs)?)?
+            .to_dtype(DType::F32)?;
+        let value_states = attn
+            .transpose_for_scores(attn.value.forward(&xs)?)?
+            .to_dtype(DType::F32)?;
+        let scale = f64::powf(attn.channels as f64 / attn.num_heads as f64, -0.25);
+        let scores = (query_states * scale)?.matmul(&(key_states.t()? * scale)?)?;
+        let xs = nn::ops::softmax(&scores, D::Minus1)?.matmul(&value_states)?;
+        let xs = xs.to_dtype(in_dtype)?.transpose(1, 2)?.contiguous()?;
+        let xs = xs.flatten_from(D::Minus2)?;
+        let xs = attn
+            .proj_attn
+            .forward(&xs)?
+            .t()?
+            .reshape((batch, channel, height, width))?;
+        (xs + residual)? / attn.config.rescale_output_factor
+    }
+
+    fn vae_attention(device: &Device) -> AttentionBlock {
+        AttentionBlock::new(
+            VarBuilder::from_varmap(&VarMap::new(), DType::F32, device),
+            4,
+            AttentionBlockConfig {
+                num_head_channels: None,
+                num_groups: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn vae_mid_attention_bounds_accepted_2048_square_and_i32_boundary() {
+        let request = GenerationRequest {
+            prompt: "budget boundary".into(),
+            width: 2048,
+            height: 2048,
+            ..Default::default()
+        };
+        crate::descriptor()
+            .capabilities
+            .validate_request(crate::MODEL_ID, &request)
+            .expect("2048-square is advertised and must remain accepted");
+
+        // SDXL VAE's /8 bottleneck is the token grid attended by both its encode and decode mid
+        // blocks. This is pure planner arithmetic: no 2048-square tensor is allocated in the test.
+        let tokens = (2048usize / crate::SIZE_MULTIPLE as usize).pow(2);
+        assert_eq!(tokens, 65_536);
+        let block = attention_budget_from_usize(ATTN_SCORES_BUDGET)
+            .query_block_rows(tokens as u64, tokens as u64);
+        assert!(
+            block < tokens as u64,
+            "2048-square VAE attention must be chunked"
+        );
+        assert!(
+            block * tokens as u64 <= ATTN_SCORES_BUDGET as u64,
+            "every planned VAE score chunk must fit the configured allocation budget"
+        );
+        assert!(
+            block * tokens as u64 <= i32::MAX as u64,
+            "every planned VAE score chunk must fit candle's i32 index envelope"
+        );
+
+        // Mutation around the old unguarded one-head VAE overflow threshold. A single 46_340²
+        // score tensor fits i32; 46_341² does not. Both now take the bounded arm, proving the
+        // planner discriminates the formerly unsafe geometry without constructing either tensor.
+        for sequence in [46_340_u64, 46_341] {
+            let chunk = attention_budget_from_usize(ATTN_SCORES_BUDGET)
+                .query_block_rows(sequence, sequence);
+            assert!(
+                chunk < sequence,
+                "{sequence}-token VAE attention must be chunked"
+            );
+            assert!(chunk * sequence <= i32::MAX as u64);
+        }
+        assert!(46_340_u64.pow(2) <= i32::MAX as u64);
+        assert!(46_341_u64.pow(2) > i32::MAX as u64);
+    }
+
+    #[test]
+    fn vae_mid_attention_chunks_and_matches_the_small_shape_pre_budget_oracle() {
+        let device = Device::Cpu;
+        let attention = vae_attention(&device);
+        let values = (0..32)
+            .map(|i| (i as f32 * 0.17).sin() - 0.2)
+            .collect::<Vec<_>>();
+        let xs = Tensor::from_vec(values, (1, 4, 2, 4), &device).unwrap(); // 8 VAE spatial tokens
+
+        let oracle = pre_budget_attention_forward(&attention, &xs).unwrap();
+        chunk_probe::reset();
+        let chunked = crate::with_attention_memory(
+            Some(GenerationMemory {
+                chunk_attention: true,
+                // `B * heads * Sk = 1 * 1 * 8`, so 24 elements gives 3 query rows per
+                // chunk and therefore the mutation-sensitive [3, 3, 2] execution.
+                attention_chunk_size: Some(24),
+                ..Default::default()
+            }),
+            || attention.forward(&xs),
+        )
+        .unwrap();
+        assert_eq!(
+            chunk_probe::last_chunk_count(),
+            3,
+            "the VAE seam must actually chunk"
+        );
+        assert!(
+            max_abs(&chunked, &oracle) < 1e-5,
+            "small VAE attention must remain numerically pinned to the pre-budget implementation"
+        );
+
+        // The nearby budget mutation disables chunking for the same shape. This prevents a false
+        // green where the planner or request-scoped budget is ignored by the VAE call site.
+        chunk_probe::reset();
+        crate::with_attention_memory(
+            Some(GenerationMemory {
+                chunk_attention: true,
+                attention_chunk_size: Some(64),
+                ..Default::default()
+            }),
+            || attention.forward(&xs),
+        )
+        .unwrap();
+        assert_eq!(
+            chunk_probe::last_chunk_count(),
+            1,
+            "the nearby in-budget mutation is single-pass"
+        );
     }
 }
 

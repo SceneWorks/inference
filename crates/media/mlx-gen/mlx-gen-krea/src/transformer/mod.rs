@@ -1561,7 +1561,14 @@ mod tests {
                 )
             });
         let error = result.expect_err("A to B phase adapter replacement must invalidate its pin");
-        assert!(error.to_string().contains("changed after load"), "{error}");
+        match error {
+            mlx_gen::Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            mlx_gen::Error::Unsupported(reason) => {
+                panic!("unexpected artifact-seal reason: {reason}")
+            }
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     #[test]
