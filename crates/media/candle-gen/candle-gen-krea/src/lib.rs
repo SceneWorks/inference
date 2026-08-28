@@ -1578,12 +1578,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     // A packed companion snapshot must load its text encoder directly on the compute device. The
     // CPU-stage fold path is only for a dense companion: QLinear's packed `quantize_onto` is
     // intentionally idempotent and therefore cannot migrate an already-packed CPU base.
-    let text_quant = if native_dit.is_some() && companion_quant_tier(spec, descriptor.id)?.is_none()
-    {
-        spec.quantize
-    } else {
-        None
-    };
+    let text_quant = text_encoder_quant_tier(spec, descriptor.id)?;
     let heavy_quant = native_quant;
     // Keep physical execution separate from evidence publication. The File contract below remains
     // rung-4 Missing, but an explicit eligible load arms the retained native pin for real block
@@ -2127,6 +2122,24 @@ fn companion_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Qu
         })
         .transpose()?;
     Ok(companion_quant)
+}
+
+/// Resolve the quantize-on-load tier for an imported checkpoint's companion text encoder.
+///
+/// `LoadSpec::quantize` describes the imported DiT's numeric tier as well as the requested tier for
+/// dense Q4/Q8 imports. Native NVFP4 is different: the single-file DiT is already packed and is
+/// loaded by `Nvfp4Linear`, while the companion text encoder remains dense. Forwarding `Nvfp4` to
+/// the text encoder would incorrectly enter the generic GGUF fold path, where NVFP4 deliberately
+/// has no block type.
+fn text_encoder_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
+    if !matches!(spec.weights, WeightsSource::File(_)) || companion_quant_tier(spec, id)?.is_some()
+    {
+        return Ok(None);
+    }
+
+    Ok(spec
+        .quantize
+        .filter(|quant| matches!(quant, Quant::Q4 | Quant::Q8)))
 }
 
 fn actual_quant_tier(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<Quant>> {
@@ -3109,6 +3122,34 @@ mod tests {
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(root.to_path_buf()),
         )
+    }
+
+    #[test]
+    fn native_nvfp4_dit_does_not_quantize_the_dense_companion_text_encoder() {
+        let fixture = tempfile::tempdir().unwrap();
+
+        let nvfp4 =
+            valid_imported_spec(fixture.path(), "krea-nvfp4.safetensors").with_quant(Quant::Nvfp4);
+        assert_eq!(
+            actual_quant_tier(&nvfp4, KREA_2_TURBO_ID).unwrap(),
+            Some(Quant::Nvfp4),
+            "the provider memory contract must retain the packed DiT tier"
+        );
+        assert_eq!(
+            text_encoder_quant_tier(&nvfp4, KREA_2_TURBO_ID).unwrap(),
+            None,
+            "NVFP4 is already packed in the DiT and has no text-encoder GGUF fold"
+        );
+
+        for quant in [Quant::Q4, Quant::Q8] {
+            let dense_import =
+                valid_imported_spec(fixture.path(), "krea-dense.safetensors").with_quant(quant);
+            assert_eq!(
+                text_encoder_quant_tier(&dense_import, KREA_2_TURBO_ID).unwrap(),
+                Some(quant),
+                "dense imported checkpoints still quantize their dense companion text encoder"
+            );
+        }
     }
 
     /// **sc-21484 follow-up: the facts reach the surface a worker actually holds.**
