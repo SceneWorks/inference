@@ -8,8 +8,11 @@
 
 use crate::approximation::{ApproximationPlan, ApproximationRequest, ApproximationSurface};
 use crate::execution_domains::{CfgBatching, ExecutionSurface, FfnChunk, GraphEvalCadence};
+use crate::hdr::HdrColorSpace;
 use crate::media::{AudioChunk, AudioTrack, Image};
-use crate::runtime::{CancelFlag, PreviewSink, Progress, PromptEnhancementSink, Quant};
+use crate::runtime::{
+    CancelFlag, HdrFrameSink, PreviewSink, Progress, PromptEnhancementSink, Quant,
+};
 use crate::voice_embed::VoiceEmbedding;
 use crate::{
     default_memory_strategy_safety_check, Error, MemoryPeakBreakdown, MemoryPhase,
@@ -293,6 +296,32 @@ pub enum GenerationOutput {
     Audio(AudioTrack),
 }
 
+/// The HDR opt-in block ([`GenerationRequest::hdr`], sc-18790).
+///
+/// One field, not two: a colour space without a sink would render HDR and discard it, and a sink
+/// without a colour space would leave the engine guessing how to interpret the samples. Bundling
+/// them makes both of those unrepresentable, and makes `Option::is_some()` the single unambiguous
+/// "is this an HDR render?" test.
+#[derive(Clone, Debug)]
+pub struct HdrRequest {
+    /// The source **and** output colour space (upstream's single `--hdr` flag covers both): how
+    /// to interpret EXR conditioning input, and which primaries / `colorSpace` tag the emitted
+    /// EXR frames carry.
+    pub color_space: HdrColorSpace,
+    /// Where decoded HDR frames are delivered, streaming, as the render produces them. An inert
+    /// sink is legal and means "render HDR but discard the frames" — useful for a caller that
+    /// only wants the HDR *decode path* (float32 VAE, no 8-bit quantization) and reads the SDR
+    /// proxy from [`GenerationOutput::Video`].
+    pub sink: HdrFrameSink,
+}
+
+impl HdrRequest {
+    /// The common case: stream frames in `color_space` to `sink`.
+    pub fn new(color_space: HdrColorSpace, sink: HdrFrameSink) -> Self {
+        Self { color_space, sink }
+    }
+}
+
 /// The request union (lifted from the SceneWorks worker's `ImageRequest`/`VideoRequest`). Most
 /// fields are optional; a model reads what it supports and `validate()` rejects the rest. A
 /// single `Default`-able struct (no builder): `GenerationRequest { prompt, ..Default::default() }`.
@@ -378,6 +407,45 @@ pub struct GenerationRequest {
     /// (the default). Consumed by Wan video models (`generate_wan.py`'s `trim_first_frames`); video
     /// models that don't support it ignore it.
     pub trim_first_frames: Option<u32>,
+
+    // --- LTX-2.5 DFR (sc-18789; the `--num-generated-keyframes` / `--temporal-upsample-rounds`
+    //     CLI equivalents) ---
+    /// Number of extra **generated keyframe slots** placed at evenly spaced interior frame
+    /// positions (reference `--num-generated-keyframes`; `ltx_dfr::evenly_spaced_keyframe_positions`).
+    /// Each slot relaxes the effective temporal compression at its position at the cost of one
+    /// latent frame's worth of tokens for one pixel frame. Requires a checkpoint whose transformer
+    /// sets `use_keyframes_abs_pos_embedding` (LTX ≥ 2.5) — an engine whose checkpoint lacks the
+    /// learned marker (`ltx_2_3`) **refuses** the request with a typed `Unsupported` rather than
+    /// denoising unmarked slots as wasted compute (the reference validates the same way, up
+    /// front). `None`/0 = off. Non-LTX models ignore it. **Until sc-18778 lands the `ltx_2_5`
+    /// engine, this knob is refusal-only** — no shipped engine consumes a positive value; the DFR
+    /// machinery it will drive is in place behind `ltx_dfr::evenly_spaced_keyframe_positions`.
+    ///
+    /// **Consumer (sc-18778):** `ltx_2_5` / `ltx_2_5_distilled` consume a positive count — it maps
+    /// through [`crate::ltx_dfr::evenly_spaced_keyframe_positions`] onto the DFR canvas. Gated by
+    /// [`Capabilities::supports_generated_keyframes`]: an engine that does not advertise it
+    /// refuses a positive value on the shared floor.
+    pub num_generated_keyframes: Option<u32>,
+    /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
+    /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
+    /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
+    /// generated-keyframe-capable checkpoint (LTX ≥ 2.5); `ltx_2_3` refuses a non-zero value with
+    /// a typed `Unsupported`. `None`/0 = off. Non-LTX models ignore it.
+    ///
+    /// **Consumer (sc-18778):** `ltx_2_5` / `ltx_2_5_distilled` honour it — each round is a real
+    /// temporal upsample + tiled re-denoise (`ltx dfr::run_temporal_rounds`), so rounds=2 does
+    /// strictly more work and yields strictly more frames than rounds=1. Bounded by
+    /// [`Capabilities::max_temporal_upsample_rounds`] on the shared floor.
+    pub temporal_upsample_rounds: Option<u32>,
+    /// **Auto-duration opt-in** (reference `--auto-duration`): let the checkpoint's duration head
+    /// predict the clip length instead of stating it. `None` = off (the default); `Some(range)`
+    /// clamps the prediction to `[min_seconds, max_seconds]`.
+    ///
+    /// An explicit [`frames`](Self::frames) always wins and the head is never invoked — the
+    /// precedence [`crate::duration_head::resolve_request_num_frames`] implements. Gated by
+    /// [`Capabilities::supports_auto_duration`]: an engine that does not advertise a duration head
+    /// refuses the request on the shared floor rather than silently ignoring the opt-in.
+    pub auto_duration: Option<crate::duration_head::AutoDurationRange>,
 
     // --- SVD image→video micro-conditioning (sc-3523; ignored by other models) ---
     /// SVD `motion_bucket_id` — the motion-strength bucket baked into the `added_time_ids`
@@ -522,6 +590,20 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_preview`]; the sink callback alone cannot distinguish those states.
     /// See [`PreviewSink`] for the frame contract.
     pub preview: PreviewSink,
+
+    // --- HDR (sc-18790; consumed by LTX-2.5 today) ---
+    /// Opt in to the HDR lane: scene-linear EXR conditioning in, scene-linear EXR frames plus a
+    /// BT.2020/HLG master out.
+    ///
+    /// **`None` is SDR and is the default.** That is not a stylistic preference — an HDR signal
+    /// delivered where SDR is expected is displayed with the wrong transfer and washes out on
+    /// every player, so the HDR path must never be reachable by accident. A request that leaves
+    /// this `None` takes byte-for-byte the same decode and quantization it took before sc-18790.
+    ///
+    /// Gated by [`Capabilities::supports_hdr`]: a model that does not advertise HDR rejects a
+    /// `Some` here as [`Error::Unsupported`] at the contract boundary rather than silently
+    /// rendering SDR and leaving the caller to discover it from the pixels.
+    pub hdr: Option<HdrRequest>,
 }
 
 /// Quality-preserving execution levers for a single generation.
@@ -838,6 +920,9 @@ impl Default for GenerationRequest {
             duration: None,
             video_mode: None,
             trim_first_frames: None,
+            num_generated_keyframes: None,
+            temporal_upsample_rounds: None,
+            auto_duration: None,
             motion_bucket_id: None,
             noise_aug_strength: None,
             decode_chunk_size: None,
@@ -856,6 +941,8 @@ impl Default for GenerationRequest {
             phases: None,
             cancel: CancelFlag::default(),
             preview: PreviewSink::default(),
+            // SDR. The one default that must never drift — see `GenerationRequest::hdr`.
+            hdr: None,
         }
     }
 }
@@ -1078,6 +1165,13 @@ impl GenerationRequest {
             fps: _,
             video_mode: _,
             trim_first_frames: _,
+            // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
+            num_generated_keyframes: _,
+            temporal_upsample_rounds: _,
+            // sc-18778: the auto-duration range's floats are validated at construction
+            // (`AutoDurationRange::new` refuses non-finite / inverted / non-positive bounds), so
+            // they never reach this sweep unchecked.
+            auto_duration: _,
             decode_chunk_size: _,
             conditioning_fps: _,
             enhance_prompt: _,
@@ -1093,6 +1187,10 @@ impl GenerationRequest {
             approximation: _,
             cancel: _,
             preview: _,
+            // Float-free by construction: an enum colour space plus a callback handle. A
+            // float-bearing HDR knob (a diffuse-white signal or roll-off rate on the request,
+            // say) must join the floor, and this named-not-`..` binding forces that decision.
+            hdr: _,
             // The audio sub-block carries its own floats — destructured below the flat knobs.
             audio,
             // The multi-phase list carries per-phase floats (guidance + adapter weights), checked
@@ -2404,6 +2502,16 @@ pub struct Capabilities {
     /// including before the first denoise step). This is advisory discoverability: it does not gate
     /// [`GenerationRequest::preview`] and [`PreviewSink`] itself does not report support.
     pub supports_preview: bool,
+    /// Whether this model can render the **HDR** lane through [`GenerationRequest::hdr`] —
+    /// scene-linear EXR conditioning in, scene-linear EXR frames plus a BT.2020/HLG master out
+    /// (sc-18790).
+    ///
+    /// `Default` is `false`, so every existing provider is unsupported and the shared floor
+    /// rejects an `hdr` request against it as [`Error::Unsupported`]. That rejection is the
+    /// point: HDR is not a knob a model can partially honor. A model that quietly ignored it
+    /// would return SDR pixels tagged as an HDR render, which is precisely the washed-out-
+    /// playback failure the opt-in exists to prevent.
+    pub supports_hdr: bool,
     /// Whether [`GenerationRequest::enhance_prompt`] changes the prompt consumed by this provider.
     ///
     /// This is weights-free discoverability for an optional semantic path, not a routing promise:
@@ -2438,6 +2546,60 @@ pub struct Capabilities {
     /// set; a script naming more than `max_speakers` distinct speakers is a range error
     /// ([`Error::Msg`], not a capability gap). `Default` is `None`.
     pub max_speakers: Option<u32>,
+
+    // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
+    //
+    // Each of the three is a REQUEST axis with a real consumer, gated here on the shared floor for
+    // the reason the audio surface is: a per-provider check is a check a provider can forget, and a
+    // forgotten one means the knob is silently ignored. Every flag below is `false`/`0` by
+    // `Default`, so every pre-2.5 provider keeps refusing these requests without editing its
+    // descriptor — declaration and enforcement move together.
+    /// Whether this model predicts clip length from a **duration head** when the request opts in
+    /// via [`GenerationRequest::auto_duration`] (reference `--auto-duration`).
+    ///
+    /// `Default` is `false`, and the shared floor then rejects an `auto_duration` request as the
+    /// typed [`Error::Unsupported`] rather than silently rendering the model's default length — an
+    /// opt-in that is quietly dropped is worse than a refusal, because the caller cannot tell the
+    /// prediction never ran. A provider sets it `true` only when its load actually binds a duration
+    /// head and its generate routes the opt-in through
+    /// [`crate::duration_head::resolve_request_num_frames`].
+    pub supports_auto_duration: bool,
+    /// Whether this model places **generated keyframe slots** at interior positions when the
+    /// request sets [`GenerationRequest::num_generated_keyframes`] (reference
+    /// `--num-generated-keyframes`).
+    ///
+    /// Requires a transformer with the learned `use_keyframes_abs_pos_embedding` slot marker
+    /// (LTX ≥ 2.5). `Default` is `false`: a checkpoint without the marker would denoise the slots
+    /// as unmarked tokens — wasted compute carrying no conditioning — so the floor refuses a
+    /// positive count as the typed [`Error::Unsupported`].
+    pub supports_generated_keyframes: bool,
+    /// The largest [`GenerationRequest::temporal_upsample_rounds`] this model honours (reference
+    /// `--temporal-upsample-rounds`). `0` (the `Default`) means the DFR temporal path is not
+    /// implemented and the floor refuses any positive round count as the typed
+    /// [`Error::Unsupported`].
+    ///
+    /// A count within the advertised bound must do real per-round work: each round temporally
+    /// upsamples the latent and re-denoises the keyframe-seam tiles, so `rounds = 2` runs strictly
+    /// more forward passes and yields strictly more frames than `rounds = 1`. Advertising a bound
+    /// above what the pipeline actually loops over would recreate the inert-knob defect this flag
+    /// exists to prevent.
+    pub max_temporal_upsample_rounds: u32,
+    /// Whether this model can decode through the **diffusion VAE decoder** (DiffVAE) when the
+    /// caller stages that component in [`crate::LoadSpec::components`].
+    ///
+    /// Unlike the two knobs above this is a **load-time** selection, not a request field — it
+    /// follows the alternate-decoder contract already in
+    /// [`crate::latent::DECODER_OPTIONS`], where staging the option's `component_id` is what
+    /// chooses it (the same seam the Wan 2.1 VAE substitution uses). The flag exists so a consumer
+    /// can discover the choice weights-free, and so a provider that has NOT wired the branch
+    /// refuses the staged component instead of accepting it and silently decoding through the plain
+    /// feed-forward decoder — frames that do not match what was asked for, with nothing in the
+    /// result saying so.
+    ///
+    /// `Default` is `false`. A provider sets it `true` only when its decode genuinely branches on
+    /// the staged component.
+    pub supports_diffusion_decoder: bool,
+
     /// Whether this model renders a **stateless multi-turn conversation history**
     /// ([`Conditioning::ConversationHistory`], sc-14150, path **A**) — the opt-in signal for
     /// context-aware conversational TTS carried entirely in the request, mirroring
@@ -2734,6 +2896,16 @@ impl Capabilities {
             self.max_count,
             self.max_size
         );
+        // HDR opt-in (sc-18790). Gated on the shared floor, not per-provider, for the reason the
+        // audio surface is: a per-provider check is a check a provider can forget, and a forgotten
+        // one here means the request renders SDR while the caller believes it asked for HDR — a
+        // silently wrong render rather than a loud rejection. `None` (SDR) validates vacuously, so
+        // this is inert for every request that has not opted in.
+        if req.hdr.is_some() && !self.supports_hdr {
+            return Err(Error::Unsupported(format!(
+                "{id}: HDR output is not supported by this model"
+            )));
+        }
         if let Some(memory) = req.memory {
             match (
                 memory.calibration_fault_harness_authorized,
@@ -2856,6 +3028,49 @@ impl Capabilities {
                     "{id}: frames {frames} exceeds the sanity cap {MAX_FRAMES}"
                 )));
             }
+        }
+        // --- LTX-2.5 generation axes (sc-18778) --------------------------------------------------
+        //
+        // Fail-closed, on the shared floor, for the reason the audio surface is: a per-provider
+        // check is a check a provider can forget, and a forgotten one means the knob is silently
+        // ignored. Every gate below is inert for a request that leaves the axis unset, and every
+        // flag defaults to the refusing position, so adding these does not change any existing
+        // provider's answer to any existing request.
+        //
+        // A provider that wants a MORE actionable message (naming the checkpoint generation that
+        // does support the axis, say) runs its own check BEFORE calling the floor — that is what
+        // `ltx_2_3` does, and why its typed refusals still name 2.5.
+        if req.num_generated_keyframes.is_some_and(|n| n > 0) && !self.supports_generated_keyframes
+        {
+            return Err(Error::Unsupported(format!(
+                "{id}: num_generated_keyframes is not supported by this engine (it requires a \
+                 checkpoint whose transformer carries the learned generated-keyframe slot marker)"
+            )));
+        }
+        if let Some(rounds) = req.temporal_upsample_rounds {
+            if rounds > self.max_temporal_upsample_rounds {
+                return Err(if self.max_temporal_upsample_rounds == 0 {
+                    // Distinguish "this engine has no DFR temporal path at all" from "you asked for
+                    // more rounds than it runs" — the first is a capability gap the caller cannot
+                    // fix by lowering the number, the second is a range error they can.
+                    Error::Unsupported(format!(
+                        "{id}: temporal_upsample_rounds is not supported by this engine (it \
+                         requires the LTX-2.5 DFR pipeline: generated keyframe slots + the \
+                         temporal latent upsampler)"
+                    ))
+                } else {
+                    Error::Msg(format!(
+                        "{id}: temporal_upsample_rounds {rounds} exceeds this engine's maximum {}",
+                        self.max_temporal_upsample_rounds
+                    ))
+                });
+            }
+        }
+        if req.auto_duration.is_some() && !self.supports_auto_duration {
+            return Err(Error::Unsupported(format!(
+                "{id}: auto_duration is not supported by this engine (it requires a checkpoint \
+                 that ships a duration head)"
+            )));
         }
         if let Some(fps) = req.fps {
             if fps == 0 {

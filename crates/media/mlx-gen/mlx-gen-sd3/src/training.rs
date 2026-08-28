@@ -1002,6 +1002,7 @@ mod tests {
                 image_path: PathBuf::from("/tmp/x.png"),
                 caption: "a swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             }],
             config,
             output_dir: PathBuf::from("/tmp/sd3_unused"),
@@ -1543,11 +1544,13 @@ mod real_weight_repro {
                 image_path: img_a.clone(),
                 caption: "sks a solid crimson swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             },
             TrainingItem {
                 image_path: img_b.clone(),
                 caption: "sks a solid cobalt swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             },
         ];
 
@@ -1692,11 +1695,13 @@ mod real_weight_repro {
                 image_path: img_a.clone(),
                 caption: "sks a solid crimson swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             },
             TrainingItem {
                 image_path: img_b.clone(),
                 caption: "sks a solid cobalt swatch".into(),
                 control_image_path: None,
+                model_options: Default::default(),
             },
         ];
 

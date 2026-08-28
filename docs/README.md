@@ -11,6 +11,11 @@ Documentation for the SceneWorks inference workspace.
   platform, with the MLX/Candle deltas. Built from the committed exact-surface tests.
 - **[Mochi 1 tier strategy](reference/mochi-1-tier-strategy.md)** — the accepted quantization
   packaging decision for the native Mochi 1 port (pre-quantized per-tier artifacts, default q4).
+- **[LTX-2.5 access + component evidence baseline (sc-18756)](reference/sc-18756-ltx-2-5-evidence-baseline.md)** —
+  epic 18755 Phase 0: measured HF access state, the reference-impl pin, the full 2.3→2.5 component
+  inventory (14 safetensors files, header-only Range reads, authenticated capture), and the
+  pre-change `dump-engine-capabilities` baseline every later LTX-2.5 story cites instead of
+  re-deriving.
 - **[MiniMax-H3 withheld upstream components](reference/minimax-h3-withheld-upstream-components.md)**
   — what `H3-Context-IR`, `H3-Regenerate-2K`, sparse-attention inference and the `<d>` dialogue
   markers cost this port, what the crates do instead, and what would change if upstream publishes.

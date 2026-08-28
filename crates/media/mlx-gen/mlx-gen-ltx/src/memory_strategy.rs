@@ -60,7 +60,7 @@ fn frame_count_matches_fps(fps: u32, frames: u32) -> bool {
     }
 }
 
-fn decode_tile_edges() -> Vec<u32> {
+pub(crate) fn decode_tile_edges() -> Vec<u32> {
     crate::pipeline::LTX_VAE_SPATIAL_PX
         .iter()
         .map(|&edge| edge as u32)

@@ -229,11 +229,56 @@ fn validate_cond_safe_completeness(
     Ok(())
 }
 
+/// The LTX-2.5 release adapters publish their scaling contract in the safetensors header.  The
+/// split provider intentionally does not inherit the 2.3 fallback of deriving rank/alpha from a
+/// tensor (or a legacy per-target blob): a missing or mismatched declaration must stop loading.
+#[derive(Clone, Copy, Debug)]
+struct Ltx25Scale {
+    rank: f32,
+    alpha: f32,
+}
+
+fn ltx25_scale(file: &AdapterFile, spec: &AdapterSpec) -> Result<Ltx25Scale> {
+    let parse = |key: &str| -> Result<f32> {
+        let value = file.meta.get(key).ok_or_else(|| {
+            CandleError::Msg(format!(
+                "ltx_2_5 adapter {} is missing required `{key}` safetensors metadata",
+                spec.path.display()
+            ))
+        })?;
+        let value = value.parse::<f32>().map_err(|_| {
+            CandleError::Msg(format!(
+                "ltx_2_5 adapter {} has non-numeric `{key}` metadata `{value}`",
+                spec.path.display()
+            ))
+        })?;
+        if !value.is_finite() || value <= 0.0 {
+            return Err(CandleError::Msg(format!(
+                "ltx_2_5 adapter {} has invalid `{key}` metadata {value}",
+                spec.path.display()
+            )));
+        }
+        Ok(value)
+    };
+    Ok(Ltx25Scale {
+        rank: parse("lora_rank")?,
+        alpha: parse("lora_alpha")?,
+    })
+}
+
 /// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
 ///
 /// A resolved module outside the exact training surface is an error, as is an incomplete or
 /// shape-mismatched pair. Thus a non-empty adapter can never silently render as the base model.
 pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
+    install_ltx_adapters_with_policy(dit, specs, false)
+}
+
+fn install_ltx_adapters_with_policy(
+    dit: &mut AvDiT,
+    specs: &[AdapterSpec],
+    strict_25: bool,
+) -> Result<AdditiveReport> {
     let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
     let mut pending_lokr: BTreeMap<String, Vec<PendingLokr>> = BTreeMap::new();
     let mut report = AdditiveReport::default();
@@ -243,6 +288,17 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
         let pass_scales = effective_pass_scales(spec)?;
         let file = read_adapter(&spec.path)?;
         let format = classify_format(spec, &file)?;
+        let strict_scale = if strict_25 {
+            if spec.kind != AdapterKind::Lora || format != AdapterFormat::Lora {
+                return Err(CandleError::Msg(format!(
+                    "ltx_2_5 adapter {} must be a LoRA file; LoKr/third-party LyCORIS are not supported by this route",
+                    spec.path.display()
+                )));
+            }
+            Some(ltx25_scale(&file, spec)?)
+        } else {
+            None
+        };
         if format == AdapterFormat::Lokr {
             let (rank, alpha) = parse_lokr_metadata(
                 file.meta.get("rank").map(String::as_str),
@@ -353,13 +409,26 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
             let (meta_alpha, meta_rank) = metadata
                 .as_ref()
                 .map_or((None, None), |meta| meta.effective(&path));
-            let scale_rank = meta_rank.unwrap_or(rank as f32);
+            let (scale_rank, alpha) = match strict_scale {
+                Some(scale) => {
+                    if rank as f32 != scale.rank {
+                        return Err(CandleError::Msg(format!(
+                            "ltx_2_5 adapter {} target `{path}` has factor rank {rank} but declares lora_rank {}",
+                            spec.path.display(), scale.rank
+                        )));
+                    }
+                    (scale.rank, scale.alpha)
+                }
+                None => (
+                    meta_rank.unwrap_or(rank as f32),
+                    triple.alpha.or(meta_alpha).unwrap_or(rank as f32),
+                ),
+            };
             if scale_rank <= 0.0 || !scale_rank.is_finite() {
                 return Err(CandleError::Msg(format!(
                     "ltx: LoRA target `{path}` has invalid metadata rank {scale_rank}"
                 )));
             }
-            let alpha = triple.alpha.or(meta_alpha).unwrap_or(scale_rank);
             if !alpha.is_finite() {
                 return Err(CandleError::Msg(format!(
                     "ltx: LoRA target `{path}` has non-finite alpha"
@@ -471,6 +540,13 @@ pub fn install_ltx_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<Ad
     }
     debug_assert_eq!(report.applied, applied_by_spec.into_iter().sum::<usize>());
     Ok(report)
+}
+
+/// Strict LTX-2.5 adapter install.  The underlying projection walker is shared with LTX-2.3, but
+/// its source-scale fallback is disabled and unmatched targets remain fatal, so a selected adapter
+/// can never be accepted without affecting the split-provider DiT.
+pub fn install_ltx25_adapters(dit: &mut AvDiT, specs: &[AdapterSpec]) -> Result<AdditiveReport> {
+    install_ltx_adapters_with_policy(dit, specs, true)
 }
 
 #[cfg(test)]

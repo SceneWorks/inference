@@ -177,6 +177,93 @@ pub fn is_hidden_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
+/// no whole-file buffer.
+///
+/// [`CheckpointMeta::from_file`] also exposes `__metadata__` (via
+/// [`CheckpointMeta::metadata`]), but it reads the entire file into memory first, which is fine for
+/// adapter-sized checkpoints and catastrophic for a 22B transformer. Component resolution keyed on
+/// `__metadata__["model_version"]` (sc-18757) must inspect exactly those multi-gigabyte files, so it
+/// uses this reader instead. An absent `__metadata__` block yields an empty map, not an error — a
+/// safetensors file is allowed to carry none.
+pub fn safetensors_file_metadata(path: impl AsRef<Path>) -> Result<BTreeMap<String, String>> {
+    /// Same ceiling `safetensors_path_tensor_headers` applies, for the same reason: refuse to
+    /// allocate an arbitrary buffer from an untrusted 8-byte length prefix.
+    const MAX_HEADER_SIZE: u64 = 100_000_000;
+
+    let path = path.as_ref();
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)?;
+    let header_len = u64::from_le_bytes(prefix);
+    if header_len > MAX_HEADER_SIZE {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} exceeds the {MAX_HEADER_SIZE}-byte maximum",
+            path.display()
+        )));
+    }
+    let data_start = 8_u64.checked_add(header_len).ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    if data_start > file_len {
+        return Err(Error::Msg(format!(
+            "safetensors header in {} extends past the file",
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        Error::Msg(format!(
+            "safetensors header too large in {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let json: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&header)
+        .map_err(|error| {
+            Error::Msg(format!("safetensors header in {}: {error}", path.display()))
+        })?;
+    // An explicit `"__metadata__": null` means the same thing as an absent key, and is what the
+    // SceneWorks-converted LTX-2.3 trees actually ship (their `upsampler.safetensors` writes the
+    // key with a null value). Erroring on it would refuse a file that declares nothing, which is a
+    // legitimate state — the null-is-absent convention this crate applies everywhere else.
+    let Some(block) = json.get("__metadata__").filter(|v| !v.is_null()) else {
+        return Ok(BTreeMap::new());
+    };
+    let block = block.as_object().ok_or_else(|| {
+        Error::Msg(format!(
+            "safetensors __metadata__ in {} is not a JSON object",
+            path.display()
+        ))
+    })?;
+    let mut out = BTreeMap::new();
+    for (key, value) in block {
+        // The safetensors spec types every `__metadata__` value as a string; a producer that emits a
+        // non-string is malformed, and silently dropping the entry would turn a `model_version`
+        // typo into "this checkpoint declares no version" (which selects the OLDEST layout).
+        let text = value.as_str().ok_or_else(|| {
+            Error::Msg(format!(
+                "safetensors __metadata__[{key:?}] in {} is {}, not a string",
+                path.display(),
+                match value {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a bool",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => "an object",
+                    serde_json::Value::String(_) => unreachable!("as_str covered strings"),
+                }
+            ))
+        })?;
+        out.insert(key.clone(), text.to_string());
+    }
+    Ok(out)
+}
+
 // =================================================================================================
 // CheckpointMeta — neutral safetensors header / byte-view reader.
 // =================================================================================================
@@ -1402,6 +1489,133 @@ mod tests {
             .prefix(prefix)
             .tempdir()
             .expect("fixture temp dir")
+    }
+
+    // --- `safetensors_file_metadata` error paths (sc-18757) --------------------------------------
+    //
+    // The happy path is exercised throughout `ltx_checkpoint`; these pin the refusals, because each
+    // one is a case where returning "no metadata" instead of an error would silently answer "this
+    // checkpoint declares no `model_version`" — which selects the OLDEST layout and mis-loads the
+    // file. Mirrors the sibling `LtxCheckpointMetadata::from_raw` malformed-JSON test.
+
+    /// Assemble a safetensors file from a raw header string (so a test can write a malformed one).
+    fn write_header(path: &Path, header: &str) {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&0_f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn file_metadata_reads_a_well_formed_block_and_tolerates_its_absence() {
+        let guard = fixture_dir("gencore_meta_ok_");
+        let with = guard.path().join("with.safetensors");
+        write_header(
+            &with,
+            r#"{"__metadata__":{"model_version":"2.5.0","format":"pt"},"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        let meta = safetensors_file_metadata(&with).expect("reads the block");
+        assert_eq!(meta.get("model_version").map(String::as_str), Some("2.5.0"));
+        assert_eq!(meta.len(), 2);
+
+        // A file with no `__metadata__` at all is legal safetensors — an empty map, not an error.
+        let without = guard.path().join("without.safetensors");
+        write_header(
+            &without,
+            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        assert!(safetensors_file_metadata(&without).unwrap().is_empty());
+
+        // An explicit `"__metadata__": null` is what the SceneWorks-converted LTX-2.3 trees ship
+        // (verified against `ltx-2.3-mlx/.../q8/upsampler.safetensors`). It declares nothing, which
+        // is a legal state — refusing it would break every 2.3 load that reads a header.
+        let null = guard.path().join("null.safetensors");
+        write_header(
+            &null,
+            r#"{"__metadata__":null,"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        assert!(safetensors_file_metadata(&null)
+            .expect("a null __metadata__ is absent, not malformed")
+            .is_empty());
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_header_longer_than_the_file() {
+        let guard = fixture_dir("gencore_meta_trunc_");
+        let path = guard.path().join("truncated.safetensors");
+        // Declare a 4096-byte header, then supply only a few bytes of it.
+        let mut bytes = 4096_u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(br#"{"__metad"#);
+        std::fs::write(&path, bytes).unwrap();
+        let err = safetensors_file_metadata(&path).expect_err("header runs past EOF");
+        assert!(err.to_string().contains("extends past the file"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_an_absurd_header_length() {
+        // The 8-byte length prefix is untrusted input; refuse to allocate from it rather than
+        // attempting a multi-gigabyte `vec![0; n]`. The file itself stays 8 bytes long.
+        let guard = fixture_dir("gencore_meta_huge_");
+        let path = guard.path().join("huge-header.safetensors");
+        std::fs::write(&path, 200_000_000_u64.to_le_bytes()).unwrap();
+        let err = safetensors_file_metadata(&path).expect_err("header length over the bound");
+        assert!(err.to_string().contains("exceeds the"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_truncated_length_prefix() {
+        let guard = fixture_dir("gencore_meta_stub_");
+        let path = guard.path().join("stub.safetensors");
+        std::fs::write(&path, b"\x01\x02\x03").unwrap();
+        assert!(safetensors_file_metadata(&path).is_err());
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_non_object_metadata_block() {
+        let guard = fixture_dir("gencore_meta_nonobj_");
+        let path = guard.path().join("nonobject.safetensors");
+        write_header(
+            &path,
+            r#"{"__metadata__":["model_version","2.5.0"],"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        let err = safetensors_file_metadata(&path).expect_err("__metadata__ must be an object");
+        assert!(err.to_string().contains("not a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_non_string_metadata_value() {
+        // The spec types every `__metadata__` value as a string. Silently dropping a non-string
+        // would turn a producer's `model_version: 2.5` typo into "declares no version".
+        let guard = fixture_dir("gencore_meta_nonstr_");
+        for (label, blob) in [
+            ("number", r#"{"model_version":2.5}"#),
+            ("bool", r#"{"model_version":true}"#),
+            ("null", r#"{"model_version":null}"#),
+            ("object", r#"{"config":{"transformer":{}}}"#),
+            ("array", r#"{"model_version":["2.5.0"]}"#),
+        ] {
+            let path = guard.path().join(format!("{label}.safetensors"));
+            write_header(
+                &path,
+                &format!(
+                    r#"{{"__metadata__":{blob},"w":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#
+                ),
+            );
+            let err = match safetensors_file_metadata(&path) {
+                Ok(map) => panic!("{label}: expected an error, got {map:?}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("not a string"), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn file_metadata_rejects_a_malformed_header_json() {
+        let guard = fixture_dir("gencore_meta_badjson_");
+        let path = guard.path().join("bad.safetensors");
+        write_header(&path, r#"{"__metadata__":{"a":"b""#);
+        let err = safetensors_file_metadata(&path).expect_err("header JSON is truncated");
+        assert!(err.to_string().contains("safetensors header in"), "{err}");
     }
 
     /// Guards the sc-17755 fix: the fixture root, and anything written into it, leave with the

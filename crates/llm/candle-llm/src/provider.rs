@@ -10,9 +10,9 @@
 use std::cell::OnceCell;
 use std::path::Path;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use core_llm::{
-    Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
+    AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
     Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
@@ -28,8 +28,10 @@ use crate::decode::{
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
 use crate::image::Qwen35ImageProcessor;
+use crate::models::gemma4_mm;
 use crate::models::{
-    CausalLm, Qwen35Config, Qwen35Model, Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
+    CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
+    Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
 use crate::primitives::nn::input_ids;
 use crate::primitives::projection::QuantSpec;
@@ -170,6 +172,18 @@ struct MultimodalPrefill {
     deepstack: Vec<Tensor>,
 }
 
+/// Gemma 4's prepared multimodal prefill: the marker-expanded prompt ids and the decoder input
+/// embeds with vision / audio feature rows spliced onto the soft-token positions.
+///
+/// Deliberately *not* [`MultimodalPrefill`]: Gemma 4 has no M-RoPE, no positional compression, and
+/// no DeepStack taps, so there is no `mrope_delta` to shift the continuation by and no per-position
+/// visual mask to build. Reusing the Qwen-VL struct would mean carrying four fields that must be
+/// filled with values that mean nothing here.
+struct Gemma4Prefill {
+    expanded_ids: Vec<i32>,
+    embeds: Tensor,
+}
+
 /// A [`Decode`] wrapper that shifts the RoPE offset by a constant `delta` for the post-prompt
 /// continuation of a multimodal decode. Image tokens compress the position cursor, so the text
 /// positions that follow the prompt are `cache_len + mrope_delta`, not `cache_len`; the new tokens
@@ -207,7 +221,7 @@ fn collect_images(messages: &[Message]) -> Vec<&ImageRef> {
         .flat_map(|m| {
             m.content.iter().filter_map(|c| match c {
                 Content::Image(img) => Some(img),
-                Content::Text(_) | Content::Video(_) => None,
+                Content::Text(_) | Content::Video(_) | Content::Audio(_) => None,
             })
         })
         .collect()
@@ -220,10 +234,72 @@ fn collect_videos(messages: &[Message]) -> Vec<&VideoRef> {
         .flat_map(|m| {
             m.content.iter().filter_map(|c| match c {
                 Content::Video(v) => Some(v),
-                Content::Text(_) | Content::Image(_) => None,
+                Content::Text(_) | Content::Image(_) | Content::Audio(_) => None,
             })
         })
         .collect()
+}
+
+/// Collect the audio blocks of a conversation, in order.
+fn collect_audio(messages: &[Message]) -> Vec<&AudioRef> {
+    messages
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|c| match c {
+                Content::Audio(a) => Some(a),
+                Content::Text(_) | Content::Image(_) | Content::Video(_) => None,
+            })
+        })
+        .collect()
+}
+
+/// Gemma 4's rendered image marker — the single token its chat template emits for an image part,
+/// which the processor (here, [`LlamaProvider::prepare_gemma4`]) expands into
+/// `boi` + N soft tokens + `eoi`.
+const GEMMA4_IMAGE_MARKER: &str = "<|image|>";
+/// Gemma 4's rendered audio marker, expanded to `boa` + M soft tokens + `eoa`.
+const GEMMA4_AUDIO_MARKER: &str = "<|audio|>";
+
+/// Replace each image/audio block with Gemma 4's marker text so the (content-free) core-llm chat
+/// template contract renders exactly what the model's own Jinja template renders for a typed image /
+/// audio part. Video is refused rather than silently rendered as an image: Gemma 4 declares a
+/// `video_token_id`, but this provider ships no frame-sampling path for it, and quietly dropping the
+/// frames would answer a question about a video from its text alone.
+fn substitute_gemma4_placeholders(messages: &[Message]) -> CoreResult<Vec<Message>> {
+    messages
+        .iter()
+        .map(|m| {
+            let content = m
+                .content
+                .iter()
+                .map(|c| match c {
+                    Content::Image(_) => Ok(Content::text(GEMMA4_IMAGE_MARKER)),
+                    Content::Audio(_) => Ok(Content::text(GEMMA4_AUDIO_MARKER)),
+                    Content::Text(t) => Ok(Content::Text(t.clone())),
+                    Content::Video(_) => Err(CoreError::Unsupported(
+                        "[candle-llama] Gemma 4: video input is not supported by this provider \
+                         (no frame-sampling path); send frames as individual images"
+                            .to_string(),
+                    )),
+                })
+                .collect::<CoreResult<Vec<_>>>()?;
+            Ok(Message {
+                role: m.role,
+                content,
+                thinking: m.thinking.clone(),
+                tool_calls: m.tool_calls.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The compute dtype of the loaded decoder.
+fn model_dtype(model: &Decoder) -> DType {
+    match model {
+        Decoder::Causal(m) => m.compute_dtype(),
+        // Gemma 4 never dispatches to the Qwen3.6 hybrid; this arm exists so the helper is total.
+        Decoder::Qwen35(m) => m.compute_dtype(),
+    }
 }
 
 /// Compute the Qwen3-VL **merged per-frame timestamps** for a sampled video, mirroring
@@ -270,25 +346,39 @@ fn video_placeholder_text(video: &VideoRef, temporal_patch_size: usize) -> Strin
 fn substitute_vision_placeholders(
     messages: &[Message],
     temporal_patch_size: usize,
-) -> Vec<Message> {
+) -> CoreResult<Vec<Message>> {
     const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
     messages
         .iter()
-        .map(|m| Message {
-            role: m.role,
-            content: m
+        .map(|m| {
+            let content = m
                 .content
                 .iter()
                 .map(|c| match c {
-                    Content::Image(_) => Content::text(IMAGE_PLACEHOLDER),
-                    Content::Video(v) => {
-                        Content::text(video_placeholder_text(v, temporal_patch_size))
-                    }
-                    Content::Text(t) => Content::Text(t.clone()),
+                    Content::Image(_) => Ok(Content::text(IMAGE_PLACEHOLDER)),
+                    Content::Video(v) => Ok(Content::text(video_placeholder_text(
+                        v,
+                        temporal_patch_size,
+                    ))),
+                    Content::Text(t) => Ok(Content::Text(t.clone())),
+                    // The Qwen-VL path has no audio projector, and this provider's `supports_audio`
+                    // is false for every Qwen checkpoint, so `validate` rejects an audio-carrying
+                    // request before substitution. Erroring here rather than dropping the block
+                    // means that if that invariant ever breaks, the request fails loudly instead of
+                    // being answered from its text alone.
+                    Content::Audio(_) => Err(CoreError::Unsupported(
+                        "[candle-llama] the Qwen-VL path carries no audio; an audio block reached \
+                         placeholder substitution, which the capability gate should have rejected"
+                            .to_string(),
+                    )),
                 })
-                .collect(),
-            thinking: m.thinking.clone(),
-            tool_calls: m.tool_calls.clone(),
+                .collect::<CoreResult<Vec<_>>>()?;
+            Ok(Message {
+                role: m.role,
+                content,
+                thinking: m.thinking.clone(),
+                tool_calls: m.tool_calls.clone(),
+            })
         })
         .collect()
 }
@@ -342,6 +432,49 @@ pub struct LlamaProvider {
     /// The Qwen3.6 vision tower + preprocessor, present iff this is a `qwen3_5` checkpoint carrying
     /// `model.visual.*`. Drives the image path in [`LlamaProvider::generate`].
     vision: Option<Qwen35Vision>,
+    /// Gemma 4's encoder-free vision embedder and/or audio projector, present iff this is a Gemma 4
+    /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
+    /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
+    gemma4: Option<Gemma4Runtime>,
+}
+
+/// Whether Gemma 4's vision path has been validated end-to-end, and may therefore be advertised.
+///
+/// **`false`** (sc-18772). The front-end is implemented and its pieces are unit-tested, but its
+/// end-to-end behaviour could not be demonstrated on real weights, and two of its steps had to be
+/// chosen without a reference implementation to check against (upstream `transformers` with
+/// `Gemma4Unified` is not available offline):
+///
+/// * the patch-grid tiling — how an arbitrary aspect ratio maps onto a patch grid within the
+///   280-soft-token budget, and
+/// * the resampling of the 1120-entry positional table onto that grid.
+///
+/// Measured on `google/gemma-4-12B-it` at Q4 on CPU, through this provider:
+///
+/// * a text-only prompt through the SAME provider instance answers cleanly ("The sun dipped below
+///   the horizon, bleeding hues of molten gold ...");
+/// * audio conditioning answers cleanly and discriminates content (a 440 Hz tone is described as
+///   "a low-frequency, rhythmic thumping or pulsing", silence as "I cannot hear anything");
+/// * an image-conditioned prompt degenerates into a `thought` loop and, where it emits anything
+///   else, describes the input as **audio**. The span itself is correct — 261 prompt tokens for a
+///   17-token question is exactly `boi + 11x22 soft tokens + eoi` — so the framing and expansion
+///   are right and the *features* are wrong. Both plausible patch flattening orders (row-major and
+///   the channel-major Conv2d equivalent) were tried on real weights and fail the same way.
+///
+/// Advertising vision on that evidence is exactly the advertised-but-absent failure this story
+/// forbids, so an image-carrying request is REJECTED by the capability gate rather than answered
+/// from its text. The embedder and its host-side geometry stay in the tree, unadvertised and
+/// unreachable, so the next attempt starts from them and from the real-weight leg that must pass
+/// before this returns `true` (`gemma4_answers_about_an_image` in the breadth suite).
+fn gemma4_vision_is_validated() -> bool {
+    false
+}
+
+/// Gemma 4's loaded multimodal front-ends plus the tensor context they build in.
+struct Gemma4Runtime {
+    mm: Gemma4Mm,
+    dtype: DType,
+    device: Device,
 }
 
 impl LlamaProvider {
@@ -434,6 +567,30 @@ impl LlamaProvider {
             None
         };
 
+        // Gemma 4 multimodal (sc-18772): load whichever front-ends the checkpoint actually ships.
+        // The capability flags are set from the LOADED tensors, never from the config alone — a
+        // `vision_config` with no `model.vision_embedder.*` yields `None` and stays unadvertised,
+        // which is the difference between declaring a capability and having one.
+        let gemma4 = if arch.is_gemma4() {
+            let layout = Gemma4Layout::detect(&weights).map_err(to_core)?;
+            let processor = read_json(dir, "processor_config.json");
+            let mm_cfg =
+                Gemma4MmConfig::from_json(&cfg_value, processor.as_ref()).map_err(to_core)?;
+            let dtype = model_dtype(&model);
+            let mm = Gemma4Mm::from_weights(&weights, layout, mm_cfg, dtype).map_err(to_core)?;
+            // Audio tracks the loaded tensors; vision does not — see `gemma4_vision_is_validated`.
+            descriptor.capabilities.supports_vision =
+                mm.vision.is_some() && gemma4_vision_is_validated();
+            descriptor.capabilities.supports_audio = mm.audio.is_some();
+            mm.audio.is_some().then(|| Gemma4Runtime {
+                mm,
+                dtype,
+                device: device.clone(),
+            })
+        } else {
+            None
+        };
+
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
         let (template, supports_thinking, supports_tools) = load_chat_template(dir);
@@ -447,6 +604,7 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision,
+            gemma4,
         })
     }
 
@@ -489,6 +647,9 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
+            // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
+            // and llama.cpp GGUFs carry no vision embedder / audio projector tensors.
+            gemma4: None,
         })
     }
 
@@ -508,6 +669,7 @@ impl LlamaProvider {
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision: None,
+            gemma4: None,
         }
     }
 
@@ -518,6 +680,155 @@ impl LlamaProvider {
     /// tokenized prompt (one `image_token_id` per image; one `video_token_id` per frame from the
     /// Text–Timestamp-Alignment placeholders). `messages` is the *original* (un-substituted)
     /// conversation, walked to recover the visual order.
+    /// Build Gemma 4's multimodal prefill: encode every image and audio clip in **document order**,
+    /// expand the rendered `<|image|>` / `<|audio|>` markers into their framed soft-token spans, and
+    /// splice the feature rows onto the matching placeholder positions.
+    ///
+    /// Simpler than the Qwen-VL path in every dimension that matters here: no ViT, no M-RoPE, no
+    /// DeepStack. The spans are ordinary positions in a causal 1-D sequence, so the continuation
+    /// needs no position shift.
+    fn prepare_gemma4(
+        &self,
+        prompt_ids: &[i32],
+        messages: &[Message],
+    ) -> CoreResult<Gemma4Prefill> {
+        let rt = self.gemma4.as_ref().ok_or_else(|| {
+            CoreError::Load("gemma 4: provider has no multimodal front-end".into())
+        })?;
+        let cfg = &rt.mm.cfg;
+
+        // Images: one feature block and one soft-token count per image, in document order.
+        let images = collect_images(messages);
+        let mut image_feats: Vec<Tensor> = Vec::with_capacity(images.len());
+        let mut image_counts: Vec<usize> = Vec::with_capacity(images.len());
+        if !images.is_empty() {
+            let tower = rt.mm.vision.as_ref().ok_or_else(|| {
+                CoreError::Unsupported(
+                    "[candle-llama] Gemma 4: this checkpoint ships no vision embedder, so it \
+                     cannot be conditioned on an image"
+                        .to_string(),
+                )
+            })?;
+            let vcfg = tower.config().clone();
+            for img in &images {
+                let (gh, gw) = gemma4_mm::soft_token_grid(
+                    img.width as usize,
+                    img.height as usize,
+                    vcfg.max_soft_tokens,
+                );
+                let (tw, th) = (gw * vcfg.patch_pixels, gh * vcfg.patch_pixels);
+                // Resize to an exact patch multiple through the PIL-matching bicubic path, then
+                // patchify. `resample: 3` in the shipped processor config is PIL BICUBIC.
+                // NOTE the argument order: `resize_bicubic_u8` takes HEIGHT before WIDTH, and
+                // returns f32 samples still on the 0..255 scale (the rescale to 0..1 happens in
+                // `patchify`). Passing width first would transpose every non-square image.
+                let resized = crate::image::resize_bicubic_u8(
+                    &img.pixels,
+                    img.height as usize,
+                    img.width as usize,
+                    th,
+                    tw,
+                )
+                .map_err(to_core)?;
+                let flat =
+                    gemma4_mm::patchify(&resized, tw, th, vcfg.patch_pixels).map_err(to_core)?;
+                let patches =
+                    gemma4_mm::patch_tensor(&flat, vcfg.patch_elems(), &rt.device, rt.dtype)
+                        .map_err(to_core)?;
+                let feats = tower.forward(&patches, (gh, gw)).map_err(to_core)?;
+                image_counts.push(gh * gw);
+                image_feats.push(feats);
+            }
+        }
+
+        // Audio: one feature block and one soft-token count per clip, in document order.
+        let clips = collect_audio(messages);
+        let mut audio_feats: Vec<Tensor> = Vec::with_capacity(clips.len());
+        let mut audio_counts: Vec<usize> = Vec::with_capacity(clips.len());
+        if !clips.is_empty() {
+            let proj = rt.mm.audio.as_ref().ok_or_else(|| {
+                CoreError::Unsupported(
+                    "[candle-llama] Gemma 4: this checkpoint ships no audio projector, so it \
+                     cannot be conditioned on audio"
+                        .to_string(),
+                )
+            })?;
+            let acfg = proj.config().clone();
+            for clip in &clips {
+                // The projector's framing is defined in samples at a fixed rate; resampling behind
+                // the caller's back would silently change what the model hears.
+                if clip.sample_rate != acfg.sample_rate {
+                    return Err(CoreError::InvalidRequest(format!(
+                        "[candle-llama] Gemma 4 audio expects {} Hz mono PCM, got {} Hz; resample \
+                         before sending",
+                        acfg.sample_rate, clip.sample_rate
+                    )));
+                }
+                let framed = gemma4_mm::audio_frames(
+                    &clip.samples,
+                    acfg.samples_per_token,
+                    acfg.max_soft_tokens,
+                )
+                .map_err(to_core)?;
+                let frames =
+                    gemma4_mm::frame_tensor(&framed, acfg.samples_per_token, &rt.device, rt.dtype)
+                        .map_err(to_core)?;
+                let feats = proj.forward(&frames).map_err(to_core)?;
+                audio_counts.push(framed.len() / acfg.samples_per_token);
+                audio_feats.push(feats);
+            }
+        }
+
+        // Expand each marker into `begin` + count soft tokens + `end`. Images first, then audio;
+        // each pass touches only its own marker id, so interleaved order is preserved.
+        let expanded = gemma4_mm::expand_framed_placeholders(
+            prompt_ids,
+            cfg.image_token_id,
+            cfg.boi_token_id,
+            cfg.eoi_token_id,
+            &image_counts,
+        )
+        .map_err(to_core)?;
+        let expanded = gemma4_mm::expand_framed_placeholders(
+            &expanded,
+            cfg.audio_token_id,
+            cfg.boa_token_id,
+            cfg.eoa_token_id,
+            &audio_counts,
+        )
+        .map_err(to_core)?;
+
+        // Splice. Each modality is placed on its own token id, so the two calls cannot collide.
+        let model = match &self.model {
+            Decoder::Causal(m) => m,
+            Decoder::Qwen35(_) => {
+                return Err(CoreError::Load(
+                    "gemma 4: the multimodal path requires the generic causal decoder".into(),
+                ))
+            }
+        };
+        let mut embeds = model
+            .embed_input_ids(&input_ids(&expanded, &rt.device).map_err(to_core)?)
+            .map_err(to_core)?;
+        if !image_feats.is_empty() {
+            let all = gemma4_mm::concat_features(&image_feats).map_err(to_core)?;
+            embeds = model
+                .splice_vision_features(&embeds, &expanded, &all, &[cfg.image_token_id])
+                .map_err(to_core)?;
+        }
+        if !audio_feats.is_empty() {
+            let all = gemma4_mm::concat_features(&audio_feats).map_err(to_core)?;
+            embeds = model
+                .splice_vision_features(&embeds, &expanded, &all, &[cfg.audio_token_id])
+                .map_err(to_core)?;
+        }
+
+        Ok(Gemma4Prefill {
+            expanded_ids: expanded,
+            embeds,
+        })
+    }
+
     fn prepare_multimodal(
         &self,
         prompt_ids: &[i32],
@@ -581,6 +892,16 @@ impl LlamaProvider {
                         push_deepstack(deepstack)?;
                     }
                     Content::Text(_) => {}
+                    // Rejected by `validate` long before here: this provider reports
+                    // `supports_audio=false` for every Qwen-VL checkpoint. Refuse rather than skip,
+                    // so a broken gate cannot answer an audio question from the text alone.
+                    Content::Audio(_) => {
+                        return Err(CoreError::Unsupported(
+                            "[candle-llama] the Qwen-VL prefill carries no audio; an audio block \
+                             reached it, which the capability gate should have rejected"
+                                .to_string(),
+                        ))
+                    }
                 }
             }
         }
@@ -656,6 +977,12 @@ impl ConstraintMask for JsonMask<'_> {
 ///   `tools` section and the model emits parseable `<tool_call>` blocks (story 7636). Covers the
 ///   Qwen3.6 XML and the Qwen2.5/Hermes JSON tool templates alike.
 fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+    // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
+    if let Some(t) = sidecar_chat_template(dir) {
+        let supports_thinking = t.source().contains("enable_thinking");
+        let supports_tools = t.source().contains("tool_call");
+        return (Box::new(t), supports_thinking, supports_tools);
+    }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
@@ -664,6 +991,46 @@ fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
         }
         Err(_) => (Box::new(Llama3Template), false, false),
     }
+}
+
+/// The modern HF layout ships the chat template as a **separate `chat_template.jinja`** beside
+/// `tokenizer_config.json` rather than inside it (transformers writes it that way for newer
+/// releases — `google/gemma-4-12B-it` is one, and its `tokenizer_config.json` carries no
+/// `chat_template` key at all).
+///
+/// Reading only the embedded key means such a snapshot silently falls back to the typed Llama-3
+/// default: the prompt still renders, the model still generates, and every assertion about shapes
+/// and lengths still passes — it just answers badly, because it is being addressed in a chat format
+/// it was never trained on. Prefer the sidecar file, then the embedded key, then the default.
+///
+/// BOS/EOS still come from `tokenizer_config.json`; the sidecar carries only the template body.
+fn sidecar_chat_template(dir: &Path) -> Option<JinjaChatTemplate> {
+    let source = std::fs::read_to_string(dir.join("chat_template.jinja")).ok()?;
+    if source.trim().is_empty() {
+        return None;
+    }
+    let (bos, eos) = tokenizer_special_tokens(dir);
+    Some(JinjaChatTemplate::with_tokens(source, bos, eos))
+}
+
+/// `(bos_token, eos_token)` strings from `tokenizer_config.json`, empty when absent. Each may be a
+/// bare string or an `AddedToken` object carrying `content`.
+fn tokenizer_special_tokens(dir: &Path) -> (String, String) {
+    let Some(v) = read_json(dir, "tokenizer_config.json") else {
+        return (String::new(), String::new());
+    };
+    let token = |key: &str| -> String {
+        match v.get(key) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Object(o)) => o
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        }
+    };
+    (token("bos_token"), token("eos_token"))
 }
 
 /// Pick a chat template for a GGUF load: a sibling `tokenizer_config.json` first, then the GGUF's
@@ -773,9 +1140,18 @@ impl TextLlm for LlamaProvider {
             None => (Vec::new(), Vec::new()),
         };
         let multimodal = !images.is_empty() || !videos.is_empty();
+        // Gemma 4 multimodal (sc-18772): its own marker substitution and prefill, taken whenever
+        // this is a Gemma 4 checkpoint with front-ends AND the request actually carries a visual or
+        // a clip. `validate` has already rejected a modality this checkpoint does not ship.
+        let gemma4_mm_request = self.gemma4.is_some()
+            && (!collect_images(&req.messages).is_empty()
+                || !collect_audio(&req.messages).is_empty());
         let substituted;
-        let messages: &[Message] = if multimodal {
-            substituted = substitute_vision_placeholders(&req.messages, temporal_patch);
+        let messages: &[Message] = if gemma4_mm_request {
+            substituted = substitute_gemma4_placeholders(&req.messages)?;
+            &substituted
+        } else if multimodal {
+            substituted = substitute_vision_placeholders(&req.messages, temporal_patch)?;
             &substituted
         } else {
             &req.messages
@@ -802,14 +1178,20 @@ impl TextLlm for LlamaProvider {
 
         // Encode + splice the visuals and compute M-RoPE positions (the placeholder-expanded prompt
         // becomes the effective sequence). `None` on the text-only path.
-        let mm = if multimodal {
+        let mm = if multimodal && !gemma4_mm_request {
             Some(self.prepare_multimodal(&prompt_ids, &req.messages)?)
+        } else {
+            None
+        };
+        let g4 = if gemma4_mm_request {
+            Some(self.prepare_gemma4(&prompt_ids, &req.messages)?)
         } else {
             None
         };
         let prompt_len = mm
             .as_ref()
             .map(|m| m.expanded_ids.len())
+            .or_else(|| g4.as_ref().map(|m| m.expanded_ids.len()))
             .unwrap_or(prompt_ids.len());
 
         let config = GenerationConfig {
@@ -978,15 +1360,47 @@ impl TextLlm for LlamaProvider {
                     )
                     .map_err(to_core)?
                 }
-                None => generate_with(
-                    &self.model,
-                    &prompt_ids,
-                    &config,
-                    &req.cancel,
-                    &mut sink,
-                    constraint,
-                )
-                .map_err(to_core)?,
+                // Gemma 4 multimodal: prefill the spliced embeds on ordinary causal 1-D positions
+                // (no M-RoPE, so no position shift for the continuation), then decode through the
+                // shared loop against the unwrapped decoder.
+                None => match &g4 {
+                    Some(m) => {
+                        let model = match &self.model {
+                            Decoder::Causal(c) => c,
+                            Decoder::Qwen35(_) => {
+                                return Err(CoreError::Load(
+                                    "gemma 4: the multimodal path requires the generic causal \
+                                     decoder"
+                                        .into(),
+                                ))
+                            }
+                        };
+                        let mut cache = model.make_cache();
+                        let first = model
+                            .decode_logits_from_embeds(&m.embeds, &mut *cache, 0)
+                            .map_err(to_core)?;
+                        generate_from_prefill(
+                            &self.model,
+                            &mut *cache,
+                            first,
+                            m.expanded_ids.clone(),
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                        )
+                        .map_err(to_core)?
+                    }
+                    None => generate_with(
+                        &self.model,
+                        &prompt_ids,
+                        &config,
+                        &req.cancel,
+                        &mut sink,
+                        constraint,
+                    )
+                    .map_err(to_core)?,
+                },
             }
         };
 
@@ -1085,6 +1499,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             supports_vision: false,
             // Text-only candle-llama accepts no video content.
             supports_video: false,
+            // Weightless default: conservative. The load path flips this on for a Gemma 4
+            // checkpoint that actually ships an audio projector (sc-18772).
+            supports_audio: false,
             // No controllable reasoning mode yet (a separate story); the contract requires an
             // explicit enable-thinking request to be rejected, which validate_request enforces.
             supports_thinking: false,
@@ -1201,10 +1618,80 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     // vision-capable — this provider loads its ViT tower alongside the decoder. The probe lets a
     // vision-required model-first load resolve it without reading weights.
     weightless_vision: Some(can_load_vision),
+    // Per-snapshot audio probe (sc-18772): Gemma 4 unified is the one architecture served here with
+    // an audio path, and the same registration also serves text-only checkpoints, so the static
+    // descriptor stays `supports_audio=false` and this probe carries the per-snapshot truth.
+    weightless_audio: Some(can_load_audio),
 };
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
     Ok(Box::new(LlamaProvider::load(spec)?))
+}
+
+/// Weightless per-snapshot vision probe (core-llm `weightless_vision`): does this provider serve the
+/// snapshot at `spec.source` *with* vision? True for a Qwen3.6 (`qwen3_5`) / Qwen3-VL (`qwen3_vl`)
+/// HF checkpoint carrying a `vision_config` (the ViT tower loads alongside the decoder), and for a
+/// Gemma 4 unified checkpoint carrying a `vision_config` + `image_token_id` (its encoder-free vision
+/// embedder loads alongside the decoder, sc-18772). Reads only `config.json` — never a weight shard.
+/// GGUF is declined (candle's GGUF path is dense text-only).
+pub fn can_load_vision(spec: &LoadSpec) -> bool {
+    let Some(v) = probe_config(spec) else {
+        return false;
+    };
+    let qwen_vl = v.get("vision_config").is_some()
+        && matches!(
+            Architecture::from_config(&v),
+            Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl)
+        );
+    // Gemma 4 is deliberately absent: its vision path is loaded but unvalidated and therefore
+    // unadvertised (see `gemma4_vision_is_validated`). The probe must agree with the loaded
+    // descriptor, or a model-first vision-required load would resolve here and then be rejected.
+    qwen_vl
+}
+
+/// Weightless per-snapshot **audio** probe (core-llm `weightless_audio`, sc-18772): does this
+/// provider serve the snapshot at `spec.source` *with* audio? Gemma 4 unified is the only
+/// architecture served here that has an audio path; like vision it is per-snapshot, so the static
+/// descriptor stays `supports_audio=false` and this probe is what lets a model-first audio-required
+/// load resolve here. Reads only `config.json`; GGUF is declined (dense text-only).
+pub fn can_load_audio(spec: &LoadSpec) -> bool {
+    let Some(v) = probe_config(spec) else {
+        return false;
+    };
+    gemma4_multimodal(&v, "audio_config", "audio_token_id")
+}
+
+/// Read and parse a snapshot's `config.json` for a weightless probe, or `None` when the source is a
+/// GGUF path (no `config.json`, and candle's GGUF path is dense text-only) or is unreadable.
+fn probe_config(spec: &LoadSpec) -> Option<serde_json::Value> {
+    if crate::gguf::is_gguf_path(&spec.source) {
+        return None;
+    }
+    let dir = Path::new(&spec.source);
+    let path = if dir.is_dir() {
+        dir.join("config.json")
+    } else {
+        dir.to_path_buf()
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()
+}
+
+/// Whether `v` is a Gemma 4 checkpoint declaring the named front-end block (`vision_config` /
+/// `audio_config`) **and** the token id that front-end splices at.
+///
+/// The token-id check is not redundant with the block: a config carrying a `vision_config` but no
+/// `image_token_id` has no row to splice image features into, so advertising vision for it would be
+/// exactly the advertised-but-absent case. The load path refuses such a config for the same reason,
+/// which keeps probe and loader agreeing.
+fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> bool {
+    if v.get(block).is_none() {
+        return false;
+    }
+    if !matches!(Architecture::from_config(v), Ok(a) if a.is_gemma4()) {
+        return false;
+    }
+    v.get(token_key).and_then(|x| x.as_i64()).is_some()
 }
 
 /// Weightless model-first probe (story 7406): can the `candle-llama` provider serve the model at
@@ -1213,43 +1700,17 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 /// For a `*.gguf` file this reads **only** the GGUF header/metadata (never a tensor block, via
 /// [`gguf_architecture`](crate::gguf::gguf_architecture)) and accepts it iff its `general.architecture`
 /// is one the native GGUF loader can reconstruct ([`gguf_arch_to_hf`](crate::gguf::gguf_arch_to_hf):
-/// `llama`/`mistral` and `qwen3`); an unsupported or non-LLM GGUF (`bert`, a `clip` mmproj, …) is
-/// declined so `load_for_model` returns a clean `Unsupported` rather than routing it here to fail at
-/// load (story 7420, replacing the earlier extension-only accept).
+/// `llama`/`mistral`, `qwen3`, and `gemma4`); an unsupported or non-LLM GGUF (`bert`, a `clip`
+/// mmproj, …) is declined so `load_for_model` returns a clean `Unsupported` rather than routing it
+/// here to fail at load (story 7420, replacing the earlier extension-only accept).
 ///
 /// Otherwise this reads **only** `config.json` and runs the same [`Architecture::from_config`] dispatch
-/// the loader uses (Llama / Mistral / Qwen2 / Qwen3 / Qwen2-MoE / Gemma2 / GLM-4 / DeepSeek-V2 / Phi-3)
-/// — it never opens a safetensors shard, so `core-llm`'s `load_for_model` can resolve a provider by
-/// model without loading weights. A multimodal snapshot (a `vision_config` block — including a VLM
-/// whose `model_type` substring-matches a text family, e.g. `mllama`) is declined so the vision
-/// provider claims it instead.
-/// Weightless per-snapshot vision probe (core-llm `weightless_vision`): does this provider serve the
-/// snapshot at `spec.source` *with* vision? True for a Qwen3.6 (`qwen3_5`) / Qwen3-VL (`qwen3_vl`)
-/// HF checkpoint carrying a `vision_config` (the ViT tower loads alongside the decoder). Reads only
-/// `config.json` — never a weight shard. GGUF is declined (candle's GGUF path is dense text-only).
-pub fn can_load_vision(spec: &LoadSpec) -> bool {
-    if crate::gguf::is_gguf_path(&spec.source) {
-        return false;
-    }
-    let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() {
-        dir.join("config.json")
-    } else {
-        dir.to_path_buf()
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    v.get("vision_config").is_some()
-        && matches!(
-            Architecture::from_config(&v),
-            Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl)
-        )
-}
-
+/// the loader uses (Llama / Mistral / Qwen2 / Qwen3 / Qwen2-MoE / Gemma2 / Gemma 4 / GLM-4 /
+/// DeepSeek-V2 / Phi-3) — it never opens a safetensors shard, so `core-llm`'s `load_for_model` can
+/// resolve a provider by model without loading weights. A multimodal snapshot (a `vision_config`
+/// block — including a VLM whose `model_type` substring-matches a text family, e.g. `mllama`) is
+/// declined so the vision provider claims it instead, **except** the families this provider serves
+/// end-to-end: Qwen3.6, Qwen3-VL, and Gemma 4 unified.
 pub fn can_load(spec: &LoadSpec) -> bool {
     if crate::gguf::is_gguf_path(&spec.source) {
         // Confirm the GGUF's architecture from its header alone (weightless) — accept iff the loader
@@ -1273,13 +1734,15 @@ pub fn can_load(spec: &LoadSpec) -> bool {
         return false;
     };
     // A multimodal snapshot (a `vision_config` block) is normally declined so a vision provider claims
-    // it — EXCEPT Qwen3.6 (`qwen3_5`) and Qwen3-VL (`qwen3_vl`), which this provider serves directly:
-    // their 27B/35B / 8B checkpoints are VLM-wrapped, but this provider carries the matching ViT tower
-    // (the decoder + vision both load here). So a `vision_config` config is declined only when it is
-    // neither qwen3_5 nor qwen3_vl.
+    // it — EXCEPT the families this provider serves directly: Qwen3.6 (`qwen3_5`) and Qwen3-VL
+    // (`qwen3_vl`), whose checkpoints are VLM-wrapped but whose matching ViT tower loads here, and
+    // Gemma 4 unified, whose encoder-free vision embedder and audio projector likewise load here
+    // (sc-18772). Gemma 4 is the reason this is not a Qwen-only list: `google/gemma-4-12B-it` carries
+    // a `vision_config`, so the old rule declined the general-purpose Gemma 4 LLM outright.
     let arch = Architecture::from_config(&v);
-    let serves_vision = matches!(arch, Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl));
-    if v.get("vision_config").is_some() && !serves_vision {
+    let serves_multimodal = matches!(arch, Ok(Architecture::Qwen35) | Ok(Architecture::Qwen3Vl))
+        || matches!(arch, Ok(a) if a.is_gemma4());
+    if v.get("vision_config").is_some() && !serves_multimodal {
         return false;
     }
     arch.is_ok()

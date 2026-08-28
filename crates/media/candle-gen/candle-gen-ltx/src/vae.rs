@@ -124,7 +124,7 @@ const DECODER_BLOCKS: [DBlock; 9] = [
 ];
 
 /// `(B, C·p², F, H, W) -> (B, C, F, H·p, W·p)` (spatial-only unpatchify, patch_size_t = 1).
-fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c_packed, f, h, w) = x.dims5()?;
     let c = c_packed / (p * p);
     // (B, C, 1, p, p, F, H, W) -> transpose (0,1,5,2,6,4,7,3) -> (B, C, F, H·p, W·p).
@@ -134,7 +134,7 @@ fn unpatchify(x: &Tensor, p: usize) -> Result<Tensor> {
 }
 
 /// Spatial-only patchify (`patch_size_t = 1`) used at the encoder input.
-fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
+pub(crate) fn patchify(x: &Tensor, p: usize) -> Result<Tensor> {
     let (b, c, f, h, w) = x.dims5()?;
     if h % p != 0 || w % p != 0 {
         return Err(candle_gen::candle_core::Error::Msg(format!(
@@ -756,6 +756,105 @@ fn plan_ltx_tiling(
 mod budget_tests {
     use super::*;
 
+    /// This file's own source, for the route guard below.
+    const VAE_SRC: &str = include_str!("vae.rs");
+
+    /// The body of one `fn` in [`VAE_SRC`], from its signature to the matching `}`.
+    fn fn_body(name: &str) -> &'static str {
+        let start = VAE_SRC
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("vae.rs no longer defines `fn {name}`"));
+        let open = VAE_SRC[start..]
+            .find('{')
+            .expect("a fn signature is followed by its body");
+        let rest = &VAE_SRC[start + open..];
+        let mut depth = 0usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces while slicing `fn {name}`");
+    }
+
+    /// sc-18799 AC1 — the **conv** decode must still route through [`auto_tiling_budgeted_ltx`],
+    /// unchanged by the DiffVAE getting a budgeted selector of its own.
+    ///
+    /// Asserted on the ROUTE, not on an output: an output-level check would look identical whether
+    /// the tiling came from the conv selector or from a "unified" one, because on a machine with
+    /// headroom both would answer `None` and both decodes would be the same picture. What must not
+    /// change is *which selector the call site names* — so this reads the call site.
+    #[test]
+    fn conv_decode_budgeted_still_selects_through_auto_tiling_budgeted_ltx() {
+        let body = fn_body("decode_budgeted");
+        assert!(
+            body.contains("match auto_tiling_budgeted_ltx(out_h, out_w, out_f)?"),
+            "the conv decode's auto-tiling arm no longer calls `auto_tiling_budgeted_ltx` with the \
+             conv output dims — sc-18799 budgets the DiffVAE, it does not re-route the conv \
+             decoder:\n{body}"
+        );
+        for foreign in ["diff_vae", "DiffVae", "budget::", "auto_diffvae"] {
+            assert!(
+                !body.contains(foreign),
+                "the conv decode route now mentions `{foreign}` — the DiffVAE selector must not \
+                 reach the conv decoder:\n{body}"
+            );
+        }
+    }
+
+    /// The other half of the same guard: the conv selector still answers from the **conv** candidate
+    /// grid. A rewrite that pointed it at the DiffVAE's three-axis stage-4 grid would keep the call
+    /// site's name and still be the regression this AC is about.
+    #[test]
+    fn the_conv_selector_still_answers_from_the_conv_candidate_grid() {
+        // Sweep the budget down a long clip so both halves of the conv grid are asked their
+        // question: every spatial edge selected must come from the conv list at overlap 64, and at
+        // least one budget must be tight enough to select a conv temporal tile.
+        let mut spatial_seen = 0usize;
+        let mut temporal_seen = 0usize;
+        for &safe_gib in &[40.0_f64, 32.0, 28.0, 26.0, 25.0] {
+            let Ok(Some(plan)) = plan_ltx_tiling(720, 1280, 241, safe_gib) else {
+                continue;
+            };
+            if let Some(spatial) = plan.spatial {
+                spatial_seen += 1;
+                assert!(
+                    LTX_VAE_SPATIAL_PX.contains(&spatial.tile_px),
+                    "conv spatial edge {} at {safe_gib} GiB is not one of the conv candidates \
+                     {LTX_VAE_SPATIAL_PX:?}",
+                    spatial.tile_px
+                );
+                assert_eq!(
+                    spatial.overlap_px, 64,
+                    "the conv selector's spatial overlap is 64 px"
+                );
+            }
+            if let Some(temporal) = plan.temporal {
+                temporal_seen += 1;
+                assert!(
+                    LTX_VAE_TEMPORAL_FR
+                        .iter()
+                        .any(|&(tile, _)| tile == temporal.tile_frames),
+                    "conv temporal tile {} at {safe_gib} GiB is not one of the conv candidates \
+                     {LTX_VAE_TEMPORAL_FR:?}",
+                    temporal.tile_frames
+                );
+            }
+        }
+        assert!(
+            spatial_seen > 0 && temporal_seen > 0,
+            "the sweep never exercised both conv axes (spatial {spatial_seen}, temporal \
+             {temporal_seen}) — the identity claim is untested"
+        );
+    }
+
     #[test]
     fn public_decode_peak_is_the_planners_full_output_case() {
         let profile = conservative_video_decode_memory_profile(64, 64, 9).unwrap();
@@ -913,7 +1012,8 @@ mod budget_tests {
     /// anchors (RTX PRO 6000 Blackwell, sm_120, f32) it was fit from — `estimated ≥ measured` for every
     /// anchor (never under-predict ⇒ the selector never OKs a tile that OOMs), and not absurdly over
     /// (≤ 2.5×). Regenerate the anchors with `cargo test -p candle-gen-ltx --features cuda --release
-    /// --test vae_decode_sweep -- --ignored --nocapture` after a decoder or candle-allocator change.
+    /// --test integration -- vae_decode_sweep:: --ignored --nocapture` after a decoder or
+    /// candle-allocator change.
     #[test]
     fn ltx_decode_peak_matches_cuda_anchors() {
         // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_peak_gib). Single-pass ⇒ tile == out.

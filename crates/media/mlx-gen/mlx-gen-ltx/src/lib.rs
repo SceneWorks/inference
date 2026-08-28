@@ -38,18 +38,29 @@ pub(crate) fn contiguous(x: &mlx_rs::Array) -> mlx_gen::Result<mlx_rs::Array> {
 
 pub mod adapters;
 pub mod audio_vae;
+pub mod block_stream;
+pub mod bundle;
 pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod convert;
+pub mod dev_sampler;
+pub mod dfr;
+pub mod diff_vae;
+pub mod duration_head;
 pub mod enhance;
 pub mod gemma;
+pub mod gemma4_te;
+pub mod image_crf;
 pub mod memory_strategy;
+pub mod memory_strategy_2_5;
 pub mod model;
+pub mod params;
 pub mod pipeline;
 pub mod positions;
 pub mod rope;
 pub mod text_encoder;
+pub mod tiers;
 pub mod tokenizer;
 pub mod training;
 pub mod transformer;
@@ -57,18 +68,36 @@ pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
-pub use adapters::{apply_ltx_adapters, LtxLoraReport};
+pub use adapters::{apply_ltx25_adapters, apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
+pub use bundle::{
+    assert_gemma_version, declared_layout, declared_model_version, resolve_split_bundle,
+    split_component_ids, text_encoder_identity,
+};
 pub use conditioning::{
     append_keyframe_clip, apply_conditioning, apply_denoise_mask, apply_keyframes,
     keyframe_append_positions, patchify_grid, unpatchify_grid, I2vConditioning, Keyframe,
     VideoTokenState,
 };
-pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
+pub use config::{AudioVaeConfig, LatentLogVar, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
-pub use convert::{convert_and_assemble, LtxConvertOpts};
+pub use convert::{convert_and_assemble, convert_vae_components, LtxConvertOpts};
+pub use dev_sampler::TransformerVariant;
+pub use diff_vae::{
+    auto_diffvae_tiling_budgeted_ltx, DiffVaeMode, DiffVaeTiling, HostNaSupport, ModelOutputType,
+    NaDiffusionDecoder, NaDiffusionDecoderConfig, NaKind, DIFFUSION_DECODER_COMPONENT,
+};
+pub use duration_head::DurationHead;
 pub use enhance::{clean_response, EnhanceConfig, SampleParams};
-pub use model::{apply_replacement_mask, descriptor, load, Ltx, MODEL_ID, SIZE_MULTIPLE};
+pub use gemma4_te::{materialize_in_batches, Ltx25TextEncoder};
+pub use image_crf::{condition_image_for_checkpoint, default_image_recompress};
+pub use model::{
+    apply_replacement_mask, descriptor, descriptor_25, load, load_25, Ltx, Ltx25, MODEL_25_ID,
+    MODEL_ID, SIZE_MULTIPLE,
+};
+pub use params::{
+    resolve_generation_params, GuiderParams, LtxGenerationParams, LTX_2_3_PARAMS, LTX_2_5_PARAMS,
+};
 pub use pipeline::{
     decode_audio_track, decode_to_frames, denoise, denoise_av, denoise_av_tokens,
     generate_av_latents, generate_av_latents_iclora, generate_i2v_latents, generate_t2v,
@@ -76,11 +105,15 @@ pub use pipeline::{
     StageKeyframe, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
+pub use tiers::{
+    convert_2_5_tier, convert_2_5_tiers, DenseReason, LtxTier, LtxTierComponentReport,
+    LtxTierReport,
+};
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config
 // so `mlx_gen_ltx::tiling::*` / `mlx_gen_ltx::TilingConfig` keep resolving for existing callers.
 pub use config::{VocoderConfig, VocoderGenConfig};
 pub use mlx_gen::tiling::{self, TilingConfig};
-pub use tokenizer::LtxTokenizer;
+pub use tokenizer::{Ltx25Tokenizer, LtxTokenizer};
 pub use training::{load_trainer, LtxTrainer};
 pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
@@ -124,6 +157,7 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::REGISTRATION)
+        .register_generator(model::REGISTRATION_25)
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
             provider_id: MODEL_ID,
@@ -132,6 +166,7 @@ pub fn register_providers(
         })
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_trainer(training::TRAINER_REGISTRATION)
+        .register_trainer(training::TRAINER_REGISTRATION_25)
 }
 
 /// Build the complete explicit MLX LTX provider catalog.
@@ -141,7 +176,7 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 /// Resolve the load-bearing VAE geometry for an MLX LTX generator id.
 pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
-    (provider_id == MODEL_ID).then_some(VAE_TILING)
+    (provider_id == MODEL_ID || provider_id == MODEL_25_ID).then_some(VAE_TILING)
 }
 
 /// Resolve the provider-owned conservative VAE decode working-set peak for an LTX generator id.
@@ -235,8 +270,8 @@ mod explicit_registry_tests {
             .map(|registration| (registration.descriptor)().id.to_string())
             .collect();
 
-        assert_eq!(explicit_generators, ["ltx_2_3"]);
-        assert_eq!(explicit_trainers, ["ltx_2_3"]);
+        assert_eq!(explicit_generators, ["ltx_2_3", "ltx_2_5"]);
+        assert_eq!(explicit_trainers, ["ltx_2_3", "ltx_2_5"]);
     }
 
     #[test]

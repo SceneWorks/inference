@@ -96,7 +96,7 @@ Each script writes into `tools/golden/` next to itself (paths are `__file__`-rel
 works from any checkout/worktree). Run the matching `#[ignore]`d test with, e.g.:
 
 ```sh
-cargo test -p mlx-gen-z-image --release --test e2e_real_weights -- --ignored --nocapture
+cargo test -p mlx-gen-z-image --release --test integration -- e2e_real_weights:: --ignored --nocapture
 ```
 
 Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the model weights in
@@ -132,19 +132,33 @@ export HYPER_LORA="$("$REF_HF" download ByteDance/Hyper-SD \
   --revision bc08d970a87c74c71209491d64e3525845698863)"
 
 # Reference goldens. Keep the 512² base and adapter configurations identical.
-ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
   ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_golden.py"
-ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--Tongyi-MAI--Z-Image-Turbo/snapshots/f332072aa78be7aecdf3ee76d5c247082da564a6" \
+ZIMAGE_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--z-image-turbo-mlx/snapshots/bb2bc9893b3c49ae96c813350775f791a2e8bc80/bf16" \
   ZIMAGE_W=512 ZIMAGE_H=512 "$REF_PY" "$TOOLS/dump_z_image_adapter_golden.py"
 
 QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
   QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
   QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
   QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_image_golden.py"
+# Qwen adapters are intentionally one kind per process. Record both the adapter-only and
+# adapter-plus-decoded-golden producers so each manifest source command is reproducible.
 QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
   QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
   QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
-  QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+  QWEN_ADAPTER_KIND=lora BUILD_ADAPTERS_ONLY=1 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lora QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lokr BUILD_ADAPTERS_ONLY=1 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
+QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx \
+  QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf \
+  QWEN_REFERENCE_MODEL="$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16" \
+  QWEN_ADAPTER_KIND=lokr QWEN_W=512 QWEN_H=512 "$REF_PY" "$TOOLS/dump_qwen_adapter_golden.py"
 
 FLUX_DEV="$HF_MODELS_ROOT/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21" \
   "$REF_PY" "$TOOLS/dump_hyper_flux_golden.py"
@@ -156,8 +170,14 @@ FLUX_DEV="$HF_MODELS_ROOT/models--black-forest-labs--FLUX.1-dev/snapshots/3de623
 # are not inherited), captures real argv/env, stdout/stderr/return codes plus
 # rustc/cargo/platform/hardware identity, and checks artifact/model/source
 # identities before and after. It rejects a zero-test cargo result because each
-# run must emit its one structured SC15505_RESULT line.
+# run must emit its one structured SC15505_RESULT line. Record every sealed mode in
+# this order, without overlap. After the three writes, update the six transcript/receipt
+# sizes and hashes in the manifest before the two verifier commands.
+python3 "$TOOLS/record_adapter_parity_transcript.py" --residual-diagnostic
+python3 "$TOOLS/record_adapter_parity_transcript.py" --qwen-effect-diagnostic
 python3 "$TOOLS/record_adapter_parity_transcript.py"
+python3 "$TOOLS/verify_adapter_parity_artifacts.py" --diagnose-result-measurements
+python3 "$TOOLS/verify_adapter_parity_artifacts.py"
 ```
 
 The scripts reject a dirty/index-modified or source-augmented frozen fork, the wrong Git remote,
@@ -176,13 +196,14 @@ python3 "$TOOLS/record_adapter_parity_transcript.py" --residual-diagnostic
 
 That exact, sanitized runner records `(Rust adapted - Rust base)` versus
 `(fork adapted - fork base)` and compares it with the dropped-adapter control (a zero Rust
-residual). It writes only the ignored diagnostic transcript and never the durable receipt. A final
+residual). It writes its own ignored diagnostic transcript and dedicated diagnostic receipt, never
+the acceptance receipt. A final
 residual cap may be locked only after the adapted residual is measured below the zero-residual
 control; the reviewed rule is their integer midpoint. If there is no separation, the parity claim
 must be reframed instead of forcing a passing cap.
 
-The retained residual diagnostic separated Z LoRA (15,692 adapted vs 26,587 zero control) and
-Z LoKr (15,476 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
+The retained residual diagnostic separated Z LoRA (12,940 adapted vs 26,587 zero control) and
+Z LoKr (14,028 vs 40,120), but rejected Qwen LoRA (63,030 vs 43,903) and Qwen LoKr
 (69,111 vs 50,446): both Qwen adapted residual errors were worse than the dropped-adapter
 control. Qwen therefore keeps the original floor-relative fork gate
 `adapted_px_gt8 <= 2 * base_floor + rgb_samples / 200` and uses a separate same-runtime effect
@@ -194,23 +215,33 @@ python3 "$TOOLS/record_adapter_parity_transcript.py" --qwen-effect-diagnostic
 
 This dedicated diagnostic records active-adapter-vs-base px>8, scale-zero byte differences, exact
 applied-module count (LoRA 24; LoKr 21), empty unmatched-path count, and RGB sample count. It has a
-fixed schema and output path and, like the residual diagnostic, cannot write the acceptance
-transcript or receipt. The retained measurement is LoRA effect 44,799 (minimum 22,399) and LoKr
+fixed schema and output path and cannot write the acceptance transcript or its receipt. It writes
+its own path-redacted diagnostic receipt, which the manifest and verifier seal separately from
+acceptance. The retained measurement is LoRA effect 44,799 (minimum 22,399) and LoKr
 effect 39,409 (minimum 19,704), each over 786,432 RGB samples; both scale-zero counts are 0 and
 their apply reports are exactly 24/21 applied with no unmatched paths. The fixed minimum is
 `measured_effect_samples_gt8 / 2`, so dropping/inerting an adapter produces zero and turns the
 effect clause red while the separate floor-relative clause continues to constrain fork parity.
 
 After recording, update the manifest with the measured `SC15505_RESULT` values plus every
-artifact/transcript size and SHA-256, then run
+artifact/transcript/receipt size and SHA-256, then first compare the acceptance and Qwen-effect
+maps without rehashing model inputs:
+
+```sh
+python3 "$TOOLS/verify_adapter_parity_artifacts.py" --diagnose-result-measurements
+```
+
+It exits nonzero and prints exact JSON paths with expected/actual values when a stale manifest
+field differs from recorder output. Once that map is empty, run
 `python3 "$TOOLS/verify_adapter_parity_artifacts.py"`. That final verifier cross-checks the
 safetensors metadata, model inventories, exact artifact hashes, and retained cargo output. The
-binaries and raw transcript remain uncommitted. The recorder also emits the committed,
-path-redacted `../adapter_parity_receipt.json`; the manifest binds both its checksum and the
-ignored raw transcript checksum, and the verifier requires the receipt to be the exact redacted
-projection of that transcript. A deliberate reference refresh must update the manifest,
-receipt, and `CHECKSUMS.txt` in the same review as any changed acceptance number; silently
-accepting a new golden is not permitted.
+binaries and raw transcripts remain uncommitted. The recorder emits one committed, path-redacted
+receipt for acceptance plus one for each diagnostic; the manifest binds all six transcript/receipt
+identities, and the verifier requires every receipt to be the exact redacted projection of its own
+transcript. Qwen acceptance and diagnostic effects are stored and verified independently, even when
+a clean run yields the same numeric value; neither record may substitute for the other. A deliberate
+reference refresh must update the manifest, all receipts, and `CHECKSUMS.txt` in the same review as
+any changed acceptance number; silently accepting a new golden is not permitted.
 
 **What the transcript binds, and what it deliberately does not (sc-17070).** `source_state()` keeps
 two different sets. The **hashed** set — `bound_source_files()` — is the Rust sources plus every
@@ -225,13 +256,12 @@ numbers. It keeps its `scripts` hash pin, which `validate_manifest` still enforc
 repairable in place. Both halves are covered by tests that do not mock `source_state`; if the verifier
 is ever renamed, `bound_source_files()` refuses rather than silently rebinding it.
 
-**The source binding is current as of the sc-17651 re-record (2026-08-04).** The frozen
-`source.files` now matches `main` at the re-record, all 11 bound entries, and the two bookkeeping
-entries that used to differ are gone: `verify_adapter_parity_artifacts.py` is no longer in the
-frozen map at all (sc-17070 narrowed `source_state()`'s hashed set before this record, so verifier
-edits no longer re-stale it), and `record_adapter_parity_transcript.py` is re-bound to its current
-bytes. `adapter_parity_receipt.json`'s `proof.source.files` is the committed, path-redacted copy of
-the frozen map, so the comparison needs no gitignored binaries:
+**A source binding is current only when its sealed transcript verifies against the worktree being
+checked.** Do not borrow the historical sc-17651 map or assert that a feature branch matches
+`main`: a current sc-21781 record binds every producer and measured Rust source byte. The verifier
+remains outside that frozen map so a checker repair does not force a licensed model run, but its
+manifest script pin still must match. `adapter_parity_receipt.json`'s `proof.source.files` is the
+committed, path-redacted copy of the frozen map, so the comparison needs no gitignored binaries:
 
 ```python
 import hashlib, json, pathlib, sys
@@ -472,6 +502,18 @@ tests; the e2e/i2v/av goldens gate the full pipeline. Several scripts also write
 | `ltx_av_e2e_golden.safetensors` | `dump_ltx_av_e2e_golden.py` | `tests/av_e2e_parity.rs` | AV e2e. |
 | `ltx_av_lora_e2e_golden.safetensors` | `dump_ltx_av_lora_e2e_golden.py` | `tests/av_lora_e2e_parity.rs` | AV e2e with LoRA (sc-2687). |
 | `ltx_vocoder_golden.safetensors` | `dump_ltx_vocoder_golden.py` | `tests/vocoder_parity.rs` | audio vocoder. |
+
+### LTX-2.5 video (`mlx-gen-ltx` + `candle-gen-ltx`, epic 18755)
+
+Dumped from **upstream** rather than the mflux fork: Lightricks/LTX-2 v1.2.0 at
+`d151147788a9284cca791edc6ce898007e727fe6`, via `tools/_ltx25_diffvae_ref.py`'s shared loader
+(`LTX2_SRC` = `packages/ltx-core/src` of that checkout). Backend-neutral by construction — every
+tensor is f32 and each fixture carries its own inputs — so `candle-gen-ltx` asserts against the same
+file by relative path instead of a second dump.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `ltx25_te_connector_golden.safetensors` | `dump_ltx25_te_connector_golden.py` | `mlx-gen-ltx` + `candle-gen-ltx` `tests/ltx_2_5_te_connector_inputs.rs` | sc-18770 LTX-2.5 text encoder → connector. Reference `LTXGemmaTextEncoder` + `EmbeddingsProcessor` (f32) on the **unquantized** `gemma4-12b-with-proj-ltx-2.5-bf16` encoder and the bf16 DiT's `{video,audio}_embeddings_connector`; needs `LTX25_TE_DIR` (the LTX-2.5 snapshot root) and `transformers>=5.8,<5.15` for `gemma4_unified`. One fixed prompt, tokenized once by the reference tokenizer at `MAX_LEN=256` (18 valid, 238 left-pad) and shipped as `input_ids`/`mask01` so neither backend re-tokenizes. Bundles `video_features` `[1,256,4096]` / `audio_features` `[1,256,2048]` (the connector **inputs**, in the tokenizer's left-padded order) and `video_embeddings`/`audio_embeddings` (the RAW connector output — register-reordered, valid rows first). `normed` (~192 MB) deliberately omitted. Bars are the 2.3 TE sibling's: `1.5e-2` on the features, `6e-2` after the connector, each asserted globally **and** over the valid rows alone. Run against the **bf16** tier, not `q8`, so tier quantization stays out of a correctness gate. Measured: `video_features 2.282e-3`, `audio_features 1.432e-3` — and the connector-output half is currently RED (`1.275e0` / `1.771e0`) on a `crate::connector` defect this golden surfaced (sc-21663); see the test's doc comment. |
 
 ### Wan-VACE video (`mlx-gen-wan`, sc-3388)
 

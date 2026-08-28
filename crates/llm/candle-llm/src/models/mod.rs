@@ -6,6 +6,7 @@
 //! `&mut dyn KvCache`.
 
 pub(crate) mod deepstack;
+pub mod gemma4_mm;
 pub mod llama;
 pub mod qwen35;
 pub mod qwen35_vision;
@@ -18,7 +19,11 @@ use crate::error::Result;
 use crate::primitives::kv_cache::KvCache;
 
 pub use deepstack::MropePositions;
-pub use llama::{shard_plan, CausalLm};
+pub use gemma4_mm::{
+    Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
+    Gemma4VisionConfig, Gemma4VisionEmbedder,
+};
+pub use llama::{shard_plan, CausalLm, RopeTables};
 pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
 pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput};
 pub use siglip::{

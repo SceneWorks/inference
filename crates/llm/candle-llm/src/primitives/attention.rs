@@ -35,7 +35,7 @@ use std::sync::Mutex;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::softmax_last_dim;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// Disallowed-attention fill for the additive mask: a large finite negative (matching the
 /// candle-gen slices — avoids `-inf` propagation through the softmax kernel).
@@ -50,6 +50,18 @@ pub enum AttnMask<'a> {
     Causal,
     /// An explicit additive mask broadcast over the score tensor (`0` keep, large-negative block).
     Additive(&'a Tensor),
+    /// **Sliding-window** causal mask (Gemma 4's `sliding_attention` layers): causal *and* limited
+    /// to the `window` most recent keys, so query `q` sees key `j` iff `0 <= q - j < window` (the
+    /// query's own position counts toward the window). Queries are bottom-right aligned over the
+    /// cached keys like [`AttnMask::Causal`], so a cached decode step attends the tail of its cache.
+    ///
+    /// Built by [`sliding_causal_mask`] and applied on the eager path; the fused FlashAttention
+    /// wrapper cannot express it, so [`sdpa`] falls back to eager for these layers.
+    SlidingCausal {
+        /// Number of most-recent keys a query may attend, inclusive of its own position. A window
+        /// `>= k_len` is exactly [`AttnMask::Causal`].
+        window: i32,
+    },
 }
 
 /// Expand grouped-query KV heads to the full query head count.
@@ -84,10 +96,104 @@ fn causal_mask(q_len: usize, k_len: usize, dtype: DType, device: &Device) -> Res
     Ok(Tensor::from_vec(data, (1, 1, q_len, k_len), device)?.to_dtype(dtype)?)
 }
 
+/// The additive **sliding-window** causal mask `[1, 1, q_len, k_len]` (`0` keep / a large finite
+/// negative to block) — Gemma 4's `sliding_attention` layers.
+///
+/// Queries are bottom-right aligned over the keys (`offset = k_len - q_len` cached positions come
+/// first), so query row `r` sits at absolute position `offset + r` and may attend key `j` iff
+/// `0 <= (offset + r) - j < window`: causal, *and* no further back than `window - 1` positions. A
+/// `window >= k_len` degenerates to the plain causal mask; a `window <= 0` is rejected rather than
+/// silently producing an all-blocked row (whose softmax is a uniform distribution over garbage).
+///
+/// Deliberately **not** routed through the single-entry causal-mask memo: that key is
+/// `(q_len, k_len, dtype, device)`, which a window would alias into. A Gemma 4 forward alternates
+/// sliding and full layers at identical `(q_len, k_len)`, so sharing the memo would hand a full
+/// layer the sliding mask.
+pub fn sliding_causal_mask(
+    q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "sliding_causal_mask: window must be positive, got {window}"
+        )));
+    }
+    let window = window as i64;
+    let offset = (k_len - q_len) as i64;
+    let mut data = vec![0f32; q_len * k_len];
+    for r in 0..q_len {
+        let pos = offset + r as i64;
+        for j in 0..k_len {
+            let delta = pos - j as i64;
+            if !(0..window).contains(&delta) {
+                data[r * k_len + j] = MASK_NEG;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(data, (1, 1, q_len, k_len), device)?.to_dtype(dtype)?)
+}
+
 /// Number of host-side [`causal_mask`] builds — lets tests pin "decode builds no mask" and "prefill
 /// builds the mask once per forward, not once per layer" (sc-12458).
 #[cfg(test)]
 static CAUSAL_MASK_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The one memoized **sliding-window** causal mask — sc-12458's memo, keyed to include the window.
+///
+/// A Gemma 4 stack has 40 `sliding_attention` layers that all ask for the identical
+/// `(q_len, k_len, window)` mask within one forward, so without a memo the host-side fill + upload
+/// in [`sliding_causal_mask`] runs 40 times per prefill. It is a **separate** entry from
+/// [`CAUSAL_MASK_CACHE`] on purpose: that key has no window field, so sharing one slot would let a
+/// `full_attention` layer collect a sliding mask (and vice versa) at the same `(q_len, k_len)` —
+/// the exact aliasing [`sliding_causal_mask`]'s doc warns about. Two slots also mean the alternating
+/// stack never thrashes a single one.
+struct SlidingMaskEntry {
+    q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: Device,
+    mask: Tensor,
+}
+
+static SLIDING_MASK_CACHE: Mutex<Option<SlidingMaskEntry>> = Mutex::new(None);
+
+/// [`sliding_causal_mask`] behind its own single-entry memo: bit-identical values (same builder),
+/// built once per distinct `(q_len, k_len, window, dtype, device)`.
+fn cached_sliding_causal_mask(
+    q_len: usize,
+    k_len: usize,
+    window: i32,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut guard = SLIDING_MASK_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(e) = guard.as_ref() {
+        if e.q_len == q_len
+            && e.k_len == k_len
+            && e.window == window
+            && e.dtype == dtype
+            && e.device.same_device(device)
+        {
+            return Ok(e.mask.clone());
+        }
+    }
+    let mask = sliding_causal_mask(q_len, k_len, window, dtype, device)?;
+    *guard = Some(SlidingMaskEntry {
+        q_len,
+        k_len,
+        window,
+        dtype,
+        device: device.clone(),
+        mask: mask.clone(),
+    });
+    Ok(mask)
+}
 
 /// The one memoized causal mask (sc-12458). Every decoder layer of a forward asks [`sdpa_eager`] for
 /// the identical `AttnMask::Causal` mask, so without memoization the host-side vec fill + upload in
@@ -180,6 +286,11 @@ fn sdpa_eager(
             scores.broadcast_add(&m)?
         }
         AttnMask::Additive(a) => scores.broadcast_add(a)?,
+        AttnMask::SlidingCausal { window } => {
+            let m =
+                cached_sliding_causal_mask(q_len, k_len, window, scores.dtype(), scores.device())?;
+            scores.broadcast_add(&m)?
+        }
     };
     let weights = softmax_last_dim(&scores)?;
     Ok(weights.matmul(&values.contiguous()?)?)
@@ -212,7 +323,8 @@ fn try_flash_attn(
     let causal = match mask {
         AttnMask::None => false,
         AttnMask::Causal => true,
-        AttnMask::Additive(_) => return Ok(None),
+        // The wrapper exposes no left-window argument, so sliding layers take the eager path.
+        AttnMask::Additive(_) | AttnMask::SlidingCausal { .. } => return Ok(None),
     };
     // The kernel is CUDA-only and f16/bf16-only.
     if !queries.device().is_cuda() {

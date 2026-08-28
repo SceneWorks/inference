@@ -205,10 +205,11 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    /// `bias` is `TransformerConfig::ff_bias` (sc-18758) — see `crate::transformer::FeedForward::load`.
+    fn load(vb: VarBuilder, bias: bool) -> Result<Self> {
         Ok(Self {
-            proj_in: linear(&vb.pp("net.0"), "proj")?,
-            proj_out: linear(&vb.pp("net"), "2")?,
+            proj_in: qlinear(&vb.pp("net.0"), "proj", bias)?,
+            proj_out: qlinear(&vb.pp("net"), "2", bias)?,
         })
     }
 
@@ -256,7 +257,7 @@ impl TrainBlock {
         Ok(Self {
             attn1: TrainAttention::load(vb.pp("attn1"), cfg.num_heads, cfg.head_dim, cfg.norm_eps)?,
             attn2: TrainAttention::load(vb.pp("attn2"), cfg.num_heads, cfg.head_dim, cfg.norm_eps)?,
-            ff: FeedForward::load(vb.pp("ff"))?,
+            ff: FeedForward::load(vb.pp("ff"), cfg.ff_bias)?,
             scale_shift_table: table("scale_shift_table")?,
             prompt_scale_shift_table: table("prompt_scale_shift_table")?,
             eps: cfg.norm_eps,
@@ -443,8 +444,10 @@ mod tests {
     use crate::transformer::AvDiT;
     use candle_gen::candle_core::Shape;
     use candle_gen::candle_nn::VarBuilder;
+    use candle_gen::train::flow_match::save_adapter;
     use candle_gen::train::gradient_checkpoint::checkpointed_backward;
     use candle_gen::train::lora::{build_lora_targets, save_lora_peft};
+    use candle_gen::train::merge::read_adapter;
     use candle_gen::train::optim::TrainOptimizer;
     use std::collections::HashMap;
 
@@ -458,13 +461,26 @@ mod tests {
                 rope_theta: 10000.0,
                 rope_max_pos: [20, 64, 64],
                 timestep_scale_multiplier: 1000.0,
+                ff_bias: true,
+                use_keyframes_abs_pos_embedding: false,
             },
             audio_heads: 1,
             audio_head_dim: 12,
             audio_max_pos: 20,
             cross_inner: 12,
             cross_max_pos: 20,
+            caption_feature_version: AvConfig::ltx_2_3().caption_feature_version,
+            audio_ff_bias: true,
         }
+    }
+
+    /// A deliberately tiny shape with the two LTX-2.5 DiT deltas enabled.  Keeping the lifecycle
+    /// test on this config catches a trainer accidentally falling back to the 2.3 FF-bias layout.
+    fn tiny_cfg_25() -> AvConfig {
+        let mut cfg = tiny_cfg();
+        cfg.video.ff_bias = false;
+        cfg.video.use_keyframes_abs_pos_embedding = true;
+        cfg
     }
 
     fn put<S: Into<Shape>>(
@@ -541,6 +557,9 @@ mod tests {
         put_linear(&mut map, "patchify_proj", vi, 8, dev);
         put_linear(&mut map, "proj_out", 8, vi, dev);
         put(&mut map, "scale_shift_table", (2, vi), dev);
+        if cfg.video.use_keyframes_abs_pos_embedding {
+            put(&mut map, "keyframes_abs_pos_embedding", (1, vi), dev);
+        }
         put_adaln(&mut map, "adaln_single", vi, 9, dev);
         put_adaln(&mut map, "prompt_adaln_single", vi, 2, dev);
         put_adaln(&mut map, "av_ca_video_scale_shift_adaln_single", vi, 4, dev);
@@ -695,7 +714,7 @@ mod tests {
     }
 
     fn assert_trained_lora_inference_roundtrip(dev: Device, tag: &str) {
-        let cfg = tiny_cfg();
+        let cfg = tiny_cfg_25();
         let map = weights(&cfg, &dev);
         let mut train = LtxDiT::new(
             VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
@@ -724,7 +743,76 @@ mod tests {
         let path = path_tmp
             .path()
             .join(format!("ltx_infer_lora_roundtrip_{tag}.safetensors"));
-        save_lora_peft(&set, "", &HashMap::new(), &path).unwrap();
+        let ltx25_metadata = HashMap::from([
+            ("lora_rank".to_string(), "2".to_string()),
+            ("lora_alpha".to_string(), "2".to_string()),
+        ]);
+        save_lora_peft(&set, "", &ltx25_metadata, &path).unwrap();
+
+        // The declared header is authoritative on LTX-2.5: a rank mismatch or a missing rank is
+        // rejected before a residual can be installed, rather than falling back to the factor shape.
+        let wrong_rank_path = path_tmp
+            .path()
+            .join(format!("ltx_bad_rank_{tag}.safetensors"));
+        save_lora_peft(
+            &set,
+            "",
+            &HashMap::from([
+                ("lora_rank".to_string(), "3".to_string()),
+                ("lora_alpha".to_string(), "2".to_string()),
+            ]),
+            &wrong_rank_path,
+        )
+        .unwrap();
+        let mut wrong_rank = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let wrong_rank_error = crate::adapters::install_ltx25_adapters(
+            &mut wrong_rank,
+            &[candle_gen::gen_core::AdapterSpec::new(
+                wrong_rank_path.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            wrong_rank_error.contains("declares lora_rank 3"),
+            "{wrong_rank_error}"
+        );
+
+        let missing_rank_path = path_tmp
+            .path()
+            .join(format!("ltx_missing_rank_{tag}.safetensors"));
+        save_lora_peft(
+            &set,
+            "",
+            &HashMap::from([("lora_alpha".to_string(), "2".to_string())]),
+            &missing_rank_path,
+        )
+        .unwrap();
+        let mut missing_rank = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let missing_rank_error = crate::adapters::install_ltx25_adapters(
+            &mut missing_rank,
+            &[candle_gen::gen_core::AdapterSpec::new(
+                missing_rank_path.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_rank_error.contains("missing required `lora_rank`"),
+            "{missing_rank_error}"
+        );
         let spec = candle_gen::gen_core::AdapterSpec::new(
             path.clone(),
             1.0,
@@ -740,14 +828,14 @@ mod tests {
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
         let report =
-            crate::adapters::install_ltx_adapters(&mut inference, std::slice::from_ref(&spec))
+            crate::adapters::install_ltx25_adapters(&mut inference, std::slice::from_ref(&spec))
                 .unwrap();
         assert_eq!(report.applied, 8);
         assert_eq!(report.skipped_keys, 0);
         let adapted = inference
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
-        let effect = (adapted - &base)
+        let effect = (adapted.clone() - &base)
             .unwrap()
             .abs()
             .unwrap()
@@ -757,6 +845,32 @@ mod tests {
             .unwrap();
         assert!(effect > 1e-6, "nonzero trained factors must change output");
 
+        // Saving and loading a second copy must reproduce the adapted prediction exactly.  This is
+        // intentionally a separate DiT, so bypassing the adapter install cannot borrow the first
+        // model's in-memory residuals.
+        let mut reloaded = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        crate::adapters::install_ltx25_adapters(&mut reloaded, std::slice::from_ref(&spec))
+            .unwrap();
+        let reproduced = reloaded
+            .forward_video_only(&latent, 0.37, &context, &positions)
+            .unwrap();
+        let roundtrip_diff = (adapted - reproduced)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            roundtrip_diff < 1e-6,
+            "saved LTX-2.5 LoRA must reproduce on reload"
+        );
+
         let mut scale_zero =
             AvDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg).unwrap();
         let zero_spec = candle_gen::gen_core::AdapterSpec::new(
@@ -764,7 +878,7 @@ mod tests {
             0.0,
             candle_gen::gen_core::AdapterKind::Lora,
         );
-        crate::adapters::install_ltx_adapters(&mut scale_zero, &[zero_spec]).unwrap();
+        crate::adapters::install_ltx25_adapters(&mut scale_zero, &[zero_spec]).unwrap();
         let zero = scale_zero
             .forward_video_only(&latent, 0.37, &context, &positions)
             .unwrap();
@@ -777,6 +891,8 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert_eq!(zero_diff, 0.0, "scale=0 must be an exact base no-op");
+        std::fs::remove_file(wrong_rank_path).ok();
+        std::fs::remove_file(missing_rank_path).ok();
         std::fs::remove_file(path).ok();
     }
 
@@ -952,6 +1068,292 @@ mod tests {
             nonzero,
             set.vars.len(),
             "some LoRA factors had zero gradients"
+        );
+    }
+
+    #[test]
+    fn av_training_host_enumerates_video_audio_cross_modal_and_ff_targets() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg_25();
+        let mut model = AvDiT::new(
+            VarBuilder::from_tensors(weights(&cfg, &dev), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let suffixes = crate::training::LTX_AV_LORA_TARGETS
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let set = build_lora_targets(&mut model, &suffixes, 2, 2.0, 23, &dev).unwrap();
+        let target_paths = set
+            .named_vars()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        // This catches a regression that enumerates only the old video attn1/attn2 leaves.
+        for required in [
+            "transformer_blocks.0.attn1.to_q",
+            "transformer_blocks.0.audio_attn1.to_q",
+            "transformer_blocks.0.audio_to_video_attn.to_q",
+            "transformer_blocks.0.video_to_audio_attn.to_q",
+            "transformer_blocks.0.ff.net.0.proj",
+            "transformer_blocks.0.audio_ff.net.0.proj",
+        ] {
+            assert!(
+                target_paths.iter().any(|path| path.starts_with(required)),
+                "missing AV target {required}: {target_paths:?}"
+            );
+        }
+        let (video, video_context, video_positions) = inputs(&dev);
+        let audio = Tensor::randn(0f32, 1f32, (1, 2, 8), &dev).unwrap();
+        let audio_positions = crate::rope::create_audio_position_grid(2, &dev).unwrap();
+        let (video_velocity, audio_velocity) = model
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &video_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        let loss = (video_velocity
+            .to_dtype(DType::F32)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap()
+            + audio_velocity
+                .to_dtype(DType::F32)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .mean_all()
+                .unwrap())
+        .unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(
+            set.vars
+                .iter()
+                .any(|var| grads.get(var.as_tensor()).is_some()),
+            "AV loss must reach installed LoRA factors"
+        );
+        // Enter the real training loss/mask path, not just a sibling AV forward. This protects
+        // first-frame conditioning, active-modality normalization and QLoRA backward together.
+        let (masked_loss, masked_grads) = crate::training::production_masked_av_lifecycle(
+            &model,
+            &video,
+            &audio,
+            &video_context,
+            &video_context,
+            &video_positions,
+            &audio_positions,
+            crate::training::ProductionAvLifecycle::Joint,
+        )
+        .unwrap();
+        assert!(
+            masked_loss.is_finite() && masked_loss >= 0.0,
+            "{masked_loss}"
+        );
+        assert!(
+            set.vars
+                .iter()
+                .any(|var| masked_grads.get(var.as_tensor()).is_some()),
+            "production masked lifecycle must reach installed LoRA factors"
+        );
+        let (single_loss, single_grads) = crate::training::production_masked_av_lifecycle(
+            &model,
+            &video,
+            &audio,
+            &video_context,
+            &video_context,
+            &video_positions,
+            &audio_positions,
+            crate::training::ProductionAvLifecycle::VideoOnly,
+        )
+        .unwrap();
+        assert!(
+            single_loss.is_finite() && single_loss >= 0.0,
+            "{single_loss}"
+        );
+        assert!(
+            set.vars
+                .iter()
+                .any(|var| single_grads.get(var.as_tensor()).is_some()),
+            "single-active production lifecycle must reach installed LoRA factors"
+        );
+        let (audio_loss, audio_grads) = crate::training::production_masked_av_lifecycle(
+            &model,
+            &video,
+            &audio,
+            &video_context,
+            &video_context,
+            &video_positions,
+            &audio_positions,
+            crate::training::ProductionAvLifecycle::AudioOnly,
+        )
+        .unwrap();
+        assert!(audio_loss.is_finite() && audio_loss >= 0.0, "{audio_loss}");
+        assert!(
+            set.vars
+                .iter()
+                .any(|var| audio_grads.get(var.as_tensor()).is_some()),
+            "audio-only production lifecycle must reach installed LoRA factors"
+        );
+        let error = crate::training::production_masked_av_lifecycle(
+            &model,
+            &video,
+            &audio,
+            &video_context,
+            &video_context,
+            &video_positions,
+            &audio_positions,
+            crate::training::ProductionAvLifecycle::ZeroVideoLoss,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no active loss tokens"), "{error}");
+    }
+
+    #[test]
+    fn ltx25_av_qlora_train_shifts_output_and_strictly_reloads() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg_25();
+        let map = weights(&cfg, &dev);
+        let (video, video_context, video_positions) = inputs(&dev);
+        let audio = Tensor::randn(0f32, 1f32, (1, 2, 8), &dev).unwrap();
+        let audio_positions = crate::rope::create_audio_position_grid(2, &dev).unwrap();
+        let suffixes = crate::training::LTX_AV_LORA_TARGETS
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let mut train = AvDiT::new(
+            VarBuilder::from_tensors(map.clone(), DType::F32, &dev),
+            &cfg,
+        )
+        .unwrap();
+        let set = build_lora_targets(&mut train, &suffixes, 2, 2.0, 29, &dev).unwrap();
+        let (base_video, base_audio) = train
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &video_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        // The optimizer/save/reload lifecycle must use the production AV mask/timestep loss, not
+        // a nearby unmasked forward.  This crosses the joint branch of `compute_av_loss_grads`.
+        let (masked_loss, grads) = crate::training::production_masked_av_lifecycle(
+            &train,
+            &video,
+            &audio,
+            &video_context,
+            &video_context,
+            &video_positions,
+            &audio_positions,
+            crate::training::ProductionAvLifecycle::Joint,
+        )
+        .unwrap();
+        assert!(
+            masked_loss.is_finite() && masked_loss >= 0.0,
+            "{masked_loss}"
+        );
+        let mut optimizer =
+            TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
+        optimizer.step(&grads).unwrap();
+        let (trained_video, trained_audio) = train
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &video_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        let video_shift = (trained_video.clone() - &base_video)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let audio_shift = (trained_audio.clone() - &base_audio)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            video_shift > 1e-7 || audio_shift > 1e-7,
+            "one real AV optimizer step must move a prediction"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ltx25_av_lifecycle.safetensors");
+        let metadata = HashMap::from([
+            ("lora_rank".to_string(), set.rank.to_string()),
+            ("lora_alpha".to_string(), set.alpha.to_string()),
+            ("family".to_string(), "ltx".to_string()),
+            ("baseModel".to_string(), crate::MODEL_25_ID.to_string()),
+        ]);
+        save_adapter(&set, &metadata, &path).unwrap();
+        let file = read_adapter(&path).unwrap();
+        assert_eq!(file.meta.get("lora_rank"), Some(&"2".to_string()));
+        assert_eq!(file.meta.get("lora_alpha"), Some(&"2".to_string()));
+        assert_eq!(file.meta.get("family"), Some(&"ltx".to_string()));
+        assert_eq!(
+            file.meta.get("baseModel"),
+            Some(&crate::MODEL_25_ID.to_string())
+        );
+
+        let spec = candle_gen::gen_core::AdapterSpec::new(
+            path,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        );
+        let mut reloaded =
+            AvDiT::new(VarBuilder::from_tensors(map, DType::F32, &dev), &cfg).unwrap();
+        crate::adapters::install_ltx25_adapters(&mut reloaded, &[spec]).unwrap();
+        let (roundtrip_video, roundtrip_audio) = reloaded
+            .forward(
+                &video,
+                &audio,
+                0.37,
+                &video_context,
+                &video_context,
+                &video_positions,
+                &audio_positions,
+            )
+            .unwrap();
+        let video_diff = (trained_video - roundtrip_video)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let audio_diff = (trained_audio - roundtrip_audio)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            video_diff < 1e-6 && audio_diff < 1e-6,
+            "strict AV adapter reload must reproduce trained predictions"
         );
     }
 }

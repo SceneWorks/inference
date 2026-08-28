@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! MLX_GEN_FLUX2_SNAPSHOT=/path/to/snapshot cargo test --release -p mlx-gen-flux2 \
-//!   --test fit_preview_rgb -- --ignored --nocapture
+//!   --test integration -- fit_preview_rgb:: --ignored --nocapture
 //! ```
 //!
 //! Eight diverse prompt/seed renders determine the OLS transform. Four disjoint renders are holdout

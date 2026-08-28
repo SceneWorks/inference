@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MLX_LLM_TEST_MODEL=/path/to/SmolLM2-135M-Instruct \
-//!   cargo test --test stop_strings -- --ignored --nocapture
+//!   cargo test --test integration -- stop_strings:: --ignored --nocapture
 //! ```
 //!
 //! Acceptance (sc-7349): a request with `stop` halts at the first occurrence, the stop sequence is

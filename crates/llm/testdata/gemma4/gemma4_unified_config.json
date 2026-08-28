@@ -1,0 +1,71 @@
+{
+ "_note": "Gemma 4 unified `config.json`, shaped after the LTX-2.5 packed text encoder's `gemma_config` metadata (google/gemma-4-12B-it). Every field the epic recorded as MEASURED is exact: hidden_size, intermediate_size, num_hidden_layers, num_key_value_heads, num_global_key_value_heads, head_dim, global_head_dim, vocab_size, sliding_window, tie_word_embeddings, final_logit_softcapping, rms_norm_eps, attention_k_eq_v, and both rope_parameters entries. `num_attention_heads: 16` is likewise confirmed against the shipped checkpoint (see `_verified_against`). `layer_types` is deliberately omitted so the fixture exercises the derived 5:1 schedule; tests that need an explicit table inject one.",
+ "_source": "huggingface/transformers Gemma4UnifiedConfig + Lightricks/LTX-2 gemma_config",
+ "_verified_against": "docs/reference/sc-18756-headers/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors.json (metadata.gemma_config, gemma_version gemma4-12b-ltx-v1) - asserted field-by-field by gemma4_real_packed_te_config_parses_to_the_same_table",
+ "architectures": [
+  "Gemma4UnifiedForConditionalGeneration"
+ ],
+ "model_type": "gemma4_unified",
+ "boi_token_id": 255999,
+ "eoi_token_id": 258882,
+ "image_token_id": 258880,
+ "video_token_id": 258884,
+ "boa_token_id": 256000,
+ "eoa_token_index": 258883,
+ "audio_token_id": 258881,
+ "initializer_range": 0.02,
+ "tie_word_embeddings": true,
+ "text_config": {
+  "model_type": "gemma4_unified_text",
+  "vocab_size": 262144,
+  "hidden_size": 3840,
+  "intermediate_size": 15360,
+  "num_hidden_layers": 48,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 8,
+  "num_global_key_value_heads": 1,
+  "head_dim": 256,
+  "global_head_dim": 512,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "max_position_embeddings": 262144,
+  "rms_norm_eps": 1e-06,
+  "sliding_window": 1024,
+  "final_logit_softcapping": 30.0,
+  "attention_k_eq_v": true,
+  "num_kv_shared_layers": 0,
+  "use_double_wide_mlp": false,
+  "use_bidirectional_attention": "vision",
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "use_cache": true,
+  "tie_word_embeddings": true,
+  "pad_token_id": 0,
+  "eos_token_id": 1,
+  "bos_token_id": 2,
+  "rope_parameters": {
+   "sliding_attention": {
+    "rope_type": "default",
+    "rope_theta": 10000.0
+   },
+   "full_attention": {
+    "rope_type": "proportional",
+    "rope_theta": 1000000.0,
+    "partial_rotary_factor": 0.25
+   }
+  }
+ },
+ "vision_config": {
+  "model_type": "gemma4_unified_vision",
+  "patch_size": 16,
+  "pooling_kernel_size": 3,
+  "mm_embed_dim": 3840,
+  "mm_posemb_size": 1120,
+  "rms_norm_eps": 1e-06,
+  "output_proj_dims": 3840
+ },
+ "audio_config": {
+  "model_type": "gemma4_unified_audio",
+  "audio_embed_dim": 640,
+  "rms_norm_eps": 1e-06
+ }
+}

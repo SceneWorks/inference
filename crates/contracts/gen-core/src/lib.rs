@@ -21,17 +21,23 @@ pub mod checkpoint_codec;
 pub mod checkpoint_facts;
 pub mod comfy_quant;
 pub mod control;
+pub mod duration_head;
 pub mod encoder_contract;
 pub mod error;
 pub mod execution_domains;
+pub mod exr_io;
 pub mod face;
+pub mod gemma_assets;
 pub mod generator;
 pub mod guidance;
+pub mod hdr;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
 pub mod latent;
 pub mod license;
+pub mod ltx_checkpoint;
+pub mod ltx_dfr;
 mod macros;
 pub mod media;
 pub mod memory_strategy;
@@ -119,15 +125,22 @@ pub use execution_domains::{
     CfgBatching, CfgBatchingDomain, ExecutionSurface, ExecutionValueDomain, FfnChunk,
     GraphEvalCadence,
 };
+pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
     AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, PrecisionFloorComponent,
-    ReplacementMode, SizeFloor, SpeechSegment, StagedResidencyAvailability, StepSupport,
-    TimeRegion, VideoClipRef,
+    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
+    PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
+    StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+};
+pub use hdr::{
+    exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
+    rgb_signal_to_yuv420p10, to_vae_range, working_frame_to_exr_payload,
+    working_frame_to_hlg_linear, HdrColorSpace, HdrTransfer, HlgConverter, HlgMasterTags,
+    Primaries, Yuv420p10, HLG_MASTER_TAGS,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
@@ -148,7 +161,7 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, Image};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
@@ -197,10 +210,10 @@ pub use registry::{
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
     AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactSeal, CancelFlag, FileStatFingerprint,
-    IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert,
-    OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame,
-    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
-    PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    HdrFrameSink, HdrOutputFrame, IdentityWeights, LoadPhase, LoadShape,
+    LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
+    Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome,
+    PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
     COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
     LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
@@ -214,10 +227,21 @@ pub use tiling::{TilingConfig, VaeTiling};
 pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
-    read_safetensors_tensor_payloads, safetensors_dir_bytes, safetensors_file_tensor_locations,
-    safetensors_path_bytes, safetensors_path_quantization_metadata,
-    safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
-    SafetensorsTensorLocation,
+    read_safetensors_tensor_payloads, safetensors_dir_bytes, safetensors_file_metadata,
+    safetensors_file_tensor_locations, safetensors_path_bytes,
+    safetensors_path_quantization_metadata, safetensors_path_tensor_headers, SafetensorsFileLayout,
+    SafetensorsTensorHeader, SafetensorsTensorLocation,
+};
+// The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
+// candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the
+// `gemma_source_checkpoint` ⇄ text-encoder `gemma_version` assertion. Pure paths + JSON, so it keeps
+// gen-core's zero-tensor invariant.
+pub use ltx_checkpoint::{
+    caption_feature_version, check_gemma_version, declared_layout, declared_model_version,
+    discover_split_bundle, discover_split_bundle_skipping, layout_for_declared_version,
+    layout_for_version, parse_model_version, CaptionFeatureVersion, GemmaEncoderIdentity,
+    GemmaSourceCheckpoint, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
+    LtxCheckpointMetadata, LtxComponent, LtxConfigRoot, LtxResolvedComponent,
 };
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The

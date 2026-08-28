@@ -817,7 +817,7 @@ mod preview_advertising {
     /// method makes one viable it reopens as a **new** story with a **new** measurement; nothing here
     /// is "to be decided".
     ///
-    /// Nineteen ids across eight crates. The crate set is *derived* from these ids by
+    /// Twenty-two ids across nine crates. The crate set is *derived* from these ids by
     /// `no_no_go_family_acquires_a_preview_fit_or_a_fit_producer` rather than restated, so a new
     /// registration in one of those crates joins the scan automatically.
     const PREVIEW_INERT_ROUTE_IDS: &[(&str, NoGo)] = &[
@@ -832,6 +832,9 @@ mod preview_advertising {
         ("wan_vace", NoGo::WanZ16),
         ("wan2_2_vace_fun_14b", NoGo::WanZ16),
         ("ltx_2_3_distilled", NoGo::Ltx),
+        // The 2.5 DiT preserves LTX's latent geometry, so the settled LTX preview fit/holdout
+        // decision carries forward; adding the provider is not authorization to rerun that fit.
+        ("ltx_2_5_distilled", NoGo::Ltx),
         ("minimax_h3", NoGo::MinimaxH3Joint),
         ("mochi_1", NoGo::Mochi),
         ("mage_flow", NoGo::Mage),
@@ -4101,7 +4104,7 @@ mod preview_advertising {
                 "candle-gen-svd",
                 "candle-gen-wan",
             ],
-            "the 20 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
+            "the 22 no-go ids must resolve to exactly these nine crates — a mismatch means an id \
              moved crates or a crate acquired a route that is not accounted for"
         );
 
@@ -5526,6 +5529,7 @@ mod tests {
                 "lens_turbo",
                 "lens",
                 "ltx_2_3_distilled",
+                "ltx_2_5_distilled",
                 "mage_flow",
                 "mage_flow_base",
                 "mage_flow_turbo",
@@ -5566,6 +5570,7 @@ mod tests {
                 "krea_2_control",
                 "lens",
                 "ltx_2_3",
+                "ltx_2_5_distilled",
                 "mage_flow_base",
                 "sd3_5_large",
                 "sd3_5_medium",
@@ -5584,15 +5589,13 @@ mod tests {
         assert_eq!(text_embedders, ["clip_vit_l14_text"]);
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
-        // where a surface change and a mapping change meet. Twelve of the fourteen trainer ids are
-        // also generator ids, which is why 54 + 14 + 1 + 2 registrations are 59 distinct ids. Both
-        // branches independently added one generator to the 53-id base (MiniMax-H3 joint-space
-        // no-go on the epic side, the Krea Turbo edit route on main), so the generator count here
-        // is their union (54), not either side's 53.
+        // where a surface change and a mapping change meet. Five of the seven trainer ids are also
+        // generator ids, which is why 55 generators + 2 trainer-only ids + 1 captioner + 2
+        // embedders are 60 distinct ids.
         //
-        // Registration is never conditioned on the mapping: 49 < 58 because nine ids load nothing
+        // Registration is never conditioned on the mapping: 50 < 60 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
-        // our metadata for CI to report, and `licenses::tests` pins which nine and why — as
+        // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
         let distinct: std::collections::BTreeSet<&String> = generators
             .iter()
@@ -5601,7 +5604,7 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 59);
+        assert_eq!(distinct.len(), 60);
         assert_eq!(super::provider_components().len(), 50);
     }
 

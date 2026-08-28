@@ -11,7 +11,11 @@ use crate::config::{
     AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE,
 };
 use crate::vocoder::LtxVocoder;
-use crate::{conditioning, transformer::AvDiT};
+use crate::{
+    conditioning, dev_sampler,
+    params::GuiderParams,
+    transformer::{AvDiT, AvPerturbation},
+};
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`: temporal `(F-1)/8 + 1`, spatial
 /// `/32`.
@@ -359,6 +363,7 @@ pub fn denoise_av_conditioned(
             audio_ctx,
             &state.positions,
             audio_grid,
+            state.keyframes_mask.as_ref(),
             &prepared_rope,
         )?;
         let avel = unflatten_audio_latent(&avel.to_dtype(DType::F32)?, audio_frames)?;
@@ -380,6 +385,363 @@ pub fn denoise_av_conditioned(
             let step = (((&alat - &aden)? * sigma_next as f64)? / sigma as f64)?;
             (&aden + step)?
         };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok((state, alat))
+}
+
+/// Non-distilled LTX-2.5 single-video Dev denoise.  This is the actual
+/// `ltxValidation.generateAudio=false` route: no audio latent is allocated, patchified, or
+/// forwarded.  With no cross-modal stream the isolated-modality prediction is the conditional
+/// prediction, so its configured guidance contribution is exactly zero.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_video_dev_conditioned(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    video_ctx: &Tensor,
+    negative_video_ctx: &Tensor,
+    sigmas: &[f32],
+    stg_blocks: &[usize],
+    video_guider: GuiderParams,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<conditioning::VideoTokenState> {
+    let mut state = video.clone();
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
+    {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx_2_5: dev STG blocks must contain 1..=8 unique indices in 0..48, got {stg_blocks:?}"
+        )));
+    }
+    let mut unique = stg_blocks.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != stg_blocks.len() {
+        return Err(candle_gen::CandleError::Msg(
+            "ltx_2_5: dev STG blocks must not contain duplicates".into(),
+        ));
+    }
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let timesteps = state.token_timesteps(sigma)?;
+        let mut forward = |context: &Tensor, perturbation: AvPerturbation| -> Result<Tensor> {
+            on_model_forward()?;
+            dit.forward_video_only_conditioned_controlled(
+                &state.latent,
+                &timesteps,
+                context,
+                &state.positions,
+                state.keyframes_mask.as_ref(),
+                &perturbation,
+            )
+        };
+        let conditional = forward(video_ctx, AvPerturbation::none())?;
+        let negative = forward(negative_video_ctx, AvPerturbation::none())?;
+        let perturbed = forward(video_ctx, AvPerturbation::stg(stg_blocks))?;
+        let denoise = |velocity: Tensor| -> Result<Tensor> {
+            conditioning::apply_denoise_mask(
+                &(&state.latent - (&velocity.to_dtype(DType::F32)? * sigma as f64)?)?,
+                &state.clean_latent,
+                &state.denoise_mask,
+            )
+        };
+        let conditional = denoise(conditional)?;
+        let negative = denoise(negative)?;
+        let perturbed = denoise(perturbed)?;
+        let video_denoised = dev_sampler::combine_guidance(
+            &conditional,
+            &negative,
+            &perturbed,
+            &conditional,
+            video_guider,
+        )?;
+        state.latent = if sigma_next <= 0.0 {
+            video_denoised
+        } else {
+            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&video_denoised + step)?
+        };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok(state)
+}
+
+/// Non-distilled LTX-2.5 stage-one denoise.  Each of the thirty official transitions makes four
+/// real joint-AvDiT evaluations: positive, negative-text, STG (self attention skipped at block
+/// 28 only), and modality-isolated (A2V/V2A skipped at every block).  Guidance combines denoised
+/// predictions, not velocities; stage two deliberately remains the existing distilled refinement.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av_dev_conditioned(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    audio: &Tensor,
+    video_ctx: &Tensor,
+    audio_ctx: &Tensor,
+    negative_video_ctx: &Tensor,
+    negative_audio_ctx: &Tensor,
+    audio_frames: usize,
+    audio_grid: &Tensor,
+    sigmas: &[f32],
+    stg_blocks: &[usize],
+    video_guider: GuiderParams,
+    audio_guider: GuiderParams,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Tensor)> {
+    let mut state = video.clone();
+    let mut alat = audio.clone();
+    let audio_request = flatten_audio_latent(&alat)?;
+    let prepared_rope =
+        dit.prepare_rope(&state.latent, &audio_request, &state.positions, audio_grid)?;
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    if stg_blocks.is_empty() || stg_blocks.len() > 8 || stg_blocks.iter().any(|&block| block >= 48)
+    {
+        return Err(candle_gen::CandleError::Msg(format!(
+            "ltx_2_5: dev STG blocks must contain 1..=8 unique indices in 0..48, got {stg_blocks:?}"
+        )));
+    }
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let aflat = flatten_audio_latent(&alat)?;
+        let timesteps = state.token_timesteps(sigma)?;
+        let mut forward = |video_context: &Tensor,
+                           audio_context: &Tensor,
+                           perturbation: AvPerturbation|
+         -> Result<(Tensor, Tensor)> {
+            on_model_forward()?;
+            dit.forward_conditioned_prepared_controlled(
+                &state.latent,
+                &aflat,
+                &timesteps,
+                sigma as f64,
+                video_context,
+                audio_context,
+                &state.positions,
+                audio_grid,
+                state.keyframes_mask.as_ref(),
+                &prepared_rope,
+                &perturbation,
+            )
+        };
+        let (conditional_video, conditional_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::none())?;
+        let (negative_video, negative_audio) = forward(
+            negative_video_ctx,
+            negative_audio_ctx,
+            AvPerturbation::none(),
+        )?;
+        let (perturbed_video, perturbed_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::stg(stg_blocks))?;
+        let (isolated_video, isolated_audio) =
+            forward(video_ctx, audio_ctx, AvPerturbation::modality_isolated())?;
+
+        let conditional_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&conditional_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let negative_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&negative_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let perturbed_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&perturbed_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let isolated_video = conditioning::apply_denoise_mask(
+            &(&state.latent - (&isolated_video.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let denoise_audio = |velocity: Tensor| -> Result<Tensor> {
+            let velocity = unflatten_audio_latent(&velocity.to_dtype(DType::F32)?, audio_frames)?;
+            &alat - (&velocity * sigma as f64)?
+        };
+        let conditional_audio = denoise_audio(conditional_audio)?;
+        let negative_audio = denoise_audio(negative_audio)?;
+        let perturbed_audio = denoise_audio(perturbed_audio)?;
+        let isolated_audio = denoise_audio(isolated_audio)?;
+        let video_denoised = dev_sampler::combine_guidance(
+            &conditional_video,
+            &negative_video,
+            &perturbed_video,
+            &isolated_video,
+            video_guider,
+        )?;
+        let audio_denoised = dev_sampler::combine_guidance(
+            &conditional_audio,
+            &negative_audio,
+            &perturbed_audio,
+            &isolated_audio,
+            audio_guider,
+        )?;
+        state.latent = if sigma_next <= 0.0 {
+            video_denoised
+        } else {
+            let step = (((&state.latent - &video_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&video_denoised + step)?
+        };
+        alat = if sigma_next <= 0.0 {
+            audio_denoised
+        } else {
+            let step = (((&alat - &audio_denoised)? * sigma_next as f64)? / sigma as f64)?;
+            (&audio_denoised + step)?
+        };
+        on_progress(Progress::Step {
+            current: step as u32 + 1,
+            total,
+        });
+    }
+    Ok((state, alat))
+}
+
+/// The audio side of an ancestral token denoise, when the audio modality is present.
+/// Deliberately mask-free — see the mlx twin's note: the reference's post-noise audio re-pin is
+/// the identity because audio always carries an all-ones denoise mask on this engine's surface.
+pub struct AncestralAudio<'a> {
+    /// `(B, 8, T, 16)` audio latent grid.
+    pub latent: &'a Tensor,
+    pub ctx: &'a Tensor,
+    pub grid: &'a Tensor,
+    pub audio_frames: usize,
+}
+
+/// Token-native **rectified-flow ancestral** denoise (sc-18789) — the twin of
+/// `mlx-gen-ltx::pipeline::denoise_tokens_rf_ancestral`; see that doc comment for the step
+/// semantics (mask-corrected x0, terminal short-circuit, RF-ancestral update with the
+/// post-noise conditioning re-pin, video-only forward when `audio` is `None`, and
+/// per-(seed, step, modality) noise keys).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_tokens_rf_ancestral(
+    dit: &AvDiT,
+    video: &conditioning::VideoTokenState,
+    video_ctx: &Tensor,
+    audio: Option<AncestralAudio<'_>>,
+    sigmas: &[f32],
+    eta: f32,
+    s_noise: f32,
+    noise_seed: u64,
+    cancel: &candle_gen::gen_core::CancelFlag,
+    on_model_forward: &mut dyn FnMut() -> Result<()>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> candle_gen::Result<(conditioning::VideoTokenState, Option<Tensor>)> {
+    let mut state = video.clone();
+    let mut alat = audio.as_ref().map(|a| a.latent.clone());
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    let device = state.latent.device().clone();
+    let seeded_normal = |shape: &[usize], step: usize, modality: u64| -> Result<Tensor> {
+        let mut rng = StdRng::seed_from_u64(
+            noise_seed
+                .wrapping_add(2 * step as u64)
+                .wrapping_add(modality),
+        );
+        let n: usize = shape.iter().product();
+        let data = candle_gen::seeded_normal_vec(&mut rng, n);
+        Tensor::from_vec(data, shape, &device)?.to_dtype(DType::F32)
+    };
+
+    for (step, window) in sigmas.windows(2).enumerate() {
+        if cancel.is_cancelled() {
+            return Err(candle_gen::CandleError::Canceled);
+        }
+        on_model_forward()?;
+        let (sigma, sigma_next) = (window[0], window[1]);
+        let timesteps = state.token_timesteps(sigma)?;
+        let (vvel, avel) = match (&alat, &audio) {
+            (Some(al), Some(a)) => {
+                let aflat = flatten_audio_latent(al)?;
+                let (vv, av) = dit.forward_conditioned(
+                    &state.latent,
+                    &aflat,
+                    &timesteps,
+                    sigma as f64,
+                    video_ctx,
+                    a.ctx,
+                    &state.positions,
+                    a.grid,
+                    state.keyframes_mask.as_ref(),
+                )?;
+                let av = unflatten_audio_latent(&av.to_dtype(DType::F32)?, a.audio_frames)?;
+                (vv, Some(av))
+            }
+            _ => (
+                dit.forward_video_only_conditioned(
+                    &state.latent,
+                    &timesteps,
+                    video_ctx,
+                    &state.positions,
+                    state.keyframes_mask.as_ref(),
+                )?,
+                None,
+            ),
+        };
+
+        // Mask-corrected x0 (reference `post_process_latent`).
+        let vden = conditioning::apply_denoise_mask(
+            &(&state.latent - (&vvel.to_dtype(DType::F32)? * sigma as f64)?)?,
+            &state.clean_latent,
+            &state.denoise_mask,
+        )?;
+        let aden = match (&alat, &avel) {
+            (Some(al), Some(av)) => Some((al - (av * sigma as f64)?)?),
+            _ => None,
+        };
+
+        if sigma_next <= 0.0 {
+            state.latent = vden;
+            if let Some(ad) = aden {
+                alat = Some(ad);
+            }
+        } else {
+            let coeffs = candle_gen::gen_core::ltx_dfr::RfAncestralCoeffs::new(
+                sigma, sigma_next, eta, s_noise,
+            )
+            .map_err(|e| candle_gen::CandleError::Msg(e.to_string()))?;
+            let ratio = coeffs.sigma_down_ratio as f64;
+            let step_rf = |x: &Tensor, x0: &Tensor, modality: u64| -> Result<Tensor> {
+                let mut next = ((x * ratio)? + (x0 * (1.0 - ratio))?)?;
+                if eta > 0.0 {
+                    // Variance-preserving rescale + fresh noise (applied even at s_noise = 0 —
+                    // the reference does not fall back to the noise-free branch when eta > 0).
+                    next = (next * coeffs.alpha_ratio as f64)?;
+                    if coeffs.renoise_coeff > 0.0 {
+                        let noise = seeded_normal(next.dims(), step, modality)?;
+                        next = (next + (noise * coeffs.renoise_coeff as f64)?)?;
+                    }
+                }
+                Ok(next)
+            };
+            let mut vnext = step_rf(&state.latent, &vden, 0)?;
+            if eta > 0.0 {
+                // Injected noise reached the conditioning tokens; re-pin them.
+                vnext = conditioning::apply_denoise_mask(
+                    &vnext,
+                    &state.clean_latent,
+                    &state.denoise_mask,
+                )?;
+            }
+            state.latent = vnext;
+            if let (Some(al), Some(ad)) = (&alat, &aden) {
+                alat = Some(step_rf(al, ad, 1)?);
+            }
+        }
         on_progress(Progress::Step {
             current: step as u32 + 1,
             total,

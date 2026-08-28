@@ -22,7 +22,7 @@ The output is a few hundred KB and is deliberately **not** committed: point the 
 Then:
 
     MINIMAX_H3_SNAPSHOT=... MINIMAX_H3_VIDEO_VAE_REFERENCE=~/minimax-h3-real-vae-reference.safetensors \
-        cargo test -p mlx-gen-minimax-h3 --test real_weights -- --ignored --nocapture
+        cargo test -p mlx-gen-minimax-h3 --test integration -- real_weights:: --ignored --nocapture
 """
 
 from __future__ import annotations

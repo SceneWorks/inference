@@ -1,7 +1,7 @@
 //! JSON-constrained decode (story 7166), gated on a real snapshot.
 //!
 //! ```text
-//! MLX_LLM_TEST_MODEL=/path/to/snapshot cargo test --test structured -- --ignored --nocapture
+//! MLX_LLM_TEST_MODEL=/path/to/snapshot cargo test --test integration -- structured:: --ignored --nocapture
 //! ```
 
 use core_llm::{Constraint, JsonState, LoadSpec, Message, Sampling, TextLlm, TextLlmRequest};

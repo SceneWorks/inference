@@ -56,7 +56,7 @@ use mlx_rs::{Array, Dtype};
 /// (minus the `.weight` suffix) ends with one of these. Matches all attention `to_q/k/v/out` (self,
 /// cross, and the cross-modal audio↔video attentions) plus the video/audio FFN in/out projections;
 /// leaves `q_norm`/`k_norm`/`to_gate_logits`/adaLN/patchify/`proj_out` dense.
-const QUANT_SUFFIXES: &[&str] = &[
+pub(crate) const TRANSFORMER_QUANT_SUFFIXES: &[&str] = &[
     ".to_q",
     ".to_k",
     ".to_v",
@@ -65,6 +65,33 @@ const QUANT_SUFFIXES: &[&str] = &[
     ".ff.proj_out",
     ".audio_ff.proj_in",
     ".audio_ff.proj_out",
+];
+
+/// The embeddings-connector Linears the LTX-2.5 tiers quantize (sc-18775).
+///
+/// The connector component keeps the checkpoint's **raw** naming (`to_out.0`, `ff.net.0.proj`,
+/// `ff.net.2`) — [`build_connector`] deliberately does not sanitize it the way the transformer is
+/// sanitized — so this is a separate list from [`TRANSFORMER_QUANT_SUFFIXES`] rather than the same
+/// one reused.
+///
+/// `to_gate_logits` is **excluded**, mirroring the reference `_quantize_ltx_predicate`'s treatment
+/// of the DiT's own gate projections: it is a `[num_heads, dim]` projection feeding a sigmoid gate,
+/// 4 MB across both connectors, and quantizing a multiplicative gate buys nothing measurable while
+/// perturbing every attention output. Norms, biases and the learnable registers are excluded for the
+/// same reason the DiT excludes them — they are not matmul weights.
+/// The two `text_embedding_projection.*_aggregate_embed` Linears are included: they live in the
+/// LTX-2.5 text-encoder file but the tier moves them into this component (where LTX-2.3 keeps them
+/// and where [`crate::text_encoder::LtxTextEncoder`]'s feature heads read them from), and at
+/// `[4096, 188160]` and `[2048, 188160]` they are 2.31 GB of the two together.
+pub(crate) const CONNECTOR_QUANT_SUFFIXES: &[&str] = &[
+    ".attn1.to_q",
+    ".attn1.to_k",
+    ".attn1.to_v",
+    ".attn1.to_out.0",
+    ".ff.net.0.proj",
+    ".ff.net.2",
+    "text_embedding_projection.video_aggregate_embed",
+    "text_embedding_projection.audio_aggregate_embed",
 ];
 
 /// The LTX-2.3 latent-upsampler component specs (component prefix → source filename in the base
@@ -163,26 +190,66 @@ fn sanitize_transformer(raw: &Weights) -> HashMap<String, Array> {
     out
 }
 
-/// `sanitize_vae_weights` (decoder) — `vae.decoder.*` (prefix stripped) + the two
-/// `per_channel_statistics` stats (`mean-of-means`→`mean`, `std-of-means`→`std`); conv3d/2d
-/// channels-last. `position_ids` and all other `vae.*` keys are dropped.
-fn sanitize_vae_decoder(raw: &Weights) -> Result<HashMap<String, Array>> {
+/// Where the video VAE's tensors sit in the source file (sc-18765).
+///
+/// LTX-2.3 ships the whole stack in one checkpoint, so its VAE tensors are namespaced `vae.*`.
+/// LTX-2.5 ships the video VAE as its **own component file**, so the very same tensors sit at the
+/// root: `decoder.*`, `encoder.*`, `per_channel_statistics.*`. Nothing else about them changed —
+/// same names, same shapes, same PyTorch layout — so the sanitizers below take the namespace as a
+/// parameter instead of carrying two copies of the mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VaeNamespace {
+    /// `vae.`-prefixed — an LTX-2.3-style all-in-one checkpoint.
+    Bundled,
+    /// Root-level — an LTX-2.5 per-component VAE checkpoint.
+    Component,
+}
+
+impl VaeNamespace {
+    /// The prefix the video VAE's tensors carry.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Bundled => "vae.",
+            Self::Component => "",
+        }
+    }
+
+    /// Detect the namespace from the key set. Presence of any `vae.` key is decisive: a component
+    /// VAE file has none, and an all-in-one checkpoint keys every VAE tensor that way.
+    fn detect(raw: &Weights) -> Self {
+        if raw.keys().any(|k| k.starts_with("vae.")) {
+            Self::Bundled
+        } else {
+            Self::Component
+        }
+    }
+}
+
+/// Shared body of the two video-VAE sanitizers: keep `{prefix}{half}.*` (prefix + half stripped) and
+/// the two `per_channel_statistics` stats under the half's own naming; conv3d/2d channels-last.
+/// `position_ids` and every other key are dropped.
+fn sanitize_vae_half(
+    raw: &Weights,
+    ns: VaeNamespace,
+    half: &str,
+    mean_key: &str,
+    std_key: &str,
+) -> Result<HashMap<String, Array>> {
+    let prefix = ns.prefix();
+    let stats = format!("{prefix}per_channel_statistics.");
+    let half_prefix = format!("{prefix}{half}.");
     let mut out = HashMap::new();
     for k in raw.keys() {
-        if k.contains("position_ids") || !k.starts_with("vae.") {
+        if k.contains("position_ids") || !k.starts_with(prefix) {
             continue;
         }
-        let new = if k.starts_with("vae.per_channel_statistics") {
-            match k {
-                "vae.per_channel_statistics.mean-of-means" => {
-                    "per_channel_statistics.mean".to_string()
-                }
-                "vae.per_channel_statistics.std-of-means" => {
-                    "per_channel_statistics.std".to_string()
-                }
+        let new = if let Some(stat) = k.strip_prefix(&stats) {
+            match stat {
+                "mean-of-means" => mean_key.to_string(),
+                "std-of-means" => std_key.to_string(),
                 _ => continue,
             }
-        } else if let Some(rest) = k.strip_prefix("vae.decoder.") {
+        } else if let Some(rest) = k.strip_prefix(&half_prefix) {
             rest.to_string()
         } else {
             continue;
@@ -193,33 +260,29 @@ fn sanitize_vae_decoder(raw: &Weights) -> Result<HashMap<String, Array>> {
     Ok(out)
 }
 
-/// `sanitize_vae_encoder_weights` — `vae.encoder.*` (prefix stripped) + the two stats remapped to the
+/// `sanitize_vae_weights` (decoder) — `{ns}decoder.*` (prefix stripped) + the two
+/// `per_channel_statistics` stats (`mean-of-means`→`mean`, `std-of-means`→`std`); conv3d/2d
+/// channels-last.
+fn sanitize_vae_decoder(raw: &Weights, ns: VaeNamespace) -> Result<HashMap<String, Array>> {
+    sanitize_vae_half(
+        raw,
+        ns,
+        "decoder",
+        "per_channel_statistics.mean",
+        "per_channel_statistics.std",
+    )
+}
+
+/// `sanitize_vae_encoder_weights` — `{ns}encoder.*` (prefix stripped) + the two stats remapped to the
 /// encoder's `_mean_of_means`/`_std_of_means`; conv3d/2d channels-last.
-fn sanitize_vae_encoder(raw: &Weights) -> Result<HashMap<String, Array>> {
-    let mut out = HashMap::new();
-    for k in raw.keys() {
-        if k.contains("position_ids") || !k.starts_with("vae.") {
-            continue;
-        }
-        let new = if k.starts_with("vae.per_channel_statistics") {
-            match k {
-                "vae.per_channel_statistics.mean-of-means" => {
-                    "per_channel_statistics._mean_of_means".to_string()
-                }
-                "vae.per_channel_statistics.std-of-means" => {
-                    "per_channel_statistics._std_of_means".to_string()
-                }
-                _ => continue,
-            }
-        } else if let Some(rest) = k.strip_prefix("vae.encoder.") {
-            rest.to_string()
-        } else {
-            continue;
-        };
-        let v = conv_channels_last(&new, raw.require(k)?, true, true)?;
-        out.insert(new, v);
-    }
-    Ok(out)
+fn sanitize_vae_encoder(raw: &Weights, ns: VaeNamespace) -> Result<HashMap<String, Array>> {
+    sanitize_vae_half(
+        raw,
+        ns,
+        "encoder",
+        "per_channel_statistics._mean_of_means",
+        "per_channel_statistics._std_of_means",
+    )
 }
 
 /// `sanitize_audio_vae_weights` — `audio_vae.decoder.*` (prefix stripped) + the two stats remapped to
@@ -317,7 +380,7 @@ fn quantize_transformer(
     let mut out = HashMap::with_capacity(m.len());
     for (k, v) in m {
         let base = k.strip_suffix(".weight");
-        let is_q = base.is_some_and(|b| QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
+        let is_q = base.is_some_and(|b| TRANSFORMER_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)));
         if let (true, Some(base)) = (is_q, base) {
             let (wq, scales, biases) = quantize(&v, group_size, bits)?;
             out.insert(format!("{base}.weight"), wq);
@@ -438,6 +501,14 @@ fn build_embedded_config() -> serde_json::Value {
             "connector_apply_gated_attention": true,
             "caption_projection_first_linear": false,
             "caption_projection_second_linear": false,
+            // sc-18763: this is the legacy 2-of-4 V2-detection key shape — the SAME shape measured
+            // directly off the already-hosted `SceneWorks/ltx-2.3-mlx` tier's real
+            // `embedded_config.json` (every cached snapshot/quant variant, coordinator review
+            // 2026-08-18). `caption_proj_before_connector`/`caption_proj_input_norm` are genuinely
+            // absent on the real shipped tiers, not merely omitted here — do NOT "complete" this to
+            // all 4 keys; `LtxConfig`'s detection carves this exact shape out as V2 explicitly
+            // (`is_legacy_two_key_v2_shape` in config.rs), so a converted directory with just these
+            // two keys loads correctly, matching production.
             "audio_connector_attention_head_dim": 64,
             "audio_connector_num_attention_heads": 32,
             "cross_attention_adaln": true,
@@ -591,13 +662,14 @@ pub fn convert_and_assemble(
         components.push("connector".into());
     }
 
-    let mut vae_decoder = sanitize_vae_decoder(&raw)?;
+    let ns = VaeNamespace::detect(&raw);
+    let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
     if !vae_decoder.is_empty() {
         cast_floats_bf16(&mut vae_decoder)?;
         save_component(out, "vae_decoder", &vae_decoder)?;
         components.push("vae_decoder".into());
     }
-    let mut vae_encoder = sanitize_vae_encoder(&raw)?;
+    let mut vae_encoder = sanitize_vae_encoder(&raw, ns)?;
     if !vae_encoder.is_empty() {
         cast_floats_bf16(&mut vae_encoder)?;
         save_component(out, "vae_encoder", &vae_encoder)?;
@@ -673,6 +745,227 @@ pub fn convert_and_assemble(
     Ok(out.to_path_buf())
 }
 
+// ---------------------------------------------------------------------------------------------
+// LTX-2.5 per-component VAE checkpoints (sc-18765)
+// ---------------------------------------------------------------------------------------------
+
+/// Read a checkpoint's `__metadata__.config` blob as JSON. LTX stamps the config as a JSON *string*
+/// in the safetensors metadata, so this is a parse, not a lookup.
+fn component_config(w: &Weights, what: &str) -> Result<serde_json::Value> {
+    let raw = w.metadata("config").ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx: {what} checkpoint carries no `__metadata__.config` (not an LTX component file?)"
+        ))
+    })?;
+    serde_json::from_str(raw).map_err(|e| Error::Msg(format!("ltx: parse {what} config: {e}")))
+}
+
+/// Convert LTX-2.5's **per-component VAE checkpoints** into the split-MLX components the shipped
+/// ports consume (sc-18765), writing them into `out_dir` alongside an `embedded_config.json`
+/// assembled from the components' own configs. Returns the emitted component names.
+///
+/// This is the same sanitize + channels-last transform [`convert_and_assemble`] applies to an
+/// LTX-2.3 all-in-one checkpoint; the only difference LTX-2.5 introduces is that the tensors sit at
+/// the file root rather than under `vae.` / alongside a transformer. The
+/// audio VAE and vocoder need no adaptation at all — LTX-2.5 keys them exactly as 2.3 does
+/// (`audio_vae.decoder.*`, `vocoder.vocoder.*`, `vocoder.bwe_generator.*`, `vocoder.mel_stft.*`).
+///
+/// `video_vae` may be either LTX-2.5 video VAE:
+///  - `CausalVideoAutoencoder` (the conv VAE) — encoder **and** a `vae_decoder` are emitted;
+///  - `CausalDiffusionVAE` (the DiffVAE) — the same conv encoder (differing solely in the declared
+///    `latent_log_var`) plus a **`vae_diffusion_decoder`** (sc-18766). The two decoders never share
+///    a component name: `vae_decoder` is the conv stack [`crate::vae::LtxVideoVae`] builds, and a
+///    directory where the two were interchangeable is one where a mis-selected file renders
+///    garbage rather than failing to load.
+///
+/// Selecting *which* component files make up a bundle is the loader's job (sc-18757); this function
+/// takes the paths it is given.
+pub fn convert_vae_components(
+    video_vae: impl AsRef<Path>,
+    audio_vae: Option<impl AsRef<Path>>,
+    out_dir: impl AsRef<Path>,
+) -> Result<Vec<String>> {
+    let out = out_dir.as_ref();
+    std::fs::create_dir_all(out)?;
+    let mut components: Vec<String> = Vec::new();
+    let mut embedded = serde_json::Map::new();
+
+    let video_path = video_vae.as_ref();
+    let raw = Weights::from_file(video_path)?;
+    let config = component_config(&raw, "video VAE")?;
+    let vae_block = config.get("vae").cloned().ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx: {} has no `config.vae` block",
+            video_path.display()
+        ))
+    })?;
+    // Parse it through the real config reader so an unknown `latent_log_var`, a nested DiffVAE
+    // encoder block, or an unsupported padding mode is an error here rather than at render time.
+    let _ = crate::config::LtxVaeConfig::from_embedded_vae(&vae_block)?;
+    let class = vae_block
+        .get("_class_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("CausalVideoAutoencoder");
+    let ns = VaeNamespace::detect(&raw);
+
+    let mut vae_encoder = sanitize_vae_encoder(&raw, ns)?;
+    if vae_encoder.is_empty() {
+        return Err(Error::Msg(format!(
+            "ltx: {} yielded no encoder tensors (expected `{}encoder.*`)",
+            video_path.display(),
+            ns.prefix()
+        )));
+    }
+    cast_floats_bf16(&mut vae_encoder)?;
+    save_component(out, "vae_encoder", &vae_encoder)?;
+    components.push("vae_encoder".into());
+    drop(vae_encoder);
+
+    match class {
+        "CausalVideoAutoencoder" => {
+            let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
+            if vae_decoder.is_empty() {
+                return Err(Error::Msg(format!(
+                    "ltx: {} declares {class} but yielded no decoder tensors",
+                    video_path.display()
+                )));
+            }
+            cast_floats_bf16(&mut vae_decoder)?;
+            save_component(out, "vae_decoder", &vae_decoder)?;
+            components.push("vae_decoder".into());
+        }
+        "CausalDiffusionVAE" => {
+            // The decoder is an `NADiffusionDecoder` (sc-18766), emitted under its own component
+            // name. `sanitize_vae_decoder` needs no special case: its tensors are all rank-2
+            // Linears, so the conv channels-last transpose is inert on them, and the
+            // `per_channel_statistics` remap is the same one the conv decoder wants.
+            let mut vae_decoder = sanitize_vae_decoder(&raw, ns)?;
+            // `sanitize_vae_decoder` also sweeps in the two `per_channel_statistics` tensors, so
+            // "not empty" is not the same as "has a decoder": classify through `crate::diff_vae`'s
+            // own predicate, the one the loader uses, rather than re-deriving it here.
+            if !crate::diff_vae::keys_look_like_diffusion_decoder(
+                vae_decoder.keys().map(String::as_str),
+            ) {
+                return Err(Error::Msg(format!(
+                    "ltx: {} declares {class} but carries no `decoder.det_stages.*` / \
+                     `decoder.diff_blocks.*` tensors",
+                    video_path.display()
+                )));
+            }
+            // Parse before writing: an unreadable `vae.decoder` block would otherwise produce a
+            // component file no loader can build a decoder from.
+            let _ = crate::diff_vae::NaDiffusionDecoderConfig::from_embedded_vae(&vae_block)?;
+            cast_floats_bf16(&mut vae_decoder)?;
+            save_component(
+                out,
+                crate::diff_vae::DIFFUSION_DECODER_COMPONENT,
+                &vae_decoder,
+            )?;
+            components.push(crate::diff_vae::DIFFUSION_DECODER_COMPONENT.into());
+        }
+        other => {
+            return Err(Error::Msg(format!(
+                "ltx: unsupported video VAE class {other:?} in {} (expected \
+                 CausalVideoAutoencoder or CausalDiffusionVAE)",
+                video_path.display()
+            )));
+        }
+    }
+    embedded.insert("vae".into(), vae_block);
+    drop(raw);
+
+    if let Some(audio_path) = audio_vae.as_ref().map(AsRef::as_ref) {
+        let raw = Weights::from_file(audio_path)?;
+        let config = component_config(&raw, "audio VAE")?;
+        for section in ["audio_vae", "vocoder"] {
+            let block = config.get(section).cloned().ok_or_else(|| {
+                Error::Msg(format!(
+                    "ltx: {} has no `config.{section}` block",
+                    audio_path.display()
+                ))
+            })?;
+            embedded.insert(section.into(), block);
+        }
+        let mut audio = sanitize_audio_vae(&raw)?;
+        if audio.is_empty() {
+            return Err(Error::Msg(format!(
+                "ltx: {} yielded no `audio_vae.decoder.*` tensors",
+                audio_path.display()
+            )));
+        }
+        cast_floats_bf16(&mut audio)?;
+        save_component(out, "audio_vae", &audio)?;
+        components.push("audio_vae".into());
+        drop(audio);
+
+        let mut vocoder = sanitize_vocoder(&raw)?;
+        cast_floats_bf16(&mut vocoder)?;
+        save_component(out, "vocoder", &vocoder)?;
+        components.push("vocoder".into());
+    }
+
+    write_json(
+        out.join("embedded_config.json"),
+        &serde_json::Value::Object(embedded),
+    )?;
+    write_json(
+        out.join("split_model.json"),
+        &serde_json::json!({
+            "format": "split",
+            "components": components,
+            "source": video_path.display().to_string(),
+        }),
+    )?;
+    Ok(components)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The component builders, shared with the LTX-2.5 tier converter (sc-18775)
+// ---------------------------------------------------------------------------------------------
+//
+// [`crate::tiers`] applies the *same* sanitizers to LTX-2.5's split components that this module
+// applies to a 2.3 all-in-one checkpoint — that equivalence is the sc-18765 finding and the reason
+// the 2.5 ports are the 2.3 ports. These wrappers are the seam: one implementation, two callers,
+// with the video-VAE namespace detected rather than passed, because a 2.5 caller always has a
+// component file and a 2.3 caller always has a bundled one.
+
+/// [`sanitize_transformer`], for the tier converter.
+pub(crate) fn sanitize_transformer_component(raw: &Weights) -> HashMap<String, Array> {
+    sanitize_transformer(raw)
+}
+
+/// [`build_connector`], for the tier converter. On an LTX-2.5 transformer this yields the two
+/// `{video,audio}_embeddings_connector.*` towers; the `text_embedding_projection.*` Linears the 2.3
+/// checkpoint kept here moved into the 2.5 text-encoder file, so they simply do not appear.
+pub(crate) fn build_connector_component(raw: &Weights) -> HashMap<String, Array> {
+    build_connector(raw)
+}
+
+/// [`sanitize_vae_decoder`] with the namespace detected from the key set.
+pub(crate) fn sanitize_vae_decoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vae_decoder(raw, VaeNamespace::detect(raw))
+}
+
+/// [`sanitize_vae_encoder`] with the namespace detected from the key set.
+pub(crate) fn sanitize_vae_encoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vae_encoder(raw, VaeNamespace::detect(raw))
+}
+
+/// [`sanitize_audio_vae`], for the tier converter.
+pub(crate) fn sanitize_audio_vae_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_audio_vae(raw)
+}
+
+/// [`sanitize_vocoder`], for the tier converter.
+pub(crate) fn sanitize_vocoder_component(raw: &Weights) -> Result<HashMap<String, Array>> {
+    sanitize_vocoder(raw)
+}
+
+/// [`cast_floats_bf16`], for the tier converter.
+pub(crate) fn cast_component_floats_bf16(map: &mut HashMap<String, Array>) -> Result<()> {
+    cast_floats_bf16(map)
+}
+
 /// Pretty-print a JSON value to `path` (matching the reference `json.dump(..., indent=2)`).
 fn write_json(path: PathBuf, value: &serde_json::Value) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
@@ -697,7 +990,7 @@ mod tests {
     fn quant_predicate_selects_reference_linears() {
         let q = |k: &str| {
             k.strip_suffix(".weight")
-                .is_some_and(|b| QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)))
+                .is_some_and(|b| TRANSFORMER_QUANT_SUFFIXES.iter().any(|s| b.ends_with(s)))
         };
         // Quantized.
         for k in [
@@ -810,6 +1103,134 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[2, 3, 4, 5]
+        );
+    }
+
+    /// **Regression guard for the sc-18765 namespace refactor.** The video-VAE sanitizers used to
+    /// hardcode the `vae.` prefix; they now take it from [`VaeNamespace`]. This pins the LTX-2.3
+    /// (`Bundled`) behaviour that the byte-parity goldens cover but that needs real checkpoints to
+    /// exercise: the `vae.` prefix and the half are stripped, the two statistics are renamed to each
+    /// half's own spelling, `position_ids` and every non-`vae.` key are dropped, and the audio VAE's
+    /// identically-suffixed statistics are NOT pulled into the video components.
+    #[test]
+    fn bundled_namespace_sanitizers_keep_the_2_3_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = |o: i32, i: i32| Array::ones::<f32>(&[o, i, 3, 3, 3]).unwrap();
+        let vec1 = |n: i32| Array::ones::<f32>(&[n]).unwrap();
+        let w = Weights::from_file(write_tmp(
+            &tmp,
+            &[
+                ("vae.decoder.conv_in.conv.weight", conv(8, 4)),
+                (
+                    "vae.decoder.up_blocks.0.res_blocks.0.conv1.conv.bias",
+                    vec1(8),
+                ),
+                ("vae.encoder.conv_out.conv.weight", conv(5, 8)),
+                (
+                    "vae.encoder.down_blocks.0.res_blocks.0.conv2.conv.bias",
+                    vec1(8),
+                ),
+                ("vae.per_channel_statistics.mean-of-means", vec1(4)),
+                ("vae.per_channel_statistics.std-of-means", vec1(4)),
+                // Dropped: not `vae.`, or explicitly excluded.
+                ("vae.decoder.position_ids", vec1(2)),
+                ("audio_vae.per_channel_statistics.mean-of-means", vec1(4)),
+                ("vocoder.vocoder.conv_pre.bias", vec1(4)),
+                (
+                    "model.diffusion_model.transformer_blocks.0.attn1.to_q.weight",
+                    vec1(4),
+                ),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(VaeNamespace::detect(&w), VaeNamespace::Bundled);
+
+        let mut dec: Vec<String> = sanitize_vae_decoder(&w, VaeNamespace::Bundled)
+            .unwrap()
+            .into_keys()
+            .collect();
+        dec.sort();
+        assert_eq!(
+            dec,
+            vec![
+                "conv_in.conv.weight",
+                "per_channel_statistics.mean",
+                "per_channel_statistics.std",
+                "up_blocks.0.res_blocks.0.conv1.conv.bias",
+            ]
+        );
+
+        let mut enc: Vec<String> = sanitize_vae_encoder(&w, VaeNamespace::Bundled)
+            .unwrap()
+            .into_keys()
+            .collect();
+        enc.sort();
+        assert_eq!(
+            enc,
+            vec![
+                "conv_out.conv.weight",
+                "down_blocks.0.res_blocks.0.conv2.conv.bias",
+                "per_channel_statistics._mean_of_means",
+                "per_channel_statistics._std_of_means",
+            ]
+        );
+
+        // Conv3d weights are transposed to the channels-last MLX layout on the way out.
+        let out = sanitize_vae_decoder(&w, VaeNamespace::Bundled).unwrap();
+        assert_eq!(out["conv_in.conv.weight"].shape(), &[8, 3, 3, 3, 4]);
+
+        // The same file read in the WRONG namespace yields nothing — the prefix is load-bearing,
+        // not incidental.
+        assert!(sanitize_vae_decoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A `Component`-namespace file is detected as such and maps onto the same 2.3 component
+    /// spellings (the LTX-2.5 shape). The full 170-key version of this runs in
+    /// `tests/ltx_2_5_vae_conformance.rs`; this pins the detection + mapping without the fixture.
+    #[test]
+    fn component_namespace_maps_onto_the_same_2_3_spellings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv = |o: i32, i: i32| Array::ones::<f32>(&[o, i, 3, 3, 3]).unwrap();
+        let vec1 = |n: i32| Array::ones::<f32>(&[n]).unwrap();
+        let w = Weights::from_file(write_tmp(
+            &tmp,
+            &[
+                ("decoder.conv_in.conv.weight", conv(8, 4)),
+                ("encoder.conv_out.conv.weight", conv(5, 8)),
+                ("per_channel_statistics.mean-of-means", vec1(4)),
+                ("per_channel_statistics.std-of-means", vec1(4)),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(VaeNamespace::detect(&w), VaeNamespace::Component);
+
+        let mut dec: Vec<String> = sanitize_vae_decoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .into_keys()
+            .collect();
+        dec.sort();
+        assert_eq!(
+            dec,
+            vec![
+                "conv_in.conv.weight",
+                "per_channel_statistics.mean",
+                "per_channel_statistics.std",
+            ]
+        );
+        let mut enc: Vec<String> = sanitize_vae_encoder(&w, VaeNamespace::Component)
+            .unwrap()
+            .into_keys()
+            .collect();
+        enc.sort();
+        assert_eq!(
+            enc,
+            vec![
+                "conv_out.conv.weight",
+                "per_channel_statistics._mean_of_means",
+                "per_channel_statistics._std_of_means",
+            ]
         );
     }
 

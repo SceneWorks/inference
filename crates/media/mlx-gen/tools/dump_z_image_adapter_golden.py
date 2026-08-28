@@ -14,12 +14,17 @@ its render px>8 against this golden — so the adapter file is the shared input,
 variables.
 """
 
+import gc
 import math
 import os
 
 import mlx.core as mx
 import numpy as np
-from _adapter_parity_provenance import assert_frozen_mflux, golden_metadata, sha256
+from _adapter_parity_provenance import (
+    assert_frozen_mflux,
+    golden_metadata,
+    sha256,
+)
 from mflux.models.common.config.model_config import ModelConfig
 from mflux.models.common.schedulers.flow_match_euler_discrete_scheduler import (
     FlowMatchEulerDiscreteScheduler as S,
@@ -31,11 +36,16 @@ from mflux.utils.image_util import ImageUtil
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
-MODEL_REPOSITORY = "Tongyi-MAI/Z-Image-Turbo"
-MODEL_REVISION = os.environ.get(
-    "ZIMAGE_REFERENCE_REVISION", "f332072aa78be7aecdf3ee76d5c247082da564a6"
+MODEL_REPOSITORY = os.environ.get(
+    "ZIMAGE_REFERENCE_REPOSITORY", "SceneWorks/z-image-turbo-mlx"
 )
+MODEL_REVISION = os.environ.get(
+    "ZIMAGE_REFERENCE_REVISION", "bb2bc9893b3c49ae96c813350775f791a2e8bc80"
+)
+MODEL_SUBDIRECTORY = os.environ.get("ZIMAGE_REFERENCE_SUBDIRECTORY", "bf16")
+MODEL_REFERENCE = os.environ.get("ZIMAGE_REFERENCE_REF", "main")
 MODEL_PATH = os.environ.get("ZIMAGE_REFERENCE_MODEL", MODEL_REPOSITORY)
+MLX_CACHE_LIMIT_GB = float(os.environ.get("ZIMAGE_MLX_CACHE_LIMIT_GB", "2.5"))
 BUILD_ADAPTERS_ONLY = os.environ.get("BUILD_ADAPTERS_ONLY") == "1"
 assert_frozen_mflux()
 
@@ -60,6 +70,24 @@ def _rng(seed):
     return np.random.default_rng(seed)
 
 
+def configure_low_peak():
+    if MLX_CACHE_LIMIT_GB <= 0:
+        raise ValueError("MLX cache limit must be positive")
+    cache_limit_bytes = int(MLX_CACHE_LIMIT_GB * (1000**3))
+    mx.set_cache_limit(cache_limit_bytes)
+    mx.clear_cache()
+    mx.reset_peak_memory()
+
+
+def release_text_encoder(model, cap_feats):
+    mx.eval(cap_feats)
+    if not hasattr(model, "text_encoder") or model.text_encoder is None:
+        raise RuntimeError("Z-Image text encoder was unavailable before prompt release")
+    model.text_encoder = None
+    gc.collect()
+    mx.clear_cache()
+
+
 def adapter_metadata(kind):
     return {
         "artifact_role": "adapter",
@@ -69,6 +97,8 @@ def adapter_metadata(kind):
             model_path=MODEL_PATH,
             model_repository=MODEL_REPOSITORY,
             model_revision=MODEL_REVISION,
+            model_subdirectory=MODEL_SUBDIRECTORY,
+            model_reference=MODEL_REFERENCE,
         ),
     }
 
@@ -115,6 +145,7 @@ def render(adapter_path):
         pass
 
     model = Holder()
+    configure_low_peak()
     ZImageInitializer.init(
         model,
         model_config=ModelConfig.z_image_turbo(),
@@ -127,6 +158,7 @@ def render(adapter_path):
     tout = tok.tokenize(PROMPT)
     num_valid = int(mx.sum(tout.attention_mask[0]).item())
     cap_feats = PromptEncoder.encode_prompt(PROMPT, tok, model.text_encoder)
+    release_text_encoder(model, cap_feats)
 
     mu = math.log(3.0)
     sigmas = mx.linspace(1.0, 1.0 / STEPS, STEPS)
@@ -167,6 +199,8 @@ for kind, builder in [("lora", build_lora), ("lokr", build_lokr)]:
                 model_path=MODEL_PATH,
                 model_repository=MODEL_REPOSITORY,
                 model_revision=MODEL_REVISION,
+                model_subdirectory=MODEL_SUBDIRECTORY,
+                model_reference=MODEL_REFERENCE,
             ),
         },
     )

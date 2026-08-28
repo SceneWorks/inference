@@ -1,3 +1,4 @@
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -27,6 +28,120 @@ SPEC.loader.exec_module(VERIFY)
 
 
 class AdapterParityArtifactProvenanceTest(unittest.TestCase):
+    def load_z_image_low_peak_functions(self, script, namespace):
+        parsed = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        functions = [
+            node
+            for node in parsed.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"configure_low_peak", "release_text_encoder"}
+        ]
+        self.assertEqual({node.name for node in functions}, {"configure_low_peak", "release_text_encoder"})
+        module = ast.Module(body=functions, type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(script), "exec"), namespace)
+        return namespace["configure_low_peak"], namespace["release_text_encoder"]
+
+    def test_z_image_low_peak_policy_materializes_features_before_releasing_encoder(self):
+        class FakeMx:
+            def __init__(self):
+                self.calls = []
+
+            def set_cache_limit(self, value):
+                self.calls.append(("set_cache_limit", value))
+
+            def clear_cache(self):
+                self.calls.append(("clear_cache",))
+
+            def reset_peak_memory(self):
+                self.calls.append(("reset_peak_memory",))
+
+            def eval(self, value):
+                self.calls.append(("eval", value))
+
+        class FakeGc:
+            def __init__(self):
+                self.calls = 0
+
+            def collect(self):
+                self.calls += 1
+
+        class Model:
+            pass
+
+        for script_name in ("dump_z_image_golden.py", "dump_z_image_adapter_golden.py"):
+            with self.subTest(script=script_name):
+                mx = FakeMx()
+                gc = FakeGc()
+                configure, release = self.load_z_image_low_peak_functions(
+                    TOOLS / script_name,
+                    {"mx": mx, "gc": gc, "MLX_CACHE_LIMIT_GB": 2.5},
+                )
+                model = Model()
+                model.text_encoder = object()
+                model.transformer = object()
+                model.vae = object()
+                model.tokenizers = {"z_image": object()}
+                model.adapters = [object()]
+                feature_tensor = object()
+                transformer = model.transformer
+                vae = model.vae
+                tokenizers = model.tokenizers
+                adapters = model.adapters
+
+                configure()
+                self.assertEqual(mx.calls[0], ("set_cache_limit", 2_500_000_000))
+                release(model, feature_tensor)
+                self.assertIsNone(model.text_encoder)
+                self.assertIs(model.transformer, transformer)
+                self.assertIs(model.vae, vae)
+                self.assertIs(model.tokenizers, tokenizers)
+                self.assertIs(model.adapters, adapters)
+                self.assertEqual(gc.calls, 1)
+                self.assertLess(
+                    mx.calls.index(("eval", feature_tensor)),
+                    mx.calls.index(("clear_cache",), 4),
+                )
+
+    def test_z_image_low_peak_policy_rejects_nonpositive_cache_or_missing_encoder(self):
+        class FakeMx:
+            def set_cache_limit(self, value):
+                pass
+
+            def clear_cache(self):
+                pass
+
+            def reset_peak_memory(self):
+                pass
+
+            def eval(self, value):
+                pass
+
+        class FakeGc:
+            def collect(self):
+                pass
+
+        class Model:
+            text_encoder = None
+
+        for script_name in ("dump_z_image_golden.py", "dump_z_image_adapter_golden.py"):
+            with self.subTest(script=script_name):
+                mx = FakeMx()
+                configure, release = self.load_z_image_low_peak_functions(
+                    TOOLS / script_name,
+                    {"mx": mx, "gc": FakeGc(), "MLX_CACHE_LIMIT_GB": 0},
+                )
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    configure()
+                with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                    release(Model(), object())
+
+    def test_qwen_adapter_generator_requires_one_isolated_kind(self):
+        source = (TOOLS / "dump_qwen_adapter_golden.py").read_text(encoding="utf-8")
+        self.assertIn('ADAPTER_KIND = os.environ.get("QWEN_ADAPTER_KIND")', source)
+        self.assertIn('ADAPTER_KIND not in {"lora", "lokr"}', source)
+        self.assertIn("QWEN_ADAPTER_KIND=lora or QWEN_ADAPTER_KIND=lokr", source)
+        self.assertIn('builder = {"lora": build_lora, "lokr": build_lokr}[ADAPTER_KIND]', source)
+
     def write_safetensors(self, path, metadata):
         header = json.dumps(
             {
@@ -91,6 +206,7 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
                 result["zero_residual_samples_gt8"] = 2
                 result["residual_cap"] = 1
             else:
+                result["acceptance_effect_samples_gt8"] = 2
                 result["effect_gate"].update(
                     {
                         "status": "locked",
@@ -153,6 +269,59 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         with self.assertRaisesRegex(VERIFY.InvalidManifest, "floor-relative formula"):
             VERIFY.validate_manifest(manifest, TOOLS)
 
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lora"]
+        q_result["acceptance_effect_samples_gt8"] = 0
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "invalid acceptance effect"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+    def test_qwen_acceptance_and_diagnostic_effect_maps_cannot_substitute_each_other(self):
+        manifest = self.valid_manifest()
+        q_result = manifest["results"]["fork_parity"]["qwen_lokr"]
+        q_result["acceptance_effect_samples_gt8"] = 5
+        q_result["effect_gate"]["effect_samples_gt8"] = 3
+        q_result["effect_gate"]["minimum_samples_gt8"] = 1
+
+        acceptance = VERIFY.expected_result_measurements(manifest)
+        diagnostic = VERIFY.expected_qwen_effect_diagnostic_measurements(manifest)
+        self.assertEqual(acceptance["qwen_lokr"]["effect_samples_gt8"], 5)
+        self.assertEqual(diagnostic["qwen_lokr"]["effect_samples_gt8"], 3)
+
+        differences = VERIFY.differing_json_paths(
+            acceptance,
+            {
+                **acceptance,
+                "qwen_lokr": {
+                    **acceptance["qwen_lokr"],
+                    "effect_samples_gt8": 3,
+                },
+            },
+        )
+        self.assertEqual(
+            differences,
+            [
+                {
+                    "path": "qwen_lokr.effect_samples_gt8",
+                    "expected": 5,
+                    "actual": 3,
+                }
+            ],
+        )
+
+    def test_diagnostic_evidence_requires_sealed_transcript_and_receipt_for_every_mode(self):
+        manifest = self.valid_manifest()
+        manifest["results"]["evidence"]["diagnostics"].pop("residual_diagnostic")
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "diagnostic evidence inventory"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
+        manifest = self.valid_manifest()
+        receipt = manifest["results"]["evidence"]["diagnostics"]["qwen_effect_diagnostic"][
+            "receipt"
+        ]
+        receipt["sha256"] = "PENDING"
+        with self.assertRaisesRegex(VERIFY.InvalidManifest, "qwen_effect_diagnostic receipt sha256"):
+            VERIFY.validate_manifest(manifest, TOOLS)
+
     def test_pending_qwen_effect_gate_cannot_fabricate_measurement(self):
         manifest = copy.deepcopy(VERIFY.load_manifest())
         evidence = manifest["results"]["evidence"]
@@ -161,6 +330,10 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         for record in (evidence["transcript"], evidence["receipt"]):
             record["bytes"] = -1
             record["sha256"] = "PENDING"
+        for diagnostic in evidence["diagnostics"].values():
+            for record in diagnostic.values():
+                record["bytes"] = -1
+                record["sha256"] = "PENDING"
         for result in manifest["results"]["fork_parity"].values():
             if not result.get("effect_gate"):
                 continue
@@ -368,7 +541,12 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         expected_base = RECORDER.proof_environment()
         for run in runs:
             self.assertIn("--exact", run["argv"])
-            self.assertIn("residual_mutation_diagnostic", run["argv"])
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertIn(
+                "adapter_real_weights::residual_mutation_diagnostic",
+                run["argv"],
+            )
             self.assertEqual(
                 {key: run["env"][key] for key in expected_base},
                 expected_base,
@@ -377,11 +555,38 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         effect_runs = RECORDER.qwen_effect_diagnostic_runs(self.valid_manifest())
         self.assertEqual([run["name"] for run in effect_runs], ["qwen_effect_diagnostic"])
         self.assertIn("--exact", effect_runs[0]["argv"])
-        self.assertIn("adapter_effect_diagnostic", effect_runs[0]["argv"])
+        target_index = effect_runs[0]["argv"].index("--test")
+        self.assertEqual(effect_runs[0]["argv"][target_index + 1], "integration")
+        self.assertIn(
+            "adapter_real_weights::adapter_effect_diagnostic",
+            effect_runs[0]["argv"],
+        )
         self.assertEqual(
             {key: effect_runs[0]["env"][key] for key in expected_base},
             expected_base,
         )
+
+    def test_acceptance_uses_integration_targets_with_module_qualified_exact_filters(self):
+        runs = RECORDER.expected_runs(self.valid_manifest())
+        expected_filters = {
+            "hyper_flux_scale_zero": (
+                "hyper_flux_real_weights::hyper_flux_scale_zero_is_bit_exact_noop"
+            ),
+            "z_image_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "z_image_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+            "qwen_lora": "adapter_real_weights::lora_render_matches_fork_golden",
+            "qwen_lokr": "adapter_real_weights::lokr_render_matches_fork_golden",
+        }
+        self.assertEqual({run["name"] for run in runs}, set(expected_filters))
+        for run in runs:
+            target_index = run["argv"].index("--test")
+            self.assertEqual(run["argv"][target_index + 1], "integration")
+            self.assertEqual(run["argv"][target_index + 2], expected_filters[run["name"]])
+            self.assertIn("--exact", run["argv"])
+            self.assertEqual(
+                run["env"]["CARGO_TARGET_DIR"],
+                str(RECORDER.ROOT / "target" / "sc-21781-adapter-parity"),
+            )
 
     def test_diagnostics_refuse_reserved_output_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -739,6 +944,7 @@ class AdapterParityArtifactProvenanceTest(unittest.TestCase):
         transcript = {
             "schema": 2,
             "story": "sc-15505",
+            "mode": "acceptance",
             "source": source,
             "source_after": source,
             "execution": execution,

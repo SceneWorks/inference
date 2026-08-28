@@ -14,6 +14,12 @@
 #[allow(dead_code)]
 mod common;
 
+#[path = "architecture_forward.rs"]
+mod architecture_forward;
+
+#[path = "architecture_regression.rs"]
+mod architecture_regression;
+
 #[path = "batch.rs"]
 mod batch;
 
@@ -32,6 +38,18 @@ mod continuous;
 #[path = "contract_roundtrip.rs"]
 mod contract_roundtrip;
 
+#[path = "gemma4_decoder.rs"]
+mod gemma4_decoder;
+
+#[path = "gemma4_primitives.rs"]
+mod gemma4_primitives;
+
+#[path = "gemma4_real_weights.rs"]
+mod gemma4_real_weights;
+
+#[path = "gemma4_sequential_residency.rs"]
+mod gemma4_sequential_residency;
+
 #[path = "gguf.rs"]
 mod gguf;
 
@@ -40,6 +58,9 @@ mod gguf_tokenizer;
 
 #[path = "joycaption.rs"]
 mod joycaption;
+
+#[path = "ltx_2_5_te_tier_quality.rs"]
+mod ltx_2_5_te_tier_quality;
 
 #[path = "paged.rs"]
 mod paged;

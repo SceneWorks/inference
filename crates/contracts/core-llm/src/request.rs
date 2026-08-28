@@ -134,6 +134,11 @@ impl TextLlmRequest {
         self.messages.iter().any(crate::message::Message::has_video)
     }
 
+    /// Whether any message carries audio content.
+    pub fn has_audio(&self) -> bool {
+        self.messages.iter().any(crate::message::Message::has_audio)
+    }
+
     /// The `enable_thinking` chat-template kwarg for this request's [`thinking`](Self::thinking)
     /// mode (`None` ⇒ omit it / use the template default). Feed into
     /// [`RenderOptions`](crate::template::RenderOptions).

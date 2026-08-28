@@ -251,8 +251,8 @@ fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
     let residual_differ = residual_px_gt8(&pixels, &no_adapter, &gimg.pixels, &fork_base);
     let zero_residual_control = px_gt8(&gimg.pixels, &fork_base);
     let residual_cap = match kind {
-        "lora" => 21_139,
-        "lokr" => 27_798,
+        "lora" => 19_763,
+        "lokr" => 27_074,
         _ => panic!("unsupported adapter golden kind {kind}"),
     };
     let pct = |n: usize| n as f64 / pixels.len() as f64 * 100.0;

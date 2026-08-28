@@ -72,6 +72,13 @@ thiserror = "2"
 serde_json = "1"
 safetensors = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Pure-Rust OpenEXR for the LTX-2.5 HDR lane (sc-18790). Scene-linear HDR frames are the render's
+# real output and EXR is the interchange format every compositor reads, so the codec belongs in the
+# tensor-free contract layer beside the colour math. Pure Rust (no OpenEXR/Imath C++ build) keeps
+# the Windows candle lane and the CUDA images buildable; BSD-3-Clause is already on the deny.toml
+# allow-list. A hand-rolled reader was rejected: conditioning EXRs come from third-party tools
+# (Nuke/Blender/Houdini) and may be tiled, PIZ- or DWA-compressed, or multi-part.
+exr = "1.74"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 rand = "0.9"
 rand_distr = "0.5"

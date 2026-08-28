@@ -606,6 +606,8 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_vision: true,
             // Single-image caption path only; no video support.
             supports_video: false,
+            // Text+vision captioner; no audio path at all.
+            supports_audio: false,
             supports_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
@@ -659,6 +661,9 @@ pub const REGISTRATION: core_llm::TextLlmRegistration = core_llm::TextLlmRegistr
     can_load,
     // The static descriptor already declares `supports_vision=true`; no per-snapshot probe needed.
     weightless_vision: None,
+    // LLaVA is a text+vision provider with no audio path; `supports_audio=false` holds for every
+    // snapshot its `can_load` claims.
+    weightless_audio: None,
 };
 
 fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {

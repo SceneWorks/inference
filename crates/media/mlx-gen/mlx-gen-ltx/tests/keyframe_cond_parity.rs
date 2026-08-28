@@ -32,6 +32,8 @@ fn base_state(c: i32) -> VideoTokenState {
         denoise_mask: Array::ones::<f32>(&[1, 1, 1]).unwrap(),
         positions: Array::zeros::<f32>(&[1, 3, 1, 2]).unwrap(),
         target_tokens: 1,
+        keyframes_mask: None,
+        generated_keyframe_layout: None,
     }
 }
 

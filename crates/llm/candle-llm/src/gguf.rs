@@ -72,6 +72,12 @@ impl GgufCheckpoint {
         let arch = meta_str(meta, "general.architecture")
             .ok_or_else(|| Error::Config("gguf: missing general.architecture".into()))?
             .to_string();
+        // Gemma 4 is deliberately refused rather than mapped (sc-18772): the safetensors path serves
+        // it fully, and a guessed GGUF mapping would mis-convert silently. See
+        // `GEMMA4_GGUF_REFUSAL`.
+        if arch == "gemma4" || arch == "gemma4_unified" {
+            return Err(Error::Unsupported(GEMMA4_GGUF_REFUSAL.to_string()));
+        }
         // llama.cpp interleaves q/k rows for the Llama/Mistral RoPE (`rope_type=NORM`); Qwen3 keeps
         // the HF half-split layout (`rope_type=NEOX`) and so is not permuted.
         let permute_qk = arch == "llama";
@@ -284,9 +290,37 @@ pub fn gguf_arch_to_hf(arch: &str) -> Option<(&'static str, &'static str)> {
     match arch {
         "llama" => Some(("llama", "LlamaForCausalLM")),
         "qwen3" => Some(("qwen3", "Qwen3ForCausalLM")),
+        // `gemma4` is knowingly absent: see `GEMMA4_GGUF_REFUSAL`. Returning `None` makes
+        // `can_load` decline a Gemma 4 GGUF up front, so `load_for_model` reports a clean
+        // `Unsupported` instead of routing it here to mis-convert.
         _ => None,
     }
 }
+
+/// Why a Gemma 4 GGUF is refused rather than converted (sc-18772).
+///
+/// Three things a converter would have to invent, none of which upstream has defined because
+/// llama.cpp ships no Gemma 4 export:
+///
+/// 1. **The 4-norm block.** [`remap_key`] maps `ffn_norm` -> `post_attention_layernorm`, correct for
+///    Llama's two-norm block. Gemma 4 has four norms, so that mapping would land the pre-FFN norm on
+///    the post-attention slot — a silent mis-conversion producing a loadable model that generates
+///    noise, not a load error.
+/// 2. **`layer_scalar`.** Every Gemma 4 decoder layer carries a per-layer scalar buffer with no GGML
+///    tensor name, so it cannot be round-tripped.
+/// 3. **The per-layer-type attention table.** `global_head_dim`, `num_global_key_value_heads`,
+///    `attention_k_eq_v`, and the dual (sliding 10k / full 1M proportional) RoPE schedule have no
+///    GGUF metadata keys, and full-attention layers ship no `attn_v` at all.
+///
+/// The safetensors path serves Gemma 4 completely, including q4/q8 quantize-on-load, so this refusal
+/// costs the ingestion route, not the model.
+pub const GEMMA4_GGUF_REFUSAL: &str = "GGUF architecture \"gemma4\": Gemma 4 is served through the \
+     safetensors snapshot path (including Q4/Q8 quantize-on-load), not GGUF. A GGUF converter would \
+     have to invent three mappings upstream has not defined — the four-norm sandwich block \
+     (`ffn_norm` would silently land on `post_attention_layernorm`), the per-layer `layer_scalar` \
+     buffer, and the per-layer-type attention table (`global_head_dim`, \
+     `num_global_key_value_heads`, `attention_k_eq_v`, the dual sliding/full RoPE schedule, and \
+     full-attention layers that ship no `attn_v`). Point the loader at the HF snapshot instead.";
 
 /// Map a GGML tensor name to the transformer (HF) key the decoder loads, or `None` if it is not a
 /// weight the engine consumes.
@@ -516,6 +550,36 @@ fn meta_i32_array(meta: &HashMap<String, Value>, key: &str) -> Option<Vec<i32>> 
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    /// `gguf_arch_to_hf` must NOT claim Gemma 4, so `can_load` declines a Gemma 4 GGUF up front and
+    /// `load_for_model` reports a clean `Unsupported` rather than routing it into a mis-conversion.
+    ///
+    /// The defect this guards is silent mis-conversion: `remap_key` recognizes every Gemma tensor
+    /// name it shares with Llama, and `ffn_norm` -> `post_attention_layernorm` would put Gemma's
+    /// pre-FFN norm on the post-attention slot. That "succeeds" and yields a model that generates
+    /// noise, so declining at the architecture gate is what keeps the failure loud.
+    #[test]
+    fn gemma4_gguf_is_declined_at_the_architecture_gate() {
+        assert!(
+            gguf_arch_to_hf("gemma4").is_none(),
+            "a Gemma 4 GGUF must not map onto the Llama tensor layout"
+        );
+        assert!(gguf_arch_to_hf("gemma4_unified").is_none());
+        // The architectures that ARE supported still map, so the decline is specific.
+        assert_eq!(
+            gguf_arch_to_hf("llama"),
+            Some(("llama", "LlamaForCausalLM"))
+        );
+        assert_eq!(
+            gguf_arch_to_hf("qwen3"),
+            Some(("qwen3", "Qwen3ForCausalLM"))
+        );
+        // The refusal text is actionable: it names the safetensors alternative and concrete missing
+        // mappings rather than just saying "unsupported".
+        assert!(GEMMA4_GGUF_REFUSAL.contains("safetensors"));
+        assert!(GEMMA4_GGUF_REFUSAL.contains("layer_scalar"));
+        assert!(GEMMA4_GGUF_REFUSAL.contains("post_attention_layernorm"));
+    }
 
     #[test]
     fn detects_gguf_paths() {

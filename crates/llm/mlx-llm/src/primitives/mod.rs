@@ -24,14 +24,17 @@ pub mod rope;
 pub mod sampler;
 pub mod weights;
 
-pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, AttnMask};
+pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_mask, AttnMask};
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use nn::{conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, soft_cap};
+pub use nn::{
+    conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
+    soft_cap,
+};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
-pub use projection::{Projection, QuantSpec};
+pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};

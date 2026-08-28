@@ -310,6 +310,12 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "candle the single-stage `ltx_2_3_distilled`, mlx the two-stage `ltx_2_3`. Both doc "
         "comments state which."
     ),
+    ("ltx", "MODEL_25_ID"): (
+        "LTX 2.5 deliberately preserves the same backend-split engine-id contract as 2.3: "
+        "candle registers `ltx_2_5_distilled`, while mlx registers `ltx_2_5`. Shortcut story "
+        "sc-18778 records these exact public ids, and SceneWorks maps the shared model to each "
+        "backend-specific id."
+    ),
     ("ltx", "CALIBRATION_FINGERPRINT"): (
         "a calibration identity is backend-specific: Candle names the released CUDA q4 I2V cell, "
         "while MLX names the Metal base/Eros I2V cell. Sharing a fingerprint would cross the "
@@ -642,6 +648,12 @@ CROSS_BACKEND_FIXTURE_FAMILIES: dict[str, str] = {
     "krea": (
         "six byte-identical fixtures, including `variant5_native_keys.txt`. Both lanes hand-type the "
         "tiny `Krea2Config` and `KreaTeConfig` the DiT and TE goldens are loaded through."
+    ),
+    "ltx": (
+        "two byte-identical fixtures — `ltx25_distilled_dit_tensors.json` (the real LTX-2.5 "
+        "distilled DiT header) and `ltx_duration_head_golden.safetensors`. Both lanes hand-type the "
+        "DiT depth and the two video-FFN bias widths the 2.3↔2.5 delta is reconstructed from, and "
+        "the duration-head golden's three modality case names and relative tolerance."
     ),
     "minimax-h3": (
         "five byte-identical safetensors goldens loaded through hand-typed video-VAE, audio-VAE and "
@@ -2630,7 +2642,8 @@ def check_cross_backend_geometry(metadata: dict, root: Path) -> None:
        values read out of the released checkpoint through diffusers, and both sides are held to them.
 
     4. **The test fixtures' geometry agrees too** (sc-19496). Every family in
-       ``CROSS_BACKEND_FIXTURE_FAMILIES`` — `anima`, `bernini`, `krea`, `minimax-h3`, `sana` — commits
+       ``CROSS_BACKEND_FIXTURE_FAMILIES`` — `anima`, `bernini`, `krea`, `ltx`, `minimax-h3`, `sana` —
+       commits
        fixture files byte-identically on both sides and loads them through geometry each lane
        hand-types, so a drift in either config leaves both lanes internally consistent and both parity
        suites green while the two backends compare a tensor dumped at one shape against a model built

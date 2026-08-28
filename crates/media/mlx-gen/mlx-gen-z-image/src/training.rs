@@ -1581,6 +1581,7 @@ mod validate_request_tests {
                     image_path: PathBuf::from(format!("img{i}.png")),
                     caption: "a cat".into(),
                     control_image_path: None,
+                    model_options: Default::default(),
                 })
                 .collect(),
             config: TrainingConfig {

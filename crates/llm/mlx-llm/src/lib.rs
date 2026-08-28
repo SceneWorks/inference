@@ -50,6 +50,7 @@ pub mod models;
 pub mod prepare;
 pub mod primitives;
 pub mod provider;
+pub mod residency;
 pub mod snapshot;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
@@ -65,15 +66,16 @@ pub use core_llm;
 
 pub use config::ModelConfig;
 pub use decode::{
-    generate, generate_batch, generate_cached, generate_continuous, generate_draft_speculative,
-    generate_prompt_lookup, generate_with_cache, BatchExactness, BatchRequest, CancelFlag,
-    ContinuousConfig, FinishReason, GenerationConfig, GenerationOutput, PrefixCache, PrefixStats,
-    SpeculativeConfig, SpeculativeStats, StreamEvent,
+    generate, generate_batch, generate_cached, generate_cached_with, generate_continuous,
+    generate_draft_speculative, generate_prompt_lookup, generate_with_cache, BatchExactness,
+    BatchRequest, CancelFlag, ContinuousConfig, FinishReason, GenerationConfig, GenerationOutput,
+    PrefixCache, PrefixStats, SpeculativeConfig, SpeculativeStats, StreamEvent,
 };
 pub use error::{Error, Result};
 pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
+pub use residency::{EncoderResidency, StreamObservation};
 pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
 
 /// Add every MLX LLM provider to an explicit registry builder.
