@@ -2,6 +2,8 @@
 //! [`Transform`](crate::transform::Transform): where weights come from, quantization +
 //! precision knobs, adapter specs, cooperative cancellation, and progress events.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -17,6 +19,23 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 #[derive(Debug)]
 struct SealHashWork(AtomicUsize);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_FULL_HASH_WORK: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_full_hash_work() {
+    THREAD_FULL_HASH_WORK.with(|work| work.set(work.get() + 1));
+}
+
+/// Current-thread full-content hash count for regression tests that must prove a path does not
+/// acquire an [`ArtifactSeal`]. This is test instrumentation only and is not artifact identity.
+#[cfg(test)]
+pub(crate) fn test_full_hash_work_count() -> usize {
+    THREAD_FULL_HASH_WORK.with(Cell::get)
+}
 
 #[cfg(test)]
 impl PartialEq for SealHashWork {
@@ -379,7 +398,10 @@ impl ArtifactSeal {
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
         #[cfg(test)]
-        pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
+        {
+            pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
+            record_full_hash_work();
+        }
         let sha256 = pinned.read_unchanged(hash_file_sha256)?;
         Ok(Self { sha256, ..pinned })
     }
@@ -417,7 +439,10 @@ impl ArtifactSeal {
 
     fn hash_content(&self, path: &Path) -> crate::Result<[u8; 32]> {
         #[cfg(test)]
-        self.hash_work.0.fetch_add(1, Ordering::Relaxed);
+        {
+            self.hash_work.0.fetch_add(1, Ordering::Relaxed);
+            record_full_hash_work();
+        }
         hash_file_sha256(path)
     }
 
