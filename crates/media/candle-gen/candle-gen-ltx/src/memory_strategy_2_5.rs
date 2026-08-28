@@ -33,6 +33,7 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 pub const ATTENTION_CHUNK_SIZES: &[u32] = &[67_108_864, 16_777_216];
 
 const CALIBRATION_FINGERPRINT: &str = "sc-18797-ltx-2-5-candle-ladder-v1";
+const CANDLE_REGISTRY_CALIBRATION_FINGERPRINT: &str = "sc-18797-ltx-2-5-candle-registry-v1";
 
 /// Request-local split-transformer construction choices after exact contract validation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -279,6 +280,7 @@ fn exact_load_receipt(
 fn build_contract(
     spec: &LoadSpec,
     asset_facts: MemoryAssetFacts,
+    calibration_fingerprint: &str,
 ) -> gen_core::Result<MemoryProviderContract> {
     let windowed = streamable(spec);
     let decode = bounded_decode(spec);
@@ -322,7 +324,7 @@ fn build_contract(
         },
         formula: MemoryFormulaKind::PhaseEnvelope { phases, variables },
         calibration: Some(MemoryCalibrationIdentity::new(
-            CALIBRATION_FINGERPRINT,
+            calibration_fingerprint,
             spec.load_shape,
         )),
         asset_facts,
@@ -341,14 +343,22 @@ fn memory_strategy_contract_for_bundle(
     spec: &LoadSpec,
     bundle: &gen_core::ltx_checkpoint::LtxBundle,
 ) -> gen_core::Result<MemoryProviderContract> {
-    build_contract(spec, exact_load_receipt(spec, bundle)?)
+    build_contract(
+        spec,
+        exact_load_receipt(spec, bundle)?,
+        CALIBRATION_FINGERPRINT,
+    )
 }
 
 fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     // Registry surfaces are executable shape declarations, not installed artifacts. Keeping the
     // physical receipt zero is the explicit gen-core convention for such fixtures; production
     // registration never calls this callback.
-    build_contract(spec, MemoryAssetFacts::default())
+    build_contract(
+        spec,
+        MemoryAssetFacts::default(),
+        CANDLE_REGISTRY_CALIBRATION_FINGERPRINT,
+    )
 }
 
 /// Bind a shared selection to the exact numeric tier the provider loaded.
@@ -472,7 +482,16 @@ fn registered_safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
-    match memory_strategy_contract(spec) {
+    let fixture = contract
+        .calibration
+        .as_ref()
+        .is_some_and(|identity| identity.fingerprint == CANDLE_REGISTRY_CALIBRATION_FINGERPRINT);
+    let expected = if fixture {
+        weights_free_contract(spec)
+    } else {
+        memory_strategy_contract(spec)
+    };
+    match expected {
         Ok(expected) if expected == *contract => match resolved_numeric_tier(spec) {
             Ok(tier) => safety_check(
                 contract,
@@ -1015,6 +1034,10 @@ mod tests {
             ),
             MemorySafetyDecision::Accept
         );
+        assert_eq!(
+            registered_safety_check(&load, &contract, &context),
+            MemorySafetyDecision::Accept
+        );
         let mut wrong_overlay = context;
         wrong_overlay.overlay = Some("adapters:wrong".into());
         assert!(matches!(
@@ -1234,6 +1257,10 @@ mod tests {
             ),
             MemorySafetyDecision::Accept
         );
+        assert_eq!(
+            registered_safety_check(&load, &contract, context),
+            MemorySafetyDecision::Accept
+        );
         let mut wrong_tier = context.clone();
         wrong_tier.selection.tier.quant = None;
         assert!(matches!(
@@ -1247,6 +1274,10 @@ mod tests {
         ));
         let mut wrong_contract = contract.clone();
         wrong_contract.provider_id.push_str("-mutated");
+        assert!(matches!(
+            registered_safety_check(&load, &wrong_contract, context),
+            MemorySafetyDecision::Reject { .. }
+        ));
         assert!(registered_begin_request(&load, &wrong_contract, context).is_err());
     }
 
@@ -1264,6 +1295,8 @@ mod tests {
         .build()
         .unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
+        let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        gen_core_testkit::memory_strategy_registry_conformance(&registry, &generic);
     }
 
     #[test]
