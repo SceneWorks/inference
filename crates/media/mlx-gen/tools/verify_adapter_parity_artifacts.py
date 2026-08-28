@@ -23,8 +23,13 @@ from record_adapter_parity_transcript import (
     model_inventories,
     parsed_results,
     proof_environment,
+    qwen_effect_diagnostic_runs,
+    residual_diagnostic_runs,
     receipt_for,
     source_state,
+    validate_qwen_effect_results,
+    validate_residual_run_results,
+    validate_shared_residual_sample_count,
 )
 
 TOOLS = Path(__file__).resolve().parent
@@ -50,6 +55,10 @@ REQUIRED_PARITY_RESULTS = {
     "z_image_lokr",
     "qwen_lora",
     "qwen_lokr",
+}
+REQUIRED_DIAGNOSTIC_EVIDENCE = {
+    "residual_diagnostic",
+    "qwen_effect_diagnostic",
 }
 REFERENCE_MATCH_FIELDS = {
     "reference_mflux_repository",
@@ -184,7 +193,7 @@ def validate_manifest(manifest: dict, tools: Path = TOOLS) -> None:
     _require(manifest.get("schema") == 1, "schema must be 1")
     _require(manifest.get("story") == "sc-15505", "story must be sc-15505")
     _require(
-        manifest.get("implementation_base") == "8b1f1bdb37e449778d3a2110425dbe1ec5cb0c8b",
+        manifest.get("implementation_base") == "482f18e04b5fab3e3bae72b14682a40252b66dcc",
         "wrong inference implementation base",
     )
     reference = manifest.get("reference", {})
@@ -216,30 +225,41 @@ def validate_manifest(manifest: dict, tools: Path = TOOLS) -> None:
         evidence_status in {"verified", "diagnostic_pending", "acceptance_pending"},
         "invalid evidence status",
     )
-    transcript = evidence.get("transcript", {})
-    _require(bool(transcript.get("local_path")), "missing result transcript path")
-    receipt = evidence.get("receipt", {})
-    _require(bool(receipt.get("local_path")), "missing durable receipt path")
+    acceptance_records = {
+        "result transcript": evidence.get("transcript", {}),
+        "durable receipt": evidence.get("receipt", {}),
+    }
+    diagnostics = evidence.get("diagnostics", {})
+    _require(
+        set(diagnostics) == REQUIRED_DIAGNOSTIC_EVIDENCE,
+        "diagnostic evidence inventory mismatch",
+    )
+    for name, diagnostic in diagnostics.items():
+        _require(
+            set(diagnostic) == {"transcript", "receipt"},
+            f"{name}: diagnostic evidence schema mismatch",
+        )
+        acceptance_records.update(
+            {
+                f"{name} transcript": diagnostic["transcript"],
+                f"{name} receipt": diagnostic["receipt"],
+            }
+        )
     if evidence_status == "verified":
-        _require(
-            type(transcript.get("bytes")) is int and transcript["bytes"] > 0,
-            "invalid result transcript bytes",
-        )
-        _require(
-            HEX64.fullmatch(transcript.get("sha256", "")) is not None,
-            "invalid result transcript sha256",
-        )
-        _require(
-            type(receipt.get("bytes")) is int and receipt["bytes"] > 0,
-            "invalid durable receipt bytes",
-        )
-        _require(
-            HEX64.fullmatch(receipt.get("sha256", "")) is not None,
-            "invalid durable receipt sha256",
-        )
+        for label, record in acceptance_records.items():
+            _require(bool(record.get("local_path")), f"missing {label} path")
+            _require(
+                type(record.get("bytes")) is int and record["bytes"] > 0,
+                f"invalid {label} bytes",
+            )
+            _require(
+                HEX64.fullmatch(record.get("sha256", "")) is not None,
+                f"invalid {label} sha256",
+            )
     else:
         _require(bool(evidence.get("pending_reason")), "missing diagnostic pending reason")
-        for label, record in (("transcript", transcript), ("receipt", receipt)):
+        for label, record in acceptance_records.items():
+            _require(bool(record.get("local_path")), f"missing pending {label} path")
             _require(record.get("bytes") == -1, f"pending {label} must not claim byte size")
             _require(record.get("sha256") == "PENDING", f"pending {label} must not claim hash")
     hyper = results.get("hyper_flux_scale_zero", {})
@@ -251,7 +271,7 @@ def validate_manifest(manifest: dict, tools: Path = TOOLS) -> None:
         provider_fields = (
             {"residual_samples_gt8", "zero_residual_samples_gt8", "residual_cap"}
             if name.startswith("z_image_")
-            else {"effect_gate"}
+            else {"acceptance_effect_samples_gt8", "effect_gate"}
         )
         _require(
             set(result) == common_fields | provider_fields,
@@ -295,6 +315,11 @@ def validate_manifest(manifest: dict, tools: Path = TOOLS) -> None:
             continue
 
         gate = result["effect_gate"]
+        acceptance_effect = result["acceptance_effect_samples_gt8"]
+        _require(
+            type(acceptance_effect) is int and 0 < acceptance_effect <= result["rgb_samples"],
+            f"{name}: invalid acceptance effect",
+        )
         expected_applied = 24 if name == "qwen_lora" else 21
         common_gate = {
             "status",
@@ -490,6 +515,8 @@ def verify_artifacts(manifest: dict, tools: Path = TOOLS) -> None:
         )
         _require(inventory == model["inventory_sha256"], f"{name}: validation model inventory drift")
     verify_result_transcript(manifest, tools)
+    verify_residual_diagnostic_transcript(manifest, tools)
+    verify_qwen_effect_diagnostic_transcript(manifest, tools)
 
 
 def expected_result_measurements(manifest: dict) -> dict[str, dict[str, int]]:
@@ -505,7 +532,7 @@ def expected_result_measurements(manifest: dict) -> dict[str, dict[str, int]]:
             "samples_gt8": result["samples_gt8"],
             "base_floor": result["base_floor"],
             "cap": result["cap"],
-            "effect_samples_gt8": gate["effect_samples_gt8"],
+            "effect_samples_gt8": result["acceptance_effect_samples_gt8"],
             "minimum_samples_gt8": gate["minimum_samples_gt8"],
             "scale_zero_byte_differences": gate[
                 "expected_scale_zero_byte_differences"
@@ -517,48 +544,149 @@ def expected_result_measurements(manifest: dict) -> dict[str, dict[str, int]]:
     return expected
 
 
-def verify_result_transcript(manifest: dict, tools: Path = TOOLS) -> None:
-    transcript_record = manifest["results"]["evidence"]["transcript"]
-    path = _expanded_path(transcript_record["local_path"], tools)
-    _require(path.is_file(), f"missing result transcript: {path}")
-    _require(path.stat().st_size == transcript_record["bytes"], "result transcript byte size mismatch")
-    _require(sha256(path) == transcript_record["sha256"], "result transcript sha256 mismatch")
-    transcript = json.loads(path.read_text(encoding="utf-8"))
-    _require(transcript.get("schema") == 2, "result transcript schema mismatch")
-    _require(transcript.get("story") == manifest["story"], "result transcript story mismatch")
+def expected_qwen_effect_diagnostic_measurements(manifest: dict) -> dict[str, dict[str, int]]:
+    expected = {}
+    for name in sorted(REQUIRED_PARITY_RESULTS):
+        if not name.startswith("qwen_"):
+            continue
+        result = manifest["results"]["fork_parity"][name]
+        gate = result["effect_gate"]
+        expected[name] = {
+            "effect_samples_gt8": gate["effect_samples_gt8"],
+            "scale_zero_byte_differences": gate[
+                "expected_scale_zero_byte_differences"
+            ],
+            "applied": gate["expected_applied"],
+            "unmatched": gate["expected_unmatched"],
+            "rgb_samples": result["rgb_samples"],
+        }
+    return expected
+
+
+def differing_json_paths(expected, actual, path: str = "") -> list[dict[str, object]]:
+    """Return stable, field-level expected/actual differences without hashing inputs."""
+    differences = []
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key in sorted(set(expected) | set(actual)):
+            child_path = f"{path}.{key}" if path else key
+            if key not in expected:
+                differences.append({"path": child_path, "expected": None, "actual": actual[key]})
+            elif key not in actual:
+                differences.append({"path": child_path, "expected": expected[key], "actual": None})
+            else:
+                differences.extend(differing_json_paths(expected[key], actual[key], child_path))
+        return differences
+    if expected != actual:
+        differences.append({"path": path or "$", "expected": expected, "actual": actual})
+    return differences
+
+
+def measurement_diagnostic(manifest: dict, tools: Path = TOOLS) -> dict[str, dict[str, object]]:
+    """Compare recorder output to manifest maps without model/artifact/source hashing.
+
+    This is intentionally narrower than the verifier: it lets an operator repair stale
+    measurement fields before starting the expensive hash-and-model verification pass.
+    """
+    evidence = manifest["results"]["evidence"]
+    records = {
+        "acceptance": (
+            evidence["transcript"],
+            expected_result_measurements(manifest),
+        ),
+        "qwen_effect_diagnostic": (
+            evidence["diagnostics"]["qwen_effect_diagnostic"]["transcript"],
+            expected_qwen_effect_diagnostic_measurements(manifest),
+        ),
+    }
+    diagnostics = {}
+    for name, (record, expected) in records.items():
+        path = _expanded_path(record["local_path"], tools)
+        transcript = json.loads(path.read_text(encoding="utf-8"))
+        actual = transcript.get("results")
+        diagnostics[name] = {
+            "path": str(path),
+            "differences": differing_json_paths(expected, actual),
+        }
+    return diagnostics
+
+
+def load_sealed_transcript(record: dict, tools: Path, label: str) -> tuple[Path, dict]:
+    path = _expanded_path(record["local_path"], tools)
+    _require(path.is_file(), f"missing {label}: {path}")
+    _require(path.stat().st_size == record["bytes"], f"{label} byte size mismatch")
+    _require(sha256(path) == record["sha256"], f"{label} sha256 mismatch")
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def verify_transcript_identity(
+    manifest: dict,
+    transcript: dict,
+    *,
+    expected_mode: str,
+    label: str,
+) -> None:
+    _require(transcript.get("schema") == 2, f"{label} schema mismatch")
+    _require(transcript.get("story") == manifest["story"], f"{label} story mismatch")
+    _require(transcript.get("mode") == expected_mode, f"{label} mode mismatch")
     expected_artifacts = manifest["results"]["evidence"]["artifact_sha256"]
     _require(
         transcript.get("artifacts_before") == expected_artifacts,
-        "result transcript pre-run artifact hashes mismatch",
+        f"{label} pre-run artifact hashes mismatch",
     )
     _require(
         transcript.get("artifacts_after") == expected_artifacts,
-        "result transcript post-run artifact hashes mismatch",
+        f"{label} post-run artifact hashes mismatch",
     )
     expected_models = model_inventories(manifest)
-    _require(transcript.get("models_before") == expected_models, "pre-run model inventory mismatch")
-    _require(transcript.get("models_after") == expected_models, "post-run model inventory mismatch")
+    _require(transcript.get("models_before") == expected_models, f"{label} pre-run model inventory mismatch")
+    _require(transcript.get("models_after") == expected_models, f"{label} post-run model inventory mismatch")
     recorded_source = transcript.get("source", {})
     recorded_source_after = transcript.get("source_after", {})
-    _require(recorded_source == recorded_source_after, "source changed during result run")
+    _require(recorded_source == recorded_source_after, f"source changed during {label}")
     _require(
         recorded_source.get("commit") == manifest["implementation_base"],
-        "result transcript source commit mismatch",
+        f"{label} source commit mismatch",
     )
     current_source = source_state(manifest)
     for key in ("base_commit", "source_sha256", "files"):
         _require(
             recorded_source.get(key) == current_source.get(key),
-            f"result transcript source {key} mismatch",
+            f"{label} source {key} mismatch",
         )
     expected_execution = execution_metadata(proof_environment())
     _require(
         transcript.get("execution") == expected_execution,
-        "result transcript execution environment mismatch",
+        f"{label} execution environment mismatch",
     )
     _require(
         transcript.get("execution_after") == expected_execution,
-        "post-run execution environment mismatch",
+        f"{label} post-run execution environment mismatch",
+    )
+
+
+def verify_receipt(
+    transcript: dict,
+    transcript_path: Path,
+    record: dict,
+    tools: Path,
+    label: str,
+) -> None:
+    receipt_path = _expanded_path(record["local_path"], tools)
+    _require(receipt_path.is_file(), f"missing {label}: {receipt_path}")
+    _require(receipt_path.stat().st_size == record["bytes"], f"{label} byte size mismatch")
+    _require(sha256(receipt_path) == record["sha256"], f"{label} sha256 mismatch")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    _require(receipt == receipt_for(transcript, transcript_path), f"{label} does not match transcript")
+
+
+def verify_result_transcript(manifest: dict, tools: Path = TOOLS) -> None:
+    transcript_record = manifest["results"]["evidence"]["transcript"]
+    path, transcript = load_sealed_transcript(transcript_record, tools, "result transcript")
+    verify_transcript_identity(
+        manifest,
+        transcript,
+        expected_mode="acceptance",
+        label="result transcript",
     )
     runs = transcript.get("runs", [])
     expected_specs = expected_runs(manifest)
@@ -582,13 +710,101 @@ def verify_result_transcript(manifest: dict, tools: Path = TOOLS) -> None:
     expected = expected_result_measurements(manifest)
     _require(transcript.get("results") == combined, "recorded result summary mismatch")
     _require(combined == expected, "result transcript measurements mismatch")
-    receipt_record = manifest["results"]["evidence"]["receipt"]
-    receipt_path = _expanded_path(receipt_record["local_path"], tools)
-    _require(receipt_path.is_file(), f"missing durable receipt: {receipt_path}")
-    _require(receipt_path.stat().st_size == receipt_record["bytes"], "durable receipt byte size mismatch")
-    _require(sha256(receipt_path) == receipt_record["sha256"], "durable receipt sha256 mismatch")
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    _require(receipt == receipt_for(transcript, path), "durable receipt does not match transcript")
+    verify_receipt(
+        transcript,
+        path,
+        manifest["results"]["evidence"]["receipt"],
+        tools,
+        "durable receipt",
+    )
+
+
+def verify_residual_diagnostic_transcript(manifest: dict, tools: Path = TOOLS) -> None:
+    evidence = manifest["results"]["evidence"]["diagnostics"]["residual_diagnostic"]
+    path, transcript = load_sealed_transcript(evidence["transcript"], tools, "residual diagnostic transcript")
+    verify_transcript_identity(
+        manifest,
+        transcript,
+        expected_mode="residual_diagnostic",
+        label="residual diagnostic transcript",
+    )
+    expected_specs = residual_diagnostic_runs(manifest)
+    runs = transcript.get("runs", [])
+    _require(
+        [run.get("name") for run in runs] == [run["name"] for run in expected_specs],
+        "residual diagnostic run inventory mismatch",
+    )
+    combined = {}
+    for run, expected_spec in zip(runs, expected_specs):
+        _require(run.get("argv") == expected_spec["argv"], f"{run.get('name')}: argv mismatch")
+        _require(run.get("env") == expected_spec["env"], f"{run.get('name')}: env mismatch")
+        _require(run.get("returncode") == 0, f"{run.get('name')}: recorded nonzero exit")
+        output = run.get("stdout", "") + run.get("stderr", "")
+        _require("test result: ok." in output, f"{run.get('name')}: missing passing cargo result")
+        try:
+            run_results = parsed_results(output)
+            validate_residual_run_results(run["name"], run_results)
+        except ValueError as error:
+            raise InvalidManifest(str(error)) from error
+        duplicate_names = set(combined).intersection(run_results)
+        _require(not duplicate_names, f"duplicate residual diagnostic result names: {sorted(duplicate_names)}")
+        combined.update(run_results)
+    try:
+        validate_shared_residual_sample_count(combined)
+    except ValueError as error:
+        raise InvalidManifest(str(error)) from error
+    _require(transcript.get("results") == combined, "residual diagnostic result summary mismatch")
+    verify_receipt(
+        transcript,
+        path,
+        evidence["receipt"],
+        tools,
+        "residual diagnostic receipt",
+    )
+
+
+def verify_qwen_effect_diagnostic_transcript(manifest: dict, tools: Path = TOOLS) -> None:
+    evidence = manifest["results"]["evidence"]["diagnostics"]["qwen_effect_diagnostic"]
+    path, transcript = load_sealed_transcript(evidence["transcript"], tools, "Qwen effect diagnostic transcript")
+    verify_transcript_identity(
+        manifest,
+        transcript,
+        expected_mode="qwen_effect_diagnostic",
+        label="Qwen effect diagnostic transcript",
+    )
+    expected_specs = qwen_effect_diagnostic_runs(manifest)
+    runs = transcript.get("runs", [])
+    _require(
+        [run.get("name") for run in runs] == [run["name"] for run in expected_specs],
+        "Qwen effect diagnostic run inventory mismatch",
+    )
+    combined = {}
+    for run, expected_spec in zip(runs, expected_specs):
+        _require(run.get("argv") == expected_spec["argv"], f"{run.get('name')}: argv mismatch")
+        _require(run.get("env") == expected_spec["env"], f"{run.get('name')}: env mismatch")
+        _require(run.get("returncode") == 0, f"{run.get('name')}: recorded nonzero exit")
+        output = run.get("stdout", "") + run.get("stderr", "")
+        _require("test result: ok." in output, f"{run.get('name')}: missing passing cargo result")
+        try:
+            run_results = parsed_results(output)
+            validate_qwen_effect_results(run_results)
+        except ValueError as error:
+            raise InvalidManifest(str(error)) from error
+        duplicate_names = set(combined).intersection(run_results)
+        _require(not duplicate_names, f"duplicate Qwen effect diagnostic result names: {sorted(duplicate_names)}")
+        combined.update(run_results)
+    _require(transcript.get("results") == combined, "Qwen effect diagnostic result summary mismatch")
+    _require(
+        combined == expected_qwen_effect_diagnostic_measurements(manifest),
+        "Qwen effect diagnostic measurements mismatch",
+    )
+    verify_receipt(
+        transcript,
+        path,
+        evidence["receipt"],
+        tools,
+        "Qwen effect diagnostic receipt",
+    )
 
 
 def main() -> int:
@@ -599,8 +815,17 @@ def main() -> int:
         action="store_true",
         help="validate tracked provenance and dump-script hashes without gitignored binaries",
     )
+    parser.add_argument(
+        "--diagnose-result-measurements",
+        action="store_true",
+        help="compare acceptance and Qwen diagnostic result maps without hashing model inputs",
+    )
     args = parser.parse_args()
     manifest = load_manifest(args.manifest)
+    if args.diagnose_result_measurements:
+        diagnostic = measurement_diagnostic(manifest, args.manifest.resolve().parent)
+        print(json.dumps(diagnostic, indent=2, sort_keys=True))
+        return int(any(value["differences"] for value in diagnostic.values()))
     validate_manifest(manifest, args.manifest.resolve().parent)
     if not args.manifest_only:
         _require(
