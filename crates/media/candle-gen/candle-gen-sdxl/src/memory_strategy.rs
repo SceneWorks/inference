@@ -6,8 +6,6 @@
 //! adapter source.  Legacy loads without `resolved_route` remain resident-only.
 
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::{
@@ -402,24 +400,9 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> gen_core::Result<()> {
     Ok(())
 }
 
-fn sha256(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(hash.finalize().into())
-}
-
 #[derive(Clone, Debug)]
 struct SealedFile {
     pin: gen_core::PinnedWeightsFile,
-    sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -519,14 +502,10 @@ impl SdxlArtifactSeal {
             }
             for path in &inventory {
                 let pin = gen_core::PinnedWeightsFile::pin(path)?;
-                let digest = pin.read_unchanged(sha256)?;
                 receipt.update((path.as_os_str().len() as u64).to_le_bytes());
                 receipt.update(path.as_os_str().as_encoded_bytes());
-                receipt.update(digest);
-                files.push(SealedFile {
-                    pin,
-                    sha256: digest,
-                });
+                receipt.update(pin.content_sha256());
+                files.push(SealedFile { pin });
             }
             roots.push((absolute, inventory));
         }
@@ -578,13 +557,7 @@ impl SdxlArtifactSeal {
             }
         }
         for file in &self.files {
-            file.pin.ensure_unchanged()?;
-            if file.pin.read_unchanged(sha256)? != file.sha256 {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "sdxl: artifact content changed after admission: {}",
-                    file.pin.loader_path().display()
-                )));
-            }
+            file.pin.verify_unchanged()?;
         }
         Ok(())
     }
@@ -1674,6 +1647,30 @@ mod tests {
 
         std::fs::write(root.join("late-file.json"), b"{}").unwrap();
         assert!(seal.ensure_unchanged().is_err());
+    }
+
+    #[test]
+    fn dense_receipt_reports_the_shared_artifact_seal_grammar_for_same_size_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, root) = dense_spec(&temp);
+        let seal = SdxlArtifactSeal::capture(&spec).unwrap();
+        let source = root.join("unet/config.json");
+        let original = std::fs::read(&source).unwrap();
+        let mut replacement = original.clone();
+        replacement[0] ^= 1;
+        std::fs::write(&source, replacement).unwrap();
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_456),
+            )
+            .unwrap();
+
+        let error = seal.ensure_unchanged().unwrap_err().to_string();
+        assert!(
+            error.contains("artifact seal mismatch after load"),
+            "Candle receipt must expose the shared seal error grammar: {error}"
+        );
     }
 
     #[test]

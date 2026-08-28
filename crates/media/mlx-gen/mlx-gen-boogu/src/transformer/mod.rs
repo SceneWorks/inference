@@ -26,6 +26,8 @@
 mod block;
 pub mod rope;
 
+use std::cell::RefCell;
+
 use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{concatenate_axis, cos, exp, multiply, sin, sum};
 use mlx_rs::{Array, Dtype};
@@ -60,6 +62,66 @@ pub struct BooguTransformer {
     single_stream: Vec<ModBlock>,
     norm_out_lin1: AdaptableLinear,
     norm_out_lin2: AdaptableLinear,
+    /// Per-render RoPE-table cache. The tables depend only on the ordered request geometry, not on
+    /// flow time or latent values, so the cond/uncond legs can reuse them across every denoise step.
+    /// Four entries keep the usual two CFG geometries resident with bounded incidental headroom.
+    rope_cache: RopeCache<RopeGeom, RopeTables>,
+}
+
+/// Every input that can change a Boogu RoPE table. Reference grids remain ordered because the
+/// OmniGen2 `pe_shift` advances after each reference, so swapping two differently shaped sources is
+/// a distinct layout even when their combined token count is unchanged.
+type RopeGeom = (usize, usize, usize, Vec<(usize, usize)>);
+
+/// Capacity shared with the Candle Boogu implementation. One slot thrashed between the two
+/// true-CFG caption lengths; four keeps both legs plus a small number of incidental geometries.
+const ROPE_CACHE_CAP: usize = 4;
+
+/// A small FIFO cache for refcounted MLX table handles. FIFO is deliberate and deterministic: hits
+/// do not reorder entries, and inserting past capacity evicts the oldest geometry. A `RefCell` is
+/// sufficient because MLX generation is synchronous on one worker thread, matching the existing
+/// Qwen-Image RoPE cache's interior-mutability contract.
+struct RopeCache<K, V> {
+    entries: RefCell<Vec<(K, V)>>,
+    cap: usize,
+}
+
+impl<K: PartialEq, V: Clone> RopeCache<K, V> {
+    fn new(cap: usize) -> Self {
+        assert!(cap > 0, "RoPE cache capacity must be non-zero");
+        Self {
+            entries: RefCell::new(Vec::with_capacity(cap)),
+            cap,
+        }
+    }
+
+    /// Return the cached value for `key`, building and inserting it only on a miss.
+    fn get_or_build(&self, key: K, build: impl FnOnce() -> V) -> V {
+        let mut entries = self.entries.borrow_mut();
+        if let Some((_, value)) = entries.iter().find(|(candidate, _)| *candidate == key) {
+            mlx_gen::diagnostics::record_cache(
+                "boogu::rope_tables",
+                mlx_gen::diagnostics::CacheDisposition::Hit,
+            );
+            return value.clone();
+        }
+
+        mlx_gen::diagnostics::record_cache(
+            "boogu::rope_tables",
+            mlx_gen::diagnostics::CacheDisposition::Miss,
+        );
+        let value = build();
+        if entries.len() == self.cap {
+            entries.remove(0);
+        }
+        entries.push((key, value.clone()));
+        value
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
 }
 
 impl BooguTransformer {
@@ -104,7 +166,40 @@ impl BooguTransformer {
                 .collect::<Result<_>>()?,
             norm_out_lin1: lin(w, "norm_out.linear_1", true)?,
             norm_out_lin2: lin(w, "norm_out.linear_2", true)?,
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
         })
+    }
+
+    /// Build or reuse tables for the complete ordered T2I/edit geometry. Configuration fields are
+    /// immutable for the transformer's lifetime, so the key only needs request-varying dimensions.
+    fn rope_tables(
+        &self,
+        cap_len: usize,
+        ht: usize,
+        wt: usize,
+        ref_grids: &[(usize, usize)],
+    ) -> RopeTables {
+        self.rope_cache
+            .get_or_build((cap_len, ht, wt, ref_grids.to_vec()), || {
+                if ref_grids.is_empty() {
+                    RopeTables::build_t2i(
+                        cap_len,
+                        ht,
+                        wt,
+                        self.cfg.axes_dim_rope[0],
+                        self.cfg.rope_theta,
+                    )
+                } else {
+                    RopeTables::build_edit_multi(
+                        cap_len,
+                        ref_grids,
+                        ht,
+                        wt,
+                        self.cfg.axes_dim_rope[0],
+                        self.cfg.rope_theta,
+                    )
+                }
+            })
     }
 
     /// Text-to-image velocity prediction.
@@ -190,24 +285,7 @@ impl BooguTransformer {
             .iter()
             .map(|rl| ((rl.shape()[2] / p) as usize, (rl.shape()[3] / p) as usize))
             .collect();
-        let rope = if ref_grids.is_empty() {
-            RopeTables::build_t2i(
-                cap_len as usize,
-                ht as usize,
-                wt as usize,
-                self.cfg.axes_dim_rope[0],
-                self.cfg.rope_theta,
-            )
-        } else {
-            RopeTables::build_edit_multi(
-                cap_len as usize,
-                &ref_grids,
-                ht as usize,
-                wt as usize,
-                self.cfg.axes_dim_rope[0],
-                self.cfg.rope_theta,
-            )
-        };
+        let rope = self.rope_tables(cap_len as usize, ht as usize, wt as usize, &ref_grids);
 
         let mut ref_tokens: Vec<Array> = Vec::with_capacity(ref_latents.len());
         for (j, rl) in ref_latents.iter().enumerate() {
@@ -444,4 +522,115 @@ fn unpatchify(tokens: &Array, ht: i32, wt: i32, p: i32, c: i32) -> Result<Array>
     let x = tokens.reshape(&[b, ht, wt, p, p, c])?; // B, h, w, p1, p2, C
     let x = x.transpose_axes(&[0, 5, 1, 3, 2, 4])?; // B, C, h, p1, w, p2
     Ok(x.reshape(&[b, c, ht * p, wt * p])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use mlx_gen::diagnostics::{self, CacheDisposition, DiagnosticCounter};
+
+    use super::*;
+
+    const AXES_DIM: usize = 40;
+    const THETA: f32 = 10_000.0;
+
+    fn flat_joint(tables: &RopeTables) -> Vec<f32> {
+        let (cos, sin) = tables.joint();
+        let mut flat = cos.as_slice::<f32>().to_vec();
+        flat.extend_from_slice(sin.as_slice::<f32>());
+        flat
+    }
+
+    /// sc-21687: same-geometry forwards reuse one table set, changed target geometry and changed
+    /// ordered reference layouts miss, and every cached value remains byte-identical to a fresh
+    /// construction with the expected sequence shapes.
+    #[test]
+    fn rope_cache_hits_misses_and_preserves_table_parity() {
+        let cache: RopeCache<RopeGeom, RopeTables> = RopeCache::new(ROPE_CACHE_CAP);
+        let builds = Cell::new(0usize);
+        let scope = diagnostics::begin_observed_request("sc-21687", "boogu").unwrap();
+
+        let t2i_key = (3, 2, 4, Vec::new());
+        let first = cache.get_or_build(t2i_key.clone(), || {
+            builds.set(builds.get() + 1);
+            RopeTables::build_t2i(3, 2, 4, AXES_DIM, THETA)
+        });
+        let hit = cache.get_or_build(t2i_key, || {
+            builds.set(builds.get() + 1);
+            RopeTables::build_t2i(3, 2, 4, AXES_DIM, THETA)
+        });
+        assert_eq!(builds.get(), 1, "repeated geometry must not rebuild");
+        assert_eq!(first.joint().0.shape(), &[1, 11, 60]);
+        assert_eq!(flat_joint(&first), flat_joint(&hit));
+
+        let changed_target = cache.get_or_build((3, 2, 5, Vec::new()), || {
+            builds.set(builds.get() + 1);
+            RopeTables::build_t2i(3, 2, 5, AXES_DIM, THETA)
+        });
+        assert_eq!(changed_target.joint().0.shape(), &[1, 13, 60]);
+
+        // Same combined reference-token count and target, but a different ordered layout. The
+        // `pe_shift` walk makes these distinct tables and the cache key must not collapse them.
+        let refs_a = vec![(2, 3), (1, 4)];
+        let refs_b = vec![(1, 4), (2, 3)];
+        let edit_a = cache.get_or_build((3, 4, 4, refs_a.clone()), || {
+            builds.set(builds.get() + 1);
+            RopeTables::build_edit_multi(3, &refs_a, 4, 4, AXES_DIM, THETA)
+        });
+        let edit_b = cache.get_or_build((3, 4, 4, refs_b.clone()), || {
+            builds.set(builds.get() + 1);
+            RopeTables::build_edit_multi(3, &refs_b, 4, 4, AXES_DIM, THETA)
+        });
+        assert_eq!(
+            builds.get(),
+            4,
+            "every distinct geometry builds exactly once"
+        );
+        assert_eq!(edit_a.joint().0.shape(), &[1, 29, 60]);
+        assert_eq!(edit_b.joint().0.shape(), &[1, 29, 60]);
+        assert_eq!(edit_a.ref_image_at(0).unwrap().0.shape(), &[1, 6, 60]);
+        assert_eq!(edit_a.ref_image_at(1).unwrap().0.shape(), &[1, 4, 60]);
+        assert_ne!(flat_joint(&edit_a), flat_joint(&edit_b));
+
+        let report = scope.finish();
+        assert!(report.counters.contains(&DiagnosticCounter::Cache {
+            site: "boogu::rope_tables",
+            disposition: CacheDisposition::Hit,
+            count: 1,
+        }));
+        assert!(report.counters.contains(&DiagnosticCounter::Cache {
+            site: "boogu::rope_tables",
+            disposition: CacheDisposition::Miss,
+            count: 4,
+        }));
+    }
+
+    /// sc-21687: capacity is a hard bound and overflow evicts insertion order, not access order.
+    #[test]
+    fn rope_cache_capacity_four_evicts_oldest_deterministically() {
+        let cache: RopeCache<usize, usize> = RopeCache::new(ROPE_CACHE_CAP);
+        let builds = Cell::new(0usize);
+        let lookup = |key| {
+            cache.get_or_build(key, || {
+                builds.set(builds.get() + 1);
+                key * 10
+            })
+        };
+
+        for key in 1..=4 {
+            assert_eq!(lookup(key), key * 10);
+        }
+        assert_eq!(cache.len(), ROPE_CACHE_CAP);
+        assert_eq!(builds.get(), 4);
+
+        assert_eq!(lookup(2), 20); // hit does not reorder FIFO entries
+        assert_eq!(lookup(5), 50); // evicts oldest key 1
+        assert_eq!(cache.len(), ROPE_CACHE_CAP);
+        assert_eq!(builds.get(), 5);
+        assert_eq!(lookup(2), 20, "key 2 must remain cached");
+        assert_eq!(lookup(1), 10, "evicted oldest key must rebuild");
+        assert_eq!(cache.len(), ROPE_CACHE_CAP);
+        assert_eq!(builds.get(), 6);
+    }
 }

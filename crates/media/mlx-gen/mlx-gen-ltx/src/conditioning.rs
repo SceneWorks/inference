@@ -371,6 +371,23 @@ pub fn keyframe_append_positions(
     spatial_scale: i64,
     fps: f32,
 ) -> Array {
+    let data =
+        keyframe_append_position_data(cf, h, w, frame_offset, temporal_scale, spatial_scale, fps);
+    Array::from_slice(&data, &[1, 3, (cf * h * w) as i32, 2])
+}
+
+/// Host-only appended-clip position values in the same C-order layout as
+/// [`keyframe_append_positions`]. The production grid wraps these values in an MLX array.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn keyframe_append_position_data(
+    cf: usize,
+    h: usize,
+    w: usize,
+    frame_offset: i32,
+    temporal_scale: i64,
+    spatial_scale: i64,
+    fps: f32,
+) -> Vec<f32> {
     let hw = h * w;
     let num = cf * hw;
     let causal = frame_offset == 0;
@@ -396,7 +413,7 @@ pub fn keyframe_append_positions(
             data[base + 2 * num * 2] = width_f;
         }
     }
-    Array::from_slice(&data, &[1, 3, num as i32, 2])
+    data
 }
 
 /// Append a keyframe clip to a [`VideoTokenState`] — the IC-LoRA in-context conditioning op (reference

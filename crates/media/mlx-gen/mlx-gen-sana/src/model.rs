@@ -401,6 +401,56 @@ fn resolve_reference<'a>(req: &'a GenerationRequest, id: &str) -> Result<Option<
     Ok(reference)
 }
 
+/// SANA's true-CFG scale is the effective base-path guidance knob.  `guidance` remains the
+/// backwards-compatible spelling, but an explicit `true_cfg` wins just as it does on Candle.
+fn resolve_base_guidance(req: &GenerationRequest) -> Option<f32> {
+    req.true_cfg.or(req.guidance)
+}
+
+/// The base SANA adapter's complete request projection. Keeping the true-CFG precedence here makes
+/// the text-conditioning decision and the denoise request consume the same public knobs.
+fn base_sana_request<'a>(
+    req: &'a GenerationRequest,
+    seed: u64,
+    init_image: Option<&'a Image>,
+    strength: Option<f32>,
+    guidance_scale: Option<f32>,
+) -> SanaGenerateRequest<'a> {
+    SanaGenerateRequest {
+        prompt: &req.prompt,
+        negative_prompt: req.negative_prompt.as_deref(),
+        height: req.height,
+        width: req.width,
+        steps: req.steps.map(|steps| steps as usize),
+        guidance_scale,
+        seed: Some(seed),
+        sampler: req.sampler.as_deref(),
+        scheduler: req.scheduler.as_deref(),
+        init_image,
+        strength,
+    }
+}
+
+/// Prepare seed-independent reference state once, then fan the same borrowed value out across the
+/// request's seed sequence. Keeping preparation outside the loop is the work-count contract for both
+/// resident MLX SANA routes (base and Sprint).
+fn render_batch_with_prepared_reference<P, O>(
+    base_seed: u64,
+    count: u32,
+    prepare: impl FnOnce() -> Result<Option<P>>,
+    mut render: impl FnMut(u64, Option<&P>) -> Result<O>,
+) -> Result<Vec<O>> {
+    let prepared_reference = prepare()?;
+    let mut outputs = Vec::with_capacity(count as usize);
+    for offset in 0..count {
+        outputs.push(render(
+            base_seed.wrapping_add(offset as u64),
+            prepared_reference.as_ref(),
+        )?);
+    }
+    Ok(outputs)
+}
+
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Delegates the shared size/count/guidance/negative/conditioning checks to the descriptor
 /// (`Capabilities::validate_request`) and adds SANA's `RES_MULTIPLE` (32×, DC-AE) divisor rule.
@@ -410,6 +460,16 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;
+    if req.strength.is_some()
+        && !req
+            .conditioning
+            .iter()
+            .any(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+    {
+        return Err(Error::Unsupported(format!(
+            "{id}: img2img strength requires Reference conditioning"
+        )));
+    }
     if req.steps == Some(0) {
         return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
@@ -502,10 +562,10 @@ impl Sana {
         };
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.map(|s| s as usize);
         // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
         // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
-        let guidance = req.guidance.unwrap_or(if self.sprint {
+        let guidance_scale = resolve_base_guidance(req);
+        let guidance = guidance_scale.unwrap_or(if self.sprint {
             SPRINT_DEFAULT_GUIDANCE
         } else {
             DEFAULT_GUIDANCE
@@ -551,32 +611,27 @@ impl Sana {
                 // Rungs 3 and 4, resolved against the trunk that will actually run them.
                 let plan =
                     crate::pipeline::resolved_rung_plan(req.memory, heavy.transformer_blocks())?;
-                let mut latents = Vec::with_capacity(req.count as usize);
-                for n in 0..req.count {
-                    let seed = base_seed.wrapping_add(n as u64);
-                    let sana_req = SanaGenerateRequest {
-                        prompt: &req.prompt,
-                        negative_prompt: req.negative_prompt.as_deref(),
-                        height: req.height,
-                        width: req.width,
-                        steps,
-                        guidance_scale: req.guidance,
-                        seed: Some(seed),
-                        sampler: req.sampler.as_deref(),
-                        scheduler: req.scheduler.as_deref(),
-                        init_image,
-                        strength,
-                    };
-                    latents.push(heavy.denoise_one_with_preview(
-                        &cond,
-                        &sana_req,
-                        guidance,
-                        &req.cancel,
-                        on_progress,
-                        &req.preview,
-                        plan,
-                    )?);
-                }
+                let prepare_req =
+                    base_sana_request(req, base_seed, init_image, strength, guidance_scale);
+                let latents = render_batch_with_prepared_reference(
+                    base_seed,
+                    req.count,
+                    || heavy.prepare_reference(&prepare_req, &req.cancel),
+                    |seed, prepared_reference| {
+                        let sana_req =
+                            base_sana_request(req, seed, init_image, strength, guidance_scale);
+                        heavy.denoise_one_with_prepared_reference(
+                            &cond,
+                            &sana_req,
+                            guidance,
+                            prepared_reference,
+                            &req.cancel,
+                            on_progress,
+                            &req.preview,
+                            plan,
+                        )
+                    },
+                )?;
                 mlx_rs::transforms::eval(latents.iter())?;
                 Ok(latents)
             },
@@ -654,6 +709,88 @@ mod tests {
     use super::*;
     use crate::pipeline::{DEFAULT_GUIDANCE, DEFAULT_STEPS};
     use mlx_gen::Quant;
+    use std::cell::{Cell, RefCell};
+
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn check_registered_reference_path(source: &str) -> Result<()> {
+        let generate = braced_item(source, "    fn generate_impl(");
+        let prepare = "|| heavy.prepare_reference(&prepare_req, &req.cancel)";
+        let prepared_tail = "heavy.denoise_one_with_prepared_reference(";
+        if generate
+            .matches("render_batch_with_prepared_reference(")
+            .count()
+            != 1
+            || generate.matches(prepare).count() != 1
+            || generate.matches(prepared_tail).count() != 1
+            || generate.contains("heavy.denoise_one_with_preview(")
+        {
+            return Err(Error::Msg(
+                "registered MLX SANA must prepare once and select only the prepared-reference tail"
+                    .into(),
+            ));
+        }
+        let prepare_at = generate.find(prepare).unwrap();
+        let tail_at = generate.find(prepared_tail).unwrap();
+        if prepare_at >= tail_at
+            || generate[tail_at..].contains("heavy.prepare_reference(")
+            || !generate[tail_at..].contains("prepared_reference,")
+        {
+            return Err(Error::Msg(
+                "registered MLX SANA moved preparation into seed fanout or dropped its borrowed state"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_generator_is_bound_to_the_prepared_reference_tail() {
+        let shipped = include_str!("model.rs");
+        check_registered_reference_path(shipped).unwrap();
+
+        let reverted = shipped.replacen(
+            "heavy.denoise_one_with_prepared_reference(",
+            "heavy.denoise_one_with_preview(",
+            1,
+        );
+        assert!(
+            check_registered_reference_path(&reverted).is_err(),
+            "reverting the real generator to per-seed preparation must fail"
+        );
+
+        let dropped = shipped.replacen(
+            "|| heavy.prepare_reference(&prepare_req, &req.cancel)",
+            "|| Ok(None)",
+            1,
+        );
+        assert!(
+            check_registered_reference_path(&dropped).is_err(),
+            "dropping request-scope preparation must fail"
+        );
+    }
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -661,6 +798,84 @@ mod tests {
             width: w,
             height: h,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn base_and_sprint_prepare_one_reference_before_count_fanout() {
+        for route in ["base", "sprint"] {
+            let request_preparations = Cell::new(0);
+            let encoder_calls = Cell::new(0);
+            let rendered = RefCell::new(Vec::new());
+            let outputs = render_batch_with_prepared_reference(
+                u64::MAX - 1,
+                4,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    let call = encoder_calls.get() + 1;
+                    encoder_calls.set(call);
+                    Ok(Some(format!("{route}-{call}")))
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((
+                        seed,
+                        Some(prepared.expect("reference must be shared").clone()),
+                    ));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            render_batch_with_prepared_reference(
+                9,
+                2,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    Ok(None::<String>)
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((seed, prepared.cloned()));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            render_batch_with_prepared_reference(
+                20,
+                2,
+                || {
+                    request_preparations.set(request_preparations.get() + 1);
+                    let call = encoder_calls.get() + 1;
+                    encoder_calls.set(call);
+                    Ok(Some(format!("{route}-{call}")))
+                },
+                |seed, prepared| {
+                    rendered.borrow_mut().push((
+                        seed,
+                        Some(prepared.expect("second request must prepare fresh").clone()),
+                    ));
+                    Ok(seed)
+                },
+            )
+            .unwrap();
+
+            assert_eq!(request_preparations.get(), 3, "{route} request preambles");
+            assert_eq!(encoder_calls.get(), 2, "{route} reference encode count");
+            assert_eq!(outputs, vec![u64::MAX - 1, u64::MAX, 0, 1]);
+            assert_eq!(
+                *rendered.borrow(),
+                vec![
+                    (u64::MAX - 1, Some(format!("{route}-1"))),
+                    (u64::MAX, Some(format!("{route}-1"))),
+                    (0, Some(format!("{route}-1"))),
+                    (1, Some(format!("{route}-1"))),
+                    (9, None),
+                    (10, None),
+                    (20, Some(format!("{route}-2"))),
+                    (21, Some(format!("{route}-2"))),
+                ],
+                "{route} must share one latent, skip txt2img encode, and prepare fresh next request"
+            );
         }
     }
 
@@ -766,6 +981,52 @@ mod tests {
             mlx_gen::img2img::init_time_step(20, Some(resolve(Some(0.0), None))),
             0
         );
+    }
+
+    #[test]
+    fn base_conditioning_fixture_matches_candle_semantics() {
+        // This is the same discriminating base fixture as Candle's adapter test: true_cfg must win
+        // over the legacy guidance spelling, and request strength must feed the sole Reference.
+        let mut r = req(1024, 1024);
+        r.negative_prompt = Some("uncond".into());
+        r.guidance = Some(1.0);
+        r.true_cfg = Some(4.5);
+        r.strength = Some(0.6);
+        r.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: None,
+        }];
+
+        assert!(validate_request(&descriptor(), &r).is_ok());
+        let (reference, strength) = resolve_reference(&r, MODEL_ID).unwrap().unwrap();
+        let sana_req = base_sana_request(
+            &r,
+            7,
+            Some(reference),
+            Some(strength),
+            resolve_base_guidance(&r),
+        );
+        assert_eq!(
+            sana_req.prompt,
+            "a red panda on a mossy log in a misty forest"
+        );
+        assert_eq!(sana_req.negative_prompt, Some("uncond"));
+        assert_eq!(sana_req.guidance_scale, Some(4.5));
+        assert!(sana_req.init_image.is_some());
+        assert_eq!(sana_req.strength, Some(0.6));
+    }
+
+    #[test]
+    fn refree_strength_is_a_typed_unsupported_knob() {
+        let mut r = req(1024, 1024);
+        r.strength = Some(0.6);
+        let error = validate_request(&descriptor(), &r).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert!(error.to_string().contains("requires Reference"));
+
+        // Omitted reference and omitted strength remain the existing text-to-image request.
+        r.strength = None;
+        assert!(validate_request(&descriptor(), &r).is_ok());
     }
 
     #[test]

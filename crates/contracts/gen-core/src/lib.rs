@@ -39,6 +39,8 @@ pub mod registry;
 pub mod residency;
 pub mod runtime;
 pub mod sampling;
+pub mod sd3_encoder_artifacts;
+pub mod sd3_request;
 pub mod sdxl_ldm;
 pub mod text_embed;
 pub mod tier_integrity;
@@ -104,11 +106,13 @@ pub use control::{
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
 };
 pub use encoder_contract::{
-    read_text_encoder_source_unchanged, text_encoder_packed_quant_bits, text_encoder_source_bytes,
-    EncoderConfigBool, EncoderConfigFloat, EncoderContract, EncoderPackingContract,
-    EncoderPromptExecutionContract, EncoderPromptLengthPolicy, EncoderPromptPadding,
-    EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding, EncoderTokenizerContract,
-    EncoderTokenizerDisposition, ValidatedEncoderSource, ValidatedTokenizerSource,
+    read_text_encoder_source_unchanged, resolve_encoder_load_time_quant_bits,
+    text_encoder_packed_quant_bits, text_encoder_planning_facts_for_discovery,
+    text_encoder_source_bytes, EncoderConfigBool, EncoderConfigFloat, EncoderContract,
+    EncoderPackingContract, EncoderPromptExecutionContract, EncoderPromptLengthPolicy,
+    EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding,
+    EncoderTokenizerContract, EncoderTokenizerDisposition, TextEncoderPlanningFacts,
+    TextEncoderSourceLayout, ValidatedEncoderSource, ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
 pub use execution_domains::{
@@ -192,13 +196,18 @@ pub use registry::{
 };
 pub use residency::{Residency, ResidencyRuntime, StagedHeavy};
 pub use runtime::{
-    AdapterApplyReport, AdapterKind, AdapterSpec, CancelFlag, FileStatFingerprint, IdentityWeights,
-    LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame, PreviewSink,
-    Progress, PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant,
-    WeightsSource, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    AdapterApplyReport, AdapterKind, AdapterSpec, ArtifactSeal, CancelFlag, FileStatFingerprint,
+    IdentityWeights, LoadPhase, LoadShape, LoadShapeDeclarationResult, LoadSpec, MoeExpert,
+    OffloadPolicy, PidWeights, PinnedWeightsFile, Precision, PreparedFilePins, PreviewFrame,
+    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource, BASE_SNAPSHOT_COMPONENT,
+    COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT,
+    LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
 };
+pub use sd3_encoder_artifacts::{
+    resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,
+};
+pub use sd3_request::map_sd3_seeded_outputs;
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tier_integrity::{control_branch_tier, is_above_selected_tier};
 pub use tiling::{TilingConfig, VaeTiling};

@@ -1519,8 +1519,12 @@ fn render_from_context(
     context: &Tensor,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    candle_gen::check_cancel(&req.cancel)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let prepared = comps
+        .dit
+        .prepare_conditioning(context, req.width, req.height)?;
 
     // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes over
     // the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
@@ -1556,7 +1560,14 @@ fn render_from_context(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = comps.dit.forward(x, &t, context)?;
+                let v = comps.dit.forward_prepared_with_memory(
+                    x,
+                    &t,
+                    &prepared,
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                    &req.cancel,
+                )?;
                 Ok(v.to_dtype(DType::F32)?)
             },
         )?;
@@ -1631,8 +1642,12 @@ fn render_img2img_from_context(
     context: &Tensor,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    candle_gen::check_cancel(&req.cancel)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let prepared = comps
+        .dit
+        .prepare_conditioning(context, req.width, req.height)?;
 
     let native = turbo_sigmas(steps);
     let sigmas = candle_gen::resolve_flow_schedule(
@@ -1683,7 +1698,14 @@ fn render_img2img_from_context(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let v = comps.dit.forward(x, &t, context)?;
+                    let v = comps.dit.forward_prepared_with_memory(
+                        x,
+                        &t,
+                        &prepared,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                        &req.cancel,
+                    )?;
                     Ok(v.to_dtype(DType::F32)?)
                 },
             )?
@@ -1770,8 +1792,19 @@ fn render_base_from_contexts(
     guidance: f32,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    candle_gen::check_cancel(&req.cancel)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let prepared = comps
+        .dit
+        .prepare_conditioning(context, req.width, req.height)?;
+    let prepared_neg = neg_context
+        .map(|context| {
+            comps
+                .dit
+                .prepare_conditioning(context, req.width, req.height)
+        })
+        .transpose()?;
 
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count); a curated scheduler
     // reshapes over the same dynamic mu. Raw sigma → DiT timestep, raw velocity → Euler
@@ -1804,12 +1837,28 @@ fn render_base_from_contexts(
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond = comps.dit.forward(x, &t, context)?;
+                let cond = comps.dit.forward_prepared_with_memory(
+                    x,
+                    &t,
+                    &prepared,
+                    candle_gen::ATTN_SCORES_BUDGET,
+                    crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                    &req.cancel,
+                )?;
                 // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
                 // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`).
                 let v = match neg_context {
-                    Some(nc) => {
-                        let uncond = comps.dit.forward(x, &t, nc)?;
+                    Some(_) => {
+                        let uncond = comps.dit.forward_prepared_with_memory(
+                            x,
+                            &t,
+                            prepared_neg
+                                .as_ref()
+                                .expect("negative context has prepared state"),
+                            candle_gen::ATTN_SCORES_BUDGET,
+                            crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                            &req.cancel,
+                        )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -1989,6 +2038,30 @@ fn render_multiphase_driver<T>(
         .map(|p| crate::multiphase::phase_spec_subset(p, all_specs))
         .collect();
 
+    // Each phase can select a different adapter set, including one that alters text-fusion leaves.
+    // Establish that phase's adapter state once, build its seed/step-invariant text/RoPE state once,
+    // then retain the tensors while the per-seed loop re-applies the same adapter stack to the mutable
+    // job-local DiT. The prepared state is value-owned, so it remains correct when the next phase swaps
+    // adapters; this avoids repeating text fusion for every image in a multi-phase request.
+    let mut phase_prepared = Vec::with_capacity(resolved.len());
+    for (phase, specs) in resolved.iter().zip(&phase_specs) {
+        materialize_multiphase_adapter_set(&mut dit, specs)?;
+        let positive = dit.prepare_conditioning(context, req.width, req.height)?;
+        let negative = if phase.guidance > 0.0 {
+            let context = neg_context.ok_or_else(|| {
+                CandleError::Msg(
+                    "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
+                     unconditional context, but none was encoded"
+                        .into(),
+                )
+            })?;
+            Some(dit.prepare_conditioning(context, req.width, req.height)?)
+        } else {
+            None
+        };
+        phase_prepared.push((positive, negative));
+    }
+
     let outputs = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         // Phase 0 starts from the initial noise at sigmas[0]; each subsequent phase resumes from the prior
         // phase's output latent at the SHARED boundary sigma.
@@ -1998,7 +2071,12 @@ fn render_multiphase_driver<T>(
         // seed loop because a counter is per trajectory — reusing it would starve image 2 of frames.
         let preview_counter = crate::preview::multiphase_counter(&sigmas);
         let preview = crate::preview::multiphase_hook(&req.preview, &preview_counter, &sigmas);
-        for (phase_index, (phase, specs)) in resolved.iter().zip(&phase_specs).enumerate() {
+        for (phase_index, ((phase, specs), (positive, negative))) in resolved
+            .iter()
+            .zip(&phase_specs)
+            .zip(&phase_prepared)
+            .enumerate()
+        {
             // Re-adapt the job-local DiT to THIS phase's adapter set: clear the prior phase's residuals,
             // then install the current subset (empty ⇒ bare base). Authoritative regardless of what the
             // prior phase installed.
@@ -2019,18 +2097,32 @@ fn render_multiphase_driver<T>(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let cond = dit.forward(x, &t, context)?;
+                    let cond = dit.forward_prepared_with_memory(
+                        x,
+                        &t,
+                        positive,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                        &req.cancel,
+                    )?;
                     // Per-phase CFG: two forwards combined by the reference `krea_cfg_combine` when
                     // guidance > 0; else the bare conditional velocity (single forward).
                     let v = if guidance > 0.0 {
-                        let nc = neg_context.ok_or_else(|| {
+                        let negative = negative.as_ref().ok_or_else(|| {
                             CandleError::Msg(
                                 "krea_2 multi-phase: a CFG phase (guidance > 0) requires the \
                                  unconditional context, but none was encoded"
                                     .into(),
                             )
                         })?;
-                        let uncond = dit.forward(x, &t, nc)?;
+                        let uncond = dit.forward_prepared_with_memory(
+                            x,
+                            &t,
+                            negative,
+                            candle_gen::ATTN_SCORES_BUDGET,
+                            crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                            &req.cancel,
+                        )?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     } else {
                         cond
@@ -2178,8 +2270,19 @@ fn render_base_img2img_from_contexts(
     guidance: f32,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
+    candle_gen::check_cancel(&req.cancel)?;
     let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let prepared = comps
+        .dit
+        .prepare_conditioning(context, req.width, req.height)?;
+    let prepared_neg = neg_context
+        .map(|context| {
+            comps
+                .dit
+                .prepare_conditioning(context, req.width, req.height)
+        })
+        .transpose()?;
 
     // Resolution-dynamic Raw sigma schedule (mu from the image-token count), identical to `render_base`.
     let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
@@ -2225,13 +2328,29 @@ fn render_base_img2img_from_contexts(
                 Some(&preview),
                 |x, timestep| -> Result<Tensor> {
                     let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                    let cond = comps.dit.forward(x, &t, context)?;
+                    let cond = comps.dit.forward_prepared_with_memory(
+                        x,
+                        &t,
+                        &prepared,
+                        candle_gen::ATTN_SCORES_BUDGET,
+                        crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                        &req.cancel,
+                    )?;
                     // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
                     // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`),
                     // exactly as `render_base`.
                     let v = match neg_context {
-                        Some(nc) => {
-                            let uncond = comps.dit.forward(x, &t, nc)?;
+                        Some(_) => {
+                            let uncond = comps.dit.forward_prepared_with_memory(
+                                x,
+                                &t,
+                                prepared_neg
+                                    .as_ref()
+                                    .expect("negative context has prepared state"),
+                                candle_gen::ATTN_SCORES_BUDGET,
+                                crate::transformer::DEFAULT_TRANSFORMER_WINDOW,
+                                &req.cancel,
+                            )?;
                             krea_cfg_combine(&cond, &uncond, guidance)?
                         }
                         None => cond,
@@ -2411,9 +2530,23 @@ fn render_edit_from_context(
         distilled,
     } = encoded;
 
+    candle_gen::check_cancel(&req.cancel)?;
+
     // Wire (a): VAE-encode each reference at the TARGET resolution → the normalized 16-ch latent (static
     // across steps). Fixed order preserved (image 1, then image 2 — sc-10878).
     let ref_latents = encode_references(vae_encoder, references, req.width, req.height, device)?;
+    let prepared =
+        heavy
+            .dit
+            .prepare_edit_conditioning(&context, &ref_latents, req.width, req.height)?;
+    let prepared_neg = neg_context
+        .as_ref()
+        .map(|context| {
+            heavy
+                .dit
+                .prepare_edit_conditioning(context, &ref_latents, req.width, req.height)
+        })
+        .transpose()?;
 
     // Turbo edit runs the distilled few-step `turbo_schedule` (fixed mu) the CFG-free student expects;
     // Raw edit runs the resolution-dynamic `base_schedule` (undistilled, like `render_base`).
@@ -2455,20 +2588,19 @@ fn render_edit_from_context(
                 // Thread the request's cancel flag into the block loop (sc-16003): an edit step at
                 // 2048² is ~45 s (a ~37k-token joint sequence), far too long for the sampler's
                 // between-steps poll to be the only checkpoint. Both CFG legs honor it.
-                let forward_edit = |ctx: &Tensor| {
-                    heavy.dit.forward_edit_with_memory(
+                let forward_edit = |prepared: &crate::transformer::PreparedConditioning| {
+                    heavy.dit.forward_edit_prepared_with_memory(
                         x,
                         &t,
-                        ctx,
-                        &ref_latents,
+                        prepared,
                         candle_gen::ATTN_SCORES_BUDGET,
                         &req.cancel,
                     )
                 };
-                let cond = forward_edit(&context)?;
-                let v = match &neg_context {
-                    Some(nc) => {
-                        let uncond = forward_edit(nc)?;
+                let cond = forward_edit(&prepared)?;
+                let v = match &prepared_neg {
+                    Some(negative) => {
+                        let uncond = forward_edit(negative)?;
                         krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
@@ -3179,9 +3311,15 @@ mod tests {
         assert!(payload_consumed.load(Ordering::SeqCst));
         let error = result
             .err()
-            .expect("mid-load replacement must invalidate the production native-file entrypoint")
-            .to_string();
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+            .expect("mid-load replacement must invalidate the production native-file entrypoint");
+        assert!(
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "unexpected: {error:?}"
+        );
     }
 
     #[test]

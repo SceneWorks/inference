@@ -15,6 +15,8 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # config parsing (matches the sdxl/wan/ltx/flux2/lens provider convention).
 serde_json = { workspace = true }
+# Parallel host-only color correction; all MLX operations remain at the I/O boundary.
+rayon = "1"
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

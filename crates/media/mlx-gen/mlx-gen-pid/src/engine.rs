@@ -24,7 +24,7 @@ use crate::config::{PidConfig, SamplerConfig};
 use crate::decoder::PidDecoder;
 use crate::gemma2::{Gemma2, Gemma2Config};
 use crate::lq::PidNet;
-use crate::registry::lookup;
+use crate::registry::{lookup, BackboneSpec};
 use crate::sampler::Sampler;
 
 /// Filename of the merged Gemma-2-2b-it checkpoint inside the gemma snapshot dir; falls back to
@@ -65,22 +65,11 @@ impl PidEngine {
         })?;
         let weights = Weights::from_file(checkpoint)?;
 
-        // The released students share the sr4x PixDiT topology; only the LQ latent-channel count and
-        // the latent grid's spatial compression differ per latent space: 16-ch / 8× for qwen/flux/sd3,
-        // 4-ch / 8× for sdxl, and **128-ch / 16×** for flux2 (the packed BN latent — see the registry
-        // `FLUX2` note, sc-7847). Both fields drive the LQ adapter geometry + `PidDecoder` output size.
-        //
         // PiD v1.5 (sc-12142) ships a different LQ topology (wider trunk, per-token scalar gate,
         // replicate padding, PiT injection, 2048 RoPE ref) under the SAME per-space checkpoint slot, so
         // the worker may hand us either a v1.0 or v1.5 file (and fall back v1.5→v1.0 when v1.5 isn't
         // downloaded — sc-12145). Pick the config by sniffing the WEIGHTS, not the filename.
-        let mut cfg = if detect_v1pt5(&weights)? {
-            PidConfig::sr4x_v1pt5()
-        } else {
-            PidConfig::sr4x()
-        };
-        cfg.lq_latent_channels = spec.latent_channels;
-        cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+        let cfg = config_for_spec(&spec, detect_v1pt5(&weights)?);
 
         // Gemma: prefer the merged single-file checkpoint, else load the snapshot dir's shards.
         let merged = gemma_dir.join(GEMMA_MERGED_FILE);
@@ -406,6 +395,26 @@ pub fn flow_capture_for_request(
     }
 }
 
+/// Assemble the per-latent-space [`PidConfig`] for a resolved backbone spec. The released students
+/// share the `sr4x` PixDiT topology; only the LQ latent-channel count, the latent grid's spatial
+/// compression, and the SR scale differ per latent space (16-ch/8× for qwen/flux/sd3, 4-ch/8× for
+/// sdxl, 128-ch/16× for flux2 — see the registry `FLUX2` note, sc-7847).
+///
+/// `sr_scale` is threaded from [`BackboneSpec::pid_scale`] (F-141, sc-21702) rather than left at the
+/// hard-coded `sr4x()` `4`. Every released student is 4× today, so this preserves their output exactly;
+/// a future 8× student now sizes its decoder output and LQ upsample ratio from the registry contract.
+fn config_for_spec(spec: &BackboneSpec, v1pt5: bool) -> PidConfig {
+    let mut cfg = if v1pt5 {
+        PidConfig::sr4x_v1pt5()
+    } else {
+        PidConfig::sr4x()
+    };
+    cfg.lq_latent_channels = spec.latent_channels;
+    cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+    cfg.sr_scale = spec.pid_scale;
+    cfg
+}
+
 /// Sniff whether a loaded PiD checkpoint is a **v1.5** student (sc-12141/sc-12142) vs a base `sr4x`
 /// v1.0 student, so [`PidEngine::load`] can pick the right [`PidConfig`] from the same per-space slot.
 ///
@@ -461,6 +470,43 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn config_threads_pid_scale_and_preserves_released_4x_geometry() {
+        let baseline = PidConfig::sr4x();
+        for backbone in ["qwenimage", "flux", "sd3", "sdxl", "flux2"] {
+            let spec = lookup(backbone).unwrap();
+            let cfg = config_for_spec(&spec, false);
+            assert_eq!(cfg.sr_scale, spec.pid_scale, "{backbone}: registry scale");
+            assert_eq!(
+                cfg.sr_scale, baseline.sr_scale,
+                "{backbone}: released 4x geometry stays identical"
+            );
+            assert_eq!(cfg.lq_latent_channels, spec.latent_channels);
+            assert_eq!(
+                cfg.latent_spatial_down_factor,
+                spec.latent_spatial_down_factor
+            );
+        }
+    }
+
+    #[test]
+    fn hypothetical_4x_and_8x_specs_produce_candle_matching_geometry() {
+        // Candle assembles the same spec fields before passing them to PidDecoder. Keep this arithmetic
+        // explicit so a future asymmetric 8x student cannot quietly inherit sr4x()'s hard-coded 4x.
+        let mut spec = lookup("flux").unwrap();
+        spec.pid_scale = 4;
+        let cfg4 = config_for_spec(&spec, false);
+        spec.pid_scale = 8;
+        let cfg8 = config_for_spec(&spec, false);
+
+        let latent_side = 32;
+        let out4 = latent_side * cfg4.latent_spatial_down_factor * cfg4.sr_scale;
+        let out8 = latent_side * cfg8.latent_spatial_down_factor * cfg8.sr_scale;
+        assert_eq!(out4, 1024, "4x output geometry");
+        assert_eq!(out8, 2048, "8x output geometry");
+        assert_eq!(out8, out4 * 2, "pid_scale changes the decoder target");
     }
 
     #[test]

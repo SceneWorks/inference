@@ -502,9 +502,13 @@ mod tests {
         assert!(final_evaluated.load(Ordering::SeqCst));
         let error = result
             .err()
-            .expect("mid-load replacement must invalidate the production control File entrypoint")
-            .to_string();
-        assert!(error.contains("changed after load"), "unexpected: {error}");
+            .expect("mid-load replacement must invalidate the production control File entrypoint");
+        match error {
+            Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            Error::Unsupported(reason) => panic!("unexpected artifact-seal reason: {reason}"),
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 
     #[test]

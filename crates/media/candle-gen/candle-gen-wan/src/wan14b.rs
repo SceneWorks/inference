@@ -546,6 +546,13 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        // One cache per projected conditioning payload for this expert's request-scoped denoise range.
+        // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
+        check_cancel(cancel)?;
+        let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
+        let neg_kv = ctx_neg
+            .map(|context| expert.prepare_cross_kv(context))
+            .transpose()?;
         for i in range {
             check_cancel(cancel)?;
             let t = sched.timestep(i);
@@ -554,12 +561,12 @@ impl Pipeline {
                 Some(y) => Tensor::cat(&[&*latents, y], 1)?,
                 None => latents.clone(),
             };
-            let v_pos = expert.forward(&x, ctx_pos, t, cos, sin)?;
+            let v_pos = expert.forward_prepared(&x, t, &pos_kv, cos, sin)?;
             // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
             // is `Some` iff that guidance > 1.0 (sc-8993).
-            let v = match ctx_neg {
-                Some(ctx_neg) if cfg_active(guidance) => {
-                    let v_neg = expert.forward(&x, ctx_neg, t, cos, sin)?;
+            let v = match &neg_kv {
+                Some(neg_kv) if cfg_active(guidance) => {
+                    let v_neg = expert.forward_prepared(&x, t, neg_kv, cos, sin)?;
                     cfg(&v_pos, &v_neg, guidance)?
                 }
                 _ => v_pos,

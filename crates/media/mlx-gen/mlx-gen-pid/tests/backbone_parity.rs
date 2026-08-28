@@ -11,7 +11,7 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_pid::backbone::{image_rope_table, sincos_2d_pos, text_rope_table};
-use mlx_gen_pid::{ConvPadding, PidConfig, PixDiT, RopeMode};
+use mlx_gen_pid::{ConvPadding, PidConfig, PixDiT};
 use mlx_rs::ops::{abs, max, split, subtract};
 use mlx_rs::Array;
 
@@ -37,13 +37,10 @@ fn tiny_cfg() -> PidConfig {
         patch_size: 2,
         txt_embed_dim: 12,
         txt_max_length: 5,
-        use_text_rope: true,
         text_rope_theta: 10000.0,
-        rope_mode: RopeMode::NtkAware,
         rope_ref_h: 16,
         rope_ref_w: 16,
         // LQ fields are irrelevant to the base backbone but required to build the struct.
-        lq_in_channels: 0,
         lq_latent_channels: 16,
         lq_hidden_dim: 512,
         lq_num_res_blocks: 4,

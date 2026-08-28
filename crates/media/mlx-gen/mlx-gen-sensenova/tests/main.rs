@@ -14,6 +14,9 @@
 #[path = "backbone_parity.rs"]
 mod backbone_parity;
 
+#[path = "compact_fixture.rs"]
+mod compact_fixture;
+
 #[path = "descriptor_conformance.rs"]
 mod descriptor_conformance;
 

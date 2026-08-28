@@ -3424,6 +3424,17 @@ mod tests {
     use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
     use std::path::PathBuf;
 
+    fn assert_artifact_seal_mismatch(error: crate::Error) {
+        match error {
+            crate::Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            crate::Error::Unsupported(reason) => {
+                panic!("expected the shared artifact-seal rejection, got: {reason}")
+            }
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
+    }
+
     struct DummyGen {
         desc: ModelDescriptor,
     }
@@ -4000,29 +4011,20 @@ mod tests {
         let load_error = registry
             .load("prepared_callback_model", &load_spec)
             .err()
-            .expect("load callback A -> B -> recreated A must fail")
-            .to_string();
-        assert!(load_error.contains("entry changed"), "got: {load_error}");
+            .expect("load callback A -> B -> recreated A must fail");
+        assert_artifact_seal_mismatch(load_error);
 
         let (_footprint_dir, footprint_spec) = spec_with_rebinding_callback("footprint");
         let footprint_error = registry
             .footprint("prepared_callback_model", &footprint_spec)
-            .expect_err("footprint callback A -> B -> recreated A must fail")
-            .to_string();
-        assert!(
-            footprint_error.contains("entry changed"),
-            "got: {footprint_error}"
-        );
+            .expect_err("footprint callback A -> B -> recreated A must fail");
+        assert_artifact_seal_mismatch(footprint_error);
 
         let (_memory_dir, memory_spec) = spec_with_rebinding_callback("memory");
         let memory_error = registry
             .memory_strategy_contract("prepared_callback_model", &memory_spec)
-            .expect_err("memory callback A -> B -> recreated A must fail")
-            .to_string();
-        assert!(
-            memory_error.contains("entry changed"),
-            "got: {memory_error}"
-        );
+            .expect_err("memory callback A -> B -> recreated A must fail");
+        assert_artifact_seal_mismatch(memory_error);
     }
 
     #[test]

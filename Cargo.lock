@@ -652,7 +652,6 @@ dependencies = [
  "candle-gen-face",
  "candle-gen-pid",
  "candle-gen-sdxl",
- "image",
  "rand",
  "tempfile",
 ]
@@ -2490,7 +2489,6 @@ dependencies = [
  "image",
  "mlx-gen",
  "pmetal-mlx-rs",
- "serde_json",
 ]
 
 [[package]]
@@ -2600,6 +2598,7 @@ version = "0.0.0"
 dependencies = [
  "mlx-gen",
  "pmetal-mlx-rs",
+ "rayon",
  "sceneworks-gen-core-testkit",
  "serde_json",
  "tempfile",

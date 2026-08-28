@@ -28,7 +28,7 @@ use mlx_gen::{
     Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_face::FaceAnalysis;
+use mlx_gen_face::{Detection, FaceAnalysis};
 use mlx_gen_flux::config::FluxVariant;
 use mlx_gen_flux::model::{load_flux1, Flux1};
 
@@ -183,7 +183,8 @@ impl PulidFlux {
     ///
     /// `cancel` (F-108): the identity tower is the priciest pre-denoise stage (SCRFD + BiSeNet +
     /// ArcFace, then the 24-block EVA-CLIP tower + IDFormer), and previously ran with zero cancel
-    /// checks. We check between stages. `analyze` / `face_features_image` already materialize to host
+    /// checks. We check between stages. The selected-face `embed` / `face_features_image` stages
+    /// already materialize to host
     /// (`Face.embedding` is a `Vec<f32>`), so the check after them is effective as-is; the EVA tower
     /// output is lazy, so we `eval` it before the check ahead of the IDFormer (no lazy-eval false
     /// green). Returns [`Error::Canceled`] on trip.
@@ -197,14 +198,17 @@ impl PulidFlux {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let faces = self.face.analyze(pixels, h, w)?;
-        let face = faces.first().ok_or_else(|| {
-            Error::Msg("pulid_flux: no face detected in the reference image".into())
-        })?;
+        // F-138: `detect` preserves largest-first ordering without running ArcFace. PuLID needs only
+        // that one identity, so embed it on demand instead of `analyze` embedding every face in a
+        // group reference.
+        let face = Self::largest_face_embedding(
+            || self.face.detect(pixels, h, w),
+            |detection| self.face.embed(pixels, h, w, detection),
+        )?;
         // ArcFace 512-d (id_ante_embedding) — raw, un-normalized, matching the reference.
         let arcface = Array::from_slice(&face.embedding, &[1, face.embedding.len() as i32]);
         // face_features_image (512² aligned, bg-whitened gray) → EVA 336² transform → tower.
-        let ffi = self.face.face_features_image(pixels, h, w, face)?;
+        let ffi = self.face.face_features_image(pixels, h, w, &face)?;
         // SCRFD/BiSeNet/ArcFace above are host-materialized; honor a cancel before the EVA tower.
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -219,6 +223,20 @@ impl PulidFlux {
         let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
         let id_cond = concatenate_axis(&[&arcface, &id_cond_vit], 1)?; // [1,1280]
         self.idformer.forward(&id_cond, &eva_out.hidden)
+    }
+
+    /// Detect faces in the face stack's largest-first order and perform exactly one requested
+    /// embedding. Keeping this selection boundary separate makes the no-N-face-ArcFace-work
+    /// guarantee testable without a real MLX model.
+    fn largest_face_embedding<T>(
+        detect: impl FnOnce() -> Result<Vec<Detection>>,
+        embed: impl FnOnce(&Detection) -> Result<T>,
+    ) -> Result<T> {
+        let detections = detect()?;
+        let largest = detections.first().ok_or_else(|| {
+            Error::Msg("pulid_flux: no face detected in the reference image".into())
+        })?;
+        embed(largest)
     }
 
     /// The unconditional id_embedding — IDFormer over **zeroed** id_cond + zeroed hidden states (the
@@ -896,5 +914,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("required"));
+    }
+
+    /// F-138: a multi-face reference reaches ArcFace exactly once, for the first detection. The
+    /// face stack's `detect` contract sorts detections largest-first, so this is the selected face
+    /// rather than the first detector-score result.
+    #[test]
+    fn largest_face_embedding_does_one_embed_for_multi_face_detection() {
+        let detections = vec![
+            Detection {
+                bbox: [0.0, 0.0, 20.0, 20.0],
+                kps: [[0.0; 2]; 5],
+                score: 0.9,
+            },
+            Detection {
+                bbox: [0.0, 0.0, 10.0, 10.0],
+                kps: [[1.0; 2]; 5],
+                score: 0.99,
+            },
+            Detection {
+                bbox: [0.0, 0.0, 5.0, 5.0],
+                kps: [[2.0; 2]; 5],
+                score: 0.8,
+            },
+        ];
+        let mut embed_calls = 0;
+        let selected = PulidFlux::largest_face_embedding(
+            || Ok(detections),
+            |detection| {
+                embed_calls += 1;
+                Ok(detection.bbox)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(embed_calls, 1, "only the selected face may reach ArcFace");
+        assert_eq!(selected, [0.0, 0.0, 20.0, 20.0]);
     }
 }

@@ -172,6 +172,15 @@ pub const DEFAULT_STEPS: u32 = 50;
 /// rather than a slow render.
 pub const MAX_STEPS: u32 = 200;
 
+/// Resolve the request seed once before the task branches into `t2va` / `fl2va` or `ref2va`.
+///
+/// An omitted seed uses gen-core's shared time-derived policy rather than a provider-local
+/// constant. The resolved value is then handed to either partition's initial latent draw, so all
+/// request paths preserve explicit-seed reproducibility.
+fn resolve_seed(req: &GenerationRequest) -> u64 {
+    req.seed.unwrap_or_else(candle_gen::gen_core::default_seed)
+}
+
 /// **The residency this provider runs at, regardless of what a caller asked for.**
 ///
 /// See the module docs: the manifest's measured `vramGbByTier` is a sequential-phase peak, so the
@@ -888,7 +897,7 @@ impl MiniMaxH3 {
         let video_shift = req.scheduler_shift.unwrap_or(VIDEO_SIGMA_SHIFT);
         let schedule =
             JointSchedule::with_shifts(evaluations as usize + 1, video_shift, AUDIO_SIGMA_SHIFT)?;
-        let seed = req.seed.unwrap_or(0);
+        let seed = resolve_seed(req);
 
         // --- 1. conditioning -----------------------------------------------------------------
         let keyframes = req.keyframes();
@@ -2021,6 +2030,55 @@ mod tests {
             frames: Some(124),
             ..Default::default()
         }
+    }
+
+    /// An omitted seed must draw from gen-core's shared policy, not re-use Candle's former zero
+    /// fallback. Two requests therefore get fresh, nonzero resolved seeds before either task path
+    /// begins loading weights.
+    #[test]
+    fn unseeded_requests_resolve_fresh_nonzero_shared_seeds() {
+        let first = resolve_seed(&request(64, 64));
+        let second = resolve_seed(&request(64, 64));
+
+        assert_ne!(first, 0, "gen-core's default seed must not use zero");
+        assert_ne!(second, 0, "gen-core's default seed must not use zero");
+        assert_ne!(
+            first, second,
+            "separate unseeded requests must not retain Candle's constant fallback"
+        );
+    }
+
+    /// A caller-supplied seed is resolved before the `t2va` / keyframe (`fl2va`) / reference
+    /// (`ref2va`) split, so every partition receives the exact explicit value for its initial
+    /// noise. The keyframe posterior keeps its own fixed stream; `conditioning` covers that
+    /// request-independent stream separately.
+    #[test]
+    fn explicit_seed_stays_stable_across_main_and_keyframe_request_paths() {
+        const EXPLICIT_SEED: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut req = request(64, 64);
+        req.seed = Some(EXPLICIT_SEED);
+
+        for (has_keyframes, has_references, expected_partition) in [
+            (false, false, BASE_DIT_PARTITION),
+            (true, false, BASE_DIT_PARTITION),
+            (false, true, REFERENCE_DIT_PARTITION),
+        ] {
+            let task = MiniMaxH3Task::resolve(has_keyframes, has_references).unwrap();
+            assert_eq!(task.partition(), expected_partition);
+            assert_eq!(resolve_seed(&req), EXPLICIT_SEED);
+        }
+
+        let geometry =
+            resolve_geometry(req.width, req.height, req.frames.unwrap() as usize).unwrap();
+        let (video_a, audio_a) =
+            initial_latents(&geometry, PATCH_SIZE, resolve_seed(&req), &Device::Cpu).unwrap();
+        let (video_b, audio_b) =
+            initial_latents(&geometry, PATCH_SIZE, resolve_seed(&req), &Device::Cpu).unwrap();
+        let flat = |tensor: &candle_gen::candle_core::Tensor| {
+            tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        assert_eq!(flat(&video_a), flat(&video_b));
+        assert_eq!(flat(&audio_a), flat(&audio_b));
     }
 
     /// **The per-edge ceiling is the widest canvas the model's own resolver emits** (sc-17152).

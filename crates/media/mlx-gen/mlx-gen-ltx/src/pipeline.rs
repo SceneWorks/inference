@@ -35,7 +35,7 @@ use crate::conditioning::{
     unpatchify_grid, I2vConditioning, Keyframe, VideoTokenState,
 };
 use crate::contiguous;
-use crate::positions::{DEFAULT_FPS, SPATIAL_SCALE, TEMPORAL_SCALE};
+use crate::positions::{SPATIAL_SCALE, TEMPORAL_SCALE};
 use crate::transformer::{to_denoised, AvDiT, LtxDiT};
 use crate::upsampler::{upsample_latents, LatentUpsampler};
 use crate::vae::LtxVideoVae;
@@ -1153,6 +1153,27 @@ pub struct StageClip<'a> {
     pub strength: f32,
 }
 
+/// Append all IC-LoRA clips using the request's output cadence. The appended-token grid is a
+/// secondary video position grid, so it must share the main video grid's `frames / fps` clock.
+fn append_iclora_clips(
+    mut state: VideoTokenState,
+    clips: &[StageClip<'_>],
+    fps: f32,
+) -> Result<VideoTokenState> {
+    for clip in clips {
+        state = append_keyframe_clip(
+            &state,
+            clip.stage1,
+            clip.frame_idx,
+            clip.strength,
+            TEMPORAL_SCALE,
+            SPATIAL_SCALE,
+            fps,
+        )?;
+    }
+    Ok(state)
+}
+
 /// The full 2-stage **IC-LoRA** (keyframe-append) A/V pipeline for extend_clip / video_bridge: stage-1
 /// **token-native** denoise with the conditioning clips appended as in-context tokens → read back the
 /// generated grid → 2× upsample → stage-2 plain grid denoise (clips are stage-1 only). Audio is
@@ -1177,6 +1198,7 @@ pub fn generate_av_latents_iclora(
     latent_std: &Array,
     clips: &[StageClip],
     grid_dims: (i32, i32, i32, i32),
+    fps: f32,
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
@@ -1187,18 +1209,11 @@ pub fn generate_av_latents_iclora(
 
     // Stage 1: build the base token state from the noise grid + main positions, append each clip as
     // in-context conditioning tokens, then run the token-native joint denoise.
-    let mut vstate = VideoTokenState::base(video_s1_noise, video_pos1)?;
-    for clip in clips {
-        vstate = append_keyframe_clip(
-            &vstate,
-            clip.stage1,
-            clip.frame_idx,
-            clip.strength,
-            TEMPORAL_SCALE,
-            SPATIAL_SCALE,
-            DEFAULT_FPS,
-        )?;
-    }
+    let vstate = append_iclora_clips(
+        VideoTokenState::base(video_s1_noise, video_pos1)?,
+        clips,
+        fps,
+    )?;
     dit.set_lora_pass(0);
     let (vstate, a) = denoise_av_tokens(
         dit,

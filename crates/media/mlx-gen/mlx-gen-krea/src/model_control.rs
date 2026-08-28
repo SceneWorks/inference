@@ -360,7 +360,8 @@ fn build_native_krea_control_from_spec(spec: &LoadSpec) -> Result<KreaTurboContr
         None => build_memory_contract(),
     })?;
     let text_base = base.clone();
-    let text_encoder_source = crate::model::ENCODER_CONTRACT.source_for_load(spec, &base)?;
+    let text_encoder_source =
+        crate::model::runtime_encoder_contract().source_for_load(spec, &base)?;
     let expected_text_encoder_bits = crate::model::native_text_encoder_expected_quant_bits(&base)?;
     let text_encoder_load_time_quant_bits = text_encoder_source
         .load_time_quant_bits(expected_text_encoder_bits, KREA_2_TURBO_CONTROL_ID)?;
@@ -890,7 +891,7 @@ mod tests {
         std::fs::write(base.join("transformer/config.json"), "{}").unwrap();
         gen_core_testkit::write_encoder_contract_fixture(
             &base.join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("native-dit.safetensors");
@@ -911,7 +912,7 @@ mod tests {
         }
         gen_core_testkit::write_encoder_contract_fixture(
             &base.join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         let dit = tmp.path().join("dit.safetensors");

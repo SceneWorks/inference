@@ -6,7 +6,7 @@
 //! the standard 8-step CFG-free Turbo denoise conditioned on a rendered OpenPose skeleton.
 //!
 //! **How it conditions:** the pose skeleton is VAE-encoded (Qwen-Image VAE) into a control latent, then
-//! [`forward_with_control`] — a drop-in for the base
+//! `forward_with_prepared_control` — a drop-in for the base
 //! `dit.forward` — adds the branch residual into the frozen main stream after each of the first N
 //! single-stream blocks, scaled by `control_scale` and RMS-clamped at τ (the S0 recipe: τ = 0.15,
 //! applied identically train/infer). `control_scale = 0` is engine-proven **byte-identical** to the
@@ -36,7 +36,7 @@ use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::Krea2Config;
-use crate::control::{forward_with_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
+use crate::control::{forward_with_prepared_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
 use crate::loader::Weights;
 use crate::pipeline::maybe_apply_style_gain;
 use crate::pipeline::to_image;
@@ -552,8 +552,12 @@ impl Krea2ControlHeavy {
         context: Tensor,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        candle_gen::check_cancel(&req.cancel)?;
         let ctrl_nchw = control_image_to_nchw(control_image, req.width, req.height, device)?;
         let ctrl_latent = self.vae_encoder.encode(&ctrl_nchw)?;
+        let prepared = self
+            .dit
+            .prepare_control_conditioning(&context, &ctrl_latent)?;
         let scale = req.control_scale as f64;
 
         let (lat_h, lat_w) = (
@@ -581,13 +585,12 @@ impl Krea2ControlHeavy {
             Some(&preview),
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let v = forward_with_control(
+                let v = forward_with_prepared_control(
                     &self.dit,
                     &self.branch,
                     x,
                     &t,
-                    &context,
-                    &ctrl_latent,
+                    &prepared,
                     scale,
                 )?;
                 Ok(v.to_dtype(DType::F32)?)
@@ -747,11 +750,14 @@ mod tests {
         let progress_called = std::cell::Cell::new(false);
         let error = model
             .generate(&request, &control_image, &mut |_| progress_called.set(true))
-            .expect_err("mutated control must fail before the first deferred materializer")
-            .to_string();
+            .expect_err("mutated control must fail before the first deferred materializer");
         assert!(
-            error.contains("receipt changed") || error.contains("pinned weights"),
-            "unexpected mutation error: {error}"
+            matches!(
+                error,
+                CandleError::Msg(ref reason)
+                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+            ),
+            "the Candle bridge must preserve the shared artifact-seal rejection: {error:?}"
         );
         assert!(!progress_called.get(), "materialization emitted progress");
         assert!(

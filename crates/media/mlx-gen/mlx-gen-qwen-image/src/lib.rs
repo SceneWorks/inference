@@ -154,6 +154,97 @@ pub const VISION_ENCODER_CONTRACT: mlx_gen::gen_core::VisionEncoderContract =
         full_attention_block_indexes: &[7, 15, 23, 31],
     };
 
+/// Encoder contract used by source admission and load-exact fact discovery.
+///
+/// Production always returns [`ENCODER_CONTRACT`]. Unit tests may install a thread-local bounded
+/// contract so the unchanged production callback/wiring can be exercised without hashing a
+/// production-logical-size sparse fixture.
+pub(crate) fn active_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    #[cfg(test)]
+    if let Some(contract) = TEST_ENCODER_CONTRACT.get() {
+        return contract;
+    }
+    ENCODER_CONTRACT
+}
+
+/// Vision companion for [`active_encoder_contract`]. Production always returns
+/// [`VISION_ENCODER_CONTRACT`].
+pub(crate) fn active_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    #[cfg(test)]
+    if let Some(contract) = TEST_VISION_ENCODER_CONTRACT.get() {
+        return contract;
+    }
+    VISION_ENCODER_CONTRACT
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ENCODER_CONTRACT: std::cell::Cell<Option<mlx_gen::gen_core::EncoderContract>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_VISION_ENCODER_CONTRACT:
+        std::cell::Cell<Option<mlx_gen::gen_core::VisionEncoderContract>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Compact Qwen2.5-VL language contract for tests that exercise sealed source/config admission.
+/// Production geometry and policy are asserted separately from these bounded physical receipts.
+#[cfg(test)]
+pub(crate) fn bounded_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        max_position_embeddings: 512,
+        mrope_section: &[4, 6, 6],
+        selected_hidden_layers: &[1],
+        ..ENCODER_CONTRACT
+    }
+}
+
+/// Compact Qwen2.5-VL vision companion for [`bounded_encoder_contract`].
+#[cfg(test)]
+pub(crate) fn bounded_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    mlx_gen::gen_core::VisionEncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        output_width: 64,
+        full_attention_block_indexes: &[0],
+        ..VISION_ENCODER_CONTRACT
+    }
+}
+
+/// Scoped, thread-local bounded contract override for tests that must execute production source
+/// admission, registry callbacks, or per-variant builders. Nested guards restore their predecessor.
+#[cfg(test)]
+pub(crate) struct BoundedEncoderContractGuard {
+    previous_language: Option<mlx_gen::gen_core::EncoderContract>,
+    previous_vision: Option<mlx_gen::gen_core::VisionEncoderContract>,
+}
+
+#[cfg(test)]
+impl Drop for BoundedEncoderContractGuard {
+    fn drop(&mut self) {
+        TEST_ENCODER_CONTRACT.set(self.previous_language);
+        TEST_VISION_ENCODER_CONTRACT.set(self.previous_vision);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_bounded_encoder_contract() -> BoundedEncoderContractGuard {
+    BoundedEncoderContractGuard {
+        previous_language: TEST_ENCODER_CONTRACT.replace(Some(bounded_encoder_contract())),
+        previous_vision: TEST_VISION_ENCODER_CONTRACT
+            .replace(Some(bounded_vision_encoder_contract())),
+    }
+}
+
 pub use adapters::apply_qwen_adapters;
 pub use control_transformer::{QwenFunControlBranch, QwenFunControlConfig};
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
@@ -264,6 +355,33 @@ pub fn provider_registry() -> mlx_gen::gen_core::Result<mlx_gen::gen_core::Provi
 
 #[cfg(test)]
 mod explicit_registry_tests {
+    fn write_minimal_safetensors(path: &std::path::Path) {
+        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend([0_u8; 2]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn bounded_snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let root = tmp.path().join("qwen-registry");
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_minimal_safetensors(&dir.join("model.safetensors"));
+        }
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            super::bounded_encoder_contract(),
+            super::bounded_vision_encoder_contract(),
+        )
+        .unwrap();
+        root
+    }
+
     /// One line per selector: the whole ladder's per-surface disposition, in rung order 0..4.
     /// `I` = Implemented, `S` = StructurallyNotApplicable, `-` = Missing.
     fn ladder_lines(provider_id: &str) -> Vec<String> {
@@ -339,19 +457,47 @@ mod explicit_registry_tests {
 
     #[test]
     fn qwen_authored_attention_bias_must_match_the_biasful_runtime() {
-        let tmp = tempfile::tempdir().unwrap();
-        let encoder = tmp.path().join("encoder");
-        gen_core_testkit::write_encoder_contract_fixture(&encoder, super::ENCODER_CONTRACT)
-            .unwrap();
-        super::ENCODER_CONTRACT
-            .validate_source(&mlx_gen::WeightsSource::Dir(encoder.clone()))
-            .expect("omission must select the biasful runtime behavior");
+        let production = super::ENCODER_CONTRACT;
+        assert_eq!(production.architecture, "qwen2_5_vl_text");
+        assert_eq!(production.hidden_size, 3584);
+        assert_eq!(production.intermediate_size, 18_944);
+        assert_eq!(production.num_hidden_layers, 28);
+        assert_eq!(production.num_attention_heads, 28);
+        assert_eq!(production.num_key_value_heads, 4);
+        assert_eq!(production.head_dim, 128);
+        assert_eq!(production.output_width, 3584);
+        assert_eq!(production.loaded_hidden_layers, 28);
+        assert_eq!(production.selected_hidden_layers, &[28]);
+        assert_eq!(production.mrope_section, &[16, 24, 24]);
+        assert_eq!(
+            production.attention_bias,
+            mlx_gen::gen_core::EncoderConfigBool::Optional(true)
+        );
+        assert!(production.attention_bias.effective());
+
+        let bounded = super::bounded_encoder_contract();
+        assert_eq!(bounded.architecture, production.architecture);
+        assert_eq!(bounded.attention_bias, production.attention_bias);
+        assert_eq!(bounded.tie_word_embeddings, production.tie_word_embeddings);
+        assert_eq!(bounded.tokenizer, production.tokenizer);
+        assert_eq!(bounded.prompt_executions, production.prompt_executions);
+        bounded.validate_definition().unwrap();
+
+        let fixture = tempfile::tempdir().unwrap();
+        let encoder = fixture.path().join("encoder");
+        gen_core_testkit::write_encoder_contract_fixture(&encoder, bounded).unwrap();
         let config_path = encoder.join("config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("attention_bias");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        bounded
+            .validate_source(&mlx_gen::WeightsSource::Dir(encoder.clone()))
+            .expect("omission must select the production biasful runtime behavior");
+
         config["attention_bias"] = serde_json::json!(false);
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let error = super::ENCODER_CONTRACT
+        let error = bounded
             .validate_source(&mlx_gen::WeightsSource::Dir(encoder))
             .unwrap_err()
             .to_string();
@@ -359,31 +505,44 @@ mod explicit_registry_tests {
         assert!(error.contains("expected true"), "{error}");
     }
 
-    fn write_minimal_safetensors(path: &std::path::Path) {
-        let mut header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();
-        while !header.len().is_multiple_of(8) {
-            header.push(b' ');
-        }
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(header);
-        bytes.extend([0_u8; 2]);
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    fn snapshot(tmp: &tempfile::TempDir) -> std::path::PathBuf {
-        let root = tmp.path().join("qwen-registry");
-        for component in ["text_encoder", "transformer", "vae"] {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_minimal_safetensors(&dir.join("model.safetensors"));
-        }
-        gen_core_testkit::write_multimodal_encoder_contract_fixture(
-            &root.join("text_encoder"),
-            super::ENCODER_CONTRACT,
-            super::VISION_ENCODER_CONTRACT,
-        )
-        .expect("validation-complete text encoder fixture");
-        root
+    #[test]
+    fn bounded_contract_override_is_thread_local_and_scoped() {
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+        assert_eq!(
+            super::active_vision_encoder_contract(),
+            super::VISION_ENCODER_CONTRACT
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            {
+                let _guard = super::scoped_bounded_encoder_contract();
+                worker_barrier.wait();
+                worker_barrier.wait();
+                assert_eq!(
+                    super::active_encoder_contract(),
+                    super::bounded_encoder_contract()
+                );
+                assert_eq!(
+                    super::active_vision_encoder_contract(),
+                    super::bounded_vision_encoder_contract()
+                );
+            }
+            assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+            assert_eq!(
+                super::active_vision_encoder_contract(),
+                super::VISION_ENCODER_CONTRACT
+            );
+        });
+        barrier.wait();
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
+        assert_eq!(
+            super::active_vision_encoder_contract(),
+            super::VISION_ENCODER_CONTRACT
+        );
+        barrier.wait();
+        worker.join().unwrap();
+        assert_eq!(super::active_encoder_contract(), super::ENCODER_CONTRACT);
     }
 
     #[test]
@@ -418,12 +577,21 @@ mod explicit_registry_tests {
         let tmp = tempfile::tempdir().unwrap();
         use mlx_gen::{LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
 
+        let _guard = super::scoped_bounded_encoder_contract();
         let registry = super::provider_registry().unwrap();
-        let root = snapshot(&tmp);
+        let root = bounded_snapshot(&tmp);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization);
-        for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
+        let ids = ["qwen_image", "qwen_image_control", "qwen_image_edit"];
+        assert_eq!(
+            registry
+                .memory_strategy_registrations()
+                .map(|registration| registration.provider_id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ids.into_iter().collect()
+        );
+        for id in ids {
             let contract = registry
                 .memory_strategy_contract(id, &spec)
                 .unwrap()
@@ -434,17 +602,34 @@ mod explicit_registry_tests {
                 super::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
             );
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn registry_footprints_price_only_route_materialized_conditioning() {
+    fn registry_footprints_bind_every_route_and_price_only_materialized_conditioning() {
         use mlx_gen::{LoadSpec, WeightsSource};
 
         let tmp = tempfile::tempdir().unwrap();
+        let _guard = super::scoped_bounded_encoder_contract();
         let registry = super::provider_registry().unwrap();
-        let root = snapshot(&tmp);
-        let base_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        assert_eq!(
+            registry
+                .generators()
+                .map(|registration| {
+                    (
+                        (registration.descriptor)().id,
+                        registration.footprint.is_some(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            std::collections::BTreeMap::from([
+                ("qwen_image", true),
+                ("qwen_image_control", true),
+                ("qwen_image_edit", true),
+            ])
+        );
+
+        let root = bounded_snapshot(&tmp);
+        let base_spec = LoadSpec::new(WeightsSource::Dir(root));
         let base = registry
             .footprint("qwen_image", &base_spec)
             .unwrap()
@@ -461,16 +646,18 @@ mod explicit_registry_tests {
         assert!(edit.text_encoder > base.text_encoder);
 
         let language_only = tmp.path().join("alternate-language");
-        gen_core_testkit::write_encoder_contract_fixture(&language_only, super::ENCODER_CONTRACT)
-            .unwrap();
+        gen_core_testkit::write_encoder_contract_fixture(
+            &language_only,
+            super::bounded_encoder_contract(),
+        )
+        .unwrap();
         let complete = tmp.path().join("alternate-complete");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &complete.join("text_encoder"),
-            super::ENCODER_CONTRACT,
-            super::VISION_ENCODER_CONTRACT,
+            super::bounded_encoder_contract(),
+            super::bounded_vision_encoder_contract(),
         )
         .unwrap();
-
         let language_spec = base_spec
             .clone()
             .with_text_encoder(WeightsSource::Dir(language_only));
@@ -482,7 +669,7 @@ mod explicit_registry_tests {
             let multimodal = registry.footprint(id, &complete_spec).unwrap().unwrap();
             assert_eq!(
                 language.text_encoder, multimodal.text_encoder,
-                "{id}: ignored alternate visual tensors must not be priced"
+                "{id}: alternate visual tensors must not replace or augment the selected language surface"
             );
         }
         let selected_t2i = registry
@@ -496,6 +683,66 @@ mod explicit_registry_tests {
         assert_eq!(
             selected_edit.text_encoder - selected_t2i.text_encoder,
             edit.text_encoder - base.text_encoder,
+            "edit must compose every selected language source with the builtin vision side exactly once"
+        );
+
+        // Exact production-logical header arithmetic remains independent from the bounded sealed
+        // receipts above.
+        let language = gen_core_testkit::encoder_contract_fixture_tensor_headers(
+            super::ENCODER_CONTRACT,
+            None,
+        )
+        .unwrap();
+        let vision = super::VISION_ENCODER_CONTRACT
+            .expected_headers()
+            .unwrap()
+            .into_iter()
+            .map(|(name, shape)| mlx_gen::gen_core::SafetensorsTensorHeader {
+                name,
+                data_bytes: shape
+                    .iter()
+                    .try_fold(2_u64, |bytes, &dimension| {
+                        bytes.checked_mul(dimension as u64)
+                    })
+                    .unwrap(),
+                dtype: mlx_gen::gen_core::weightsmeta::Dtype::F16,
+                shape,
+            })
+            .collect::<Vec<_>>();
+        let base = super::model::projected_conditioning_headers(&language, None).unwrap();
+        let control = super::model::projected_conditioning_headers(&language, None).unwrap();
+        let edit = super::model::projected_conditioning_headers(&language, Some(&vision)).unwrap();
+        assert_eq!(base, control);
+        assert!(edit > base);
+
+        let mut multimodal = language.clone();
+        multimodal.extend(vision.iter().cloned());
+        let selected_multimodal = super::ENCODER_CONTRACT
+            .materialized_dense_language_tensor_headers(&multimodal)
+            .unwrap();
+        assert_eq!(selected_multimodal, language);
+        for id in ["qwen_image", "qwen_image_control", "qwen_image_edit"] {
+            let include_vision = id == "qwen_image_edit";
+            assert_eq!(
+                super::model::projected_conditioning_headers(
+                    &language,
+                    include_vision.then_some(vision.as_slice()),
+                )
+                .unwrap(),
+                super::model::projected_conditioning_headers(
+                    &selected_multimodal,
+                    include_vision.then_some(vision.as_slice()),
+                )
+                .unwrap(),
+                "{id}: ignored alternate visual tensors must not be priced"
+            );
+        }
+        assert_eq!(
+            edit - base,
+            mlx_gen::asset_facts::projected_tensor_headers_bytes(&vision, |_| {
+                mlx_gen::asset_facts::ResidentProjection::Stored
+            })
+            .unwrap(),
             "edit must always add the exact builtin vision side once"
         );
     }

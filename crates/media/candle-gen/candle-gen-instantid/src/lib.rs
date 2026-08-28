@@ -23,8 +23,6 @@
 //! entry points the worker drives — lives in [`model`], composing the candle-gen-sdxl IP-Adapter /
 //! ControlNet / sampler / denoise stack and the candle-gen-face embedder.
 
-mod resample;
-
 pub mod kps;
 pub mod memory_strategy;
 pub mod model;

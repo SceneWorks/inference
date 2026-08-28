@@ -1021,6 +1021,19 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     let has_reference = match req.conditioning.as_slice() {
         [] => false,
         [Conditioning::Reference { .. }] => true,
+        conditioning
+            if conditioning
+                .iter()
+                .any(|value| matches!(value, Conditioning::Reference { .. }))
+                && conditioning
+                    .iter()
+                    .any(|value| !matches!(value, Conditioning::Reference { .. })) =>
+        {
+            return Err(Error::Unsupported(format!(
+                "{}: FLUX.1 IP-Adapter Reference conditioning cannot be combined with pose/control or other conditioning",
+                desc.id
+            )));
+        }
         _ => {
             return Err(Error::Msg(format!(
                 "{}: only a single Reference image is supported (no MultiReference / multiple references)",
@@ -1456,6 +1469,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("single Reference"));
+    }
+
+    #[test]
+    fn validate_rejects_reference_plus_pose_as_an_unsupported_combination() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let req = GenerationRequest {
+            prompt: "a posed portrait".into(),
+            conditioning: vec![
+                reference(Some(0.7)),
+                Conditioning::Control {
+                    image: tiny_image(),
+                    kind: mlx_gen::ControlKind::Pose,
+                    scale: Some(1.0),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matches!(model.validate(&req), Err(gen_core::Error::Unsupported(message)) if message.contains("cannot be combined"))
+        );
     }
 
     #[test]

@@ -62,7 +62,6 @@ jobs:
       candle_cpu: ${{ steps.select.outputs.candle_cpu }}
       macos_metal: ${{ steps.select.outputs.macos_metal }}
       windows_cuda: ${{ steps.select.outputs.windows_cuda }}
-      supply_chain: ${{ steps.select.outputs.supply_chain }}
       docs: ${{ steps.select.outputs.docs }}
       release: ${{ steps.select.outputs.release }}
       # Informational only: ordinary CI has no job that consumes this output because privileged
@@ -1021,8 +1020,6 @@ jobs:
 
   supply-chain:
     name: dependency policy + advisories
-    needs: changes
-    if: needs.changes.outputs.supply_chain == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1039,6 +1036,8 @@ jobs:
       - name: Install cargo-deny
         if: steps.cargo-deny-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-deny --locked --version 0.19.9
+      - name: Validate advisory-ignore governance
+        run: python3 scripts/ci/check_advisory_policy.py
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny --locked check advisories bans licenses sources
 
