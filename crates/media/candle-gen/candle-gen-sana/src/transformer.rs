@@ -433,8 +433,16 @@ impl CrossAttn {
         })
     }
 
-    /// `x` (query) `[B, N, dim]`, `kv` (caption) `[B, M, dim]`.
-    fn forward(&self, x: &Tensor, kv: &Tensor, score_budget: Option<usize>) -> Result<Tensor> {
+    /// `x` (query) `[B, N, dim]`, `kv` (caption) `[B, M, dim]`, `kv_mask` (optional `[B, M]`,
+    /// `1.0` real / `0.0` padding). The mask is applied additively before softmax, matching the MLX
+    /// sibling and diffusers' `encoder_attention_mask` semantics.
+    fn forward(
+        &self,
+        x: &Tensor,
+        kv: &Tensor,
+        kv_mask: Option<&Tensor>,
+        score_budget: Option<usize>,
+    ) -> Result<Tensor> {
         let (b, n, _) = x.dims3()?;
         let m = kv.dim(1)?;
 
@@ -468,15 +476,35 @@ impl CrossAttn {
             .map(|budget| (budget / b.max(1) / self.heads.max(1) / m.max(1)).max(1))
             .unwrap_or(n)
             .min(n);
+        let bias = kv_mask
+            .map(|mask| -> Result<Tensor> {
+                let (mask_b, mask_m) = mask.dims2()?;
+                if (mask_b, mask_m) != (b, m) {
+                    return Err(candle_gen::candle_core::Error::Msg(format!(
+                        "SANA caption mask shape [{mask_b}, {mask_m}] != caption shape [{b}, {m}]"
+                    )));
+                }
+                // [B,M] -> [B,1,1,M], with real-token bias 0 and padding bias -1e9.
+                mask.to_dtype(DType::F32)?
+                    .reshape((b, 1, 1, m))?
+                    .affine(1e9, -1e9)
+            })
+            .transpose()?;
+        let attend = |query: &Tensor| -> Result<Tensor> {
+            let scores = query.matmul(&kt)?.affine(scale, 0.0)?;
+            let scores = match &bias {
+                Some(bias) => scores.broadcast_add(bias)?,
+                None => scores,
+            };
+            softmax_last_dim(&scores)?.matmul(&v)
+        };
         let ctx = if rows == n {
-            let scores = q.matmul(&kt)?.affine(scale, 0.0)?;
-            softmax_last_dim(&scores)?.matmul(&v)?
+            attend(&q)?
         } else {
             let mut chunks = Vec::with_capacity(n.div_ceil(rows));
             for first in (0..n).step_by(rows) {
                 let count = rows.min(n - first);
-                let scores = q.narrow(2, first, count)?.matmul(&kt)?.affine(scale, 0.0)?;
-                chunks.push(softmax_last_dim(&scores)?.matmul(&v)?);
+                chunks.push(attend(&q.narrow(2, first, count)?)?);
             }
             Tensor::cat(&chunks, 2)?
         };
@@ -555,10 +583,12 @@ impl SanaBlock {
     }
 
     /// `hidden` `[B, N, dim]` (N = H·W tokens), `caption` `[B, M, dim]`, `temb` `[B, 6·dim]`.
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         hidden: &Tensor,
         caption: &Tensor,
+        caption_mask: Option<&Tensor>,
         temb: &Tensor,
         h: usize,
         w: usize,
@@ -580,7 +610,9 @@ impl SanaBlock {
         let hidden = (hidden + gate_msa.broadcast_mul(&attn_out)?)?;
 
         // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption, attention_budget)?;
+        let cross = self
+            .attn2
+            .forward(&hidden, caption, caption_mask, attention_budget)?;
         let hidden = (cross + hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to NCHW [B,dim,H,W] → GLUMBConv → flatten → gate.
@@ -872,7 +904,7 @@ impl SanaTransformer {
         caption: &Tensor,
         timestep: &Tensor,
     ) -> Result<Tensor> {
-        self.forward_with_guidance_memory(latent_nchw, caption, timestep, None, None)
+        self.forward_with_guidance_mask_memory(latent_nchw, caption, timestep, None, None, None)
     }
 
     /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint).
@@ -888,15 +920,38 @@ impl SanaTransformer {
         timestep: &Tensor,
         guidance: Option<&Tensor>,
     ) -> Result<Tensor> {
-        self.forward_with_guidance_memory(latent_nchw, caption, timestep, guidance, None)
+        self.forward_with_guidance_mask_memory(latent_nchw, caption, timestep, guidance, None, None)
     }
 
+    /// Backward-compatible mask-free memory-aware entrypoint. SANA production routes call
+    /// [`Self::forward_with_guidance_mask_memory`] with their gathered caption masks; PiD-style and
+    /// low-level callers that intentionally omit one retain the prior behavior here.
     pub fn forward_with_guidance_memory(
         &self,
         latent_nchw: &Tensor,
         caption: &Tensor,
         timestep: &Tensor,
         guidance: Option<&Tensor>,
+        attention_budget: Option<usize>,
+    ) -> Result<Tensor> {
+        self.forward_with_guidance_mask_memory(
+            latent_nchw,
+            caption,
+            timestep,
+            guidance,
+            None,
+            attention_budget,
+        )
+    }
+
+    /// [`Self::forward_with_guidance_memory`] with the diffusers SANA caption padding mask.
+    pub fn forward_with_guidance_mask_memory(
+        &self,
+        latent_nchw: &Tensor,
+        caption: &Tensor,
+        timestep: &Tensor,
+        guidance: Option<&Tensor>,
+        caption_mask: Option<&Tensor>,
         attention_budget: Option<usize>,
     ) -> Result<Tensor> {
         let cfg = &self.cfg;
@@ -969,13 +1024,29 @@ impl SanaTransformer {
                         edge,
                     )
                     .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))?;
-                    hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+                    hidden = block.forward(
+                        &hidden,
+                        &caption,
+                        caption_mask,
+                        &temb,
+                        ph,
+                        pw,
+                        attention_budget,
+                    )?;
                 }
                 source.device.synchronize()?;
             }
         } else {
             for block in &self.blocks {
-                hidden = block.forward(&hidden, &caption, &temb, ph, pw, attention_budget)?;
+                hidden = block.forward(
+                    &hidden,
+                    &caption,
+                    caption_mask,
+                    &temb,
+                    ph,
+                    pw,
+                    attention_budget,
+                )?;
             }
         }
 
@@ -1269,6 +1340,88 @@ mod tests {
         assert!(
             max_error < 1e-5,
             "query-row chunking changed caption attention by {max_error}"
+        );
+    }
+
+    #[test]
+    fn caption_mask_excludes_padding_keys_for_full_and_chunked_attention() {
+        let dev = Device::Cpu;
+        let cfg = small_cfg();
+        let model =
+            SanaTransformer::from_weights(&synthetic_trunk_weights(&cfg, &dev), cfg.clone())
+                .unwrap();
+        let latent = det(&[1, cfg.in_channels as usize, 4, 4], 101, &dev);
+        let caption = det(&[1, 3, cfg.caption_channels as usize], 202, &dev);
+        let mut changed = caption.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for value in &mut changed[cfg.caption_channels as usize..] {
+            *value += 25.0;
+        }
+        let changed =
+            Tensor::from_vec(changed, (1, 3, cfg.caption_channels as usize), &dev).unwrap();
+        let mask = Tensor::from_vec(vec![1.0f32, 0.0, 0.0], (1, 3), &dev).unwrap();
+        let timestep = Tensor::from_vec(vec![0.7f32], (1,), &dev).unwrap();
+
+        let run = |caption: &Tensor, budget| {
+            model
+                .forward_with_guidance_mask_memory(
+                    &latent,
+                    caption,
+                    &timestep,
+                    None,
+                    Some(&mask),
+                    budget,
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let masked = run(&caption, None);
+        let masked_changed = run(&changed, None);
+        let masked_chunked = run(&changed, Some(12));
+        let unmasked_changed = model
+            .forward(&latent, &changed, &timestep)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let max_error = |left: &[f32], right: &[f32]| {
+            left.iter()
+                .zip(right)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max)
+        };
+
+        assert!(
+            max_error(&masked, &masked_changed) < 1e-5,
+            "masked padding embeddings must not affect cross-attention"
+        );
+        assert!(
+            max_error(&masked, &masked_chunked) < 1e-5,
+            "query chunking must preserve the same caption mask"
+        );
+        assert!(
+            max_error(&masked, &unmasked_changed) > 1e-4,
+            "dropping the mask must be mutation-observable"
+        );
+
+        let wrong = Tensor::ones((1, 2), DType::F32, &dev).unwrap();
+        let error = model
+            .forward_with_guidance_mask_memory(
+                &latent,
+                &caption,
+                &timestep,
+                None,
+                Some(&wrong),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("caption mask shape"),
+            "unexpected error: {error}"
         );
     }
 

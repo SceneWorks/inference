@@ -20,6 +20,24 @@ use candle_gen::gen_core::{
 };
 use std::sync::{Arc, Mutex};
 
+fn selected_encoder_discovery_roots(
+    source: &WeightsSource,
+) -> gen_core::Result<Vec<std::path::PathBuf>> {
+    let root = match source {
+        WeightsSource::Dir(path) => path.as_path(),
+        WeightsSource::File(path) => path.parent().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "selected text encoder file has no parent directory: {}",
+                path.display()
+            ))
+        })?,
+    };
+    let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 /// Full output edge used by the bounded-decode hook at the representative 1024px calibration cell.
 /// This intentionally does not spatially partition that cell: the saving comes from separating the
 /// full-image attention-bearing head from the upsampling tail's live envelope, while preserving a
@@ -517,14 +535,19 @@ pub(crate) fn composed_provider_contract_for(
                 )))
             }
         };
-        let selected = variant.encoder_contract().source_for_planning(spec, base)?;
-        let headers = selected.materialized_language_tensor_headers(&variant.encoder_contract())?;
+        let builtin = WeightsSource::Dir(base.join("text_encoder"));
+        let source = spec.text_encoder.as_ref().unwrap_or(&builtin);
+        let roots = selected_encoder_discovery_roots(source)?;
+        let facts = variant
+            .encoder_contract()
+            .validate_source_for_discovery(source, &roots)?;
+        let headers = facts.materialized_language_tensor_headers();
         let text_encoder_quant = (provider_id == FLUX2_DEV_ID)
             .then(|| resolved_quant(spec))
             .transpose()?
             .flatten();
         components.text_encoder = f32_or_packed_tensor_headers(
-            &headers,
+            headers,
             text_encoder_quant,
             "selected text encoder",
             true,

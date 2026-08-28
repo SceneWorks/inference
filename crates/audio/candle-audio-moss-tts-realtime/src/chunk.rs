@@ -2,42 +2,49 @@
 //! (sc-13392).
 //!
 //! MOSS-TTS-Realtime is autoregressive: [`crate::decode`]'s AR loop emits one RVQ frame at a time.
-//! Rather than wait for the whole track and chunk it after the fact, [`StreamingChunker`] decodes
-//! the codec ([`crate::codec`]) over the growing frame prefix on every `block`-frame boundary and
-//! emits the newly-revealed PCM as the next [`AudioChunk`] — so chunks flow **while** the AR loop is
-//! still generating later frames. [`crate::model`] feeds it each frame from inside
-//! [`crate::decode::Decoder::run`].
+//! Rather than wait for the whole track and chunk it after the fact, [`StreamingChunker`] retains one
+//! request-local codec state and hands the codec only the newly available frames on each
+//! scheduled boundary. The codec emits only that block's new PCM, so chunks flow **while** the AR loop
+//! is still generating later frames without replaying the growing prefix. [`crate::model`] feeds it
+//! each frame from inside [`crate::decode::Decoder::run`].
 //!
-//! The returned track is exactly the **concatenation of the emitted chunk tails** — the same
-//! growing-prefix-delta numerical path the pre-interleaving code used, only now driven from inside
-//! the AR loop. So the `AudioChunk` reassembly law (concat(chunks) == track) holds by construction,
-//! and one-shot `generate()` is byte-identical to the concatenated stream because both entry points
-//! build the track this way from the same prefixes+seed. (The MOSS codec is causal in principle but
-//! not bit-exact across prefix lengths, so the track is assembled from the deltas rather than
-//! replaced by a single full-length decode — that would perturb the samples at block seams.)
+//! The returned track is exactly the **concatenation of the emitted blocks**. The `AudioChunk`
+//! reassembly law (concat(chunks) == track) therefore holds by construction, and one-shot
+//! `generate()` is byte-identical to the concatenated stream because both entry points use this one
+//! stateful block sequence for the same request+seed.
 //!
-//! The codec is abstracted behind [`PrefixDecoder`] so this interleaving logic is unit-testable
-//! **offline** (no weights, no real codec) with a fake frame→PCM source.
+//! The codec is abstracted behind [`IncrementalDecoder`] so this interleaving logic and its linear
+//! work bound are unit-testable **offline** (no weights, no real codec) with a fake frame→PCM source.
 
 use candle_audio::candle_core::Result as CandleResult;
 use candle_audio::gen_core::{AudioChunk, AudioTrack};
 
+use crate::codec::DecodePartitionSchedule;
 use crate::decode::RvqFrame;
 
-/// Decodes a growing prefix of RVQ frames into that prefix's full mono PCM. The production impl is
-/// the MOSS-Audio-Tokenizer codec ([`crate::codec::MossAudioCodec`]); a fake drives the offline
-/// [`StreamingChunker`] test.
-pub trait PrefixDecoder {
+/// Decodes newly appended RVQ frames with request-local state. The production implementation is the
+/// MOSS-Audio-Tokenizer codec ([`crate::codec::MossAudioCodec`]); a fake drives the offline
+/// [`StreamingChunker`] tests.
+pub trait IncrementalDecoder {
+    /// State retained for exactly one synthesis request. Implementations keep it bounded by their
+    /// fixed causal context rather than the number of frames already decoded.
+    type State;
+
     /// Native PCM sample rate (Hz).
     fn sample_rate(&self) -> u32;
     /// Waveform samples produced per RVQ frame (the codec's downsample rate).
     fn samples_per_frame(&self) -> usize;
-    /// Decode `frames` → interleaved mono PCM of exactly `frames.len() * samples_per_frame()`
-    /// samples, or `Ok(None)` if `cancel` tripped. Must be **causal**: `decode_prefix(&frames[..k])`
-    /// is a byte-identical prefix of `decode_prefix(&frames[..k'])` for `k <= k'` — the property the
-    /// reassembly law relies on.
-    fn decode_prefix(
+
+    /// Create a fresh request state. Sharing one loaded decoder across requests must not share their
+    /// mutable causal history.
+    fn new_state(&self) -> Self::State;
+
+    /// Decode only the newly appended `frames`, returning exactly
+    /// `frames.len() * samples_per_frame()` new mono samples. `state` carries the bounded causal
+    /// history and absolute positions from prior calls. Returns `Ok(None)` if `cancel` tripped.
+    fn decode_next(
         &self,
+        state: &mut Self::State,
         frames: &[RvqFrame],
         cancel: &dyn Fn() -> bool,
     ) -> CandleResult<Option<Vec<f32>>>;
@@ -47,36 +54,34 @@ pub trait PrefixDecoder {
 /// as they are produced; call [`finish`](Self::finish) at EOS/budget to flush the remainder and get
 /// the full [`AudioTrack`]. It emits `0..N`-indexed, contiguous [`AudioChunk`]s whose concatenation
 /// is exactly the track (the reassembly law).
-pub struct StreamingChunker<'a, D: PrefixDecoder> {
+pub struct StreamingChunker<'a, D: IncrementalDecoder> {
     decoder: &'a D,
-    block: usize,
-    /// The RVQ frames buffered so far (the growing prefix handed to the codec).
+    /// Request-local codec history (stage positions + bounded per-layer KV state in production).
+    state: D::State,
+    schedule: DecodePartitionSchedule,
+    /// Only frames not yet handed to the codec. Cleared after every successful flush.
     frames: Vec<RvqFrame>,
-    /// The concatenation of every emitted chunk tail — the running track PCM (so the reassembly law
-    /// holds by construction). Its length is also the number of samples already emitted.
+    /// The concatenation of every emitted block — the running track PCM (the reassembly law).
     samples: Vec<f32>,
-    /// Frame count covered by the last flush, so [`finish`](Self::finish) skips a redundant decode
-    /// when the last `push` already landed on a block boundary.
-    flushed_frames: usize,
     /// Next chunk index (`0..N`).
     index: usize,
 }
 
-impl<'a, D: PrefixDecoder> StreamingChunker<'a, D> {
-    /// New chunker emitting a chunk every `block` frames (clamped to `>= 1`).
-    pub fn new(decoder: &'a D, block: usize) -> Self {
+impl<'a, D: IncrementalDecoder> StreamingChunker<'a, D> {
+    /// New chunker using the request's canonical, validated codec partition schedule.
+    pub fn new(decoder: &'a D, schedule: DecodePartitionSchedule) -> Self {
         Self {
             decoder,
-            block: block.max(1),
+            state: decoder.new_state(),
+            schedule,
             frames: Vec::new(),
             samples: Vec::new(),
-            flushed_frames: 0,
             index: 0,
         }
     }
 
-    /// Buffer one AR frame; on a `block`-frame boundary decode the growing prefix and emit the newly
-    /// revealed PCM as the next chunk. Returns `Ok(None)` if `cancel` tripped inside the codec decode.
+    /// Buffer one AR frame; on the next scheduled boundary decode only that new block and emit its PCM
+    /// as the next chunk. Returns `Ok(None)` if `cancel` tripped inside the codec decode.
     pub fn push(
         &mut self,
         frame: RvqFrame,
@@ -84,7 +89,9 @@ impl<'a, D: PrefixDecoder> StreamingChunker<'a, D> {
         on_chunk: &mut dyn FnMut(AudioChunk),
     ) -> CandleResult<Option<()>> {
         self.frames.push(frame);
-        if self.frames.len().is_multiple_of(self.block) && self.flush(cancel, on_chunk)?.is_none() {
+        if self.frames.len() == self.schedule.block_frames(self.index)
+            && self.flush(cancel, on_chunk)?.is_none()
+        {
             return Ok(None);
         }
         Ok(Some(()))
@@ -97,7 +104,7 @@ impl<'a, D: PrefixDecoder> StreamingChunker<'a, D> {
         cancel: &dyn Fn() -> bool,
         on_chunk: &mut dyn FnMut(AudioChunk),
     ) -> CandleResult<Option<AudioTrack>> {
-        if self.flushed_frames != self.frames.len() && self.flush(cancel, on_chunk)?.is_none() {
+        if !self.frames.is_empty() && self.flush(cancel, on_chunk)?.is_none() {
             return Ok(None);
         }
         Ok(Some(AudioTrack {
@@ -108,29 +115,45 @@ impl<'a, D: PrefixDecoder> StreamingChunker<'a, D> {
         }))
     }
 
-    /// Decode the current frame prefix and emit the newly-revealed tail (the delta beyond what
-    /// earlier chunks already carried) as one chunk, appending it to the running track. `Ok(None)`
-    /// on cancel.
+    /// Decode the current pending block with the request-local state and emit its new PCM as one
+    /// chunk. `Ok(None)` on cancel.
     fn flush(
         &mut self,
         cancel: &dyn Fn() -> bool,
         on_chunk: &mut dyn FnMut(AudioChunk),
     ) -> CandleResult<Option<()>> {
-        let pcm = match self.decoder.decode_prefix(&self.frames, cancel)? {
+        let pcm = match self
+            .decoder
+            .decode_next(&mut self.state, &self.frames, cancel)?
+        {
             Some(p) => p,
             None => return Ok(None),
         };
-        self.flushed_frames = self.frames.len();
-        // The delta beyond what earlier prefixes already emitted (the growing-prefix numerical path).
-        let tail = &pcm[self.samples.len().min(pcm.len())..];
-        if !tail.is_empty() {
+        let expected = self
+            .frames
+            .len()
+            .checked_mul(self.decoder.samples_per_frame())
+            .ok_or_else(|| {
+                candle_audio::candle_core::Error::Msg(
+                    "incremental codec output length overflow".to_owned(),
+                )
+            })?;
+        if pcm.len() != expected {
+            candle_audio::candle_core::bail!(
+                "incremental codec returned {} samples for {} frames; expected {expected}",
+                pcm.len(),
+                self.frames.len()
+            );
+        }
+        self.frames.clear();
+        if !pcm.is_empty() {
             on_chunk(AudioChunk {
-                samples: tail.to_vec(),
+                samples: pcm.clone(),
                 sample_rate: self.decoder.sample_rate(),
                 channels: 1,
                 index: self.index,
             });
-            self.samples.extend_from_slice(tail);
+            self.samples.extend_from_slice(&pcm);
             self.index += 1;
         }
         Ok(Some(()))
@@ -140,24 +163,43 @@ impl<'a, D: PrefixDecoder> StreamingChunker<'a, D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
-    /// A fake, causal frame→PCM codec: frame `f`'s codebook-0 code `c` contributes `spf` samples all
-    /// equal to `c as f32`, appended in frame order. `decode_prefix(&frames[..k])` is therefore a
-    /// byte-identical prefix of any longer decode — exactly the causal contract the real codec meets.
+    fn uniform_schedule(block: usize) -> DecodePartitionSchedule {
+        DecodePartitionSchedule::new(block, block).unwrap()
+    }
+
+    /// A fake stateful frame→PCM codec: frame `f`'s codebook-0 code `c` contributes `spf` samples all
+    /// equal to `c as f32`. `work` counts every frame actually handed to the codec, so replaying old
+    /// prefixes makes the deterministic linear-work assertion fail.
     struct FakeCodec {
         spf: usize,
         cancel_after: Option<usize>,
+        work: Cell<usize>,
     }
 
-    impl PrefixDecoder for FakeCodec {
+    #[derive(Default)]
+    struct FakeState {
+        decoded_frames: usize,
+    }
+
+    impl IncrementalDecoder for FakeCodec {
+        type State = FakeState;
+
         fn sample_rate(&self) -> u32 {
             24_000
         }
         fn samples_per_frame(&self) -> usize {
             self.spf
         }
-        fn decode_prefix(
+
+        fn new_state(&self) -> Self::State {
+            FakeState::default()
+        }
+
+        fn decode_next(
             &self,
+            state: &mut Self::State,
             frames: &[RvqFrame],
             cancel: &dyn Fn() -> bool,
         ) -> CandleResult<Option<Vec<f32>>> {
@@ -165,15 +207,17 @@ mod tests {
                 return Ok(None);
             }
             if let Some(n) = self.cancel_after {
-                if frames.len() > n {
+                if state.decoded_frames + frames.len() > n {
                     return Ok(None);
                 }
             }
+            self.work.set(self.work.get() + frames.len());
             let mut pcm = Vec::with_capacity(frames.len() * self.spf);
             for f in frames {
                 let v = f[0] as f32;
                 pcm.extend(std::iter::repeat_n(v, self.spf));
             }
+            state.decoded_frames += frames.len();
             Ok(Some(pcm))
         }
     }
@@ -184,7 +228,10 @@ mod tests {
 
     /// The one-shot reference: a single full-length decode over every frame.
     fn full_decode(codec: &FakeCodec, frames: &[RvqFrame]) -> Vec<f32> {
-        codec.decode_prefix(frames, &|| false).unwrap().unwrap()
+        frames
+            .iter()
+            .flat_map(|frame| std::iter::repeat_n(frame[0] as f32, codec.spf))
+            .collect()
     }
 
     #[test]
@@ -193,12 +240,13 @@ mod tests {
         let codec = FakeCodec {
             spf: 10,
             cancel_after: None,
+            work: Cell::new(0),
         };
         let frames: Vec<RvqFrame> = (0..20).map(|i| frame(i + 1)).collect();
         let no_cancel = || false;
 
         let mut chunks: Vec<AudioChunk> = Vec::new();
-        let mut chunker = StreamingChunker::new(&codec, 8);
+        let mut chunker = StreamingChunker::new(&codec, uniform_schedule(8));
         for f in &frames {
             chunker
                 .push(f.clone(), &no_cancel, &mut |c| chunks.push(c))
@@ -239,7 +287,12 @@ mod tests {
         assert_eq!(
             track.samples,
             full_decode(&codec, &frames),
-            "the streamed track is byte-identical to one full-length decode"
+            "the concatenated incremental blocks are byte-identical to one-shot chunked decode"
+        );
+        assert_eq!(
+            codec.work.get(),
+            frames.len(),
+            "each frame is decoded exactly once; growing-prefix replay would be superlinear"
         );
     }
 
@@ -249,11 +302,12 @@ mod tests {
         let codec = FakeCodec {
             spf: 4,
             cancel_after: None,
+            work: Cell::new(0),
         };
         let frames: Vec<RvqFrame> = (0..10).map(|i| frame(i + 1)).collect();
         let no_cancel = || false;
         let mut chunks: Vec<AudioChunk> = Vec::new();
-        let mut chunker = StreamingChunker::new(&codec, 8);
+        let mut chunker = StreamingChunker::new(&codec, uniform_schedule(8));
         for f in &frames {
             chunker
                 .push(f.clone(), &no_cancel, &mut |c| chunks.push(c))
@@ -277,11 +331,12 @@ mod tests {
         let codec = FakeCodec {
             spf: 2,
             cancel_after: None,
+            work: Cell::new(0),
         };
         let frames: Vec<RvqFrame> = (0..16).map(|i| frame(i + 1)).collect();
         let no_cancel = || false;
         let mut chunks: Vec<AudioChunk> = Vec::new();
-        let mut chunker = StreamingChunker::new(&codec, 8);
+        let mut chunker = StreamingChunker::new(&codec, uniform_schedule(8));
         for f in &frames {
             chunker
                 .push(f.clone(), &no_cancel, &mut |c| chunks.push(c))
@@ -302,15 +357,16 @@ mod tests {
 
     #[test]
     fn cancel_inside_a_block_decode_stops_the_stream() {
-        // The codec cancels once the prefix grows beyond 8 frames: the first block flush (at 8)
-        // succeeds, the second (at 16) returns None → push reports cancellation.
+        // The codec cancels once total decoded work would exceed 8 frames: the first block flush
+        // succeeds, the second returns None → push reports cancellation.
         let codec = FakeCodec {
             spf: 3,
             cancel_after: Some(8),
+            work: Cell::new(0),
         };
         let no_cancel = || false;
         let mut chunks: Vec<AudioChunk> = Vec::new();
-        let mut chunker = StreamingChunker::new(&codec, 8);
+        let mut chunker = StreamingChunker::new(&codec, uniform_schedule(8));
         let mut canceled = false;
         for i in 0..20u32 {
             if chunker
@@ -331,10 +387,11 @@ mod tests {
         let codec = FakeCodec {
             spf: 4,
             cancel_after: None,
+            work: Cell::new(0),
         };
         let no_cancel = || false;
         let mut chunks: Vec<AudioChunk> = Vec::new();
-        let chunker = StreamingChunker::new(&codec, 8);
+        let chunker = StreamingChunker::new(&codec, uniform_schedule(8));
         let track = chunker
             .finish(&no_cancel, &mut |c| chunks.push(c))
             .unwrap()

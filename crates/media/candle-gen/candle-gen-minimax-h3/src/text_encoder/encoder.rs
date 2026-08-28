@@ -380,10 +380,11 @@ impl MiniMaxH3TextEncoder {
         self.layers.len()
     }
 
-    /// Device bytes the loaded projections hold (the embedding table included).
+    /// Device bytes the loaded projections hold (the embedding table included when dense).
     ///
-    /// The conditioning stage's resident cost, readable without a profiler — which is what makes
-    /// the staged-residency tripwire able to assert on the *encoder* rather than on a proxy.
+    /// The conditioning stage's resident device cost, readable without a profiler. A packed token
+    /// table contributes zero here because its compact rows are host-resident and each lookup makes
+    /// only a bounded, temporary device table for the selected token IDs.
     pub fn nbytes(&self) -> usize {
         self.embed_tokens.base_bytes
             + self

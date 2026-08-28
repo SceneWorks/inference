@@ -492,9 +492,9 @@ mod tests {
         let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
         gen_core_testkit::write_encoder_contract_fixture(
             &snapshot.path().join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+            crate::bounded_encoder_contract(),
         )
-        .expect("validation-complete encoder and tokenizer fixture");
+        .expect("bounded validation-complete encoder and tokenizer fixture");
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
             .with_offload_policy(policy);
         (snapshot, spec)
@@ -502,6 +502,7 @@ mod tests {
 
     #[test]
     fn build_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
         for policy in [
             mlx_gen::OffloadPolicy::Resident,
             mlx_gen::OffloadPolicy::Sequential,
@@ -509,8 +510,8 @@ mod tests {
             let (snapshot, spec) = incomplete_snapshot_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
-            let res =
-                crate::model::build_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
+            let (_tokenizer, res) =
+                crate::model::load_residency(&spec, MODEL_ID, BASE_PRECISION_MSG, BASE_FILE_MSG)
                     .unwrap_or_else(|error| {
                         panic!("{policy:?} must defer absent heavy components: {error}")
                     });

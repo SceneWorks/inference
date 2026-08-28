@@ -18,8 +18,8 @@
 
 use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
-    run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image, PreviewSink, Progress,
-    Result, TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler_with_latent_hook, CancelFlag, FlowMatchEuler, Image,
+    PreviewSink, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -39,6 +39,14 @@ pub const SPATIAL_SCALE: u32 = 8;
 pub const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 /// SD3.5-Large static flow-match shift (`scheduler_config.json` `shift = 3.0`, no dynamic shifting).
 pub const SCHEDULE_SHIFT: f32 = 3.0;
+
+/// Resolve SD3.5's native or curated flow schedule over its static model shift.  The `normal`
+/// endpoint is intentionally the same as the frozen native fixture; other curated names may
+/// redistribute interior steps but must never lose the static shift.
+pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
+    let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+    resolve_flow_schedule(scheduler, SCHEDULE_SHIFT.ln(), steps, &native.sigmas)
+}
 
 /// Seeded txt2img latent noise — shape `[1, 16, height/8, width/8]`, f32. diffusers
 /// `randn_tensor([B, 16, H/8, W/8])`; we draw f32 via `mx.random.normal` keyed on `seed`.
@@ -385,17 +393,65 @@ pub(crate) fn denoise_img2img_cfg_with_memory(
     attention: mlx_gen::attention::AttentionPlan<'_>,
     transformer_window: Option<usize>,
 ) -> Result<Array> {
+    let clean = encode_reference(vae, init, width, height)?;
+    denoise_img2img_from_clean_cfg_with_memory(
+        transformer,
+        scheduler,
+        sampler_name,
+        seed,
+        &clean,
+        strength,
+        width,
+        height,
+        steps,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+        preview,
+        attention,
+        transformer_window,
+    )
+}
+
+/// Encode the seed-independent SD3 img2img reference into its normalized clean latent. Callers
+/// producing multiple outputs must materialize and reuse this value across their per-seed loop.
+pub fn encode_reference(vae: &Vae, init: &Image, width: u32, height: u32) -> Result<Array> {
     // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
     // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
     // unpacked.
     let image_nchw = preprocess_init_image(init, width, height)?;
-    let clean = vae.encode(&image_nchw)?;
+    vae.encode(&image_nchw)
+}
+
+/// Per-seed img2img denoise from an already encoded clean reference latent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_img2img_from_clean_cfg_with_memory(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    clean: &Array,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    preview: &PreviewSink,
+    attention: mlx_gen::attention::AttentionPlan<'_>,
+    transformer_window: Option<usize>,
+) -> Result<Array> {
     let noise = create_noise(seed, width, height)?;
 
     // Start step from strength; blend clean⊕noise at σ_k, then denoise sigmas[k..]. The schedule has
     // `steps + 1` sigmas, so clamp the start index inside it (strength ≥ 1 → the last usable step).
     let start = init_time_step(steps, Some(strength)).min(scheduler.sigmas.len().saturating_sub(1));
-    let x_start = add_noise_by_interpolation(&clean, &noise, scheduler.sigmas[start])?;
+    let x_start = add_noise_by_interpolation(clean, &noise, scheduler.sigmas[start])?;
     denoise_over_sigmas(
         transformer,
         &scheduler.sigmas[start..],
@@ -699,5 +755,24 @@ mod tests {
         for (got, want) in s.sigmas.iter().zip(expected) {
             assert!((got - want).abs() < 1e-5, "got {got} want {want}");
         }
+    }
+
+    #[test]
+    fn native_and_curated_sd35_schedule_endpoints_match_frozen_fixture() {
+        // Frozen from diffusers FlowMatchEulerDiscreteScheduler { shift: 3.0 } at four steps.
+        let fixture = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
+        let native = resolve_sd3_sigmas(None, 4);
+        assert_eq!(native.len(), fixture.len());
+        for (got, want) in native.iter().zip(fixture) {
+            assert!((got - want).abs() < 1e-5, "native got {got} want {want}");
+        }
+
+        let curated = resolve_sd3_sigmas(Some("normal"), 4);
+        assert_eq!(curated.first(), Some(&fixture[0]));
+        assert_eq!(curated.last(), Some(&fixture[4]));
+        assert!(
+            curated[1] > 0.8,
+            "curated SD3.5 schedule lost static shift: {curated:?}"
+        );
     }
 }

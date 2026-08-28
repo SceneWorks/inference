@@ -12,12 +12,14 @@ use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 use mlx_gen::gen_core::TransformerComponent;
-pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
+pub use mlx_gen::img2img::{
+    add_noise_by_interpolation, init_time_step, preprocess_init_image, resolve_reference,
+};
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
-    run_flow_sampler_with_latent_hook, CancelFlag, Conditioning, Error, FlowMatchEuler,
-    GenerationRequest, Image, LatentDecoder, PreviewSink, Progress, Result, TimestepConvention,
+    run_flow_sampler_with_latent_hook, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
+    LatentDecoder, PreviewSink, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array, Dtype};
@@ -666,27 +668,6 @@ pub(crate) fn encode_uncond(
     slice_valid(&enc, num_valid)
 }
 
-/// Resolve the single img2img init image + its strength from the request's conditioning (F-035). The
-/// per-reference strength wins over `req.strength`. Z-Image conditions on exactly one init image, so
-/// more than one `Reference` is an error (multi-image is `MultiReference`, unadvertised here).
-pub(crate) fn resolve_reference<'a>(
-    req: &'a GenerationRequest,
-    id: &str,
-) -> Result<Option<(&'a Image, Option<f32>)>> {
-    let mut reference = None;
-    for c in &req.conditioning {
-        if let Conditioning::Reference { image, strength } = c {
-            if reference.is_some() {
-                return Err(Error::Msg(format!(
-                    "{id}: multiple reference images are not supported (single img2img init only)"
-                )));
-            }
-            reference = Some((image, strength.or(req.strength)));
-        }
-    }
-    Ok(reference)
-}
-
 /// Request-scoped memory-ladder controls shared by every Z-Image variant.
 pub(crate) struct RequestRungs<'a> {
     pub(crate) stage_residency: bool,
@@ -1033,6 +1014,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+    use mlx_gen::Conditioning;
 
     struct DecodeSpy {
         output: Array,

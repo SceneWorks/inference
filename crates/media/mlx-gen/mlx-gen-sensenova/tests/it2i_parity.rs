@@ -15,7 +15,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{NeoChatConfig, T2iModel, T2iOptions};
 use mlx_rs::Array;
 
-const FIXTURE: &str = concat!(
+const CASE_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/it2i_golden.safetensors"
 );
@@ -71,19 +71,19 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 
 #[test]
 fn it2i_denoise_matches_reference() {
-    let w = Weights::from_file(FIXTURE).expect("load fixture");
-    let cfg = config_from_meta(&w);
-    let img_context_id: i32 = w.metadata("img_context_id").unwrap().parse().unwrap();
-    let img_start_id: i32 = w.metadata("img_start_id").unwrap().parse().unwrap();
+    let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
+    let cfg = config_from_meta(&case);
+    let img_context_id: i32 = case.metadata("img_context_id").unwrap().parse().unwrap();
+    let img_start_id: i32 = case.metadata("img_start_id").unwrap().parse().unwrap();
     let model = T2iModel::from_weights(&w, &cfg)
         .expect("build T2iModel")
         .with_image_token_ids(img_context_id, img_start_id, 12);
 
-    let width: i32 = w.metadata("width").unwrap().parse().unwrap();
-    let height: i32 = w.metadata("height").unwrap().parse().unwrap();
-    let num_steps: usize = w.metadata("num_steps").unwrap().parse().unwrap();
-    let src_gh: i32 = w.metadata("src_grid_h").unwrap().parse().unwrap();
-    let src_gw: i32 = w.metadata("src_grid_w").unwrap().parse().unwrap();
+    let width: i32 = case.metadata("width").unwrap().parse().unwrap();
+    let height: i32 = case.metadata("height").unwrap().parse().unwrap();
+    let num_steps: usize = case.metadata("num_steps").unwrap().parse().unwrap();
+    let src_gh: i32 = case.metadata("src_grid_h").unwrap().parse().unwrap();
+    let src_gw: i32 = case.metadata("src_grid_w").unwrap().parse().unwrap();
 
     let ids: Vec<i32> = w
         .require("prefix.input_ids")

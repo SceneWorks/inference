@@ -659,6 +659,27 @@ mod tests {
             caps.validate_request(FLUX1_DEV_CONTROL_ID, &tcfg),
             Err(gen_core::Error::Unsupported(_))
         ));
+
+        // The control provider declares Control only. A Reference carried alongside the pose is
+        // therefore a typed refusal, rather than an identity hint that might be ignored.
+        let reference_plus_control = GenerationRequest {
+            conditioning: vec![
+                mlx_gen::Conditioning::Reference {
+                    image: Image {
+                        width: 64,
+                        height: 64,
+                        pixels: vec![0u8; 64 * 64 * 3],
+                    },
+                    strength: Some(0.7),
+                },
+                base.conditioning[0].clone(),
+            ],
+            ..base
+        };
+        assert!(matches!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &reference_plus_control),
+            Err(gen_core::Error::Unsupported(_))
+        ));
     }
 
     #[test]

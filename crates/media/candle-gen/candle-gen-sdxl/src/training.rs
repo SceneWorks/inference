@@ -45,6 +45,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
+use candle_gen::diffusion_schedule::SDXL_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{
     schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
@@ -82,10 +83,6 @@ use crate::pipeline::{
 };
 use crate::unet::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
 use crate::MODEL_ID;
-
-/// DDPM training-noise schedule length (the diffusers `num_train_timesteps`). `t` is sampled uniform
-/// over `[0, NUM_TRAIN_TIMESTEPS)`, matching torch's `randint(0, num_train_timesteps)`.
-const NUM_TRAIN_TIMESTEPS: usize = 1000;
 
 /// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650). Mirrors the
 /// `SAMPLE_PROMPT_CAP` the FlowMatch driver applies to the flow-match families — a preview is a

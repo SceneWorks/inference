@@ -161,7 +161,8 @@ pub(crate) fn memory_strategy_contract_with_plan(
         })?,
         None => 0,
     };
-    let selected_text_encoder = crate::model::ENCODER_CONTRACT.source_for_load(spec, root)?;
+    let selected_text_encoder =
+        crate::model::runtime_encoder_contract().source_for_load(spec, root)?;
     let language_bytes = crate::model::selected_language_resident_bytes(
         &selected_text_encoder,
         plan.effective_quant.map(mlx_gen::Quant::bits),
@@ -172,11 +173,12 @@ pub(crate) fn memory_strategy_contract_with_plan(
         provider_id,
         crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
     ) {
-        let vision = crate::model::ENCODER_CONTRACT
+        let language_contract = crate::model::runtime_encoder_contract();
+        let vision = language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
         let vision_headers = vision.materialized_vision_tensor_headers(
-            &crate::model::VISION_ENCODER_CONTRACT,
-            &crate::model::ENCODER_CONTRACT,
+            &crate::model::runtime_vision_encoder_contract(),
+            &language_contract,
         )?;
         vision_bytes =
             projected_tensor_headers_bytes(&vision_headers, |_| ResidentProjection::Stored)?;
@@ -445,7 +447,7 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     // projection is the one both native contracts read.
     let base_cfg = base_architecture_config(provider_id, base_snapshot_dir)?;
     let selected_text_encoder =
-        crate::model::ENCODER_CONTRACT.source_for_load(spec, base_snapshot_dir)?;
+        crate::model::runtime_encoder_contract().source_for_load(spec, base_snapshot_dir)?;
     let expected_language_bits =
         crate::model::native_text_encoder_expected_quant_bits(base_snapshot_dir)?;
     let language_bytes = crate::model::selected_language_resident_bytes(
@@ -458,13 +460,14 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         provider_id,
         crate::model::KREA_2_EDIT_ID | crate::model::KREA_2_TURBO_EDIT_ID
     ) {
-        let builtin = crate::model::ENCODER_CONTRACT.validate_source_against_base(
+        let language_contract = crate::model::runtime_encoder_contract();
+        let builtin = language_contract.validate_source_against_base(
             &WeightsSource::Dir(base_snapshot_dir.join("text_encoder")),
             base_snapshot_dir,
         )?;
         let headers = builtin.materialized_vision_tensor_headers(
-            &crate::model::VISION_ENCODER_CONTRACT,
-            &crate::model::ENCODER_CONTRACT,
+            &crate::model::runtime_vision_encoder_contract(),
+            &language_contract,
         )?;
         vision_bytes = projected_tensor_headers_bytes(&headers, |_| ResidentProjection::Stored)?;
     }
@@ -1005,8 +1008,8 @@ mod tests {
         }
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &root.join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
-            crate::model::VISION_ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
+            crate::model::test_vision_encoder_contract(),
         )
         .expect("validation-complete text encoder fixture");
         std::fs::write(
@@ -1653,7 +1656,7 @@ mod tests {
                 if component == "text_encoder" {
                     gen_core_testkit::write_encoder_contract_fixture(
                         &root.join("text_encoder"),
-                        crate::model::ENCODER_CONTRACT,
+                        crate::model::test_encoder_contract(),
                     )
                     .expect("restore validation-complete text encoder fixture");
                 } else {
@@ -1839,7 +1842,7 @@ mod tests {
         let external_text_encoder = root.join("external-text");
         gen_core_testkit::write_encoder_contract_fixture(
             &external_text_encoder,
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .expect("validation-complete selected text encoder fixture");
         text_encoder.text_encoder = Some(WeightsSource::Dir(external_text_encoder));
@@ -1893,10 +1896,18 @@ mod tests {
         let native = root.join("native.safetensors");
         write_native_i8_safetensors(&native);
         let contract = native_memory_strategy_contract("krea_2_turbo", &native, &root).unwrap();
-        assert_eq!(contract.asset_facts.conditioning_bytes, 7_843_069_440);
+        let conditioning_bytes = gen_core_testkit::encoder_contract_fixture_tensor_headers(
+            crate::model::test_encoder_contract(),
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|header| header.data_bytes)
+        .sum::<u64>();
+        assert_eq!(contract.asset_facts.conditioning_bytes, conditioning_bytes);
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 2 * 64 * 2);
-        assert_eq!(contract.asset_facts.base_bytes, 7_843_069_698);
+        assert_eq!(contract.asset_facts.base_bytes, conditioning_bytes + 258);
         for strategy in [
             MemoryStrategy::Resident,
             MemoryStrategy::BoundedDecode,
@@ -1930,14 +1941,15 @@ mod tests {
             .expect("t2i contract");
         let (edit, _) = memory_strategy_contract_with_plan(crate::model::KREA_2_EDIT_ID, &spec)
             .expect("edit contract");
-        let vision = crate::model::ENCODER_CONTRACT
+        let language_contract = crate::model::test_encoder_contract();
+        let vision = language_contract
             .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), &root)
             .unwrap();
         let vision_bytes = projected_tensor_headers_bytes(
             &vision
                 .materialized_vision_tensor_headers(
-                    &crate::model::VISION_ENCODER_CONTRACT,
-                    &crate::model::ENCODER_CONTRACT,
+                    &crate::model::test_vision_encoder_contract(),
+                    &language_contract,
                 )
                 .unwrap(),
             |_| ResidentProjection::Stored,

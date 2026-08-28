@@ -487,9 +487,9 @@ mod tests {
         let snapshot = tempfile::tempdir().expect("snapshot fixture dir");
         gen_core_testkit::write_encoder_contract_fixture(
             &snapshot.path().join("text_encoder"),
-            crate::ENCODER_CONTRACT,
+            crate::bounded_encoder_contract(),
         )
-        .expect("validation-complete encoder and tokenizer fixture");
+        .expect("bounded validation-complete encoder and tokenizer fixture");
         let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()))
             .with_control(WeightsSource::File(
                 snapshot.path().join("control.safetensors"),
@@ -500,15 +500,17 @@ mod tests {
 
     #[test]
     fn build_control_residency_defers_for_both_legacy_offload_values() {
+        let _guard = crate::scoped_bounded_encoder_contract();
         for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
             let (snapshot, spec) = incomplete_control_spec(policy);
             assert!(!snapshot.path().join("transformer").exists());
             assert!(!snapshot.path().join("vae").exists());
             assert!(!snapshot.path().join("control.safetensors").exists());
-            let res = crate::model_control::build_control_residency(&spec, MODEL_ID, PRECISION_MSG)
-                .unwrap_or_else(|error| {
-                    panic!("{policy:?} must defer absent heavy components: {error}")
-                });
+            let (_tokenizer, res) =
+                crate::model_control::load_control_residency(&spec, MODEL_ID, PRECISION_MSG)
+                    .unwrap_or_else(|error| {
+                        panic!("{policy:?} must defer absent heavy components: {error}")
+                    });
             assert!(
                 res.with_resident_parts(|_, _| ()).unwrap().is_none(),
                 "{policy:?} must begin with no warm request-scoped pair"

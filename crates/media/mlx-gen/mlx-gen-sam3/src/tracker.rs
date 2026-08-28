@@ -58,6 +58,19 @@ const STABILITY_THRESH: f32 = 0.98; // dynamic_multimask_stability_thresh
 const NO_OBJ_SCORE: f32 = -1024.0; // logit for "object absent" frames
 const MASK_INPUT_SIZE: i32 = 288; // prompt encoder mask_input_size (4·1008/14)
 
+/// Point coordinates and labels are positional. Reject mismatched cardinalities before any image or
+/// prompt encoding so malformed interactive input cannot reach an out-of-bounds device gather.
+fn validate_point_prompt(points: &[(f32, f32)], labels: &[i32]) -> Result<()> {
+    if points.len() != labels.len() {
+        return Err(Error::Msg(format!(
+            "sam3 point prompt: points/labels length mismatch ({} vs {})",
+            points.len(),
+            labels.len()
+        )));
+    }
+    Ok(())
+}
+
 fn weight_bias(w: &Weights, prefix: &str) -> Result<(Array, Array)> {
     Ok((
         w.require(&join(prefix, "weight"))?.clone(),
@@ -434,6 +447,7 @@ impl PromptEncoder {
         labels: &[i32],
         g: i32,
     ) -> Result<(Array, Array)> {
+        validate_point_prompt(points, labels)?;
         let n = points.len();
         // n point coords + 1 pad point (0,0), each `+0.5` then normalized by the 1008 input size.
         let norm = |v: f32| (v + 0.5) / INPUT_SIZE;
@@ -1650,6 +1664,7 @@ impl Sam3Tracker {
         points: &[(f32, f32)],
         labels: &[i32],
     ) -> Result<TrackerMask> {
+        validate_point_prompt(points, labels)?;
         let g = image_embedding.shape()[1];
         let (sparse, dense) = self.prompt.encode_points(points, labels, g)?;
         self.decode_prompt(image_embedding, high_res, &sparse, &dense, true)
@@ -1879,6 +1894,7 @@ impl Sam3Tracker {
         points: &[(f32, f32)],
         labels: &[i32],
     ) -> Result<TrackerMask> {
+        validate_point_prompt(points, labels)?;
         let (emb, high_res) = self.encode_frame(pixel_values)?;
         self.segment_encoded_points(&emb, &high_res, points, labels)
     }
@@ -1915,4 +1931,35 @@ fn sine_pe_1d(positions: &[f32], dim: usize, temperature: f32) -> Array {
         }
     }
     Array::from_slice(&out, &[positions.len() as i32, dim as i32])
+}
+
+#[cfg(test)]
+mod point_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn point_prompt_rejects_more_labels_than_points() {
+        let err = validate_point_prompt(&[(10.0, 20.0)], &[1, 0]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Msg(ref message)
+                if message == "sam3 point prompt: points/labels length mismatch (1 vs 2)"
+        ));
+    }
+
+    #[test]
+    fn point_prompt_rejects_fewer_labels_than_points() {
+        let err = validate_point_prompt(&[(10.0, 20.0), (30.0, 40.0)], &[1]).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Msg(ref message)
+                if message == "sam3 point prompt: points/labels length mismatch (2 vs 1)"
+        ));
+    }
+
+    #[test]
+    fn point_prompt_accepts_matching_cardinality() {
+        validate_point_prompt(&[(10.0, 20.0), (30.0, 40.0)], &[1, 0]).unwrap();
+        validate_point_prompt(&[], &[]).unwrap();
+    }
 }

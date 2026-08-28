@@ -952,6 +952,43 @@ impl SanaHeavy {
         }
     }
 
+    /// Encode the request's seed-independent img2img reference once. The returned denoise-space
+    /// latent is reusable for every seed in a `count` batch; `None` is the exact txt2img / explicit
+    /// zero-strength path. Both base flow-match and Sprint SCM use this same preparation boundary.
+    pub(crate) fn prepare_reference(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+    ) -> Result<Option<Array>> {
+        let steps = req.steps.unwrap_or(if self.sprint {
+            SPRINT_DEFAULT_STEPS
+        } else {
+            DEFAULT_STEPS
+        });
+        let start_step = match req.init_image {
+            Some(_) => init_time_step(steps, req.strength),
+            None => 0,
+        };
+        if start_step == 0 {
+            return Ok(None);
+        }
+
+        let image = req.init_image.ok_or_else(|| {
+            Error::Msg("SANA positive img2img start requires an init image".into())
+        })?;
+        let encoder = self.encoder.as_ref().ok_or_else(|| {
+            Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+        })?;
+        Ok(Some(encode_init_latents(
+            encoder,
+            &self.dc_ae_cfg,
+            image,
+            req.width,
+            req.height,
+            cancel,
+        )?))
+    }
+
     /// Render ONE image from pre-encoded [`SanaConditioning`] + a per-image request. `guidance` is the
     /// already-resolved guidance scale (the caller resolved it against [`Self::default_guidance`] so the
     /// encode's uncond decision and this render agree). Branches on `sprint`. Byte-identical to the tail
@@ -1038,10 +1075,54 @@ impl SanaHeavy {
         preview: &PreviewSink,
         plan: crate::transformer::SanaForwardPlan,
     ) -> Result<Array> {
+        let prepared_reference = self.prepare_reference(req, cancel)?;
+        self.denoise_one_with_prepared_reference(
+            cond,
+            req,
+            guidance,
+            prepared_reference.as_ref(),
+            cancel,
+            on_progress,
+            preview,
+            plan,
+        )
+    }
+
+    /// Seed-dependent denoise tail over a reference latent prepared once at request scope.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn denoise_one_with_prepared_reference(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        prepared_reference: Option<&Array>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+        preview: &PreviewSink,
+        plan: crate::transformer::SanaForwardPlan,
+    ) -> Result<Array> {
         if self.sprint {
-            self.denoise_sprint(cond, req, guidance, cancel, on_progress, preview, plan)
+            self.denoise_sprint(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
         } else {
-            self.denoise_cfg(cond, req, guidance, cancel, on_progress, preview, plan)
+            self.denoise_cfg(
+                cond,
+                req,
+                guidance,
+                prepared_reference,
+                cancel,
+                on_progress,
+                preview,
+                plan,
+            )
         }
     }
 
@@ -1052,6 +1133,7 @@ impl SanaHeavy {
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
+        prepared_reference: Option<&Array>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
@@ -1077,38 +1159,20 @@ impl SanaHeavy {
             Some(_) => init_time_step(steps, req.strength),
             None => 0,
         };
-        let clean = if start_step > 0 {
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
-            })?;
-            Some(encode_init_latents(
-                encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?)
-        } else {
-            None
-        };
-
         let noise = create_noise(seed, req.width, req.height)?;
-        let latents = match &clean {
-            // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[start_step]`.
-            Some(clean) => {
-                let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
-                    Error::Msg(format!(
-                        "sana img2img: start step {start_step} out of range for {}-element schedule",
-                        scheduler.sigmas.len()
-                    ))
-                })?;
-                add_noise_by_interpolation(clean, &noise, sigma)?
-            }
-            None => noise,
+        let latents = if start_step > 0 {
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg("SANA img2img denoise requires a prepared reference latent".into())
+            })?;
+            let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
+                Error::Msg(format!(
+                    "sana img2img: start step {start_step} out of range for {}-element schedule",
+                    scheduler.sigmas.len()
+                ))
+            })?;
+            add_noise_by_interpolation(clean, &noise, sigma)?
+        } else {
+            noise
         };
         // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
         let uncond = cond.uncond.as_ref().map(|(u, _)| u);
@@ -1148,6 +1212,7 @@ impl SanaHeavy {
         cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
         guidance: f32,
+        prepared_reference: Option<&Array>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         preview: &PreviewSink,
@@ -1167,22 +1232,13 @@ impl SanaHeavy {
         let noise = create_noise(seed, req.width, req.height)?;
         let latents = if start_step > 0 {
             // img2img: renoise the encoded init to the start angle `timesteps[start_step]`.
-            let image = req
-                .init_image
-                .expect("start_step > 0 implies an init image");
-            let encoder = self.encoder.as_ref().ok_or_else(|| {
-                Error::Msg("SANA text-to-image bundle cannot encode an init image".into())
+            let clean = prepared_reference.ok_or_else(|| {
+                Error::Msg(
+                    "SANA-Sprint img2img denoise requires a prepared reference latent".into(),
+                )
             })?;
-            let clean = encode_init_latents(
-                encoder,
-                &self.dc_ae_cfg,
-                image,
-                req.width,
-                req.height,
-                cancel,
-            )?;
             // x0 in the SCM prior space (σ_data-scaled); noise likewise. TrigFlow renoise to angle t.
-            let x0 = multiply(&clean, arr1(sd))?;
+            let x0 = multiply(clean, arr1(sd))?;
             let noise_sd = multiply(&noise, arr1(sd))?;
             let t = scheduler.timesteps[start_step];
             add(
@@ -1358,6 +1414,259 @@ mod tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn braced_item<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing production item {marker}"));
+        let open = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("production item {marker} has no body"));
+        let mut depth = 0usize;
+        for (offset, byte) in source[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("production item {marker} has unbalanced braces")
+    }
+
+    fn replace_in_item(source: &str, marker: &str, from: &str, to: &str) -> String {
+        let start = source.find(marker).unwrap();
+        let item = braced_item(source, marker);
+        let replaced = item.replacen(from, to, 1);
+        assert_ne!(item, replaced, "mutation target must exist in {marker}");
+        format!(
+            "{}{}{}",
+            &source[..start],
+            replaced,
+            &source[start + item.len()..]
+        )
+    }
+
+    fn call_arguments(source: &str, marker: &str) -> Vec<String> {
+        call_arguments_nth(source, marker, 0)
+    }
+
+    fn call_arguments_nth(source: &str, marker: &str, nth: usize) -> Vec<String> {
+        let start = source
+            .match_indices(marker)
+            .nth(nth)
+            .map(|(offset, _)| offset)
+            .map(|offset| offset + marker.len())
+            .unwrap_or_else(|| panic!("missing production call {marker} occurrence {nth}"));
+        let mut depth = 0usize;
+        let mut current = String::new();
+        let mut arguments = Vec::new();
+        for ch in source[start..].chars() {
+            match ch {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' if depth == 0 => {
+                    if !current.trim().is_empty() {
+                        arguments.push(current.trim().to_owned());
+                    }
+                    return arguments;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    arguments.push(current.trim().to_owned());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        panic!("production call {marker} has no closing parenthesis")
+    }
+
+    fn compact(item: &str) -> String {
+        item.split_whitespace().collect()
+    }
+
+    fn check_registered_mask_routes(source: &str) -> Result<()> {
+        let encode = braced_item(source, "pub fn encode_conditioning(");
+        if encode
+            .matches("text_encoder.encode_with_mask(prompt)?")
+            .count()
+            != 1
+            || encode
+                .matches("text_encoder.encode_with_mask(negative_prompt.unwrap_or(\"\"))?")
+                .count()
+                != 1
+        {
+            return Err(Error::Msg(
+                "SANA conditioning must obtain positive and CFG-negative masks beside their selected embeddings"
+                    .into(),
+            ));
+        }
+
+        let base = braced_item(source, "    fn denoise_cfg(\n        &self,");
+        let base_args = call_arguments(base, "denoise_cfg_with_memory(");
+        if base_args.len() != 15
+            || base_args[6] != "&cond.cond"
+            || base_args[7] != "Some(&cond.cond_mask)"
+            || base_args[8] != "uncond"
+            || base_args[9] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base CFG-on/off must route each selected embedding with its own gathered mask"
+                    .into(),
+            ));
+        }
+
+        let sprint = braced_item(source, "    fn denoise_sprint(\n        &self,");
+        let sprint_args = call_arguments(sprint, "denoise_sprint_from_with_memory(");
+        if sprint_args.len() != 13
+            || sprint_args[5] != "&cond.cond"
+            || sprint_args[6] != "Some(&cond.cond_mask)"
+        {
+            return Err(Error::Msg(
+                "Sprint must route the selected positive embedding with its gathered mask".into(),
+            ));
+        }
+
+        let base_impl = braced_item(source, "pub(crate) fn denoise_cfg_with_memory(");
+        let cond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 0);
+        let uncond_call = call_arguments_nth(base_impl, "transformer.forward_with_memory(", 1);
+        if cond_call.len() != 7
+            || cond_call[1] != "cond"
+            || cond_call[4] != "cond_mask"
+            || uncond_call.len() != 7
+            || uncond_call[1] != "uc"
+            || uncond_call[4] != "uncond_mask"
+        {
+            return Err(Error::Msg(
+                "Base's actual cond/uncond transformer calls must receive their matching masks"
+                    .into(),
+            ));
+        }
+
+        let sprint_impl = braced_item(source, "pub(crate) fn denoise_sprint_from_with_memory(");
+        let sprint_call = call_arguments(sprint_impl, "transformer.forward_with_memory(");
+        if sprint_call.len() != 7
+            || sprint_call[1] != "cond"
+            || sprint_call[3] != "Some(&guidance)"
+            || sprint_call[4] != "cond_mask"
+        {
+            return Err(Error::Msg(
+                "Sprint's actual transformer call must receive its gathered positive mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_transformer_mask_propagation(source: &str) -> Result<()> {
+        let forward = compact(braced_item(source, "pub(crate) fn forward_with_memory("));
+        if !forward.contains(
+            "block.forward(&hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,)?",
+        ) || !forward.contains(
+            "self.run_windowed_blocks(hidden,&caption,caption_mask,&temb,ph,pw,plan.attention,window,cancel,)?",
+        ) {
+            return Err(Error::Msg(
+                "resident and windowed transformer routes must preserve caption_mask".into(),
+            ));
+        }
+
+        let windowed = compact(braced_item(source, "fn run_windowed_blocks("));
+        if !windowed.contains("block.forward(&cur,caption,caption_mask,temb,h,w,budget)?") {
+            return Err(Error::Msg(
+                "every materialized window block must receive caption_mask".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn registered_mask_route_table_is_positional_and_mutation_sensitive() {
+        let shipped = include_str!("pipeline.rs");
+        check_registered_mask_routes(shipped).unwrap();
+
+        let base_marker = "    fn denoise_cfg(\n        &self,";
+        let sprint_marker = "    fn denoise_sprint(\n        &self,";
+        for mutated in [
+            replace_in_item(shipped, base_marker, "Some(&cond.cond_mask),", "None,"),
+            replace_in_item(shipped, base_marker, "uncond_mask,", "None,"),
+            replace_in_item(
+                shipped,
+                base_marker,
+                "Some(&cond.cond_mask),\n            uncond,\n            uncond_mask,",
+                "uncond_mask,\n            uncond,\n            Some(&cond.cond_mask),",
+            ),
+            replace_in_item(shipped, sprint_marker, "Some(&cond.cond_mask),", "None,"),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping or swapping any Base/Sprint production mask must fail"
+            );
+        }
+
+        for mutated in [
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, cond, &t, None, cond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, cond, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_cfg_with_memory(",
+                "transformer.forward_with_memory(x, uc, &t, None, uncond_mask, plan, cancel)?",
+                "transformer.forward_with_memory(x, uc, &t, None, None, plan, cancel)?",
+            ),
+            replace_in_item(
+                shipped,
+                "pub(crate) fn denoise_sprint_from_with_memory(",
+                "            Some(&guidance),\n            cond_mask,\n            plan,",
+                "            Some(&guidance),\n            None,\n            plan,",
+            ),
+        ] {
+            assert!(
+                check_registered_mask_routes(&mutated).is_err(),
+                "dropping a mask at an actual Base/Sprint transformer call must fail"
+            );
+        }
+
+        let transformer = include_str!("transformer.rs");
+        check_transformer_mask_propagation(transformer).unwrap();
+        for mutated in [
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                        caption_mask,\n                        &temb,",
+                "                        None,\n                        &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "pub(crate) fn forward_with_memory(",
+                "                caption_mask,\n                &temb,",
+                "                None,\n                &temb,",
+            ),
+            replace_in_item(
+                transformer,
+                "fn run_windowed_blocks(",
+                "block.forward(&cur, caption, caption_mask, temb, h, w, budget)?",
+                "block.forward(&cur, caption, None, temb, h, w, budget)?",
+            ),
+        ] {
+            assert!(
+                check_transformer_mask_propagation(&mutated).is_err(),
+                "dropping caption_mask from resident/windowed block propagation must fail"
+            );
+        }
     }
 
     #[test]

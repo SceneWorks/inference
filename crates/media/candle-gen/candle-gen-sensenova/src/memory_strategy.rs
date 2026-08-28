@@ -33,6 +33,9 @@ const FAST_ROUTES: &[&str] = &[
     "sensenova_u1_8b_infographic_v2_fast",
     "sensenova_u1_8b_infographic_v3_fast",
 ];
+/// The SceneWorks descriptor's advertised image-count surface. SenseNova renders each requested
+/// image independently, but admission still prices the caller's complete request geometry.
+const ADVERTISED_GENERATION_COUNTS: &[u32] = &[1, 2, 4];
 
 fn expected_repository(route: &str) -> Option<String> {
     QUALITY_ROUTES
@@ -558,7 +561,7 @@ fn validate_route(provider_id: &str, context: &MemoryRunContext) -> gen_core::Re
     let valid_batch = if interleave {
         (1..=10).contains(&context.geometry.batch)
     } else {
-        context.geometry.batch == 1
+        ADVERTISED_GENERATION_COUNTS.contains(&context.geometry.batch)
     };
     if context.geometry.width == 0
         || context.geometry.height == 0
@@ -1138,6 +1141,68 @@ mod tests {
                     context.mode.as_key(),
                     reference_count
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_admission_conforms_to_the_advertised_generation_count_table() {
+        let load_spec = spec(LoadShape::EagerMaterialization);
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let contract = weights_free_contract(provider_id, &load_spec).unwrap();
+            for (count, expected_admission) in [
+                (0, false),
+                (1, true),
+                (2, true),
+                (3, false),
+                (4, true),
+                (5, false),
+            ] {
+                let mut context = gen_core::standard_memory_behavior_context(
+                    &contract,
+                    MemoryStrategy::BoundedAttention,
+                    MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant: None,
+                        component_precision_floors: &[],
+                    },
+                    MemoryBehaviorRoute {
+                        mode: MemoryMode::TextToImage,
+                        reference_count: 0,
+                        use_pid: false,
+                        has_phases: false,
+                        overlay: None,
+                    },
+                )
+                .unwrap();
+                context.geometry.batch = count;
+                let admission =
+                    registered_begin_request(provider_id, &load_spec, &contract, &context);
+                if expected_admission {
+                    assert!(
+                        admission.is_ok(),
+                        "{provider_id}: calibrated count {count} must be admitted"
+                    );
+                } else {
+                    let error = match admission {
+                        Ok(_) => panic!(
+                            "{provider_id}: unsupported/unfitted count {count} must be refused"
+                        ),
+                        Err(error) => error,
+                    };
+                    let gen_core::Error::Unsupported(reason) = error else {
+                        panic!(
+                            "{provider_id}: unsupported/unfitted count {count} must use the shared typed refusal"
+                        );
+                    };
+                    assert_eq!(
+                        safety_check(provider_id, &contract, &context, None),
+                        MemorySafetyDecision::Reject {
+                            reason: format!("unsupported: {reason}"),
+                        },
+                        "{provider_id}: registry admission and request scope must preserve the same refusal"
+                    );
+                }
             }
         }
     }

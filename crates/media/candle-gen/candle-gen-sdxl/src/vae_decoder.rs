@@ -10,11 +10,11 @@
 //! the upstream surface, and the backend revision is pinned, so the decoder is ported here.
 //!
 //! **This is a port, not a redesign.** Layer order, key layout, group counts, epsilons, padding and
-//! the `output_scale_factor` divide are the upstream ones, and the mid block is still upstream's
-//! public [`UNetMidBlock2D`]. `tests/vae_decoder_parity.rs` builds this decoder and the stock
-//! `AutoEncoderKL` from the *same* synthetic checkpoint and asserts their dense decodes agree at
-//! both f32 and f16 — so a key-naming, ordering, epsilon or dtype divergence fails there rather
-//! than silently in a render.
+//! the `output_scale_factor` divide are the upstream ones. The mid block uses the local faithful
+//! copy so its spatial attention can take the shared i32-safe budget seam.
+//! `tests/vae_decoder_parity.rs` builds this decoder and the stock `AutoEncoderKL` from the same
+//! synthetic checkpoint and asserts their dense decodes agree at both f32 and f16 — so a key-naming,
+//! ordering, epsilon or dtype divergence fails there rather than silently in a render.
 //!
 //! Only the decode half is built: nothing in this crate ever called `AutoEncoderKL::encode` (the
 //! edit path uses the vendored deterministic `VaeMomentsEncoder` instead, because the stock
@@ -35,10 +35,9 @@ use candle_gen::candle_nn::{self as nn, Module, VarBuilder};
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::vae_tiling::{tiled_conv2d_3x3_nchw, GlobalGroupNorm};
 use candle_gen::{CandleError, Result};
-use candle_transformers::models::stable_diffusion::unet_2d_blocks::{
-    UNetMidBlock2D, UNetMidBlock2DConfig,
-};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKLConfig;
+
+use crate::unet::{UNetMidBlock2D, UNetMidBlock2DConfig};
 
 /// Every `GroupNorm` on the SDXL VAE decode path uses this epsilon — upstream's
 /// `UpDecoderBlock2DConfig::resnet_eps`, `UNetMidBlock2DConfig::resnet_eps` and the literal passed

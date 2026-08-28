@@ -257,6 +257,37 @@ struct ExpertState {
     suffix: &'static str,
 }
 
+/// Visit every preview adapter and preserve the first visitor failure. Preview rendering must not
+/// continue after a model traversal fails: that would leave a partially frozen/thawed expert set
+/// and hide a structural model error behind a best-effort preview warning (F-035 / sc-21704).
+fn visit_preview_lora_hosts<'a, H: LoraHost + 'a>(
+    hosts: impl IntoIterator<Item = &'a mut H>,
+    visitor: &mut dyn FnMut(&mut candle_gen::train::lora::LoraLinear) -> Result<()>,
+) -> Result<()> {
+    for host in hosts {
+        host.visit_lora_mut(visitor)?;
+    }
+    Ok(())
+}
+
+fn freeze_preview_lora_hosts<'a, H: LoraHost + 'a>(
+    hosts: impl IntoIterator<Item = &'a mut H>,
+) -> Result<()> {
+    visit_preview_lora_hosts(hosts, &mut |ll| {
+        ll.freeze_adapter();
+        Ok(())
+    })
+}
+
+fn thaw_preview_lora_hosts<'a, H: LoraHost + 'a>(
+    hosts: impl IntoIterator<Item = &'a mut H>,
+) -> Result<()> {
+    visit_preview_lora_hosts(hosts, &mut |ll| {
+        ll.thaw_adapter();
+        Ok(())
+    })
+}
+
 /// Cap on the number of preview prompts rendered per [`TrainingConfig::sample_every`] cadence
 /// (sc-8650) — matches the shared `SAMPLE_PROMPT_CAP` the FlowMatchTrainer driver applies. A Wan still
 /// is a full dual-expert denoise + z16 VAE decode, so this keeps the preview cost bounded.
@@ -870,12 +901,7 @@ impl WanMoeTrainer {
                     // Freeze BOTH experts' adapters to detached snapshots so the preview denoise runs
                     // graph-free (the factor `Var`s are otherwise tracked → the forward's activations are
                     // retained → OOM at full resolution). Restored right after so training keeps its grads.
-                    for ex in experts.iter_mut() {
-                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
-                            ll.freeze_adapter();
-                            Ok(())
-                        });
-                    }
+                    freeze_preview_lora_hosts(experts.iter_mut().map(|ex| &mut ex.dit))?;
                     for (i, prompt) in state.prompts.iter().enumerate() {
                         if req.cancel.is_cancelled() {
                             break;
@@ -896,12 +922,7 @@ impl WanMoeTrainer {
                             ),
                         }
                     }
-                    for ex in experts.iter_mut() {
-                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
-                            ll.thaw_adapter();
-                            Ok(())
-                        });
-                    }
+                    thaw_preview_lora_hosts(experts.iter_mut().map(|ex| &mut ex.dit))?;
                 }
             }
 
@@ -1178,6 +1199,28 @@ mod tests {
         assert_ne!(
             y0, y1,
             "setting set.vars must change the installed LoraLinear forward"
+        );
+    }
+
+    #[test]
+    fn preview_lora_visitor_failure_propagates() {
+        struct FailingHost;
+        impl LoraHost for FailingHost {
+            fn visit_lora_mut(
+                &mut self,
+                _f: &mut dyn FnMut(
+                    &mut candle_gen::train::lora::LoraLinear,
+                ) -> candle_gen::Result<()>,
+            ) -> candle_gen::Result<()> {
+                Err(CandleError::Msg("injected Wan visitor failure".into()))
+            }
+        }
+
+        let mut hosts = [FailingHost];
+        let err = freeze_preview_lora_hosts(hosts.iter_mut()).unwrap_err();
+        assert!(
+            matches!(err, CandleError::Msg(ref message) if message == "injected Wan visitor failure"),
+            "the visitor error must reach the training caller, got {err:?}"
         );
     }
 

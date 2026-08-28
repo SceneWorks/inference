@@ -107,10 +107,14 @@ impl Variant {
 /// VAE spatial downscale (image/8 per side) — re-exported from [`crate::vae`] for the latent geometry.
 const VAE_SCALE: u32 = SPATIAL_SCALE;
 
+/// SD3.5 img2img's product default, shared with the MLX provider: an omitted strength starts at
+/// the midpoint rather than silently changing a reference-guided request into txt2img.
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.5;
+
 /// The SD3.5 `FlowMatchEulerDiscreteScheduler` σ ramp for `steps` inference steps with the given
 /// `shift`, matching diffusers `set_timesteps`:
 ///
-/// 1. `sigmas = linspace(1.0, 1/num_train, steps)` (the σ table the timesteps map to, σ_max = 1.0);
+/// 1. `sigmas = linspace(1.0, 1/steps, steps)` (the inference σ table, σ_max = 1.0);
 /// 2. shift each: `σ' = shift·σ / (1 + (shift − 1)·σ)` (the resolution-independent flow shift);
 /// 3. append a trailing `0.0` (the clean end).
 ///
@@ -118,10 +122,10 @@ const VAE_SCALE: u32 = SPATIAL_SCALE;
 /// [`candle_gen::resolve_flow_schedule`]. Pure; unit-tested without a GPU.
 pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
     let steps = steps.max(1);
-    // diffusers: timesteps = linspace(num_train, ~0, steps); sigmas = timesteps / num_train. With
-    // num_train = 1000 this is sigmas = linspace(1.0, 1/1000, steps). The exact lower endpoint barely
-    // matters (it is shifted then the trailing 0.0 dominates the final step); use 1/num_train for parity.
-    let num_train = 1000.0f32;
+    // `FlowMatchEulerDiscreteScheduler.set_timesteps` builds the inference schedule from
+    // `linspace(1.0, 1/steps, steps)`.  Using the training-grid endpoint (1/1000) here made Candle
+    // disagree with MLX and the frozen SD3.5 fixture at every interior point.
+    let min_sigma = 1.0 / steps as f32;
     let mut out: Vec<f32> = (0..steps)
         .map(|i| {
             let frac = if steps == 1 {
@@ -129,13 +133,21 @@ pub fn sd3_sigmas(steps: usize, shift: f32) -> Vec<f32> {
             } else {
                 i as f32 / (steps - 1) as f32
             };
-            // linspace(1.0, 1/num_train, steps)
-            let sigma = 1.0 - frac * (1.0 - 1.0 / num_train);
+            // linspace(1.0, 1/steps, steps)
+            let sigma = 1.0 - frac * (1.0 - min_sigma);
             shift * sigma / (1.0 + (shift - 1.0) * sigma)
         })
         .collect();
     out.push(0.0);
     out
+}
+
+/// Resolve SD3.5's native or curated flow schedule over the model's static shift.  Curated
+/// schedules must retain the model's `shift = 3.0`; using an unshifted flow model here silently
+/// turns their interior sigmas into a linear ramp.
+pub(crate) fn resolve_sd3_sigmas(scheduler: Option<&str>, steps: usize, shift: f32) -> Vec<f32> {
+    let native = sd3_sigmas(steps, shift);
+    candle_gen::resolve_flow_schedule(scheduler, shift.ln(), steps, &native)
 }
 
 /// The img2img **fork step** (sc-11784) — how many σ-schedule nodes to SKIP before the denoise starts,
@@ -159,6 +171,12 @@ pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
         }
         _ => 0,
     }
+}
+
+/// Resolve a reference's optional strength at the SD3.5 img2img boundary.  Keeping this explicit
+/// makes an omitted UI value match MLX instead of falling through to the txt2img start step.
+pub(crate) fn resolve_img2img_strength(strength: Option<f32>) -> f32 {
+    strength.unwrap_or(DEFAULT_IMG2IMG_STRENGTH)
 }
 
 /// Resolve the single img2img init image + its effective strength from the request's conditioning
@@ -644,7 +662,7 @@ impl Pipeline {
 
         let reference = resolve_reference(req)?;
         let start_step = match &reference {
-            Some((_, strength)) => init_time_step(steps, *strength),
+            Some((_, strength)) => init_time_step(steps, Some(resolve_img2img_strength(*strength))),
             None => 0,
         };
         let clean = if start_step > 0 {
@@ -757,8 +775,7 @@ pub(crate) fn render_core(
     let (lat_h, lat_w) = latent_hw;
 
     // Native SD3 flow-match schedule (shifted), then the curated scheduler axis (default = native).
-    let native = sd3_sigmas(steps, shift);
-    let sigmas = candle_gen::resolve_flow_schedule(scheduler, 0.0, steps, &native);
+    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
 
     // sc-3673 parity — deterministic, launch-portable initial noise: N(0,1) from a CPU RNG seeded by
     // `seed`, built on CPU then moved to the device.
@@ -843,8 +860,7 @@ fn denoise_latents(
     preview: &candle_gen::preview::PreviewHook<'_>,
 ) -> Result<Tensor> {
     let (lat_h, lat_w) = latent_hw;
-    let native = sd3_sigmas(steps, shift);
-    let sigmas = candle_gen::resolve_flow_schedule(scheduler, 0.0, steps, &native);
+    let sigmas = resolve_sd3_sigmas(scheduler, steps, shift);
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = candle_gen::seeded_normal_vec(&mut rng, n);
@@ -1072,6 +1088,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_and_curated_sd35_schedule_endpoints_match_frozen_fixture() {
+        // Frozen from diffusers FlowMatchEulerDiscreteScheduler { shift: 3.0 } at four steps.
+        // The native route must preserve the whole table; curated routes may redistribute interior
+        // points, but retain the model's shifted high-noise region and both endpoints.
+        let fixture = [1.0_f32, 0.9, 0.75, 0.5, 0.0];
+        let native = resolve_sd3_sigmas(None, 4, 3.0);
+        assert_eq!(native.len(), fixture.len());
+        for (got, want) in native.iter().zip(fixture) {
+            assert!((got - want).abs() < 1e-5, "native got {got} want {want}");
+        }
+
+        let curated = resolve_sd3_sigmas(Some("normal"), 4, 3.0);
+        assert_eq!(curated.first(), Some(&fixture[0]));
+        assert_eq!(curated.last(), Some(&fixture[4]));
+        assert!(
+            curated[1] > 0.8,
+            "curated SD3.5 schedule lost static shift: {curated:?}"
+        );
+    }
+
     /// **The parsed packed `group_size` is threaded, not discarded** (sc-9474). A `transformer/config.json`
     /// carrying `quantization: { bits, group_size }` parses into a `PackedConfig` whose `group_size` is the
     /// on-disk value (32 here, boogu's group size) — proving `transformer_packed_config` no longer throws
@@ -1148,6 +1185,17 @@ mod tests {
             .map(|&s| init_time_step(28, Some(s)))
             .collect();
         assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+    }
+
+    #[test]
+    fn missing_img2img_strength_defaults_to_mlx_midpoint() {
+        assert_eq!(DEFAULT_IMG2IMG_STRENGTH, 0.5);
+        assert_eq!(resolve_img2img_strength(None), DEFAULT_IMG2IMG_STRENGTH);
+        assert_eq!(
+            init_time_step(28, Some(resolve_img2img_strength(None))),
+            14,
+            "a missing img2img strength must not silently become txt2img"
+        );
     }
 
     /// `resolve_reference` pulls the single img2img init image + its effective strength from the

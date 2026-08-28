@@ -21,6 +21,24 @@ use gen_core::MemoryRequestScope;
 #[cfg(test)]
 use gen_core::{GenerationMemory, GenerationRequest, MemoryGeometry, MemoryRunOutcome};
 
+fn selected_encoder_discovery_roots(
+    source: &WeightsSource,
+) -> gen_core::Result<Vec<std::path::PathBuf>> {
+    let root = match source {
+        WeightsSource::Dir(path) => path.as_path(),
+        WeightsSource::File(path) => path.parent().ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "selected text encoder file has no parent directory: {}",
+                path.display()
+            ))
+        })?,
+    };
+    let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 pub(crate) const DECODE_TILE_EDGE: u32 = 512;
 pub(crate) const DECODE_OVERLAP: u32 = 128;
 pub(crate) const ATTENTION_CHUNK_SIZE: u32 =
@@ -285,24 +303,29 @@ fn validated_materialized_text_encoder_bytes(
     comfyui_file: bool,
 ) -> gen_core::Result<Option<u64>> {
     let selected = if comfyui_file && matches!(source, WeightsSource::File(_)) {
-        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(source)?;
-        if headers
+        let roots = selected_encoder_discovery_roots(source)?;
+        let inventory = gen_core::encoder_contract::text_encoder_source_inventory_for_discovery(
+            source, &roots,
+        )?;
+        if inventory
+            .tensor_headers()
             .iter()
             .any(|header| header.name == "model.embed_tokens.weight")
         {
-            crate::ENCODER_CONTRACT.validate_comfyui_source(source)?
+            crate::ENCODER_CONTRACT.validate_comfyui_source_for_discovery(source, &roots)?
         } else if selected_encoder_has_authoritative_config(source) {
-            crate::ENCODER_CONTRACT.validate_source_for_planning(source)?
+            crate::ENCODER_CONTRACT.validate_source_for_discovery(source, &roots)?
         } else {
             return Ok(None);
         }
     } else if selected_encoder_has_authoritative_config(source) {
-        crate::ENCODER_CONTRACT.validate_source_for_planning(source)?
+        let roots = selected_encoder_discovery_roots(source)?;
+        crate::ENCODER_CONTRACT.validate_source_for_discovery(source, &roots)?
     } else {
         return Ok(None);
     };
-    let headers = selected.materialized_language_tensor_headers(&crate::ENCODER_CONTRACT)?;
-    materialized_text_encoder_headers_bytes(&headers).map(Some)
+    materialized_text_encoder_headers_bytes(selected.materialized_language_tensor_headers())
+        .map(Some)
 }
 
 fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerComponentBytes> {
@@ -412,8 +435,15 @@ fn imported_file_components(
         if let Some(bytes) = validated_materialized_text_encoder_bytes(source, true)? {
             return Ok(bytes);
         }
-        let headers = gen_core::encoder_contract::text_encoder_source_tensor_headers(source)?;
-        imported_tensor_headers_bytes(&headers, "text encoder", "direct-shard inventory")
+        let roots = selected_encoder_discovery_roots(source)?;
+        let inventory = gen_core::encoder_contract::text_encoder_source_inventory_for_discovery(
+            source, &roots,
+        )?;
+        imported_tensor_headers_bytes(
+            inventory.tensor_headers(),
+            "text encoder",
+            "direct-shard inventory",
+        )
     };
     match (text_encoder, vae) {
         (None, None) => {
@@ -495,7 +525,12 @@ pub(crate) fn provider_contract(
             if let Some(bytes) = validated_materialized_text_encoder_bytes(effective, false)? {
                 components.text_encoder = bytes;
             } else if selected_text_encoder.is_some() {
-                components.text_encoder = gen_core::text_encoder_source_bytes(effective)?;
+                let roots = selected_encoder_discovery_roots(effective)?;
+                components.text_encoder =
+                    gen_core::encoder_contract::text_encoder_source_inventory_for_discovery(
+                        effective, &roots,
+                    )?
+                    .source_bytes();
             }
             components
         }
@@ -1406,6 +1441,21 @@ mod tests {
             .expect_err("the executable load seam must reject a missing selected encoder")
             .to_string();
         assert!(error.contains("text encoder"), "got: {error}");
+    }
+
+    #[test]
+    fn weights_free_contract_does_not_require_a_builtin_encoder_to_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nonexistent");
+        let spec = LoadSpec::new(WeightsSource::Dir(missing.clone()));
+
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap_or_else(|error| {
+            panic!(
+                "weights-free catalog construction must not require or canonicalize {}: {error}",
+                missing.join("text_encoder").display()
+            )
+        });
+        assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
     }
 
     #[test]

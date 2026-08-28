@@ -187,7 +187,7 @@ impl KreaText {
     /// first grounded (edit) encode via [`Self::ensure_vision`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let selected = crate::model::ENCODER_CONTRACT.source_for_load(
+        let selected = crate::model::runtime_encoder_contract().source_for_load(
             &mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
             root,
         )?;
@@ -276,7 +276,7 @@ impl KreaText {
 }
 
 fn resolve_vision_encoder_source(root: &Path) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
-    crate::model::ENCODER_CONTRACT
+    crate::model::runtime_encoder_contract()
         .validate_source(&WeightsSource::Dir(root.join("text_encoder")))
         .map_err(Into::into)
 }
@@ -287,8 +287,8 @@ fn read_validated_vision_source<T>(
     read: impl FnOnce(&WeightsSource) -> Result<T>,
 ) -> Result<T> {
     source.validate_vision(
-        &crate::model::VISION_ENCODER_CONTRACT,
-        &crate::model::ENCODER_CONTRACT,
+        &crate::model::runtime_vision_encoder_contract(),
+        &crate::model::runtime_encoder_contract(),
     )?;
     source.read_unchanged(read)
 }
@@ -1970,7 +1970,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         gen_core_testkit::write_encoder_contract_fixture(
             &fixture.path().join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .unwrap();
 
@@ -2068,11 +2068,12 @@ mod tests {
     #[test]
     fn public_snapshot_text_phase_rejects_the_wrong_encoder_before_tokenizer_open() {
         let fixture = tempfile::tempdir().unwrap();
+        let contract = crate::model::test_encoder_contract();
         gen_core_testkit::write_encoder_contract_fixture(
             &fixture.path().join("text_encoder"),
             mlx_gen::gen_core::EncoderContract {
-                hidden_size: crate::model::ENCODER_CONTRACT.hidden_size + 1,
-                ..crate::model::ENCODER_CONTRACT
+                hidden_size: contract.hidden_size + 1,
+                ..contract
             },
         )
         .unwrap();
@@ -2087,7 +2088,8 @@ mod tests {
 
     #[test]
     fn edit_vision_contract_rejects_missing_and_wrong_visual_surface_at_admission() {
-        let mut headers = crate::model::VISION_ENCODER_CONTRACT
+        let vision_contract = crate::model::test_vision_encoder_contract();
+        let mut headers = vision_contract
             .expected_headers()
             .unwrap()
             .into_iter()
@@ -2099,7 +2101,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         headers.remove(0);
-        let error = crate::model::VISION_ENCODER_CONTRACT
+        let error = vision_contract
             .validate_tensor_headers(&headers, std::path::Path::new("missing-visual"))
             .unwrap_err()
             .to_string();
@@ -2108,17 +2110,15 @@ mod tests {
         let missing = tempfile::tempdir().unwrap();
         gen_core_testkit::write_encoder_contract_fixture(
             &missing.path().join("text_encoder"),
-            crate::model::ENCODER_CONTRACT,
+            crate::model::test_encoder_contract(),
         )
         .unwrap();
-        let source = crate::model::ENCODER_CONTRACT
+        let language_contract = crate::model::test_encoder_contract();
+        let source = language_contract
             .validate_source(&WeightsSource::Dir(missing.path().join("text_encoder")))
             .unwrap();
         let error = source
-            .validate_vision(
-                &crate::model::VISION_ENCODER_CONTRACT,
-                &crate::model::ENCODER_CONTRACT,
-            )
+            .validate_vision(&vision_contract, &language_contract)
             .unwrap_err()
             .to_string();
         assert!(error.contains("vision_config"), "{error}");
@@ -2127,24 +2127,21 @@ mod tests {
         let component = wrong.path().join("text_encoder");
         gen_core_testkit::write_multimodal_encoder_contract_fixture(
             &component,
-            crate::model::ENCODER_CONTRACT,
-            crate::model::VISION_ENCODER_CONTRACT,
+            language_contract,
+            vision_contract,
         )
         .unwrap();
         let config_path = component.join("config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
         config["vision_config"]["out_hidden_size"] =
-            serde_json::json!(crate::model::ENCODER_CONTRACT.hidden_size + 1);
+            serde_json::json!(language_contract.hidden_size + 1);
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let source = crate::model::ENCODER_CONTRACT
+        let source = language_contract
             .validate_source(&WeightsSource::Dir(component))
             .unwrap();
         let error = source
-            .validate_vision(
-                &crate::model::VISION_ENCODER_CONTRACT,
-                &crate::model::ENCODER_CONTRACT,
-            )
+            .validate_vision(&vision_contract, &language_contract)
             .unwrap_err()
             .to_string();
         assert!(error.contains("out_hidden_size"), "{error}");

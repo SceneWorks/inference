@@ -386,17 +386,34 @@ fn transform_vae_tensor(src_key: &str, t: &Array) -> Result<Array> {
 mod tests {
     use super::*;
 
+    fn bounded_multimodal_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        mlx_gen::gen_core::EncoderContract,
+    ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let component = fixture.path().join("text_encoder");
+        let language = crate::bounded_encoder_contract();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &component,
+            language,
+            crate::bounded_vision_encoder_contract(),
+        )
+        .unwrap();
+        (fixture, component, language)
+    }
+
     #[test]
     fn qwen_edit_vision_contract_rejects_missing_visual_headers() {
         let fixture = tempfile::tempdir().unwrap();
         let component = fixture.path().join("text_encoder");
-        gen_core_testkit::write_encoder_contract_fixture(&component, crate::ENCODER_CONTRACT)
-            .unwrap();
-        let selected = crate::ENCODER_CONTRACT
+        let language = crate::bounded_encoder_contract();
+        gen_core_testkit::write_encoder_contract_fixture(&component, language).unwrap();
+        let selected = language
             .validate_source(&WeightsSource::Dir(component))
             .unwrap();
         let error = selected
-            .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+            .validate_vision(&crate::bounded_vision_encoder_contract(), &language)
             .unwrap_err()
             .to_string();
         assert!(error.contains("vision_config"), "{error}");
@@ -404,19 +421,29 @@ mod tests {
 
     #[test]
     fn qwen2_5_vision_behavior_defaults_are_accepted_but_explicit_conflicts_fail() {
-        let write_fixture = || {
-            let fixture = tempfile::tempdir().unwrap();
-            let component = fixture.path().join("text_encoder");
-            gen_core_testkit::write_multimodal_encoder_contract_fixture(
-                &component,
-                crate::ENCODER_CONTRACT,
-                crate::VISION_ENCODER_CONTRACT,
-            )
+        let contract = crate::VISION_ENCODER_CONTRACT;
+        contract
+            .validate_definition(&crate::ENCODER_CONTRACT)
             .unwrap();
-            (fixture, component)
-        };
+        assert_eq!(
+            contract.architecture,
+            mlx_gen::gen_core::VisionEncoderArchitecture::Qwen2_5Vl
+        );
+        assert_eq!(contract.rope_theta.get(), 10_000.0);
+        assert_eq!(contract.normalization_eps.get(), 1e-6);
+        assert_eq!(contract.hidden_size, 1280);
+        assert_eq!(contract.intermediate_size, 3420);
+        assert_eq!(contract.num_hidden_layers, 32);
+        assert_eq!(contract.num_attention_heads, 16);
+        assert_eq!(contract.output_width, 3584);
+        assert_eq!(contract.patch_size, 14);
+        assert_eq!(contract.temporal_patch_size, 2);
+        assert_eq!(contract.spatial_merge_size, 2);
+        assert_eq!(contract.in_channels, 3);
+        assert_eq!(contract.window_size, Some(112));
+        assert_eq!(contract.full_attention_block_indexes, &[7, 15, 23, 31]);
 
-        let (_fixture, component) = write_fixture();
+        let (_fixture, component, language) = bounded_multimodal_fixture();
         let config_path = component.join("config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
@@ -429,23 +456,23 @@ mod tests {
             .unwrap()
             .remove("rms_norm_eps");
         std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        crate::ENCODER_CONTRACT
+        language
             .validate_source(&WeightsSource::Dir(component))
             .unwrap()
-            .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+            .validate_vision(&crate::bounded_vision_encoder_contract(), &language)
             .expect("omission must resolve to the exact Qwen2.5-VL runtime defaults");
 
         for (field, value) in [("rope_theta", 9_999.0), ("rms_norm_eps", 1e-5)] {
-            let (_fixture, component) = write_fixture();
+            let (_fixture, component, language) = bounded_multimodal_fixture();
             let config_path = component.join("config.json");
             let mut config: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
             config["vision_config"][field] = serde_json::json!(value);
             std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-            let error = crate::ENCODER_CONTRACT
+            let error = language
                 .validate_source(&WeightsSource::Dir(component))
                 .unwrap()
-                .validate_vision(&crate::VISION_ENCODER_CONTRACT, &crate::ENCODER_CONTRACT)
+                .validate_vision(&crate::bounded_vision_encoder_contract(), &language)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(field), "{error}");

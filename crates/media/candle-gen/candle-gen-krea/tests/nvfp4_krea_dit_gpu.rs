@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::quant::{ActPrecision, CublasLt, OutlierClass};
+use candle_gen::quant::{ActPrecision, CublasLt, Nvfp4Context, OutlierClass};
 use candle_gen_krea::loader::Weights;
 use candle_gen_krea::nvfp4_dit::{LayerRole, Nvfp4Capability};
 use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
@@ -1561,7 +1561,12 @@ fn nvfp4_krea_dit_lane_surface_and_final_head_are_correct() {
     // saying so, the `predicted_packed` count below is being computed against a fiction and this
     // assertion fails first, naming the reason.
     let probe_w = trunk_weights(&root, &dev, DType::BF16);
-    let probe_plan = DitPlan::nvfp4(Nvfp4Quant::Mixed).with_num_layers(cfg.num_layers);
+    // The live shared handle, exactly as `Krea2Transformer::load_planned` threads it: without it the
+    // plan's context is `Nvfp4Context::none()` and `nvfp4_capability` honestly reports
+    // `nvfp4_device: false` even on a genuine sm_120 part (sc-11045 terminal-evidence defect).
+    let probe_plan = DitPlan::nvfp4(Nvfp4Quant::Mixed)
+        .with_num_layers(cfg.num_layers)
+        .with_nvfp4_context(Nvfp4Context::new(&dev).expect("nvfp4 context"));
     const PROBE_KEY: &str = "transformer_blocks.7.attn.to_q.weight";
     // The dense shape the loader itself passes on this (bf16, un-planned) snapshot — the `None`
     // form is for a plan-backed native row, where the codec spec answers the grid question, and

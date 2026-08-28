@@ -28,6 +28,49 @@ const VISION_START: &str = "<|vision_start|>";
 const VISION_END: &str = "<|vision_end|>";
 const IMAGE_PAD: &str = "<|image_pad|>";
 
+/// Maximum rendered tokens on text-only conditioning paths. This is the declared Qwen3-VL prompt
+/// contract and mirrors the Candle Boogu backend: over-budget input is rejected before the text
+/// encoder can allocate its attention state.
+pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
+
+/// Maximum rendered tokens on image-grounded Edit conditioning paths. A 2048² reference emits
+/// 4096 merged vision tokens, so Edit needs a separate ceiling from the text-only contract. The
+/// 8192-token bound mirrors Candle and still serves every advertised single-reference geometry.
+pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
+
+/// Host token ids admitted for one image-grounded edit. The ids are kept on the host during
+/// preflight and converted to MLX arrays only after the combined reference+instruction budget has
+/// passed, so the vision path consumes exactly the sequence admission checked.
+#[derive(Debug, Clone)]
+pub(crate) struct EditTokenIds {
+    ids: Vec<i32>,
+}
+
+impl EditTokenIds {
+    pub(crate) fn to_arrays(&self) -> Result<(Array, Array)> {
+        ids_to_arrays(&self.ids)
+    }
+}
+
+/// Host token ids admitted under the ordinary 1280-token contract. The registered generators keep
+/// these ids outside MLX until after request admission, then reuse them across resident/sequential
+/// conditioning so no positive or CFG-negative leg re-tokenizes after component entry.
+#[derive(Debug, Clone)]
+pub(crate) struct TextTokenIds {
+    ids: Vec<i32>,
+}
+
+impl TextTokenIds {
+    pub(crate) fn to_arrays(&self) -> Result<(Array, Array)> {
+        ids_to_arrays(&self.ids)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
@@ -62,8 +105,9 @@ impl BooguTokenizer {
             root.as_ref().join("mllm").join("tokenizer.json"),
             TokenizerConfig {
                 // We render the chat string ourselves and call `encode_ids` directly, so the config
-                // template/padding are unused; keep them inert.
-                max_length: 1280,
+                // template/padding are unused. Keep the declared text ceiling here as well as at the
+                // explicit boundary below so inspection cannot report a contradictory contract.
+                max_length: MAX_TEXT_TOKENS,
                 pad_token_id: 151643, // Qwen <|endoftext|>; unused (no padding on this path)
                 chat_template: ChatTemplate::None,
                 pad_to_max_length: false,
@@ -72,19 +116,42 @@ impl BooguTokenizer {
         Ok(Self { inner })
     }
 
-    /// Encode a rendered chat string to ids (`add_special_tokens=false`, matching the reference).
+    /// Encode a rendered text-only chat string to ids (`add_special_tokens=false`, matching the
+    /// reference), rejecting an over-budget prompt before condition-encoder attention allocation.
     fn encode(&self, text: &str) -> Result<Vec<i32>> {
+        Ok(self.preflight_text(text)?.ids)
+    }
+
+    fn preflight_text(&self, text: &str) -> Result<TextTokenIds> {
+        let ids = self.raw_ids(text)?;
+        check_len(ids.len(), MAX_TEXT_TOKENS)?;
+        Ok(TextTokenIds { ids })
+    }
+
+    /// Tokenize without applying a path-specific length ceiling. The caller immediately applies
+    /// either [`check_len`] or [`check_edit_len`] before constructing device arrays.
+    fn raw_ids(&self, text: &str) -> Result<Vec<i32>> {
         Ok(self.inner.encode_ids(text, false)?)
     }
 
     /// Encode the **positive** text-to-image instruction → `(input_ids, attention_mask)` `[1, L]`.
     pub fn encode_t2i(&self, prompt: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))?)
+        self.preflight_t2i(prompt)?.to_arrays()
+    }
+
+    /// Admit the positive Base/Turbo instruction without creating MLX arrays.
+    pub(crate) fn preflight_t2i(&self, prompt: &str) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_T2I, prompt))
     }
 
     /// Encode the CFG **negative** (empty instruction with the drop system prompt) → `[1, L]`.
     pub fn encode_negative(&self) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))?)
+        self.preflight_negative()?.to_arrays()
+    }
+
+    /// Admit the fixed text-only CFG-negative instruction without creating MLX arrays.
+    pub(crate) fn preflight_negative(&self) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_DROP, ""))
     }
 
     /// Encode the **edit** instruction → `(input_ids, attention_mask)` `[1, L]`. The TI2I system
@@ -96,7 +163,12 @@ impl BooguTokenizer {
     /// the reference image through the Qwen3-VL vision tower (deepstack) so the MLLM "sees" it; that
     /// semantic path is tracked separately (E7b). The DiT's spatial reference path is fully wired.
     pub fn encode_edit(&self, instruction: &str) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
+        self.preflight_edit(instruction)?.to_arrays()
+    }
+
+    /// Admit a text-only Edit positive instruction under the ordinary 1280-token contract.
+    pub(crate) fn preflight_edit(&self, instruction: &str) -> Result<TextTokenIds> {
+        self.preflight_text(&render_chat(SYSTEM_PROMPT_DROP, instruction))
     }
 
     /// Encode a **multi-image** edit instruction → `(input_ids, attention_mask)` `[1, L]`, with one
@@ -112,11 +184,30 @@ impl BooguTokenizer {
         instruction: &str,
         num_image_tokens: &[usize],
     ) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat_with_images(
+        self.preflight_edit_with_images(instruction, num_image_tokens)?
+            .to_arrays()
+    }
+
+    /// Tokenize and validate a complete image-grounded edit while retaining the exact host ids for
+    /// the later text-tower call. This is deliberately array-free: callers run it before loading or
+    /// forwarding the MLX vision tower.
+    pub(crate) fn preflight_edit_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<EditTokenIds> {
+        let ids = self.raw_ids(&render_chat_with_images(
             SYSTEM_PROMPT_DROP,
             instruction,
             num_image_tokens,
-        ))?)
+        ))?;
+        check_edit_len(
+            ids.len(),
+            num_image_tokens.iter().sum(),
+            num_image_tokens.len(),
+            MAX_EDIT_TOKENS,
+        )?;
+        Ok(EditTokenIds { ids })
     }
 
     /// Raw id vector for the positive instruction (parity testing against the golden).
@@ -126,18 +217,94 @@ impl BooguTokenizer {
 }
 
 /// `Vec<i32>` ids → `(input_ids, attention_mask)` `[1, L]` int32 arrays (mask all-ones: no padding).
-fn ids_to_arrays(ids: Vec<i32>) -> Result<(Array, Array)> {
+fn ids_to_arrays(ids: &[i32]) -> Result<(Array, Array)> {
     let len = ids.len() as i32;
     let mask = vec![1i32; ids.len()];
     Ok((
-        Array::from_slice(&ids, &[1, len]),
+        Array::from_slice(ids, &[1, len]),
         Array::from_slice(&mask, &[1, len]),
     ))
 }
 
+/// Reject an empty or over-budget text-only conditioning sequence before device-array or attention
+/// allocation. Pure so the exact inclusive boundary is covered without a tokenizer snapshot.
+fn check_len(len: usize, max_tokens: usize) -> Result<()> {
+    if len == 0 {
+        return Err(mlx_gen::Error::Msg("boogu: empty token sequence".into()));
+    }
+    if len > max_tokens {
+        return Err(mlx_gen::Error::Msg(format!(
+            "boogu: prompt has {len} tokens, exceeds max_text_tokens={max_tokens}"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an over-budget image-grounded edit before the Qwen3-VL text attention allocation. The
+/// diagnostic separates reference placeholders from instruction/template tokens so callers know
+/// whether to reduce reference geometry/count rather than being told only that the prompt is long.
+pub(crate) fn check_edit_len(
+    total: usize,
+    ref_tokens: usize,
+    num_refs: usize,
+    max_tokens: usize,
+) -> Result<()> {
+    if total == 0 {
+        return Err(mlx_gen::Error::Msg("boogu: empty token sequence".into()));
+    }
+    if total > max_tokens {
+        let instruction_tokens = total.saturating_sub(ref_tokens);
+        return Err(mlx_gen::Error::Msg(format!(
+            "boogu edit: {total} tokens ({ref_tokens} from {num_refs} reference image(s) + \
+             {instruction_tokens} instruction/template tokens) exceeds max_edit_tokens={max_tokens}; \
+             reduce the reference image sizes or count"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_chat_with_images;
+    use super::*;
+
+    #[test]
+    fn text_budget_is_inclusive_and_rejects_just_over() {
+        assert!(check_len(1, MAX_TEXT_TOKENS).is_ok());
+        assert!(check_len(MAX_TEXT_TOKENS, MAX_TEXT_TOKENS).is_ok());
+        let error = check_len(MAX_TEXT_TOKENS + 1, MAX_TEXT_TOKENS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1281"), "names actual token count: {error}");
+        assert!(
+            error.contains("max_text_tokens=1280"),
+            "names declared ceiling: {error}"
+        );
+    }
+
+    #[test]
+    fn edit_budget_serves_one_advertised_max_reference_but_bounds_multi_reference() {
+        // Qwen3-VL merges one token per 32×32 reference cell: a 2048² source produces 4096.
+        let max_ref_tokens = (2048 / 32) * (2048 / 32);
+        assert_eq!(max_ref_tokens, 4096);
+        assert!(check_edit_len(max_ref_tokens + 100, max_ref_tokens, 1, MAX_EDIT_TOKENS).is_ok());
+        assert!(check_edit_len(MAX_EDIT_TOKENS, MAX_EDIT_TOKENS - 100, 2, MAX_EDIT_TOKENS).is_ok());
+        let error = check_edit_len(
+            MAX_EDIT_TOKENS + 1,
+            MAX_EDIT_TOKENS - 100,
+            2,
+            MAX_EDIT_TOKENS,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("max_edit_tokens=8192"));
+        assert!(error.contains("reference image"));
+    }
+
+    #[test]
+    fn both_token_contracts_reject_empty_sequences() {
+        assert!(check_len(0, MAX_TEXT_TOKENS).is_err());
+        assert!(check_edit_len(0, 0, 0, MAX_EDIT_TOKENS).is_err());
+    }
 
     /// One image block per reference, back-to-back (no separator, no "Picture N:" label), each with
     /// its own `<|image_pad|>` count, then the instruction. The single-reference edit is the

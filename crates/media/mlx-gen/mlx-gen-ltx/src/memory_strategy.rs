@@ -1772,6 +1772,26 @@ mod tests {
     }
 
     #[test]
+    fn calibrated_scope_rejects_zero_fps_before_installing_controls() {
+        let (mut scope, request) = calibrated_t2v_scope_and_request();
+        let mut zero_fps = GenerationRequest {
+            fps: Some(0),
+            ..request
+        };
+        let error = scope
+            .configure_request(&mut zero_fps)
+            .expect_err("calibrated MLX LTX admission must reject zero fps");
+        assert!(
+            matches!(error, gen_core::Error::Unsupported(_)),
+            "got: {error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("requires public fps 24, 25, or 30"));
+        assert_eq!(zero_fps.memory, None);
+    }
+
+    #[test]
     fn first_last_fixture_binds_ordered_two_keyframe_identity() {
         let spec = fixture_spec();
         let contract = weights_free_memory_strategy_contract(&spec).unwrap();

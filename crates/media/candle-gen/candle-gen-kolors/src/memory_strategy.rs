@@ -48,7 +48,7 @@ struct SealedInventory {
     label: &'static str,
     root: PathBuf,
     paths: Vec<PathBuf>,
-    files: Vec<(gen_core::PinnedWeightsFile, [u8; 32])>,
+    files: Vec<gen_core::PinnedWeightsFile>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,11 +76,7 @@ impl KolorsLoadSeal {
         }
         let files = paths
             .iter()
-            .map(|path| {
-                let pin = gen_core::PinnedWeightsFile::pin(path)?;
-                let digest = pin.read_unchanged(sha256_file)?;
-                Ok((pin, digest))
-            })
+            .map(gen_core::PinnedWeightsFile::pin)
             .collect::<gen_core::Result<Vec<_>>>()?;
         Ok(SealedInventory {
             label,
@@ -222,16 +218,8 @@ impl KolorsLoadSeal {
                     inventory.label
                 )));
             }
-            for (pin, expected_digest) in &inventory.files {
-                pin.ensure_unchanged()?;
-                let actual = pin.read_unchanged(sha256_file)?;
-                if actual != *expected_digest {
-                    return Err(gen_core::Error::Unsupported(format!(
-                        "kolors: {} content changed after admission: {}",
-                        inventory.label,
-                        pin.loader_path().display()
-                    )));
-                }
+            for pin in &inventory.files {
+                pin.verify_unchanged()?;
             }
         }
         Ok(())
@@ -314,20 +302,6 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> 
         collect_files(&entry, files)?;
     }
     Ok(())
-}
-
-fn sha256_file(path: &Path) -> gen_core::Result<[u8; 32]> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(digest.finalize().into())
 }
 
 fn validate_float_tensor_inventory(path: &Path, label: &str) -> gen_core::Result<()> {

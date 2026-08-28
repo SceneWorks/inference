@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{linear, Module};
+use candle_gen::diffusion_schedule::{
+    KOLORS_BETA_END as BETA_END, KOLORS_BETA_START as BETA_START,
+    KOLORS_TRAIN_STEPS as NUM_TRAIN_TIMESTEPS,
+};
 use candle_gen::gen_core::sampling::AlphaSchedule;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingOutput, TrainingProgress, TrainingRequest,
@@ -34,9 +38,6 @@ use crate::MODEL_ID;
 
 const LABEL: &str = "kolors trainer";
 const VAE_SCALE: f64 = 0.13025;
-const NUM_TRAIN_TIMESTEPS: usize = 1100;
-const BETA_START: f32 = 0.00085;
-const BETA_END: f32 = 0.014;
 const ADDITION_TIME_EMBED_DIM: usize = 256;
 const PROJECTION_INPUT_DIM: usize = 5632;
 const CONTEXT_DIM: usize = 4096;

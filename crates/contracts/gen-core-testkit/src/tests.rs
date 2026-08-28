@@ -895,9 +895,23 @@ fn encoder_contract_fixture_payload_is_a_hole_not_seven_gigabytes() {
     // Deliberately not named `text_encoder`: that spelling also emits a tokenizer artifact, which is
     // irrelevant here and would only add a second file to reason about.
     let root = tmp.path().join("encoder");
+    let expected_headers =
+        encoder_contract_fixture_tensor_headers(SPARSE_FIXTURE_CONTRACT, None).unwrap();
     write_encoder_contract_fixture(&root, SPARSE_FIXTURE_CONTRACT).unwrap();
 
     let weights = root.join("model.safetensors");
+    let actual_headers = gen_core::safetensors_path_tensor_headers(&weights).unwrap();
+    let by_name = |headers: Vec<gen_core::SafetensorsTensorHeader>| {
+        headers
+            .into_iter()
+            .map(|header| (header.name, (header.dtype, header.shape, header.data_bytes)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        by_name(actual_headers),
+        by_name(expected_headers),
+        "in-memory header facts must be byte-exact with the sparse writer without reading payload"
+    );
     let meta = std::fs::metadata(&weights).unwrap();
     assert!(
         meta.len() > 4 << 30,
@@ -949,6 +963,14 @@ fn encoder_contract_fixture_payload_is_a_hole_not_seven_gigabytes() {
             meta.len()
         );
     }
+}
+
+#[test]
+fn in_memory_encoder_header_facts_reject_dense_only_packing() {
+    let error = encoder_contract_fixture_tensor_headers(SPARSE_FIXTURE_CONTRACT, Some(4))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dense-only"), "{error}");
 }
 
 /// Copying a fixture must not be how the hole gets materialized.

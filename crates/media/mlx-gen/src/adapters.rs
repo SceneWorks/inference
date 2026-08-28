@@ -1308,10 +1308,16 @@ mod tests {
                 adapter.materialize()
             });
             let error = result.expect_err("A to B replacement must invalidate the adapter pin");
-            assert!(
-                error.to_string().contains("changed after load"),
-                "{kind:?}: unexpected error: {error}"
-            );
+            match error {
+                crate::Error::Unsupported(reason)
+                    if reason.starts_with("artifact seal mismatch after load: ") => {}
+                crate::Error::Unsupported(reason) => {
+                    panic!("{kind:?}: unexpected artifact-seal reason: {reason}")
+                }
+                other => {
+                    panic!("{kind:?}: expected a typed artifact-seal rejection, got: {other:?}")
+                }
+            }
         }
     }
 

@@ -323,9 +323,15 @@ mod conditioning_budget_tests {
             .unwrap();
         let error = spec
             .file_pin_for(path)
-            .expect_err("the prepared donor identity must fail closed after replacement")
-            .to_string();
-        assert!(error.contains("changed after load"), "got: {error}");
+            .expect_err("the prepared donor identity must fail closed after replacement");
+        match error {
+            mlx_gen::gen_core::Error::Unsupported(reason)
+                if reason.starts_with("artifact seal mismatch after load: ") => {}
+            mlx_gen::gen_core::Error::Unsupported(reason) => {
+                panic!("unexpected artifact-seal reason: {reason}")
+            }
+            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+        }
     }
 }
 #[doc(hidden)]

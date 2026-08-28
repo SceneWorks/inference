@@ -3073,6 +3073,9 @@ impl Capabilities {
             )));
         }
         if let Some(fps) = req.fps {
+            if fps == 0 {
+                return Err(Error::Msg(format!("{id}: fps must be greater than zero")));
+            }
             if fps > MAX_FPS {
                 return Err(Error::Msg(format!(
                     "{id}: fps {fps} exceeds the sanity cap {MAX_FPS}"
@@ -4846,6 +4849,15 @@ mod tests {
             c.validate_request("m", &fps).is_err(),
             "u32::MAX fps capped"
         );
+        let zero_fps = GenerationRequest {
+            fps: Some(0),
+            ..base_req()
+        };
+        let err = c
+            .validate_request("m", &zero_fps)
+            .expect_err("zero fps must be rejected before a provider derives durations");
+        assert!(matches!(err, Error::Msg(_)), "got: {err:?}");
+        assert!(err.to_string().contains("fps must be greater than zero"));
         // Realistic values pass.
         assert!(c
             .validate_request(

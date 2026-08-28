@@ -559,32 +559,167 @@ impl Flux2Config {
     }
 }
 
+/// Bounded Mistral contract for provider tests that need to exercise the real sealed-source
+/// validator rather than the production checkpoint's multi-gigabyte tensor payload.
+///
+/// Tests that use this must assert the production fields they care about separately. The compact
+/// dimensions preserve the same architecture, behavior flags, tokenizer literals, prompt policies,
+/// final norm, LM head, and packing policy while keeping the hashed fixture below a megabyte.
+#[cfg(test)]
+pub(crate) fn bounded_dev_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        vocab_size: 14,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        max_position_embeddings: 512,
+        selected_hidden_layers: &[1],
+        ..DEV_ENCODER_CONTRACT
+    }
+}
+
+/// Bounded Qwen3 contract for sealed-source residency smoke tests.
+#[cfg(test)]
+pub(crate) fn bounded_klein_encoder_contract() -> mlx_gen::gen_core::EncoderContract {
+    mlx_gen::gen_core::EncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 32,
+        output_width: 64,
+        loaded_hidden_layers: 1,
+        selected_hidden_layers: &[1],
+        ..KLEIN_ENCODER_CONTRACT
+    }
+}
+
+/// Bounded Pixtral companion for [`bounded_dev_encoder_contract`].
+#[cfg(test)]
+pub(crate) fn bounded_dev_vision_encoder_contract() -> mlx_gen::gen_core::VisionEncoderContract {
+    mlx_gen::gen_core::VisionEncoderContract {
+        hidden_size: 64,
+        intermediate_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 2,
+        output_width: 64,
+        ..DEV_VISION_ENCODER_CONTRACT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn assert_policy_fields_match(
+        bounded: mlx_gen::gen_core::EncoderContract,
+        production: mlx_gen::gen_core::EncoderContract,
+    ) {
+        assert_eq!(bounded.architecture, production.architecture);
+        assert_eq!(bounded.requires_final_norm, production.requires_final_norm);
+        assert_eq!(bounded.requires_lm_head, production.requires_lm_head);
+        assert_eq!(bounded.hidden_activation, production.hidden_activation);
+        assert_eq!(bounded.attention_dropout, production.attention_dropout);
+        assert_eq!(bounded.rms_norm_eps, production.rms_norm_eps);
+        assert_eq!(bounded.qk_norm_eps, production.qk_norm_eps);
+        assert_eq!(bounded.rope_theta, production.rope_theta);
+        assert_eq!(bounded.attention_bias, production.attention_bias);
+        assert_eq!(bounded.tie_word_embeddings, production.tie_word_embeddings);
+        assert_eq!(bounded.tokenizer, production.tokenizer);
+        assert_eq!(bounded.prompt_executions, production.prompt_executions);
+        assert_eq!(bounded.bos_token_id, production.bos_token_id);
+        assert_eq!(bounded.eos_token_id, production.eos_token_id);
+        assert_eq!(bounded.image_token_id, production.image_token_id);
+        assert_eq!(
+            bounded.vision_start_token_id,
+            production.vision_start_token_id
+        );
+        assert_eq!(bounded.vision_end_token_id, production.vision_end_token_id);
+        assert_eq!(bounded.mrope_section, production.mrope_section);
+        assert_eq!(bounded.mrope_interleaved, production.mrope_interleaved);
+        assert_eq!(bounded.packing, production.packing);
+        assert_eq!(
+            bounded.dense_storage_dtype_probe,
+            production.dense_storage_dtype_probe
+        );
+    }
+
     #[test]
     fn dev_authored_behavior_boole_must_match_the_biasless_untied_runtime() {
+        assert_eq!(
+            DEV_ENCODER_CONTRACT.attention_bias,
+            mlx_gen::gen_core::EncoderConfigBool::Optional(false)
+        );
+        assert_eq!(
+            DEV_ENCODER_CONTRACT.tie_word_embeddings,
+            mlx_gen::gen_core::EncoderConfigBool::Optional(false)
+        );
+        DEV_ENCODER_CONTRACT.validate_definition().unwrap();
+
+        let bounded = bounded_dev_encoder_contract();
+        assert_policy_fields_match(bounded, DEV_ENCODER_CONTRACT);
         for field in ["attention_bias", "tie_word_embeddings"] {
             let tmp = tempfile::tempdir().unwrap();
             let encoder = tmp.path().join("encoder");
-            gen_core_testkit::write_encoder_contract_fixture(&encoder, DEV_ENCODER_CONTRACT)
-                .unwrap();
-            DEV_ENCODER_CONTRACT
+            gen_core_testkit::write_encoder_contract_fixture(&encoder, bounded).unwrap();
+            bounded
                 .validate_source(&mlx_gen::WeightsSource::Dir(encoder.clone()))
-                .expect("omission must select the fixed false runtime behavior");
+                .expect("the bounded source must exercise omission through the real validator");
             let config_path = encoder.join("config.json");
             let mut config: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
             config[field] = serde_json::json!(true);
             std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-            let error = DEV_ENCODER_CONTRACT
+            let error = bounded
                 .validate_source(&mlx_gen::WeightsSource::Dir(encoder))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(field), "{field}: {error}");
             assert!(error.contains("expected false"), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn bounded_klein_contract_retains_every_production_policy_field() {
+        let bounded = bounded_klein_encoder_contract();
+        assert_policy_fields_match(bounded, KLEIN_ENCODER_CONTRACT);
+        bounded.validate_definition().unwrap();
+    }
+
+    #[test]
+    fn bounded_vision_contract_retains_every_production_policy_field() {
+        let bounded = bounded_dev_vision_encoder_contract();
+        let production = DEV_VISION_ENCODER_CONTRACT;
+        assert_eq!(bounded.architecture, production.architecture);
+        assert_eq!(bounded.hidden_activation, production.hidden_activation);
+        assert_eq!(bounded.rope_theta, production.rope_theta);
+        assert_eq!(bounded.normalization_eps, production.normalization_eps);
+        assert_eq!(bounded.patch_size, production.patch_size);
+        assert_eq!(bounded.temporal_patch_size, production.temporal_patch_size);
+        assert_eq!(bounded.spatial_merge_size, production.spatial_merge_size);
+        assert_eq!(bounded.in_channels, production.in_channels);
+        assert_eq!(
+            bounded.num_position_embeddings,
+            production.num_position_embeddings
+        );
+        assert_eq!(
+            bounded.deepstack_visual_indexes,
+            production.deepstack_visual_indexes
+        );
+        assert_eq!(bounded.window_size, production.window_size);
+        assert_eq!(
+            bounded.full_attention_block_indexes,
+            production.full_attention_block_indexes
+        );
+        bounded
+            .validate_definition(&bounded_dev_encoder_contract())
+            .unwrap();
     }
 
     #[test]

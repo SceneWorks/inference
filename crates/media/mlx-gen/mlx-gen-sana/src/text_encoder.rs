@@ -26,8 +26,8 @@
 //! ## Mask handling
 //! `_get_gemma_prompt_embeds` returns `(prompt_embeds, prompt_attention_mask)` and `encode_prompt`
 //! gathers the **same** `select_index` from both. [`SanaTextEncoder::encode_with_mask`] returns both
-//! gathered arrays; the pipeline threads `caption_mask` through
-//! [`crate::transformer::SanaTransformer::forward`] into every block's `attn2` cross-attention.
+//! gathered arrays; the pipeline threads `caption_mask` through the internal
+//! `SanaTransformer::forward_with_memory` path into every block's `attn2` cross-attention.
 //! This is required for correctness: short captions leave most of the 300 positions padded, and
 //! attending to those padding embeddings would swamp the real conditioning.
 
@@ -82,9 +82,10 @@ impl SanaTextEncoder {
     }
 
     /// The padded `(input_ids, attention_mask)` for a caption (length `num_chi_tokens + 300 − 2`,
-    /// pre token-selection). Exposed so the tokenizer + CHI-prompt + length policy can be
-    /// parity-checked against the reference without the gemma weights, and so the attention mask is
-    /// available even though the trunk does not consume it.
+    /// before token selection). This is Gemma's input mask, exposed for tokenizer/CHI parity. The
+    /// public render contract is [`Self::encode_with_mask`]: it gathers the released `select_index`
+    /// from both last-hidden states and this mask, then every base and Sprint route threads the
+    /// returned `[1, 300]` mask into transformer `attn2`.
     pub fn token_ids(&self, caption: &str) -> Result<(Vec<i32>, Vec<i32>)> {
         self.inner.token_ids(&preprocess(caption))
     }
@@ -96,11 +97,12 @@ impl SanaTextEncoder {
         self.inner.encode(&preprocess(caption))
     }
 
-    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. SANA's trunk
-    /// applies the mask in `attn2` cross-attention (diffusers passes `prompt_attention_mask` into
-    /// `SanaTransformer2DModel`). Required for correctness: a short caption leaves the 300 slots mostly
-    /// PAD, so without the mask the padding embeddings swamp the real conditioning (colorful-noise /
-    /// cartoonish output that worsens as the prompt shortens).
+    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. Both arrays use
+    /// the same released `select_index = [0] + range(-(300 - 1), 0)`; this is not the longer Gemma
+    /// input mask returned by [`Self::token_ids`]. Every advertised SANA base and Sprint render route
+    /// applies this gathered mask in transformer `attn2` cross-attention (diffusers passes it as
+    /// `prompt_attention_mask`). Required for correctness: a short caption leaves the 300 slots mostly
+    /// PAD, so without the mask the padding embeddings swamp the real conditioning.
     pub fn encode_with_mask(&self, caption: &str) -> Result<(Array, Array)> {
         self.inner.encode_with_mask(&preprocess(caption))
     }

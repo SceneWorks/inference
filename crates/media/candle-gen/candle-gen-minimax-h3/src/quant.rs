@@ -214,14 +214,16 @@ pub fn lin(
     })
 }
 
-/// A loaded token embedding plus the device bytes its table holds.
+/// A loaded token embedding plus its long-lived device bytes.
 ///
-/// The embedding analogue of [`TieredLinear`], and recorded at load for the same reason: a packed
-/// table never materializes densely and [`candle_gen::quant::QEmbedding`] exposes no byte accessor.
+/// The embedding analogue of [`TieredLinear`]. A packed [`QEmbedding`] retains its compact rows on
+/// the host, so its full-vocabulary device-table contribution is zero; its forward creates only the
+/// selected rows temporarily. A dense embedding still retains its complete table on the device.
 pub struct TieredEmbedding {
     /// The shared dense-or-packed token table.
     pub embedding: QEmbedding,
-    /// Device bytes the table holds (the GGUF blocks when packed, the dense table otherwise).
+    /// Long-lived device bytes the table holds. Packed rows are host-resident, so this is zero for
+    /// a packed embedding and the dense table size otherwise.
     pub base_bytes: usize,
     /// The table's `hidden` width — recoverable from a packed table only via its scales, so it is
     /// captured here rather than re-derived at the call site.
@@ -240,13 +242,12 @@ pub struct TieredEmbedding {
 /// (`candle-gen-boogu`'s Qwen3-VL precedent, sc-9410): the caller widens to the compute dtype after
 /// the gather, not before.
 ///
-/// # The packed forward dequantizes the whole table
+/// # The packed forward dequantizes selected rows
 ///
-/// [`candle_gen::quant::QEmbedding`]'s quantized forward dequantizes the full `[vocab, hidden]`
-/// table before index-selecting, so the packed path trades a permanent dense table for a transient
-/// one. That is the shared seam's established behaviour (boogu runs the identical path for this same
-/// Qwen3-VL tower) and it is bounded: conditioning runs **once per render**, not once per step. The
-/// resident saving is real; the transient is the documented cost of it.
+/// [`candle_gen::quant::QEmbedding`]'s quantized forward deduplicates the requested token IDs,
+/// dequantizes only those rows, then restores duplicate positions. The packed path retains just the
+/// host row source and has no long-lived device table; its transient work is bounded by distinct
+/// prompt tokens, and conditioning runs **once per render**, not once per step.
 pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
@@ -268,14 +269,14 @@ pub fn embed(w: &Weights, base: &str, dtype: DType) -> Result<TieredEmbedding> {
         let device = wq.device().clone();
         let embedding =
             QEmbedding::from_packed_dtype_gs(&wq, &scales, &biases, &device, dtype, GROUP_SIZE)?;
-        let base_bytes = match &embedding {
-            QEmbedding::Quantized { table, .. } => table.storage_size_in_bytes(),
-            QEmbedding::Dense(_) => {
-                return Err(CandleError::Msg(format!(
+        let base_bytes = embedding
+            .resident_storage()
+            .ok_or_else(|| {
+                CandleError::Msg(format!(
                     "minimax-h3 te {base}: the packed repack produced a dense embedding"
-                )))
-            }
-        };
+                ))
+            })?
+            .device_table_bytes;
         return Ok(TieredEmbedding {
             embedding,
             base_bytes,
