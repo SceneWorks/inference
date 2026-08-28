@@ -1153,6 +1153,27 @@ fn a_multiaxis_tiled_decode_crosses_real_boundaries_and_is_mutation_sensitive() 
     );
 }
 
+#[test]
+fn budgeted_seeded_decode_preserves_the_seeded_canvas_and_reaches_the_selector() {
+    // This is the executable counterpart to the provider-route guard: the ordinary provider uses
+    // `decode_budgeted_seeded`, so it must draw the same full canvas as `decode_seeded` and then
+    // enter `decode_budgeted` rather than silently selecting the unbounded decode path.
+    let cfg = tiny_config();
+    let decoder = tiny_decoder(&cfg);
+    let latent = probe(&[1, cfg.in_channels, 3, 4, 4], 81);
+    let noise = decoder.seeded_noise(&latent, 82).expect("seeded canvas");
+    let explicit = decoder
+        .decode_budgeted(&latent, &noise, DiffVaeMode::ChunkedEager)
+        .expect("explicit budgeted decode");
+    let seeded = decoder
+        .decode_budgeted_seeded(&latent, 82, DiffVaeMode::ChunkedEager)
+        .expect("seeded budgeted decode");
+    assert!(
+        max_abs_diff(&seeded, &explicit) < 1e-5,
+        "budgeted seeded decode changed its full noise canvas or bypassed the selector"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // sc-18799 — the budgeted DiffVAE selector
 // ---------------------------------------------------------------------------------------------
