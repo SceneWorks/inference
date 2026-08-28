@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "story": "sc-15505",
-  "implementation_base": "8b1f1bdb37e449778d3a2110425dbe1ec5cb0c8b",
+  "implementation_base": "482f18e04b5fab3e3bae72b14682a40252b66dcc",
   "reference": {
     "repository": "https://github.com/michaeltrefry/mflux.git",
     "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
@@ -72,6 +72,7 @@
         "samples_gt8": 40696,
         "base_floor": 47293,
         "cap": 98518,
+        "acceptance_effect_samples_gt8": 44799,
         "rgb_samples": 786432,
         "effect_gate": {
           "status": "locked",
@@ -87,6 +88,7 @@
         "samples_gt8": 49765,
         "base_floor": 47293,
         "cap": 98518,
+        "acceptance_effect_samples_gt8": 39409,
         "rgb_samples": 786432,
         "effect_gate": {
           "status": "locked",
@@ -103,13 +105,39 @@
       "status": "verified",
       "transcript": {
         "local_path": "${TOOLS}/golden/sc-15505-real-weight-transcript.json",
-        "bytes": 21178,
-        "sha256": "373e9af4c13bb8a05c12169e496e4597820d7b315cf3767b217d561ec2c70f95"
+        "bytes": 21551,
+        "sha256": "5841df537149acc3f5d7a4afb3b673dd2046356eb7a69c833e8fcde472ee21c3"
       },
       "receipt": {
         "local_path": "${TOOLS}/adapter_parity_receipt.json",
-        "bytes": 21621,
-        "sha256": "f418504272a146888d24a445fe0d0bb311333e04923755747b017ffdb0416cab"
+        "bytes": 22021,
+        "sha256": "4ea127748eec9fcff810d1866bd31b24673070d22c2d0f8dab2e16d6b3cb11cc"
+      },
+      "diagnostics": {
+        "residual_diagnostic": {
+          "transcript": {
+            "local_path": "${TOOLS}/golden/sc-15505-residual-diagnostic-transcript.json",
+            "bytes": 16415,
+            "sha256": "9815ad20c09b7f6396dece7de57d50c4f5e3fc26547ff625d09c6fb2716ebc32"
+          },
+          "receipt": {
+            "local_path": "${TOOLS}/adapter_parity_residual_diagnostic_receipt.json",
+            "bytes": 16559,
+            "sha256": "fb774fd6bbb1202d8dfaf97c015460275130ad8d069788f78a6a20dfeae4fa73"
+          }
+        },
+        "qwen_effect_diagnostic": {
+          "transcript": {
+            "local_path": "${TOOLS}/golden/sc-15505-qwen-effect-diagnostic-transcript.json",
+            "bytes": 13040,
+            "sha256": "1bd027a33ef32f974a5ca086db6ef7a436234240cc677f932edc234f9cf44d4d"
+          },
+          "receipt": {
+            "local_path": "${TOOLS}/adapter_parity_qwen_effect_diagnostic_receipt.json",
+            "bytes": 13557,
+            "sha256": "d8fe248a4f86544b7e38453ba2f4444c1f9052aec80aa6ffa28d036f5b3b1626"
+          }
+        }
       },
       "artifact_sha256": {
         "hyper_flux_lora": "e0ab0fdf569cd01a382f19bd87681f628879dea7ad51fe5a3799b6c18c7b2d03",
@@ -120,22 +148,22 @@
         "z_image_lokr_adapter": "a70b07001c05012bbd283d340f62202a857fccdcb5330bf8dbece9aa298ffc1c",
         "z_image_lokr_golden": "38c8cc5c676e5a3636d1119fe48a23c2cbfab8cec593449295467b0c84b9c1e0",
         "qwen_base_golden": "5f810691d0b2768cc2d3e42a5e14885c3c2832234dc3f15b89453e28d07cc7b4",
-        "qwen_lora_adapter": "af9ea08c4f98f273d7dcaeca1b75eb730a49da0efe345b3eaf80916ba87553f7",
-        "qwen_lora_golden": "8d70dbf738da177e015cfe92dc07ab47ad20b31ac809ec5c30bba850288de6f2",
-        "qwen_lokr_adapter": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
-        "qwen_lokr_golden": "c652442623327fa63892ad5ad21ee1208707f47ebd83550d5b38555d498f2c9c"
+        "qwen_lora_adapter": "1216a0ab9dfc1748e266de402a8fe0e51d842651511170496455c055f32567cd",
+        "qwen_lora_golden": "174ce5ab79f93e6d7d1d82a3bdcd1e85662acf27db5bcc1787e759b6d945dcda",
+        "qwen_lokr_adapter": "f540e35a21c9478db39f80fedf619d3d4e218e6d7e731b9aa222d358a51a9d25",
+        "qwen_lokr_golden": "3c3337e6f3c167203831a4d7b87416d33ea283c140cbbf2f214ddb3e0de4eeed"
       }
     }
   },
   "scripts": {
     "_adapter_parity_provenance.py": "32fcff87d1140a4d53d03a66ab8b8678e1029d03e9a8886f50b242dd3bd23bed",
     "dump_hyper_flux_golden.py": "3b2541078e074c30df682c05bb1e8b84d8c4335c2772eb48065dd391e09b8bd8",
-    "dump_qwen_adapter_golden.py": "01dcc25673e4c491d617ccd07b7ae9b13f634de047fed4d85753b97b0704f5ba",
+    "dump_qwen_adapter_golden.py": "d6765dce833f7b8cbcc1ea34e7b136bde64c04a1dd2bfdcf00a63f0633986654",
     "dump_qwen_image_golden.py": "a08b4b8f1411b4401ccd461113928136741f35d14a6098ad8ac8d415fac7604f",
     "dump_z_image_adapter_golden.py": "df8e24798dbf09335a5edad92ef3b4de7d328a61e7dd13d7b77208c7c2d0bbc8",
     "dump_z_image_golden.py": "f7b4b872e282dfe97e4a8b1f3d5884cc3329a81f7689a8cc9550b194c0cb63b1",
-    "record_adapter_parity_transcript.py": "0643e35630cd03e18edb4faf2820677516f4b5d6f05932c7244fa808dd375fee",
-    "verify_adapter_parity_artifacts.py": "6b0715b24121eeb2ad1a89b4fab0dd5a86cc9e8e4420357a24e37bd883d5acf1"
+    "record_adapter_parity_transcript.py": "f938fc6df9b87fc79a50ae796ebe11bdb14b87137351a4e498ffef2597ceb228",
+    "verify_adapter_parity_artifacts.py": "67fb9740acd3af6f6c242d757c8fa740ef7d8d557056a8e52863146f551e925b"
   },
   "artifacts": {
     "hyper_flux_lora": {
@@ -295,7 +323,7 @@
     "qwen_lora_adapter": {
       "committed": false,
       "bytes": 4728679,
-      "sha256": "af9ea08c4f98f273d7dcaeca1b75eb730a49da0efe345b3eaf80916ba87553f7",
+      "sha256": "1216a0ab9dfc1748e266de402a8fe0e51d842651511170496455c055f32567cd",
       "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
       "local_path": "${TOOLS}/golden/qwen_lora_adapter.safetensors",
       "source": {
@@ -303,7 +331,7 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_qwen_adapter_golden.py",
-        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_ADAPTER_KIND=lora BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
         "model_repository": "SceneWorks/qwen-image-mlx",
         "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
         "model_reference": "main",
@@ -315,7 +343,7 @@
     "qwen_lora_golden": {
       "committed": false,
       "bytes": 3147111,
-      "sha256": "8d70dbf738da177e015cfe92dc07ab47ad20b31ac809ec5c30bba850288de6f2",
+      "sha256": "174ce5ab79f93e6d7d1d82a3bdcd1e85662acf27db5bcc1787e759b6d945dcda",
       "license": "Apache-2.0",
       "local_path": "${TOOLS}/golden/qwen_lora_golden.safetensors",
       "source": {
@@ -323,7 +351,7 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_qwen_adapter_golden.py",
-        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_ADAPTER_KIND=lora QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
         "model_repository": "SceneWorks/qwen-image-mlx",
         "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
         "model_reference": "main",
@@ -335,7 +363,7 @@
     "qwen_lokr_adapter": {
       "committed": false,
       "bytes": 543300,
-      "sha256": "1e13570724e75f926e9fb079f2ec336cc87f3932eada8415ab71b83a43e179cf",
+      "sha256": "f540e35a21c9478db39f80fedf619d3d4e218e6d7e731b9aa222d358a51a9d25",
       "license": "Synthetic deterministic fixture generated by Apache-2.0 repository code",
       "local_path": "${TOOLS}/golden/qwen_lokr_adapter.safetensors",
       "source": {
@@ -343,7 +371,7 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_qwen_adapter_golden.py",
-        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_ADAPTER_KIND=lokr BUILD_ADAPTERS_ONLY=1 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
         "model_repository": "SceneWorks/qwen-image-mlx",
         "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
         "model_reference": "main",
@@ -355,7 +383,7 @@
     "qwen_lokr_golden": {
       "committed": false,
       "bytes": 3147111,
-      "sha256": "c652442623327fa63892ad5ad21ee1208707f47ebd83550d5b38555d498f2c9c",
+      "sha256": "3c3337e6f3c167203831a4d7b87416d33ea283c140cbbf2f214ddb3e0de4eeed",
       "license": "Apache-2.0",
       "local_path": "${TOOLS}/golden/qwen_lokr_golden.safetensors",
       "source": {
@@ -363,7 +391,7 @@
         "repository": "https://github.com/michaeltrefry/mflux.git",
         "revision": "81106c833435d1a1f62ca04a8c01c1d380d39272",
         "script": "dump_qwen_adapter_golden.py",
-        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
+        "command": "QWEN_REFERENCE_REPOSITORY=SceneWorks/qwen-image-mlx QWEN_REFERENCE_REVISION=8080a4171f1c8b7fca6c30491eafbe6ffab754bf QWEN_REFERENCE_MODEL=$HF_MODELS_ROOT/models--SceneWorks--qwen-image-mlx/snapshots/8080a4171f1c8b7fca6c30491eafbe6ffab754bf/bf16 QWEN_ADAPTER_KIND=lokr QWEN_W=512 QWEN_H=512 $REF_PY $TOOLS/dump_qwen_adapter_golden.py",
         "model_repository": "SceneWorks/qwen-image-mlx",
         "model_revision": "8080a4171f1c8b7fca6c30491eafbe6ffab754bf",
         "model_reference": "main",

@@ -18,11 +18,15 @@ from _adapter_parity_provenance import assert_hf_snapshot, sha256
 TOOLS = Path(__file__).resolve().parent
 ROOT = TOOLS.parents[3]
 MANIFEST = TOOLS / "adapter_parity_artifacts.json"
-TARGET_DIR = "/private/tmp/codex-sc-15505-release-target"
+# Keep the release artifacts isolated from concurrent worktrees.  This path is
+# ignored by Git, so it does not enter source_state()'s evidence allowlist.
+TARGET_DIR = str(ROOT / "target" / "sc-21781-adapter-parity")
 RECEIPT = TOOLS / "adapter_parity_receipt.json"
 ACCEPTANCE_TRANSCRIPT = TOOLS / "golden/sc-15505-real-weight-transcript.json"
 DIAGNOSTIC_TRANSCRIPT = TOOLS / "golden/sc-15505-residual-diagnostic-transcript.json"
 QWEN_EFFECT_TRANSCRIPT = TOOLS / "golden/sc-15505-qwen-effect-diagnostic-transcript.json"
+RESIDUAL_DIAGNOSTIC_RECEIPT = TOOLS / "adapter_parity_residual_diagnostic_receipt.json"
+QWEN_EFFECT_DIAGNOSTIC_RECEIPT = TOOLS / "adapter_parity_qwen_effect_diagnostic_receipt.json"
 RESULT_LINE = re.compile(
     r"^SC15505_RESULT (?P<name>[a-z0-9_]+) "
     r"(?P<fields>(?:[a-z0-9_]+=[0-9]+ ?)+)$",
@@ -37,6 +41,8 @@ RUST_SOURCE_FILES = (
 EVIDENCE_CHANGE_FILES = {
     "crates/media/mlx-gen/tools/adapter_parity_artifacts.json",
     "crates/media/mlx-gen/tools/adapter_parity_receipt.json",
+    "crates/media/mlx-gen/tools/adapter_parity_residual_diagnostic_receipt.json",
+    "crates/media/mlx-gen/tools/adapter_parity_qwen_effect_diagnostic_receipt.json",
     "crates/media/mlx-gen/tools/golden/CHECKSUMS.txt",
     "crates/media/mlx-gen/tools/golden/README.md",
     "scripts/tests/test_adapter_parity_artifacts.py",
@@ -522,11 +528,18 @@ def _redact(value):
 
 
 def receipt_for(transcript: dict, transcript_path: Path) -> dict:
+    try:
+        relative_path = transcript_path.resolve().relative_to(TOOLS.resolve()).as_posix()
+        local_path = f"${{TOOLS}}/{relative_path}"
+    except ValueError:
+        # Unit fixtures exercise receipt equality with a temporary transcript.
+        # Production entry points refuse arbitrary output before this helper runs.
+        local_path = str(transcript_path)
     return {
         "schema": 1,
         "story": "sc-15505",
         "transcript": {
-            "local_path": "${TOOLS}/golden/sc-15505-real-weight-transcript.json",
+            "local_path": local_path,
             "bytes": transcript_path.stat().st_size,
             "sha256": sha256(transcript_path),
         },
@@ -653,7 +666,16 @@ def main() -> int:
         else:
             validate_qwen_effect_results(parsed)
         write_transcript(args.output, transcript)
+        receipt = {
+            "residual_diagnostic": RESIDUAL_DIAGNOSTIC_RECEIPT,
+            "qwen_effect_diagnostic": QWEN_EFFECT_DIAGNOSTIC_RECEIPT,
+        }[mode]
+        receipt.write_text(
+            json.dumps(receipt_for(transcript, args.output), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         print(f"wrote source/env-bound {mode} {args.output}")
+        print(f"wrote tracked path-redacted {mode} receipt {receipt}")
         return 0
     RECEIPT.write_text(
         json.dumps(receipt_for(transcript, args.output), indent=2, sort_keys=True) + "\n",
