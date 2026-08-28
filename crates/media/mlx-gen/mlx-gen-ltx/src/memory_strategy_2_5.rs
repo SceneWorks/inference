@@ -1044,8 +1044,10 @@ mod tests {
         missing_parameter.attention_chunk_size = None;
         assert!(validate_request_memory(&contract, &missing_parameter).is_err());
 
-        let mut stray_parameter = GenerationMemory::default();
-        stray_parameter.transformer_window_size = Some(TRANSFORMER_WINDOW_SIZE);
+        let stray_parameter = GenerationMemory {
+            transformer_window_size: Some(TRANSFORMER_WINDOW_SIZE),
+            ..Default::default()
+        };
         assert!(validate_request_memory(&contract, &stray_parameter).is_err());
 
         let eager =
