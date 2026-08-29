@@ -453,6 +453,13 @@ impl Receipt {
 }
 
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
+    let rfc3339 = |v: &str| {
+        v.len() >= 20
+            && v.as_bytes().get(4) == Some(&b'-')
+            && v.as_bytes().get(7) == Some(&b'-')
+            && v.as_bytes().get(10) == Some(&b'T')
+            && v.ends_with('Z')
+    };
     if receipt.schema_version != 3
         || receipt.harness_version != "sc-20671-kv-baseline-v3"
         || receipt.status != "complete"
@@ -462,8 +469,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }
     if !["dense", "compressed"].contains(&receipt.mode.as_str())
         || receipt.run_id.is_empty()
-        || !receipt.captured_at.contains('T')
-        || !receipt.captured_at.ends_with('Z')
+        || !rfc3339(&receipt.captured_at)
     {
         return Err("receipt timestamp/run id is malformed".into());
     }
@@ -539,8 +545,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             || event.phase.is_empty()
             || event.kind.is_empty()
             || !REQUIRED_PHASES.contains(&event.phase.as_str())
-            || !event.timestamp.contains('T')
-            || !event.timestamp.ends_with('Z')
+            || !rfc3339(&event.timestamp)
         {
             return Err("allocation event is malformed".into());
         }
@@ -647,6 +652,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .sum::<f64>()
         / 5.0;
     let cv = variance.sqrt() / decode_mean;
+    let mut p95 = receipt
+        .timings
+        .samples
+        .iter()
+        .map(|s| s.decode_tokens_per_second)
+        .collect::<Vec<_>>();
+    p95.sort_by(f64::total_cmp);
+    if (receipt.timings.summary.decode_tokens_per_second_mean - decode_mean).abs() > 1e-9
+        || (receipt.timings.summary.decode_tokens_per_second_p95 - p95[4]).abs() > 1e-9
+    {
+        return Err("timing mean/P95 is not derived".into());
+    }
     if (receipt.timings.summary.decode_tokens_per_second_variance - variance).abs() > 1e-9
         || (receipt
             .timings
@@ -688,7 +705,13 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || receipt.quality.multi_turn_prompt_cache < 1.0
         || REQUIRED_FIXTURES.iter().any(|name| {
             receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
-                !f.passed || f.artifact_sha256.len() != 64 || f.independent_reference.is_empty()
+                !f.passed
+                    || f.artifact_sha256.len() != 64
+                    || !f
+                        .artifact_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b >= b'a' && b <= b'f'))
+                    || f.independent_reference.is_empty()
             })
         })
     {
@@ -696,6 +719,42 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
         return Err("release/cancellation evidence failed".into());
+    }
+    let lifecycle = [
+        ("append", receipt.lifecycle.append),
+        ("chunkedPrefill", receipt.lifecycle.chunked_prefill),
+        ("singleShotPrefill", receipt.lifecycle.single_shot_prefill),
+        ("promptCacheReuse", receipt.lifecycle.prompt_cache_reuse),
+        ("trim", receipt.lifecycle.trim),
+        ("rollback", receipt.lifecycle.rollback),
+        ("clear", receipt.lifecycle.clear),
+        ("cancel", receipt.lifecycle.cancel),
+        ("clone", receipt.lifecycle.clone),
+        ("batchSplit", receipt.lifecycle.batch_split),
+        ("batchMerge", receipt.lifecycle.batch_merge),
+        ("prefixCopyOnWrite", receipt.lifecycle.prefix_copy_on_write),
+        ("pageImport", receipt.lifecycle.page_import),
+        ("pageExport", receipt.lifecycle.page_export),
+        ("serialization", receipt.lifecycle.serialization),
+        ("restore", receipt.lifecycle.restore),
+        ("denseFallback", receipt.lifecycle.dense_fallback),
+        ("postRunRelease", receipt.lifecycle.post_run_release),
+    ];
+    for (name, supported) in lifecycle {
+        let reason = format!("{name}FallbackReason");
+        if supported && receipt.lifecycle.fallback_reasons.contains_key(&reason) {
+            return Err(format!(
+                "supported lifecycle capability has fallback reason: {name}"
+            ));
+        }
+        if !supported && !receipt.lifecycle.fallback_reasons.contains_key(&reason) {
+            return Err(format!(
+                "unsupported lifecycle capability lacks fallback reason: {name}"
+            ));
+        }
+    }
+    if !receipt.lifecycle.post_run_release {
+        return Err("postRunRelease is required".into());
     }
     if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
     Ok(())
