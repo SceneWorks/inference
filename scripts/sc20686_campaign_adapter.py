@@ -8,6 +8,7 @@ PRODUCER = "sc20686-campaign-adapter-v1"
 GEOMETRY = ("resolution", "reference_count", "frames", "prompt", "guidance", "layers",
             "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope")
 WAN_ROUTES = ("wan2_2_ti2v_5b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan_vace", "wan2_2_vace_fun_14b")
+FLUX_ROUTES = ("flux2_klein_9b_edit",)
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -98,6 +99,43 @@ def entrypoint_campaign_runner(entrypoint, snapshot):
         if not events: raise ValueError(f"{variant}/{arm} produced no observer events")
         return events
     return run
+
+def publish_matrix_campaign(runner, row_builder, destination):
+    """Run and atomically publish the complete Wan+FLUX normal/cancel matrix.
+
+    The runner owns product execution and `row_builder` must derive a sealed row from each
+    same-run event stream. Publication is all-or-nothing: the final directory must not already
+    exist, and all artifacts are written under a sibling staging directory before one rename.
+    """
+    coordinates = [(route, arm) for route in WAN_ROUTES + FLUX_ROUTES for arm in ("normal", "cancel")]
+    rows = []
+    for variant, arm in coordinates:
+        events = runner(variant, arm)
+        if not isinstance(events, list) or not events:
+            raise ValueError(f"{variant}/{arm} produced no observer events")
+        row = row_builder(variant, arm, events)
+        if not isinstance(row, dict): raise ValueError("row builder returned no receipt row")
+        rows.append(row)
+    keys = [(row.get("family"), row.get("variant"), row.get("coordinate_id"), row.get("arm")) for row in rows]
+    if len(keys) != len(set(keys)) or len(rows) != len(coordinates):
+        raise ValueError("campaign matrix has missing or duplicate coordinates")
+    staging = Path(destination).with_name(f".{Path(destination).name}.staging-{os.getpid()}")
+    final = Path(destination)
+    if final.exists(): raise ValueError("campaign destination already exists")
+    try:
+        staging.mkdir(parents=False)
+        result = {"schema": "sc-20686-cache-attribution-v2", "rows": rows}
+        raw = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
+        markdown = ("# SC-20686 campaign\n\n" + json.dumps({"coordinates": keys}, indent=2, sort_keys=True) + "\n").encode()
+        for name, payload in (("campaign.json", raw), ("campaign.md", markdown)):
+            (staging / name).write_bytes(payload)
+            (staging / f"{name}.sha256").write_text(f"{hashlib.sha256(payload).hexdigest()}  {name}\n", encoding="utf-8")
+        os.replace(staging, final)
+    except Exception:
+        if staging.exists():
+            import shutil
+            shutil.rmtree(staging)
+        raise
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if args.fake:
