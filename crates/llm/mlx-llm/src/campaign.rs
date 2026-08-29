@@ -30,6 +30,23 @@ pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptProvenance {
     pub scene_works_revision: String,
     pub inference_revision: String,
@@ -443,14 +460,64 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("receipt constants mismatch".into());
     }
-    if receipt.run_id.is_empty()
+    if !["dense", "compressed"].contains(&receipt.mode.as_str())
+        || receipt.run_id.is_empty()
         || !receipt.captured_at.contains('T')
         || !receipt.captured_at.ends_with('Z')
     {
         return Err("receipt timestamp/run id is malformed".into());
     }
+    let p = &receipt.provenance;
+    if [
+        p.mlx_revision.as_str(),
+        p.os.as_str(),
+        p.xcode.as_str(),
+        p.hardware.as_str(),
+        p.model_id.as_str(),
+        p.power_mode.as_str(),
+        p.thermal_state.as_str(),
+        p.command_template.as_str(),
+        p.command.as_str(),
+    ]
+    .iter()
+    .any(|v| v.is_empty())
+        || p.model_file_bytes == 0
+        || p.thermal_state != "nominal"
+    {
+        return Err("provenance is incomplete".into());
+    }
+    let g = &receipt.geometry;
+    if [
+        g.batch,
+        g.query_heads,
+        g.kv_heads,
+        g.head_dimension,
+        g.query_length,
+        g.kv_length,
+        g.layers,
+        g.element_bytes,
+        g.capacity,
+    ]
+    .into_iter()
+    .any(|v| v == 0)
+    {
+        return Err("geometry contains zero".into());
+    }
     let pids: Vec<u32> = receipt.memory.phase_samples.iter().map(|p| p.pid).collect();
-    if pids.len() != 8 || pids.iter().any(|p| *p == 0 || *p != pids[0]) {
+    if pids.len() != 8
+        || pids.iter().any(|p| *p == 0 || *p != pids[0])
+        || receipt
+            .memory
+            .phase_samples
+            .iter()
+            .zip(REQUIRED_PHASES)
+            .any(|(p, expected)| {
+                p.phase != expected
+                    || p.source != "footprint -p"
+                    || p.mlx.source != "mlx_rs::memory"
+                    || p.phys_footprint_peak_bytes < p.phys_footprint_bytes
+            })
+    {
         return Err("phase PID evidence is inconsistent".into());
     }
     if receipt.memory.phase_samples.windows(2).any(|w| {
@@ -489,6 +556,20 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("timing policy failed".into());
     }
+    if receipt.quality.parity_max_error < 0.0
+        || receipt.quality.parity_max_error > 0.0001
+        || receipt.quality.perplexity_delta > 0.01
+        || [
+            receipt.quality.greedy_token_agreement,
+            receipt.quality.structured_tool_agreement,
+            receipt.quality.needle_retrieval,
+            receipt.quality.multi_turn_prompt_cache,
+        ]
+        .into_iter()
+        .any(|v| !(0.0..=1.0).contains(&v))
+    {
+        return Err("quality thresholds failed".into());
+    }
     if receipt.quality.fixture_evidence.len() != 4
         || receipt.quality.statistics.repeats != 5
         || receipt.quality.statistics.warmups != 2
@@ -524,16 +605,16 @@ pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String
         .map_err(|e| e.to_string())?
         .into_bytes();
     Ok(ArtifactBundle {
-        receipt_sidecar: format!("{}  receipt.json", seal_bytes(&bytes)),
-        human_sidecar: format!("{}  receipt.txt", seal_bytes(&human)),
+        receipt_sidecar: format!("{}  receipt.json\n", seal_bytes(&bytes)),
+        human_sidecar: format!("{}  receipt.txt\n", seal_bytes(&human)),
         receipt: bytes,
         human,
     })
 }
 
 pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
-    if bundle.receipt_sidecar != format!("{}  receipt.json", seal_bytes(&bundle.receipt))
-        || bundle.human_sidecar != format!("{}  receipt.txt", seal_bytes(&bundle.human))
+    if bundle.receipt_sidecar != format!("{}  receipt.json\n", seal_bytes(&bundle.receipt))
+        || bundle.human_sidecar != format!("{}  receipt.txt\n", seal_bytes(&bundle.human))
     {
         return Err("artifact sidecar does not match exact bytes".into());
     }
