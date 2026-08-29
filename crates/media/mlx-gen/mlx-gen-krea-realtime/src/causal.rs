@@ -531,12 +531,11 @@ impl CausalKvCache {
         Ok(positions)
     }
 
-    /// Materialize the *packed* physical read window only.  This is the companion to
-    /// [`Self::window_prev`], but deliberately has no `StoredKv::dense` call: it gathers uint32
-    /// payload and bf16 metadata in-place for the retained custom kernel.
-    fn prepare_packed_window(&mut self, s_new: usize) -> Result<Vec<i64>> {
+    /// Accept only an already-physical packed read window.  The POC deliberately does not gather
+    /// before lazy Metal JIT: a JIT/command-buffer error must be able to fall straight back to
+    /// dense SDPA without rollback. Sliding/sink geometries therefore reject before mutation.
+    fn prepare_packed_window(&self, s_new: usize) -> Result<Vec<i64>> {
         let positions = self.preview_window_positions(s_new)?;
-        let sink_kept = self.sink_kept();
         let phys: Vec<i32> = positions
             .iter()
             .map(|&g| self.phys_index(g as usize) as i32)
@@ -544,24 +543,13 @@ impl CausalKvCache {
         let whole = phys.len() == self.retained_tokens()
             && phys.iter().enumerate().all(|(i, &p)| p as usize == i);
         if !whole {
-            let idx = Array::from_slice(&phys, &[phys.len() as i32]);
-            for slot in self.layers.iter_mut() {
-                let stored = slot.as_ref().ok_or_else(|| {
-                    Error::Msg("krea packed window has tokens but a layer slot is empty".into())
-                })?;
-                // Fail before replacing any slot when the cache was not Q8/Q4 packed.
-                stored.packed()?;
-            }
-            for slot in self.layers.iter_mut() {
-                let stored = slot.take().expect("checked populated packed cache slot");
-                *slot = Some(stored.take(&idx)?);
-            }
+            return Err(Error::Msg(
+                "krea packed Metal POC requires an already-physical cache window; sliding/sink gather falls back before mutation".into(),
+            ));
         }
-        self.tail_base = positions
-            .iter()
-            .map(|&g| g as usize)
-            .find(|&g| g >= sink_kept)
-            .unwrap_or(self.committed_tokens);
+        for stored in self.layers.iter().flatten() {
+            stored.packed()?;
+        }
         Ok(positions)
     }
 
@@ -1046,11 +1034,12 @@ impl CausalKreaTransformer {
         let mut kv_positions = preview_positions.clone();
         kv_positions.extend(q_positions.iter().copied());
         let mask = block_causal_mask(&q_positions, &kv_positions, self.block_size)?;
-        let packed_eligible = cache.experimental_packed_metal_enabled()
+        let packed_positions = (cache.experimental_packed_metal_enabled()
             && !preview_positions.is_empty()
-            && mask.is_none();
-        let (velocity, new_kv) = if packed_eligible {
-            let packed_positions = cache.prepare_packed_window(s_new)?;
+            && mask.is_none())
+        .then(|| cache.prepare_packed_window(s_new))
+        .transpose()?;
+        let (velocity, new_kv) = if let Some(packed_positions) = packed_positions {
             let query_positions = Array::from_slice(&q_positions, &[q_positions.len() as i32]);
             let mut key_positions = packed_positions;
             key_positions.extend(q_positions.iter().copied());

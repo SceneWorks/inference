@@ -580,7 +580,6 @@ impl SelfAttention {
         prev_v: Option<&Array>,
         mask: Option<&Array>,
         packed_attention: Option<(&mut dyn CausalPackedAttention, usize)>,
-        packed_attention: Option<(&mut dyn CausalPackedAttention, usize)>,
     ) -> Result<(Array, Array, Array)> {
         // q/k/v projection + qk-RMSNorm + offset-RoPE + head split — byte-identical to `forward`.
         let xw = bf16(x_mod)?;
@@ -1046,6 +1045,7 @@ impl Block {
         prev_k: Option<&Array>,
         prev_v: Option<&Array>,
         mask: Option<&Array>,
+        packed_attention: Option<(&mut dyn CausalPackedAttention, usize)>,
     ) -> Result<(Array, Array, Array)> {
         // adaLN-6vec modulation — identical to `forward`.
         let dim = self.self_attn.num_heads as i32 * self.self_attn.head_dim as i32;

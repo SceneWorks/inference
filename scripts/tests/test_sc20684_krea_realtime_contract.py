@@ -85,6 +85,21 @@ class KreaRealtimeContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("receipt contract must remain unproduced and complete", result.stdout)
 
+    def test_metal_source_uses_bounded_mma_and_online_rescale(self) -> None:
+        source = (
+            ROOT / "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs"
+        ).read_text(encoding="utf-8")
+        for needle in (
+            "simdgroup_load(a",
+            "simdgroup_multiply_accumulate",
+            "threadgroup float scores[Q_TILE][K_TILE]",
+            "acc0 *= old_weight[q_row]",
+            "lane * 4",
+            ".thread_group(256, 1, 1)",
+        ):
+            self.assertIn(needle, source)
+        self.assertNotIn("q_tile[thread_index_in_threadgroup.x][d]", source)
+
 
 if __name__ == "__main__":
     unittest.main()

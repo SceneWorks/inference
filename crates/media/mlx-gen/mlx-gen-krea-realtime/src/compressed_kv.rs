@@ -1,11 +1,10 @@
 //! Experimental compressed-domain attention for Krea Realtime's persistent KV cache.
 //!
-//! This module deliberately does not call MLX.  It is the source-owned, deterministic
-//! contract for the eventual retained simdgroup kernel: it packs the same D-axis affine
-//! rows as [`crate::causal::PackedKv`], streams those rows directly into a tiled online
-//! softmax, and gives device code an exact fail-closed selection boundary.  The public
-//! API is off by default and is not wired into the shipping causal forward until a Metal
-//! handle is supplied and the device receipt required by SC-20684 exists.
+//! This module owns both a source-level CPU oracle and an off-by-default MLX custom-Metal
+//! dispatch. It packs the same D-axis affine rows as [`crate::causal::PackedKv`], streams
+//! those rows through tiled online softmax, and gives device code an exact fail-closed
+//! selection boundary. The public API remains disabled until a caller explicitly retains
+//! a Metal handle and produces the SC-20684 device receipt.
 //!
 //! No cached K/V row is expanded into a dense window and no score matrix is allocated.
 //! The only dynamic result allocation is the required output tensor; the device analogue
@@ -132,6 +131,24 @@ impl KreaPackedMetalKernel {
         key_positions: &Array,
     ) -> MlxGenResult<Array> {
         let shape = q.shape();
+        if shape.len() != 4 || shape[0] != 1 || shape[1] != 40 || shape[3] != 128 {
+            return Err(mlx_gen::Error::Msg(
+                "krea packed Metal POC supports only B=1/H=40/D=128".into(),
+            ));
+        }
+        if current_k.shape() != current_v.shape()
+            || current_k.shape().len() != 4
+            || current_k.shape()[0] != 1
+            || current_k.shape()[1] != 40
+            || current_k.shape()[3] != 128
+            || key_positions.shape().len() != 1
+            || query_positions.shape().len() != 1
+        {
+            return Err(mlx_gen::Error::Msg(
+                "krea packed Metal POC received incompatible current-K/V or position geometry"
+                    .into(),
+            ));
+        }
         let (batch, heads, sq, dim) = (shape[0], shape[1], shape[2], shape[3]);
         let output = self
             .kernel
@@ -151,8 +168,8 @@ impl KreaPackedMetalKernel {
                 shape: vec![batch, heads, sq, dim],
                 dtype: q.dtype(),
             })
-            .grid(sq * heads, batch, 1)
-            .thread_group(32, 1, 1)
+            .grid(((sq + 7) / 8) * heads * 256, batch, 1)
+            .thread_group(256, 1, 1)
             .template_arg("BITS", self.tier.bits() as i32)
             .template_arg("HEAD_DIM", dim)
             .run()?;
@@ -182,65 +199,86 @@ using namespace metal;
 "#;
 
 const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
+    // One 256-thread group owns an 8-query tile: eight simdgroups, each with 32 lanes.
+    // A lane owns four D values, covering all 128 output channels.  Scores are streamed in
+    // 8-key blocks; `scores` is a bounded 8x8 threadgroup tile, never an Sq-by-Sk allocation.
+    constexpr uint Q_TILE = 8, K_TILE = 8, GROUP = 64;
+    const uint tid = thread_position_in_threadgroup.x;
     const uint lane = thread_index_in_simdgroup;
-    const uint qh = threadgroup_position_in_grid.x;
+    const uint q_row = simdgroup_index_in_threadgroup;
+    const uint group = threadgroup_position_in_grid.x;
+    const uint tiles_per_head = (q_shape[2] + Q_TILE - 1) / Q_TILE;
+    const uint h = group / tiles_per_head;
+    const uint q_base = (group % tiles_per_head) * Q_TILE;
+    const uint qi = q_base + q_row;
     const uint b = threadgroup_position_in_grid.y;
-    const uint h = qh / q_shape[2];
-    const uint qi = qh % q_shape[2];
-    const uint d = thread_position_in_threadgroup.x;
-    constexpr uint GROUP = 64;
-    threadgroup float q_tile[32][128];
-    threadgroup float v_acc[32][128];
-    threadgroup float row_max[32];
-    threadgroup float row_sum[32];
-    if (d < HEAD_DIM) {
-        q_tile[thread_index_in_threadgroup.x][d] = float(q[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d]);
-        v_acc[thread_index_in_threadgroup.x][d] = 0.0f;
+    threadgroup float q_tile[Q_TILE][HEAD_DIM];
+    threadgroup float k_tile[K_TILE][HEAD_DIM];
+    threadgroup float v_tile[K_TILE][HEAD_DIM];
+    threadgroup float scores[Q_TILE][K_TILE];
+    threadgroup float row_max[Q_TILE];
+    threadgroup float row_sum[Q_TILE];
+    threadgroup float old_weight[Q_TILE];
+    threadgroup float new_weight[Q_TILE];
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    if (q_row < Q_TILE && qi < q_shape[2]) {
+        for (uint j = 0; j < 4; ++j) {
+            const uint d = lane * 4 + j;
+            q_tile[q_row][d] = float(q[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d]);
+        }
     }
-    if (d == 0) { row_max[thread_index_in_threadgroup.x] = -INFINITY; row_sum[thread_index_in_threadgroup.x] = 0.0f; }
+    if (lane == 0) { row_max[q_row] = -INFINITY; row_sum[q_row] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // The fragments are tile-local scratch only. The scalar online recurrence below carries no
-    // score tile beyond one current score; simdgroup MMA consumes the same q/K tile on device.
-    simdgroup_matrix<float, 8, 8> q_fragment;
-    simdgroup_matrix<float, 8, 8> k_fragment;
-    simdgroup_matrix<float, 8, 8> dot_fragment(0.0f);
-    for (uint key = 0; key < key_positions_shape[0]; ++key) {
-        const bool allowed = key_positions[key] <= query_positions[qi];
-        float partial = 0.0f;
-        for (uint col = lane; col < HEAD_DIM; col += 32) {
-            const uint packed_word = col * BITS / 32;
-            const uint packed_shift = (col * BITS) % 32;
-            const uint code_mask = (1u << BITS) - 1u;
-            const bool historical = key < kw_shape[2];
-            const uint k_code = historical ? ((kw[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM * BITS / 32) + packed_word] >> packed_shift) & code_mask) : 0u;
-            const float k_value = historical
-                ? float(ks[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + col / GROUP]) * float(k_code) + float(kb[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + col / GROUP])
-                : float(current_k[((b * q_shape[1] + h) * current_k_shape[2] + (key - kw_shape[2])) * HEAD_DIM + col]);
-            partial += q_tile[thread_index_in_threadgroup.x][col] * k_value;
-        }
-        partial = simd_sum(partial) * rsqrt(float(HEAD_DIM));
-        if (lane == 0 && allowed) {
-            const float next_max = max(row_max[thread_index_in_threadgroup.x], partial);
-            const float old_weight = isfinite(row_max[thread_index_in_threadgroup.x]) ? exp(row_max[thread_index_in_threadgroup.x] - next_max) : 0.0f;
-            const float new_weight = exp(partial - next_max);
-            row_sum[thread_index_in_threadgroup.x] = row_sum[thread_index_in_threadgroup.x] * old_weight + new_weight;
-            row_max[thread_index_in_threadgroup.x] = next_max;
+    for (uint key_base = 0; key_base < key_positions_shape[0]; key_base += K_TILE) {
+        for (uint i = tid; i < K_TILE * HEAD_DIM; i += 256) {
+            const uint kr = i / HEAD_DIM, d = i % HEAD_DIM, key = key_base + kr;
+            if (key < key_positions_shape[0]) {
+                const bool historical = key < kw_shape[2];
+                const uint word = d * BITS / 32, shift = (d * BITS) % 32, mask = (1u << BITS) - 1u;
+                const uint kc = historical ? ((kw[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM * BITS / 32) + word] >> shift) & mask) : 0u;
+                const uint vc = historical ? ((vw[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM * BITS / 32) + word] >> shift) & mask) : 0u;
+                k_tile[kr][d] = historical ? float(ks[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) * float(kc) + float(kb[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) : float(current_k[((b * q_shape[1] + h) * current_k_shape[2] + key - kw_shape[2]) * HEAD_DIM + d]);
+                v_tile[kr][d] = historical ? float(vs[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) * float(vc) + float(vb[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) : float(current_v[((b * q_shape[1] + h) * current_v_shape[2] + key - vw_shape[2]) * HEAD_DIM + d]);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (d < HEAD_DIM && allowed) {
-            const uint packed_word = d * BITS / 32;
-            const uint packed_shift = (d * BITS) % 32;
-            const uint code_mask = (1u << BITS) - 1u;
-            const bool historical = key < vw_shape[2];
-            const uint v_code = historical ? ((vw[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM * BITS / 32) + packed_word] >> packed_shift) & code_mask) : 0u;
-            const float value = historical
-                ? float(vs[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) * float(v_code) + float(vb[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP])
-                : float(current_v[((b * q_shape[1] + h) * current_v_shape[2] + (key - vw_shape[2])) * HEAD_DIM + d]);
-            v_acc[thread_index_in_threadgroup.x][d] += exp(partial - row_max[thread_index_in_threadgroup.x]) * value;
+        // simdgroup 0 computes the bounded Q_TILE x K_TILE score block with real MMA fragments.
+        if (q_row == 0) {
+            simdgroup_matrix<float, 8, 8> a, bmat, c(0.0f);
+            for (uint d0 = 0; d0 < HEAD_DIM; d0 += 8) {
+                simdgroup_load(a, &q_tile[0][d0], HEAD_DIM);
+                simdgroup_load(bmat, &k_tile[0][d0], HEAD_DIM, true);
+                simdgroup_multiply_accumulate(c, a, bmat, c);
+            }
+            simdgroup_store(c, &scores[0][0], K_TILE);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0 && qi < q_shape[2]) {
+            const uint valid = min(K_TILE, key_positions_shape[0] - key_base);
+            float next_max = row_max[q_row];
+            for (uint kr = 0; kr < valid; ++kr) next_max = max(next_max, scores[q_row][kr] * rsqrt(float(HEAD_DIM)));
+            old_weight[q_row] = isfinite(row_max[q_row]) ? exp(row_max[q_row] - next_max) : 0.0f;
+            row_sum[q_row] *= old_weight[q_row];
+            for (uint kr = 0; kr < valid; ++kr) row_sum[q_row] += exp(scores[q_row][kr] * rsqrt(float(HEAD_DIM)) - next_max);
+            row_max[q_row] = next_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (qi < q_shape[2]) {
+            const uint valid = min(K_TILE, key_positions_shape[0] - key_base);
+            acc0 *= old_weight[q_row]; acc1 *= old_weight[q_row]; acc2 *= old_weight[q_row]; acc3 *= old_weight[q_row];
+            for (uint kr = 0; kr < valid; ++kr) {
+                const float w = exp(scores[q_row][kr] * rsqrt(float(HEAD_DIM)) - row_max[q_row]);
+                acc0 += w * v_tile[kr][lane * 4 + 0]; acc1 += w * v_tile[kr][lane * 4 + 1];
+                acc2 += w * v_tile[kr][lane * 4 + 2]; acc3 += w * v_tile[kr][lane * 4 + 3];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (d < HEAD_DIM) out[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d] = v_acc[thread_index_in_threadgroup.x][d] / row_sum[thread_index_in_threadgroup.x];
+    if (qi < q_shape[2]) {
+        const uint o = ((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + lane * 4;
+        out[o + 0] = acc0 / row_sum[q_row]; out[o + 1] = acc1 / row_sum[q_row];
+        out[o + 2] = acc2 / row_sum[q_row]; out[o + 3] = acc3 / row_sum[q_row];
+    }
 "#;
 
 #[derive(Clone, Debug)]

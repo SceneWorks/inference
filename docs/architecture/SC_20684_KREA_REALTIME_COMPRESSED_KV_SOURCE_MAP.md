@@ -26,6 +26,8 @@ Accordingly the implementation is Krea-owned: `compressed_kv.rs` packs K/V in Kr
 
 `append_after_decision` quantizes a full K/V pair before replacement; no half-written layer is observable. `trim_prefix` copies only retained packed words and metadata, checks cancellation before state replacement, and does not dequantize a historical window. `tiled_online_attention` is the CPU parity oracle. The retained Metal path uses `KreaPackedMetalKernel::dispatch` over actual `PackedKv` uint32/bf16 arrays, current K/V, and O(S) global position vectors; it allocates neither a dense historical K/V window nor an `Sq × Sk` score/mask array.
 
+The Metal POC accepts only an already-physical global packed window. It rejects sliding/sink gathers before dispatch, so MLX lazy-JIT or command-buffer failure cannot strand a partially gathered cache; the caller can retry the unchanged dense path from the same cache state. Its bounded MSL tile is eight queries by eight keys, with 256 threads (eight simdgroups), real `simdgroup_matrix` MMA for the score tile, lane-owned four-channel value accumulators, and online max rescaling on every key tile.
+
 Absolute RoPE remains the Wan/Krea producer's responsibility: keys passed to append are post-RoPE and `query_start`/`key_start` make block-mask comparison global. The opt-in `CausalPackedAttention` seam now wires the retained Krea kernel into Wan's per-layer causal forward. It only dispatches the exact B=1/H=40/D=128, all-allowed block; any materialized block mask, missing packed history, Q4 without acknowledgement, unsupported shape, or kernel setup failure stays on the pre-existing dense route before the packed read window is prepared.
 
 ## Receipt and migration contract

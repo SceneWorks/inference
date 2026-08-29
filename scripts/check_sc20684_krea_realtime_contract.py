@@ -125,7 +125,9 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
                 errors.append(f"compressed POC must not allocate a dense K/V window or score route: {needle}")
         required = (
             "TILE_ROWS", "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision",
-            "simdgroup_matrix", "KreaPackedMetalKernel", "current_k", "current_v",
+            "simdgroup_matrix", "simdgroup_load", "simdgroup_multiply_accumulate",
+            "KreaPackedMetalKernel", "current_k", "current_v", "acc0 *= old_weight",
+            "lane * 4", ".thread_group(256, 1, 1)",
         )
         for needle in required:
             if needle not in source:
