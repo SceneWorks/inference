@@ -14,7 +14,7 @@ The required-axis/result matrix is
 [`receipts/sc-20673-coverage.json`](receipts/sc-20673-coverage.json), checked
 by the fail-closed `scripts/check_sc20673_receipt.py` validator.
 
-## Measured result
+## Upstream benchmark medians (not probe metrics)
 
 The group-affine scalar fused decode path showed the upstream result at
 `B=1,H=32,D=128,b=2,g=32,nsg=8`: 2.12x at `S_kv=512`, 3.60x at 2048,
@@ -31,6 +31,21 @@ those do not establish compressed-domain attention. The evidence therefore
 supports a measured no-go for porting the RaBitQ attention kernels as a default
 decode/prefill path on this development GPU, while preserving group-affine as
 the candidate requiring independent SceneWorks integration evaluation.
+
+## Probe metrics and current eligibility
+
+The checked-in transcript predates the fresh-process probe and contains only
+upstream benchmark medians. Its former whole-process elapsed/RSS aliases are
+not compile, dispatch, synchronization, warm-state, or MLX allocator metrics
+and must not be used for eligibility. A future campaign invokes
+`scripts/sc20673_frozen_probe.py` in a fresh child against the frozen checkout;
+that child records separately labeled enqueue, first synchronized evaluation,
+explicit synchronization, warm synchronized median, MLX peak/delta, and exact
+geometry bytes for group-affine decode, RaBitQ decode/prefill, and RVQ pack.
+Coverage and result rows are derived from that same probe JSON, then every
+canonical artifact is sidecar-sealed. Product eligibility remains pending that
+probe and independent SceneWorks integration; this document makes no current
+promotion claim.
 
 ## Scope and limitations
 
