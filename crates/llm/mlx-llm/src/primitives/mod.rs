@@ -37,9 +37,10 @@ pub use nn::{
     soft_cap,
 };
 pub use packed_group_affine_kv::{
-    select_decoder_cache, CompiledKernelHandle, DecoderCacheSelection, DenseFallbackEvent,
-    DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
-    PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
+    OpaqueCompiledKernel, PackedCacheRequest, PackedGroupAffineKvCache, RepresentationMetadata,
+    RetainedPackedKernel,
 };
 pub use packed_metal::{PackedMask, PackedMetalKernel};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};

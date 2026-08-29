@@ -389,6 +389,31 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
     }
 }
 
+/// Explicit experimental construction route.  The retained reader is supplied by the model
+/// after its backend/device capability probe; binding happens before the returned cache can see an
+/// update.  The legacy factory above intentionally remains dense by default.
+pub fn select_decoder_cache_with_reader(
+    request: PackedCacheRequest,
+    handle: CompiledKernelHandle,
+) -> DecoderCacheSelection {
+    let mut selection = select_decoder_cache(request.clone());
+    let Some(cache) = selection
+        .cache
+        .as_any_mut()
+        .downcast_mut::<DenseFallbackPackedDecoderCache>()
+    else {
+        return selection;
+    };
+    if let Err(error) = cache.bind_compiled_handle(handle) {
+        selection.route = CacheRoute::DenseFallback {
+            reason: format!("packed reader rejected before mutation: {error}"),
+        };
+        return selection;
+    }
+    selection.route = cache.preflight_packed(request.query_length, request.has_mask);
+    selection
+}
+
 #[derive(Clone, Debug)]
 struct PackedTensor {
     rows: usize,
@@ -1688,6 +1713,78 @@ mod tests {
             adapter.preflight_packed(1, false),
             CacheRoute::DenseFallback { .. }
         ));
+    }
+
+    #[test]
+    fn decoder_factory_binds_reader_before_experimental_route() {
+        let handle = CompiledKernelHandle::new(Arc::new(OpaqueCompiledKernel::new(
+            "m",
+            "mlx-metal",
+            32,
+            Arc::new(()),
+        )));
+        let selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "m".into(),
+                layers: 1,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: 4,
+                query_length: 1,
+                has_mask: false,
+            },
+            handle,
+        );
+        // An opaque handle is intentionally non-dispatchable, but factory binding and route
+        // selection are still observable before any K/V mutation.
+        assert_eq!(selection.route(), &CacheRoute::ExperimentalPacked);
+        let mut cache = selection.into_cache();
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        assert_eq!(packed.staged_representation().logical_len, 0);
+        assert!(packed
+            .dispatch_packed(
+                0,
+                &Array::from_slice(&[0.0f32; 64], &[1, 1, 1, 64]),
+                crate::primitives::packed_metal::PackedMask::Causal
+            )
+            .is_err());
+        assert_eq!(packed.staged_representation().logical_len, 0);
+    }
+
+    #[test]
+    fn decoder_factory_rejects_mask_before_packed_mutation() {
+        let handle = CompiledKernelHandle::new(Arc::new(OpaqueCompiledKernel::new(
+            "m",
+            "mlx-metal",
+            1,
+            Arc::new(()),
+        )));
+        let selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "m".into(),
+                layers: 1,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: 4,
+                query_length: 1,
+                has_mask: true,
+            },
+            handle,
+        );
+        assert!(matches!(
+            selection.route(),
+            CacheRoute::DenseFallback { .. }
+        ));
+        assert!(selection.cache.as_any_mut().is::<ContiguousKvCache>());
     }
 
     #[test]

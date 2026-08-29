@@ -62,7 +62,8 @@ use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{
-    select_decoder_cache, ContiguousKvCache, PackedCacheRequest, PagedKvCache, Weights,
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    ContiguousKvCache, PackedCacheRequest, PagedKvCache, Weights,
 };
 
 /// Cached decode runs in bf16 (matching the reference engines).
@@ -932,6 +933,36 @@ impl crate::decode::Decode for CausalLm {
 
     fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> Result<Array> {
         self.decode_logits(input_ids, cache, offset)
+    }
+}
+
+impl CausalLm {
+    /// Explicit opt-in construction for the retained packed reader.  Normal `Decode::make_cache`
+    /// remains unchanged; callers must provide a reader that was compiled for this model's
+    /// identity and pass the real batch/query geometry discovered at the model boundary.
+    pub fn make_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> Box<dyn KvCache> {
+        select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: handle.cache_identity().to_owned(),
+                layers: self.cfg.num_layers,
+                batch,
+                kv_heads: self.cfg.num_kv_heads as usize,
+                head_dimension: self.cfg.head_dim as usize,
+                group_size: 4,
+                query_length,
+                has_mask,
+            },
+            handle,
+        )
+        .into_cache()
     }
 }
 
