@@ -59,8 +59,8 @@
       "owner": "SceneWorks",
       "purpose": "security/sanitizer acceptance; not an SVG-Bench image-quality case",
       "generator": "starvector-terminal-hostile-v1",
-      "content_identity_sha256": "5aa20542d80d215cf3c6840316ee94233e6cd682018ef17c76deb43e32416fc7",
-      "selection_rule": "Generate ten hostile SVG construct families (script, event-handler, javascript-url, foreign-object, external-use, active-animation, css-import, xml-pi, cdata, doctype), twenty canonical payloads per family, in listed family then ordinal order. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 payload identities."
+      "content_identity_sha256": "47ee8f0ff3643c44b79c8893c5b1a0cbcdf98acbfc332c87d91d3e48bb0dcaf1",
+      "selection_rule": "Generate ten canonical payloads for each of 20 ordered E5 families: prefix, suffix, multiple-root, malformed, DTD/entity, PI/CDATA, script, foreignObject, event handler, CSS import, animation, external/data/file href, use, text, and byte/node-depth/attribute-path/coordinate-dimension-viewBox overruns. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 payload identities."
     },
     "prompt_composition": {
       "required_count": 60,
