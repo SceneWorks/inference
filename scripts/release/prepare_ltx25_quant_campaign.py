@@ -28,6 +28,7 @@ CAMPAIGN_SCHEMA = "sceneworks-ltx25-quant-campaign-v1"
 PROMOTION_SCHEMA = "sceneworks-ltx25-quant-promotion-v2"
 POLICY_ID = "sc-18777-reviewed-selection-v1"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
+WINDOWS_NAME_SURROGATE_REPARSE_BIT = 0x20000000
 
 # (case id, transformer variant, bundle subdir, optional all-BF16 text encoder)
 TERMINAL_CASES: tuple[tuple[str, str, str, str | None], ...] = (
@@ -182,6 +183,20 @@ def _sha256_and_size(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _is_unsafe_directory_link(path: Path, metadata: os.stat_result) -> bool:
+    """Reject directory links that os.walk may otherwise follow on Windows."""
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    path_is_junction = getattr(path, "is_junction", None)
+    if path_is_junction is not None and path_is_junction():
+        return True
+    os_path_isjunction = getattr(os.path, "isjunction", None)
+    if os_path_isjunction is not None and os_path_isjunction(path):
+        return True
+    reparse_tag = getattr(metadata, "st_reparse_tag", 0)
+    return bool(reparse_tag & WINDOWS_NAME_SURROGATE_REPARSE_BIT)
+
+
 def validate_snapshot_against_readback(snapshot: Path, revision: str, raw: bytes) -> None:
     """Prove the canonical snapshot is an exact, non-escaping copy of the public revision."""
     snapshot = require_absolute(snapshot, "snapshot").resolve(strict=True)
@@ -195,8 +210,12 @@ def validate_snapshot_against_readback(snapshot: Path, revision: str, raw: bytes
         root = Path(directory)
         for name in directories:
             candidate = root / name
-            if candidate.is_symlink():
-                raise ValueError(f"snapshot contains a directory symlink: {candidate}")
+            metadata = candidate.lstat()
+            if _is_unsafe_directory_link(candidate, metadata):
+                raise ValueError(
+                    "snapshot contains a directory symlink, junction, or "
+                    f"name-surrogate reparse point: {candidate}"
+                )
         for name in files:
             logical = root / name
             metadata = logical.lstat()

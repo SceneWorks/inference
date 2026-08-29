@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = (
@@ -226,6 +227,42 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
             ).encode()
             with self.assertRaisesRegex(ValueError, "outside canonical blob store"):
                 MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+
+    def test_snapshot_inventory_rejects_windows_directory_junction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "models--SceneWorks--ltx-2.5-mlx"
+            (repo / "blobs").mkdir(parents=True)
+            snapshot = repo / "snapshots" / REVISION
+            junction = snapshot / "redirected"
+            junction.mkdir(parents=True)
+            raw = json.dumps(
+                {
+                    "id": MODULE.PUBLIC_REPOSITORY,
+                    "sha": REVISION,
+                    "private": False,
+                    "gated": False,
+                    "siblings": [{"rfilename": "redirected/file.json", "size": 2}],
+                }
+            ).encode()
+
+            real_isjunction = MODULE.os.path.isjunction
+
+            def isjunction(path):
+                return Path(path) == junction or real_isjunction(path)
+
+            with mock.patch.object(MODULE.os.path, "isjunction", side_effect=isjunction):
+                with self.assertRaisesRegex(ValueError, "directory symlink, junction"):
+                    MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+
+    def test_windows_name_surrogate_reparse_tag_is_an_unsafe_directory_link(self):
+        metadata = mock.Mock(
+            st_mode=0o040000,
+            st_reparse_tag=MODULE.WINDOWS_NAME_SURROGATE_REPARSE_BIT,
+        )
+        self.assertTrue(
+            MODULE._is_unsafe_directory_link(Path("synthetic-directory"), metadata)
+        )
 
     def test_promotion_input_contains_only_explicit_reviewed_winners(self):
         snapshot = Path("/cache/models--SceneWorks--ltx-2.5-mlx/snapshots") / REVISION
