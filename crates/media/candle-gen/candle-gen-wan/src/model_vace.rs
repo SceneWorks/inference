@@ -459,6 +459,9 @@ impl Generator for WanVaceGenerator {
             latent_frames as u32,
             latent_height as u32,
             latent_width as u32,
+            &req.prompt,
+            req.guidance,
+            reference_count,
         )
         .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = Pipeline::load(&self.root, &self.device);

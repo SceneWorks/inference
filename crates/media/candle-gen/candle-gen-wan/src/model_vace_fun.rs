@@ -563,6 +563,9 @@ impl Generator for WanVaceFunGenerator {
             latent_frames as u32,
             latent_height as u32,
             latent_width as u32,
+            &req.prompt,
+            req.guidance,
+            0,
         )
         .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(

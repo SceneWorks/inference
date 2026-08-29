@@ -267,6 +267,14 @@ impl Attention {
     fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
         let measured = std::time::Instant::now();
         let (b, s_kv, _) = context.dims3()?;
+        crate::sc20686_observer::bind_cross_kv_geometry(
+            self.blocks.len() as u32,
+            self.num_heads as u32,
+            self.head_dim as u32,
+            0,
+            s_kv as u64,
+            format!("{:?}", context.dtype()),
+        );
         let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
         let v = self.to_v.forward(context)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
@@ -297,6 +305,14 @@ impl Attention {
     ) -> Result<Tensor> {
         let measured = std::time::Instant::now();
         let (b, s, _) = hidden.dims3()?;
+        crate::sc20686_observer::bind_cross_kv_geometry(
+            0,
+            self.num_heads as u32,
+            self.head_dim as u32,
+            s as u64,
+            0,
+            format!("{:?}", hidden.dtype()),
+        );
         let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
             t.reshape((b, s, self.num_heads, self.head_dim))?

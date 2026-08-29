@@ -57,6 +57,17 @@ pub struct CampaignGeometry {
     pub(crate) latent_frames: u32,
     pub(crate) latent_height: u32,
     pub(crate) latent_width: u32,
+    pub(crate) prompt_sha256: String,
+    pub(crate) guidance: String,
+    pub(crate) reference_count: u32,
+    pub(crate) layers: u32,
+    pub(crate) heads: u32,
+    pub(crate) head_dimension: u32,
+    pub(crate) sq: u64,
+    pub(crate) skv: u64,
+    pub(crate) dtype: String,
+    pub(crate) mask: String,
+    pub(crate) rope: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -211,6 +222,9 @@ pub(crate) fn activate_requested(
     latent_frames: u32,
     latent_height: u32,
     latent_width: u32,
+    prompt: &str,
+    guidance: Option<f32>,
+    reference_count: u32,
 ) -> io::Result<Option<Scope>> {
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
     let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
@@ -229,6 +243,19 @@ pub(crate) fn activate_requested(
             latent_frames,
             latent_height,
             latent_width,
+            prompt_sha256: format!("{:x}", Sha256::digest(prompt.as_bytes())),
+            guidance: guidance.map_or_else(|| "none".into(), |value| value.to_string()),
+            reference_count,
+            // These are resolved from the live prepared arrays at the ownership hook. Until that
+            // hook binds them, activation is intentionally incomplete rather than fabricated.
+            layers: 0,
+            heads: 0,
+            head_dimension: 0,
+            sq: 0,
+            skv: 0,
+            dtype: String::new(),
+            mask: "none".into(),
+            rope: "none".into(),
         },
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -300,6 +327,21 @@ impl CacheObserver for JsonlObserver {
                 value["snapshot_sha256"] = serde_json::json!(ctx.snapshot_sha256);
                 value["snapshot_bytes"] = serde_json::json!(ctx.snapshot_bytes);
                 value["variant"] = serde_json::json!(ctx.variant);
+                value["geometry"] = serde_json::json!({
+                    "resolution": format!("{}x{}", ctx.geometry.width, ctx.geometry.height),
+                    "reference_count": ctx.geometry.reference_count,
+                    "frames": ctx.geometry.frames,
+                    "prompt": ctx.geometry.prompt_sha256,
+                    "guidance": ctx.geometry.guidance,
+                    "layers": ctx.geometry.layers,
+                    "heads": ctx.geometry.heads,
+                    "head_dimension": ctx.geometry.head_dimension,
+                    "sq": ctx.geometry.sq,
+                    "skv": ctx.geometry.skv,
+                    "dtype": ctx.geometry.dtype,
+                    "mask": ctx.geometry.mask,
+                    "rope": ctx.geometry.rope,
+                });
                 value["cancellation_armed"] = serde_json::json!(event.reused == 1);
                 if event.reused == 1 {
                     value["cancellation_arm_id"] =
@@ -488,6 +530,47 @@ pub fn observe_tensor(
 pub fn observe_cancelled() {
     observe("cancelled", 0, 0, 0);
 }
+
+/// Bind geometry from the live prepared K/V arrays. This is deliberately producer-only; callers
+/// cannot supply these values through the campaign request.
+pub(crate) fn bind_cross_kv_geometry(
+    layers: u32,
+    heads: u32,
+    head_dimension: u32,
+    sq: u64,
+    skv: u64,
+    dtype: impl Into<String>,
+) {
+    let bound = CONTEXT.with(|slot| {
+        if let Some(context) = slot.borrow_mut().as_mut() {
+            if layers != 0 {
+                context.geometry.layers = layers;
+            }
+            if heads != 0 {
+                context.geometry.heads = heads;
+            }
+            if head_dimension != 0 {
+                context.geometry.head_dimension = head_dimension;
+            }
+            if sq != 0 {
+                context.geometry.sq = sq;
+            }
+            if skv != 0 {
+                context.geometry.skv = skv;
+            }
+            let dtype = dtype.into();
+            if !dtype.is_empty() {
+                context.geometry.dtype = dtype;
+            }
+            true
+        } else {
+            false
+        }
+    });
+    if bound {
+        observe("metadata", 0, 0, 0);
+    }
+}
 impl Drop for Scope {
     fn drop(&mut self) {
         observe("released", 0, 0, 0);
@@ -534,6 +617,17 @@ mod tests {
                 latent_frames: 2,
                 latent_height: 8,
                 latent_width: 8,
+                prompt_sha256: "a".repeat(64),
+                guidance: "none".into(),
+                reference_count: 0,
+                layers: 1,
+                heads: 1,
+                head_dimension: 1,
+                sq: 64,
+                skv: 128,
+                dtype: "bf16".into(),
+                mask: "none".into(),
+                rope: "none".into(),
             },
         )
         .unwrap();
