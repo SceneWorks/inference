@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, ltx_checkpoint::LtxBundle, LoadSpec, LtxComponent, Quant};
@@ -17,6 +18,15 @@ use sha2::{Digest, Sha256};
 use crate::{dev_sampler::TransformerVariant, MODEL_25_ID};
 
 pub const RUNTIME_BINDING_FILE: &str = "ltx25-quant-runtime-binding.json";
+pub const RUNTIME_BINDING_SCHEMA: &str = "sceneworks-ltx25-quant-runtime-bindings-v1";
+pub const LTX25_PUBLIC_REPOSITORY: &str = "SceneWorks/ltx-2.5-mlx";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ltx25QuantRuntimeBindings {
+    pub schema_version: String,
+    pub bindings: Vec<Ltx25QuantRuntimeIdentity>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,11 +36,26 @@ pub struct Ltx25QuantRuntimeIdentity {
     pub inference_revision: String,
     pub executable_contract_sha256: String,
     pub executable_sha256: String,
+    pub source_model_revision: String,
+    pub source_model_inventory_sha256: String,
+    pub source_bundle_subdir: String,
+    pub source_bf16_text_encoder_subpath: String,
+    pub source_runtime_bundle_sha256: String,
+    pub source_selected_bundle_sha256: String,
     pub model_revision: String,
     pub model_inventory_sha256: String,
+    pub bundle_subdir: String,
+    pub bf16_text_encoder_subpath: String,
     pub runtime_bundle_sha256: String,
+    pub selected_bundle_sha256: String,
+    pub public_repository: String,
+    pub public_readback_sha256: String,
+    pub public_replay_receipt_sha256: String,
+    pub public_replay_output_sha256: String,
+    pub promotion_copy_sha256: String,
     pub reference_model_revision: String,
     pub reference_model_inventory_sha256: String,
+    pub reference_bundle_subdir: String,
     pub reference_runtime_bundle_sha256: String,
     pub receipt_sha256: String,
     pub transcript_sha256: String,
@@ -41,6 +66,13 @@ pub struct Ltx25QuantRuntimeIdentity {
     pub operator_kind: String,
     pub operator_contract_sha256: String,
     pub operator_weight_inventory_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ltx25QuantAcceptedMeasurement {
+    pub receipt: Ltx25QuantMeasurementReceipt,
+    pub runtime: Ltx25QuantRuntimeIdentity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,29 +256,10 @@ const fn terminal_dev_case(
     case
 }
 
-/// Both current physical generations compare bf16, packed q4/q8, and ConvRot. Native NVFP4 exists
-/// only for the exact consumer `sm_120` row.
+/// The active physical campaign pool is consumer Blackwell `sm_120`. Unsupported generations stay
+/// classified above so selecting them still fails closed, but they are not measurement rows. The
+/// upstream NVFP4 artifact is distilled-only, so no dev/NVFP4 row is representable.
 pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
-    terminal_case(
-        "ltx25-bf16-ada-v1",
-        Ltx25QuantMode::Bf16,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_case(
-        "ltx25-packed-q4-ada-v1",
-        Ltx25QuantMode::Q4,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_case(
-        "ltx25-packed-q8-ada-v1",
-        Ltx25QuantMode::PackedQ8,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_case(
-        "ltx25-int8-convrot-ada-v1",
-        Ltx25QuantMode::Int8ConvRot,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
     terminal_case(
         "ltx25-bf16-blackwell-v1",
         Ltx25QuantMode::Bf16,
@@ -273,26 +286,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
     terminal_dev_case(
-        "ltx25-bf16-ada-dev-v1",
-        Ltx25QuantMode::Bf16,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_dev_case(
-        "ltx25-packed-q4-ada-dev-v1",
-        Ltx25QuantMode::Q4,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_dev_case(
-        "ltx25-packed-q8-ada-dev-v1",
-        Ltx25QuantMode::PackedQ8,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_dev_case(
-        "ltx25-int8-convrot-ada-dev-v1",
-        Ltx25QuantMode::Int8ConvRot,
-        Ltx25GpuGeneration::AdaSm89,
-    ),
-    terminal_dev_case(
         "ltx25-bf16-blackwell-dev-v1",
         Ltx25QuantMode::Bf16,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
@@ -310,11 +303,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
     terminal_dev_case(
         "ltx25-int8-convrot-blackwell-dev-v1",
         Ltx25QuantMode::Int8ConvRot,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
-    terminal_dev_case(
-        "ltx25-nvfp4-blackwell-dev-v1",
-        Ltx25QuantMode::Nvfp4,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
 ];
@@ -355,10 +343,15 @@ pub struct Ltx25QuantMeasurementReceipt {
     pub executable_sha256: String,
     pub model_revision: String,
     pub model_inventory_sha256: String,
+    pub bundle_subdir: String,
+    pub bf16_text_encoder_subpath: String,
     pub runtime_bundle_sha256: String,
+    pub selected_bundle_sha256: String,
     pub reference_model_revision: String,
     pub reference_model_inventory_sha256: String,
+    pub reference_bundle_subdir: String,
     pub reference_runtime_bundle_sha256: String,
+    pub reference_selected_bundle_sha256: String,
     pub gpu_name: String,
     pub compute_capability: String,
     pub driver_version: String,
@@ -400,10 +393,15 @@ pub(crate) struct Ltx25QuantMeasurementDraft {
     pub executable_sha256: String,
     pub model_revision: String,
     pub model_inventory_sha256: String,
+    pub bundle_subdir: String,
+    pub bf16_text_encoder_subpath: String,
     pub runtime_bundle_sha256: String,
+    pub selected_bundle_sha256: String,
     pub reference_model_revision: String,
     pub reference_model_inventory_sha256: String,
+    pub reference_bundle_subdir: String,
     pub reference_runtime_bundle_sha256: String,
+    pub reference_selected_bundle_sha256: String,
     pub gpu_name: String,
     pub compute_capability: String,
     pub driver_version: String,
@@ -434,6 +432,17 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn is_normalized_bundle_subdir(value: &str) -> bool {
+    value == "."
+        || (!value.is_empty()
+            && !value.starts_with('/')
+            && !value.ends_with('/')
+            && !value.contains(['\\', ':'])
+            && value
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != ".."))
 }
 
 impl Ltx25QuantMeasurementReceipt {
@@ -470,10 +479,21 @@ impl Ltx25QuantMeasurementReceipt {
             "model_inventory_sha256",
             &self.model_inventory_sha256,
         );
+        push_string(&mut fields, "bundle_subdir", &self.bundle_subdir);
+        push_string(
+            &mut fields,
+            "bf16_text_encoder_subpath",
+            &self.bf16_text_encoder_subpath,
+        );
         push_string(
             &mut fields,
             "runtime_bundle_sha256",
             &self.runtime_bundle_sha256,
+        );
+        push_string(
+            &mut fields,
+            "selected_bundle_sha256",
+            &self.selected_bundle_sha256,
         );
         push_string(
             &mut fields,
@@ -487,8 +507,18 @@ impl Ltx25QuantMeasurementReceipt {
         );
         push_string(
             &mut fields,
+            "reference_bundle_subdir",
+            &self.reference_bundle_subdir,
+        );
+        push_string(
+            &mut fields,
             "reference_runtime_bundle_sha256",
             &self.reference_runtime_bundle_sha256,
+        );
+        push_string(
+            &mut fields,
+            "reference_selected_bundle_sha256",
+            &self.reference_selected_bundle_sha256,
         );
         push_string(&mut fields, "gpu_name", &self.gpu_name);
         push_string(&mut fields, "compute_capability", &self.compute_capability);
@@ -544,7 +574,7 @@ impl Ltx25QuantMeasurementReceipt {
     #[cfg(any(test, feature = "terminal-quant-measurement"))]
     pub(crate) fn seal(draft: Ltx25QuantMeasurementDraft) -> Self {
         let mut receipt = Self {
-            schema_version: "sceneworks-ltx25-quant-receipt-v4".to_owned(),
+            schema_version: "sceneworks-ltx25-quant-receipt-v6".to_owned(),
             case_id: draft.case_id,
             mode: draft.mode,
             gpu_generation: draft.gpu_generation,
@@ -560,10 +590,15 @@ impl Ltx25QuantMeasurementReceipt {
             executable_sha256: draft.executable_sha256,
             model_revision: draft.model_revision,
             model_inventory_sha256: draft.model_inventory_sha256,
+            bundle_subdir: draft.bundle_subdir,
+            bf16_text_encoder_subpath: draft.bf16_text_encoder_subpath,
             runtime_bundle_sha256: draft.runtime_bundle_sha256,
+            selected_bundle_sha256: draft.selected_bundle_sha256,
             reference_model_revision: draft.reference_model_revision,
             reference_model_inventory_sha256: draft.reference_model_inventory_sha256,
+            reference_bundle_subdir: draft.reference_bundle_subdir,
             reference_runtime_bundle_sha256: draft.reference_runtime_bundle_sha256,
+            reference_selected_bundle_sha256: draft.reference_selected_bundle_sha256,
             gpu_name: draft.gpu_name,
             compute_capability: draft.compute_capability,
             driver_version: draft.driver_version,
@@ -636,8 +671,39 @@ impl Ltx25QuantMeasurementReceipt {
                 ));
             }
         }
-        if self.schema_version != "sceneworks-ltx25-quant-receipt-v4" {
+        if self.schema_version != "sceneworks-ltx25-quant-receipt-v6" {
             errors.push("unknown receipt schema version".to_owned());
+        }
+        for (label, subdir) in [
+            ("bundle subdir", self.bundle_subdir.as_str()),
+            (
+                "reference bundle subdir",
+                self.reference_bundle_subdir.as_str(),
+            ),
+        ] {
+            if !is_normalized_bundle_subdir(subdir) {
+                errors.push(format!(
+                    "{label} must be a normalized relative path using forward slashes"
+                ));
+            }
+        }
+        let advanced = matches!(
+            self.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        );
+        if advanced {
+            if !is_normalized_bundle_subdir(&self.bf16_text_encoder_subpath)
+                || self.bf16_text_encoder_subpath == "."
+            {
+                errors.push(
+                    "advanced receipt requires a normalized explicit bf16 text encoder subpath"
+                        .to_owned(),
+                );
+            }
+        } else if !self.bf16_text_encoder_subpath.is_empty() {
+            errors.push(
+                "non-advanced receipt must not bind an external bf16 text encoder".to_owned(),
+            );
         }
         for (label, value, expected) in [
             ("inference revision", self.inference_revision.as_str(), 40),
@@ -659,6 +725,11 @@ impl Ltx25QuantMeasurementReceipt {
                 64,
             ),
             (
+                "selected bundle SHA-256",
+                self.selected_bundle_sha256.as_str(),
+                64,
+            ),
+            (
                 "reference model revision",
                 self.reference_model_revision.as_str(),
                 40,
@@ -671,6 +742,11 @@ impl Ltx25QuantMeasurementReceipt {
             (
                 "reference runtime bundle SHA-256",
                 self.reference_runtime_bundle_sha256.as_str(),
+                64,
+            ),
+            (
+                "reference selected bundle SHA-256",
+                self.reference_selected_bundle_sha256.as_str(),
                 64,
             ),
             ("run nonce SHA-256", self.run_nonce_sha256.as_str(), 64),
@@ -766,7 +842,9 @@ impl Ltx25QuantMeasurementReceipt {
         if self.mode == Ltx25QuantMode::Bf16
             && (self.reference_model_revision != self.model_revision
                 || self.reference_model_inventory_sha256 != self.model_inventory_sha256
+                || self.reference_bundle_subdir != self.bundle_subdir
                 || self.reference_runtime_bundle_sha256 != self.runtime_bundle_sha256
+                || self.reference_selected_bundle_sha256 != self.selected_bundle_sha256
                 || self.reference_output_sha256 != self.output_sha256)
         {
             errors.push("bf16 receipt must be self-bound as its own reference identity".to_owned());
@@ -824,15 +902,18 @@ pub enum Ltx25QuantAdmission {
 /// Adding a reviewed receipt must not change the contract that the already-sealed campaign names.
 /// The Rust admission implementation and receipt schema remain inside that digest; only this inert
 /// allowlist payload is excluded, avoiding a self-referential promotion cycle.
-pub const ACCEPTED_MEASUREMENT_RECEIPTS: &[Ltx25QuantMeasurementReceipt] =
-    include!("accepted_quant_receipts.allowlist");
+pub static ACCEPTED_MEASUREMENT_RECEIPTS: LazyLock<Vec<Ltx25QuantAcceptedMeasurement>> =
+    LazyLock::new(|| {
+        serde_json::from_str(include_str!("accepted_quant_receipts.allowlist"))
+            .expect("accepted LTX-2.5 quant allowlist must be valid JSON")
+    });
 
 pub fn admit(
     mode: Ltx25QuantMode,
     gpu: Ltx25GpuGeneration,
     variant: TransformerVariant,
     runtime: Option<&Ltx25QuantRuntimeIdentity>,
-    receipts: &[Ltx25QuantMeasurementReceipt],
+    accepted: &[Ltx25QuantAcceptedMeasurement],
 ) -> Ltx25QuantAdmission {
     if mode == Ltx25QuantMode::PackedQ8 {
         return Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: packed-q8 is a terminal comparison source, not a production selector; production Quant::Q8 means int8-convrot") };
@@ -855,14 +936,20 @@ pub fn admit(
             ),
         };
     };
-    match receipts.iter().find(|receipt| receipt.case_id == case.id) {
-        Some(receipt)
-            if receipt.validation_errors().is_empty()
-                && runtime.is_some_and(|runtime| receipt_matches_runtime(receipt, runtime)) =>
+    match accepted
+        .iter()
+        .find(|accepted| accepted.receipt.case_id == case.id)
+    {
+        Some(accepted)
+            if accepted.receipt.validation_errors().is_empty()
+                && runtime.is_some_and(|runtime| {
+                    runtime == &accepted.runtime
+                        && receipt_matches_runtime(&accepted.receipt, runtime)
+                }) =>
         {
             Ltx25QuantAdmission::Admitted
         }
-        Some(receipt) if !receipt.validation_errors().is_empty() => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} measurement receipt is invalid: {}", case.id, receipt.validation_errors().join("; ")) },
+        Some(accepted) if !accepted.receipt.validation_errors().is_empty() => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} measurement receipt is invalid: {}", case.id, accepted.receipt.validation_errors().join("; ")) },
         Some(_) => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} receipt does not match the active code/model/bundle/evidence runtime identity; replay is refused", case.id) },
         None => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} is selectable but not catalog-adopted until the terminal campaign records the {} receipt (exact code/model/GPU, VRAM, wall-clock, output, transcript, and quality)", mode.id(), case.id) },
     }
@@ -877,11 +964,15 @@ fn receipt_matches_runtime(
         && receipt.inference_revision == runtime.inference_revision
         && receipt.executable_contract_sha256 == runtime.executable_contract_sha256
         && receipt.executable_sha256 == runtime.executable_sha256
-        && receipt.model_revision == runtime.model_revision
-        && receipt.model_inventory_sha256 == runtime.model_inventory_sha256
-        && receipt.runtime_bundle_sha256 == runtime.runtime_bundle_sha256
+        && receipt.model_revision == runtime.source_model_revision
+        && receipt.model_inventory_sha256 == runtime.source_model_inventory_sha256
+        && receipt.bundle_subdir == runtime.source_bundle_subdir
+        && receipt.bf16_text_encoder_subpath == runtime.source_bf16_text_encoder_subpath
+        && receipt.runtime_bundle_sha256 == runtime.source_runtime_bundle_sha256
+        && receipt.selected_bundle_sha256 == runtime.source_selected_bundle_sha256
         && receipt.reference_model_revision == runtime.reference_model_revision
         && receipt.reference_model_inventory_sha256 == runtime.reference_model_inventory_sha256
+        && receipt.reference_bundle_subdir == runtime.reference_bundle_subdir
         && receipt.reference_runtime_bundle_sha256 == runtime.reference_runtime_bundle_sha256
         && receipt.receipt_sha256 == runtime.receipt_sha256
         && receipt.transcript_sha256 == runtime.transcript_sha256
@@ -892,6 +983,50 @@ fn receipt_matches_runtime(
         && receipt.operator_kind == runtime.operator_kind
         && receipt.operator_contract_sha256 == runtime.operator_contract_sha256
         && receipt.operator_weight_inventory_sha256 == runtime.operator_weight_inventory_sha256
+        && runtime.public_repository == LTX25_PUBLIC_REPOSITORY
+        && is_lower_hex(&runtime.public_readback_sha256, 64)
+        && is_lower_hex(&runtime.public_replay_receipt_sha256, 64)
+        && runtime.public_replay_output_sha256 == receipt.output_sha256
+        && runtime.source_selected_bundle_sha256 == runtime.selected_bundle_sha256
+        && runtime.promotion_copy_sha256 == promotion_copy_sha256(receipt, runtime)
+}
+
+pub(crate) fn promotion_copy_sha256(
+    receipt: &Ltx25QuantMeasurementReceipt,
+    runtime: &Ltx25QuantRuntimeIdentity,
+) -> String {
+    let rows = [
+        format!("receipt:{}", receipt.receipt_sha256),
+        format!("source-revision:{}", runtime.source_model_revision),
+        format!("source-inventory:{}", runtime.source_model_inventory_sha256),
+        format!("source-subdir:{}", runtime.source_bundle_subdir),
+        format!(
+            "source-bf16-text-encoder:{}",
+            runtime.source_bf16_text_encoder_subpath
+        ),
+        format!("source-bundle:{}", runtime.source_runtime_bundle_sha256),
+        format!("source-selected:{}", runtime.source_selected_bundle_sha256),
+        format!("public-revision:{}", runtime.model_revision),
+        format!("public-inventory:{}", runtime.model_inventory_sha256),
+        format!("public-subdir:{}", runtime.bundle_subdir),
+        format!(
+            "public-bf16-text-encoder:{}",
+            runtime.bf16_text_encoder_subpath
+        ),
+        format!("public-bundle:{}", runtime.runtime_bundle_sha256),
+        format!("public-selected:{}", runtime.selected_bundle_sha256),
+        format!("public-repository:{}", runtime.public_repository),
+        format!("public-readback:{}", runtime.public_readback_sha256),
+        format!(
+            "public-replay-receipt:{}",
+            runtime.public_replay_receipt_sha256
+        ),
+        format!(
+            "public-replay-output:{}",
+            runtime.public_replay_output_sha256
+        ),
+    ];
+    sha256_hex(rows.join("\n").as_bytes())
 }
 
 pub const fn catalog_advertised(mode: Ltx25QuantMode) -> bool {
@@ -944,14 +1079,215 @@ fn snapshot_revision(root: &Path) -> gen_core::Result<String> {
     Ok(revision.to_owned())
 }
 
+fn canonical_public_snapshot_for_selected(
+    selected_root: &Path,
+    bundle_subdir: &str,
+) -> gen_core::Result<PathBuf> {
+    if !is_normalized_bundle_subdir(bundle_subdir) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: public bundle subdir {bundle_subdir:?} is not normalized"
+        )));
+    }
+    let selected_root = fs::canonicalize(selected_root).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize selected public bundle {}: {error}",
+            selected_root.display()
+        ))
+    })?;
+    let snapshot = if snapshot_revision(&selected_root).is_ok() {
+        selected_root.clone()
+    } else {
+        if bundle_subdir == "." {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: nested public weights require a non-root reviewed bundle subdir"
+            )));
+        }
+        let mut candidate = selected_root.clone();
+        for _ in Path::new(bundle_subdir).components() {
+            if !candidate.pop() {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{MODEL_25_ID}: selected public bundle cannot be mapped to its reviewed snapshot root"
+                )));
+            }
+        }
+        let expected_selected =
+            fs::canonicalize(candidate.join(bundle_subdir)).map_err(|error| {
+                gen_core::Error::Msg(format!(
+                    "canonicalize reviewed public bundle {}: {error}",
+                    candidate.join(bundle_subdir).display()
+                ))
+            })?;
+        if expected_selected != selected_root {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: active weights {} do not equal reviewed public bundle subdir {bundle_subdir:?}",
+                selected_root.display()
+            )));
+        }
+        snapshot_revision(&candidate)?;
+        candidate
+    };
+    let expected_repo_dir = format!("models--{}", LTX25_PUBLIC_REPOSITORY.replace('/', "--"));
+    let actual_repo_dir = snapshot
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if actual_repo_dir != Some(expected_repo_dir.as_str()) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: public snapshot must be under canonical Hugging Face repository cache {expected_repo_dir:?}"
+        )));
+    }
+    Ok(snapshot)
+}
+
+/// Select one logical file inside an immutable snapshot without resolving its final HF-cache
+/// symlink out to `blobs/`. Parent-directory symlinks are forbidden. A final symlink is accepted
+/// only when its target is one file in the same canonical repository blob store.
+pub(crate) fn snapshot_bound_file(
+    snapshot: &Path,
+    relative: &Path,
+    label: &str,
+) -> gen_core::Result<PathBuf> {
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: {label} must be a non-empty traversal-free relative path"
+        )));
+    }
+    let mut logical = snapshot.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        logical.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&logical).map_err(|error| {
+            gen_core::Error::Msg(format!(
+                "inspect {label} {} inside immutable snapshot: {error}",
+                logical.display()
+            ))
+        })?;
+        let final_component = index + 1 == components.len();
+        if !final_component && metadata.file_type().is_symlink() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: {label} parent {} may not be a symlink",
+                logical.display()
+            )));
+        }
+        if final_component {
+            if metadata.file_type().is_symlink() {
+                let target = fs::canonicalize(&logical)
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+                let repo_root = snapshot
+                    .parent()
+                    .filter(|path| path.file_name().is_some_and(|name| name == "snapshots"))
+                    .and_then(Path::parent)
+                    .ok_or_else(|| {
+                        gen_core::Error::Unsupported(format!(
+                            "{MODEL_25_ID}: symlinked {label} requires canonical <repo>/snapshots/<revision> layout"
+                        ))
+                    })?;
+                let blobs = fs::canonicalize(repo_root.join("blobs"))
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+                if !target.is_file() || !target.starts_with(&blobs) {
+                    return Err(gen_core::Error::Unsupported(format!(
+                        "{MODEL_25_ID}: symlinked {label} {} resolves outside canonical blob store {}",
+                        logical.display(),
+                        blobs.display()
+                    )));
+                }
+            } else if !metadata.is_file() {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{MODEL_25_ID}: {label} {} must be one file",
+                    logical.display()
+                )));
+            }
+        }
+    }
+    Ok(logical)
+}
+
+/// Convert the ordinary nested SceneWorks tier selection into the exact full-snapshot-plus-explicit-
+/// components shape used by terminal measurement. The reviewed bundle subdir must map the active
+/// weights to one canonical public HF snapshot; sibling variants can never be discovered implicitly.
+pub fn stage_public_runtime_spec(
+    spec: &LoadSpec,
+    promotion: &Ltx25QuantRuntimeIdentity,
+) -> gen_core::Result<LoadSpec> {
+    if promotion.public_repository != LTX25_PUBLIC_REPOSITORY
+        || !is_normalized_bundle_subdir(&promotion.bf16_text_encoder_subpath)
+        || promotion.bf16_text_encoder_subpath == "."
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: promoted runtime lacks an exact public BF16 text-encoder binding"
+        )));
+    }
+    let selected_root = snapshot_root(spec)?;
+    let snapshot =
+        canonical_public_snapshot_for_selected(&selected_root, &promotion.bundle_subdir)?;
+    let encoder = snapshot_bound_file(
+        &snapshot,
+        Path::new(&promotion.bf16_text_encoder_subpath),
+        "promoted BF16 text encoder",
+    )?;
+    let mut staged = spec.clone();
+    staged.components.insert(
+        LtxComponent::TextEncoder.id().to_owned(),
+        gen_core::WeightsSource::File(encoder),
+    );
+    Ok(staged)
+}
+
+pub fn bind_public_runtime_spec(
+    spec: &LoadSpec,
+    bundle: &LtxBundle,
+    promotion: &Ltx25QuantRuntimeIdentity,
+) -> gen_core::Result<LoadSpec> {
+    if promotion.public_repository != LTX25_PUBLIC_REPOSITORY {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: promotion repository is not the canonical public repository"
+        )));
+    }
+    let selected_root = snapshot_root(spec)?;
+    let snapshot =
+        canonical_public_snapshot_for_selected(&selected_root, &promotion.bundle_subdir)?;
+    let bundle_root = snapshot.join(&promotion.bundle_subdir);
+    let expected_text_encoder = snapshot_bound_file(
+        &snapshot,
+        Path::new(&promotion.bf16_text_encoder_subpath),
+        "promoted BF16 text encoder",
+    )?;
+    let mut bound = spec.clone();
+    bound.weights = gen_core::WeightsSource::Dir(snapshot);
+    bound.components.clear();
+    for component in bundle.components() {
+        let path = component.path().to_path_buf();
+        if !(path.starts_with(&bundle_root)
+            || component.component() == LtxComponent::TextEncoder && path == expected_text_encoder)
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: selected component {} escapes reviewed public bundle {}",
+                path.display(),
+                bundle_root.display()
+            )));
+        }
+        let source = if path.is_dir() {
+            gen_core::WeightsSource::Dir(path)
+        } else {
+            gen_core::WeightsSource::File(path)
+        };
+        bound
+            .components
+            .insert(component.component().id().to_owned(), source);
+    }
+    Ok(bound)
+}
+
 pub(crate) fn inventory_for_snapshot(root: &Path) -> gen_core::Result<SnapshotInventory> {
-    fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> {
+    fn visit(dir: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> {
         for entry in fs::read_dir(dir).map_err(|error| gen_core::Error::Msg(error.to_string()))? {
             let entry = entry.map_err(|error| gen_core::Error::Msg(error.to_string()))?;
             let path = entry.path();
-            if path == root.join(RUNTIME_BINDING_FILE) {
-                continue;
-            }
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
             if metadata.file_type().is_symlink() {
@@ -967,7 +1303,7 @@ pub(crate) fn inventory_for_snapshot(root: &Path) -> gen_core::Result<SnapshotIn
                     )));
                 }
             } else if metadata.is_dir() {
-                visit(root, &path, files)?;
+                visit(&path, files)?;
             } else if metadata.is_file() {
                 files.push(path);
             }
@@ -975,7 +1311,7 @@ pub(crate) fn inventory_for_snapshot(root: &Path) -> gen_core::Result<SnapshotIn
         Ok(())
     }
     let mut files = Vec::new();
-    visit(root, root, &mut files)?;
+    visit(root, &mut files)?;
     files.sort();
     if files.is_empty() {
         return Err(gen_core::Error::Msg(
@@ -1098,52 +1434,126 @@ pub(crate) fn bundle_identity_sha256(
     Ok(sha256_hex(rows.join("\n").as_bytes()))
 }
 
-/// Reconstruct the active production identity from the exact bundle on disk. The binding sidecar is
-/// only a carrier for the evidence hashes/model revision; live code, inventory, bundle resolution,
-/// transformer descriptor contract, and sidecar agreement are all re-verified here.
+/// Content identity shared by a measured source bundle and its final public copy. Unlike
+/// [`bundle_identity_sha256`], this deliberately excludes the containing snapshot inventory and
+/// revision, but includes every selected component id, bundle-relative path, and exact file hash.
+/// Promotion requires this digest to be identical across the two independently inventoried roots.
+pub(crate) fn selected_bundle_identity_sha256(
+    bundle: &LtxBundle,
+    snapshot_root: &Path,
+    bundle_subdir: &str,
+    inventory: &SnapshotInventory,
+    variant: TransformerVariant,
+    mode: Ltx25QuantMode,
+) -> gen_core::Result<String> {
+    if !is_normalized_bundle_subdir(bundle_subdir) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: selected bundle subdir {bundle_subdir:?} is not normalized"
+        )));
+    }
+    let bundle_root = if bundle_subdir == "." {
+        snapshot_root.to_path_buf()
+    } else {
+        snapshot_root.join(bundle_subdir)
+    };
+    let mut rows = Vec::new();
+    for component in bundle.components() {
+        let snapshot_relative = component.path().strip_prefix(snapshot_root).map_err(|_| {
+            gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: selected component {} escapes snapshot {}",
+                component.path().display(),
+                snapshot_root.display()
+            ))
+        })?;
+        let snapshot_relative = snapshot_relative.to_string_lossy().replace('\\', "/");
+        let bundle_relative = match component.path().strip_prefix(&bundle_root) {
+            Ok(path) => path.to_string_lossy().replace('\\', "/"),
+            Err(_) if component.component() == LtxComponent::TextEncoder => {
+                format!("@snapshot/{snapshot_relative}")
+            }
+            Err(_) => {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{MODEL_25_ID}: selected component {} escapes bundle subdir {bundle_subdir:?}",
+                    component.path().display()
+                )))
+            }
+        };
+        let entry = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.path == snapshot_relative)
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "{MODEL_25_ID}: selected component {} is absent from the full snapshot inventory",
+                    component.path().display()
+                ))
+            })?;
+        rows.push(format!(
+            "{}:{bundle_relative}:{}:{}",
+            component.component().id(),
+            entry.bytes,
+            entry.sha256
+        ));
+    }
+    rows.sort();
+    rows.insert(0, format!("mode:{}", mode.id()));
+    rows.insert(0, format!("variant:{}", variant.id()));
+    Ok(sha256_hex(rows.join("\n").as_bytes()))
+}
+
+/// Reconstruct the active production identity from the exact public bundle on disk and a reviewed
+/// source-to-public promotion binding. The final public revision, full inventory, selected bundle,
+/// and transformer operator contract are re-derived live; no model-provided sidecar can authorize
+/// itself.
 pub fn runtime_identity_from_bundle(
     spec: &LoadSpec,
     bundle: &LtxBundle,
     mode: Ltx25QuantMode,
     variant: TransformerVariant,
+    promotion: &Ltx25QuantRuntimeIdentity,
 ) -> gen_core::Result<Ltx25QuantRuntimeIdentity> {
-    let root = snapshot_root(spec)?;
-    let binding_path = root.join(RUNTIME_BINDING_FILE);
-    let mut identity: Ltx25QuantRuntimeIdentity =
-        serde_json::from_slice(&fs::read(&binding_path).map_err(|error| {
-            gen_core::Error::Unsupported(format!(
-                "{MODEL_25_ID}: advanced quant bundle lacks readable {}: {error}",
-                binding_path.display()
-            ))
-        })?)
-        .map_err(|error| {
-            gen_core::Error::Unsupported(format!(
-                "{MODEL_25_ID}: parse runtime binding {}: {error}",
-                binding_path.display()
-            ))
-        })?;
+    let root =
+        canonical_public_snapshot_for_selected(&snapshot_root(spec)?, &promotion.bundle_subdir)?;
     let inventory = inventory_for_snapshot(&root)?;
     let model_revision = snapshot_revision(&root)?;
     let inventory_sha256 = snapshot_inventory_sha256(&inventory)?;
     let bundle_hash =
         bundle_identity_sha256(bundle, &root, &inventory, &inventory_sha256, variant, mode)?;
+    let selected_hash = selected_bundle_identity_sha256(
+        bundle,
+        &root,
+        &promotion.bundle_subdir,
+        &inventory,
+        variant,
+        mode,
+    )?;
     let transformer = bundle.require(LtxComponent::Transformer)?.path();
     let inspection = crate::advanced_quant::inspect_transformer_source(transformer, mode)
         .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
-    if identity.mode != mode
-        || identity.transformer_variant != variant
-        || identity.executable_contract_sha256 != env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
-        || identity.model_revision != model_revision
-        || identity.model_inventory_sha256 != inventory_sha256
-        || identity.runtime_bundle_sha256 != bundle_hash
-        || identity.operator_contract_sha256 != inspection.operator_contract_sha256
+    if promotion.mode != mode
+        || promotion.transformer_variant != variant
+        || promotion.public_repository != LTX25_PUBLIC_REPOSITORY
+        || !is_normalized_bundle_subdir(&promotion.bf16_text_encoder_subpath)
+        || promotion.bf16_text_encoder_subpath == "."
+        || !is_lower_hex(&promotion.public_readback_sha256, 64)
+        || !is_lower_hex(&promotion.public_replay_receipt_sha256, 64)
+        || !is_lower_hex(&promotion.public_replay_output_sha256, 64)
+        || promotion.executable_contract_sha256 != env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
+        || promotion.model_revision != model_revision
+        || promotion.model_inventory_sha256 != inventory_sha256
+        || promotion.runtime_bundle_sha256 != bundle_hash
+        || promotion.selected_bundle_sha256 != selected_hash
+        || promotion.source_selected_bundle_sha256 != selected_hash
+        || promotion.operator_contract_sha256 != inspection.operator_contract_sha256
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_25_ID}: runtime binding disagrees with active code/model/bundle/operator identity; receipt replay is refused"
+            "{MODEL_25_ID}: promotion binding disagrees with active code/public-model/bundle/operator identity; receipt replay is refused"
         )));
     }
+    let mut identity = promotion.clone();
     identity.model_inventory_sha256 = inventory_sha256;
     identity.runtime_bundle_sha256 = bundle_hash;
+    identity.selected_bundle_sha256 = selected_hash;
     Ok(identity)
 }
 
@@ -1174,10 +1584,22 @@ mod tests {
             executable_sha256: "4".repeat(64),
             model_revision: "b".repeat(40),
             model_inventory_sha256: "c".repeat(64),
+            bundle_subdir: "bundles/distilled/int8".to_owned(),
+            bf16_text_encoder_subpath: if matches!(
+                case.mode,
+                Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+            ) {
+                "shared/gemma4-bf16.safetensors".to_owned()
+            } else {
+                String::new()
+            },
             runtime_bundle_sha256: "5".repeat(64),
+            selected_bundle_sha256: "0".repeat(64),
             reference_model_revision: "9".repeat(40),
             reference_model_inventory_sha256: "a".repeat(64),
+            reference_bundle_subdir: "bundles/distilled/bf16".to_owned(),
             reference_runtime_bundle_sha256: "b".repeat(64),
+            reference_selected_bundle_sha256: "2".repeat(64),
             gpu_name: if case.gpu == Ltx25GpuGeneration::AdaSm89 {
                 "NVIDIA GeForce RTX 4090".to_owned()
             } else {
@@ -1185,7 +1607,7 @@ mod tests {
             },
             compute_capability: cap.to_owned(),
             driver_version: "580.12".to_owned(),
-            harness_version: "sc-18777-terminal-v4".to_owned(),
+            harness_version: "sc-18777-terminal-v6".to_owned(),
             run_nonce_sha256: "d".repeat(64),
             transcript_sha256: "e".repeat(64),
             evidence_manifest_sha256: "f".repeat(64),
@@ -1224,17 +1646,32 @@ mod tests {
     }
 
     fn runtime(receipt: &Ltx25QuantMeasurementReceipt) -> Ltx25QuantRuntimeIdentity {
-        Ltx25QuantRuntimeIdentity {
+        let mut runtime = Ltx25QuantRuntimeIdentity {
             mode: receipt.mode,
             transformer_variant: receipt.transformer_variant,
             inference_revision: receipt.inference_revision.clone(),
             executable_contract_sha256: receipt.executable_contract_sha256.clone(),
             executable_sha256: receipt.executable_sha256.clone(),
+            source_model_revision: receipt.model_revision.clone(),
+            source_model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+            source_bundle_subdir: receipt.bundle_subdir.clone(),
+            source_bf16_text_encoder_subpath: receipt.bf16_text_encoder_subpath.clone(),
+            source_runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+            source_selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
             model_revision: receipt.model_revision.clone(),
             model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+            bundle_subdir: receipt.bundle_subdir.clone(),
+            bf16_text_encoder_subpath: receipt.bf16_text_encoder_subpath.clone(),
             runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+            selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
+            public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
+            public_readback_sha256: "8".repeat(64),
+            public_replay_receipt_sha256: "9".repeat(64),
+            public_replay_output_sha256: receipt.output_sha256.clone(),
+            promotion_copy_sha256: String::new(),
             reference_model_revision: receipt.reference_model_revision.clone(),
             reference_model_inventory_sha256: receipt.reference_model_inventory_sha256.clone(),
+            reference_bundle_subdir: receipt.reference_bundle_subdir.clone(),
             reference_runtime_bundle_sha256: receipt.reference_runtime_bundle_sha256.clone(),
             receipt_sha256: receipt.receipt_sha256.clone(),
             transcript_sha256: receipt.transcript_sha256.clone(),
@@ -1245,7 +1682,18 @@ mod tests {
             operator_kind: receipt.operator_kind.clone(),
             operator_contract_sha256: receipt.operator_contract_sha256.clone(),
             operator_weight_inventory_sha256: receipt.operator_weight_inventory_sha256.clone(),
-        }
+        };
+        runtime.promotion_copy_sha256 = promotion_copy_sha256(receipt, &runtime);
+        runtime
+    }
+
+    fn write_minimal_safetensors(path: &Path) {
+        let header = r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -1269,8 +1717,112 @@ mod tests {
         );
         assert_ne!(Ltx25QuantMode::PackedQ8, Ltx25QuantMode::Int8ConvRot);
         assert!(
-            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::AdaSm89, TransformerVariant::Distilled, None, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
+            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
         );
+    }
+
+    #[test]
+    fn promoted_nested_selection_binds_full_public_snapshot_and_explicit_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let revision = "b".repeat(40);
+        let snapshot = dir
+            .path()
+            .join("models--SceneWorks--ltx-2.5-mlx")
+            .join("snapshots")
+            .join(&revision);
+        let bundle_root = snapshot.join("bundles/distilled/int8");
+        let transformer = bundle_root.join("transformer.safetensors");
+        let encoder = snapshot.join("shared/gemma4-bf16.safetensors");
+        write_minimal_safetensors(&transformer);
+        write_minimal_safetensors(&encoder);
+
+        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        let mut promotion = runtime(&measured);
+        promotion.model_revision = revision;
+        promotion.bundle_subdir = "bundles/distilled/int8".to_owned();
+        promotion.bf16_text_encoder_subpath = "shared/gemma4-bf16.safetensors".to_owned();
+        let selected = LoadSpec::new(gen_core::WeightsSource::Dir(bundle_root.clone()));
+        let staged = stage_public_runtime_spec(&selected, &promotion).unwrap();
+        assert_eq!(staged.weights, selected.weights);
+        let canonical_encoder = fs::canonicalize(&encoder).unwrap();
+        assert_eq!(
+            staged.components.get(LtxComponent::TextEncoder.id()),
+            Some(&gen_core::WeightsSource::File(canonical_encoder.clone()))
+        );
+
+        let bundle = candle_gen::gen_core::ltx_checkpoint::LtxBundleBuilder::new()
+            .with_component(
+                LtxComponent::Transformer,
+                fs::canonicalize(&transformer).unwrap(),
+            )
+            .with_component(LtxComponent::TextEncoder, canonical_encoder.clone())
+            .build()
+            .unwrap();
+        let bound = bind_public_runtime_spec(&staged, &bundle, &promotion).unwrap();
+        assert_eq!(
+            bound.weights,
+            gen_core::WeightsSource::Dir(fs::canonicalize(snapshot).unwrap())
+        );
+        assert_eq!(
+            bound.components.get(LtxComponent::Transformer.id()),
+            Some(&gen_core::WeightsSource::File(
+                fs::canonicalize(transformer).unwrap()
+            ))
+        );
+        assert_eq!(
+            bound.components.get(LtxComponent::TextEncoder.id()),
+            Some(&gen_core::WeightsSource::File(canonical_encoder))
+        );
+
+        let private_root = dir
+            .path()
+            .join("models--Private--ltx")
+            .join("snapshots")
+            .join("c".repeat(40))
+            .join("bundles/distilled/int8");
+        fs::create_dir_all(&private_root).unwrap();
+        let private = LoadSpec::new(gen_core::WeightsSource::Dir(private_root));
+        assert!(stage_public_runtime_spec(&private, &promotion).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_bound_file_preserves_hf_logical_path_and_rejects_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--SceneWorks--ltx-2.5-mlx");
+        let snapshot = repo.join("snapshots").join("b".repeat(40));
+        let blobs = repo.join("blobs");
+        fs::create_dir_all(snapshot.join("shared")).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        let blob = blobs.join("object");
+        write_minimal_safetensors(&blob);
+        let logical = snapshot.join("shared/gemma.safetensors");
+        symlink(&blob, &logical).unwrap();
+
+        assert_eq!(
+            snapshot_bound_file(
+                &fs::canonicalize(&snapshot).unwrap(),
+                Path::new("shared/gemma.safetensors"),
+                "test encoder"
+            )
+            .unwrap(),
+            fs::canonicalize(&snapshot)
+                .unwrap()
+                .join("shared/gemma.safetensors")
+        );
+
+        let outside = dir.path().join("outside.safetensors");
+        write_minimal_safetensors(&outside);
+        let escaped = snapshot.join("shared/escaped.safetensors");
+        symlink(outside, &escaped).unwrap();
+        assert!(snapshot_bound_file(
+            &fs::canonicalize(snapshot).unwrap(),
+            Path::new("shared/escaped.safetensors"),
+            "test encoder"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1315,7 +1867,7 @@ mod tests {
         assert!(!catalog_advertised(Ltx25QuantMode::Int8ConvRot));
         assert!(!catalog_advertised(Ltx25QuantMode::Nvfp4));
         assert!(
-            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::AdaSm89, TransformerVariant::Distilled, None, ACCEPTED_MEASUREMENT_RECEIPTS), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
+            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, ACCEPTED_MEASUREMENT_RECEIPTS.as_slice()), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
         );
     }
 
@@ -1323,10 +1875,11 @@ mod tests {
     fn promotion_allowlist_is_external_to_the_stable_code_contract() {
         assert_eq!(
             include_str!("accepted_quant_receipts.allowlist").trim(),
-            "&[]"
+            "[]"
         );
         let source = include_str!("quant_eval.rs");
-        assert!(source.contains("include!(\"accepted_quant_receipts.allowlist\")"));
+        assert!(source.contains("include_str!(\"accepted_quant_receipts.allowlist\")"));
+        assert!(source.contains("LazyLock<Vec<Ltx25QuantAcceptedMeasurement>>"));
         let build = include_str!("../build.rs");
         assert!(build.contains("extension == \"rs\""));
         assert!(!build.contains("accepted_quant_receipts.allowlist"));
@@ -1337,14 +1890,14 @@ mod tests {
             .split("pub fn runtime_identity_from_bundle(")
             .nth(1)
             .unwrap();
-        assert!(runtime.contains("identity.executable_contract_sha256"));
-        assert!(!runtime
-            .contains("identity.inference_revision != env!(\"LTX25_BUILD_INFERENCE_REVISION\")"));
+        assert!(runtime.contains("promotion.executable_contract_sha256"));
+        assert!(runtime.contains("promotion.source_selected_bundle_sha256 != selected_hash"));
+        assert!(!runtime.contains("fs::read(&binding_path)"));
     }
 
     #[test]
     fn receipt_cannot_omit_peak_wall_quality_or_identity() {
-        let mut row = receipt("ltx25-int8-convrot-ada-v1");
+        let mut row = receipt("ltx25-int8-convrot-blackwell-v1");
         row.peak_vram_bytes = 0;
         row.wall_clock_ms = 0;
         row.quality.temporal_boundary_drift = f64::NAN;
@@ -1367,7 +1920,7 @@ mod tests {
 
     #[test]
     fn sealed_receipt_cannot_be_replayed_across_code_model_gpu_or_case_identity() {
-        let original = receipt("ltx25-int8-convrot-ada-v1");
+        let original = receipt("ltx25-int8-convrot-blackwell-v1");
         assert!(original.validation_errors().is_empty());
         let mut mutations = Vec::new();
         let mut code = original.clone();
@@ -1383,7 +1936,7 @@ mod tests {
         gpu.gpu_name = "different GPU".to_owned();
         mutations.push(gpu);
         let mut case = original.clone();
-        case.case_id = "ltx25-int8-convrot-blackwell-v1".to_owned();
+        case.case_id = "ltx25-int8-convrot-blackwell-dev-v1".to_owned();
         mutations.push(case);
         let mut variant = original.clone();
         variant.transformer_variant = TransformerVariant::Dev;
@@ -1396,15 +1949,19 @@ mod tests {
 
     #[test]
     fn production_admission_compares_every_replay_sensitive_runtime_field() {
-        let accepted = receipt("ltx25-int8-convrot-ada-v1");
+        let accepted = receipt("ltx25-int8-convrot-blackwell-v1");
         let identity = runtime(&accepted);
+        let accepted_record = Ltx25QuantAcceptedMeasurement {
+            receipt: accepted.clone(),
+            runtime: identity.clone(),
+        };
         assert_eq!(
             admit(
                 accepted.mode,
                 accepted.gpu_generation,
                 accepted.transformer_variant,
                 Some(&identity),
-                std::slice::from_ref(&accepted),
+                std::slice::from_ref(&accepted_record),
             ),
             Ltx25QuantAdmission::Admitted
         );
@@ -1412,11 +1969,24 @@ mod tests {
             |value| value.inference_revision = "0".repeat(40),
             |value| value.executable_contract_sha256 = "0".repeat(64),
             |value| value.executable_sha256 = "0".repeat(64),
+            |value| value.source_model_revision = "0".repeat(40),
+            |value| value.source_model_inventory_sha256 = "0".repeat(64),
+            |value| value.source_bundle_subdir = "bundles/other".to_owned(),
+            |value| value.source_runtime_bundle_sha256 = "0".repeat(64),
+            |value| value.source_selected_bundle_sha256 = "f".repeat(64),
             |value| value.model_revision = "0".repeat(40),
             |value| value.model_inventory_sha256 = "0".repeat(64),
+            |value| value.bundle_subdir = "bundles/other".to_owned(),
             |value| value.runtime_bundle_sha256 = "0".repeat(64),
+            |value| value.selected_bundle_sha256 = "f".repeat(64),
+            |value| value.public_repository = "private/repository".to_owned(),
+            |value| value.public_readback_sha256 = "0".repeat(64),
+            |value| value.public_replay_receipt_sha256 = "0".repeat(64),
+            |value| value.public_replay_output_sha256 = "0".repeat(64),
+            |value| value.promotion_copy_sha256 = "0".repeat(64),
             |value| value.reference_model_revision = "0".repeat(40),
             |value| value.reference_model_inventory_sha256 = "0".repeat(64),
+            |value| value.reference_bundle_subdir = "bundles/other".to_owned(),
             |value| value.reference_runtime_bundle_sha256 = "0".repeat(64),
             |value| value.receipt_sha256 = "0".repeat(64),
             |value| value.transcript_sha256 = "0".repeat(64),
@@ -1436,7 +2006,7 @@ mod tests {
                 accepted.gpu_generation,
                 accepted.transformer_variant,
                 Some(&replay),
-                std::slice::from_ref(&accepted),
+                std::slice::from_ref(&accepted_record),
             );
             assert!(
                 matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("replay")),
@@ -1446,11 +2016,32 @@ mod tests {
     }
 
     #[test]
-    fn full_matrix_distinguishes_all_five_modes_and_nvfp4_is_sm120_only() {
-        for gpu in [
-            Ltx25GpuGeneration::AdaSm89,
-            Ltx25GpuGeneration::ConsumerBlackwellSm120,
-        ] {
+    fn promotion_copy_proof_cannot_be_replayed_across_public_identity_or_selected_bytes() {
+        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        let original = runtime(&measured);
+        assert!(receipt_matches_runtime(&measured, &original));
+
+        let mut public_revision = original.clone();
+        public_revision.model_revision = "f".repeat(40);
+        assert!(!receipt_matches_runtime(&measured, &public_revision));
+
+        let mut different_selected_bytes = original;
+        different_selected_bytes.selected_bundle_sha256 = "f".repeat(64);
+        different_selected_bytes.promotion_copy_sha256 =
+            promotion_copy_sha256(&measured, &different_selected_bytes);
+        assert!(!receipt_matches_runtime(
+            &measured,
+            &different_selected_bytes
+        ));
+    }
+
+    #[test]
+    fn current_pool_matrix_is_sm120_only_and_nvfp4_is_distilled_only() {
+        assert_eq!(TERMINAL_MEASUREMENT_CASES.len(), 9);
+        assert!(TERMINAL_MEASUREMENT_CASES
+            .iter()
+            .all(|case| case.gpu == Ltx25GpuGeneration::ConsumerBlackwellSm120));
+        for variant in [TransformerVariant::Distilled, TransformerVariant::Dev] {
             for mode in [
                 Ltx25QuantMode::Bf16,
                 Ltx25QuantMode::Q4,
@@ -1459,7 +2050,7 @@ mod tests {
             ] {
                 assert!(TERMINAL_MEASUREMENT_CASES
                     .iter()
-                    .any(|case| case.mode == mode && case.gpu == gpu));
+                    .any(|case| case.mode == mode && case.transformer_variant == variant));
             }
         }
         assert!(TERMINAL_MEASUREMENT_CASES
@@ -1469,6 +2060,16 @@ mod tests {
         assert!(!TERMINAL_MEASUREMENT_CASES
             .iter()
             .any(|case| case.mode == Ltx25QuantMode::Nvfp4
-                && case.gpu != Ltx25GpuGeneration::ConsumerBlackwellSm120));
+                && case.transformer_variant == TransformerVariant::Dev));
+        assert!(matches!(
+            admit(
+                Ltx25QuantMode::Int8ConvRot,
+                Ltx25GpuGeneration::AdaSm89,
+                TransformerVariant::Distilled,
+                None,
+                &[],
+            ),
+            Ltx25QuantAdmission::Refused { reason } if reason.contains("no supported terminal measurement case")
+        ));
     }
 }

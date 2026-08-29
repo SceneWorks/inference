@@ -1,0 +1,115 @@
+name: LTX-2.5 quant campaign
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_revision:
+        description: Exact public SceneWorks/ltx-2.5-mlx revision containing all nine campaign bundles
+        type: string
+        required: true
+      physical_gpu:
+        description: One physical Blackwell GPU ordinal (no list)
+        type: string
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+# The Windows host may expose more than one listener/GPU. Only one complete campaign is allowed to
+# occupy it at a time; the driver additionally makes exactly one physical ordinal visible.
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+jobs:
+  campaign:
+    name: Serial consumer-Blackwell campaign
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 1440
+    env:
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "120"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+      PUBLIC_REVISION: ${{ inputs.public_revision }}
+      PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+      LTX25_HF_CACHE_ROOT: ${{ vars.CANDLE_LTX25_HF_CACHE_ROOT }}
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - name: Validate immutable public source and one consumer Blackwell device
+        shell: powershell
+        run: |
+          if ($env:PUBLIC_REVISION -notmatch '^[0-9a-f]{40}$') {
+            throw "public_revision must be one exact lowercase 40-hex revision"
+          }
+          if ($env:PHYSICAL_GPU -notmatch '^\d+$') {
+            throw "physical_gpu must be one numeric physical ordinal"
+          }
+          if (-not $env:LTX25_HF_CACHE_ROOT -or
+              -not [System.IO.Path]::IsPathRooted($env:LTX25_HF_CACHE_ROOT)) {
+            throw "repository variable CANDLE_LTX25_HF_CACHE_ROOT must be an absolute persistent Windows cache root"
+          }
+          $capability = (nvidia-smi -i $env:PHYSICAL_GPU --query-gpu=compute_cap --format=csv,noheader,nounits).Trim()
+          if ($LASTEXITCODE -ne 0 -or $capability -ne '12.0') {
+            throw "LTX-2.5 terminal campaign requires exact consumer Blackwell sm_120; got '$capability'"
+          }
+          $suffix = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $manifest = Join-Path $env:RUNNER_TEMP "ltx25-quant-campaign-$suffix.json"
+          $readback = Join-Path $env:RUNNER_TEMP "ltx25-public-readback-$suffix.json"
+          $evidence = Join-Path $env:RUNNER_TEMP "ltx25-quant-evidence-$suffix"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CAMPAIGN_MANIFEST=$manifest"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CAMPAIGN_READBACK=$readback"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "EVIDENCE_ROOT=$evidence"
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Materialize full public snapshot and exact campaign manifest
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/prepare_ltx25_quant_campaign.py campaign --revision "%PUBLIC_REVISION%" --cache-root "%LTX25_HF_CACHE_ROOT%" --manifest-out "%CAMPAIGN_MANIFEST%" --readback-out "%CAMPAIGN_READBACK%" || exit /b 1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Build terminal producer once
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo build --release --locked -p candle-gen-ltx --features cuda,terminal-quant-measurement --example ltx25-quant-measure || exit /b 1
+      - name: Run BF16 references then candidates serially
+        shell: powershell
+        run: |
+          $producer = Join-Path $PWD "target\release\examples\ltx25-quant-measure.exe"
+          & $producer `
+            --acknowledgement I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY `
+            --campaign-manifest $env:CAMPAIGN_MANIFEST `
+            --output-root $env:EVIDENCE_ROOT `
+            --physical-gpu $env:PHYSICAL_GPU
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $controller = Join-Path $env:EVIDENCE_ROOT "controller"
+          New-Item -ItemType Directory -Path $controller -Force | Out-Null
+          Copy-Item -LiteralPath $producer -Destination (Join-Path $controller "ltx25-quant-measure.exe")
+          Copy-Item -LiteralPath $env:CAMPAIGN_MANIFEST -Destination (Join-Path $controller "campaign-manifest.json")
+          Copy-Item -LiteralPath $env:CAMPAIGN_READBACK -Destination (Join-Path $controller "campaign-public-readback.json")
+      - name: Upload sealed campaign evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ltx25-quant-campaign-${{ github.sha }}-gpu${{ inputs.physical_gpu }}-attempt${{ github.run_attempt }}
+          path: ${{ runner.temp }}\ltx25-quant-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error

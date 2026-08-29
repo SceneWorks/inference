@@ -14,13 +14,16 @@
 //! single `.safetensors`; [`declared_model_version`] handles both, so the gate is the same shape on
 //! either input.
 
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
+use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::gen_core::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
 use candle_gen::gen_core::{self, LoadSpec, WeightsSource};
+use safetensors::Dtype as SafetensorDtype;
 
 /// The `model_version` a checkpoint location declares — the `split_model.json` manifest of a packed
 /// MLX tier first, then any component file's `__metadata__`. `None` when nothing declares one.
@@ -92,6 +95,73 @@ pub fn resolve_split_bundle(spec: &LoadSpec) -> gen_core::Result<LtxBundle> {
     builder.build()
 }
 
+/// Bind an explicitly selected nested bundle to its complete immutable snapshot.
+///
+/// Discovery is confined to `bundle_subdir`, then every discovered component is copied into an
+/// explicit [`LoadSpec::components`] slot while [`LoadSpec::weights`] remains the full snapshot
+/// root. This is the terminal campaign and production-replay shape: component choice is narrow,
+/// but inventory and runtime provenance cover the complete public/upstream snapshot.
+pub fn select_snapshot_bundle(
+    snapshot_root: &Path,
+    bundle_subdir: &Path,
+) -> gen_core::Result<(LoadSpec, String)> {
+    if bundle_subdir.is_absolute()
+        || bundle_subdir.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 bundle subdir {} must be relative and cannot contain parent traversal",
+            bundle_subdir.display()
+        )));
+    }
+    let snapshot_root = fs::canonicalize(snapshot_root).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize LTX-2.5 snapshot {}: {error}",
+            snapshot_root.display()
+        ))
+    })?;
+    let bundle_root = fs::canonicalize(snapshot_root.join(bundle_subdir)).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize selected LTX-2.5 bundle {}: {error}",
+            snapshot_root.join(bundle_subdir).display()
+        ))
+    })?;
+    if !bundle_root.is_dir() || !bundle_root.starts_with(&snapshot_root) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "selected LTX-2.5 bundle {} must be a directory inside snapshot {}",
+            bundle_root.display(),
+            snapshot_root.display()
+        )));
+    }
+    let logical = bundle_root
+        .strip_prefix(&snapshot_root)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let logical = if logical.is_empty() {
+        ".".to_owned()
+    } else {
+        logical
+    };
+
+    let discovered = resolve_split_bundle(&LoadSpec::new(WeightsSource::Dir(bundle_root)))?;
+    let mut selected = LoadSpec::new(WeightsSource::Dir(snapshot_root));
+    for component in discovered.components() {
+        let path = component.path().to_path_buf();
+        let source = if path.is_dir() {
+            WeightsSource::Dir(path)
+        } else {
+            WeightsSource::File(path)
+        };
+        selected = selected.with_component(component.component().id(), source);
+    }
+    Ok((selected, logical))
+}
+
 /// Read the text encoder's declared identity (`model_type` + `gemma_version`) from whichever layout
 /// it ships as: a packed single-file encoder (LTX-2.5) or an HF snapshot directory (LTX-2.3).
 pub fn text_encoder_identity(bundle: &LtxBundle) -> gen_core::Result<GemmaEncoderIdentity> {
@@ -104,6 +174,34 @@ pub fn text_encoder_identity(bundle: &LtxBundle) -> gen_core::Result<GemmaEncode
 pub fn assert_gemma_version(bundle: &LtxBundle) -> gen_core::Result<GemmaVersionCheck> {
     let encoder = text_encoder_identity(bundle)?;
     bundle.check_gemma_version(&encoder)
+}
+
+/// Require the advanced CUDA lane's explicitly selected upstream Gemma-4 text encoder to be a
+/// genuinely dense BF16 safetensors source. Comfy's I8 encoder must never be interpreted through the
+/// Candle dense path merely because it declares the same Gemma generation.
+pub fn assert_bf16_text_encoder(bundle: &LtxBundle) -> gen_core::Result<()> {
+    let path = bundle.require(LtxComponent::TextEncoder)?.path();
+    if !path.is_file() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 advanced text encoder {} must be one explicit BF16 safetensors file",
+            path.display()
+        )));
+    }
+    // SAFETY: read-only safetensors header inspection; no tensor/device allocation occurs.
+    let safetensors = unsafe { MmapedSafetensors::new(path) }
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let tensors = safetensors.tensors();
+    if tensors.is_empty()
+        || tensors
+            .iter()
+            .any(|(_, tensor)| tensor.dtype() != SafetensorDtype::BF16)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 advanced text encoder {} is not an all-BF16 upstream Gemma source; Comfy/I8 or mixed sources are forbidden",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -179,6 +277,18 @@ mod tests {
         );
     }
 
+    fn write_typed_safetensors(path: &Path, dtype: &str, payload: &[u8]) {
+        let header = format!(
+            r#"{{"weight":{{"dtype":"{dtype}","shape":[1],"data_offsets":[0,{}]}}}}"#,
+            payload.len()
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(payload);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn a_dense_2_3_checkpoint_declares_the_all_in_one_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -208,6 +318,113 @@ mod tests {
             declared_layout(dir.path()).unwrap(),
             LtxCheckpointLayout::AllInOne
         );
+    }
+
+    #[test]
+    fn nested_bundle_selection_keeps_the_full_snapshot_as_weights_and_explicitly_pins_components() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let nested = snapshot.path().join("packages/distilled-bf16");
+        write_2_5_bundle(&nested);
+        std::fs::write(snapshot.path().join("upstream-readme.md"), b"full snapshot").unwrap();
+
+        let (spec, logical) =
+            select_snapshot_bundle(snapshot.path(), Path::new("packages/distilled-bf16")).unwrap();
+        assert_eq!(logical, "packages/distilled-bf16");
+        assert_eq!(
+            spec.weights,
+            WeightsSource::Dir(std::fs::canonicalize(snapshot.path()).unwrap())
+        );
+        assert!(!spec.components.is_empty());
+        let nested = std::fs::canonicalize(nested).unwrap();
+        assert!(spec.components.values().all(|source| {
+            let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
+            path.starts_with(&nested)
+        }));
+    }
+
+    #[test]
+    fn nested_bundle_selection_refuses_parent_traversal() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let error = select_snapshot_bundle(snapshot.path(), Path::new("../outside"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("parent traversal"), "{error}");
+    }
+
+    #[test]
+    fn selected_bundle_digest_allows_unrelated_snapshot_files_but_rejects_component_mutation() {
+        use crate::dev_sampler::TransformerVariant;
+        use crate::quant_eval::{
+            inventory_for_snapshot, selected_bundle_identity_sha256, Ltx25QuantMode,
+        };
+
+        let source = tempfile::tempdir().unwrap();
+        let public = tempfile::tempdir().unwrap();
+        for root in [source.path(), public.path()] {
+            write_2_5_bundle(&root.join("packages/distilled-bf16"));
+        }
+        std::fs::write(source.path().join("source-only.txt"), b"upstream").unwrap();
+        std::fs::write(public.path().join("public-card.md"), b"SceneWorks").unwrap();
+        let (source_spec, source_subdir) =
+            select_snapshot_bundle(source.path(), Path::new("packages/distilled-bf16")).unwrap();
+        let (public_spec, public_subdir) =
+            select_snapshot_bundle(public.path(), Path::new("packages/distilled-bf16")).unwrap();
+        let source_bundle = resolve_split_bundle(&source_spec).unwrap();
+        let public_bundle = resolve_split_bundle(&public_spec).unwrap();
+        let source_root = std::fs::canonicalize(source.path()).unwrap();
+        let public_root = std::fs::canonicalize(public.path()).unwrap();
+        let source_inventory = inventory_for_snapshot(&source_root).unwrap();
+        let public_inventory = inventory_for_snapshot(&public_root).unwrap();
+        let source_digest = selected_bundle_identity_sha256(
+            &source_bundle,
+            &source_root,
+            &source_subdir,
+            &source_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        let public_digest = selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &public_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        assert_eq!(source_digest, public_digest);
+
+        let transformer = public
+            .path()
+            .join("packages/distilled-bf16/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors");
+        let mut bytes = std::fs::read(&transformer).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&transformer, bytes).unwrap();
+        let mutated_inventory = inventory_for_snapshot(&public_root).unwrap();
+        let mutated = selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &mutated_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        assert_ne!(source_digest, mutated);
+
+        let renamed = transformer.with_file_name("renamed-transformer.safetensors");
+        std::fs::rename(&transformer, renamed).unwrap();
+        let renamed_inventory = inventory_for_snapshot(&public_root).unwrap();
+        assert!(selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &renamed_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .is_err());
     }
 
     #[test]
@@ -244,6 +461,28 @@ mod tests {
             assert_gemma_version(&bundle).unwrap(),
             GemmaVersionCheck::Matched(_)
         ));
+    }
+
+    #[test]
+    fn advanced_text_encoder_accepts_only_explicit_all_bf16_upstream_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let bf16 = dir.path().join("upstream-gemma4-bf16.safetensors");
+        write_typed_safetensors(&bf16, "BF16", &[0, 0]);
+        let bundle = LtxBundleBuilder::new()
+            .with_component(LtxComponent::TextEncoder, bf16)
+            .build()
+            .unwrap();
+        assert_bf16_text_encoder(&bundle).unwrap();
+
+        let int8 = dir.path().join("comfy-gemma4-int8.safetensors");
+        write_typed_safetensors(&int8, "I8", &[0]);
+        let bundle = LtxBundleBuilder::new()
+            .with_component(LtxComponent::TextEncoder, int8)
+            .build()
+            .unwrap();
+        let error = assert_bf16_text_encoder(&bundle)
+            .expect_err("the Comfy I8 text encoder must fail before device loading");
+        assert!(error.to_string().contains("Comfy/I8"));
     }
 
     #[test]
