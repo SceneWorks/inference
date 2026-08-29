@@ -59,8 +59,8 @@
       "owner": "SceneWorks",
       "purpose": "security/sanitizer acceptance; not an SVG-Bench image-quality case",
       "generator": "starvector-terminal-hostile-v1",
-      "content_identity_sha256": "47ee8f0ff3643c44b79c8893c5b1a0cbcdf98acbfc332c87d91d3e48bb0dcaf1",
-      "selection_rule": "Generate ten canonical payloads for each of 20 ordered E5 families: prefix, suffix, multiple-root, malformed, DTD/entity, PI/CDATA, script, foreignObject, event handler, CSS import, animation, external/data/file href, use, text, and byte/node-depth/attribute-path/coordinate-dimension-viewBox overruns. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 payload identities."
+      "content_identity_sha256": "60a6aa7022e9c2b14b9c9aa51f9a329a5a97eb1118e2e3e836f3c59a5897f236",
+      "selection_rule": "Generate ten canonical payloads for each of 20 ordered E5 families: structure variants; doctype/entity; PI/CDATA; script; foreignObject; handler; CSS import; animation; external/data/file href; use; text; and byte/node/depth/attribute-total-value/path-command-number/points-transform/coordinate-dimension-viewBox overruns. Combined families alternate actual variant payloads by ordinal. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 payload identities."
     },
     "prompt_composition": {
       "required_count": 60,
