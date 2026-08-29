@@ -521,6 +521,7 @@ pub(crate) fn active_source() -> Option<Arc<AdvancedQuantSource>> {
     ACTIVE_SOURCE.with(|active| active.borrow().last().cloned())
 }
 
+#[cfg(any(test, feature = "terminal-quant-measurement"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperatorAttestation {
     pub mode: Ltx25QuantMode,
@@ -541,6 +542,7 @@ thread_local! {
     static OPERATOR_ATTESTATION: RefCell<AttestationState> = RefCell::new(AttestationState::default());
 }
 
+#[cfg(any(test, feature = "terminal-quant-measurement"))]
 pub fn begin_operator_attestation(mode: Ltx25QuantMode) {
     OPERATOR_ATTESTATION.with(|state| {
         *state.borrow_mut() = AttestationState {
@@ -572,10 +574,12 @@ pub(crate) fn record_projection_execution(
     });
 }
 
+#[cfg(any(test, feature = "terminal-quant-measurement"))]
 pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
     OPERATOR_ATTESTATION.with(|state| finish_attestation(&state.borrow()))
 }
 
+#[cfg(any(test, feature = "terminal-quant-measurement"))]
 fn finish_attestation(state: &AttestationState) -> Result<OperatorAttestation> {
     let mode = state
         .mode

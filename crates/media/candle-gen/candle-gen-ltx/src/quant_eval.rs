@@ -382,6 +382,7 @@ pub struct Ltx25QuantMeasurementReceipt {
 
 /// Internal pre-seal shape. Only the terminal controller can turn an observation into a receipt;
 /// production code only validates an already-reviewed entry.
+#[cfg(any(test, feature = "terminal-quant-measurement"))]
 pub(crate) struct Ltx25QuantMeasurementDraft {
     pub case_id: String,
     pub mode: Ltx25QuantMode,
@@ -539,6 +540,7 @@ impl Ltx25QuantMeasurementReceipt {
         fields.join("\n")
     }
 
+    #[cfg(any(test, feature = "terminal-quant-measurement"))]
     pub(crate) fn seal(draft: Ltx25QuantMeasurementDraft) -> Self {
         let mut receipt = Self {
             schema_version: "sceneworks-ltx25-quant-receipt-v4".to_owned(),
