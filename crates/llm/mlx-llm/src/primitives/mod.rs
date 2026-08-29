@@ -31,7 +31,7 @@ pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_ma
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
+pub use kv_cache::{CacheRoute, ContiguousKvCache, KvCache, PackedAttentionMask};
 pub use nn::{
     conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
     soft_cap,

@@ -301,6 +301,46 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         self.dense.update(layer, keys, values)
     }
 
+    fn try_packed_attention(
+        &mut self,
+        layer: usize,
+        query: &mlx_rs::Array,
+        keys: &mlx_rs::Array,
+        values: &mlx_rs::Array,
+        mask: crate::primitives::kv_cache::PackedAttentionMask,
+        _scale: f32,
+        retained_for_sharing: bool,
+    ) -> Result<Option<mlx_rs::Array>> {
+        if retained_for_sharing || self.staged.compiled_handle().is_none() {
+            return Ok(None);
+        }
+        let packed_mask = match mask {
+            crate::primitives::kv_cache::PackedAttentionMask::None
+            | crate::primitives::kv_cache::PackedAttentionMask::Causal => {
+                crate::primitives::packed_metal::PackedMask::Causal
+            }
+            crate::primitives::kv_cache::PackedAttentionMask::SlidingWindow(window) => {
+                crate::primitives::packed_metal::PackedMask::SlidingWindow(window)
+            }
+            crate::primitives::kv_cache::PackedAttentionMask::Additive => return Ok(None),
+        };
+        let keys = keys.as_dtype(mlx_rs::Dtype::Float32)?;
+        let values = values.as_dtype(mlx_rs::Dtype::Float32)?;
+        keys.eval()?;
+        values.eval()?;
+        let step = keys.shape()[2] as usize;
+        let mut staged = self.staged.clone();
+        staged.append(
+            layer,
+            keys.as_slice::<f32>(),
+            values.as_slice::<f32>(),
+            step,
+        )?;
+        let output = staged.dispatch_packed(layer, query, packed_mask)?;
+        self.staged = staged;
+        Ok(Some(output))
+    }
+
     fn offset(&self) -> i32 {
         self.dense.offset()
     }

@@ -55,6 +55,7 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
 use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::PackedAttentionMask;
 use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
 };
@@ -1315,6 +1316,32 @@ impl LlamaAttention {
         let (k_all, v_all) = match &self.kv {
             Some(kv) => {
                 let (k, v) = self.project_kv(kv, x, cos, sin)?;
+                // The packed route is an explicit opt-in on the cache. It is attempted before
+                // `update`, so an accepted result cannot accidentally materialize full K/V and
+                // then fall through to dense SDPA. Shared-K/V and score-softcap layers stay on
+                // the established path because the retained reader cannot preserve those extra
+                // semantics without a dense shared tensor.
+                if self.softcap.is_none() {
+                    let packed_mask = match mask {
+                        AttnMask::Causal => PackedAttentionMask::Causal,
+                        AttnMask::SlidingCausal { window } => {
+                            PackedAttentionMask::SlidingWindow(window as usize)
+                        }
+                        AttnMask::None if q.shape()[2] == 1 => PackedAttentionMask::Causal,
+                        AttnMask::None | AttnMask::Additive(_) => PackedAttentionMask::Additive,
+                    };
+                    if let Some(out) = cache.try_packed_attention(
+                        layer_idx,
+                        &q,
+                        &k,
+                        &v,
+                        packed_mask,
+                        self.scale,
+                        self.stores_kv,
+                    )? {
+                        return self.output(&out);
+                    }
+                }
                 let both = cache.update(layer_idx, &k, &v)?;
                 if self.stores_kv {
                     shared.set(self.kind, both.clone());

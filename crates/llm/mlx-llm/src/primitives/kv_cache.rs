@@ -29,6 +29,14 @@ pub enum CacheRoute {
     ExperimentalPacked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackedAttentionMask {
+    None,
+    Causal,
+    SlidingWindow(usize),
+    Additive,
+}
+
 /// The decoder-facing cache contract.
 ///
 /// A decoder, for each layer, hands the cache this step's keys/values and gets back the full
@@ -42,6 +50,22 @@ pub trait KvCache {
         CacheRoute::DenseFallback {
             reason: "experimental packed representation disabled".into(),
         }
+    }
+    /// Optional pre-update packed attention path. Returning `Some` means the cache appended the
+    /// current K/V and produced attention output directly; callers must not call `update` or
+    /// dense SDPA for that layer. The default preserves all existing cache implementations.
+    #[allow(clippy::too_many_arguments)]
+    fn try_packed_attention(
+        &mut self,
+        _layer: usize,
+        _query: &Array,
+        _keys: &Array,
+        _values: &Array,
+        _mask: PackedAttentionMask,
+        _scale: f32,
+        _retained_for_sharing: bool,
+    ) -> Result<Option<Array>> {
+        Ok(None)
     }
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return
     /// the full cached `(keys, values)` to attend over, same layout with the sequence axis grown.
