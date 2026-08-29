@@ -273,12 +273,15 @@ pub fn run_dense_coordinate(
         ..Default::default()
     };
     let mut saw_token = false;
-    let output = provider.generate(&request, &mut |event| {
-        if !saw_token && matches!(event, StreamEvent::Token { .. }) {
-            saw_token = true;
-            observer.phase("first-token");
-        }
-    })?;
+    let output = provider.generate_observed(
+        &request,
+        &mut |event| {
+            if matches!(event, StreamEvent::Token { .. }) {
+                saw_token = true;
+            }
+        },
+        observer,
+    )?;
     if !saw_token {
         return Err(core_llm::Error::InvalidRequest(
             "dense campaign produced no first-token observation".into(),

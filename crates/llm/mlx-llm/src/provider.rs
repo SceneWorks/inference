@@ -23,8 +23,8 @@ use core_llm::{
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill, generate_with, generate_with_observer, ConstraintMask, Decode,
+    FinishReason, GenerationConfig, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -953,6 +953,27 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, None)
+    }
+}
+
+impl LlamaProvider {
+    /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
+    pub(crate) fn generate_observed(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, Some(observer))
+    }
+
+    fn generate_inner(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        mut observer: Option<&mut dyn crate::campaign::Observer>,
+    ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -1235,16 +1256,29 @@ impl TextLlm for LlamaProvider {
                         )
                         .map_err(to_core)?
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?,
+                    None => match observer.as_deref_mut() {
+                        Some(observer) => generate_with_observer(
+                            &self.model,
+                            &prompt_ids,
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            Some(observer),
+                        )
+                        .map_err(to_core)?,
+                        None => generate_with(
+                            &self.model,
+                            &prompt_ids,
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                        )
+                        .map_err(to_core)?,
+                    },
                 },
             }
         };
