@@ -1073,21 +1073,33 @@ impl PackedGroupAffineKvCache {
             .get(layer)
             .and_then(Option::as_ref)
             .ok_or_else(|| Error::Config("packed layer is not resident".into()))?;
-        if storage.keys.pending_tokens != 0 {
-            return Err(Error::Unsupported(
-                "packed Metal reader requires complete key groups".into(),
-            ));
+        // The retained reader uses a physically padded final token group.  Padding is made on a
+        // short-lived argument copy and the logical sequence length remains the real bound used by
+        // the kernel, so first-token/tail calls never expose synthetic values to attention.
+        let mut keys = storage.keys.clone();
+        if keys.pending_tokens != 0 {
+            let pad = keys.group_size - keys.pending_tokens;
+            let mut last = vec![0.0; self.rows() * self.head_dimension];
+            let start = (keys.pending_tokens - 1) * self.rows() * self.head_dimension;
+            for row in 0..self.rows() {
+                let row_start = start + row * self.head_dimension;
+                last[row * self.head_dimension..(row + 1) * self.head_dimension]
+                    .copy_from_slice(&keys.pending[row_start..row_start + self.head_dimension]);
+            }
+            for _ in 0..pad {
+                keys.append(&last, 1)?;
+            }
         }
         let groups = self.logical_len.div_ceil(self.group_size);
         let rows = self.rows();
         let key_bytes = storage.keys.code_bytes_per_group();
         let key_codes = Array::from_slice(
-            &storage.keys.codes,
+            &keys.codes,
             &[self.batch, self.kv_heads, groups, key_bytes].map(|v| v as i32),
         );
         let key_shape = [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
-        let key_scale = Array::from_slice(&storage.keys.scales, &key_shape);
-        let key_zero = Array::from_slice(&storage.keys.zeros, &key_shape);
+        let key_scale = Array::from_slice(&keys.scales, &key_shape);
+        let key_zero = Array::from_slice(&keys.zeros, &key_shape);
         let value_bytes = self.head_dimension.div_ceil(4);
         let value_codes = Array::from_slice(
             &storage.values.codes,
@@ -1098,7 +1110,7 @@ impl PackedGroupAffineKvCache {
             [self.batch, self.kv_heads, self.logical_len, value_groups].map(|v| v as i32);
         let value_scale = Array::from_slice(&storage.values.scales, &value_shape);
         let value_zero = Array::from_slice(&storage.values.zeros, &value_shape);
-        debug_assert_eq!(rows * groups * key_bytes, storage.keys.codes.len());
+        debug_assert_eq!(rows * groups * key_bytes, keys.codes.len());
         Ok((
             key_codes,
             key_scale,
@@ -1124,11 +1136,6 @@ impl PackedGroupAffineKvCache {
         if self.logical_len == 0 {
             return Err(Error::Config(
                 "cannot dispatch an empty packed cache".into(),
-            ));
-        }
-        if !self.logical_len.is_multiple_of(self.group_size) {
-            return Err(Error::Unsupported(
-                "incomplete key group requires dense fallback".into(),
             ));
         }
         let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
