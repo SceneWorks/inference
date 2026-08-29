@@ -610,7 +610,6 @@ impl Pipeline {
                 total,
             });
         }
-        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(())
     }
 
@@ -1205,6 +1204,7 @@ impl Generator for Wan14bGenerator {
             let components = self.components(&pipe)?;
             pipe.render(req, &components, on_progress)?
         };
+        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,

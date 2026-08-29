@@ -138,7 +138,17 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t0 = std::time::Instant::now();
-    let output = gen.generate(&req, &mut on_progress)?;
+    let output = match gen.generate(&req, &mut on_progress) {
+        Ok(output) => output,
+        Err(error)
+            if args.iter().any(|arg| arg == "--sc20686-cancel")
+                && candle_gen_wan::sc20686_observer::campaign_cancelled() =>
+        {
+            println!("[smoke] expected SC-20686 campaign cancellation");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let secs = t0.elapsed().as_secs_f32();
     let (frames, fps) = match output {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),

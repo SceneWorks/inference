@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEvent {
@@ -125,6 +126,13 @@ pub struct CampaignContext {
 pub struct CampaignOutputRequest {
     path: PathBuf,
     cancellation: bool,
+}
+static LAST_CAMPAIGN_CANCELLATION: AtomicBool = AtomicBool::new(false);
+
+/// Whether the most recent armed campaign was cancelled by the product after its first live read.
+/// This survives scope teardown so CLI wrappers can map only that expected error to exit 0.
+pub fn campaign_cancelled() -> bool {
+    LAST_CAMPAIGN_CANCELLATION.load(Ordering::Relaxed)
 }
 
 pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
@@ -318,6 +326,7 @@ pub(crate) fn activate_requested(
     // Metadata is emitted exactly once, after bind_cross_kv_geometry has populated the
     // product-owned attention geometry. Never publish the zero-valued activation placeholder.
     CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = cancellation);
+    LAST_CAMPAIGN_CANCELLATION.store(false, Ordering::Relaxed);
     CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = Some(cancel.clone()));
     Ok(Some(scope))
 }
@@ -672,6 +681,7 @@ pub fn observe_timed(
         && !CANCEL_TRIGGERED.with(|slot| *slot.borrow())
     {
         CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = true);
+        LAST_CAMPAIGN_CANCELLATION.store(true, Ordering::Relaxed);
         CAMPAIGN_HANDLE.with(|slot| {
             if let Some(cancel) = slot.borrow().as_ref() {
                 cancel.cancel();
