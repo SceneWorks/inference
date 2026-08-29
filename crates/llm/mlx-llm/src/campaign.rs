@@ -263,6 +263,50 @@ pub struct ReceiptBuilder {
 
 impl ReceiptBuilder {
     pub fn finish(mut self) -> Result<Receipt, String> {
+        self.template.schema_version = 3;
+        self.template.harness_version = "sc-20671-kv-baseline-v3".into();
+        let digest = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+        let revision = |v: &str| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit());
+        if !digest(&self.template.contract_hash)
+            || !digest(&self.template.provenance.dependency_lock_sha256)
+            || !digest(&self.template.provenance.model_file_sha256)
+            || !revision(&self.template.provenance.scene_works_revision)
+            || !revision(&self.template.provenance.inference_revision)
+        {
+            return Err("malformed receipt identity".into());
+        }
+        if self.template.provenance.thermal_state != "nominal"
+            || !self.template.provenance.command_template.contains("{mode}")
+            || self.template.provenance.command
+                != self
+                    .template
+                    .provenance
+                    .command_template
+                    .replace("{mode}", &self.template.mode)
+        {
+            return Err("invalid command or thermal provenance".into());
+        }
+        if !["llama", "qwen"].contains(&self.template.matrix.family.as_str())
+            || !CONTEXT_BANDS.contains(&self.template.matrix.context_band.as_str())
+            || !["single", "supported-batch"].contains(&self.template.matrix.request_mode.as_str())
+            || !["chunked", "single-shot"].contains(&self.template.matrix.prefill_mode.as_str())
+            || !["cold", "warm"].contains(&self.template.matrix.process_temperature.as_str())
+        {
+            return Err("invalid matrix coordinate".into());
+        }
+        if self.template.geometry.query_heads == 0
+            || self.template.geometry.kv_heads == 0
+            || self.template.geometry.query_heads % self.template.geometry.kv_heads != 0
+            || self.template.geometry.capacity < self.template.geometry.kv_length
+        {
+            return Err("invalid geometry".into());
+        }
+        if (self.template.matrix.request_mode == "single" && self.template.geometry.batch != 1)
+            || (self.template.matrix.request_mode == "supported-batch"
+                && self.template.geometry.batch <= 1)
+        {
+            return Err("batch disagrees with matrix".into());
+        }
         if self.phases.len() != 8 || self.allocations.is_empty() || self.timings.len() != 5 {
             return Err("receipt evidence is incomplete".into());
         }
@@ -461,6 +505,14 @@ pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
         .map_or(true, |v| v.len() != 4)
     {
         return Err("receipt fixture evidence is incomplete".into());
+    }
+    let mut core = value.clone();
+    core.as_object_mut()
+        .ok_or("receipt is not an object")?
+        .remove("receiptSha256");
+    let expected = seal_bytes(&serde_json::to_vec(&core).map_err(|e| e.to_string())?);
+    if object.get("receiptSha256").and_then(|v| v.as_str()) != Some(expected.as_str()) {
+        return Err("receipt semantic hash mismatch".into());
     }
     Ok(())
 }
