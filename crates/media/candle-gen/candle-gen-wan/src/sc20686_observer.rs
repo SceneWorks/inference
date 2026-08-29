@@ -18,6 +18,16 @@ pub struct CacheEvent {
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
 }
+/// Product-owned identity captured after Wan model loading; campaign callers must not populate
+/// evidence fields from CLI claims.
+#[derive(Clone, Debug)]
+pub struct CampaignContext {
+    pub source_ref: String,
+    pub snapshot_sha256: String,
+    pub snapshot_bytes: u64,
+    pub variant: String,
+    pub geometry_json: String,
+}
 pub struct JsonlObserver(File);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
@@ -30,6 +40,11 @@ pub fn install_jsonl(path: impl AsRef<Path>) -> io::Result<Scope> {
     let path = path.as_ref();
     let file = if path == Path::new("-") { File::create("/dev/stdout")? } else { File::create(path)? };
     Ok(install(Box::new(JsonlObserver(file))))
+}
+pub fn install_jsonl_with_context(path: impl AsRef<Path>, context: CampaignContext) -> io::Result<Scope> {
+    let scope = install_jsonl(path)?;
+    observe("metadata", context.snapshot_bytes, 0, 0);
+    Ok(scope)
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 pub struct Scope {
