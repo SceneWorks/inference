@@ -47,6 +47,7 @@ pub struct ReceiptProvenance {
     pub thermal_state: String,
     pub command_template: String,
     pub command: String,
+    pub campaign_session_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +83,45 @@ pub struct ProductGeometry {
     pub head_dimension: u64,
     pub layers: u64,
     pub element_bytes: u64,
+}
+
+/// A campaign-only loaded product session. The provider and prefix cache remain resident across
+/// warmup and measured repeats; ordinary serving continues to use the provider directly.
+pub struct CampaignSession {
+    provider: crate::provider::LlamaProvider,
+    inventory: SnapshotInventory,
+    session_id: String,
+}
+
+impl CampaignSession {
+    pub fn load(snapshot: impl AsRef<Path>) -> core_llm::Result<Self> {
+        let inventory = inventory_snapshot(snapshot.as_ref())
+            .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
+        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            snapshot.as_ref().to_string_lossy().to_string(),
+        ))?;
+        let session_id = seal_bytes(
+            format!(
+                "{}:{}:{}",
+                inventory.sha256,
+                inventory.bytes,
+                std::process::id()
+            )
+            .as_bytes(),
+        );
+        Ok(Self {
+            provider,
+            inventory,
+            session_id,
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn inventory(&self) -> &SnapshotInventory {
+        &self.inventory
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,7 +241,9 @@ pub struct ReceiptQualityStatistics {
     pub confidence_interval: String,
     pub outlier_policy: String,
     pub variance_policy: String,
-    pub max_coefficient_of_variation: f64,
+    #[allow(non_snake_case)]
+    #[serde(rename = "maxCoefficientOfVariation")]
+    pub max_coefficient_of_VARIATION: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -262,6 +304,7 @@ pub struct ReceiptWarmup {
     pub completed: bool,
     pub worker_pid: u32,
     pub suite_sha256: String,
+    pub session_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -600,10 +643,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             p.thermal_state.as_str(),
             p.command_template.as_str(),
             p.command.as_str(),
+            p.campaign_session_id.as_str(),
         ]
         .iter()
         .any(|v| v.is_empty())
         || p.model_file_bytes == 0
+        || !lowercase_hex(&p.campaign_session_id, 64)
         || p.thermal_state != "nominal"
         || !p.command_template.contains("{mode}")
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
@@ -931,6 +976,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || (warm.required != (receipt.matrix.process_temperature == "warm"))
         || (warm.required && (!warm.completed || warm.suite_sha256.len() != 64))
         || (!warm.required && (warm.completed || !warm.suite_sha256.is_empty()))
+        || warm.required && warm.session_id != receipt.provenance.campaign_session_id
+        || !warm.required && !warm.session_id.is_empty()
     {
         return Err("warm worker discipline evidence failed".into());
     }
@@ -983,7 +1030,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.lifecycle.post_run_release {
         return Err("postRunRelease is required".into());
     }
-    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
+    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_VARIATION != 0.05 { return Err("frozen quality statistics mismatch".into()); }
     Ok(())
 }
 
@@ -1019,7 +1066,7 @@ pub fn assemble_artifacts_with_fixtures(
 }
 
 pub fn assemble_artifacts_named(
-    mut receipt: Receipt,
+    receipt: Receipt,
     receipt_name: &str,
     human_name: &str,
 ) -> Result<ArtifactBundle, String> {
@@ -1567,13 +1614,17 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             if prompt.trim().is_empty() {
                 return Err("campaign prompt must not be empty".into());
             }
+            let candidate_session = CampaignSession::load(&snapshot)
+                .map_err(|e| format!("load candidate campaign session: {e}"))?;
+            let reference_session = CampaignSession::load(&reference_snapshot)
+                .map_err(|e| format!("load reference campaign session: {e}"))?;
             // Warm rows run the exact same product fixture suite once before collection in this
             // child.  The measured suite is therefore a genuine same-worker warm observation;
             // cold rows intentionally skip this path and are launched in fresh children.
             let warmup_suite_sha256 = if row.coordinate.process_temperature == "warm" {
-                let suite = run_product_fixture_suite(
-                    &snapshot,
-                    &reference_snapshot,
+                let suite = run_product_fixture_suite_on_sessions(
+                    &candidate_session,
+                    &reference_session,
                     &prompt,
                     &row.coordinate,
                 )
@@ -1590,15 +1641,23 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                         coordinate_slug(&row.coordinate)
                     )
                 })?;
-                Some(seal_bytes(&canonical_json_bytes(&serde_json::json!({"workerPid": std::process::id(), "kernel": suite.kernel_candidate.output.text})).map_err(|e| e.to_string())?))
+                Some(seal_bytes(
+                    format!(
+                        "session={};workerPid={};kernel={}",
+                        candidate_session.session_id(),
+                        std::process::id(),
+                        suite.kernel_candidate.output.text
+                    )
+                    .as_bytes(),
+                ))
             } else {
                 None
             };
             let mut suites = Vec::with_capacity(5);
             for repeat in 0..5 {
-                let suite = run_product_fixture_suite(
-                    &snapshot,
-                    &reference_snapshot,
+                let suite = run_product_fixture_suite_on_sessions(
+                    &candidate_session,
+                    &reference_session,
                     &prompt,
                     &row.coordinate,
                 )
@@ -2151,6 +2210,8 @@ pub fn sequence_marker() -> u64 {
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
+    /// Record a coordinate operation that actually executed on this observed product session.
+    fn operation(&mut self, _operation: &'static str) {}
     /// Exact fp32 logits materialized from the production decode seam only while a campaign
     /// observer is attached.  Ordinary serving never takes this host-read path.
     fn logits(&mut self, _stage: &'static str, _values: &[f32]) {}
@@ -2177,6 +2238,8 @@ pub struct ProductObserver {
     prefill_logits: Option<Vec<f32>>,
     token_probabilities: Vec<(i32, f64)>,
     error: Option<String>,
+    session_id: Option<String>,
+    operations: Vec<String>,
 }
 
 impl ProductObserver {
@@ -2193,7 +2256,17 @@ impl ProductObserver {
             prefill_logits: None,
             token_probabilities: Vec::new(),
             error: None,
+            session_id: None,
+            operations: Vec::new(),
         }
+    }
+
+    pub fn bind_session(&mut self, session_id: impl Into<String>) {
+        self.session_id = Some(session_id.into());
+    }
+
+    pub fn operation(&mut self, operation: &'static str) {
+        self.operations.push(operation.into());
     }
 
     pub fn finish(self) -> Result<ProductObservations, String> {
@@ -2226,6 +2299,10 @@ impl ProductObserver {
             allocations: self.allocations,
             prefill_logits,
             token_probabilities: self.token_probabilities,
+            session_id: self
+                .session_id
+                .ok_or("product observer is missing campaign session")?,
+            operations: self.operations,
         })
     }
 }
@@ -2244,9 +2321,15 @@ pub struct ProductObservations {
     pub allocations: Vec<ReceiptAllocation>,
     pub prefill_logits: Vec<f32>,
     pub token_probabilities: Vec<(i32, f64)>,
+    pub session_id: String,
+    pub operations: Vec<String>,
 }
 
 impl Observer for ProductObserver {
+    fn operation(&mut self, operation: &'static str) {
+        self.operation(operation);
+    }
+
     fn phase(&mut self, name: &'static str) {
         let expected = REQUIRED_PHASES.get(self.phases.len()).copied();
         if self.error.is_some() || expected != Some(name) {
@@ -2614,25 +2697,34 @@ pub fn run_dense_lifecycle_request(
     coordinate: Option<&Coordinate>,
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
+    let session = CampaignSession::load(snapshot)?;
+    run_dense_lifecycle_request_on_session(&session, prefix_prompt, request, coordinate, observer)
+}
+
+pub fn run_dense_lifecycle_request_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    coordinate: Option<&Coordinate>,
+    observer: &mut dyn Observer,
+) -> core_llm::Result<TextLlmOutput> {
+    observer.bind_session(session.session_id());
     observer.phase("process-start");
-    let inventory = inventory_snapshot(snapshot.as_ref())
-        .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
+    let inventory = session.inventory();
+    let provider = &session.provider;
     let output = {
-        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
-            snapshot.as_ref().to_string_lossy().to_string(),
-        ))?;
-        observer.snapshot_inventory(&inventory);
+        observer.snapshot_inventory(inventory);
         observer.geometry(provider.campaign_geometry());
         observer.phase("weights-loaded");
         observer.allocation("weights", "persistent", inventory.bytes);
         if let Some(coordinate) = coordinate {
-            // These are product operations on this very provider, not an out-of-band control.
-            // A row cannot be measured until its requested batch/prefill behavior has executed.
             if coordinate.request_mode == "supported-batch" {
                 provider.campaign_supported_batch(prefix_prompt, 2)?;
+                observer.operation("supported-batch");
             }
             if coordinate.prefill_mode == "chunked" {
                 provider.campaign_prefix_reuse(prefix_prompt)?;
+                observer.operation("chunked-prefix-reuse");
             }
         }
         let mut saw_token = false;
@@ -2646,9 +2738,12 @@ pub fn run_dense_lifecycle_request(
                 "dense campaign produced no first-token observation".into(),
             ));
         }
-        provider.campaign_prefix_reuse(prefix_prompt)?;
-        observer.phase("prompt-cache-reuse");
+        observer.operation("single-shot-generation");
+        if coordinate.is_some_and(|c| c.prefill_mode == "chunked") {
+            observer.operation("prompt-cache-reuse");
+        }
         provider.campaign_cancel_after_first_token(request)?;
+        observer.phase("prompt-cache-reuse");
         observer.phase("cancellation-cleanup");
         output
     };
@@ -2670,9 +2765,19 @@ pub fn run_product_fixture(
     request: TextLlmRequest,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
+    let session = CampaignSession::load(snapshot)?;
+    run_product_fixture_on_session(&session, prefix_prompt, request, coordinate)
+}
+
+pub fn run_product_fixture_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    coordinate: &Coordinate,
+) -> core_llm::Result<ProductFixtureResult> {
     let mut observer = ProductObserver::new();
-    let output = run_dense_lifecycle_request(
-        snapshot,
+    let output = run_dense_lifecycle_request_on_session(
+        session,
         prefix_prompt,
         request,
         Some(coordinate),
@@ -2824,6 +2929,17 @@ pub fn run_product_fixture_suite(
     prompt: &str,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureSuite> {
+    let candidate = CampaignSession::load(candidate_snapshot)?;
+    let reference = CampaignSession::load(reference_snapshot)?;
+    run_product_fixture_suite_on_sessions(&candidate, &reference, prompt, coordinate)
+}
+
+pub fn run_product_fixture_suite_on_sessions(
+    candidate_session: &CampaignSession,
+    reference_session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+) -> core_llm::Result<ProductFixtureSuite> {
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
     let kernel_prompt = format!("{prompt}\nReturn a concise deterministic answer.");
     let tool_prompt = format!(
@@ -2836,8 +2952,8 @@ pub fn run_product_fixture_suite(
     let cache_prompt = format!("{prompt}\nRepeat the stable baseline fact.");
     let run_pair = |prefix: &str, request: TextLlmRequest| -> core_llm::Result<_> {
         Ok((
-            run_product_fixture(candidate_snapshot, prefix, request.clone(), coordinate)?,
-            run_product_fixture(reference_snapshot, prefix, request, coordinate)?,
+            run_product_fixture_on_session(candidate_session, prefix, request.clone(), coordinate)?,
+            run_product_fixture_on_session(reference_session, prefix, request, coordinate)?,
         ))
     };
     let (kernel_candidate, kernel_reference) = run_pair(
@@ -3050,6 +3166,22 @@ fn product_receipt(
 ) -> Result<Receipt, String> {
     let quality = suite.quality()?;
     let observation = &suite.kernel_candidate.observation;
+    let required_operation = if coordinate.request_mode == "supported-batch" {
+        "supported-batch"
+    } else if coordinate.prefill_mode == "chunked" {
+        "chunked-prefix-reuse"
+    } else {
+        "single-shot-generation"
+    };
+    if !observation
+        .operations
+        .iter()
+        .any(|operation| operation == required_operation)
+    {
+        return Err(format!(
+            "coordinate did not execute required product operation {required_operation}"
+        ));
+    }
     let reference = &suite.kernel_reference.observation.snapshot;
     let model = &observation.snapshot;
     let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3130,12 +3262,12 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
+        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone() },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:0,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_suite_sha256.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256.unwrap_or_default() } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_suite_sha256.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256.unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() } } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -3424,6 +3556,7 @@ mod tests {
                 thermal_state: "nominal".into(),
                 command_template: "run --mode {mode}".into(),
                 command: "run --mode dense".into(),
+                campaign_session_id: "e".repeat(64),
             },
             matrix: ReceiptMatrix {
                 family: "llama".into(),
@@ -3493,7 +3626,7 @@ mod tests {
                     confidence_interval: "95% bootstrap".into(),
                     outlier_policy: "report all samples; no silent deletion".into(),
                     variance_policy: "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),
-                    max_coefficient_of_variation: 0.05,
+                    max_coefficient_of_VARIATION: 0.05,
                 },
                 fixture_evidence: std::collections::BTreeMap::new(),
             },
@@ -3526,6 +3659,7 @@ mod tests {
                 completed: false,
                 worker_pid: 7,
                 suite_sha256: String::new(),
+                session_id: String::new(),
             },
         };
         for name in REQUIRED_FIXTURES {

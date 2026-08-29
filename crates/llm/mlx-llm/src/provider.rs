@@ -9,7 +9,7 @@
 //! `core_llm::JinjaChatTemplate`, story 7164), falling back to the typed [`Llama3Template`] when a
 //! snapshot ships no `tokenizer_config.json`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::path::Path;
 
 use core_llm::{
@@ -410,6 +410,8 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// Campaign-only prefix cache; ordinary serving never consults this state.
+    campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
 }
 
 impl LlamaProvider {
@@ -472,18 +474,20 @@ impl LlamaProvider {
             ..Default::default()
         };
         let cancel = crate::decode::CancelFlag::new();
-        let mut cache = crate::decode::PrefixCache::new(2);
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
         let mut sink = |_| {};
-        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
             .map_err(to_core)?;
-        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
             .map_err(to_core)?;
         if cache.stats().hits == 0 {
             return Err(CoreError::Load(
                 "campaign prefix reuse did not produce a cache hit".into(),
             ));
         }
-        Ok(cache.stats().hits)
+        u64::try_from(cache.stats().hits)
+            .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))
     }
 
     /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
@@ -651,6 +655,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision,
             gemma4,
+            campaign_prefix_cache: RefCell::new(None),
         })
     }
 
@@ -671,6 +676,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
         }
     }
 
