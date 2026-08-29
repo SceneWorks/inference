@@ -191,10 +191,10 @@ pub(crate) fn generate_with_observer(
             let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
             observer.logits("prefill", &values);
         }
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("prefill-peak");
         }
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
         let output = {
             let mut saw_first_token = false;
             let mut observed_events = |event| {
@@ -248,10 +248,22 @@ fn observe_cache_events(
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return;
     };
+    let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
-        observer.allocation(event.role, event.lifetime, event.bytes);
+        if event.role == "cache" && event.lifetime == "persistent" {
+            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        }
     }
     *seen = cache.events().len();
+    if !latest_by_layer.is_empty() {
+        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let tokens = latest_by_layer
+            .values()
+            .map(|(_, tokens)| *tokens)
+            .max()
+            .unwrap_or_default();
+        observer.cache_snapshot(bytes, tokens);
+    }
 }
 
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
@@ -440,7 +452,8 @@ fn selected_token_probability(logits: &Array, token: i32) -> Result<f64> {
     if token < 0 {
         return Err(Error::Msg("negative sampled token id".into()));
     }
-    let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>();
+    let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+    let values = logits_f32.as_slice::<f32>();
     let token = token as usize;
     if token >= values.len() || values.iter().any(|value| !value.is_finite()) {
         return Err(Error::Msg(

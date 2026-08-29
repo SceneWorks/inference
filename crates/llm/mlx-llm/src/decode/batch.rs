@@ -160,8 +160,8 @@ pub(crate) fn generate_batch_with_observer(
         let logits_f32 = logits.as_dtype(Dtype::Float32)?;
         let values = logits_f32.as_slice::<f32>().to_vec();
         observer.logits("prefill", &values);
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
         observer.phase("prefill-peak");
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
     }
 
     // Sample the first token per sequence; keep the lanes that did not immediately retire.
@@ -269,8 +269,8 @@ pub(crate) fn generate_batch_with_observer(
     }
 
     if let Some(observer) = observer.as_deref_mut() {
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
         observer.phase("decode-steady");
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
         if cancel.is_cancelled() {
             observer.phase("cancellation-cleanup");
         }
@@ -299,10 +299,22 @@ fn observe_cache_events(
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return;
     };
+    let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
-        observer.allocation(event.role, event.lifetime, event.bytes);
+        if event.role == "cache" && event.lifetime == "persistent" {
+            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        }
     }
     *seen = cache.events().len();
+    if !latest_by_layer.is_empty() {
+        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let tokens = latest_by_layer
+            .values()
+            .map(|(_, tokens)| *tokens)
+            .max()
+            .unwrap_or_default();
+        observer.cache_snapshot(bytes, tokens);
+    }
 }
 
 /// Build the left-padded prefill inputs: token ids, per-row RoPE positions, and the additive

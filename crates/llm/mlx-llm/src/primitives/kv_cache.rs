@@ -83,10 +83,12 @@ pub trait KvCache {
 /// decoder contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEvent {
+    pub layer: usize,
     pub operation: &'static str,
     pub role: &'static str,
     pub lifetime: &'static str,
     pub bytes: u64,
+    pub tokens: u64,
 }
 
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
@@ -165,10 +167,13 @@ impl KvCache for ContiguousKvCache {
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| crate::error::Error::Msg("KV byte accounting overflows u64".into()))?;
         self.events.push(CacheEvent {
+            layer,
             operation: "append",
             role: "cache",
             lifetime: "persistent",
             bytes,
+            tokens: u64::try_from(merged.0.shape()[SEQ_AXIS as usize])
+                .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?,
         });
         Ok(merged)
     }
@@ -237,10 +242,12 @@ impl KvCache for ContiguousKvCache {
             .sum();
         if bytes > 0 {
             self.events.push(CacheEvent {
+                layer: usize::MAX,
                 operation: "reset",
                 role: "kv-cache",
                 lifetime: "released",
                 bytes,
+                tokens: 0,
             });
         }
         for slot in &mut self.layers {

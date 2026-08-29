@@ -245,14 +245,15 @@ pub(crate) fn generate_cached_with_observer(
         Some((cache, len)) => (cache, len),
         None => (model.new_cache(), 0),
     };
+    let mut observed_cache_events = 0;
     let suffix = input_ids(&prompt_ids[matched_len..]);
     let logits = model.decode_logits(&suffix, &mut cache, matched_len as i32)?;
     if let Some(observer) = observer.as_deref_mut() {
         let logits_f32 = logits.as_dtype(Dtype::Float32)?;
         let values = logits_f32.as_slice::<f32>().to_vec();
         observer.logits("prefill", &values);
-        observe_cache_events(&mut cache, observer);
         observer.phase("prefill-peak");
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer);
     }
 
     let out = decode_loop(
@@ -270,8 +271,8 @@ pub(crate) fn generate_cached_with_observer(
     )?;
 
     if let Some(observer) = observer.as_deref_mut() {
-        observe_cache_events(&mut cache, observer);
         observer.phase("decode-steady");
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer);
         if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
             observer.phase("cancellation-cleanup");
         }
@@ -291,12 +292,29 @@ pub(crate) fn generate_cached_with_observer(
     Ok(out)
 }
 
-fn observe_cache_events(cache: &mut dyn KvCache, observer: &mut dyn crate::campaign::Observer) {
+fn observe_cache_events(
+    cache: &mut dyn KvCache,
+    seen: &mut usize,
+    observer: &mut dyn crate::campaign::Observer,
+) {
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return;
     };
-    for event in cache.events() {
-        observer.allocation(event.role, event.lifetime, event.bytes);
+    let mut latest_by_layer = std::collections::BTreeMap::new();
+    for event in cache.events().iter().skip(*seen) {
+        if event.role == "cache" && event.lifetime == "persistent" {
+            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        }
+    }
+    *seen = cache.events().len();
+    if !latest_by_layer.is_empty() {
+        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let tokens = latest_by_layer
+            .values()
+            .map(|(_, tokens)| *tokens)
+            .max()
+            .unwrap_or_default();
+        observer.cache_snapshot(bytes, tokens);
     }
 }
 

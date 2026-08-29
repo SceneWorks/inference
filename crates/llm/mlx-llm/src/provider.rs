@@ -396,6 +396,10 @@ fn substitute_vision_placeholders(
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
+    /// Architecture parsed from the loaded snapshot. Campaign receipts use this product-owned
+    /// identity instead of trusting the matrix row's caller-authored family label.
+    architecture: Architecture,
+    campaign_family: Option<&'static str>,
     model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
@@ -415,6 +419,85 @@ pub struct LlamaProvider {
 }
 
 impl LlamaProvider {
+    /// Frozen SC-20671 family identity for architectures that implement the campaign's contiguous
+    /// cache controls. Other architectures fail closed instead of being mislabeled as Llama/Qwen.
+    pub(crate) fn campaign_family(&self) -> CoreResult<&'static str> {
+        self.campaign_family.ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "SC-20671 does not support loaded architecture {:?} as Llama or Qwen",
+                self.architecture
+            ))
+        })
+    }
+
+    pub(crate) fn campaign_context_window(&self) -> CoreResult<u64> {
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "SC-20671 requires a causal decoder context window".into(),
+            ));
+        };
+        u64::try_from(model.config().max_position_embeddings)
+            .ok()
+            .filter(|tokens| *tokens >= 1_024)
+            .ok_or_else(|| {
+                CoreError::Load(
+                    "SC-20671 requires max_position_embeddings >= 1024 in loaded config".into(),
+                )
+            })
+    }
+
+    pub(crate) fn campaign_prompt_tokens(&self, prompt: &str) -> CoreResult<u64> {
+        u64::try_from(self.tokenizer.encode(prompt, false)?.len())
+            .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
+    }
+
+    /// Build a tokenizer-measured payload for one frozen context band. A binary search chooses the
+    /// largest deterministic filler that stays below the band target, avoiding assumptions that a
+    /// repeated source word maps to exactly one token for both supported families.
+    pub(crate) fn campaign_context_payload(&self, context_band: &str) -> CoreResult<String> {
+        let context_window = self.campaign_context_window()?;
+        let medium = (context_window / 16).clamp(128, 1_024);
+        let memory_material = context_window / 4;
+        let fit_boundary = context_window.saturating_sub(512);
+        if !(32 < medium && medium < memory_material && memory_material < fit_boundary) {
+            return Err(CoreError::Load(format!(
+                "loaded context window {context_window} cannot represent four distinct bands"
+            )));
+        }
+        let target = match context_band {
+            "short" => 32,
+            "medium" => medium,
+            "memory-material" => memory_material,
+            "fit-boundary" => fit_boundary,
+            _ => {
+                return Err(CoreError::InvalidRequest(format!(
+                    "unknown context band {context_band}"
+                )))
+            }
+        };
+        let header = format!("SC20671-CONTEXT-BAND-{context_band}");
+        let mut lower = 0usize;
+        let mut upper = usize::try_from(target)
+            .map_err(|_| CoreError::Load("campaign context target overflows usize".into()))?;
+        while lower < upper {
+            let midpoint = lower + (upper - lower).div_ceil(2);
+            let candidate = format!("{header}{}", " context".repeat(midpoint));
+            if self.campaign_prompt_tokens(&candidate)? <= target {
+                lower = midpoint;
+            } else {
+                upper = midpoint - 1;
+            }
+        }
+        let payload = format!("{header}{}", " context".repeat(lower));
+        let observed_tokens = self.campaign_prompt_tokens(&payload)?;
+        if observed_tokens < target / 2 || observed_tokens > target {
+            return Err(CoreError::Load(format!(
+                "context band {context_band} produced {observed_tokens} tokens for target {target}"
+            )));
+        }
+        Ok(payload)
+    }
+
     /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign
     /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
     pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
@@ -686,6 +769,26 @@ impl LlamaProvider {
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
+        let text_config = cfg_value.get("text_config").unwrap_or(&cfg_value);
+        let architecture_name = text_config
+            .get("architectures")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let model_type = text_config
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let campaign_family = match arch {
+            Architecture::Qwen3 => Some("qwen"),
+            Architecture::Llama if architecture_name.contains("llama") || model_type == "llama" => {
+                Some("llama")
+            }
+            _ => None,
+        };
         let weights = Weights::from_dir(dir).map_err(to_core)?;
 
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
@@ -767,6 +870,8 @@ impl LlamaProvider {
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
+            architecture: arch,
+            campaign_family,
             model,
             tokenizer,
             template,
@@ -786,8 +891,16 @@ impl LlamaProvider {
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+        let architecture = model.config().architecture;
+        let campaign_family = match architecture {
+            Architecture::Llama => Some("llama"),
+            Architecture::Qwen3 => Some("qwen"),
+            _ => None,
+        };
         Self {
             descriptor: provider_descriptor(),
+            architecture,
+            campaign_family,
             model: Decoder::Causal(model),
             tokenizer,
             template: Box::new(Llama3Template),
