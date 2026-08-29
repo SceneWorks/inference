@@ -12,6 +12,7 @@ pub mod llama;
 pub mod qwen35;
 pub mod qwen35_vision;
 pub mod siglip;
+pub mod starcoder2;
 pub mod starvector_vision;
 
 pub use gemma4_mm::{
@@ -26,6 +27,7 @@ pub use qwen35_vision::{
     Qwen3VLVisionModel, Qwen3VLVisionOutput,
 };
 pub use siglip::{SiglipVisionConfig, SiglipVisionTower};
+pub use starcoder2::{StarCoder2, StarCoder2Config};
 pub use starvector_vision::{StarVectorAdapter, StarVectorClipVision, IMAGE_SIZE, IMAGE_TOKENS};
 
 use mlx_rs::Array;
