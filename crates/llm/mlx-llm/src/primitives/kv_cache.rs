@@ -21,6 +21,14 @@ use crate::error::Result;
 /// stored already-RoPE'd; values raw. The sequence axis (2) is the one that grows each step.
 pub const SEQ_AXIS: i32 = 2;
 
+/// Experimental representation routing is decided before cache mutation.  The dense route is the
+/// compatibility default until a backend advertises every requested semantic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CacheRoute {
+    DenseFallback { reason: String },
+    ExperimentalPacked,
+}
+
 /// The decoder-facing cache contract.
 ///
 /// A decoder, for each layer, hands the cache this step's keys/values and gets back the full
@@ -28,6 +36,13 @@ pub const SEQ_AXIS: i32 = 2;
 /// reports how many positions are already cached (the RoPE offset for the next step), so the
 /// decoder reads it once before the step rather than threading an `index_pos` through every call.
 pub trait KvCache {
+    /// Preflight an experimental representation without changing the cache.  Existing dense
+    /// implementations retain their feature-off behavior through this default.
+    fn preflight_packed(&self, _query_length: usize, _mask: bool) -> CacheRoute {
+        CacheRoute::DenseFallback {
+            reason: "experimental packed representation disabled".into(),
+        }
+    }
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return
     /// the full cached `(keys, values)` to attend over, same layout with the sequence axis grown.
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)>;
@@ -121,6 +136,11 @@ impl ContiguousKvCache {
     /// [`seeded`]: ContiguousKvCache::seeded
     pub fn export(&self) -> Option<Vec<(Array, Array)>> {
         self.layers.iter().cloned().collect()
+    }
+
+    /// Dense compatibility route used by the experimental packed-cache planner before mutation.
+    pub fn packed_preflight(&self, query_length: usize, mask: bool) -> CacheRoute {
+        self.preflight_packed(query_length, mask)
     }
 }
 
