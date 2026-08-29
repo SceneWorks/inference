@@ -137,6 +137,7 @@ pub struct StarVectorImageProcessor {
 }
 
 impl Default for StarVectorImageProcessor {
+    #[allow(clippy::excessive_precision)] // Published CLIP processor constants; truncating changes conditioning.
     fn default() -> Self {
         Self {
             size: IMAGE_SIZE,
@@ -355,6 +356,9 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
         events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
     ) -> core_llm::Result<core_llm::StarVectorOutput> {
         self.validate_svg(req)?;
+        if req.text_request.cancel.is_cancelled() {
+            return Err(core_llm::Error::Canceled);
+        }
         let image = req
             .text_request
             .messages
@@ -452,6 +456,8 @@ fn to_core(error: Error) -> core_llm::Error {
 mod tests {
     use super::*;
     use candle_core::DType;
+    use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
+    use core_llm_testkit::{starvector_conformance, StarVectorProfile};
     use serde_json::json;
 
     fn exact_config() -> Value {
@@ -506,5 +512,102 @@ mod tests {
         assert!(StarVectorImageProcessor::default()
             .preprocess(&[0; 4], 1, 1, &Device::Cpu)
             .is_err());
+    }
+
+    struct FixtureProvider {
+        text: core_llm::TextLlmDescriptor,
+        svg: core_llm::StarVectorDescriptor,
+    }
+
+    impl FixtureProvider {
+        fn new() -> Self {
+            Self {
+                text: descriptor(),
+                svg: svg_descriptor(),
+            }
+        }
+    }
+
+    impl TextLlm for FixtureProvider {
+        fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+            &self.text
+        }
+        fn validate(&self, request: &core_llm::TextLlmRequest) -> core_llm::Result<()> {
+            self.text
+                .capabilities
+                .validate_request(&self.text.id, request)?;
+            if request.has_image() {
+                Ok(())
+            } else {
+                Err(core_llm::Error::InvalidRequest(
+                    "fixture requires image".into(),
+                ))
+            }
+        }
+        fn generate(
+            &self,
+            _request: &core_llm::TextLlmRequest,
+            _events: &mut dyn FnMut(core_llm::StreamEvent),
+        ) -> core_llm::Result<core_llm::TextLlmOutput> {
+            unreachable!("shared StarVector suite drives generate_svg")
+        }
+    }
+
+    impl StarVectorProvider for FixtureProvider {
+        fn starvector_descriptor(&self) -> &core_llm::StarVectorDescriptor {
+            &self.svg
+        }
+        fn generate_svg(
+            &self,
+            request: &core_llm::StarVectorRequest,
+            events: &mut dyn FnMut(StarVectorStreamEvent),
+        ) -> core_llm::Result<core_llm::StarVectorOutput> {
+            self.validate_svg(request)?;
+            if request.text_request.cancel.is_cancelled() {
+                return Err(core_llm::Error::Canceled);
+            }
+            let mut stream = StarVectorBoundedStream::new(request);
+            for (index, fragment) in core_llm_testkit::deterministic_svg_fixture()
+                .fragments
+                .iter()
+                .enumerate()
+            {
+                let status = stream.push(fragment, std::time::Duration::ZERO)?;
+                events(StarVectorStreamEvent::Source {
+                    text: (*fragment).into(),
+                    index: index as u32,
+                });
+                if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
+                    break;
+                }
+            }
+            let output = stream.output()?;
+            events(StarVectorStreamEvent::Done {
+                finish_reason: output.finish_reason,
+                generated_tokens: output.generated_tokens,
+                generated_bytes: output.generated_bytes,
+            });
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn native_provider_metadata_and_bounded_svg_contract_pass_shared_conformance() {
+        starvector_conformance(
+            || Box::new(FixtureProvider::new()),
+            &StarVectorProfile::cheap(),
+        );
+    }
+
+    #[test]
+    fn registry_exposes_only_the_exact_starvector_snapshot_probe() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), exact_config().to_string()).unwrap();
+        assert!(can_load_path(root.path()));
+        let mut wrong = exact_config();
+        wrong["image_size"] = json!(336);
+        std::fs::write(root.path().join("config.json"), wrong.to_string()).unwrap();
+        assert!(!can_load_path(root.path()));
+        assert!(crate::text_registry().unwrap().find(PROVIDER_ID).is_some());
     }
 }
