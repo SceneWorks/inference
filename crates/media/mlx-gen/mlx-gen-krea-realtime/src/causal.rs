@@ -62,8 +62,8 @@ fn mask_materialization_count() -> usize {
 pub type LayerKv = (Array, Array);
 
 /// One forward's borrowed adapter from Wan's projected q/current-K/current-V into Krea's retained
-/// packed history. It declines unsupported masks before dispatch; Wan then uses its unchanged dense
-/// path with the normal window it was given.
+/// packed history. Any per-layer capability miss is promoted to the whole-forward fallback boundary
+/// because this adapter intentionally omits dense history from Wan's provisional packed attempt.
 struct PackedKreaAttentionBackend<'a> {
     cache: &'a CausalKvCache,
     query_positions: Array,
@@ -99,7 +99,10 @@ impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
             || shape[3] != 128
             || scale.to_bits() != expected_scale.to_bits()
         {
-            return Ok(None);
+            return Err(Error::Msg(format!(
+                "{PACKED_DISPATCH_ERROR_PREFIX}unsupported layer {layer} query geometry {:?} or scale {scale}",
+                q.shape()
+            )));
         }
         let output = self
             .cache
@@ -459,6 +462,10 @@ pub struct CausalKvCache {
     packed_metal_accepted_forwards: usize,
     packed_metal_dense_fallbacks: usize,
     last_packed_metal_fallback: Option<String>,
+    /// Largest logical old-plus-successor payload simultaneously alive at an immutable MLX append
+    /// barrier. Process receipts still measure allocator high water; this prevents retained-only
+    /// accounting from concealing full-history concat residency.
+    peak_append_coexistence_bytes: usize,
     /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
     /// eager max-window eviction exactly; production builds do not carry this field or branch.
     #[cfg(test)]
@@ -492,6 +499,7 @@ impl CausalKvCache {
             packed_metal_accepted_forwards: 0,
             packed_metal_dense_fallbacks: 0,
             last_packed_metal_fallback: None,
+            peak_append_coexistence_bytes: 0,
             #[cfg(test)]
             evict_to_next_read: true,
         }
@@ -521,6 +529,10 @@ impl CausalKvCache {
             self.packed_metal_dense_fallbacks,
             self.last_packed_metal_fallback.as_deref(),
         )
+    }
+
+    pub fn peak_append_coexistence_bytes(&self) -> usize {
+        self.peak_append_coexistence_bytes
     }
 
     /// Explicitly construct and retain the MLX custom kernel for an already-quantized Krea cache.
@@ -890,6 +902,7 @@ impl CausalKvCache {
             .committed_tokens
             .checked_add(s_new)
             .ok_or_else(|| Error::Msg("krea causal: committed token count overflow".into()))?;
+        let previous_retained_bytes = self.retained_bytes();
 
         // Build every layer's packed/concatenated successor without touching observable cache state.
         // A late pack/concat failure therefore leaves all layers and counters at the old boundary.
@@ -902,6 +915,13 @@ impl CausalKvCache {
             };
             staged_layers.push(Some(staged));
         }
+        let staged_retained_bytes = staged_layers
+            .iter()
+            .flatten()
+            .map(StoredKv::nbytes)
+            .sum::<usize>();
+        let append_coexistence_bytes =
+            previous_retained_bytes.saturating_add(staged_retained_bytes);
 
         // Concatenation and quantization only build lazy MLX graphs. Evaluate every successor
         // before publishing any layer so a late fault leaves the old cache intact for retry. The
@@ -910,6 +930,9 @@ impl CausalKvCache {
         for staged in staged_layers.iter().flatten() {
             staged.eval()?;
         }
+        self.peak_append_coexistence_bytes = self
+            .peak_append_coexistence_bytes
+            .max(append_coexistence_bytes);
 
         #[cfg(test)]
         let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
@@ -1932,6 +1955,42 @@ mod tests {
         );
         assert_eq!(cache.stored_tokens(), 4);
         assert_eq!(cache.retained_tokens(), 4);
+    }
+
+    #[test]
+    fn packed_layer_capability_miss_requests_whole_forward_fallback() {
+        let cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        let positions = Array::from_slice(&[0i64], &[1]);
+        let mut backend = PackedKreaAttentionBackend {
+            cache: &cache,
+            query_positions: positions.clone(),
+            key_positions: positions,
+            block_size: 1,
+            dispatched_outputs: Vec::new(),
+        };
+        let unsupported = Array::from_slice(&[0.0f32], &[1, 1, 1, 1]);
+        let error = backend
+            .attend(0, &unsupported, &unsupported, &unsupported, None, 1.0)
+            .expect_err("unsupported packed geometry must leave the provisional packed forward");
+        assert!(
+            error.to_string().contains(PACKED_DISPATCH_ERROR_PREFIX),
+            "the whole-forward fallback boundary must recognize this decline: {error}"
+        );
+        assert!(backend.dispatched_outputs.is_empty());
+    }
+
+    #[test]
+    fn immutable_append_reports_old_plus_successor_coexistence() {
+        let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        cache
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let first_retained = cache.retained_bytes();
+        cache
+            .append(wide_kv_block(&[4, 5], Dtype::Bfloat16))
+            .unwrap();
+        assert!(cache.peak_append_coexistence_bytes() >= first_retained + cache.retained_bytes());
+        assert!(cache.peak_append_coexistence_bytes() > cache.retained_bytes());
     }
 
     /// A group size that does not divide `head_dim` is a **config** error, and must be reported as one
