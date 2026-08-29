@@ -1179,6 +1179,21 @@ impl Generator for Wan14bGenerator {
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B);
+        let (latent_frames, latent_height, latent_width) =
+            latent_dims(frames, req.width, req.height);
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.root,
+            self.variant.id(),
+            1,
+            frames,
+            req.width,
+            req.height,
+            latent_frames as u32,
+            latent_height as u32,
+            latent_width as u32,
+        )
+        .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = match &self.comfyui {
             Some(experts) => {
                 Pipeline::load_comfyui(&self.root, &self.device, self.variant, experts.clone())

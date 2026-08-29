@@ -1,9 +1,11 @@
 //! Optional SC-20686 campaign observer. `None` is the production default.
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEvent {
@@ -45,6 +47,122 @@ pub struct CampaignContext {
     snapshot_bytes: u64,
     variant: String,
     geometry: CampaignGeometry,
+}
+
+pub struct CampaignOutputRequest {
+    path: PathBuf,
+}
+
+pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
+    CampaignOutputRequest { path: path.into() }
+}
+
+thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = RefCell::new(None); }
+
+impl CampaignOutputRequest {
+    pub fn arm(self) -> Self {
+        PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = Some(self.path.clone()));
+        self
+    }
+}
+
+impl Drop for CampaignOutputRequest {
+    fn drop(&mut self) {
+        PENDING_OUTPUT.with(|slot| {
+            if slot.borrow().as_ref() == Some(&self.path) {
+                *slot.borrow_mut() = None;
+            }
+        });
+    }
+}
+
+fn snapshot_identity(root: &Path) -> io::Result<(String, u64)> {
+    fn files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                files(root, &path, out)?;
+            } else if path.is_file() {
+                out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut names = Vec::new();
+    files(root, root, &mut names)?;
+    names.sort();
+    let mut aggregate = Sha256::new();
+    let mut total = 0u64;
+    for name in names {
+        let path = root.join(&name);
+        let mut file = File::open(&path)?;
+        let mut file_digest = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "snapshot byte count overflow")
+            })?;
+            file_digest.update(&buffer[..read]);
+        }
+        total = total.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "snapshot byte count overflow")
+        })?;
+        let digest = file_digest.finalize();
+        aggregate.update(name.to_string_lossy().as_bytes());
+        aggregate.update([0]);
+        aggregate.update(bytes.to_le_bytes());
+        aggregate.update([0]);
+        aggregate.update(digest);
+        aggregate.update([b'\n']);
+    }
+    Ok((format!("{:x}", aggregate.finalize()), total))
+}
+
+pub(crate) fn activate_requested(
+    root: &Path,
+    variant: &str,
+    batch: u32,
+    frames: u32,
+    width: u32,
+    height: u32,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
+) -> io::Result<Option<Scope>> {
+    let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
+    let Some(path) = path else { return Ok(None) };
+    let (digest, bytes) = snapshot_identity(root)?;
+    let context = CampaignContext::from_runtime(
+        root.display().to_string(),
+        digest,
+        bytes,
+        variant.into(),
+        CampaignGeometry {
+            batch,
+            frames,
+            width,
+            height,
+            latent_frames,
+            latent_height,
+            latent_width,
+        },
+    )
+    .map_err(io::Error::other)?;
+    let file = if path == Path::new("-") {
+        File::create("/dev/stdout")?
+    } else {
+        File::create(path)?
+    };
+    Ok(Some(install_with_context(
+        Box::new(JsonlObserver(file)),
+        context,
+    )))
 }
 
 impl CampaignContext {
@@ -299,5 +417,21 @@ mod tests {
             geometry,
         )
         .is_err());
+    }
+
+    #[test]
+    fn requested_output_derives_identity_from_snapshot_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), b"{\"layers\":1}").unwrap();
+        let output = root.path().join("events.jsonl");
+        let _request = request_output(&output).arm();
+        let scope = activate_requested(root.path(), "wan2_2_t2v_14b", 1, 5, 64, 64, 2, 8, 8)
+            .unwrap()
+            .expect("armed output request activates at runtime");
+        observe("loaded", 1, 0, 0);
+        drop(scope);
+        let lines = std::fs::read_to_string(output).unwrap();
+        assert!(lines.contains("wan2_2_t2v_14b"));
+        assert!(!lines.contains("config.json"));
     }
 }

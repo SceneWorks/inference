@@ -1154,6 +1154,21 @@ impl Generator for WanGenerator {
             i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
         run_serialized_request(&self.lifecycle, || {
+            let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
+            let (latent_frames, latent_height, latent_width) =
+                pipeline::latent_dims(frames, req.width, req.height);
+            let _campaign = crate::sc20686_observer::activate_requested(
+                &self.root,
+                MODEL_ID,
+                1,
+                frames,
+                req.width,
+                req.height,
+                latent_frames as u32,
+                latent_height as u32,
+                latent_width as u32,
+            )
+            .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
             let pipe = self.pipeline();
             // Sequential offload (sc-12757): stage load→use→drop each heavy component so the
             // denoise peak is the DiT alone. A request-selected staged transition must first evict a

@@ -464,6 +464,24 @@ impl Generator for WanVaceGenerator {
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let frames = req
+            .control_clip()
+            .map(|clip| clip.frames.len() as u32)
+            .ok_or_else(|| gen_core::Error::Msg("missing control clip".into()))?;
+        let (latent_frames, latent_height, latent_width) =
+            crate::wan14b::latent_dims(frames, req.width, req.height);
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.root,
+            MODEL_ID_VACE,
+            1,
+            frames,
+            req.width,
+            req.height,
+            latent_frames as u32,
+            latent_height as u32,
+            latent_width as u32,
+        )
+        .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = Pipeline::load(&self.root, &self.device);
         let pipe = self
             .campaign_context
