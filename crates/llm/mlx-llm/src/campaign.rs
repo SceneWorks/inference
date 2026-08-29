@@ -710,6 +710,14 @@ pub struct ArtifactBundle {
 /// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
 /// partially-written receipt directory from being mistaken for a campaign result.
 pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String> {
+    assemble_artifacts_named(receipt, "receipt.json", "receipt.txt")
+}
+
+pub fn assemble_artifacts_named(
+    mut receipt: Receipt,
+    receipt_name: &str,
+    human_name: &str,
+) -> Result<ArtifactBundle, String> {
     let mut semantic = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
     semantic
         .as_object_mut()
@@ -722,11 +730,40 @@ pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String
         .map_err(|e| e.to_string())?
         .into_bytes();
     Ok(ArtifactBundle {
-        receipt_sidecar: format!("{}  receipt.json\n", seal_bytes(&bytes)),
-        human_sidecar: format!("{}  receipt.txt\n", seal_bytes(&human)),
+        receipt_sidecar: format!("{}  {receipt_name}\n", seal_bytes(&bytes)),
+        human_sidecar: format!("{}  {human_name}\n", seal_bytes(&human)),
         receipt: bytes,
         human,
     })
+}
+
+/// Atomically publish a complete artifact set. Temporary files are confined to `directory` and
+/// renamed only after all bytes and sidecars have been prepared.
+pub fn write_artifacts(
+    directory: &Path,
+    receipt_name: &str,
+    human_name: &str,
+    bundle: &ArtifactBundle,
+) -> std::io::Result<()> {
+    fs::create_dir_all(directory)?;
+    let files: Vec<(String, &[u8])> = vec![
+        (receipt_name.into(), &bundle.receipt),
+        (human_name.into(), &bundle.human),
+        (
+            format!("{receipt_name}.sha256"),
+            bundle.receipt_sidecar.as_bytes(),
+        ),
+        (
+            format!("{human_name}.sha256"),
+            bundle.human_sidecar.as_bytes(),
+        ),
+    ];
+    for (name, bytes) in files {
+        let tmp = directory.join(format!(".{name}.tmp"));
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, directory.join(name))?;
+    }
+    Ok(())
 }
 
 pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
