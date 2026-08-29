@@ -25,7 +25,7 @@ use crate::config::{Architecture, ModelConfig};
 use crate::decode::generate_with_observer;
 use crate::decode::{
     generate_batch, generate_from_prefill, generate_with, BatchRequest, CancelFlag, ConstraintMask,
-    Decode, FinishReason, GenerationConfig, StreamEvent,
+    Decode, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -490,6 +490,70 @@ impl LlamaProvider {
             .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))
     }
 
+    /// Execute the cache-hit half of the real prefix-reuse path with campaign observation attached.
+    /// The first call seeds the provider-owned cache; the second call is the measured operation and
+    /// must prove a new hit before its output can be used as coordinate evidence.
+    pub(crate) fn campaign_prefix_reuse_observed(
+        &self,
+        prompt: &str,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<(GenerationOutput, u64, u64)> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let before_hits = cache.stats().hits;
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        let mut emitted = 0usize;
+        let output = crate::decode::prefix::generate_cached_with_observer(
+            model,
+            &ids,
+            &config,
+            &cancel,
+            &mut |event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            cache,
+            None,
+            None,
+            Some(observer),
+        )
+        .map_err(to_core)?;
+        let hits = cache.stats().hits;
+        if hits <= before_hits || emitted == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce an observed cache hit and token".into(),
+            ));
+        }
+        Ok((
+            output,
+            u64::try_from(hits)
+                .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))?,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign prefix token count overflow".into()))?,
+        ))
+    }
+
     /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
     /// This is not emulated by serial `TextLlm` requests.
     pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
@@ -530,6 +594,61 @@ impl LlamaProvider {
             ));
         }
         Ok(outputs.len() as u64)
+    }
+
+    /// Run the actual batched decoder while the receipt observer is attached to its prefill and
+    /// decode path.  Ordinary scheduling continues to call [`Self::campaign_supported_batch`].
+    pub(crate) fn campaign_supported_batch_observed(
+        &self,
+        prompt: &str,
+        batch: usize,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<(Vec<GenerationOutput>, u64)> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = crate::decode::batch::generate_batch_with_observer(
+            model,
+            &requests,
+            &cancel,
+            &mut |_, event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            Some(observer),
+        )
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no observed product tokens".into(),
+            ));
+        }
+        Ok((
+            outputs,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign batch token count overflow".into()))?,
+        ))
     }
 
     /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative

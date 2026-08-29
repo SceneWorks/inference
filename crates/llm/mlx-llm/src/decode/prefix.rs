@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use core_llm::prefix::{PrefixId, PrefixIndex};
 
@@ -174,13 +174,14 @@ pub fn generate_cached(
     on_event: &mut dyn FnMut(StreamEvent),
     prefix_cache: &mut PrefixCache,
 ) -> Result<GenerationOutput> {
-    generate_cached_with(
+    generate_cached_with_observer(
         model,
         prompt_ids,
         config,
         cancel,
         on_event,
         prefix_cache,
+        None,
         None,
         None,
     )
@@ -201,6 +202,33 @@ pub fn generate_cached_with(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
+    generate_cached_with_observer(
+        model,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        prefix_cache,
+        constraint,
+        should_stop,
+        None,
+    )
+}
+
+/// Campaign-only observer variant of [`generate_cached_with`].  The observer is attached to the
+/// cache-hit prefill and decode that actually execute, rather than to a later single-shot control.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_cached_with_observer(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    prefix_cache: &mut PrefixCache,
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
     }
@@ -219,6 +247,13 @@ pub fn generate_cached_with(
     };
     let suffix = input_ids(&prompt_ids[matched_len..]);
     let logits = model.decode_logits(&suffix, &mut cache, matched_len as i32)?;
+    if let Some(observer) = observer.as_deref_mut() {
+        let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+        let values = logits_f32.as_slice::<f32>().to_vec();
+        observer.logits("prefill", &values);
+        observe_cache_events(&mut cache, observer);
+        observer.phase("prefill-peak");
+    }
 
     let out = decode_loop(
         model,
@@ -231,8 +266,16 @@ pub fn generate_cached_with(
         on_event,
         constraint,
         should_stop,
-        None,
+        observer.as_deref_mut(),
     )?;
+
+    if let Some(observer) = observer.as_deref_mut() {
+        observe_cache_events(&mut cache, observer);
+        observer.phase("decode-steady");
+        if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
+            observer.phase("cancellation-cleanup");
+        }
+    }
 
     // Store the sequence whose KV the cache actually holds, so the next shared-prefix request
     // reuses it. On a budget (`MaxTokens`) finish — and on a host-stop (`Stopped`) finish —
@@ -246,6 +289,15 @@ pub fn generate_cached_with(
     prefix_cache.store(full, &cache);
 
     Ok(out)
+}
+
+fn observe_cache_events(cache: &mut dyn KvCache, observer: &mut dyn crate::campaign::Observer) {
+    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
+        return;
+    };
+    for event in cache.events() {
+        observer.allocation(event.role, event.lifetime, event.bytes);
+    }
 }
 
 /// The sequence length (axis [`SEQ_AXIS`]) the stored per-layer KV actually holds — layer 0 speaks

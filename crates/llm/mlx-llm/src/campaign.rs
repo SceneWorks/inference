@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,7 @@ pub struct ReceiptProvenance {
     pub command_template: String,
     pub command: String,
     pub campaign_session_id: String,
+    pub campaign_cache_state_version: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,21 +93,26 @@ pub struct CampaignSession {
     provider: crate::provider::LlamaProvider,
     inventory: SnapshotInventory,
     session_id: String,
+    cache_state_version: Cell<u64>,
 }
 
 impl CampaignSession {
     pub fn load(snapshot: impl AsRef<Path>) -> core_llm::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
         let inventory = inventory_snapshot(snapshot.as_ref())
             .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
         let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
             snapshot.as_ref().to_string_lossy().to_string(),
         ))?;
+        let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
         let session_id = seal_bytes(
             format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 inventory.sha256,
                 inventory.bytes,
-                std::process::id()
+                std::process::id(),
+                generation,
             )
             .as_bytes(),
         );
@@ -113,6 +120,7 @@ impl CampaignSession {
             provider,
             inventory,
             session_id,
+            cache_state_version: Cell::new(0),
         })
     }
 
@@ -121,6 +129,14 @@ impl CampaignSession {
     }
     pub fn inventory(&self) -> &SnapshotInventory {
         &self.inventory
+    }
+    fn advance_cache_state(&self) -> u64 {
+        let next = self.cache_state_version.get().saturating_add(1);
+        self.cache_state_version.set(next);
+        next
+    }
+    pub fn cache_state_version(&self) -> u64 {
+        self.cache_state_version.get()
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -305,6 +321,7 @@ pub struct ReceiptWarmup {
     pub worker_pid: u32,
     pub suite_sha256: String,
     pub session_id: String,
+    pub cache_state_version: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -649,6 +666,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .any(|v| v.is_empty())
         || p.model_file_bytes == 0
         || !lowercase_hex(&p.campaign_session_id, 64)
+        || p.campaign_cache_state_version == 0
         || p.thermal_state != "nominal"
         || !p.command_template.contains("{mode}")
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
@@ -977,7 +995,10 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || (warm.required && (!warm.completed || warm.suite_sha256.len() != 64))
         || (!warm.required && (warm.completed || !warm.suite_sha256.is_empty()))
         || warm.required && warm.session_id != receipt.provenance.campaign_session_id
-        || !warm.required && !warm.session_id.is_empty()
+        || warm.required
+            && (warm.cache_state_version == 0
+                || warm.cache_state_version > receipt.provenance.campaign_cache_state_version)
+        || !warm.required && (!warm.session_id.is_empty() || warm.cache_state_version != 0)
     {
         return Err("warm worker discipline evidence failed".into());
     }
@@ -1217,6 +1238,9 @@ pub fn validate_artifact_bundle_named(
             return Err("fixture artifact or sidecar is malformed".into());
         }
     }
+    if bundle.fixtures.len() != REQUIRED_FIXTURES.len() * 5 {
+        return Err("complete product evidence requires every fixture for every repeat".into());
+    }
     let value: serde_json::Value =
         serde_json::from_slice(&bundle.receipt).map_err(|e| e.to_string())?;
     let typed: Receipt =
@@ -1268,6 +1292,18 @@ pub fn validate_artifact_bundle_named(
                 "receipt fixture {name} is not bound to exact artifact bytes"
             ));
         }
+        validate_fixture_binding(&typed, name, &artifact.bytes, 0)?;
+    }
+    for repeat in 0..5 {
+        for fixture in REQUIRED_FIXTURES {
+            let artifact_name = fixture_artifact_name(fixture, repeat);
+            let artifact = bundle
+                .fixtures
+                .iter()
+                .find(|artifact| artifact.name == artifact_name)
+                .ok_or_else(|| format!("missing repeat-bound fixture {artifact_name}"))?;
+            validate_fixture_binding(&typed, fixture, &artifact.bytes, repeat)?;
+        }
     }
     let mut core = value.clone();
     core.as_object_mut()
@@ -1280,6 +1316,109 @@ pub fn validate_artifact_bundle_named(
     let human = std::str::from_utf8(&bundle.human).map_err(|_| "human receipt is not UTF-8")?;
     if !human.contains(&format!("- Receipt hash: {expected}\\n")) {
         return Err("human receipt is not bound to the sealed JSON receipt".into());
+    }
+    Ok(())
+}
+
+fn validate_fixture_binding(
+    receipt: &Receipt,
+    name: &str,
+    bytes: &[u8],
+    expected_repeat: usize,
+) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("fixture {name} JSON: {e}"))?;
+    let binding = value
+        .get("binding")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("fixture {name} lacks producer binding"))?;
+    let expected_coordinate = coordinate_slug(&Coordinate {
+        family: match receipt.matrix.family.as_str() {
+            "llama" => "llama",
+            "qwen" => "qwen",
+            _ => return Err("fixture receipt family".into()),
+        },
+        context_band: match receipt.matrix.context_band.as_str() {
+            "short" => "short",
+            "medium" => "medium",
+            "memory-material" => "memory-material",
+            "fit-boundary" => "fit-boundary",
+            _ => return Err("fixture receipt context".into()),
+        },
+        request_mode: match receipt.matrix.request_mode.as_str() {
+            "single" => "single",
+            "supported-batch" => "supported-batch",
+            _ => return Err("fixture receipt request mode".into()),
+        },
+        prefill_mode: match receipt.matrix.prefill_mode.as_str() {
+            "chunked" => "chunked",
+            "single-shot" => "single-shot",
+            _ => return Err("fixture receipt prefill mode".into()),
+        },
+        process_temperature: match receipt.matrix.process_temperature.as_str() {
+            "cold" => "cold",
+            "warm" => "warm",
+            _ => return Err("fixture receipt temperature".into()),
+        },
+    });
+    if binding
+        .get("coordinate")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_coordinate.as_str())
+        || binding.get("repeat").and_then(serde_json::Value::as_u64) != Some(expected_repeat as u64)
+    {
+        return Err(format!("fixture {name} coordinate/repeat binding mismatch"));
+    }
+    let candidate = binding
+        .get("candidate")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("fixture {name} candidate binding"))?;
+    let reference = binding
+        .get("reference")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("fixture {name} reference binding"))?;
+    let field = |object: &serde_json::Map<String, serde_json::Value>, key: &str| {
+        object.get(key).and_then(serde_json::Value::as_str)
+    };
+    let (reference_inventory, reference_session) = receipt
+        .provenance
+        .model_id
+        .rsplit_once(";reference=")
+        .and_then(|(_, binding)| binding.split_once(";referenceSession="))
+        .filter(|(digest, session)| {
+            digest.len() == 64
+                && session.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && session.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| format!("fixture {name} receipt lacks reference inventory binding"))?;
+    let expected_operation = if receipt.matrix.request_mode == "supported-batch" {
+        "supported-batch"
+    } else if receipt.matrix.prefill_mode == "chunked" {
+        "chunked-prefix-reuse"
+    } else {
+        "single-shot-generation"
+    };
+    if field(candidate, "coordinateInventorySha256")
+        != Some(receipt.provenance.model_file_sha256.as_str())
+        || field(candidate, "qualityInventorySha256")
+            != Some(receipt.provenance.model_file_sha256.as_str())
+        || field(candidate, "coordinateSessionId")
+            != Some(receipt.provenance.campaign_session_id.as_str())
+        || field(candidate, "qualitySessionId")
+            != Some(receipt.provenance.campaign_session_id.as_str())
+        || field(candidate, "operation") != Some(expected_operation)
+        || field(candidate, "operationOutputSha256").is_none_or(|hash| hash.len() != 64)
+        || field(candidate, "qualityTranscriptSha256").is_none_or(|hash| hash.len() != 64)
+        || field(reference, "coordinateInventorySha256") != Some(reference_inventory)
+        || field(reference, "qualityInventorySha256") != Some(reference_inventory)
+        || field(reference, "coordinateSessionId") != Some(reference_session)
+        || field(reference, "qualitySessionId") != Some(reference_session)
+        || field(reference, "operation") != Some(expected_operation)
+        || field(reference, "operationOutputSha256").is_none_or(|hash| hash.len() != 64)
+        || field(reference, "qualityTranscriptSha256").is_none_or(|hash| hash.len() != 64)
+    {
+        return Err(format!("fixture {name} producer binding mismatch"));
     }
     Ok(())
 }
@@ -1447,18 +1586,20 @@ pub fn load_prepared_coordinate_receipt(
         fs::read_to_string(directory.join("receipt.json.sha256")).map_err(|e| e.to_string())?;
     let human_sidecar =
         fs::read_to_string(directory.join("receipt.md.sha256")).map_err(|e| e.to_string())?;
-    let typed: Receipt = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
-    let mut fixtures = Vec::with_capacity(typed.quality.fixture_evidence.len());
-    for evidence in typed.quality.fixture_evidence.values() {
-        let bytes = fs::read(directory.join(&evidence.artifact_name)).map_err(|e| e.to_string())?;
-        let sidecar =
-            fs::read_to_string(directory.join(format!("{}.sha256", evidence.artifact_name)))
+    let _: Receipt = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
+    let mut fixtures = Vec::with_capacity(REQUIRED_FIXTURES.len() * 5);
+    for repeat in 0..5 {
+        for fixture in REQUIRED_FIXTURES {
+            let name = fixture_artifact_name(fixture, repeat);
+            let bytes = fs::read(directory.join(&name)).map_err(|e| e.to_string())?;
+            let sidecar = fs::read_to_string(directory.join(format!("{name}.sha256")))
                 .map_err(|e| e.to_string())?;
-        fixtures.push(SealedFixtureArtifact {
-            name: evidence.artifact_name.clone(),
-            bytes,
-            sidecar,
-        });
+            fixtures.push(SealedFixtureArtifact {
+                name,
+                bytes,
+                sidecar,
+            });
+        }
     }
     let bundle = ArtifactBundle {
         receipt_name: "receipt.json".into(),
@@ -1577,11 +1718,9 @@ fn required_flag(args: &[String], name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing {name}"))
 }
 
-/// CLI entrypoint used by the standalone `sc20671-kv-baseline` binary.  The child mode remains
-/// fail-closed until the decoder exposes its real numeric quality-reference hooks; it still runs
-/// the complete product lifecycle before refusing publication, rather than manufacturing a
-/// caller-authored receipt.  This keeps the executable safe to invoke while making the missing
-/// product measurement surface explicit.
+/// CLI entrypoint used by the standalone `sc20671-kv-baseline` binary.  The child accepts no
+/// caller-authored evidence: identity, geometry, timing, quality, cache, and fixtures are bound
+/// from the loaded product session before receipt publication.
 pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
@@ -1621,7 +1760,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             // Warm rows run the exact same product fixture suite once before collection in this
             // child.  The measured suite is therefore a genuine same-worker warm observation;
             // cold rows intentionally skip this path and are launched in fresh children.
-            let warmup_suite_sha256 = if row.coordinate.process_temperature == "warm" {
+            let warmup = if row.coordinate.process_temperature == "warm" {
                 let suite = run_product_fixture_suite_on_sessions(
                     &candidate_session,
                     &reference_session,
@@ -1641,14 +1780,17 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                         coordinate_slug(&row.coordinate)
                     )
                 })?;
-                Some(seal_bytes(
-                    format!(
-                        "session={};workerPid={};kernel={}",
-                        candidate_session.session_id(),
-                        std::process::id(),
-                        suite.kernel_candidate.output.text
-                    )
-                    .as_bytes(),
+                Some((
+                    seal_bytes(
+                        format!(
+                            "session={};workerPid={};kernel={}",
+                            candidate_session.session_id(),
+                            std::process::id(),
+                            suite.kernel_candidate.output.text
+                        )
+                        .as_bytes(),
+                    ),
+                    candidate_session.cache_state_version(),
                 ))
             } else {
                 None
@@ -1681,14 +1823,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 row.coordinate.process_temperature,
             )?;
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            let fixtures = sealed_product_fixture_artifacts(&suites[0])?;
+            let fixtures = sealed_product_fixture_artifacts(&suites, &row.coordinate)?;
             let receipt = product_receipt(
                 &row.coordinate,
                 &suites[0],
                 timings,
                 &executable,
                 &fixtures,
-                warmup_suite_sha256,
+                warmup,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -2121,9 +2263,11 @@ pub fn fixture_artifact(name: &str, raw: &QualityObservation) -> Result<(Vec<u8>
 fn product_fixture_artifact(
     name: &str,
     suite: &ProductFixtureSuite,
+    coordinate: &Coordinate,
+    repeat: usize,
 ) -> Result<(Vec<u8>, String), String> {
     let quality = suite.quality()?;
-    let (evidence, reference) = match name {
+    let (evidence, candidate, reference) = match name {
         "kernel-fp32-reference" => (
             serde_json::json!({
                 "candidatePerplexity": quality.candidate_perplexity,
@@ -2132,26 +2276,56 @@ fn product_fixture_artifact(
                 "greedyMatches": quality.greedy_matches,
                 "greedyTotal": quality.greedy_total,
             }),
-            suite.kernel_reference.observation.snapshot.sha256.clone(),
+            &suite.kernel_candidate,
+            &suite.kernel_reference,
         ),
         "structured-tool-call" => (
             serde_json::json!({ "matches": quality.tool_matches, "total": quality.tool_total }),
-            suite.tool_reference.observation.snapshot.sha256.clone(),
+            &suite.tool_candidate,
+            &suite.tool_reference,
         ),
         "long-context-needle" => (
             serde_json::json!({ "matches": quality.needle_matches, "total": quality.needle_total }),
-            suite.needle_reference.observation.snapshot.sha256.clone(),
+            &suite.needle_candidate,
+            &suite.needle_reference,
         ),
         "multi-turn-prompt-cache" => (
             serde_json::json!({ "matches": quality.cache_matches, "total": quality.cache_total }),
-            suite.cache_reference.observation.snapshot.sha256.clone(),
+            &suite.cache_candidate,
+            &suite.cache_reference,
         ),
         _ => return Err(format!("unknown fixture {name}")),
     };
     let metrics = compute_quality(&quality)?;
     let value = serde_json::json!({
         "fixture": name,
-        "independentReference": format!("fp32-snapshot:{reference}"),
+        "independentReference": format!("fp32-snapshot:{}", reference.quality_observation.snapshot.sha256),
+        "binding": {
+            "coordinate": coordinate_slug(coordinate),
+            "repeat": repeat,
+            "candidate": {
+                "coordinateInventorySha256": candidate.observation.snapshot.sha256.as_str(),
+                "coordinateSessionId": candidate.observation.session_id.as_str(),
+                "qualityInventorySha256": candidate.quality_observation.snapshot.sha256.as_str(),
+                "qualitySessionId": candidate.quality_observation.session_id.as_str(),
+                "operation": candidate.coordinate_operation.as_str(),
+                "operationOutputSha256": candidate.coordinate_output_sha256.as_str(),
+                "operationGeneratedTokens": candidate.coordinate_generated_tokens,
+                "operationPromptTokens": candidate.coordinate_prompt_tokens,
+                "qualityTranscriptSha256": seal_bytes(candidate.output.text.as_bytes()),
+            },
+            "reference": {
+                "coordinateInventorySha256": reference.observation.snapshot.sha256.as_str(),
+                "coordinateSessionId": reference.observation.session_id.as_str(),
+                "qualityInventorySha256": reference.quality_observation.snapshot.sha256.as_str(),
+                "qualitySessionId": reference.quality_observation.session_id.as_str(),
+                "operation": reference.coordinate_operation.as_str(),
+                "operationOutputSha256": reference.coordinate_output_sha256.as_str(),
+                "operationGeneratedTokens": reference.coordinate_generated_tokens,
+                "operationPromptTokens": reference.coordinate_prompt_tokens,
+                "qualityTranscriptSha256": seal_bytes(reference.output.text.as_bytes()),
+            },
+        },
         "evidence": evidence,
         "metrics": {
             "parityMaxError": metrics.parity_max_error,
@@ -2165,21 +2339,34 @@ fn product_fixture_artifact(
     Ok(sealed_json(&value))
 }
 
+fn fixture_artifact_name(fixture: &str, repeat: usize) -> String {
+    if repeat == 0 {
+        format!("fixtures/{fixture}.json")
+    } else {
+        format!("fixtures/repeat-{repeat}/{fixture}.json")
+    }
+}
+
 fn sealed_product_fixture_artifacts(
-    suite: &ProductFixtureSuite,
+    suites: &[ProductFixtureSuite],
+    coordinate: &Coordinate,
 ) -> Result<Vec<SealedFixtureArtifact>, String> {
-    REQUIRED_FIXTURES
-        .iter()
-        .map(|fixture| {
-            let (bytes, hash) = product_fixture_artifact(fixture, suite)?;
-            let name = format!("fixtures/{fixture}.json");
-            Ok(SealedFixtureArtifact {
+    if suites.len() != 5 {
+        return Err("complete product evidence requires exactly five repeats".into());
+    }
+    let mut artifacts = Vec::with_capacity(REQUIRED_FIXTURES.len() * suites.len());
+    for (repeat, suite) in suites.iter().enumerate() {
+        for fixture in REQUIRED_FIXTURES {
+            let (bytes, hash) = product_fixture_artifact(fixture, suite, coordinate, repeat)?;
+            let name = fixture_artifact_name(fixture, repeat);
+            artifacts.push(SealedFixtureArtifact {
                 sidecar: format!("{hash}  {name}\n"),
                 name,
                 bytes,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(artifacts)
 }
 
 pub fn validate_fixture_evidence(evidence: &[FixtureEvidence]) -> Result<(), String> {
@@ -2210,6 +2397,12 @@ pub fn sequence_marker() -> u64 {
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
+    /// Bind a product-owned provider-load identity before the first phase.  The default preserves
+    /// existing non-campaign observers without permitting receipt assembly to invent an identity.
+    fn bind_session(&mut self, _session_id: &str) {}
+    /// Cache state is versioned by the provider-load session.  It prevents a same-PID reload from
+    /// being mislabeled as a warmed provider/cache.
+    fn cache_state(&mut self, _version: u64) {}
     /// Record a coordinate operation that actually executed on this observed product session.
     fn operation(&mut self, _operation: &'static str) {}
     /// Exact fp32 logits materialized from the production decode seam only while a campaign
@@ -2239,6 +2432,7 @@ pub struct ProductObserver {
     token_probabilities: Vec<(i32, f64)>,
     error: Option<String>,
     session_id: Option<String>,
+    cache_state_version: Option<u64>,
     operations: Vec<String>,
 }
 
@@ -2257,12 +2451,21 @@ impl ProductObserver {
             token_probabilities: Vec::new(),
             error: None,
             session_id: None,
+            cache_state_version: None,
             operations: Vec::new(),
         }
     }
 
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
         self.session_id = Some(session_id.into());
+    }
+
+    pub fn cache_state(&mut self, version: u64) {
+        if version == 0 {
+            self.error = Some("campaign cache state version must be positive".into());
+        } else {
+            self.cache_state_version = Some(version);
+        }
     }
 
     pub fn operation(&mut self, operation: &'static str) {
@@ -2302,6 +2505,9 @@ impl ProductObserver {
             session_id: self
                 .session_id
                 .ok_or("product observer is missing campaign session")?,
+            cache_state_version: self
+                .cache_state_version
+                .ok_or("product observer is missing provider cache-state evidence")?,
             operations: self.operations,
         })
     }
@@ -2322,10 +2528,19 @@ pub struct ProductObservations {
     pub prefill_logits: Vec<f32>,
     pub token_probabilities: Vec<(i32, f64)>,
     pub session_id: String,
+    pub cache_state_version: u64,
     pub operations: Vec<String>,
 }
 
 impl Observer for ProductObserver {
+    fn bind_session(&mut self, session_id: &str) {
+        self.bind_session(session_id);
+    }
+
+    fn cache_state(&mut self, version: u64) {
+        self.cache_state(version);
+    }
+
     fn operation(&mut self, operation: &'static str) {
         self.operation(operation);
     }
@@ -2742,6 +2957,9 @@ pub fn run_dense_lifecycle_request_on_session(
         if coordinate.is_some_and(|c| c.prefill_mode == "chunked") {
             observer.operation("prompt-cache-reuse");
         }
+        // A successful prefix reuse is the product-owned cache proof for this exact provider
+        // load.  The version is monotonically scoped to `CampaignSession`, not this PID.
+        observer.cache_state(session.advance_cache_state());
         provider.campaign_cancel_after_first_token(request)?;
         observer.phase("prompt-cache-reuse");
         observer.phase("cancellation-cleanup");
@@ -2755,8 +2973,17 @@ pub fn run_dense_lifecycle_request_on_session(
 /// is selected by the worker, but every numeric value and emitted tool/token fact comes from the
 /// loaded provider through the observer and `TextLlmOutput`.
 pub struct ProductFixtureResult {
+    /// Product observations for the coordinate's actual dispatch (single, batch, or prefix reuse).
+    /// Receipt memory/timing/geometry consume this field exclusively.
     pub observation: ProductObservations,
+    /// Independently observed single-request fixture output used only for the frozen quality checks.
+    /// It is sealed alongside the coordinate observation and is never used as coordinate telemetry.
+    pub quality_observation: ProductObservations,
     pub output: TextLlmOutput,
+    pub coordinate_operation: String,
+    pub coordinate_generated_tokens: u64,
+    pub coordinate_prompt_tokens: u64,
+    pub coordinate_output_sha256: String,
 }
 
 pub fn run_product_fixture(
@@ -2775,19 +3002,134 @@ pub fn run_product_fixture_on_session(
     request: TextLlmRequest,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
+    let (
+        observation,
+        coordinate_operation,
+        coordinate_generated_tokens,
+        coordinate_prompt_tokens,
+        coordinate_output_sha256,
+    ) = run_coordinate_operation_on_session(session, prefix_prompt, request.clone(), coordinate)?;
     let mut observer = ProductObserver::new();
     let output = run_dense_lifecycle_request_on_session(
         session,
         prefix_prompt,
         request,
-        Some(coordinate),
+        None,
         &mut observer,
     )?;
-    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    let quality_observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(ProductFixtureResult {
         observation,
+        quality_observation,
         output,
+        coordinate_operation,
+        coordinate_generated_tokens,
+        coordinate_prompt_tokens,
+        coordinate_output_sha256,
     })
+}
+
+/// Execute the exact requested coordinate while a product observer is attached.  Quality fixtures
+/// are intentionally a second, separately-bound product operation: they may not relabel a normal
+/// single request as a batch or prefix-reuse measurement.
+fn run_coordinate_operation_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    coordinate: &Coordinate,
+) -> core_llm::Result<(ProductObservations, String, u64, u64, String)> {
+    if coordinate.request_mode == "supported-batch" && coordinate.prefill_mode == "chunked" {
+        return Err(core_llm::Error::Unsupported(
+            "mixed supported-batch/chunked coordinate requires two independently observed operations"
+                .into(),
+        ));
+    }
+    let provider = &session.provider;
+    let mut observer = ProductObserver::new();
+    observer.bind_session(session.session_id());
+    observer.phase("process-start");
+    observer.snapshot_inventory(session.inventory());
+    observer.geometry(provider.campaign_geometry());
+    observer.phase("weights-loaded");
+    observer.allocation("weights", "persistent", session.inventory().bytes);
+
+    let (operation, generated_tokens, prompt_tokens, output_sha256) =
+        if coordinate.request_mode == "supported-batch" {
+            let (outputs, prompt_tokens) =
+                provider.campaign_supported_batch_observed(prefix_prompt, 2, &mut observer)?;
+            let mut bytes = Vec::new();
+            let generated = outputs
+                .iter()
+                .map(|output| output.tokens.len() as u64)
+                .sum();
+            for output in outputs {
+                for token in output.tokens {
+                    bytes.extend_from_slice(&token.to_le_bytes());
+                }
+            }
+            observer.operation("supported-batch");
+            (
+                "supported-batch".to_string(),
+                generated,
+                prompt_tokens,
+                seal_bytes(&bytes),
+            )
+        } else if coordinate.prefill_mode == "chunked" {
+            let (output, hits, prompt_tokens) =
+                provider.campaign_prefix_reuse_observed(prefix_prompt, &mut observer)?;
+            if hits == 0 {
+                return Err(core_llm::Error::InvalidRequest(
+                    "observed prefix coordinate has no cache hit".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            for token in &output.tokens {
+                bytes.extend_from_slice(&token.to_le_bytes());
+            }
+            observer.operation("chunked-prefix-reuse");
+            (
+                "chunked-prefix-reuse".to_string(),
+                output.tokens.len() as u64,
+                prompt_tokens,
+                seal_bytes(&bytes),
+            )
+        } else {
+            let mut saw_token = false;
+            let output = provider.generate_observed(
+                &request,
+                &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
+                &mut observer,
+            )?;
+            if !saw_token {
+                return Err(core_llm::Error::InvalidRequest(
+                    "single coordinate produced no first-token observation".into(),
+                ));
+            }
+            observer.operation("single-shot-generation");
+            (
+                "single-shot-generation".to_string(),
+                output.usage.generated_tokens as u64,
+                output.usage.prompt_tokens as u64,
+                seal_bytes(output.text.as_bytes()),
+            )
+        };
+
+    // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
+    // replace the coordinate operation measured above.
+    provider.campaign_prefix_reuse(prefix_prompt)?;
+    observer.cache_state(session.advance_cache_state());
+    observer.phase("prompt-cache-reuse");
+    provider.campaign_cancel_after_first_token(request)?;
+    observer.phase("cancellation-cleanup");
+    observer.phase("post-run-release");
+    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    Ok((
+        observation,
+        operation,
+        generated_tokens,
+        prompt_tokens,
+        output_sha256,
+    ))
 }
 
 fn negative_log_likelihood(probabilities: &[(i32, f64)]) -> Result<f64, String> {
@@ -2830,8 +3172,8 @@ pub fn quality_from_product_fixtures(
     cache_reference: &ProductFixtureResult,
     expected_needle: &str,
 ) -> Result<QualityObservation, String> {
-    let candidate_logits = &kernel_candidate.observation.prefill_logits;
-    let reference_logits = &kernel_reference.observation.prefill_logits;
+    let candidate_logits = &kernel_candidate.quality_observation.prefill_logits;
+    let reference_logits = &kernel_reference.quality_observation.prefill_logits;
     if candidate_logits.len() != reference_logits.len() || candidate_logits.is_empty() {
         return Err("candidate/reference production logits are not comparable".into());
     }
@@ -2841,12 +3183,12 @@ pub fn quality_from_product_fixtures(
         .map(|(candidate, reference)| f64::from((candidate - reference).abs()))
         .collect::<Vec<_>>();
     let (greedy_matches, greedy_total) = token_agreement(
-        &kernel_candidate.observation.token_probabilities,
-        &kernel_reference.observation.token_probabilities,
+        &kernel_candidate.quality_observation.token_probabilities,
+        &kernel_reference.quality_observation.token_probabilities,
     );
     let (cache_matches, cache_total) = token_agreement(
-        &cache_candidate.observation.token_probabilities,
-        &cache_reference.observation.token_probabilities,
+        &cache_candidate.quality_observation.token_probabilities,
+        &cache_reference.quality_observation.token_probabilities,
     );
     let tool_ok = !tool_candidate.output.tool_calls.is_empty()
         && tool_candidate.output.tool_calls == tool_reference.output.tool_calls;
@@ -2861,10 +3203,10 @@ pub fn quality_from_product_fixtures(
     Ok(QualityObservation {
         parity_errors,
         reference_perplexity: negative_log_likelihood(
-            &kernel_reference.observation.token_probabilities,
+            &kernel_reference.quality_observation.token_probabilities,
         )?,
         candidate_perplexity: negative_log_likelihood(
-            &kernel_candidate.observation.token_probabilities,
+            &kernel_candidate.quality_observation.token_probabilities,
         )?,
         greedy_matches,
         greedy_total,
@@ -3066,7 +3408,7 @@ pub fn timing_samples_from_product_repeats(
         .map(|run| {
             timing_from_product_observation(
                 &run.observation,
-                run.output.usage.generated_tokens as usize,
+                run.coordinate_generated_tokens as usize,
                 process_temperature,
             )
         })
@@ -3147,10 +3489,31 @@ fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, S
 /// no-throttling/no-pressure observation and normalize it to the schema's semantic `nominal`.
 fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
     let normalized = value.to_ascii_lowercase();
-    if normalized.contains("thermal pressure: 0")
-        || normalized.contains("thermal level: 0")
-        || normalized.contains("nominal")
+    if normalized.contains("not nominal")
+        || normalized.contains("throttl")
+        || normalized.contains("critical")
     {
+        return Err("pmset thermal probe reports throttling or a contradictory state".into());
+    }
+    let mut saw_zero = false;
+    for line in normalized.lines().map(str::trim) {
+        let Some((name, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        if !matches!(name.trim(), "thermal pressure" | "thermal level") {
+            continue;
+        }
+        let value = raw_value.trim();
+        let digits = value
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        if digits.is_empty() || digits != "0" {
+            return Err("pmset thermal probe reports nonzero thermal pressure".into());
+        }
+        saw_zero = true;
+    }
+    if saw_zero {
         return Ok("nominal".into());
     }
     Err("pmset thermal probe did not prove nominal thermal state".into())
@@ -3162,25 +3525,31 @@ fn product_receipt(
     timings: Vec<RawTiming>,
     executable: &Path,
     fixtures: &[SealedFixtureArtifact],
-    warmup_suite_sha256: Option<String>,
+    warmup: Option<(String, u64)>,
 ) -> Result<Receipt, String> {
     let quality = suite.quality()?;
     let observation = &suite.kernel_candidate.observation;
-    let required_operation = if coordinate.request_mode == "supported-batch" {
-        "supported-batch"
-    } else if coordinate.prefill_mode == "chunked" {
-        "chunked-prefix-reuse"
-    } else {
-        "single-shot-generation"
-    };
-    if !observation
-        .operations
-        .iter()
-        .any(|operation| operation == required_operation)
-    {
-        return Err(format!(
-            "coordinate did not execute required product operation {required_operation}"
-        ));
+    let required_operations = [
+        (
+            coordinate.request_mode == "supported-batch",
+            "supported-batch",
+        ),
+        (coordinate.prefill_mode == "chunked", "chunked-prefix-reuse"),
+        (
+            coordinate.request_mode == "single" && coordinate.prefill_mode == "single-shot",
+            "single-shot-generation",
+        ),
+    ];
+    for (_, required_operation) in required_operations.iter().filter(|(required, _)| *required) {
+        if !observation
+            .operations
+            .iter()
+            .any(|operation| operation == *required_operation)
+        {
+            return Err(format!(
+                "coordinate did not execute required product operation {required_operation}"
+            ));
+        }
     }
     let reference = &suite.kernel_reference.observation.snapshot;
     let model = &observation.snapshot;
@@ -3262,12 +3631,12 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone() },
+        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={};referenceSession={}", model.root.display(), model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
-        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
+        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: suite.kernel_candidate.coordinate_prompt_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.coordinate_prompt_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_suite_sha256.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256.unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() } } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -3557,6 +3926,7 @@ mod tests {
                 command_template: "run --mode {mode}".into(),
                 command: "run --mode dense".into(),
                 campaign_session_id: "e".repeat(64),
+                campaign_cache_state_version: 1,
             },
             matrix: ReceiptMatrix {
                 family: "llama".into(),
@@ -3660,6 +4030,7 @@ mod tests {
                 worker_pid: 7,
                 suite_sha256: String::new(),
                 session_id: String::new(),
+                cache_state_version: 0,
             },
         };
         for name in REQUIRED_FIXTURES {
@@ -3840,5 +4211,24 @@ mod tests {
         );
         assert!(output.join("run.txt.sha256").is_file());
         assert!(write_artifacts(&output, "run.json", "run.txt", &bundle).is_err());
+    }
+
+    #[test]
+    fn thermal_probe_requires_an_explicit_zero_pressure_record() {
+        assert_eq!(
+            normalize_pmset_thermal("Thermal Pressure: 0\n").unwrap(),
+            "nominal"
+        );
+        for invalid in [
+            "Thermal Pressure: 1\n",
+            "Thermal Level: 0\nnot nominal\n",
+            "nominal\n",
+            "Thermal Pressure: 0\nthrottling active\n",
+        ] {
+            assert!(
+                normalize_pmset_thermal(invalid).is_err(),
+                "invalid thermal probe unexpectedly accepted: {invalid:?}"
+            );
+        }
     }
 }
