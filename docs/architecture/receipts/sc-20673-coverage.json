@@ -1,0 +1,302 @@
+{
+  "axes": {
+    "B": [
+      1
+    ],
+    "D": {
+      "supported": [
+        64,
+        128,
+        256
+      ],
+      "tested": [
+        128
+      ],
+      "unmeasured": [
+        64,
+        256
+      ]
+    },
+    "GQA": [
+      1,
+      4
+    ],
+    "Hkv": [
+      4,
+      8,
+      32
+    ],
+    "Hq": [
+      4,
+      8,
+      32
+    ],
+    "Skv": [
+      32,
+      64,
+      512,
+      1024,
+      2048,
+      8192,
+      16384
+    ],
+    "Sq": [
+      1,
+      256,
+      1024
+    ],
+    "bits": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "code_format": [
+      "uint8",
+      "bit-packed uint32",
+      "nibble-packed uint8"
+    ],
+    "dtype": [
+      "float16",
+      "float32",
+      "uint8",
+      "uint32"
+    ],
+    "group_size": [
+      32
+    ],
+    "masks": [
+      "unmasked",
+      "tail/validation masks"
+    ],
+    "simd_groups": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tails_nonmultiples": true
+  },
+  "independent_reference": "numpy reconstruction + softmax/value accumulation in frozen upstream parity tests",
+  "live_vs_benchmark": "all attention kernels benchmark-only; RVQ quantize+pack is write-path helper, not live compressed attention",
+  "msl": [
+    "RVQ: one threadgroup per vector, D lanes",
+    "scalar attend: nsg SIMD-groups per B*H",
+    "RaBitQ decode: 8 SIMD-groups per query",
+    "RaBitQ prefill: 8x8 simdgroup_matrix tiles"
+  ],
+  "observed_raw_rows": [
+    "# fused group-affine decode-attend  |  B=1 H=32 D=128 b=2 g=32 nsg=8  |  MLX 0.32.2",
+    "| S_kv | before (MLX) ms | after (fused) ms | speedup |",
+    "|------|-----------------|------------------|---------|",
+    "|   512 |           0.910 |            0.464 |   1.96x |",
+    "|  2048 |           1.860 |            0.529 |   3.52x |",
+    "|  8192 |           6.640 |            1.936 |   3.43x |",
+    "| 16384 |          13.487 |            3.717 |   3.63x |",
+    "# KIVI group quant  |  B=1 H=8 D=128 b=2 g=32  |  MLX 0.32.2",
+    "| S | axis | scheme | MLX ms | Metal ms | speedup |",
+    "|---|------|--------|--------|----------|---------|",
+    "| 32 | -2 | keys (per-channel) | 0.2917 | 0.2281 | 1.28x |",
+    "| 32 | -1 | values (per-token) | 0.2864 | 0.1832 | 1.56x |",
+    "| 512 | -2 | keys (per-channel) | 0.4413 | 0.2429 | 1.82x |",
+    "| 512 | -1 | values (per-token) | 0.3523 | 0.2158 | 1.63x |",
+    "| 2048 | -2 | keys (per-channel) | 0.8485 | 0.3100 | 2.74x |",
+    "| 2048 | -1 | values (per-token) | 0.7236 | 0.3249 | 2.23x |",
+    "# RVQ quantize+pack  |  D=128 bits=2  |  MLX 0.32.2",
+    "| N | MLX ms | Fused ms | speedup | MLX GB/s | Fused GB/s |",
+    "|---|--------|----------|---------|----------|------------|",
+    "| 64 | 0.3476 | 0.2210 | 1.57x | 0.15 | 0.17 |",
+    "| 1024 | 0.4308 | 0.2585 | 1.67x | 1.98 | 2.28 |",
+    "| 8192 | 0.8755 | 0.4767 | 1.84x | 7.78 | 9.90 |",
+    "S_kv | fused (ms) | packed-V (ms) | baseline (ms) | speedup | pk spd",
+    "512 |      0.517 |         0.485 |         0.338 |   0.65x |  0.70x",
+    "2048 |      0.594 |         0.409 |         0.263 |   0.44x |  0.64x",
+    "8192 |      1.262 |         1.162 |         0.440 |   0.35x |  0.38x",
+    "N | fused (ms) |  mlx (ms) | numpy (ms) |  vs mlx | vs numpy",
+    "1024 |      0.214 |     0.289 |      0.300 |   1.35x |    1.40x",
+    "8192 |      0.307 |     0.437 |      1.161 |   1.42x |    3.78x",
+    "32768 |      0.654 |     0.495 |      4.207 |   0.76x |    6.43x",
+    "S_q   S_kv | prefill (ms) | decode-k (ms) | baseline (ms) | vs base",
+    "256   2048 |        1.963 |         4.232 |         0.461 |   0.23x",
+    "256   8192 |        7.226 |        16.292 |         1.833 |   0.25x",
+    "1024   8192 |       14.955 |        63.136 |         2.003 |   0.13x"
+  ],
+  "physical_bytes": [
+    {
+      "bytes": 1048576,
+      "format": "dense fp16 K",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 1048576,
+      "format": "dense fp16 V",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 524288,
+      "format": "group-affine uint8 K codes",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 16384,
+      "format": "group-affine K scale+zero metadata",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 524288,
+      "format": "group-affine uint8 V codes",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 16384,
+      "format": "group-affine V scale+zero metadata",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 65536,
+      "format": "RaBitQ bit-packed K",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 65536,
+      "format": "RaBitQ nibble-packed V",
+      "geometry": "B1 H8 Skv512 D128"
+    },
+    {
+      "bytes": 2097152,
+      "format": "dense transient K/V reconstruction",
+      "geometry": "B1 H8 Skv512 D128"
+    }
+  ],
+  "provenance": {
+    "dependency_lock": "external pyproject.toml; no lock file",
+    "host": "system=macOS-26.5.2-arm64-arm-64bit-Mach-O; machine=arm64; python=3.13.13; xcode=26.5 (17F42); metal=macOS 26.5.2; chip=Apple M5 Max; unified_memory_bytes=137438953472; mlx=0.32.2; mlx_lm=0.31.3; mlx_metal=0.32.2",
+    "inference_base": "3deb898c8dfa572e939ba9705adfe311dd6d43f0",
+    "run_receipt_sha256": "generated with the same canonical receipt bytes after coverage insertion",
+    "upstream_commit": "54989ee223611627592f7f9bd925e924658f1f22"
+  },
+  "results": {
+    "rabitq_decode": {
+      "speedup": [
+        0.65,
+        0.44,
+        0.35
+      ],
+      "timings_ms": {
+        "2048": [
+          0.594,
+          0.263
+        ],
+        "512": [
+          0.517,
+          0.338
+        ],
+        "8192": [
+          1.262,
+          0.44
+        ]
+      }
+    },
+    "rabitq_prefill": {
+      "speedup": [
+        0.23,
+        0.25,
+        0.13
+      ],
+      "timings_ms": {
+        "1024x8192": [
+          14.955,
+          2.003
+        ],
+        "256x2048": [
+          1.963,
+          0.461
+        ],
+        "256x8192": [
+          7.226,
+          1.833
+        ]
+      }
+    },
+    "scalar_group_affine": {
+      "speedup": [
+        1.96,
+        3.52,
+        3.43,
+        3.63
+      ],
+      "timings_ms": {
+        "16384": [
+          13.487,
+          3.717
+        ],
+        "2048": [
+          1.86,
+          0.529
+        ],
+        "512": [
+          0.91,
+          0.464
+        ],
+        "8192": [
+          6.64,
+          1.936
+        ]
+      }
+    }
+  },
+  "schemaVersion": 1,
+  "story": "SC-20673",
+  "timing": {
+    "compilation": "process_boundary_proxy; not isolated from first dispatch",
+    "first_dispatch": "process_boundary_proxy; not isolated from compilation",
+    "limitation": "Exact kernel compile, first-dispatch, synchronization, and MLX allocator peaks are not separately exposed by frozen upstream callables; timing_measurements are wrapper/process-boundary values and block product eligibility.",
+    "steady_state": "benchmark medians from named upstream scripts",
+    "synchronization": "process_boundary_proxy; subprocess completion boundary",
+    "transient_peak": "child ru_maxrss process peak; not MLX allocator peak"
+  },
+  "timing_measurements": [
+    {
+      "compile_first_dispatch_process_s": 8.957,
+      "name": "parity",
+      "steady_synchronized_process_s": 8.957,
+      "synchronization_process_boundary_s": 8.957,
+      "transient_peak_rss_bytes": 3490398208
+    },
+    {
+      "compile_first_dispatch_process_s": 1.24,
+      "name": "rabitq_decode_benchmark",
+      "steady_synchronized_process_s": 1.24,
+      "synchronization_process_boundary_s": 1.24,
+      "transient_peak_rss_bytes": 3490398208
+    },
+    {
+      "compile_first_dispatch_process_s": 1.57,
+      "name": "rabitq_encode_benchmark",
+      "steady_synchronized_process_s": 1.57,
+      "synchronization_process_boundary_s": 1.57,
+      "transient_peak_rss_bytes": 3490398208
+    },
+    {
+      "compile_first_dispatch_process_s": 7.4,
+      "name": "rabitq_prefill_benchmark",
+      "steady_synchronized_process_s": 7.4,
+      "synchronization_process_boundary_s": 7.4,
+      "transient_peak_rss_bytes": 3490398208
+    }
+  ],
+  "unsupported": [
+    {
+      "case": "D=256 measurement",
+      "fallback": "dense SDPA"
+    },
+    {
+      "case": "masked/causal RaBitQ prefill",
+      "fallback": "dense SDPA"
+    },
+    {
+      "case": "older Apple GPU",
+      "fallback": "unknown; hardware unavailable"
+    }
+  ]
+}
