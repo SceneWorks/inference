@@ -114,7 +114,7 @@ impl ConvRotLinear {
                 self.rotation.get_or_init(|| rotation)
             };
             let rotated = shared::convrot_rotate(x, rotation)?;
-            return self.linear.forward(&rotated);
+            self.linear.forward(&rotated)
         }
         #[cfg(not(feature = "cuda"))]
         {

@@ -153,7 +153,8 @@ impl Ltx25GpuGeneration {
             let Device::Cuda(cuda) = device else {
                 unreachable!("CUDA variant checked above")
             };
-            let context = cuda.cuda_stream().context();
+            let stream = cuda.cuda_stream();
+            let context = stream.context();
             let major = context
                 .attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
                 .map_err(|error| {
