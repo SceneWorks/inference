@@ -627,6 +627,105 @@ pub struct MemorySample {
     pub mlx_peak_bytes: u64,
 }
 
+pub trait CampaignSampler {
+    fn sample(&mut self, phase: &'static str) -> Result<MemorySample, String>;
+}
+
+/// Injectable phase recorder used by both the device runner and weightless tests.
+pub struct PhaseRecorder<S> {
+    sampler: S,
+    pub samples: Vec<ReceiptPhase>,
+    pid: Option<u32>,
+}
+
+impl<S: CampaignSampler> PhaseRecorder<S> {
+    pub fn new(sampler: S) -> Self {
+        Self {
+            sampler,
+            samples: Vec::new(),
+            pid: None,
+        }
+    }
+    pub fn capture(
+        &mut self,
+        phase: &'static str,
+        timestamp: impl Into<String>,
+    ) -> Result<(), String> {
+        let sample = self.sampler.sample(phase)?;
+        if let Some(pid) = self.pid {
+            if pid != sample.pid {
+                return Err("campaign worker PID changed".into());
+            }
+        } else {
+            if sample.pid == 0 {
+                return Err("campaign worker PID is zero".into());
+            }
+            self.pid = Some(sample.pid);
+        }
+        self.samples.push(ReceiptPhase {
+            phase: phase.into(),
+            pid: sample.pid,
+            source: "footprint -p".into(),
+            timestamp: timestamp.into(),
+            phys_footprint_bytes: sample.current_bytes,
+            phys_footprint_peak_bytes: sample.peak_bytes,
+            mlx: ReceiptMlx {
+                source: "mlx_rs::memory".into(),
+                active_bytes: sample.mlx_active_bytes,
+                cache_bytes: sample.mlx_cache_bytes,
+                peak_bytes: sample.mlx_peak_bytes,
+            },
+        });
+        Ok(())
+    }
+    pub fn finish(self) -> Result<Vec<ReceiptPhase>, String> {
+        if self.samples.len() != REQUIRED_PHASES.len() {
+            return Err("campaign did not capture all required phases".into());
+        }
+        for (sample, expected) in self.samples.iter().zip(REQUIRED_PHASES) {
+            if sample.phase != expected {
+                return Err(format!("phase order mismatch: expected {expected}"));
+            }
+        }
+        Ok(self.samples)
+    }
+}
+
+/// Run the evidence state machine around a product operation. The operation receives the recorder
+/// so it can report cache/prefix/cancellation events at their ownership sites.
+pub fn run_lifecycle<S: CampaignSampler, F>(
+    sampler: S,
+    mut operation: F,
+) -> Result<Vec<ReceiptPhase>, String>
+where
+    F: FnMut(&mut PhaseRecorder<S>) -> Result<(), String>,
+{
+    let mut recorder = PhaseRecorder::new(sampler);
+    for phase in ["process-start", "weights-loaded", "prefill-peak"] {
+        recorder.capture(
+            phase,
+            format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
+        )?;
+    }
+    operation(&mut recorder)?;
+    if recorder.samples.len() < 5 {
+        return Err("operation omitted first-token/decode observations".into());
+    }
+    recorder.capture(
+        "prompt-cache-reuse",
+        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
+    )?;
+    recorder.capture(
+        "cancellation-cleanup",
+        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
+    )?;
+    recorder.capture(
+        "post-run-release",
+        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
+    )?;
+    recorder.finish()
+}
+
 /// Parse Darwin footprint fields while accepting the units emitted by different macOS releases.
 pub fn parse_footprint_value(value: &str) -> Option<u64> {
     let mut parts = value.split_whitespace();
@@ -826,6 +925,33 @@ mod tests {
             ..raw
         })
         .is_err());
+    }
+
+    struct FakeSampler;
+    impl CampaignSampler for FakeSampler {
+        fn sample(&mut self, _phase: &'static str) -> Result<MemorySample, String> {
+            Ok(MemorySample {
+                pid: 7,
+                current_bytes: 100,
+                peak_bytes: 100,
+                mlx_active_bytes: 10,
+                mlx_cache_bytes: 1,
+                mlx_peak_bytes: 10,
+            })
+        }
+    }
+
+    #[test]
+    fn fake_runner_requires_and_orders_all_phases() {
+        let phases = run_lifecycle(FakeSampler, |recorder| {
+            recorder.capture("first-token", "2026-01-01T00:00:03.000Z")?;
+            recorder.capture("decode-steady", "2026-01-01T00:00:04.000Z")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(phases.len(), 8);
+        assert_eq!(phases[5].phase, "prompt-cache-reuse");
+        assert!(run_lifecycle(FakeSampler, |_recorder| Ok(())).is_err());
     }
 
     #[test]
