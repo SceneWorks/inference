@@ -41,12 +41,16 @@ fn main() -> Result<()> {
     // registry has resolved the real snapshot and request geometry.  This keeps caller flags from
     // becoming evidence and ensures the scope covers generation and release.
     let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
-        Some(
-            candle_gen_wan::sc20686_observer::request_output(
+        {
+            let request = candle_gen_wan::sc20686_observer::request_output(
                 arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
-            )
-            .arm(),
-        )
+            );
+            Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+                request.arm_cancellation()
+            } else {
+                request.arm()
+            })
+        }
     } else {
         None
     };

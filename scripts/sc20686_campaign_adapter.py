@@ -91,11 +91,18 @@ def entrypoint_campaign_runner(entrypoint, snapshot):
         command = [str(entrypoint), "--sc20686-campaign", "--sc20686-events", "-",
                    "--snapshot", str(snapshot), "--variant", variant]
         if arm == "cancel": command.append("--sc20686-cancel")
-        completed = subprocess.run(command, check=False, text=True, encoding="utf-8",
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if completed.returncode:
-            raise ValueError(f"{variant}/{arm} entrypoint failed: {completed.stderr.strip()}")
-        events = [json.loads(line) for line in completed.stdout.splitlines() if line.lstrip().startswith("{")]
+        child = subprocess.Popen(command, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process_samples = []
+        while child.poll() is None:
+            try:
+                rss_kib = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(child.pid)], text=True).strip() or "0")
+                if rss_kib > 0: process_samples.append({"phase": "process-sample", "sample_kind": "process", "peak_bytes": rss_kib * 1024, "at_ns": time.time_ns()})
+            except (OSError, subprocess.SubprocessError, ValueError): pass
+            time.sleep(0.05)
+        stdout, stderr = child.communicate()
+        if child.returncode: raise ValueError(f"{variant}/{arm} entrypoint failed: {stderr.strip()}")
+        events = [json.loads(line) for line in stdout.splitlines() if line.lstrip().startswith("{")]
+        events.extend(process_samples)
         if not events: raise ValueError(f"{variant}/{arm} produced no observer events")
         return events
     return run
@@ -129,9 +136,11 @@ def publish_matrix_campaign(runner, row_builder, destination):
         reducer_spec = importlib.util.spec_from_file_location("sc20686_reducer", REDUCER)
         reducer = importlib.util.module_from_spec(reducer_spec); reducer_spec.loader.exec_module(reducer)
         sealed_rows = []
+        row_sidecars = []
         for index, row in enumerate(rows):
-            sealed, _ = seal(row, f"row-{index:02d}.json")
+            sealed, sidecar = seal(row, f"row-{index:02d}.json")
             sealed_rows.append(sealed)
+            row_sidecars.append((f"row-{index:02d}.json", canonical(sealed), sidecar))
         decision = reducer.reduce(sealed_rows)
         result = {"schema": "sc-20686-cache-attribution-v2", "decision": decision, "rows": sealed_rows}
         raw = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
@@ -141,6 +150,9 @@ def publish_matrix_campaign(runner, row_builder, destination):
         for name, payload in (("campaign.json", raw), ("campaign.md", markdown)):
             (staging / name).write_bytes(payload)
             (staging / f"{name}.sha256").write_text(f"{hashlib.sha256(payload).hexdigest()}  {name}\n", encoding="utf-8")
+        for name, payload, sidecar in row_sidecars:
+            (staging / name).write_bytes(payload)
+            (staging / f"{name}.sha256").write_bytes(sidecar)
         os.replace(staging, final)
     except Exception:
         if staging.exists():
@@ -164,7 +176,12 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if any(not isinstance(metrics.get(k), (int, float)) for k in metric_keys):
         raise ValueError("entrypoint metrics are incomplete")
     phases = {e.get("phase") for e in events}
-    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "released"} <= phases:
+    required = {"generation-start", "cross-kv-created", "cross-kv-read", "invalidated", "released"}
+    if args.cancel_campaign:
+        required.add("cancelled")
+    else:
+        required.add("generation-end")
+    if not required <= phases:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
     cancelled = [i for i, e in enumerate(events) if e.get("phase") == "cancelled"]
     released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
@@ -174,6 +191,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("deliberate cancellation cleanup must precede release")
     if not args.cancel_campaign and cancelled:
         raise ValueError("normal generation cannot contain cancellation")
+    if args.cancel_campaign and "generation-end" in phases:
+        raise ValueError("cancel arm cannot claim successful generation completion")
     geometry = geometry_from(events)
     coordinate_id = digest(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode())[:16]
     arm = "cancel" if args.cancel_campaign else "normal"
