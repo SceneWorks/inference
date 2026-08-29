@@ -187,7 +187,9 @@ pub struct ReceiptTimings {
 #[serde(deny_unknown_fields)]
 pub struct ReceiptFixture {
     pub passed: bool,
+    pub artifact_name: String,
     pub artifact_sha256: String,
+    pub artifact_sidecar_sha256: String,
     pub independent_reference: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -894,12 +896,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || REQUIRED_FIXTURES.iter().any(|name| {
             receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
                 !f.passed
+                    || f.artifact_name != format!("fixtures/{name}.json")
                     || f.artifact_sha256.len() != 64
                     || !f
                         .artifact_sha256
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b >= b'a' && b <= b'f'))
                     || f.independent_reference.is_empty()
+                    || f.artifact_sidecar_sha256.len() != 64
+                    || !f
+                        .artifact_sidecar_sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
         })
     {
@@ -969,18 +977,42 @@ pub struct ArtifactBundle {
     pub receipt_sidecar: String,
     pub human: Vec<u8>,
     pub human_sidecar: String,
+    pub fixtures: Vec<SealedFixtureArtifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedFixtureArtifact {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub sidecar: String,
 }
 
 /// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
 /// partially-written receipt directory from being mistaken for a campaign result.
 pub fn assemble_artifacts(receipt: Receipt) -> Result<ArtifactBundle, String> {
-    assemble_artifacts_named(receipt, "receipt.json", "receipt.md")
+    assemble_artifacts_with_fixtures_named(receipt, "receipt.json", "receipt.md", Vec::new())
+}
+
+pub fn assemble_artifacts_with_fixtures(
+    receipt: Receipt,
+    fixtures: Vec<SealedFixtureArtifact>,
+) -> Result<ArtifactBundle, String> {
+    assemble_artifacts_with_fixtures_named(receipt, "receipt.json", "receipt.md", fixtures)
 }
 
 pub fn assemble_artifacts_named(
     mut receipt: Receipt,
     receipt_name: &str,
     human_name: &str,
+) -> Result<ArtifactBundle, String> {
+    assemble_artifacts_with_fixtures_named(receipt, receipt_name, human_name, Vec::new())
+}
+
+fn assemble_artifacts_with_fixtures_named(
+    mut receipt: Receipt,
+    receipt_name: &str,
+    human_name: &str,
+    fixtures: Vec<SealedFixtureArtifact>,
 ) -> Result<ArtifactBundle, String> {
     let mut semantic = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
     semantic
@@ -1009,6 +1041,7 @@ pub fn assemble_artifacts_named(
         human_sidecar: format!("{}  {human_name}\n", seal_bytes(&human)),
         receipt: bytes,
         human,
+        fixtures,
     })
 }
 
@@ -1057,7 +1090,7 @@ pub fn write_artifacts(
         ));
     }
     fs::create_dir(&staging)?;
-    let files: Vec<(String, &[u8])> = vec![
+    let mut files: Vec<(String, &[u8])> = vec![
         (receipt_name.into(), &bundle.receipt),
         (human_name.into(), &bundle.human),
         (
@@ -1069,8 +1102,18 @@ pub fn write_artifacts(
             bundle.human_sidecar.as_bytes(),
         ),
     ];
+    for fixture in &bundle.fixtures {
+        files.push((fixture.name.clone(), &fixture.bytes));
+        files.push((
+            format!("{}.sha256", fixture.name),
+            fixture.sidecar.as_bytes(),
+        ));
+    }
     let result = (|| {
         for (name, bytes) in files {
+            if let Some(parent) = staging.join(&name).parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(staging.join(&name), bytes)?;
         }
         fs::rename(&staging, directory)
@@ -1099,6 +1142,15 @@ pub fn validate_artifact_bundle_named(
     }
     if bundle.receipt.is_empty() || bundle.human.is_empty() {
         return Err("partial artifact bundle".into());
+    }
+    for fixture in &bundle.fixtures {
+        if fixture.name.starts_with('/')
+            || fixture.name.contains("..")
+            || fixture.bytes.is_empty()
+            || fixture.sidecar != format!("{}  {}\n", seal_bytes(&fixture.bytes), fixture.name)
+        {
+            return Err("fixture artifact or sidecar is malformed".into());
+        }
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bundle.receipt).map_err(|e| e.to_string())?;
@@ -1137,6 +1189,20 @@ pub fn validate_artifact_bundle_named(
         .map_or(true, |v| v.len() != 4)
     {
         return Err("receipt fixture evidence is incomplete".into());
+    }
+    for (name, evidence) in &typed.quality.fixture_evidence {
+        let artifact = bundle
+            .fixtures
+            .iter()
+            .find(|artifact| artifact.name == evidence.artifact_name)
+            .ok_or_else(|| format!("receipt fixture {name} has no published artifact"))?;
+        if evidence.artifact_sha256 != seal_bytes(&artifact.bytes)
+            || evidence.artifact_sidecar_sha256 != seal_bytes(artifact.sidecar.as_bytes())
+        {
+            return Err(format!(
+                "receipt fixture {name} is not bound to exact artifact bytes"
+            ));
+        }
     }
     let mut core = value.clone();
     core.as_object_mut()
@@ -1268,10 +1334,18 @@ pub fn publish_complete_campaign(
             .map_err(|e| e.to_string())?;
             let receipt: Receipt =
                 serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            let mut files = vec![
+                serde_json::json!({"name": item.bundle.receipt_name, "sha256": seal_bytes(&item.bundle.receipt), "sidecarSha256": seal_bytes(item.bundle.receipt_sidecar.as_bytes())}),
+                serde_json::json!({"name": item.bundle.human_name, "sha256": seal_bytes(&item.bundle.human), "sidecarSha256": seal_bytes(item.bundle.human_sidecar.as_bytes())}),
+            ];
+            for fixture in &item.bundle.fixtures {
+                files.push(serde_json::json!({"name": fixture.name, "sha256": seal_bytes(&fixture.bytes), "sidecarSha256": seal_bytes(fixture.sidecar.as_bytes())}));
+            }
             manifest_rows.push(serde_json::json!({
                 "coordinate": slug,
                 "receiptSha256": receipt.receipt_sha256,
                 "workerPid": receipt.memory.phase_samples[0].pid,
+                "files": files,
             }));
         }
         let manifest = serde_json::json!({
@@ -1308,6 +1382,19 @@ pub fn load_prepared_coordinate_receipt(
         fs::read_to_string(directory.join("receipt.json.sha256")).map_err(|e| e.to_string())?;
     let human_sidecar =
         fs::read_to_string(directory.join("receipt.md.sha256")).map_err(|e| e.to_string())?;
+    let typed: Receipt = serde_json::from_slice(&receipt).map_err(|e| e.to_string())?;
+    let mut fixtures = Vec::with_capacity(typed.quality.fixture_evidence.len());
+    for evidence in typed.quality.fixture_evidence.values() {
+        let bytes = fs::read(directory.join(&evidence.artifact_name)).map_err(|e| e.to_string())?;
+        let sidecar =
+            fs::read_to_string(directory.join(format!("{}.sha256", evidence.artifact_name)))
+                .map_err(|e| e.to_string())?;
+        fixtures.push(SealedFixtureArtifact {
+            name: evidence.artifact_name.clone(),
+            bytes,
+            sidecar,
+        });
+    }
     let bundle = ArtifactBundle {
         receipt_name: "receipt.json".into(),
         human_name: "receipt.md".into(),
@@ -1315,6 +1402,7 @@ pub fn load_prepared_coordinate_receipt(
         receipt_sidecar,
         human,
         human_sidecar,
+        fixtures,
     };
     validate_artifact_bundle(&bundle)?;
     Ok(PreparedCoordinateReceipt { coordinate, bundle })
@@ -1461,23 +1549,39 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             if prompt.trim().is_empty() {
                 return Err("campaign prompt must not be empty".into());
             }
-            verify_coordinate_product_controls(&snapshot, &row.coordinate, &prompt).map_err(
-                |e| {
-                    format!(
-                        "product coordinate controls for {}: {e}",
-                        coordinate_slug(&row.coordinate)
-                    )
-                },
-            )?;
-            let mut suites = Vec::with_capacity(5);
-            for repeat in 0..5 {
-                let suite = run_product_fixture_suite(&snapshot, &reference_snapshot, &prompt)
+            // Warm rows run the exact same product fixture suite once before collection in this
+            // child.  The measured suite is therefore a genuine same-worker warm observation;
+            // cold rows intentionally skip this path and are launched in fresh children.
+            if row.coordinate.process_temperature == "warm" {
+                run_product_fixture_suite(&snapshot, &reference_snapshot, &prompt, &row.coordinate)
                     .map_err(|e| {
                         format!(
-                            "product fixture repeat {repeat} for {}: {e}",
+                            "product warmup for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        )
+                    })?
+                    .quality()
+                    .map_err(|e| {
+                        format!(
+                            "product warmup quality for {}: {e}",
                             coordinate_slug(&row.coordinate)
                         )
                     })?;
+            }
+            let mut suites = Vec::with_capacity(5);
+            for repeat in 0..5 {
+                let suite = run_product_fixture_suite(
+                    &snapshot,
+                    &reference_snapshot,
+                    &prompt,
+                    &row.coordinate,
+                )
+                .map_err(|e| {
+                    format!(
+                        "product fixture repeat {repeat} for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?;
                 // Every raw fixture is independently quality-validated before any timing or
                 // aggregate publication decision.  There is no successful partial-repeat path.
                 suite.quality()?;
@@ -1492,8 +1596,10 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 row.coordinate.process_temperature,
             )?;
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            let receipt = product_receipt(&row.coordinate, &suites[0], timings, &executable)?;
-            let bundle = assemble_artifacts(receipt)?;
+            let fixtures = sealed_product_fixture_artifacts(&suites[0])?;
+            let receipt =
+                product_receipt(&row.coordinate, &suites[0], timings, &executable, &fixtures)?;
+            let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
                 &PathBuf::from(required_flag(args, "--out")?),
                 "receipt.json",
@@ -1663,6 +1769,16 @@ pub fn inventory_snapshot(root: impl AsRef<Path>) -> std::io::Result<SnapshotInv
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == ".git"
+                || name == ".DS_Store"
+                || name.ends_with(".lock")
+                || name.ends_with(".tmp")
+                || name.ends_with(".partial")
+            {
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
                 visit(root, &path, out)?;
@@ -1711,6 +1827,22 @@ pub fn inventory_snapshot(root: impl AsRef<Path>) -> std::io::Result<SnapshotInv
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "empty snapshot",
+        ));
+    }
+    let names = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !names.contains("config.json") || !names.contains("tokenizer.json") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is missing config.json or tokenizer.json",
+        ));
+    }
+    if !files.iter().any(|file| file.path.ends_with(".safetensors")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot has no resolved safetensors shard",
         ));
     }
     let mut digest = Sha256::new();
@@ -1940,6 +2072,23 @@ fn product_fixture_artifact(
         },
     });
     Ok(sealed_json(&value))
+}
+
+fn sealed_product_fixture_artifacts(
+    suite: &ProductFixtureSuite,
+) -> Result<Vec<SealedFixtureArtifact>, String> {
+    REQUIRED_FIXTURES
+        .iter()
+        .map(|fixture| {
+            let (bytes, hash) = product_fixture_artifact(fixture, suite)?;
+            let name = format!("fixtures/{fixture}.json");
+            Ok(SealedFixtureArtifact {
+                sidecar: format!("{hash}  {name}\n"),
+                name,
+                bytes,
+            })
+        })
+        .collect()
 }
 
 pub fn validate_fixture_evidence(evidence: &[FixtureEvidence]) -> Result<(), String> {
@@ -2419,7 +2568,7 @@ pub fn run_dense_lifecycle(
         seed: Some(0),
         ..Default::default()
     };
-    run_dense_lifecycle_request(snapshot, prompt, request, observer)
+    run_dense_lifecycle_request(snapshot, prompt, request, None, observer)
 }
 
 /// Product-only fixture entrypoint.  The request is constructed in this crate (including tools and
@@ -2430,6 +2579,7 @@ pub fn run_dense_lifecycle_request(
     snapshot: impl AsRef<Path>,
     prefix_prompt: &str,
     request: TextLlmRequest,
+    coordinate: Option<&Coordinate>,
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
     observer.phase("process-start");
@@ -2443,6 +2593,16 @@ pub fn run_dense_lifecycle_request(
         observer.geometry(provider.campaign_geometry());
         observer.phase("weights-loaded");
         observer.allocation("weights", "persistent", inventory.bytes);
+        if let Some(coordinate) = coordinate {
+            // These are product operations on this very provider, not an out-of-band control.
+            // A row cannot be measured until its requested batch/prefill behavior has executed.
+            if coordinate.request_mode == "supported-batch" {
+                provider.campaign_supported_batch(prefix_prompt, 2)?;
+            }
+            if coordinate.prefill_mode == "chunked" {
+                provider.campaign_prefix_reuse(prefix_prompt)?;
+            }
+        }
         let mut saw_token = false;
         let output = provider.generate_observed(
             &request,
@@ -2476,9 +2636,16 @@ pub fn run_product_fixture(
     snapshot: impl AsRef<Path>,
     prefix_prompt: &str,
     request: TextLlmRequest,
+    coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
     let mut observer = ProductObserver::new();
-    let output = run_dense_lifecycle_request(snapshot, prefix_prompt, request, &mut observer)?;
+    let output = run_dense_lifecycle_request(
+        snapshot,
+        prefix_prompt,
+        request,
+        Some(coordinate),
+        &mut observer,
+    )?;
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(ProductFixtureResult {
         observation,
@@ -2623,6 +2790,7 @@ pub fn run_product_fixture_suite(
     candidate_snapshot: &Path,
     reference_snapshot: &Path,
     prompt: &str,
+    coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureSuite> {
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
     let kernel_prompt = format!("{prompt}\nReturn a concise deterministic answer.");
@@ -2636,8 +2804,8 @@ pub fn run_product_fixture_suite(
     let cache_prompt = format!("{prompt}\nRepeat the stable baseline fact.");
     let run_pair = |prefix: &str, request: TextLlmRequest| -> core_llm::Result<_> {
         Ok((
-            run_product_fixture(candidate_snapshot, prefix, request.clone())?,
-            run_product_fixture(reference_snapshot, prefix, request)?,
+            run_product_fixture(candidate_snapshot, prefix, request.clone(), coordinate)?,
+            run_product_fixture(reference_snapshot, prefix, request, coordinate)?,
         ))
     };
     let (kernel_candidate, kernel_reference) = run_pair(
@@ -2827,11 +2995,25 @@ fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, S
     Ok(value)
 }
 
+/// `pmset -g therm` is verbose diagnostic text, never a receipt state.  Accept only an explicit
+/// no-throttling/no-pressure observation and normalize it to the schema's semantic `nominal`.
+fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.contains("thermal pressure: 0")
+        || normalized.contains("thermal level: 0")
+        || normalized.contains("nominal")
+    {
+        return Ok("nominal".into());
+    }
+    Err("pmset thermal probe did not prove nominal thermal state".into())
+}
+
 fn product_receipt(
     coordinate: &Coordinate,
     suite: &ProductFixtureSuite,
     timings: Vec<RawTiming>,
     executable: &Path,
+    fixtures: &[SealedFixtureArtifact],
 ) -> Result<Receipt, String> {
     let quality = suite.quality()?;
     let observation = &suite.kernel_candidate.observation;
@@ -2848,6 +3030,8 @@ fn product_receipt(
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
     let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
     let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
+    let thermal_state = probed_command("pmset", &["-g", "therm"], "thermal state")?;
+    let normalized_thermal_state = normalize_pmset_thermal(&thermal_state)?;
     let transcript = format!(
         "{}\n{}\n{}\n{}",
         suite.kernel_candidate.output.text,
@@ -2891,19 +3075,29 @@ fn product_receipt(
     let start = observation.phases.first().ok_or("start phase")?;
     let mut fixture_evidence = std::collections::BTreeMap::new();
     for name in REQUIRED_FIXTURES {
-        let (_, hash) = product_fixture_artifact(name, suite)?;
+        let artifact_name = format!("fixtures/{name}.json");
+        let artifact = fixtures
+            .iter()
+            .find(|artifact| artifact.name == artifact_name)
+            .ok_or_else(|| format!("missing sealed fixture artifact {name}"))?;
+        let hash = seal_bytes(&artifact.bytes);
+        if artifact.sidecar != format!("{hash}  {}\n", artifact.name) {
+            return Err(format!("fixture sidecar does not bind {name}"));
+        }
         fixture_evidence.insert(
             name.into(),
             ReceiptFixture {
                 passed: true,
+                artifact_name,
                 artifact_sha256: hash,
+                artifact_sidecar_sha256: seal_bytes(artifact.sidecar.as_bytes()),
                 independent_reference: format!("fp32-snapshot:{}", reference.sha256),
             },
         );
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: "nominal".into(), command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
+        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
@@ -3300,7 +3494,9 @@ mod tests {
                 (*name).into(),
                 ReceiptFixture {
                     passed: true,
+                    artifact_name: format!("fixtures/{name}.json"),
                     artifact_sha256: "a".repeat(64),
+                    artifact_sidecar_sha256: "b".repeat(64),
                     independent_reference: "independent-reference".into(),
                 },
             );
@@ -3431,15 +3627,18 @@ mod tests {
         let mut partial = receipt.clone();
         partial.timings.samples.pop();
         assert!(validate_receipt_semantics(&partial).is_err());
-        let bundle = assemble_artifacts(receipt).expect("valid receipt must assemble");
-        assert!(validate_artifact_bundle(&bundle).is_ok());
+        let bundle = assemble_artifacts(receipt).expect("receipt bytes must assemble");
+        assert!(
+            validate_artifact_bundle(&bundle).is_err(),
+            "campaign receipts require published fixture bytes"
+        );
         let named = assemble_artifacts_named(
             serde_json::from_slice(&bundle.receipt).unwrap(),
             "baseline.json",
             "baseline.txt",
         )
         .unwrap();
-        assert!(validate_artifact_bundle_named(&named, "baseline.json", "baseline.txt").is_ok());
+        assert!(validate_artifact_bundle_named(&named, "baseline.json", "baseline.txt").is_err());
         let mut sealed_tampered = bundle.clone();
         sealed_tampered.receipt[0] ^= 1;
         assert!(validate_artifact_bundle(&sealed_tampered).is_err());
@@ -3457,6 +3656,7 @@ mod tests {
             human_sidecar: format!("{}  run.txt\n", seal_bytes(&human)),
             receipt: receipt.clone(),
             human: human.clone(),
+            fixtures: Vec::new(),
         };
         let output = dir.path().join("run");
         write_artifacts(&output, "run.json", "run.txt", &bundle).unwrap();
