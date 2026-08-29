@@ -3,7 +3,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -153,16 +153,15 @@ pub(crate) fn activate_requested(
             latent_width,
         },
     )
-    .map_err(io::Error::other)?;
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let file = if path == Path::new("-") {
         File::create("/dev/stdout")?
     } else {
         File::create(path)?
     };
-    Ok(Some(install_with_context(
-        Box::new(JsonlObserver(file)),
-        context,
-    )))
+    let scope = install_with_context(Box::new(JsonlObserver(file)), context);
+    observe("campaign-context-bound", 0, 0, 0);
+    Ok(Some(scope))
 }
 
 impl CampaignContext {
@@ -432,6 +431,12 @@ mod tests {
         drop(scope);
         let lines = std::fs::read_to_string(output).unwrap();
         assert!(lines.contains("wan2_2_t2v_14b"));
+        assert!(lines
+            .lines()
+            .any(|line| line.contains("campaign-context-bound") && line.contains("t2v")));
+        assert!(lines
+            .lines()
+            .any(|line| line.contains("released") && line.contains("t2v")));
         assert!(!lines.contains("config.json"));
     }
 }

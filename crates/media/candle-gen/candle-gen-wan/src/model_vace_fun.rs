@@ -104,15 +104,9 @@ struct Pipeline {
     vae_cfg: Vae16Config,
     vace_cfg: WanVaceConfig,
     adapters: Vec<AdapterSpec>,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 impl Pipeline {
-    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
-
     fn new(
         root: &Path,
         device: &Device,
@@ -127,7 +121,6 @@ impl Pipeline {
             vae_cfg: Vae16Config::wan21(),
             vace_cfg: WanVaceConfig::vace_14b(),
             adapters,
-            campaign_context: None,
         }
     }
 
@@ -421,17 +414,6 @@ pub struct WanVaceFunGenerator {
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
-}
-
-impl WanVaceFunGenerator {
-    pub(crate) fn with_campaign_context(
-        mut self,
-        context: crate::sc20686_observer::CampaignContext,
-    ) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
 }
 
 impl WanVaceFunGenerator {
@@ -595,13 +577,6 @@ impl Generator for WanVaceFunGenerator {
             self.adapters.clone(),
             self.tier.clone(),
         );
-        let pipeline = self
-            .campaign_context
-            .clone()
-            .map_or(pipeline, |context| pipeline.with_campaign_context(context));
-        if pipeline.campaign_context.is_some() {
-            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
-        }
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
         let (mut prepared, resident_shared) = match effective_offload {
@@ -841,7 +816,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         shared: Mutex::new(None),
         experts: Mutex::new(None),
         i2v_memory,
-        campaign_context: None,
     }))
 }
 

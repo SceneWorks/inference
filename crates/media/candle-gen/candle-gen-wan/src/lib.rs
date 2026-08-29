@@ -243,7 +243,6 @@ struct Pipeline {
     /// the [`WanGenerator`] handle a worker holds (sc-11045 fix round, BLOCKER 1). The snapshot
     /// (dense/packed-tier) routes compile no plan and publish nothing.
     facts: gen_core::CheckpointFactsSink,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
@@ -258,11 +257,6 @@ fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
 }
 
 impl Pipeline {
-    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
-
     fn load(
         root: &Path,
         device: &Device,
@@ -279,7 +273,6 @@ impl Pipeline {
             device: device.clone(),
             dit_source,
             facts,
-            campaign_context: None,
         }
     }
 
@@ -679,9 +672,6 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         crate::sc20686_observer::observe("process-start", 0, 0, 0);
-        if self.campaign_context.is_some() {
-            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
-        }
         let knobs = self.resolve_knobs(req);
 
         // Text encode (pos + optional neg for CFG), then project to the DiT context once.
@@ -918,18 +908,6 @@ pub struct WanGenerator {
     /// into every [`Pipeline`] this generator builds, and the GGUF DiT load publishes into it. Read
     /// back through [`gen_core::Generator::checkpoint_weight_facts`].
     checkpoint_facts: gen_core::CheckpointFactsSink,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
-}
-
-impl WanGenerator {
-    /// Install the opt-in campaign context; ordinary registry construction leaves this unset.
-    pub(crate) fn with_campaign_context(
-        mut self,
-        context: crate::sc20686_observer::CampaignContext,
-    ) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
 }
 
 fn run_serialized_request<T>(
@@ -977,16 +955,13 @@ fn load_or_replace_cached_variant<T: Clone>(
 
 impl WanGenerator {
     fn pipeline(&self) -> Pipeline {
-        let pipeline = Pipeline::load(
+        Pipeline::load(
             &self.root,
             &self.device,
             self.adapters.clone(),
             self.dit_source.clone(),
             self.checkpoint_facts.clone(),
-        );
-        self.campaign_context
-            .clone()
-            .map_or(pipeline, |context| pipeline.with_campaign_context(context))
+        )
     }
 
     fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
@@ -1365,7 +1340,6 @@ fn build_generator_with_source(
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
         checkpoint_facts: gen_core::CheckpointFactsSink::new(),
-        campaign_context: None,
     })
 }
 
@@ -1999,7 +1973,6 @@ mod tests {
             device: Device::Cpu,
             dit_source: DitSource::Snapshot,
             facts: gen_core::CheckpointFactsSink::new(),
-            campaign_context: None,
         }
     }
 

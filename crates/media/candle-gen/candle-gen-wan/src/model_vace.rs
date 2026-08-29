@@ -77,15 +77,9 @@ struct Pipeline {
     vae_cfg: Vae16Config,
     root: PathBuf,
     device: Device,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 impl Pipeline {
-    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
-
     fn load(root: &Path, device: &Device) -> Self {
         Self {
             te_cfg: TextEncoderConfig::umt5_xxl(),
@@ -93,7 +87,6 @@ impl Pipeline {
             vae_cfg: Vae16Config::wan21(),
             root: root.to_path_buf(),
             device: device.clone(),
-            campaign_context: None,
         }
     }
 
@@ -163,9 +156,6 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         crate::sc20686_observer::observe("process-start", 0, 0, 0);
-        if self.campaign_context.is_some() {
-            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
-        }
         let clip = req
             .control_clip()
             .ok_or_else(|| CandleError::Msg("wan-vace: requires a ControlClip".into()))?;
@@ -309,17 +299,6 @@ pub struct WanVaceGenerator {
     device: Device,
     components: Mutex<Option<Components>>,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
-    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
-}
-
-impl WanVaceGenerator {
-    pub(crate) fn with_campaign_context(
-        mut self,
-        context: crate::sc20686_observer::CampaignContext,
-    ) -> Self {
-        self.campaign_context = Some(context);
-        self
-    }
 }
 
 impl WanVaceGenerator {
@@ -483,10 +462,6 @@ impl Generator for WanVaceGenerator {
         )
         .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = Pipeline::load(&self.root, &self.device);
-        let pipe = self
-            .campaign_context
-            .clone()
-            .map_or(pipe, |context| pipe.with_campaign_context(context));
         let components = self.components(&pipe)?;
         let (frames, fps) = match pipe.render(req, &components, on_progress) {
             Ok(result) => result,
@@ -597,7 +572,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         components: Mutex::new(None),
         i2v_memory,
-        campaign_context: None,
     }))
 }
 
