@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "story": "SC-20684",
+  "validation": "checked-out-current-source",
+  "decision": "do-not-implement-until-format-and-mask-route-are-proven",
+  "upstream": {
+    "repository": "https://github.com/rajveer43/VeloxQuant-MLX",
+    "tag": "v0.65.0",
+    "commit": "54989ee223611627592f7f9bd925e924658f1f22",
+    "mechanisms": ["scalar_fused_decode_attend", "rabitq_prefill_attend"]
+  },
+  "currentProduct": {
+    "modelIds": ["krea_realtime_14b"],
+    "requestModes": ["text-to-video", "image-to-video", "video-to-video"],
+    "cacheRepresentation": "Q8/Q4 affine along head dimension for both K and V; packed payload plus bf16 scale/bias",
+    "cacheRead": "gather packed window then dequantize full dense K/V per layer before MLX SDPA",
+    "attention": "dense MLX scaled_dot_product_attention with optional additive block-causal mask",
+    "commit": "one post-RoPE K/raw-V cache append per chunk; readonly denoise and clean-context recompute are distinct",
+    "qualityEvidence": "Q8 existing-route drift measured; Q4 existing-route quality unvalidated"
+  },
+  "poc": {
+    "candidate": "RaBitQ tiled large-Sq prefill only as a new Krea-owned format",
+    "status": "blocked-before-implementation",
+    "nativeGeometry": "B/H/Sq/D query tiles; D divisible by 8 and D <= 128; unmasked all-keys attention",
+    "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant group-affine K token-axis layout",
+    "nonGoal": "full-cache dequantize-then-SDPA is not compressed-domain execution"
+  },
+  "rejectionFallbacks": [
+    {"id": "format", "reason": "current Q8/Q4 packed layout is incompatible with frozen direct-kernel inputs"},
+    {"id": "mask", "reason": "RaBitQ tiled prefill is unmasked cross-attention only; additive block-causal masks require dense fallback"},
+    {"id": "head-dimension", "reason": "RaBitQ tiled prefill requires D divisible by 8 and D <= 128"},
+    {"id": "lifecycle", "reason": "append, window eviction, RoPE offset, readonly/recompute, and cancellation have no implemented compressed route"},
+    {"id": "receipt", "reason": "no device-produced parity, quality, resident-byte, transient-byte, or dispatch receipt exists"}
+  ],
+  "receipt": {
+    "status": "not-produced",
+    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "persistentBytes", "transientBytes", "fallbackReason", "parity", "quality", "cancellation"],
+    "forbiddenClaims": ["local performance", "local memory reduction", "local quality parity", "compressed-domain execution"]
+  },
+  "sourceMappings": [
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/config.rs", "needle": "pub struct KvCacheQuant"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/config.rs", "needle": "pub fn row_bytes"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "struct PackedKv"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn dense(&self, quant: Option<KvCacheQuant>)"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn window_prev"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn append"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn denoise_chunk_inner"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/t2v.rs", "needle": "fn resolve_request_config"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs", "needle": "fn run_ar_loop_conditioned"},
+    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "fn forward_causal("},
+    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk"}
+  ]
+}
