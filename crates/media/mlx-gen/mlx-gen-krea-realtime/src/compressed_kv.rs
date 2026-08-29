@@ -475,7 +475,7 @@ impl PackedAffineRows {
             return Err(DispatchFailure::UnsupportedGroupSize);
         }
         let bits = tier.bits();
-        if (head_dim * bits) % 32 != 0 {
+        if !(head_dim * bits).is_multiple_of(32) {
             return Err(DispatchFailure::UnsupportedHeadDimension);
         }
         let words_per_row = head_dim * bits / 32;
@@ -636,7 +636,7 @@ impl CompressedKvCache {
             .or_else(|| {
                 (self.config.group_size != 64).then_some(DispatchFailure::UnsupportedGroupSize)
             })
-            .or_else(|| match mask {
+            .or(match mask {
                 KreaMask::None | KreaMask::BlockCausal { block_size: 1.. } => None,
                 KreaMask::BlockCausal { block_size: 0 } => Some(DispatchFailure::UnsupportedMask),
             });
@@ -782,15 +782,15 @@ impl CompressedKvCache {
                             };
                             let new_weight = (score - next_max).exp();
                             sum = sum * old_weight + new_weight;
-                            for d in 0..geometry.head_dim {
-                                acc[d] =
-                                    acc[d] * old_weight + new_weight * values.decode(b, h, k, d);
+                            for (d, accumulated) in acc.iter_mut().enumerate() {
+                                *accumulated = *accumulated * old_weight
+                                    + new_weight * values.decode(b, h, k, d);
                             }
                             max = next_max;
                         }
                         if sum != 0.0 {
-                            for d in 0..geometry.head_dim {
-                                out.set(b, h, q, d, acc[d] / sum);
+                            for (d, accumulated) in acc.iter().enumerate() {
+                                out.set(b, h, q, d, *accumulated / sum);
                             }
                         }
                     }
@@ -803,8 +803,8 @@ impl CompressedKvCache {
     }
 }
 
-/// The bounded number of query rows a retained simdgroup kernel owns at once.
-pub const TILE_ROWS: usize = 32;
+/// The bounded number of query rows a retained threadgroup owns at once.
+pub const TILE_ROWS: usize = 8;
 
 pub trait CancellationProbe {
     fn cancelled(&self) -> bool;
@@ -999,8 +999,8 @@ mod tests {
     }
 
     #[test]
-    fn q8_packed_attention_matches_independent_dense_reference_for_tiles_tails_masks_and_outliers()
-    {
+    fn q8_packed_attention_matches_independent_dequantize_then_fp32_reference_for_tiles_tails_masks_and_outliers(
+    ) {
         let keys = tensor(35, 0.0);
         let values = tensor(35, 0.5);
         let query = tensor(37, -0.25);
@@ -1014,14 +1014,24 @@ mod tests {
                 &false,
             )
             .unwrap();
+        // The fused-path contract is parity with an independent dequantize-then-fp32-attend
+        // reference. Comparing directly with the pre-quantized f32 fixtures would instead fold
+        // Q8/BF16-metadata quality loss into the kernel-parity assertion and can hide a correct
+        // packed reader behind an invalid tolerance.
+        let decoded_keys = CpuTensor::from_fn(keys.shape, |b, h, s, d| {
+            cache.k.as_ref().unwrap().decode(b, h, s, d)
+        });
+        let decoded_values = CpuTensor::from_fn(values.shape, |b, h, s, d| {
+            cache.v.as_ref().unwrap().decode(b, h, s, d)
+        });
         let expected = dense_reference(
             &query,
-            &keys,
-            &values,
+            &decoded_keys,
+            &decoded_values,
             geometry(37, 35),
             KreaMask::BlockCausal { block_size: 7 },
         );
-        assert_max_error(&actual, &expected, 0.09);
+        assert_max_error(&actual, &expected, 1e-5);
         let stats = cache.instrumentation();
         assert_eq!(stats.dense_window_bytes, 0);
         assert_eq!(stats.score_matrix_bytes, 0);

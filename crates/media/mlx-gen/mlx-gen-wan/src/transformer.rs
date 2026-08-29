@@ -571,6 +571,7 @@ impl SelfAttention {
     /// concatenates + scores. Returns `(out [B, S, dim] bf16, new_k [B, n, S, d] bf16,
     /// new_v [B, n, S, d] bf16)`: `new_k`/`new_v` are **this chunk's** post-RoPE k / raw v for the
     /// caller to append to its running cache. Inference-only (no SDPA checkpointing).
+    #[allow(clippy::too_many_arguments)]
     fn forward_causal(
         &self,
         x_mod: &Array,
