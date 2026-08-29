@@ -212,6 +212,9 @@ pub struct ReceiptLifecycle {
     pub restore: bool,
     pub dense_fallback: bool,
     pub post_run_release: bool,
+    /// Schema-approved `<capability>FallbackReason` fields for unsupported capabilities.
+    #[serde(flatten)]
+    pub fallback_reasons: std::collections::BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -260,26 +263,28 @@ pub struct ArtifactBundle {
 /// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
 /// partially-written receipt directory from being mistaken for a campaign result.
 pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String> {
-    receipt.receipt_sha256.clear();
-    let semantic = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+    let mut semantic = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
+    semantic
+        .as_object_mut()
+        .ok_or("receipt is not an object")?
+        .remove("receiptSha256");
+    let semantic = serde_json::to_vec(&semantic).map_err(|e| e.to_string())?;
     receipt.receipt_sha256 = seal_bytes(&semantic);
     let bytes = receipt.bytes().map_err(|e| e.to_string())?;
-    let human = format!(
-        "SC-20671 {} {} {}\n",
-        receipt.run_id, receipt.mode, receipt.status
-    )
-    .into_bytes();
+    let human = serde_json::to_string_pretty(&receipt)
+        .map_err(|e| e.to_string())?
+        .into_bytes();
     Ok(ArtifactBundle {
-        receipt_sidecar: seal_bytes(&bytes),
-        human_sidecar: seal_bytes(&human),
+        receipt_sidecar: format!("{}  receipt.json", seal_bytes(&bytes)),
+        human_sidecar: format!("{}  receipt.txt", seal_bytes(&human)),
         receipt: bytes,
         human,
     })
 }
 
 pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
-    if seal_bytes(&bundle.receipt) != bundle.receipt_sidecar
-        || seal_bytes(&bundle.human) != bundle.human_sidecar
+    if bundle.receipt_sidecar != format!("{}  receipt.json", seal_bytes(&bundle.receipt))
+        || bundle.human_sidecar != format!("{}  receipt.txt", seal_bytes(&bundle.human))
     {
         return Err("artifact sidecar does not match exact bytes".into());
     }
@@ -956,6 +961,7 @@ mod tests {
                 restore: true,
                 dense_fallback: true,
                 post_run_release: true,
+                fallback_reasons: std::collections::BTreeMap::new(),
             },
             cancellation: ReceiptCancellation {
                 cleanup_verified: true,
