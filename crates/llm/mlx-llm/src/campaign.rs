@@ -973,7 +973,7 @@ pub struct ArtifactBundle {
 /// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
 /// partially-written receipt directory from being mistaken for a campaign result.
 pub fn assemble_artifacts(receipt: Receipt) -> Result<ArtifactBundle, String> {
-    assemble_artifacts_named(receipt, "receipt.json", "receipt.txt")
+    assemble_artifacts_named(receipt, "receipt.json", "receipt.md")
 }
 
 pub fn assemble_artifacts_named(
@@ -1192,6 +1192,99 @@ pub fn required_coordinates() -> Vec<Coordinate> {
                 })
         })
         .collect()
+}
+
+/// Process discipline for a matrix coordinate.  A cold result is invalid unless it came from a
+/// brand-new worker; a warm result is invalid unless it follows an in-worker warmup using the same
+/// loaded model/session.  This is intentionally part of the checked-in schedule rather than a
+/// free-form receipt label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessDiscipline {
+    FreshChild,
+    ReusedWarmWorker,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledCoordinate {
+    pub coordinate: Coordinate,
+    pub discipline: ProcessDiscipline,
+}
+
+/// The parent executable consumes exactly this schedule.  It never accepts a caller-supplied row
+/// list, which prevents a selectively successful campaign from being published as the baseline.
+pub fn required_schedule() -> Vec<ScheduledCoordinate> {
+    required_coordinates()
+        .into_iter()
+        .map(|coordinate| ScheduledCoordinate {
+            discipline: if coordinate.process_temperature == "cold" {
+                ProcessDiscipline::FreshChild
+            } else {
+                ProcessDiscipline::ReusedWarmWorker
+            },
+            coordinate,
+        })
+        .collect()
+}
+
+/// Validate worker outcomes before aggregate publication.  `pid` is read from the product-owned
+/// receipt phase samples, never supplied separately by the orchestrator.  Cold worker PID reuse is
+/// rejected so a warmed model cannot be relabelled as cold.
+pub fn validate_schedule_outcomes(
+    scheduled: &[ScheduledCoordinate],
+    outcomes: &[(Coordinate, ProcessDiscipline, u32)],
+) -> Result<(), String> {
+    if scheduled.len() != 64 || outcomes.len() != scheduled.len() {
+        return Err("campaign schedule must contain exactly 64 outcomes".into());
+    }
+    let key = |coordinate: &Coordinate| {
+        format!(
+            "{}/{}/{}/{}/{}",
+            coordinate.family,
+            coordinate.context_band,
+            coordinate.request_mode,
+            coordinate.prefill_mode,
+            coordinate.process_temperature
+        )
+    };
+    let expected = scheduled
+        .iter()
+        .map(|row| (key(&row.coordinate), row.discipline))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if expected.len() != 64 {
+        return Err("campaign schedule contains duplicate coordinates".into());
+    }
+    let mut actual = std::collections::BTreeMap::new();
+    let mut cold_pids = std::collections::BTreeSet::new();
+    for (coordinate, discipline, pid) in outcomes {
+        if *pid == 0 || actual.insert(key(coordinate), *discipline).is_some() {
+            return Err("campaign outcome has a zero PID or duplicate coordinate".into());
+        }
+        if *discipline == ProcessDiscipline::FreshChild && !cold_pids.insert(*pid) {
+            return Err("cold coordinate reused a worker PID".into());
+        }
+    }
+    if actual != expected {
+        return Err("campaign outcomes do not equal the required matrix".into());
+    }
+    Ok(())
+}
+
+/// The only scheduling seam.  Production supplies a child-process launcher; tests may use a fake
+/// worker, but it receives the immutable schedule rather than inventing rows or temperatures.
+pub fn execute_required_schedule<F>(
+    mut worker: F,
+) -> Result<Vec<(Coordinate, ProcessDiscipline, u32)>, String>
+where
+    F: FnMut(&ScheduledCoordinate) -> Result<u32, String>,
+{
+    let schedule = required_schedule();
+    let mut outcomes = Vec::with_capacity(schedule.len());
+    for row in &schedule {
+        let pid = worker(row)?;
+        outcomes.push((row.coordinate.clone(), row.discipline, pid));
+    }
+    validate_schedule_outcomes(&schedule, &outcomes)?;
+    Ok(outcomes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1992,6 +2085,59 @@ mod tests {
         for (index, coordinate) in coordinates.iter().enumerate() {
             assert!(!coordinates[index + 1..].contains(coordinate));
         }
+    }
+
+    #[test]
+    fn schedule_is_exact_and_rejects_duplicate_or_reused_cold_workers() {
+        let schedule = required_schedule();
+        assert_eq!(schedule.len(), 64);
+        assert_eq!(
+            schedule
+                .iter()
+                .filter(|row| row.discipline == ProcessDiscipline::FreshChild)
+                .count(),
+            32
+        );
+        let outcomes = schedule
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.coordinate.clone(), row.discipline, (index + 1) as u32))
+            .collect::<Vec<_>>();
+        assert!(validate_schedule_outcomes(&schedule, &outcomes).is_ok());
+        let mut duplicate = outcomes.clone();
+        duplicate[1].0 = duplicate[0].0.clone();
+        assert!(validate_schedule_outcomes(&schedule, &duplicate).is_err());
+        let first_cold = outcomes
+            .iter()
+            .position(|row| row.1 == ProcessDiscipline::FreshChild)
+            .unwrap();
+        let second_cold = outcomes
+            .iter()
+            .enumerate()
+            .find(|(index, row)| *index != first_cold && row.1 == ProcessDiscipline::FreshChild)
+            .map(|(index, _)| index)
+            .unwrap();
+        let mut reused_cold = outcomes;
+        reused_cold[second_cold].2 = reused_cold[first_cold].2;
+        assert!(validate_schedule_outcomes(&schedule, &reused_cold).is_err());
+    }
+
+    #[test]
+    fn private_worker_seam_schedules_every_coordinate_once_with_declared_isolation() {
+        let mut seen = Vec::new();
+        let outcomes = execute_required_schedule(|row| {
+            seen.push((row.coordinate.clone(), row.discipline));
+            Ok((seen.len() + 100) as u32)
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 64);
+        assert_eq!(outcomes.len(), 64);
+        assert_eq!(
+            seen.iter()
+                .filter(|(_, discipline)| *discipline == ProcessDiscipline::ReusedWarmWorker)
+                .count(),
+            32
+        );
     }
 
     #[test]
