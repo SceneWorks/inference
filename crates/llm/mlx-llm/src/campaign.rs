@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use core_llm::{Message, Role, Sampling, StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest};
+use core_llm::{Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest};
 
 pub const REQUIRED_PHASES: [&str; 8] = [
     "process-start",
@@ -24,7 +24,7 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "post-run-release",
 ];
 pub const QUALITY_CONTRACT_HASH: &str =
-    "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d";
+    "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d2";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 
@@ -70,6 +70,17 @@ pub struct ReceiptGeometry {
     pub layers: u64,
     pub element_bytes: u64,
     pub capacity: u64,
+}
+
+/// Geometry copied from the loaded decoder configuration, not an input JSON field.  Query/KV
+/// lengths and batch are supplied by the actual request immediately before dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductGeometry {
+    pub query_heads: u64,
+    pub kv_heads: u64,
+    pub head_dimension: u64,
+    pub layers: u64,
+    pub element_bytes: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -455,10 +466,35 @@ impl Receipt {
     /// Serialize the exact receipt bytes; `receipt_sha256` is filled by the caller after clearing
     /// that field according to the SceneWorks semantic-core convention.
     pub fn bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
-        let mut bytes = serde_json::to_vec(self)?;
+        let mut bytes = canonical_json_bytes(&serde_json::to_value(self)?)?;
         bytes.push(b'\n');
         Ok(bytes)
     }
+}
+
+/// The portable receipt identity is the same canonical JSON used by SceneWorks: recursively
+/// sorted object keys, two-space indentation, and no trailing newline in the semantic core.
+/// File bytes add exactly one newline in [`Receipt::bytes`].  Do not replace this with serde's
+/// struct-order serialization: the JS validator intentionally does not trust insertion order.
+pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    fn stable(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(stable).collect())
+            }
+            serde_json::Value::Object(values) => {
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort_unstable();
+                let mut object = serde_json::Map::new();
+                for key in keys {
+                    object.insert(key.clone(), stable(&values[key]));
+                }
+                serde_json::Value::Object(object)
+            }
+            _ => value.clone(),
+        }
+    }
+    serde_json::to_vec_pretty(&stable(value))
 }
 
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
@@ -950,12 +986,21 @@ pub fn assemble_artifacts_named(
         .as_object_mut()
         .ok_or("receipt is not an object")?
         .remove("receiptSha256");
-    let semantic = serde_json::to_vec(&semantic).map_err(|e| e.to_string())?;
+    let semantic = canonical_json_bytes(&semantic).map_err(|e| e.to_string())?;
     receipt.receipt_sha256 = seal_bytes(&semantic);
     let bytes = receipt.bytes().map_err(|e| e.to_string())?;
-    let human = serde_json::to_string_pretty(&receipt)
-        .map_err(|e| e.to_string())?
-        .into_bytes();
+    let human = format!(
+        "# {} KV receipt\\n\\n- Run: {}\\n- Mode: {}\\n- Receipt hash: {}\\n",
+        if receipt.mode == "dense" {
+            "Dense"
+        } else {
+            "Compressed"
+        },
+        receipt.run_id,
+        receipt.mode,
+        receipt.receipt_sha256
+    )
+    .into_bytes();
     Ok(ArtifactBundle {
         receipt_name: receipt_name.into(),
         human_name: human_name.into(),
@@ -1096,9 +1141,13 @@ pub fn validate_artifact_bundle_named(
     core.as_object_mut()
         .ok_or("receipt is not an object")?
         .remove("receiptSha256");
-    let expected = seal_bytes(&serde_json::to_vec(&core).map_err(|e| e.to_string())?);
+    let expected = seal_bytes(&canonical_json_bytes(&core).map_err(|e| e.to_string())?);
     if object.get("receiptSha256").and_then(|v| v.as_str()) != Some(expected.as_str()) {
         return Err("receipt semantic hash mismatch".into());
+    }
+    let human = std::str::from_utf8(&bundle.human).map_err(|_| "human receipt is not UTF-8")?;
+    if !human.contains(&format!("- Receipt hash: {expected}\\n")) {
+        return Err("human receipt is not bound to the sealed JSON receipt".into());
     }
     Ok(())
 }
@@ -1363,7 +1412,7 @@ pub struct QualityMetrics {
 
 /// Compute quality from raw reference/candidate observations; no caller-supplied pass flag exists.
 pub fn compute_quality(raw: &QualityObservation) -> Result<QualityMetrics, String> {
-    let ratio = |matched: u64, total: u64| {
+    let ratio = |matched: u64, total: u64| -> Result<f64, String> {
         if total == 0 {
             Err("quality observation has zero denominator".into())
         } else {
@@ -1424,9 +1473,123 @@ pub fn sequence_marker() -> u64 {
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
+    /// Model identity is derived from the exact files resolved by the product loader, never a
+    /// caller-authored digest string.
+    fn snapshot_inventory(&mut self, _inventory: &SnapshotInventory) {}
+    fn geometry(&mut self, _geometry: ProductGeometry) {}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Device-backed product observer.  It deliberately has no setters for identity, phase samples,
+/// or allocation records: receipt assembly consumes only observations made at product boundaries.
+pub struct ProductObserver {
+    pid: u32,
+    phase: Option<&'static str>,
+    phases: Vec<ReceiptPhase>,
+    allocations: Vec<ReceiptAllocation>,
+    snapshot: Option<SnapshotInventory>,
+    geometry: Option<ProductGeometry>,
+    error: Option<String>,
+}
+
+impl ProductObserver {
+    pub fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            phase: None,
+            phases: Vec::new(),
+            allocations: Vec::new(),
+            snapshot: None,
+            geometry: None,
+            error: None,
+        }
+    }
+
+    pub fn finish(self) -> Result<ProductObservations, String> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        if self.snapshot.is_none() || self.geometry.is_none() {
+            return Err("product observer is missing snapshot identity or loaded geometry".into());
+        }
+        if self.phases.len() != REQUIRED_PHASES.len() {
+            return Err("product observer did not capture the exact phase set".into());
+        }
+        Ok(ProductObservations {
+            snapshot: self.snapshot.expect("checked above"),
+            geometry: self.geometry.expect("checked above"),
+            phases: self.phases,
+            allocations: self.allocations,
+        })
+    }
+}
+
+impl Default for ProductObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct ProductObservations {
+    pub snapshot: SnapshotInventory,
+    pub geometry: ProductGeometry,
+    pub phases: Vec<ReceiptPhase>,
+    pub allocations: Vec<ReceiptAllocation>,
+}
+
+impl Observer for ProductObserver {
+    fn phase(&mut self, name: &'static str) {
+        let expected = REQUIRED_PHASES.get(self.phases.len()).copied();
+        if self.error.is_some() || expected != Some(name) {
+            self.error = Some(format!("duplicate or out-of-order product phase {name}"));
+            return;
+        }
+        match sample_memory(self.pid) {
+            Ok(sample) => self.phases.push(ReceiptPhase {
+                phase: name.into(),
+                pid: sample.pid,
+                source: "footprint -p".into(),
+                timestamp: sample.captured_at,
+                phys_footprint_bytes: sample.current_bytes,
+                phys_footprint_peak_bytes: sample.peak_bytes,
+                mlx: ReceiptMlx {
+                    source: "mlx_rs::memory".into(),
+                    active_bytes: sample.mlx_active_bytes,
+                    cache_bytes: sample.mlx_cache_bytes,
+                    peak_bytes: sample.mlx_peak_bytes,
+                },
+            }),
+            Err(error) => self.error = Some(format!("product memory sample at {name}: {error}")),
+        }
+        self.phase = Some(name);
+    }
+
+    fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
+        let Some(phase) = self.phase else {
+            self.error = Some("allocation observed before a product phase".into());
+            return;
+        };
+        if bytes == 0 {
+            return;
+        }
+        self.allocations.push(ReceiptAllocation {
+            kind: format!("product-{role}"),
+            role: role.into(),
+            lifetime: lifetime.into(),
+            phase: phase.into(),
+            timestamp: timestamp_now(),
+            bytes,
+        });
+    }
+
+    fn snapshot_inventory(&mut self, inventory: &SnapshotInventory) {
+        self.snapshot = Some(inventory.clone());
+    }
+    fn geometry(&mut self, geometry: ProductGeometry) {
+        self.geometry = Some(geometry);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemorySample {
     pub captured_at: String,
     pub pid: u32,
@@ -1438,11 +1601,45 @@ pub struct MemorySample {
 }
 
 fn timestamp_now() -> String {
-    let seconds = std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MICROS: AtomicU64 = AtomicU64::new(0);
+
+    let observed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    format!("{seconds}")
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    let micros = loop {
+        let prior = LAST_MICROS.load(Ordering::Relaxed);
+        let next = observed.max(prior.saturating_add(1));
+        if LAST_MICROS
+            .compare_exchange_weak(prior, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break next;
+        }
+    };
+    let seconds = micros / 1_000_000;
+    let fraction = micros % 1_000_000;
+    // Civil date from Unix days, using the proleptic Gregorian calendar.  Keeping this local
+    // avoids a second time dependency in the MLX engine while producing the exact RFC3339 shape
+    // required by the paired SceneWorks validator.
+    let days = (seconds / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    let day_seconds = seconds % 86_400;
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fraction:06}Z")
 }
 
 pub trait CampaignSampler {
@@ -1546,7 +1743,11 @@ pub fn parse_footprint_value(value: &str) -> Option<u64> {
     if !number.is_finite() || number < 0.0 {
         return None;
     }
-    (number * multiplier).round().try_into().ok()
+    let bytes = (number * multiplier).round();
+    if !bytes.is_finite() || !(0.0..=(u64::MAX as f64)).contains(&bytes) {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
 #[cfg(target_os = "macos")]
@@ -1595,39 +1796,101 @@ pub fn run_dense_coordinate(
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
     observer.phase("process-start");
-    let _inventory = inventory_snapshot(snapshot.as_ref())
+    let inventory = inventory_snapshot(snapshot.as_ref())
         .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
-    let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
-        snapshot.as_ref().to_string_lossy().to_string(),
-    ))?;
-    observer.phase("weights-loaded");
-    let request = TextLlmRequest {
-        messages: vec![Message::text(Role::User, prompt)],
-        sampling: Sampling {
-            temperature: 0.0,
-            top_p: 1.0,
-            ..Default::default()
-        },
-        max_new_tokens,
-        seed: Some(0),
-        ..Default::default()
-    };
-    let mut saw_token = false;
-    let output = provider.generate_observed(
-        &request,
-        &mut |event| {
-            if matches!(event, StreamEvent::Token { .. }) {
-                saw_token = true;
-            }
-        },
-        observer,
-    )?;
-    if !saw_token {
-        return Err(core_llm::Error::InvalidRequest(
-            "dense campaign produced no first-token observation".into(),
-        ));
+    if inventory.bytes == 0 || inventory.files.is_empty() {
+        return Err(core_llm::Error::Load("snapshot inventory is empty".into()));
     }
-    observer.phase("decode-steady");
+    let output = {
+        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            snapshot.as_ref().to_string_lossy().to_string(),
+        ))?;
+        observer.snapshot_inventory(&inventory);
+        observer.geometry(provider.campaign_geometry());
+        observer.phase("weights-loaded");
+        observer.allocation("weights", "persistent", inventory.bytes);
+        let request = TextLlmRequest {
+            messages: vec![Message::text(Role::User, prompt)],
+            sampling: Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                ..Default::default()
+            },
+            max_new_tokens,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let mut saw_token = false;
+        let output = provider.generate_observed(
+            &request,
+            &mut |event| {
+                if matches!(event, StreamEvent::Token { .. }) {
+                    saw_token = true;
+                }
+            },
+            observer,
+        )?;
+        if !saw_token {
+            return Err(core_llm::Error::InvalidRequest(
+                "dense campaign produced no first-token observation".into(),
+            ));
+        }
+        output
+    }; // Provider/model ownership is released before the final sample.
+    observer.phase("post-run-release");
+    Ok(output)
+}
+
+/// Full one-process product lifecycle used by a worker in the 64-coordinate runner.  The parent
+/// runner is responsible for spawning a fresh process for every `cold` coordinate; this function
+/// refuses to manufacture a receipt when an unsupported family cannot exercise a required cache
+/// lifecycle.
+pub fn run_dense_lifecycle(
+    snapshot: impl AsRef<Path>,
+    prompt: &str,
+    max_new_tokens: u32,
+    observer: &mut dyn Observer,
+) -> core_llm::Result<TextLlmOutput> {
+    observer.phase("process-start");
+    let inventory = inventory_snapshot(snapshot.as_ref())
+        .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
+    let output = {
+        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            snapshot.as_ref().to_string_lossy().to_string(),
+        ))?;
+        observer.snapshot_inventory(&inventory);
+        observer.geometry(provider.campaign_geometry());
+        observer.phase("weights-loaded");
+        observer.allocation("weights", "persistent", inventory.bytes);
+        let request = TextLlmRequest {
+            messages: vec![Message::text(Role::User, prompt)],
+            sampling: Sampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                ..Default::default()
+            },
+            max_new_tokens,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let mut saw_token = false;
+        let output = provider.generate_observed(
+            &request,
+            &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
+            observer,
+        )?;
+        if !saw_token {
+            return Err(core_llm::Error::InvalidRequest(
+                "dense campaign produced no first-token observation".into(),
+            ));
+        }
+        provider.campaign_prefix_reuse(prompt)?;
+        observer.phase("prompt-cache-reuse");
+        provider.campaign_cancel_after_first_token(request)?;
+        observer.phase("cancellation-cleanup");
+        output
+    };
+    observer.phase("post-run-release");
     Ok(output)
 }
 
@@ -1638,7 +1901,7 @@ mod tests {
 
     #[test]
     fn formula_includes_batch_and_key_value_pair() {
-        assert_eq!(dense_kv_bytes(2, 3, 4, 5, 6, 2), Ok(1440));
+        assert_eq!(dense_kv_bytes(2, 3, 4, 5, 6, 2), Ok(2880));
         assert!(dense_kv_bytes(u64::MAX, 2, 1, 1, 1, 1).is_err());
     }
 
@@ -1699,6 +1962,30 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_is_the_paired_sceneworks_representation() {
+        let value = serde_json::json!({ "z": 1, "a": { "y": 2, "x": 3 } });
+        assert_eq!(
+            String::from_utf8(canonical_json_bytes(&value).unwrap()).unwrap(),
+            "{\n  \"a\": {\n    \"x\": 3,\n    \"y\": 2\n  },\n  \"z\": 1\n}"
+        );
+    }
+
+    #[test]
+    fn producer_timestamp_is_rfc3339_and_strictly_monotonic() {
+        let first = timestamp_now();
+        let second = timestamp_now();
+        assert!(first.ends_with('Z'));
+        assert!(second.ends_with('Z'));
+        assert!(first < second);
+    }
+
+    #[test]
+    fn product_observer_refuses_caller_supplied_partial_evidence() {
+        let observer = ProductObserver::new();
+        assert!(observer.finish().is_err());
+    }
+
+    #[test]
     fn required_matrix_is_exactly_64_coordinates() {
         let coordinates = required_coordinates();
         assert_eq!(coordinates.len(), 64);
@@ -1733,11 +2020,13 @@ mod tests {
         .is_err());
     }
 
-    struct FakeSampler;
+    struct FakeSampler(u8);
     impl CampaignSampler for FakeSampler {
         fn sample(&mut self, _phase: &'static str) -> Result<MemorySample, String> {
+            let second = self.0;
+            self.0 += 1;
             Ok(MemorySample {
-                captured_at: "2026-01-01T00:00:00Z".into(),
+                captured_at: format!("2026-01-01T00:00:{second:02}.000Z"),
                 pid: 7,
                 current_bytes: 100,
                 peak_bytes: 100,
@@ -1750,7 +2039,7 @@ mod tests {
 
     #[test]
     fn fake_runner_requires_and_orders_all_phases() {
-        let phases = run_lifecycle(FakeSampler, |recorder| {
+        let phases = run_lifecycle(FakeSampler(0), |recorder| {
             recorder.capture("process-start")?;
             recorder.capture("weights-loaded")?;
             recorder.capture("prefill-peak")?;
@@ -1764,7 +2053,7 @@ mod tests {
         .unwrap();
         assert_eq!(phases.len(), 8);
         assert_eq!(phases[5].phase, "prompt-cache-reuse");
-        assert!(run_lifecycle(FakeSampler, |_recorder| Ok(())).is_err());
+        assert!(run_lifecycle(FakeSampler(0), |_recorder| Ok(())).is_err());
     }
 
     #[test]
@@ -1876,7 +2165,7 @@ mod tests {
                     warmups: 2,
                     confidence_interval: "95% bootstrap".into(),
                     outlier_policy: "report all samples; no silent deletion".into(),
-                    variance_policy: "all raw repeats retained".into(),
+                    variance_policy: "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),
                     max_coefficient_of_variation: 0.05,
                 },
                 fixture_evidence: std::collections::BTreeMap::new(),

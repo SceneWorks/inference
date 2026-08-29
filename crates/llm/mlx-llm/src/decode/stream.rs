@@ -15,6 +15,7 @@ use mlx_rs::Array;
 
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
+use crate::primitives::kv_cache::ContiguousKvCache;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
@@ -168,7 +169,6 @@ pub(crate) fn generate_with_observer(
     if cancel.is_cancelled() {
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("cancellation-cleanup");
-            observer.phase("post-run-release");
         }
         return Err(Error::Canceled); // typed pre-inference cancel
     }
@@ -177,28 +177,74 @@ pub(crate) fn generate_with_observer(
     }
 
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = decoder.make_cache();
-
-    // Prefill the whole prompt at offset 0; logits are for the last prompt position.
-    let prompt = input_ids(prompt_ids);
-    if let Some(observer) = observer.as_deref_mut() {
-        observer.phase("prefill-peak");
+    let output = {
+        let mut cache = decoder.make_cache();
+        let mut observed_cache_events = 0;
+        // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
+        // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
+        let prompt = input_ids(prompt_ids);
+        let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("prefill-peak");
+        }
+        let output = {
+            let mut saw_first_token = false;
+            let mut observed_events = |event| {
+                if !saw_first_token && matches!(event, StreamEvent::Token { .. }) {
+                    saw_first_token = true;
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer.phase("first-token");
+                    }
+                }
+                on_event(event);
+            };
+            decode_loop(
+                decoder,
+                cache.as_mut(),
+                logits,
+                rng,
+                prompt_ids.to_vec(),
+                config,
+                cancel,
+                &mut observed_events,
+                constraint,
+                should_stop,
+                None,
+            )?
+        };
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("decode-steady");
+        }
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
+        output
+    }; // Drop the cache before a cancellation-cleanup observation.
+    if matches!(output.finish_reason, FinishReason::Cancelled) {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("cancellation-cleanup");
+        }
     }
-    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+    Ok(output)
+}
 
-    decode_loop(
-        decoder,
-        cache.as_mut(),
-        logits,
-        rng,
-        prompt_ids.to_vec(),
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-        observer,
-    )
+/// Export only cache-owned byte observations.  Unsupported cache implementations produce no
+/// synthetic events; the receipt producer must then record an explicit fallback rather than
+/// inventing an allocation total.
+fn observe_cache_events(
+    cache: &mut dyn KvCache,
+    seen: &mut usize,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) {
+    let Some(observer) = observer.as_deref_mut() else {
+        return;
+    };
+    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
+        return;
+    };
+    for event in cache.events().iter().skip(*seen) {
+        observer.allocation(event.role, event.lifetime, event.bytes);
+    }
+    *seen = cache.events().len();
 }
 
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
@@ -320,9 +366,6 @@ pub(crate) fn decode_loop(
         // genuinely effective despite MLX's lazy evaluation.
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
-            if let Some(observer) = observer.as_deref_mut() {
-                observer.phase("cancellation-cleanup");
-            }
             break;
         }
 
@@ -372,10 +415,6 @@ pub(crate) fn decode_loop(
         reason: finish,
         generated: generated.len(),
     });
-    if let Some(observer) = observer.as_deref_mut() {
-        observer.phase("decode-steady");
-        observer.phase("post-run-release");
-    }
     Ok(GenerationOutput {
         tokens: generated,
         finish_reason: finish,

@@ -22,9 +22,10 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
+use crate::decode::generate_with_observer;
 use crate::decode::{
-    generate_from_prefill, generate_with, generate_with_observer, ConstraintMask, Decode,
-    FinishReason, GenerationConfig, StreamEvent,
+    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
+    StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -412,6 +413,101 @@ pub struct LlamaProvider {
 }
 
 impl LlamaProvider {
+    /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign
+    /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
+    pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
+        let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
+            Decoder::Causal(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+            Decoder::Qwen35(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+        };
+        crate::campaign::ProductGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dimension: head_dimension.max(0) as u64,
+            layers: layers as u64,
+            // The dense MLX decode cache is bf16 on this provider path.
+            element_bytes: 2,
+        }
+    }
+
+    /// Exercise real contiguous-cache prefix reuse on the loaded causal decoder.  Hybrid Qwen3.6
+    /// has a distinct cache contract and is rejected here rather than being mislabeled as a
+    /// successful contiguous-cache observation.
+    pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<()> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache = crate::decode::PrefixCache::new(2);
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+            .map_err(to_core)?;
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+            .map_err(to_core)?;
+        if cache.stats().hits == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce a cache hit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative
+    /// cleanup path rather than recording a pre-cancelled no-op request.
+    pub(crate) fn campaign_cancel_after_first_token(
+        &self,
+        mut request: TextLlmRequest,
+    ) -> CoreResult<()> {
+        let cancel = crate::decode::CancelFlag::new();
+        request.cancel = cancel.clone();
+        let mut sink = |event: CoreEvent| {
+            if matches!(event, CoreEvent::Token { .. }) {
+                cancel.cancel();
+            }
+        };
+        let output = self.generate_inner(&request, &mut sink, None)?;
+        if output.finish_reason != Some(CoreFinish::Cancelled) {
+            return Err(CoreError::Load(
+                "campaign cancellation did not finish as cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.

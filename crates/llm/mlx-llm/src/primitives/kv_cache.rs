@@ -166,7 +166,7 @@ impl KvCache for ContiguousKvCache {
             .ok_or_else(|| crate::error::Error::Msg("KV byte accounting overflows u64".into()))?;
         self.events.push(CacheEvent {
             operation: "append",
-            role: "kv-cache",
+            role: "cache",
             lifetime: "persistent",
             bytes,
         });

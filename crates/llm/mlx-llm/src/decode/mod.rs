@@ -27,6 +27,9 @@ pub use stream::{
     generate, generate_from_prefill, generate_with, generate_with_cache, ConstraintMask, Decode,
     FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
+// The receipt producer is deliberately crate-private: ordinary callers must not install campaign
+// observers on a production decode.
+pub(crate) use stream::generate_with_observer;
 
 pub(super) enum LaneStep {
     Continue,
