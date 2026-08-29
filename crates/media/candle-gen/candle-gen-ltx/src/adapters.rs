@@ -234,36 +234,57 @@ fn validate_cond_safe_completeness(
 /// tensor (or a legacy per-target blob): a missing or mismatched declaration must stop loading.
 #[derive(Clone, Copy, Debug)]
 struct Ltx25Scale {
-    rank: f32,
+    rank: usize,
     alpha: f32,
 }
 
 fn ltx25_scale(file: &AdapterFile, spec: &AdapterSpec) -> Result<Ltx25Scale> {
-    let parse = |key: &str| -> Result<f32> {
-        let value = file.meta.get(key).ok_or_else(|| {
+    let required = |key: &str| -> Result<&str> {
+        file.meta.get(key).map(String::as_str).ok_or_else(|| {
             CandleError::Msg(format!(
                 "ltx_2_5 adapter {} is missing required `{key}` safetensors metadata",
                 spec.path.display()
             ))
-        })?;
+        })
+    };
+    let rank = required("lora_rank")?;
+    let rank = rank.parse::<usize>().map_err(|_| {
+        CandleError::Msg(format!(
+            "ltx_2_5 adapter {} has non-positive-integer `lora_rank` metadata `{rank}`",
+            spec.path.display()
+        ))
+    })?;
+    if rank == 0 {
+        return Err(CandleError::Msg(format!(
+            "ltx_2_5 adapter {} has invalid `lora_rank` metadata 0",
+            spec.path.display()
+        )));
+    }
+    let parse_alpha = |value: &str| -> Result<f32> {
         let value = value.parse::<f32>().map_err(|_| {
             CandleError::Msg(format!(
-                "ltx_2_5 adapter {} has non-numeric `{key}` metadata `{value}`",
+                "ltx_2_5 adapter {} has non-numeric `lora_alpha` metadata `{value}`",
                 spec.path.display()
             ))
         })?;
         if !value.is_finite() || value <= 0.0 {
             return Err(CandleError::Msg(format!(
-                "ltx_2_5 adapter {} has invalid `{key}` metadata {value}",
+                "ltx_2_5 adapter {} has invalid `lora_alpha` metadata {value}",
                 spec.path.display()
             )));
         }
         Ok(value)
     };
     Ok(Ltx25Scale {
-        rank: parse("lora_rank")?,
-        alpha: parse("lora_alpha")?,
+        rank,
+        alpha: parse_alpha(required("lora_alpha")?)?,
     })
+}
+
+/// Published LTX-2.5 distilled factors use the declared decomposition rank until a projection
+/// dimension is smaller, at which point the physical factor width is capped to that dimension.
+fn ltx25_factor_rank(declared_rank: usize, in_features: usize, out_features: usize) -> usize {
+    declared_rank.min(in_features).min(out_features)
 }
 
 /// Read and install LoRA / PEFT-LoKr adapters on the complete LTX AudioVideo projection surface.
@@ -411,13 +432,15 @@ fn install_ltx_adapters_with_policy(
                 .map_or((None, None), |meta| meta.effective(&path));
             let (scale_rank, alpha) = match strict_scale {
                 Some(scale) => {
-                    if rank as f32 != scale.rank {
+                    let expected = ltx25_factor_rank(scale.rank, in_features, out_features);
+                    if rank != expected {
                         return Err(CandleError::Msg(format!(
-                            "ltx_2_5 adapter {} target `{path}` has factor rank {rank} but declares lora_rank {}",
-                            spec.path.display(), scale.rank
+                            "ltx_2_5 adapter {} target `{path}` has factor rank {rank} but declares lora_rank {}; projection [{out_features}, {in_features}] requires factor rank {expected}",
+                            spec.path.display(),
+                            scale.rank
                         )));
                     }
-                    (scale.rank, scale.alpha)
+                    (scale.rank as f32, scale.alpha)
                 }
                 None => (
                     meta_rank.unwrap_or(rank as f32),
@@ -557,6 +580,14 @@ mod tests {
     use candle_gen::candle_core::Device;
     use candle_gen::candle_nn::{Linear, Module};
     use candle_gen::train::lora::LoraLinear;
+
+    #[test]
+    fn ltx25_declared_rank_caps_to_projection_dimensions_exactly() {
+        assert_eq!(ltx25_factor_rank(450, 4096, 4096), 450);
+        assert_eq!(ltx25_factor_rank(450, 2048, 32), 32);
+        assert_eq!(ltx25_factor_rank(450, 256, 2048), 256);
+        assert_eq!(ltx25_factor_rank(450, 128, 4096), 128);
+    }
 
     #[test]
     fn key_mapping_is_exact() {

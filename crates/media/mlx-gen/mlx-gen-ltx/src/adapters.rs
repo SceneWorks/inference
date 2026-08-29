@@ -20,10 +20,12 @@
 //! mapped through this same LTX key→module table, and installed as a forward-time residual carrying
 //! the same per-pass strength as LoRA.
 //!
-//! **Skips, never errors-on-skip.** Mirrors the reference (`apply_loras_to_weights` counts skipped
-//! modules, never raises): audio / `av_ca` / `a2v` targets (the video-only port has no such modules)
-//! and the PixArt-spelled adaLN embedder (`linear_1/2` ≠ the checkpoint's `linear1/2`) resolve to no
-//! module and are reported, not dropped. We error only if a non-empty spec list matched *nothing*.
+//! **Skips, never errors-on-skip.** The LTX-2.3 route mirrors the reference
+//! (`apply_loras_to_weights` counts skipped modules, never raises): audio / `av_ca` / `a2v` targets
+//! (the video-only port has no such modules) and the PixArt-spelled adaLN embedder (`linear_1/2` ≠
+//! the checkpoint's `linear1/2`) resolve to no module and are reported, not dropped. LTX-2.5's
+//! stricter route aliases its published `linear_1/2` targets to the converted MLX base names and
+//! requires every pair to resolve. We error only if a non-empty 2.3 spec list matched *nothing*.
 
 use std::collections::BTreeMap;
 
@@ -44,8 +46,8 @@ use crate::transformer::LtxAdaptable;
 const PREFIXES: [&str; 3] = ["model.diffusion_model.", "diffusion_model.", "model."];
 
 /// Outcome of applying the LTX adapter specs: residuals installed and the LoRA module paths that
-/// resolved to no target (surfaced, never silently dropped — audio/av_ca/a2v and PixArt-spelled
-/// adaLN embedder leaves).
+/// resolved to no target (surfaced, never silently dropped — audio/av_ca/a2v and, on the 2.3
+/// compatibility route, PixArt-spelled adaLN embedder leaves).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LtxLoraReport {
     pub applied: usize,
@@ -90,6 +92,25 @@ pub(crate) fn normalize_ltx_key(key: &str) -> String {
     t = t.replace(".audio_ff.net.2.", ".audio_ff.proj_out.");
     t = t.replace(".audio_ff.net.2", ".audio_ff.proj_out");
     t
+}
+
+/// Normalize the published LTX-2.5 LoRA namespace onto the converted MLX checkpoint namespace.
+///
+/// The public base checkpoint is converted from diffusers' `linear_1/linear_2` spelling to the
+/// provider's `linear1/linear2` spelling by `convert.rs`. The official distilled LoRA deliberately
+/// remains in diffusers spelling, including all eight video/audio/cross-stream timestep embedders.
+/// Keep this alias scoped to the strict 2.5 route: LTX-2.3 compatibility preserves the reference's
+/// historical skip/report behavior for third-party PixArt-spelled targets.
+fn normalize_ltx25_key(key: &str) -> String {
+    normalize_ltx_key(key)
+        .replace(
+            ".emb.timestep_embedder.linear_1",
+            ".emb.timestep_embedder.linear1",
+        )
+        .replace(
+            ".emb.timestep_embedder.linear_2",
+            ".emb.timestep_embedder.linear2",
+        )
 }
 
 /// Suffix → role, longest-first. PEFT `lora_A/B`, kohya `lora_down/up`, the peft-export `.default`
@@ -250,7 +271,7 @@ fn require_spec_applied(
 /// it at the wrong strength.
 #[derive(Clone, Copy, Debug)]
 struct Ltx25Scale {
-    rank: f32,
+    rank: i32,
     alpha: f32,
 }
 
@@ -259,31 +280,55 @@ fn ltx25_scale(
     alpha: Option<&str>,
     source: &std::path::Path,
 ) -> Result<Ltx25Scale> {
-    let parse = |key: &str, value: Option<&str>| -> Result<f32> {
-        let value = value.ok_or_else(|| {
-            Error::Msg(format!(
-                "ltx_2_5 adapter {} is missing required `{key}` safetensors metadata",
-                source.display()
-            ))
-        })?;
+    let rank = rank.ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} is missing required `lora_rank` safetensors metadata",
+            source.display()
+        ))
+    })?;
+    let rank = rank.parse::<i32>().map_err(|_| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} has non-positive-integer `lora_rank` metadata `{rank}`",
+            source.display()
+        ))
+    })?;
+    if rank == 0 {
+        return Err(Error::Msg(format!(
+            "ltx_2_5 adapter {} has invalid `lora_rank` metadata 0",
+            source.display()
+        )));
+    }
+    let alpha = alpha.ok_or_else(|| {
+        Error::Msg(format!(
+            "ltx_2_5 adapter {} is missing required `lora_alpha` safetensors metadata",
+            source.display()
+        ))
+    })?;
+    let parse_alpha = |value: &str| -> Result<f32> {
         let value = value.parse::<f32>().map_err(|_| {
             Error::Msg(format!(
-                "ltx_2_5 adapter {} has non-numeric `{key}` metadata `{value}`",
+                "ltx_2_5 adapter {} has non-numeric `lora_alpha` metadata `{value}`",
                 source.display()
             ))
         })?;
         if !value.is_finite() || value <= 0.0 {
             return Err(Error::Msg(format!(
-                "ltx_2_5 adapter {} has invalid `{key}` metadata {value}",
+                "ltx_2_5 adapter {} has invalid `lora_alpha` metadata {value}",
                 source.display()
             )));
         }
         Ok(value)
     };
     Ok(Ltx25Scale {
-        rank: parse("lora_rank", rank)?,
-        alpha: parse("lora_alpha", alpha)?,
+        rank,
+        alpha: parse_alpha(alpha)?,
     })
+}
+
+/// Published LTX-2.5 distilled factors use the declared decomposition rank until a projection
+/// dimension is smaller, at which point the physical factor width is capped to that dimension.
+fn ltx25_factor_rank(declared_rank: i32, in_features: i32, out_features: i32) -> i32 {
+    declared_rank.min(in_features).min(out_features)
 }
 
 /// Install one LoRA file's residuals onto `host` at `spec`'s strength, accumulating into `report`.
@@ -304,7 +349,11 @@ fn apply_one(
         else {
             continue; // not a LoRA factor key (base weight / bundled extra) — ignore.
         };
-        let path = normalize_ltx_key(stem);
+        let path = if strict_25.is_some() {
+            normalize_ltx25_key(stem)
+        } else {
+            normalize_ltx_key(stem)
+        };
         let parts = groups.entry(path).or_default();
         match role {
             Role::Down => parts.down = Some(w.require(&key)?.clone()),
@@ -345,13 +394,18 @@ fn apply_one(
         let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
         let (rank, alpha) = match strict_25 {
             Some(contract) => {
-                if down.shape()[0] as f32 != contract.rank {
+                let expected = ltx25_factor_rank(contract.rank, down.shape()[1], up.shape()[0]);
+                if down.shape()[0] != expected {
                     return Err(Error::Msg(format!(
-                        "ltx_2_5 adapter {} target `{path}` has factor rank {} but declares lora_rank {}",
-                        spec.path.display(), down.shape()[0], contract.rank
+                        "ltx_2_5 adapter {} target `{path}` has factor rank {} but declares lora_rank {}; projection [{}, {}] requires factor rank {expected}",
+                        spec.path.display(),
+                        down.shape()[0],
+                        contract.rank,
+                        up.shape()[0],
+                        down.shape()[1]
                     )));
                 }
-                (contract.rank, contract.alpha)
+                (contract.rank as f32, contract.alpha)
             }
             None => {
                 let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
@@ -497,9 +551,9 @@ pub fn apply_ltx_adapters(
 
 /// Install a split LTX-2.5 LoRA stack.  This deliberately has a stricter contract than
 /// [`apply_ltx_adapters`]: every selected file must be a LoRA file, declare `lora_rank` and
-/// `lora_alpha`, have factors of that declared rank, and resolve every factor pair to the loaded
-/// DiT.  Keeping the policy at the provider seam prevents a valid 2.3 compatibility fallback from
-/// weakening the 2.5 route.
+/// `lora_alpha`, have the exact factor rank implied by the declaration and projection dimensions,
+/// and resolve every factor pair to the loaded DiT. Keeping the policy at the provider seam
+/// prevents a valid 2.3 compatibility fallback from weakening the 2.5 route.
 pub fn apply_ltx25_adapters(
     host: &mut impl LtxAdaptable,
     specs: &[AdapterSpec],
@@ -548,7 +602,7 @@ mod tests {
     fn ltx25_header_requires_declared_450_rank_and_alpha_without_fallback() {
         let source = std::path::Path::new("synthetic-450.safetensors");
         let scale = ltx25_scale(Some("450"), Some("450"), source).unwrap();
-        assert_eq!(scale.rank, 450.0);
+        assert_eq!(scale.rank, 450);
         assert_eq!(scale.alpha, 450.0);
 
         let missing_rank = ltx25_scale(None, Some("450"), source)
@@ -559,6 +613,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(missing_alpha.contains("lora_alpha"), "{missing_alpha}");
+
+        let fractional_rank = ltx25_scale(Some("450.5"), Some("450"), source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fractional_rank.contains("non-positive-integer `lora_rank`"),
+            "{fractional_rank}"
+        );
+    }
+
+    #[test]
+    fn ltx25_declared_rank_caps_to_projection_dimensions_exactly() {
+        assert_eq!(ltx25_factor_rank(450, 4096, 4096), 450);
+        assert_eq!(ltx25_factor_rank(450, 2048, 32), 32);
+        assert_eq!(ltx25_factor_rank(450, 256, 2048), 256);
+        assert_eq!(ltx25_factor_rank(450, 128, 4096), 128);
+    }
+
+    #[test]
+    fn ltx25_published_timestep_targets_alias_only_on_the_strict_route() {
+        for controller in [
+            "adaln_single",
+            "prompt_adaln_single",
+            "audio_adaln_single",
+            "audio_prompt_adaln_single",
+            "av_ca_video_scale_shift_adaln_single",
+            "av_ca_audio_scale_shift_adaln_single",
+            "av_ca_a2v_gate_adaln_single",
+            "av_ca_v2a_gate_adaln_single",
+        ] {
+            for (published, converted) in [("linear_1", "linear1"), ("linear_2", "linear2")] {
+                let published =
+                    format!("diffusion_model.{controller}.emb.timestep_embedder.{published}");
+                let converted = format!("{controller}.emb.timestep_embedder.{converted}");
+                assert_eq!(normalize_ltx25_key(&published), converted);
+                assert!(
+                    normalize_ltx_key(&published).contains("linear_"),
+                    "the LTX-2.3 normalizer must retain its established skip/report spelling"
+                );
+            }
+        }
     }
 
     /// sc-13019: the file-derived inventory the `#[ignore]`d multi-surface gates assert against —
