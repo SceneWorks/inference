@@ -28,7 +28,7 @@ pub const QUALITY_CONTRACT_HASH: &str =
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptProvenance {
     pub scene_works_revision: String,
@@ -46,7 +46,7 @@ pub struct ReceiptProvenance {
     pub command_template: String,
     pub command: String,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptMatrix {
     pub family: String,
@@ -55,7 +55,7 @@ pub struct ReceiptMatrix {
     pub prefill_mode: String,
     pub process_temperature: String,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptGeometry {
     pub batch: u64,
@@ -68,7 +68,7 @@ pub struct ReceiptGeometry {
     pub element_bytes: u64,
     pub capacity: u64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptMlx {
     pub source: String,
@@ -76,7 +76,7 @@ pub struct ReceiptMlx {
     pub cache_bytes: u64,
     pub peak_bytes: u64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptPhase {
     pub phase: String,
@@ -87,7 +87,7 @@ pub struct ReceiptPhase {
     pub phys_footprint_peak_bytes: u64,
     pub mlx: ReceiptMlx,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptAllocation {
     pub kind: String,
@@ -97,14 +97,14 @@ pub struct ReceiptAllocation {
     pub timestamp: String,
     pub bytes: u64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptReconciliation {
     pub expected_dense_kv_bytes: u64,
     pub observed_persistent_kv_bytes: u64,
     pub tolerance_bytes: u64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptRelease {
     pub verified: bool,
@@ -112,7 +112,7 @@ pub struct ReceiptRelease {
     pub mlx_active_tolerance_bytes: u64,
     pub mlx_cache_tolerance_bytes: u64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptMemory {
     pub model_weights_bytes: u64,
@@ -124,7 +124,7 @@ pub struct ReceiptMemory {
     pub reconciliation: ReceiptReconciliation,
     pub release: ReceiptRelease,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptTimingSample {
     pub load_ms: f64,
@@ -135,7 +135,7 @@ pub struct ReceiptTimingSample {
     pub cold_compile_ms: f64,
     pub warm_compile_ms: f64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptTimingSummary {
     pub decode_tokens_per_second_mean: f64,
@@ -145,7 +145,7 @@ pub struct ReceiptTimingSummary {
     pub confidence_interval_low: f64,
     pub confidence_interval_high: f64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptTimings {
     pub load_ms: f64,
@@ -158,14 +158,14 @@ pub struct ReceiptTimings {
     pub samples: Vec<ReceiptTimingSample>,
     pub summary: ReceiptTimingSummary,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptFixture {
     pub passed: bool,
     pub artifact_sha256: String,
     pub independent_reference: String,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptQualityStatistics {
     pub repeats: u64,
@@ -175,7 +175,7 @@ pub struct ReceiptQualityStatistics {
     pub variance_policy: String,
     pub max_coefficient_of_variation: f64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReceiptQuality {
     #[serde(rename = "parityMaxError")]
     pub parity_max_error: f64,
@@ -193,7 +193,7 @@ pub struct ReceiptQuality {
     #[serde(rename = "fixtureEvidence")]
     pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptLifecycle {
     pub append: bool,
@@ -218,12 +218,12 @@ pub struct ReceiptLifecycle {
     #[serde(flatten)]
     pub fallback_reasons: std::collections::BTreeMap<String, String>,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptCancellation {
     pub cleanup_verified: bool,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub schema_version: u32,
@@ -542,6 +542,9 @@ pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&bundle.receipt).map_err(|e| e.to_string())?;
+    let typed: Receipt =
+        serde_json::from_value(value.clone()).map_err(|e| format!("receipt decode: {e}"))?;
+    validate_receipt_semantics(&typed)?;
     let object = value.as_object().ok_or("receipt is not an object")?;
     for key in ["memory", "timings", "quality", "lifecycle", "cancellation"] {
         if !object.contains_key(key) {
