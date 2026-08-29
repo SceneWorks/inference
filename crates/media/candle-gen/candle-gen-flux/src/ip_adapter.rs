@@ -188,18 +188,6 @@ pub struct FluxIpInjector<'a> {
     block_kv: RefCell<Vec<Option<(Tensor, Tensor)>>>,
 }
 
-/// Producer-owned evidence for the supported reference-image edit route. The image tokens are
-/// request-scoped and recomputed by the injector's projection only when a block is first touched;
-/// this explicitly does not claim a persistent cross-request K/V cache.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FluxReferenceEvidence {
-    pub target_shape: Vec<usize>,
-    pub reference_shape: Vec<usize>,
-    pub dtype: String,
-    pub reference_bytes: u64,
-    pub persistent_kv: bool,
-}
-
 impl<'a> FluxIpInjector<'a> {
     /// Bind `adapter` to the precomputed image `tokens` (`[B, num_tokens, cross_attn_dim]`) at `scale`.
     pub fn new(adapter: &'a FluxIpAdapter, tokens: Tensor, scale: f64) -> Self {
@@ -210,21 +198,6 @@ impl<'a> FluxIpInjector<'a> {
             scale,
             block_kv,
         }
-    }
-
-    /// Bind actual target/reference tensor geometry at the joint-stream ownership boundary.
-    pub fn reference_evidence(&self, target: &Tensor) -> Result<FluxReferenceEvidence> {
-        let _ = self.tokens.dims3()?;
-        let reference_bytes = (self.tokens.elem_count() as u64)
-            .checked_mul(self.tokens.dtype().size() as u64)
-            .ok_or_else(|| candle_core::Error::Msg("reference evidence byte overflow".into()))?;
-        Ok(FluxReferenceEvidence {
-            target_shape: target.dims().to_vec(),
-            reference_shape: self.tokens.dims().to_vec(),
-            dtype: format!("{:?}", self.tokens.dtype()),
-            reference_bytes,
-            persistent_kv: false,
-        })
     }
 
     #[cfg(test)]

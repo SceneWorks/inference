@@ -1,0 +1,103 @@
+{
+  "schema": "sc-20686-source-map-v1",
+  "compatibility_target": {
+    "story": "SC-20675",
+    "format": "packed-group-affine-v2",
+    "bits": 2,
+    "group_size": 64,
+    "metadata": "f16 scale and zero per completed group",
+    "pending_key_tail": "dense f32"
+  },
+  "variants": {
+    "flux2_klein_9b_edit": {
+      "family": "flux2-klein",
+      "route": "flux2_klein_9b_edit",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs", "symbol": "sc20686_observer::activate_requested", "line": 524}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs", "symbol": "sc20686_observer::observe_tensor", "line": 695}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs", "symbol": "sc20686_observer::observe_tensor", "line": 751}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "Scope::drop", "line": 582}],
+      "current_kernel": "dense FLUX.2 edit double-stream/single-stream attention",
+      "cache_format": "no persistent cross-KV cache",
+      "paging": "none",
+      "offload": "provider memory-strategy staging; no reference-KV paging",
+      "recompute": "reference K/V is recomputed on every denoise step",
+      "compatibility": "counterfactual only; SC-20675 packed persistence is not wired to this route",
+      "self_attention_excluded": true
+    },
+    "wan2_2_ti2v_5b": {
+      "family": "wan",
+      "route": "wan2_2_ti2v_5b",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs", "symbol": "sc20686_observer::activate_requested", "line": 1148}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::register_cache", "line": 317}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::record_cache_read", "line": 362}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "PreparedBlockCrossKv::drop", "line": 176}],
+      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+      "paging": "none",
+      "offload": "resident or request-selected sequential component staging",
+      "recompute": "prepared once per conditioning branch and reused across denoise steps",
+      "compatibility": "shape-compatible with SC-20675 group-affine projection",
+      "self_attention_excluded": true
+    },
+    "wan2_2_t2v_14b": {
+      "family": "wan",
+      "route": "wan2_2_t2v_14b",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs", "symbol": "sc20686_observer::activate_requested", "line": 1176}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::register_cache", "line": 317}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::record_cache_read", "line": 362}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "PreparedBlockCrossKv::drop", "line": 176}],
+      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+      "paging": "none",
+      "offload": "resident or sequential high/low expert staging",
+      "recompute": "prepared once per expert and conditioning branch",
+      "compatibility": "shape-compatible with SC-20675 group-affine projection",
+      "self_attention_excluded": true
+    },
+    "wan2_2_i2v_14b": {
+      "family": "wan",
+      "route": "wan2_2_i2v_14b",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs", "symbol": "sc20686_observer::activate_requested", "line": 1176}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::register_cache", "line": 317}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::record_cache_read", "line": 362}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "PreparedBlockCrossKv::drop", "line": 176}],
+      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+      "paging": "none",
+      "offload": "resident or sequential high/low expert staging",
+      "recompute": "prepared once per expert and conditioning branch",
+      "compatibility": "shape-compatible with SC-20675 group-affine projection",
+      "self_attention_excluded": true
+    },
+    "wan_vace": {
+      "family": "wan",
+      "route": "wan_vace",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs", "symbol": "sc20686_observer::activate_requested", "line": 459}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::register_cache", "line": 317}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::record_cache_read", "line": 362}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "PreparedBlockCrossKv::drop", "line": 176}],
+      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+      "paging": "none",
+      "offload": "request-scoped model lifecycle",
+      "recompute": "prepared once per conditioning branch",
+      "compatibility": "shape-compatible with SC-20675 group-affine projection",
+      "self_attention_excluded": true
+    },
+    "wan2_2_vace_fun_14b": {
+      "family": "wan",
+      "route": "wan2_2_vace_fun_14b",
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs", "symbol": "sc20686_observer::activate_requested", "line": 564}],
+      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::register_cache", "line": 317}],
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "sc20686_observer::record_cache_read", "line": 362}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "PreparedBlockCrossKv::drop", "line": 176}],
+      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+      "paging": "none",
+      "offload": "resident or sequential high/low expert staging",
+      "recompute": "prepared once per expert and conditioning branch",
+      "compatibility": "shape-compatible with SC-20675 group-affine projection",
+      "self_attention_excluded": true
+    }
+  }
+}

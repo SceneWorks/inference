@@ -159,7 +159,10 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, run_three_stage_sequential, CandleError, Result as CResult};
+use candle_gen::{
+    check_cancel as product_check_cancel, run_three_stage_sequential, CandleError,
+    Result as CResult,
+};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
@@ -170,6 +173,13 @@ use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
 use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
+
+fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
+    product_check_cancel(cancel).map_err(|error| {
+        sc20686_observer::observe_cancelled();
+        error
+    })
+}
 
 /// The DiT source is resolved exactly once when the generator is loaded. The native-GGUF seam is
 /// process-global today, but generation must never re-read it: doing so could make a generator whose
@@ -558,6 +568,7 @@ impl Pipeline {
         // Text K/V is invariant for the full request. Keep the cache local to this denoise call so it
         // cannot outlive the request, while both CFG branches reuse their own payload exactly once.
         check_cancel(cancel)?;
+        crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = dit.prepare_cross_kv(ctx_pos)?;
         let (pos_bytes, pos_shape, pos_dtype) = pos_kv.evidence();
         crate::sc20686_observer::observe_tensor(
@@ -618,6 +629,7 @@ impl Pipeline {
                         }
                         None => v_pos,
                     };
+                    check_cancel(cancel)?;
                     Ok(v)
                 },
             )?
@@ -648,6 +660,7 @@ impl Pipeline {
                     }
                     None => v_pos,
                 };
+                check_cancel(cancel)?;
                 latents = sched.step(&v, &latents)?;
                 if let Some(conditioning) = ti2v {
                     latents =

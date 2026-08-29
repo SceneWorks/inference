@@ -140,7 +140,7 @@ fn main() -> Result<()> {
     let t0 = std::time::Instant::now();
     let output = match gen.generate(&req, &mut on_progress) {
         Ok(output) => output,
-        Err(error)
+        Err(_error)
             if args.iter().any(|arg| arg == "--sc20686-cancel")
                 && candle_gen_wan::sc20686_observer::campaign_cancelled() =>
         {

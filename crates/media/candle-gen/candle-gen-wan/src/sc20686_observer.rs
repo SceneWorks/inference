@@ -2,12 +2,12 @@
 use candle_gen::gen_core::runtime::CancelFlag;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEvent {
@@ -26,6 +26,10 @@ pub struct CacheEvent {
     pub rope: String,
     pub context: Option<CampaignContext>,
     pub sample_kind: &'static str,
+    pub cache_id: u64,
+    pub candidate_persistent_bytes: u64,
+    pub allocator_before_bytes: u64,
+    pub allocator_after_bytes: u64,
 }
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
@@ -90,6 +94,53 @@ pub fn checked_compressed_bytes(
         .checked_div(block_bytes)?;
     blocks.checked_mul(block_bytes)
 }
+
+/// Exact SC-20675 v2 payload projection for one live `[B,H,Skv,D]` K/V cache.
+/// Keys group on the token axis and retain an f32 dense pending tail; values group on the
+/// channel axis. Every completed group carries f16 scale and zero metadata.
+pub fn checked_packed_group_affine_kv_bytes(
+    batch: u64,
+    heads: u64,
+    tokens: u64,
+    width: u64,
+    group_size: u64,
+) -> Option<u64> {
+    if batch == 0 || heads == 0 || tokens == 0 || width == 0 || group_size == 0 {
+        return None;
+    }
+    let rows = batch.checked_mul(heads)?;
+    let complete_groups = tokens.checked_div(group_size)?;
+    let pending_tokens = tokens.checked_rem(group_size)?;
+
+    let key_codes_per_group = group_size
+        .checked_mul(width)?
+        .checked_add(3)?
+        .checked_div(4)?;
+    let key_codes = rows
+        .checked_mul(complete_groups)?
+        .checked_mul(key_codes_per_group)?;
+    let key_metadata = rows
+        .checked_mul(complete_groups)?
+        .checked_mul(width)?
+        .checked_mul(4)?;
+    let key_pending = rows
+        .checked_mul(pending_tokens)?
+        .checked_mul(width)?
+        .checked_mul(4)?;
+
+    let value_rows = rows.checked_mul(tokens)?;
+    let value_codes_per_row = width.checked_add(3)?.checked_div(4)?;
+    let value_groups_per_row = width.checked_add(group_size - 1)?.checked_div(group_size)?;
+    let value_codes = value_rows.checked_mul(value_codes_per_row)?;
+    let value_metadata = value_rows
+        .checked_mul(value_groups_per_row)?
+        .checked_mul(4)?;
+    key_codes
+        .checked_add(key_metadata)?
+        .checked_add(key_pending)?
+        .checked_add(value_codes)?
+        .checked_add(value_metadata)
+}
 /// Product-owned identity captured after Wan model loading; campaign callers must not populate
 /// evidence fields from CLI claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -121,18 +172,19 @@ pub struct CampaignContext {
     snapshot_bytes: u64,
     variant: String,
     geometry: CampaignGeometry,
+    /// Set only after a product-owned transformer has successfully projected live snapshot-backed
+    /// tensors. Campaign activation and CLI arguments cannot assert this fact.
+    real_weights: bool,
 }
 
 pub struct CampaignOutputRequest {
     path: PathBuf,
     cancellation: bool,
 }
-static LAST_CAMPAIGN_CANCELLATION: AtomicBool = AtomicBool::new(false);
-
 /// Whether the most recent armed campaign was cancelled by the product after its first live read.
 /// This survives scope teardown so CLI wrappers can map only that expected error to exit 0.
 pub fn campaign_cancelled() -> bool {
-    LAST_CAMPAIGN_CANCELLATION.load(Ordering::Relaxed)
+    LAST_CAMPAIGN_CANCELLATION.with(Cell::get)
 }
 
 pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
@@ -144,6 +196,7 @@ pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
 
 thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = RefCell::new(None); }
 thread_local! { static PENDING_CANCELLATION: RefCell<bool> = RefCell::new(false); }
+thread_local! { static LAST_CAMPAIGN_CANCELLATION: Cell<bool> = const { Cell::new(false) }; }
 
 impl CampaignOutputRequest {
     pub fn arm(self) -> Self {
@@ -317,16 +370,16 @@ pub(crate) fn activate_requested(
         },
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let file = if path == Path::new("-") {
-        File::create("/dev/stdout")?
+    let writer: Box<dyn Write> = if path == Path::new("-") {
+        Box::new(io::stdout())
     } else {
-        File::create(path)?
+        Box::new(File::create(path)?)
     };
-    let scope = install_with_context(Box::new(JsonlObserver(file)), context);
+    let scope = install_with_context(Box::new(JsonlObserver(writer)), context);
     // Metadata is emitted exactly once, after bind_cross_kv_geometry has populated the
     // product-owned attention geometry. Never publish the zero-valued activation placeholder.
     CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = cancellation);
-    LAST_CAMPAIGN_CANCELLATION.store(false, Ordering::Relaxed);
+    LAST_CAMPAIGN_CANCELLATION.with(|slot| slot.set(false));
     CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = Some(cancel.clone()));
     Ok(Some(scope))
 }
@@ -367,10 +420,11 @@ impl CampaignContext {
             snapshot_bytes,
             variant,
             geometry,
+            real_weights: false,
         })
     }
 }
-pub struct JsonlObserver(File);
+pub struct JsonlObserver(Box<dyn Write>);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
         let context = serde_json::to_value(&event.context).unwrap_or(serde_json::Value::Null);
@@ -380,7 +434,10 @@ impl CacheObserver for JsonlObserver {
             "rope": event.rope, "context": context, "persistent_bytes": event.persistent_bytes,
             "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes,
             "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns,
-            "sample_kind": event.sample_kind,
+            "sample_kind": event.sample_kind, "cache_id": event.cache_id,
+            "candidate_persistent_bytes": event.candidate_persistent_bytes,
+            "allocator_before_bytes": event.allocator_before_bytes,
+            "allocator_after_bytes": event.allocator_after_bytes,
         });
         if let Some(ctx) = &event.context {
             if event.phase == "metadata" {
@@ -412,33 +469,25 @@ impl CacheObserver for JsonlObserver {
                     value["cancellation_arm_id"] =
                         serde_json::json!(format!("{}:{}", ctx.source_ref, ctx.variant));
                 }
-                value["real_weights"] = serde_json::json!(true);
+                value["real_weights"] = serde_json::json!(ctx.real_weights);
                 value["full_generation"] = serde_json::json!(event.reused != 1);
                 value["attention_kind"] = serde_json::json!("cross");
             }
         }
         if event.phase == "metrics" {
-            let current = CURRENT_PERSISTENT.with(|slot| *slot.borrow());
+            let current = PEAK_PERSISTENT.with(|slot| *slot.borrow());
             let transient = CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow());
             let reused = REUSED_REQUESTS.with(|slot| *slot.borrow());
             let generation_ms = GENERATION_DURATION_MS.with(|slot| *slot.borrow());
             let read_ms = CACHE_READ_DURATION_MS.with(|slot| *slot.borrow());
-            // This is a checked geometry-derived projection for the qualified 2-bit format; it is
-            // intentionally emitted separately from measured current allocation.
-            let candidate = event
-                .context
-                .as_ref()
-                .and_then(|ctx| {
-                    let g = &ctx.geometry;
-                    let elements = u64::from(g.batch)
-                        .checked_mul(u64::from(g.layers))?
-                        .checked_mul(u64::from(g.heads))?
-                        .checked_mul(g.skv)?
-                        .checked_mul(u64::from(g.head_dimension))?
-                        .checked_mul(2)?;
-                    checked_compressed_bytes(elements, 2, 64)
-                })
-                .unwrap_or(0);
+            let candidate = PEAK_CANDIDATE.with(|slot| *slot.borrow());
+            let minimum_cache_reads = CACHE_STATES.with(|slot| {
+                slot.borrow()
+                    .values()
+                    .map(|state| state.reads)
+                    .min()
+                    .unwrap_or(0)
+            });
             value["current_persistent_bytes"] = serde_json::json!(current);
             value["current_read_transient_bytes"] = serde_json::json!(transient);
             value["candidate_persistent_bytes"] = serde_json::json!(candidate);
@@ -452,7 +501,11 @@ impl CacheObserver for JsonlObserver {
                 .max(read_ms as f64)
                 .max(0.001));
             value["reused_requests"] = serde_json::json!(reused);
-            value["real_weights"] = serde_json::json!(true);
+            value["minimum_cache_reads"] = serde_json::json!(minimum_cache_reads);
+            value["real_weights"] = serde_json::json!(event
+                .context
+                .as_ref()
+                .is_some_and(|context| context.real_weights));
             value["full_generation"] =
                 serde_json::json!(!CAMPAIGN_CANCEL.with(|slot| *slot.borrow()));
             value["attention_kind"] = serde_json::json!("cross");
@@ -464,25 +517,25 @@ impl CacheObserver for JsonlObserver {
 }
 pub fn install_jsonl(path: impl AsRef<Path>) -> io::Result<Scope> {
     let path = path.as_ref();
-    let file = if path == Path::new("-") {
-        File::create("/dev/stdout")?
+    let writer: Box<dyn Write> = if path == Path::new("-") {
+        Box::new(io::stdout())
     } else {
-        File::create(path)?
+        Box::new(File::create(path)?)
     };
-    Ok(install(Box::new(JsonlObserver(file))))
+    Ok(install(Box::new(JsonlObserver(writer))))
 }
 pub fn install_jsonl_with_context(
     path: impl AsRef<Path>,
     context: CampaignContext,
 ) -> io::Result<Scope> {
     let path = path.as_ref();
-    let file = if path == Path::new("-") {
-        File::create("/dev/stdout")?
+    let writer: Box<dyn Write> = if path == Path::new("-") {
+        Box::new(io::stdout())
     } else {
-        File::create(path)?
+        Box::new(File::create(path)?)
     };
     let snapshot_bytes = context.snapshot_bytes;
-    let scope = install_with_context(Box::new(JsonlObserver(file)), context);
+    let scope = install_with_context(Box::new(JsonlObserver(writer)), context);
     observe("metadata", snapshot_bytes, 0, 0);
     Ok(scope)
 }
@@ -495,7 +548,12 @@ thread_local! { static PENDING_START: RefCell<bool> = const { RefCell::new(false
 thread_local! { static LIVE_READ_SEEN: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static CAMPAIGN_CANCEL: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static CAMPAIGN_HANDLE: RefCell<Option<CancelFlag>> = const { RefCell::new(None) }; }
-thread_local! { static CURRENT_PERSISTENT: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static LIVE_PERSISTENT: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static PEAK_PERSISTENT: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static LIVE_CANDIDATE: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static PEAK_CANDIDATE: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static NEXT_CACHE_ID: Cell<u64> = const { Cell::new(1) }; }
+thread_local! { static CACHE_STATES: RefCell<BTreeMap<u64, CacheAccounting>> = const { RefCell::new(BTreeMap::new()) }; }
 thread_local! { static CURRENT_READ_TRANSIENT: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static REUSED_REQUESTS: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static GENERATION_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
@@ -504,6 +562,13 @@ thread_local! { static GENERATION_DURATION_PRECISE_MS: RefCell<f64> = const { Re
 thread_local! { static CACHE_READ_DURATION_PRECISE_MS: RefCell<f64> = const { RefCell::new(0.0) }; }
 thread_local! { static CANCEL_TRIGGERED: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static TERMINAL_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CacheAccounting {
+    dense_bytes: u64,
+    candidate_bytes: u64,
+    reads: u64,
+}
 
 /// Read the backend's continuous high-water mark. A campaign receipt is never allowed to use the
 /// attributed byte sum as a substitute for a process/device measurement.
@@ -514,6 +579,18 @@ fn backend_peak_bytes() -> Option<u64> {
 
 #[cfg(not(feature = "cuda"))]
 fn backend_peak_bytes() -> Option<u64> {
+    None
+}
+
+/// Product-owned allocator sample used to bound one live read. The campaign remains CUDA-only;
+/// non-CUDA builds return `None` and therefore cannot manufacture transient evidence.
+#[cfg(feature = "cuda")]
+pub(crate) fn backend_reserved_bytes() -> Option<u64> {
+    candle_gen::cuda_mempool::MemPool::device_default(0)?.reserved()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn backend_reserved_bytes() -> Option<u64> {
     None
 }
 pub struct Scope {
@@ -540,7 +617,12 @@ fn install_with_context_inner(
     LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
     CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
     CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = None);
-    CURRENT_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+    LIVE_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+    PEAK_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+    LIVE_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
+    PEAK_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
+    NEXT_CACHE_ID.with(|slot| slot.set(1));
+    CACHE_STATES.with(|slot| slot.borrow_mut().clear());
     CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow_mut() = 0);
     REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = 0);
     GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
@@ -565,6 +647,31 @@ pub fn observe_timed(
     reused: u64,
     measured: Option<Instant>,
 ) {
+    observe_timed_for_cache(
+        phase,
+        persistent_bytes,
+        transient_bytes,
+        reused,
+        measured,
+        0,
+        0,
+        0,
+        0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_timed_for_cache(
+    phase: &'static str,
+    persistent_bytes: u64,
+    transient_bytes: u64,
+    reused: u64,
+    measured: Option<Instant>,
+    cache_id: u64,
+    candidate_persistent_bytes: u64,
+    allocator_before_bytes: u64,
+    allocator_after_bytes: u64,
+) {
     if phase == "generation-start" {
         if START_EVENT_EMITTED.with(|slot| *slot.borrow()) {
             return;
@@ -586,21 +693,67 @@ pub fn observe_timed(
             let mut value = slot.borrow_mut();
             *value = value.saturating_add(reused);
         });
+        if cache_id != 0 {
+            CACHE_STATES.with(|slot| {
+                if let Some(state) = slot.borrow_mut().get_mut(&cache_id) {
+                    state.reads = state.reads.saturating_add(1);
+                }
+            });
+        }
         CACHE_READ_DURATION_MS.with(|slot| {
             let mut value = slot.borrow_mut();
-            *value = (*value).max(measured.map_or(0, |t| t.elapsed().as_millis() as u64));
+            *value = (*value).saturating_add(
+                measured.map_or(0, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            );
         });
         CACHE_READ_DURATION_PRECISE_MS.with(|slot| {
             let mut value = slot.borrow_mut();
-            *value = (*value)
-                .max(measured.map_or(0.001, |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001)));
+            *value += measured.map_or(0.001, |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001));
         });
     }
     if phase == "cross-kv-created" {
-        CURRENT_PERSISTENT.with(|slot| {
+        let live = LIVE_PERSISTENT.with(|slot| {
             let mut value = slot.borrow_mut();
-            *value = (*value).max(persistent_bytes);
+            *value = (*value).saturating_add(persistent_bytes);
+            *value
         });
+        PEAK_PERSISTENT.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = (*value).max(live);
+        });
+        if cache_id != 0 {
+            CACHE_STATES.with(|slot| {
+                slot.borrow_mut().insert(
+                    cache_id,
+                    CacheAccounting {
+                        dense_bytes: persistent_bytes,
+                        candidate_bytes: candidate_persistent_bytes,
+                        reads: 0,
+                    },
+                );
+            });
+            let candidate_live = LIVE_CANDIDATE.with(|slot| {
+                let mut value = slot.borrow_mut();
+                *value = value.saturating_add(candidate_persistent_bytes);
+                *value
+            });
+            PEAK_CANDIDATE.with(|slot| {
+                let mut value = slot.borrow_mut();
+                *value = (*value).max(candidate_live);
+            });
+        }
+    }
+    if phase == "cross-kv-released" {
+        LIVE_PERSISTENT.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = (*value).saturating_sub(persistent_bytes);
+        });
+        if cache_id != 0 {
+            LIVE_CANDIDATE.with(|slot| {
+                let mut value = slot.borrow_mut();
+                *value = value.saturating_sub(candidate_persistent_bytes);
+            });
+        }
     }
     if phase == "generation-end" {
         if TERMINAL_EMITTED.with(|slot| *slot.borrow()) {
@@ -632,9 +785,15 @@ pub fn observe_timed(
         if let Some(observer) = slot.borrow_mut().as_mut() {
             let context = CONTEXT.with(|ctx| ctx.borrow().clone());
             let measured_peak = backend_peak_bytes();
-            if context.is_some() && measured_peak.is_none() && !cfg!(test) {
-                return;
-            }
+            let peak_bytes = measured_peak.unwrap_or_else(|| {
+                if context.is_some() && !cfg!(test) {
+                    // Activation already refuses an absent counter. If it disappears mid-run,
+                    // preserve an explicit invalid zero sample so the adapter rejects the receipt.
+                    0
+                } else {
+                    persistent_bytes.saturating_add(transient_bytes)
+                }
+            });
             let event = CacheEvent {
                 phase,
                 attention: "cross",
@@ -652,8 +811,7 @@ pub fn observe_timed(
                     |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 ),
                 reused,
-                peak_bytes: measured_peak
-                    .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
+                peak_bytes,
                 at_ns: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -665,6 +823,10 @@ pub fn observe_timed(
                 rope: String::new(),
                 context,
                 sample_kind: "allocator",
+                cache_id,
+                candidate_persistent_bytes,
+                allocator_before_bytes,
+                allocator_after_bytes,
             };
             observer.record(event.clone());
             if phase == "generation-end" {
@@ -681,17 +843,75 @@ pub fn observe_timed(
         && !CANCEL_TRIGGERED.with(|slot| *slot.borrow())
     {
         CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = true);
-        LAST_CAMPAIGN_CANCELLATION.store(true, Ordering::Relaxed);
         CAMPAIGN_HANDLE.with(|slot| {
             if let Some(cancel) = slot.borrow().as_ref() {
                 cancel.cancel();
             }
         });
-        observe_cancelled();
     }
     if phase == "metadata" && PENDING_START.with(|slot| *slot.borrow()) {
         PENDING_START.with(|slot| *slot.borrow_mut() = false);
         observe("generation-start", 0, 0, 0);
+    }
+}
+
+/// Register one product-owned prepared cache and return its run-local identity.
+pub(crate) fn register_cache(dense_bytes: u64, candidate_bytes: u64, measured: Instant) -> u64 {
+    let cache_id = NEXT_CACHE_ID.with(|slot| {
+        let value = slot.get();
+        slot.set(value.saturating_add(1));
+        value
+    });
+    observe_timed_for_cache(
+        "cross-kv-created",
+        dense_bytes,
+        0,
+        0,
+        Some(measured),
+        cache_id,
+        candidate_bytes,
+        0,
+        0,
+    );
+    cache_id
+}
+
+/// Record one read against the exact created cache identity. `transient_bytes` is a physical
+/// allocator delta, never a tensor element-count surrogate.
+pub(crate) fn record_cache_read(
+    cache_id: u64,
+    transient_bytes: u64,
+    allocator_before_bytes: u64,
+    allocator_after_bytes: u64,
+    measured: Instant,
+) {
+    observe_timed_for_cache(
+        "cross-kv-read",
+        0,
+        transient_bytes,
+        1,
+        Some(measured),
+        cache_id,
+        0,
+        allocator_before_bytes,
+        allocator_after_bytes,
+    );
+}
+
+pub(crate) fn release_cache(cache_id: u64) {
+    let state = CACHE_STATES.with(|slot| slot.borrow().get(&cache_id).copied());
+    if let Some(state) = state {
+        observe_timed_for_cache(
+            "cross-kv-released",
+            state.dense_bytes,
+            0,
+            0,
+            None,
+            cache_id,
+            state.candidate_bytes,
+            0,
+            0,
+        );
     }
 }
 
@@ -740,9 +960,13 @@ pub fn observe_tensor(
         if let Some(observer) = slot.borrow_mut().as_mut() {
             let context = CONTEXT.with(|ctx| ctx.borrow().clone());
             let measured_peak = backend_peak_bytes();
-            if context.is_some() && measured_peak.is_none() && !cfg!(test) {
-                return;
-            }
+            let peak_bytes = measured_peak.unwrap_or_else(|| {
+                if context.is_some() && !cfg!(test) {
+                    0
+                } else {
+                    persistent_bytes.saturating_add(transient_bytes)
+                }
+            });
             observer.record(CacheEvent {
                 phase,
                 attention: "cross",
@@ -755,8 +979,7 @@ pub fn observe_tensor(
                         .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
                 }),
                 reused,
-                peak_bytes: measured_peak
-                    .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
+                peak_bytes,
                 at_ns: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -768,6 +991,10 @@ pub fn observe_tensor(
                 rope,
                 context,
                 sample_kind: "allocator",
+                cache_id: 0,
+                candidate_persistent_bytes: 0,
+                allocator_before_bytes: 0,
+                allocator_after_bytes: 0,
             });
         }
     });
@@ -779,6 +1006,7 @@ pub fn observe_cancelled() {
         && LIVE_READ_SEEN.with(|slot| *slot.borrow())
         && !TERMINAL_EMITTED.with(|slot| *slot.borrow())
     {
+        LAST_CAMPAIGN_CANCELLATION.with(|slot| slot.set(true));
         TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = true);
         let elapsed = elapsed_precise_ms_for(None).max(0.001);
         GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = elapsed);
@@ -825,18 +1053,44 @@ pub(crate) fn bind_cross_kv_geometry(
         }
     });
     if bound {
-        let cancellation = CAMPAIGN_CANCEL.with(|slot| *slot.borrow());
-        observe("metadata", 0, 0, u64::from(cancellation));
-        if !START_EVENT_EMITTED.with(|slot| *slot.borrow())
-            && !PENDING_START.with(|slot| *slot.borrow())
-        {
-            observe("generation-start", 0, 0, 0);
+        try_emit_bound_metadata();
+    }
+}
+
+/// Confirm that live model-owned weights completed a K/V projection. Geometry binding alone is
+/// insufficient: it happens before projection and cannot prove that a snapshot-backed model loaded
+/// successfully. Tests deliberately remain non-promotable even when their synthetic tensors project.
+pub(crate) fn confirm_real_weight_projection() {
+    let bound = CONTEXT.with(|slot| {
+        if let Some(context) = slot.borrow_mut().as_mut() {
+            context.real_weights = !cfg!(test);
+            true
+        } else {
+            false
         }
+    });
+    if !bound {
+        return;
+    }
+    try_emit_bound_metadata();
+}
+
+fn try_emit_bound_metadata() {
+    let cancellation = CAMPAIGN_CANCEL.with(|slot| *slot.borrow());
+    observe("metadata", 0, 0, u64::from(cancellation));
+    if METADATA_EMITTED.with(|slot| *slot.borrow())
+        && !START_EVENT_EMITTED.with(|slot| *slot.borrow())
+        && !PENDING_START.with(|slot| *slot.borrow())
+    {
+        observe("generation-start", 0, 0, 0);
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
-        if !TERMINAL_EMITTED.with(|slot| *slot.borrow()) {
+        let unconfirmed_cancel = CAMPAIGN_CANCEL.with(|slot| *slot.borrow())
+            && CANCEL_TRIGGERED.with(|slot| *slot.borrow())
+            && !LAST_CAMPAIGN_CANCELLATION.with(Cell::get);
+        if !TERMINAL_EMITTED.with(|slot| *slot.borrow()) && !unconfirmed_cancel {
             observe("generation-end", 0, 0, 0);
         }
         observe("invalidated", 0, 0, 0);
@@ -854,6 +1108,11 @@ impl Drop for Scope {
         TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = false);
         GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
         CACHE_READ_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
+        LIVE_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+        PEAK_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+        LIVE_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
+        PEAK_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
+        CACHE_STATES.with(|slot| slot.borrow_mut().clear());
         let _ = self.started;
     }
 }
@@ -876,6 +1135,27 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|e| e.attention == "cross"));
         assert_eq!(rows[1].transient_bytes, 64);
+    }
+
+    #[test]
+    fn accounting_tracks_simultaneous_residency_and_sums_all_reads() {
+        let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _scope = install(Box::new(Sink(out)));
+        observe("cross-kv-created", 100, 0, 1);
+        observe("cross-kv-created", 150, 0, 1);
+        observe("cross-kv-released", 100, 0, 0);
+        observe("cross-kv-created", 50, 0, 1);
+        observe_timed("cross-kv-read", 0, 32, 1, None);
+        observe_timed("cross-kv-read", 0, 64, 1, None);
+
+        assert_eq!(LIVE_PERSISTENT.with(|slot| *slot.borrow()), 200);
+        assert_eq!(PEAK_PERSISTENT.with(|slot| *slot.borrow()), 250);
+        assert_eq!(CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow()), 64);
+        assert_eq!(REUSED_REQUESTS.with(|slot| *slot.borrow()), 2);
+        assert_eq!(
+            CACHE_READ_DURATION_PRECISE_MS.with(|slot| *slot.borrow()),
+            0.002
+        );
     }
 
     #[test]
@@ -974,6 +1254,53 @@ mod tests {
     }
 
     #[test]
+    fn packed_projection_includes_metadata_and_dense_pending_key_tail() {
+        // B=1,H=2,Skv=65,D=64: keys have one complete group and one dense f32
+        // pending token; values have 130 channel-grouped rows.
+        assert_eq!(
+            checked_packed_group_affine_kv_bytes(1, 2, 65, 64, 64),
+            Some(5_672)
+        );
+        assert_eq!(checked_packed_group_affine_kv_bytes(1, 2, 0, 64, 64), None);
+        assert_eq!(
+            checked_packed_group_affine_kv_bytes(u64::MAX, 2, 65, 64, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn reuse_is_the_minimum_reads_of_each_created_cache() {
+        let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _scope = install(Box::new(Sink(out.clone())));
+        let first = register_cache(100, 50, Instant::now());
+        let second = register_cache(200, 80, Instant::now());
+        record_cache_read(first, 32, 1000, 1032, Instant::now());
+        record_cache_read(first, 32, 1032, 1064, Instant::now());
+        record_cache_read(second, 64, 1064, 1128, Instant::now());
+        assert_eq!(
+            CACHE_STATES.with(|slot| slot.borrow().values().map(|state| state.reads).min()),
+            Some(1)
+        );
+        record_cache_read(second, 64, 1128, 1192, Instant::now());
+        assert_eq!(
+            CACHE_STATES.with(|slot| slot.borrow().values().map(|state| state.reads).min()),
+            Some(2)
+        );
+        assert_eq!(PEAK_PERSISTENT.with(|slot| *slot.borrow()), 300);
+        assert_eq!(PEAK_CANDIDATE.with(|slot| *slot.borrow()), 130);
+        release_cache(first);
+        assert_eq!(LIVE_PERSISTENT.with(|slot| *slot.borrow()), 200);
+        assert_eq!(LIVE_CANDIDATE.with(|slot| *slot.borrow()), 80);
+        let rows = out.borrow();
+        assert!(rows.iter().any(|event| event.cache_id == first));
+        assert!(rows.iter().any(|event| {
+            event.cache_id == second
+                && event.allocator_before_bytes == 1_128
+                && event.allocator_after_bytes == 1_192
+        }));
+    }
+
+    #[test]
     fn campaign_plan_covers_each_route_once_per_arm() {
         let plan = campaign_plan();
         assert_eq!(plan.len(), CAMPAIGN_ROUTES.len() * 2);
@@ -997,12 +1324,16 @@ mod tests {
     fn lifecycle_deduplicates_start_and_triggers_cancel_once_after_read() {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let scope = install(Box::new(Sink(out.clone())));
+        LAST_CAMPAIGN_CANCELLATION.with(|slot| slot.set(false));
         CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = true);
         METADATA_EMITTED.with(|slot| *slot.borrow_mut() = true);
         observe("generation-start", 0, 0, 0);
         observe("generation-start", 0, 0, 0);
         observe("cross-kv-read", 1, 2, 1);
         observe("cross-kv-read", 1, 2, 1);
+        assert!(!campaign_cancelled());
+        observe_cancelled();
+        assert!(campaign_cancelled());
         drop(scope);
         let rows = out.borrow();
         assert_eq!(
@@ -1047,6 +1378,35 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_trigger_without_product_error_never_claims_a_terminal() {
+        let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let scope = install(Box::new(Sink(out.clone())));
+        LAST_CAMPAIGN_CANCELLATION.with(|slot| slot.set(false));
+        CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = true);
+        METADATA_EMITTED.with(|slot| *slot.borrow_mut() = true);
+        observe("generation-start", 0, 0, 0);
+        observe("cross-kv-read", 1, 2, 1);
+        drop(scope);
+        let rows = out.borrow();
+        assert!(!campaign_cancelled());
+        assert!(!rows
+            .iter()
+            .any(|event| { matches!(event.phase, "cancelled" | "generation-end" | "metrics") }));
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "invalidated")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "released")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn requested_output_derives_identity_from_snapshot_bytes() {
         let root = tempfile::tempdir().unwrap();
         let snapshot = root.path().join("0123456789abcdef0123456789abcdef01234567");
@@ -1072,6 +1432,7 @@ mod tests {
         .unwrap()
         .expect("armed output request activates at runtime");
         bind_cross_kv_geometry(1, 8, 64, 1, 2, "bf16");
+        confirm_real_weight_projection();
         observe("loaded", 1, 0, 0);
         drop(scope);
         let lines = std::fs::read_to_string(output).unwrap();
@@ -1086,6 +1447,7 @@ mod tests {
         assert!(lines
             .lines()
             .any(|line| line.contains("\"attention_kind\":\"cross\"")));
+        assert!(lines.contains("\"real_weights\":false"));
         assert!(lines
             .lines()
             .any(|line| line.contains("released") && line.contains("t2v")));

@@ -278,9 +278,6 @@ impl IpAdapterFlux {
         )?;
 
         let state = State::new(&t5_emb, &clip_emb, &noise)?;
-        // Capture the actual target/reference joint-stream geometry at the edit-route ownership
-        // boundary. This route intentionally reports no persistent cross-request KV cache.
-        let _reference_evidence = injector.reference_evidence(&state.img)?;
         let timesteps = if self.variant.is_dev() {
             get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
         } else {

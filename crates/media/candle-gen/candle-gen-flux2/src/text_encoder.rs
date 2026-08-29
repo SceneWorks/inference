@@ -193,7 +193,6 @@ impl Attention {
         .transpose(1, 2)?;
         let v = v.transpose(1, 2)?.contiguous()?;
         let (q, k) = rotary.apply_at(&q, &k, offset)?;
-        // This is changing decoder self-attention, deliberately excluded from SC-20686 reuse.
         let (k, v) = cache
             .update(layer, &k, &v)
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
@@ -521,9 +520,7 @@ impl Flux2PromptEncoder {
                 "flux2 caption-upsample: expected batch 1, got {batch}"
             )));
         }
-        if let Err(error) = candle_gen::check_cancel(cancel) {
-            return Err(error);
-        }
+        candle_gen::check_cancel(cancel)?;
         let mut cache = ContiguousKvCache::new(self.layers.len());
         let mut rng = SplitMix64::new(sampling.seed);
         let params = SamplingParams {
@@ -536,9 +533,7 @@ impl Flux2PromptEncoder {
         let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
         let mut generated = Vec::new();
         for step in 0..sampling.max_new_tokens {
-            if let Err(error) = candle_gen::check_cancel(cancel) {
-                return Err(error);
-            }
+            candle_gen::check_cancel(cancel)?;
             let next = sample(&logits, &[], &params, &mut rng, None)
                 .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
             if next == eos_token {

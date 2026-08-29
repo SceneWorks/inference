@@ -10,6 +10,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Exact externally registered edit route. The model configuration remains `flux2_klein_9b`;
+/// campaign evidence must identify the product operation, not conflate it with that config id.
+pub const PRODUCT_ROUTE_ID: &str = "flux2_klein_9b_edit";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEvent {
     pub phase: &'static str,
@@ -80,6 +84,7 @@ pub struct CampaignContext {
     snapshot_bytes: u64,
     variant: String,
     cancellation_armed: bool,
+    real_weights: bool,
     geometry: CampaignGeometry,
 }
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -88,9 +93,10 @@ pub struct CampaignMetrics {
     current_read_transient_bytes: u64,
     candidate_persistent_bytes: u64,
     candidate_read_transient_bytes: u64,
-    generation_duration_ms: u64,
-    cache_read_duration_ms: u64,
+    generation_duration_ms: f64,
+    cache_read_duration_ms: f64,
     reused_requests: u64,
+    minimum_cache_reads: u64,
 }
 pub struct CampaignOutputRequest {
     path: PathBuf,
@@ -109,18 +115,19 @@ thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = const {
 thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = const { RefCell::new(None) }; }
 thread_local! { static STARTED: RefCell<Option<Instant>> = const { RefCell::new(None) }; }
 thread_local! { static MEASUREMENTS: RefCell<Measurements> = const { RefCell::new(Measurements::EMPTY) }; }
+thread_local! { static CANCELLATION_TRIGGERED: RefCell<bool> = const { RefCell::new(false) }; }
 #[derive(Clone, Copy, Default)]
 struct Measurements {
     current_read_transient_bytes: u64,
     candidate_persistent_bytes: u64,
-    cache_read_duration_ms: u64,
+    cache_read_duration_ns: u128,
     reused_requests: u64,
 }
 impl Measurements {
     const EMPTY: Self = Self {
         current_read_transient_bytes: 0,
         candidate_persistent_bytes: 0,
-        cache_read_duration_ms: 0,
+        cache_read_duration_ns: 0,
         reused_requests: 0,
     };
 }
@@ -245,6 +252,12 @@ pub(crate) fn activate_requested(
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
     let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
     let Some(path) = path else { return Ok(None) };
+    if backend_peak_bytes().is_none() && !cfg!(test) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SC-20686 requires a live backend allocator peak counter",
+        ));
+    }
     let (snapshot_sha256, snapshot_bytes) = snapshot_identity(root)?;
     let context = CampaignContext {
         source_ref: source_revision(root)?,
@@ -252,6 +265,7 @@ pub(crate) fn activate_requested(
         snapshot_bytes,
         variant: variant.into(),
         cancellation_armed: cancellation,
+        real_weights: false,
         geometry: CampaignGeometry {
             batch: 1,
             frames: 1,
@@ -273,12 +287,12 @@ pub(crate) fn activate_requested(
             rope: "flux2-4-axis".into(),
         },
     };
-    let file = if path == Path::new("-") {
-        File::create("/dev/stdout")?
+    let writer: Box<dyn Write> = if path == Path::new("-") {
+        Box::new(io::stdout())
     } else {
-        File::create(path)?
+        Box::new(File::create(path)?)
     };
-    let scope = install_with_context(Box::new(JsonlObserver(file)), context);
+    let scope = install_with_context(Box::new(JsonlObserver(writer)), context);
     if cancellation {
         observe("campaign-cancellation-armed", 0, 0, 1);
     }
@@ -319,6 +333,9 @@ pub(crate) fn bind_edit_geometry(
         context.geometry.latent_height = latent_height;
         context.geometry.latent_width = latent_width;
         context.geometry.dtype = dtype.into();
+        // This hook runs only after the product edit route has materialized live reference tokens
+        // from its loaded snapshot. Synthetic unit-test tensors remain explicitly non-promotable.
+        context.real_weights = !cfg!(test);
         MEASUREMENTS.with(|metrics| {
             metrics.borrow_mut().candidate_persistent_bytes =
                 checked_compressed_bytes(reference_elements, 4, 64).unwrap_or(0)
@@ -330,7 +347,7 @@ pub(crate) fn bind_edit_geometry(
     }
 }
 
-pub struct JsonlObserver(File);
+pub struct JsonlObserver(Box<dyn Write>);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
         let mut value = serde_json::json!({"phase": event.phase, "attention": event.attention, "operation": event.operation, "tensor_shape": event.tensor_shape, "dtype": event.dtype, "mask": event.mask, "rope": event.rope, "persistent_bytes": event.persistent_bytes, "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes, "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns, "sample_kind": event.sample_kind});
@@ -346,9 +363,9 @@ impl CacheObserver for JsonlObserver {
                     value["cancellation_arm_id"] =
                         serde_json::json!(format!("{}:{}", context.source_ref, context.variant));
                 }
-                value["real_weights"] = serde_json::json!(true);
-                value["full_generation"] = serde_json::json!(true);
-                value["attention_kind"] = serde_json::json!("joint-image-reference");
+                value["real_weights"] = serde_json::json!(context.real_weights);
+                value["full_generation"] = serde_json::json!(!context.cancellation_armed);
+                value["attention_kind"] = serde_json::json!("cross");
             }
         }
         if let Some(metrics) = event.metrics {
@@ -362,6 +379,7 @@ impl CacheObserver for JsonlObserver {
             value["generation_duration_ms"] = serde_json::json!(metrics.generation_duration_ms);
             value["cache_read_duration_ms"] = serde_json::json!(metrics.cache_read_duration_ms);
             value["reused_requests"] = serde_json::json!(metrics.reused_requests);
+            value["minimum_cache_reads"] = serde_json::json!(metrics.minimum_cache_reads);
         }
         let _ = self.0.write_all(
             serde_json::to_string(&value)
@@ -393,7 +411,29 @@ fn install_inner(observer: Box<dyn CacheObserver>, context: Option<CampaignConte
     CONTEXT.with(|slot| *slot.borrow_mut() = context);
     STARTED.with(|slot| *slot.borrow_mut() = Some(Instant::now()));
     MEASUREMENTS.with(|slot| *slot.borrow_mut() = Measurements::EMPTY);
+    CANCELLATION_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
     Scope
+}
+
+/// Consume the campaign's deliberate cancellation request at the first live cache-read boundary.
+/// Ordinary product cancellation continues to use the request's `CancelFlag`; this hook exists only
+/// while an explicitly armed receipt observer owns the current edit call.
+pub(crate) fn take_requested_cancellation() -> bool {
+    let armed = CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|context| context.cancellation_armed)
+    });
+    armed
+        && CANCELLATION_TRIGGERED.with(|slot| {
+            let mut triggered = slot.borrow_mut();
+            if *triggered {
+                false
+            } else {
+                *triggered = true;
+                true
+            }
+        })
 }
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
     observe_tensor(
@@ -447,11 +487,23 @@ pub fn observe_tensor(
         };
         let context = CONTEXT.with(|ctx| ctx.borrow().clone());
         let measured_peak = backend_peak_bytes();
-        if context.is_some() && measured_peak.is_none() && !cfg!(test) {
-            return;
-        }
+        let peak_bytes = measured_peak.unwrap_or_else(|| {
+            if context.is_some() && !cfg!(test) {
+                // Activation already rejects a missing counter; a mid-run loss is retained as an
+                // invalid zero sample so publication fails closed without panicking in cleanup.
+                0
+            } else {
+                persistent_bytes.saturating_add(transient_bytes)
+            }
+        });
+        let measured_duration = measured.map(|instant| instant.elapsed());
         let elapsed_ms = measured
-            .map(|instant| instant.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .map(|_| {
+                measured_duration
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            })
             .unwrap_or_else(|| {
                 STARTED.with(|started| {
                     started.borrow().as_ref().map_or(0, |instant| {
@@ -464,8 +516,9 @@ pub fn observe_tensor(
                 let mut metrics = metrics.borrow_mut();
                 metrics.current_read_transient_bytes =
                     metrics.current_read_transient_bytes.max(transient_bytes);
-                metrics.cache_read_duration_ms =
-                    metrics.cache_read_duration_ms.saturating_add(elapsed_ms);
+                metrics.cache_read_duration_ns = metrics
+                    .cache_read_duration_ns
+                    .saturating_add(measured_duration.unwrap_or_default().as_nanos());
                 metrics.reused_requests = metrics.reused_requests.saturating_add(reused);
             });
         }
@@ -476,8 +529,7 @@ pub fn observe_tensor(
             transient_bytes,
             elapsed_ms,
             reused,
-            peak_bytes: measured_peak
-                .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
+            peak_bytes,
             at_ns: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -499,10 +551,20 @@ pub fn observe_tensor(
                     current_persistent_bytes: 0,
                     current_read_transient_bytes: measurement.current_read_transient_bytes,
                     candidate_persistent_bytes: measurement.candidate_persistent_bytes,
-                    candidate_read_transient_bytes: 0,
-                    generation_duration_ms: elapsed_ms,
-                    cache_read_duration_ms: measurement.cache_read_duration_ms,
+                    // No compressed FLUX read kernel exists in this attribution story. Preserve the
+                    // measured dense read transient conservatively instead of claiming it vanishes.
+                    candidate_read_transient_bytes: measurement.current_read_transient_bytes,
+                    generation_duration_ms: STARTED.with(|started| {
+                        started
+                            .borrow()
+                            .as_ref()
+                            .map_or(0.0, |instant| instant.elapsed().as_secs_f64() * 1_000.0)
+                    }),
+                    cache_read_duration_ms: measurement.cache_read_duration_ns as f64 / 1_000_000.0,
                     reused_requests: measurement.reused_requests,
+                    // FLUX owns one logical reference-conditioning payload for the coordinate;
+                    // every observed recomputation is a read of that same product-owned payload.
+                    minimum_cache_reads: measurement.reused_requests,
                 }
             });
             observer.record(CacheEvent {
@@ -524,6 +586,7 @@ impl Drop for Scope {
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         STARTED.with(|slot| *slot.borrow_mut() = None);
+        CANCELLATION_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
     }
 }
 
@@ -557,5 +620,41 @@ mod tests {
         assert!(!is_lowercase_sha(
             "A012345678901234567890123456789012345678"
         ));
+    }
+
+    #[test]
+    fn deliberate_cancellation_is_consumed_once_only_when_armed() {
+        let out = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let context = CampaignContext {
+            source_ref: "a".repeat(40),
+            snapshot_sha256: "b".repeat(64),
+            snapshot_bytes: 1,
+            variant: "flux2_klein_9b_edit".into(),
+            cancellation_armed: true,
+            real_weights: false,
+            geometry: CampaignGeometry {
+                batch: 1,
+                frames: 1,
+                width: 1024,
+                height: 1024,
+                latent_frames: 1,
+                latent_height: 128,
+                latent_width: 128,
+                prompt_sha256: "c".repeat(64),
+                guidance: "1".into(),
+                reference_count: 1,
+                layers: 1,
+                heads: 1,
+                head_dimension: 1,
+                sq: 1,
+                skv: 1,
+                dtype: "F32".into(),
+                mask: "joint-unmasked".into(),
+                rope: "flux2-4-axis".into(),
+            },
+        };
+        let _scope = install_with_context(Box::new(Sink(out)), context);
+        assert!(take_requested_cancellation());
+        assert!(!take_requested_cancellation());
     }
 }

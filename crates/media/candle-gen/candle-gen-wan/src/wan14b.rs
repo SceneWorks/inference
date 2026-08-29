@@ -33,7 +33,7 @@ use candle_gen::gen_core::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert,
     OffloadPolicy, Progress, Quant, WeightsSource,
 };
-use candle_gen::{check_cancel, CandleError, Result as CResult};
+use candle_gen::{check_cancel as product_check_cancel, CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
@@ -47,6 +47,14 @@ use crate::rope::WanRope;
 use crate::scheduler::{FlowScheduler, Sampler};
 use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
+
+fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
+    product_check_cancel(cancel).map_err(|error| {
+        crate::sc20686_observer::observe_cancelled();
+        error
+    })
+}
+
 /// Concrete z16 VAE assigned to both A14B routes.
 pub type ProviderVae = crate::vae16::WanVae16;
 
@@ -552,6 +560,7 @@ impl Pipeline {
         if let Err(error) = check_cancel(cancel) {
             return Err(error);
         }
+        crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
         let (pos_bytes, pos_shape, pos_dtype) = pos_kv.evidence();
         crate::sc20686_observer::observe_tensor(
@@ -585,7 +594,6 @@ impl Pipeline {
         crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
         for i in range {
             if let Err(error) = check_cancel(cancel) {
-                crate::sc20686_observer::observe_cancelled();
                 return Err(error);
             }
             let t = sched.timestep(i);
@@ -604,6 +612,7 @@ impl Pipeline {
                 }
                 _ => v_pos,
             };
+            check_cancel(cancel)?;
             *latents = sched.step(&v, latents)?; // 16-channel latent (out_dim 16)
             on_progress(Progress::Step {
                 current: i as u32 + 1,
@@ -1157,6 +1166,13 @@ impl Generator for Wan14bGenerator {
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B);
         let (latent_frames, latent_height, latent_width) =
             latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.root,
             &req.cancel,
@@ -1170,7 +1186,7 @@ impl Generator for Wan14bGenerator {
             latent_width as u32,
             &req.prompt,
             req.guidance,
-            0,
+            reference_count,
         )
         .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = match &self.comfyui {

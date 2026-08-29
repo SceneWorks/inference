@@ -523,7 +523,7 @@ impl Flux2Edit {
         // variant and request facts all come from the loaded provider, not campaign arguments.
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.campaign_snapshot_root,
-            self.variant.id(),
+            crate::sc20686_observer::PRODUCT_ROUTE_ID,
             req.width,
             req.height,
             &req.prompt,
@@ -753,13 +753,16 @@ impl Flux2Edit {
                     "joint-reconcat",
                     0,
                     (hidden.elem_count() as u64).saturating_mul(hidden.dtype().size() as u64),
-                    0,
+                    1,
                     format!("{:?}", hidden.dims()),
                     format!("{:?}", hidden.dtype()),
                     "joint-unmasked",
                     "flux2-4-axis",
                     Some(recompute_started),
                 );
+                if crate::sc20686_observer::take_requested_cancellation() {
+                    return Err(CandleError::Canceled);
+                }
                 if embedded_guidance {
                     // dev: a single forward feeding the embedded guidance scalar to the DiT.
                     return self.velocity(

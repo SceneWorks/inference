@@ -1,8 +1,37 @@
 {
-  "schema": "sc-20686-supported-coverage-v1",
+  "schema": "sc-20686-supported-coverage-v2",
   "families": {
-    "flux2-klein": ["flux2_klein_9b_edit"],
-    "wan": ["wan2_2_ti2v_5b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan_vace", "wan2_2_vace_fun_14b"]
+    "flux2-klein": {
+      "flux2_klein_9b_edit": {
+        "coordinates": {
+          "edit-512-ref1-cfg1": {"resolution": "512x512", "frames": 1, "reference_count": 1, "prompt": "6c8d6812785e96e6241dc0e9b6d7d8d1542c6606fb70e3872156f82130f27238", "guidance": "1"},
+          "edit-768x512-ref2-cfg2": {"resolution": "768x512", "frames": 1, "reference_count": 2, "prompt": "b93b8a5e0470837a2a1e05613e005cebc58e4404950beff45972a7aa90913c8c", "guidance": "2"}
+        }
+      }
+    },
+    "wan": {
+      "wan2_2_ti2v_5b": {"coordinates": {
+        "square-17f": {"resolution": "512x512", "frames": 17, "reference_count": 0, "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5", "guidance": "5"},
+        "landscape-33f": {"resolution": "768x512", "frames": 33, "reference_count": 0, "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713", "guidance": "4"}
+      }},
+      "wan2_2_t2v_14b": {"coordinates": {
+        "square-17f": {"resolution": "512x512", "frames": 17, "reference_count": 0, "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5", "guidance": "5"},
+        "landscape-33f": {"resolution": "768x512", "frames": 33, "reference_count": 0, "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713", "guidance": "4"}
+      }},
+      "wan2_2_i2v_14b": {"coordinates": {
+        "square-17f-ref1": {"resolution": "512x512", "frames": 17, "reference_count": 1, "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5", "guidance": "5"},
+        "landscape-33f-ref1": {"resolution": "768x512", "frames": 33, "reference_count": 1, "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713", "guidance": "4"}
+      }},
+      "wan_vace": {"coordinates": {
+        "square-17f-control": {"resolution": "512x512", "frames": 17, "reference_count": 0, "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5", "guidance": "5"},
+        "landscape-33f-reference": {"resolution": "768x512", "frames": 33, "reference_count": 1, "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713", "guidance": "4"}
+      }},
+      "wan2_2_vace_fun_14b": {"coordinates": {
+        "square-17f-control": {"resolution": "512x512", "frames": 17, "reference_count": 0, "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5", "guidance": "5"},
+        "landscape-33f-reference": {"resolution": "768x512", "frames": 33, "reference_count": 1, "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713", "guidance": "4"}
+      }}
+    }
   },
+  "required_arms": ["normal", "cancel"],
   "required_geometry_axes": ["resolution", "reference_count", "frames", "prompt", "guidance", "layers", "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope"]
 }

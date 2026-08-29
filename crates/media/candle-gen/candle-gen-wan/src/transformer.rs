@@ -170,6 +170,13 @@ struct Attention {
 pub(crate) struct PreparedBlockCrossKv {
     key: Tensor,
     value: Tensor,
+    cache_id: u64,
+}
+
+impl Drop for PreparedBlockCrossKv {
+    fn drop(&mut self) {
+        crate::sc20686_observer::release_cache(self.cache_id);
+    }
 }
 
 /// Request-scoped cross-attention K/V heads for every base Wan block.
@@ -283,16 +290,35 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        crate::sc20686_observer::observe_timed(
-            "cross-kv-created",
-            (k.elem_count() + v.elem_count()) as u64 * 2,
-            0,
-            1,
-            Some(measured),
-        );
+        let key = to_heads(&k)?;
+        let value = to_heads(&v)?;
+        let retained_bytes = [&key, &value].iter().fold(0u64, |bytes, tensor| {
+            bytes.saturating_add(
+                (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size_in_bytes() as u64),
+            )
+        });
+        let candidate_bytes = crate::sc20686_observer::checked_packed_group_affine_kv_bytes(
+            b as u64,
+            self.num_heads as u64,
+            s_kv as u64,
+            self.head_dim as u64,
+            64,
+        )
+        .ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "SC-20686 packed group-affine projection overflow".into(),
+            )
+        })?;
+        // Only a successfully materialized projection can prove that the product-owned loaded
+        // weights are real. Emit metadata/start before the first created event once query geometry
+        // has also been bound by the denoise caller.
+        crate::sc20686_observer::confirm_real_weight_projection();
+        let cache_id =
+            crate::sc20686_observer::register_cache(retained_bytes, candidate_bytes, measured);
         Ok(PreparedBlockCrossKv {
-            key: to_heads(&k)?,
-            value: to_heads(&v)?,
+            key,
+            value,
+            cache_id,
         })
     }
 
@@ -327,13 +353,18 @@ impl Attention {
             k = apply_rope(&k, cos, sin)?;
         }
         let scale = (self.head_dim as f64).powf(-0.5);
+        let allocator_before = crate::sc20686_observer::backend_reserved_bytes();
         let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
-        crate::sc20686_observer::observe_timed(
-            "cross-kv-read",
-            0,
-            (q.elem_count() as u64) * 4,
-            1,
-            Some(measured),
+        let allocator_after = crate::sc20686_observer::backend_reserved_bytes();
+        let physical_read_transient = allocator_before
+            .zip(allocator_after)
+            .map_or(0, |(before, after)| after.saturating_sub(before));
+        crate::sc20686_observer::record_cache_read(
+            kv.cache_id,
+            physical_read_transient,
+            allocator_before.unwrap_or(0),
+            allocator_after.unwrap_or(0),
+            measured,
         );
         let out = out
             .transpose(1, 2)?

@@ -554,6 +554,13 @@ impl Generator for WanVaceFunGenerator {
             .ok_or_else(|| gen_core::Error::Msg("missing control clip".into()))?;
         let (latent_frames, latent_height, latent_width) =
             crate::wan14b::latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.root,
             &req.cancel,
@@ -567,7 +574,7 @@ impl Generator for WanVaceFunGenerator {
             latent_width as u32,
             &req.prompt,
             req.guidance,
-            0,
+            reference_count,
         )
         .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let effective_offload = crate::i2v_memory_strategy::selected_offload_policy(

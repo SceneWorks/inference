@@ -1,154 +1,437 @@
+import argparse
+import importlib.util
 import json
-import subprocess
-import sys
+import os
 import tempfile
 import unittest
 from pathlib import Path
-import importlib.util
 
 ADAPTER = Path(__file__).parents[1] / "sc20686_campaign_adapter.py"
-GEOMETRY = {"resolution": "512x512", "reference_count": 1, "frames": 1,
-            "prompt": "f" * 64, "guidance": "1.0", "layers": 1, "heads": 2,
-            "head_dimension": 64, "sq": 1, "skv": 1024, "dtype": "bf16",
-            "mask": "causal", "rope": "native"}
+REDUCER = Path(__file__).parents[1] / "sc20686_cache_attribution.py"
+
+
+def load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class CampaignAdapterTests(unittest.TestCase):
-    def test_wan_manifest_requires_exact_routes_and_real_files(self):
-        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
-        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); binary = root / "wan"; binary.write_text("#!/bin/sh\n", encoding="utf-8"); binary.chmod(0o755)
-            entries = {}
-            for route in adapter.WAN_ROUTES:
-                snapshot = root / route; snapshot.mkdir(); (snapshot / "config.json").write_text("{}", encoding="utf-8")
-                entries[route] = {"entrypoint": str(binary), "snapshot": str(snapshot), "args": []}
-            manifest = root / "manifest.json"; manifest.write_text(json.dumps(entries), encoding="utf-8")
-            self.assertEqual(set(adapter.load_wan_manifest(manifest)), set(adapter.WAN_ROUTES))
-            del entries[adapter.WAN_ROUTES[-1]]; manifest.write_text(json.dumps(entries), encoding="utf-8")
-            with self.assertRaises(ValueError): adapter.load_wan_manifest(manifest)
+    @classmethod
+    def setUpClass(cls):
+        cls.adapter = load(ADAPTER, "sc20686_adapter_test")
+        cls.reducer = load(REDUCER, "sc20686_reducer_test")
+        cls.coverage = json.loads(cls.adapter.COVERAGE.read_text(encoding="utf-8"))
+        cls.source_map_hash = cls.adapter.digest(cls.adapter.SOURCE_MAP.read_bytes())
 
-    def test_dispatch_campaign_covers_each_route_and_cancel_cleanup(self):
-        calls = []
-        def runner(variant, arm):
-            calls.append((variant, arm))
-            return [{"phase": "cross-kv-created"}, {"phase": "cancelled" if arm == "cancel" else "generation-end"}, {"phase": "released"}]
-        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
-        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
-        runs = adapter.dispatch_campaign(runner)
-        self.assertEqual(len(runs), 10)
-        self.assertEqual(calls, [(route, arm) for route in adapter.WAN_ROUTES for arm in ("normal", "cancel")])
-        self.assertEqual(sum(any(event["phase"] == "cancelled" for event in events) for _, arm, events in runs if arm == "cancel"), 5)
-
-    def test_caller_authored_jsonl_is_rejected(self):
-        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
-        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "snapshot"; root.mkdir()
-            (root / "config.json").write_text("{}", encoding="utf-8")
-            snapshot_hash, snapshot_bytes = adapter.snapshot_identity(root)
-            geometry = {**GEOMETRY, "resolution": "64x64", "frames": 5}
-            events = [{"phase": "metadata", "source_ref": "a" * 40,
-                       "snapshot_sha256": snapshot_hash, "snapshot_bytes": snapshot_bytes,
-                       "variant": "wan2_2_t2v_14b", "geometry": geometry,
-                       "real_weights": True, "full_generation": True, "attention_kind": "cross"},
-                      {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 1024, "at_ns": 1},
-                      {"phase": "cross-kv-created", "persistent_bytes": 700, "transient_bytes": 0, "sample_kind": "allocator", "peak_bytes": 1024, "at_ns": 2},
-                      {"phase": "cross-kv-read", "persistent_bytes": 700, "transient_bytes": 10, "sample_kind": "allocator", "peak_bytes": 1024, "at_ns": 3},
-                      {"phase": "generation-end", "sample_kind": "allocator", "peak_bytes": 1024, "at_ns": 4},
-                      {"phase": "invalidated", "sample_kind": "allocator", "peak_bytes": 1024, "at_ns": 5},
-                      {"phase": "released", "sample_kind": "allocator", "peak_bytes": 1, "at_ns": 6},
-                      {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 2048, "at_ns": 7},
-                      {"phase": "metrics", "current_persistent_bytes": 1024**3, "current_read_transient_bytes": 10,
-                       "candidate_persistent_bytes": 100, "candidate_read_transient_bytes": 10,
-                       "generation_duration_ms": 100, "cache_read_duration_ms": 5, "reused_requests": 2}]
-            events_path = root.parent / "events.json"
-            events_path.write_text(json.dumps(events), encoding="utf-8")
-            output = root.parent / "decision.json"
-            completed = subprocess.run([sys.executable, str(ADAPTER), "--campaign", "--family", "wan",
-                                        "--variant", "wan2_2_t2v_14b", "--snapshot", str(root),
-                                        "--events", str(events_path), "--output", str(output)],
-                                       check=False, text=True, capture_output=True)
-            self.assertNotEqual(completed.returncode, 0)
-            self.assertFalse(output.exists())
-
-    def test_flux_nonpersistent_route_requires_dense_read_evidence(self):
-        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
-        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
-        geometry = {**GEOMETRY, "sq": 64, "skv": 16}
-        events = [
-            {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
-             "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": geometry,
-             "real_weights": True, "full_generation": True, "attention_kind": "cross"},
-            {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "cross-kv-read", "persistent_bytes": 0, "transient_bytes": 64, "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "generation-end", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "invalidated", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "released", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 100},
-            {"phase": "metrics", "current_persistent_bytes": 0, "current_read_transient_bytes": 64,
-             "candidate_persistent_bytes": 32, "candidate_read_transient_bytes": 0,
-             "generation_duration_ms": 10, "cache_read_duration_ms": 1, "reused_requests": 0},
+    def flux_events(self, *, variant="flux2_klein_9b_edit", cancel=False):
+        geometry = {
+            "resolution": "512x512", "reference_count": 1, "frames": 1,
+            "prompt": "6c8d6812785e96e6241dc0e9b6d7d8d1542c6606fb70e3872156f82130f27238",
+            "guidance": "1", "layers": 24, "heads": 24, "head_dimension": 128,
+            "sq": 4096, "skv": 1024, "dtype": "BF16", "mask": "none", "rope": "4-axis",
+        }
+        metadata = {
+            "phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
+            "snapshot_bytes": 1, "variant": variant, "geometry": geometry,
+            "real_weights": True, "full_generation": not cancel, "attention_kind": "cross",
+            "cancellation_armed": cancel,
+        }
+        if cancel:
+            metadata["cancellation_arm_id"] = "a:flux2_klein_9b_edit"
+        terminal = "cancelled" if cancel else "generation-end"
+        metrics = {
+            "phase": "metrics", "sample_kind": "allocator", "peak_bytes": 10 * 1024**3,
+            "current_persistent_bytes": 0, "current_read_transient_bytes": 700 * 1024**2,
+            "candidate_persistent_bytes": 100 * 1024**2,
+            "candidate_read_transient_bytes": 700 * 1024**2,
+            "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
+            "reused_requests": 2, "minimum_cache_reads": 2,
+        }
+        base = {"sample_kind": "allocator", "peak_bytes": 10 * 1024**3}
+        return [
+            metadata,
+            {"phase": "generation-start", **base},
+            {"phase": "cross-kv-created", "persistent_bytes": 0, **base},
+            {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
+             "reused": 1, **base},
+            {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
+             "reused": 1, **base},
+            {"phase": terminal, **base},
+            metrics,
+            {"phase": "invalidated", **base},
+            {"phase": "released", **base},
+            {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 10 * 1024**3},
         ]
-        args = type("Args", (), {"fake": False, "family": "flux2-klein",
-                                   "variant": "flux2_klein_9b_edit", "cancel_campaign": False})()
-        row = adapter.make_row(args, {}, "b" * 64, 1, events)
-        self.assertEqual(row["current_persistent_bytes"], 0)
-        events[2]["persistent_bytes"] = 1
-        with self.assertRaisesRegex(ValueError, "non-persistent"):
-            adapter.make_row(args, {}, "b" * 64, 1, events)
 
-    def test_cancel_arm_requires_product_metrics_and_cancel_identity(self):
-        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
-        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
-        events = [
-            {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
-             "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": GEOMETRY,
-             "real_weights": True, "full_generation": False, "attention_kind": "cross",
-             "cancellation_armed": True, "cancellation_arm_id": "a:b"},
-            {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "cross-kv-read", "persistent_bytes": 0, "transient_bytes": 64, "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "cancelled", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "invalidated", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "released", "sample_kind": "allocator", "peak_bytes": 100},
-            {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 100},
-            {"phase": "metrics", "current_persistent_bytes": 0, "current_read_transient_bytes": 64,
-             "candidate_persistent_bytes": 32, "candidate_read_transient_bytes": 0,
-             "generation_duration_ms": 2, "cache_read_duration_ms": 1, "reused_requests": 0},
-        ]
-        args = type("Args", (), {"fake": False, "family": "flux2-klein",
-                                   "variant": "flux2_klein_9b_edit", "cancel_campaign": True})()
-        self.assertEqual(adapter.make_row(args, {}, "b" * 64, 1, events)["arm"], "cancel")
-        events[-1].pop("generation_duration_ms")
+    def config(self):
+        return {
+            "route_manifest_sha256": "c" * 64,
+            "source_map_sha256": self.source_map_hash,
+            "input_file_sha256": {"reference-0": "d" * 64},
+            "evidence_artifact_sha256": {"run.stdout": "e" * 64},
+        }
+
+    def row_args(self, cancel=False):
+        return argparse.Namespace(
+            fake=False, family="flux2-klein", variant="flux2_klein_9b_edit",
+            coordinate_name="edit-512-ref1-cfg1", cancel_campaign=cancel,
+        )
+
+    def test_flux_route_identity_is_product_operation_not_config_id(self):
+        row = self.adapter.make_row(
+            self.row_args(), self.config(), "b" * 64, 1, self.flux_events()
+        )
+        self.assertEqual(row["variant"], "flux2_klein_9b_edit")
+        with self.assertRaisesRegex(ValueError, "exact product route"):
+            self.adapter.make_row(
+                self.row_args(), self.config(), "b" * 64, 1,
+                self.flux_events(variant="flux2_klein_9b"),
+            )
+
+    def test_raw_receipt_sidecar_hashes_exact_unsigned_artifact(self):
+        sealed, raw, sidecar = self.adapter.seal({"value": 1}, "row.json")
+        self.reducer.verify_seal_artifact(sealed, raw, sidecar, "row.json")
+        with self.assertRaises(ValueError):
+            self.reducer.verify_seal_artifact(sealed, raw + b" ", sidecar, "row.json")
+
+    def test_streaming_runner_drains_more_than_pipe_capacity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "producer"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,time\n"
+                "for i in range(10000): print(json.dumps({'phase':'noise','payload':'x'*256}))\n"
+                "time.sleep(.2)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            run = self.adapter.run_entrypoint(
+                executable, snapshot, "route", "normal", timeout_seconds=5
+            )
+            self.assertEqual(len(run.events) - len(run.process_samples), 10000)
+            self.assertGreater(len(run.stdout), 64 * 1024)
+            self.assertTrue(run.process_samples)
+
+    def test_streaming_runner_enforces_timeout_and_terminates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "producer"
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport time\nprint('{}', flush=True)\ntime.sleep(5)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                self.adapter.run_entrypoint(
+                    executable, snapshot, "route", "normal", timeout_seconds=0.1
+                )
+
+    def _manifest_fixture(self, root):
+        prompt_by_hash = {
+            "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5":
+                "SC-20686 representative still-motion study",
+            "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713":
+                "SC-20686 representative long-motion study",
+        }
+        image = root / "image.png"
+        image.write_bytes(b"image")
+        reference = root / "reference.png"
+        reference.write_bytes(b"reference")
+        control = root / "control"
+        mask = root / "mask"
+        control.mkdir()
+        mask.mkdir()
+        (control / "0.png").write_bytes(b"control")
+        (mask / "0.png").write_bytes(b"mask")
+        entries = {}
+        for route in self.adapter.WAN_ROUTES:
+            binary = root / self.adapter.WAN_ENTRYPOINT_STEMS[route]
+            binary.write_text("#!/bin/sh\n", encoding="utf-8")
+            binary.chmod(0o755)
+            snapshot = root / route
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            coordinates = {}
+            for name, expected in self.coverage["families"]["wan"][route]["coordinates"].items():
+                width, height = expected["resolution"].split("x")
+                values = [
+                    "--width", width, "--height", height, "--frames", str(expected["frames"]),
+                    "--prompt", prompt_by_hash[expected["prompt"]], "--guidance",
+                    expected["guidance"], "--steps", "4",
+                ]
+                if route == "wan2_2_i2v_14b":
+                    values[0:0] = ["--image", str(image)]
+                if route in ("wan_vace", "wan2_2_vace_fun_14b"):
+                    values[0:0] = [
+                        "--control-dir", str(control), "--mask-dir", str(mask),
+                    ]
+                    if expected["reference_count"]:
+                        values[0:0] = ["--reference", str(reference)]
+                coordinates[name] = values
+            entries[route] = {
+                "provider_id": route, "entrypoint": str(binary),
+                "snapshot": str(snapshot), "coordinates": coordinates,
+            }
+        return entries
+
+    def test_manifest_closes_frozen_coordinates_and_hashes_file_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = self._manifest_fixture(root)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            loaded = self.adapter.load_wan_manifest(manifest)
+            self.assertEqual(set(loaded), set(self.adapter.WAN_ROUTES))
+            i2v = next(iter(loaded["wan2_2_i2v_14b"].values()))
+            self.assertTrue(any(item["flag"] == "--image" for item in i2v.input_file_inventory))
+            vace = loaded["wan_vace"]["landscape-33f-reference"]
+            self.assertEqual(
+                {item["flag"] for item in vace.input_file_inventory},
+                {"--reference", "--control-dir", "--mask-dir"},
+            )
+            self.adapter.verify_coordinate_inputs(i2v)
+            image = next(
+                Path(item["path"])
+                for item in i2v.input_file_inventory if item["flag"] == "--image"
+            )
+            image.write_bytes(b"changed after resolution")
+            with self.assertRaisesRegex(ValueError, "route input changed"):
+                self.adapter.verify_coordinate_inputs(i2v)
+            del entries[self.adapter.WAN_ROUTES[-1]]["coordinates"][
+                next(iter(entries[self.adapter.WAN_ROUTES[-1]]["coordinates"]))
+            ]
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "frozen coverage"):
+                self.adapter.load_wan_manifest(manifest)
+
+    def test_every_file_bearing_route_argument_is_content_hashed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_path = root / "weights.safetensors"
+            file_path.write_bytes(b"weights")
+            folder = root / "frames"
+            folder.mkdir()
+            (folder / "0.png").write_bytes(b"frame")
+            arguments = []
+            for flag in sorted(self.adapter.FILE_ARGUMENT_FLAGS):
+                arguments.extend((flag, str(folder if flag.endswith("-dir") else file_path)))
+            hashes, inventory = self.adapter.hash_file_arguments(arguments)
+            self.assertEqual(len(hashes), len(self.adapter.FILE_ARGUMENT_FLAGS))
+            self.assertEqual(len(inventory), len(self.adapter.FILE_ARGUMENT_FLAGS))
+            before = dict(hashes)
+            file_path.write_bytes(b"changed")
+            after, _ = self.adapter.hash_file_arguments(arguments)
+            self.assertNotEqual(before, after)
+
+    def test_cancel_arm_requires_product_identity_and_metrics(self):
+        row = self.adapter.make_row(
+            self.row_args(cancel=True), self.config(), "b" * 64, 1,
+            self.flux_events(cancel=True),
+        )
+        self.assertEqual(row["arm"], "cancel")
+        broken = self.flux_events(cancel=True)
+        next(event for event in broken if event["phase"] == "metrics").pop(
+            "minimum_cache_reads"
+        )
         with self.assertRaisesRegex(ValueError, "metrics"):
-            adapter.make_row(args, {}, "b" * 64, 1, events)
+            self.adapter.make_row(
+                self.row_args(cancel=True), self.config(), "b" * 64, 1, broken
+            )
 
-    def test_fake_both_families_emit_sealed_rows(self):
-        for family in ("flux2-klein", "wan"):
-            with self.subTest(family=family), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory) / "snapshot"
-                root.mkdir(); (root / "config.json").write_text(
-                    json.dumps({"source_ref": "frozen-test", "sc20686_geometry": GEOMETRY}),
-                    encoding="utf-8")
-                output = Path(directory) / "decision.json"
-                command = [sys.executable, str(ADAPTER), "--campaign", "--fake",
-                           "--family", family, "--variant", "test", "--snapshot", str(root),
-                           "--output", str(output)]
-                completed = subprocess.run(command, check=False, text=True,
-                                           encoding="utf-8", capture_output=True)
-                self.assertNotEqual(completed.returncode, 0)
-                self.assertFalse(output.exists())
+    def test_wan_reuse_is_per_cache_and_every_cache_is_released(self):
+        expected = self.coverage["families"]["wan"]["wan2_2_ti2v_5b"][
+            "coordinates"
+        ]["square-17f"]
+        geometry = {
+            **expected, "layers": 2, "heads": 2, "head_dimension": 64,
+            "sq": 1024, "skv": 128, "dtype": "BF16", "mask": "none",
+            "rope": "none",
+        }
+        base = {"sample_kind": "allocator", "peak_bytes": 10 * 1024**3}
+        events = [
+            {"phase": "metadata", "source_ref": "a" * 40,
+             "snapshot_sha256": "b" * 64, "snapshot_bytes": 1,
+             "variant": "wan2_2_ti2v_5b", "geometry": geometry,
+             "real_weights": True, "full_generation": True,
+             "attention_kind": "cross"},
+            {"phase": "generation-start", **base},
+            {"phase": "cross-kv-created", "cache_id": 1,
+             "persistent_bytes": 400 * 1024**2,
+             "candidate_persistent_bytes": 100 * 1024**2, **base},
+            {"phase": "cross-kv-created", "cache_id": 2,
+             "persistent_bytes": 400 * 1024**2,
+             "candidate_persistent_bytes": 100 * 1024**2, **base},
+            {"phase": "cross-kv-read", "cache_id": 1,
+             "transient_bytes": 64 * 1024**2, "reused": 1,
+             "allocator_before_bytes": 1024, "allocator_after_bytes": 1024 + 64 * 1024**2,
+             **base},
+            {"phase": "cross-kv-read", "cache_id": 2,
+             "transient_bytes": 64 * 1024**2, "reused": 1,
+             "allocator_before_bytes": 2048, "allocator_after_bytes": 2048 + 64 * 1024**2,
+             **base},
+            {"phase": "cross-kv-read", "cache_id": 1,
+             "transient_bytes": 64 * 1024**2, "reused": 1,
+             "allocator_before_bytes": 3072, "allocator_after_bytes": 3072 + 64 * 1024**2,
+             **base},
+            {"phase": "cross-kv-read", "cache_id": 2,
+             "transient_bytes": 64 * 1024**2, "reused": 1,
+             "allocator_before_bytes": 4096, "allocator_after_bytes": 4096 + 64 * 1024**2,
+             **base},
+            {"phase": "cross-kv-released", "cache_id": 1,
+             "persistent_bytes": 400 * 1024**2,
+             "candidate_persistent_bytes": 100 * 1024**2, **base},
+            {"phase": "cross-kv-released", "cache_id": 2,
+             "persistent_bytes": 400 * 1024**2,
+             "candidate_persistent_bytes": 100 * 1024**2, **base},
+            {"phase": "generation-end", **base},
+            {"phase": "metrics", "current_persistent_bytes": 800 * 1024**2,
+             "current_read_transient_bytes": 64 * 1024**2,
+             "candidate_persistent_bytes": 200 * 1024**2,
+             "candidate_read_transient_bytes": 64 * 1024**2,
+             "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
+             "reused_requests": 4, "minimum_cache_reads": 2, **base},
+            {"phase": "invalidated", **base},
+            {"phase": "released", **base},
+            {"phase": "process-sample", "sample_kind": "process",
+             "peak_bytes": 10 * 1024**3},
+        ]
+        args = argparse.Namespace(
+            fake=False, family="wan", variant="wan2_2_ti2v_5b",
+            coordinate_name="square-17f", cancel_campaign=False,
+        )
+        row = self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
+        self.assertEqual(row["minimum_cache_reads"], 2)
+        metrics = next(event for event in events if event["phase"] == "metrics")
+        metrics["candidate_persistent_bytes"] -= 1
+        with self.assertRaisesRegex(ValueError, "exact simultaneous residency"):
+            self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
+        metrics["candidate_persistent_bytes"] += 1
+        first_read = next(event for event in events if event["phase"] == "cross-kv-read")
+        first_read["allocator_after_bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "allocator before/after"):
+            self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
+        first_read["allocator_after_bytes"] -= 1
+        next(event for event in events if event["phase"] == "metrics")[
+            "minimum_cache_reads"
+        ] = 4
+        with self.assertRaisesRegex(ValueError, "per-cache minimum"):
+            self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
+        next(event for event in events if event["phase"] == "metrics")[
+            "minimum_cache_reads"
+        ] = 2
+        events = [
+            event for event in events
+            if not (event.get("phase") == "cross-kv-released" and event.get("cache_id") == 2)
+        ]
+        with self.assertRaisesRegex(ValueError, "release every exact cache"):
+            self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
 
-    def test_normal_invocation_and_missing_hook_refuse(self):
+    def test_atomic_publication_removes_staging_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory); (root / "config.json").write_text("{}", encoding="utf-8")
-            base = [sys.executable, str(ADAPTER), "--family", "wan", "--variant", "x",
-                    "--snapshot", str(root), "--output", str(root / "o.json")]
-            self.assertNotEqual(subprocess.run(base, check=False).returncode, 0)
-            command = base + ["--campaign"]
-            self.assertNotEqual(subprocess.run(command, check=False).returncode, 0)
+            destination = Path(directory) / "campaign"
+            coordinates = [object(), object()]
+            calls = 0
+
+            def runner(_coordinate, _arm):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ValueError("boom")
+                return self.adapter.CampaignRun([], b"", b"", ("producer",), ({},))
+
+            with self.assertRaisesRegex(ValueError, "boom"):
+                self.adapter.publish_campaign(
+                    coordinates, runner, lambda *_: {}, destination
+                )
+            self.assertFalse(destination.exists())
+            self.assertFalse(any(Path(directory).glob(".campaign.staging-*")))
+
+    def test_complete_bundle_is_reproducible_and_tampering_fails(self):
+        coordinates = []
+        for family, variants in self.coverage["families"].items():
+            for variant, variant_spec in variants.items():
+                for name in variant_spec["coordinates"]:
+                    coordinates.append(argparse.Namespace(
+                        family=family, variant=variant, name=name,
+                    ))
+
+        def runner(coordinate, arm):
+            metadata = {
+                "phase": "metadata", "sample_kind": "allocator",
+                "peak_bytes": 10 * 1024**3,
+            }
+            process = {
+                "phase": "process-sample", "sample_kind": "process",
+                "peak_bytes": 10 * 1024**3, "at_ns": 1,
+            }
+            argv = [
+                "product-entrypoint", "--sc20686-campaign", "--sc20686-events", "-",
+                "--snapshot", "/snapshot", "--variant", coordinate.variant,
+            ]
+            if arm == "cancel":
+                argv.append("--sc20686-cancel")
+            return self.adapter.CampaignRun(
+                [metadata, process], self.adapter.canonical(metadata), b"",
+                tuple(argv), (process,),
+            )
+
+        def row_builder(coordinate, arm, events, evidence_hashes):
+            expected = self.coverage["families"][coordinate.family][coordinate.variant][
+                "coordinates"
+            ][coordinate.name]
+            geometry = {
+                **expected, "layers": 2, "heads": 2, "head_dimension": 64,
+                "sq": 1024, "skv": 128, "dtype": "BF16", "mask": "none",
+                "rope": "none",
+            }
+            return {
+                "producer": self.adapter.PRODUCER, "family": coordinate.family,
+                "variant": coordinate.variant, "coordinate_name": coordinate.name,
+                "coordinate_id": self.adapter.digest(self.adapter.canonical(geometry))[:16],
+                "arm": arm, "source_ref": "a" * 40,
+                "route_manifest_sha256": "b" * 64,
+                "source_map_sha256": self.source_map_hash,
+                "model_snapshot_sha256": "c" * 64, "model_snapshot_bytes": 1,
+                "input_file_sha256": {},
+                "evidence_artifact_sha256": evidence_hashes,
+                "geometry": geometry,
+                "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
+                "allocator_samples": [{"phase": "metadata", "peak_bytes": 10 * 1024**3}],
+                "process_samples": [{"phase": "process-sample", "peak_bytes": 10 * 1024**3}],
+                "observer_events": events,
+                "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
+                "real_weights": True, "full_generation": arm == "normal",
+                "attention_kind": "cross", "current_persistent_bytes": 1,
+                "current_read_transient_bytes": 1, "candidate_persistent_bytes": 0,
+                "candidate_read_transient_bytes": 1, "generation_duration_ms": 1000,
+                "cache_read_duration_ms": 10, "reused_requests": 2,
+                "minimum_cache_reads": 2,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "campaign"
+            self.adapter.publish_campaign(
+                coordinates, runner, row_builder, destination
+            )
+            result = self.reducer.verify_campaign_bundle(destination)
+            self.assertEqual(set(result["decisions"]), {"flux2-klein", "wan"})
+            markdown = (destination / "campaign.md").read_text(encoding="utf-8")
+            self.assertIn("## Sealed source map", markdown)
+            self.assertIn("- Group size: `64`", markdown)
+            self.assertIn("- Pending key tail: dense f32", markdown)
+            self.assertIn("packed-group-affine", json.dumps(result["source_map"]))
+            transcript = destination / "run-00-normal.stdout"
+            transcript.write_bytes(transcript.read_bytes() + b"tamper")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                self.reducer.verify_campaign_bundle(destination)
 
 
 if __name__ == "__main__":

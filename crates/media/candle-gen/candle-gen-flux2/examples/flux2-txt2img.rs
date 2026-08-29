@@ -42,11 +42,6 @@ fn arg(args: &[String], key: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let _campaign_scope = if args.iter().any(|arg| arg == "--sc20686-campaign") {
-        Some(candle_gen_flux2::sc20686_observer::install_jsonl(
-            arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
-        )?)
-    } else { None };
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("FLUX2_SNAPSHOT").ok())
         .ok_or(

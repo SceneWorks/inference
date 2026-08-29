@@ -205,6 +205,15 @@ impl WanVaceTransformer {
     /// Prepare the K/V heads which are invariant for one projected conditioning payload. This cache
     /// belongs to the caller's request scope and covers both VACE control and main Wan block stacks.
     fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedVaceCrossKv> {
+        let (_, s_kv, _) = context.dims3()?;
+        crate::sc20686_observer::bind_cross_kv_geometry(
+            (self.vace_blocks.len() + self.blocks.len()) as u32,
+            0,
+            0,
+            0,
+            s_kv as u64,
+            format!("{:?}", context.dtype()),
+        );
         Ok(PreparedVaceCrossKv {
             vace_blocks: self
                 .vace_blocks
@@ -575,6 +584,7 @@ pub fn denoise_vace(
         "wan-vace token length assumes a square spatial patch (ph == pw)"
     );
     let l = (f / pt) * (hl / ph) * (wl / ph); // width uses `ph` too (square patch)
+    crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, l as u64, 0, "");
     let control_emb = transformer.embed_control(control, l)?;
     let pos_kv = transformer.prepare_cross_kv(ctx_pos)?;
     let neg_kv = ctx_neg
@@ -585,6 +595,7 @@ pub fn denoise_vace(
     let mut sched = FlowScheduler::new(sampler, steps, shift);
     for i in 0..steps {
         if cancel.is_cancelled() {
+            crate::sc20686_observer::observe_cancelled();
             return Err(CandleError::Canceled);
         }
         let t = sched.timestep(i);
@@ -612,6 +623,10 @@ pub fn denoise_vace(
             }
             None => cond,
         };
+        if cancel.is_cancelled() {
+            crate::sc20686_observer::observe_cancelled();
+            return Err(CandleError::Canceled);
+        }
         latents = sched.step(&v, &latents)?;
         on_step(i + 1);
     }
@@ -649,6 +664,7 @@ pub fn denoise_vace_range(
     let (_b, _c, f, hl, wl) = latents.dims5()?;
     let (pt, ph, pw) = transformer.cfg.base.patch;
     let l = (f / pt) * (hl / ph) * (wl / pw);
+    crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, l as u64, 0, "");
     let control_emb = transformer.embed_control(control, l)?;
     let pos_kv = transformer.prepare_cross_kv(ctx_pos)?;
     let neg_kv = ctx_neg
@@ -656,6 +672,7 @@ pub fn denoise_vace_range(
         .transpose()?;
     for i in range {
         if cancel.is_cancelled() {
+            crate::sc20686_observer::observe_cancelled();
             return Err(CandleError::Canceled);
         }
         let timestep = timesteps[i];
@@ -683,6 +700,10 @@ pub fn denoise_vace_range(
             }
             None => cond,
         };
+        if cancel.is_cancelled() {
+            crate::sc20686_observer::observe_cancelled();
+            return Err(CandleError::Canceled);
+        }
         *latents = scheduler.step(&velocity, latents)?;
         on_step(i + 1);
     }
