@@ -189,7 +189,7 @@ impl RetainedKernelHandle for KreaPackedMetalKernel {
 }
 
 // MLX synthesizes the argument list from `MetalKernel::with_options`.  Each threadgroup owns a
-// 32-row query tile; packed history is decoded from Krea's actual uint32/bf16 D-axis rows.  The
+// 8-row query tile; packed history is decoded from Krea's actual uint32/bf16 D-axis rows.  The
 // simdgroup fragments are register/tile-local, while max/sum/value are streamed over keys: no
 // dense historical K/V buffer and no `Sq × Sk` score allocation are representable by this source.
 const KREA_PACKED_ONLINE_SOFTMAX_HEADER: &str = r#"
