@@ -52,6 +52,7 @@ pub mod primitives;
 pub mod provider;
 pub mod residency;
 pub mod snapshot;
+pub mod starvector_1b;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
 // integration suites pull in as `mod common;` — included by path rather than copied, so the two
@@ -77,6 +78,7 @@ pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use residency::{EncoderResidency, StreamObservation};
 pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
+pub use starvector_1b::StarVector1bProvider;
 
 /// Add every MLX LLM provider to an explicit registry builder.
 pub fn register_text_providers(
@@ -85,6 +87,7 @@ pub fn register_text_providers(
     registry
         .register(provider::REGISTRATION)
         .register(joycaption::REGISTRATION)
+        .register(starvector_1b::REGISTRATION)
 }
 
 /// Build the complete, explicit MLX LLM provider catalog.
@@ -139,7 +142,10 @@ mod explicit_registry_tests {
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(explicit, ["mlx-llama", "mlx-joycaption"]);
+        assert_eq!(
+            explicit,
+            ["mlx-llama", "mlx-joycaption", "mlx-starvector-1b"]
+        );
 
         let preparers = super::snapshot_preparer_registry().unwrap();
         assert_eq!(

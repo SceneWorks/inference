@@ -271,6 +271,35 @@ impl<'a> StarVectorBoundedStream<'a> {
         }
     }
 
+    /// Seed a fixed decoder prompt into the source without charging a generated token.
+    ///
+    /// Some checkpoints prefill a literal root opener (StarVector-1B uses `<svg`) before the
+    /// first sampled continuation. The prompt is still part of the published UTF-8 byte budget,
+    /// but is not a sampled token and therefore must not consume `max_new_tokens`. Only an
+    /// incomplete, root-valid prefix is accepted; a provider cannot use this to publish a complete
+    /// document or to smuggle active markup before the root.
+    pub fn push_static_prefix(&mut self, fragment: &str) -> Result<StarVectorStreamStatus> {
+        if self.finish_reason.is_some() || self.generated_tokens != 0 || !self.source.is_empty() {
+            return Err(Error::InvalidRequest(
+                "StarVector static source prefix must be the first stream input".into(),
+            ));
+        }
+        if self.request.text_request.cancel.is_cancelled() {
+            return Ok(self.stop(StarVectorFinishReason::Cancelled));
+        }
+        let next_bytes = fragment.len();
+        if next_bytes > self.request.max_svg_bytes {
+            return Ok(self.stop(StarVectorFinishReason::ByteLimit));
+        }
+        self.source.push_str(fragment);
+        match scan_svg_root(&self.source)? {
+            SvgRootState::Incomplete => Ok(StarVectorStreamStatus::Continue),
+            SvgRootState::Complete => Err(Error::InvalidRequest(
+                "StarVector static source prefix may not complete an SVG root".into(),
+            )),
+        }
+    }
+
     /// Accept one decoded token's valid UTF-8 source fragment.
     pub fn push(&mut self, fragment: &str, elapsed: Duration) -> Result<StarVectorStreamStatus> {
         if self.finish_reason.is_some() {
@@ -559,6 +588,32 @@ mod tests {
             Some("<svg data-name=\"café\"><path d=\"M0 0\"/></svg>")
         );
         assert_eq!(out.generated_bytes, out.svg.as_ref().unwrap().len());
+    }
+
+    #[test]
+    fn static_root_prefix_counts_bytes_but_not_generated_tokens() {
+        let req = request(1, 32, TEST_LIMIT);
+        let mut stream = StarVectorBoundedStream::new(&req);
+        assert_eq!(
+            stream.push_static_prefix("<svg").unwrap(),
+            StarVectorStreamStatus::Continue
+        );
+        assert_eq!(
+            push(&mut stream, "></svg>", STEP).unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot)
+        );
+        let output = stream.output().unwrap();
+        assert_eq!(output.svg.as_deref(), Some("<svg></svg>"));
+        assert_eq!(output.generated_tokens, 1);
+        assert_eq!(output.generated_bytes, "<svg></svg>".len());
+
+        let too_small = request(1, 3, TEST_LIMIT);
+        let mut limited = StarVectorBoundedStream::new(&too_small);
+        assert_eq!(
+            limited.push_static_prefix("<svg").unwrap(),
+            StarVectorStreamStatus::Stop(StarVectorFinishReason::ByteLimit)
+        );
+        assert_eq!(limited.output().unwrap().svg, None);
     }
 
     #[test]
