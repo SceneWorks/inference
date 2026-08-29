@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
 from pathlib import Path
 
 
@@ -31,28 +30,48 @@ def get(data: dict, path: str):
     return value
 
 
-def git_path_exists(revision: str, path: str) -> bool:
-    return (
-        subprocess.run(
-            ["git", "cat-file", "-e", f"{revision}:{path}"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        ).returncode
-        == 0
-    )
+def source_mapping_errors(data: dict, source_root: Path = ROOT) -> list[str]:
+    """Bind mappings to the checked-out source, not an archival product pin.
 
-
-def git_source_contains(revision: str, path: str, needle: str) -> bool:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0 and needle in result.stdout
+    ``productInferenceRevision`` is immutable provenance for the SceneWorks
+    product pin. GitHub PR checkouts deliberately fetch only the current head,
+    so requiring that historical object would make this source audit depend on
+    unrelated checkout depth instead of the files the gate is validating.
+    """
+    errors: list[str] = []
+    for mapping in data.get("localSourceMappings", []):
+        path = mapping.get("path")
+        symbol = mapping.get("symbol")
+        source_needle = mapping.get("sourceNeedle")
+        if not isinstance(path, str) or not path:
+            errors.append("local source mapping has no path")
+            continue
+        relative_path = Path(path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            errors.append(f"local source mapping is not a repository path: {path}")
+            continue
+        source = source_root / relative_path
+        if not source.is_file():
+            errors.append(f"local source mapping is absent in checked-out source: {path}")
+            continue
+        if not isinstance(symbol, str) or not symbol:
+            errors.append(f"local source mapping has no symbol: {path}")
+        if not isinstance(source_needle, str) or not source_needle:
+            errors.append(f"local source mapping has no source needle: {path}")
+            continue
+        try:
+            source_text = source.read_text(encoding="utf-8")
+        except OSError:
+            errors.append(f"local source mapping cannot be read in checked-out source: {path}")
+            continue
+        except UnicodeDecodeError:
+            errors.append(f"local source mapping is not UTF-8 source: {path}")
+            continue
+        if source_needle not in source_text:
+            errors.append(
+                f"local source mapping is missing {source_needle!r} in checked-out source: {path}"
+            )
+    return errors
 
 
 def main() -> int:
@@ -82,21 +101,14 @@ def main() -> int:
         except (KeyError, TypeError):
             pass
 
-    revision = data.get("localProvenance", {}).get("productInferenceRevision", "")
-    for mapping in data.get("localSourceMappings", []):
-        path = mapping.get("path")
-        symbol = mapping.get("symbol")
-        source_needle = mapping.get("sourceNeedle")
-        if not isinstance(path, str) or not path:
-            errors.append("local source mapping has no path")
-        elif not git_path_exists(revision, path):
-            errors.append(f"local source mapping is absent at {revision}: {path}")
-        if not isinstance(symbol, str) or not symbol:
-            errors.append(f"local source mapping has no symbol: {path}")
-        if not isinstance(source_needle, str) or not source_needle:
-            errors.append(f"local source mapping has no source needle: {path}")
-        elif isinstance(path, str) and git_path_exists(revision, path) and not git_source_contains(revision, path, source_needle):
-            errors.append(f"local source mapping is missing {source_needle!r} at {revision}: {path}")
+    try:
+        validation_mode = get(data, "localProvenance.sourceMappingValidation.mode")
+    except (KeyError, TypeError):
+        errors.append("manifest is missing localProvenance.sourceMappingValidation.mode")
+    else:
+        if validation_mode != "checked-out-current-source":
+            errors.append("source mappings must validate checked-out current source")
+    errors.extend(source_mapping_errors(data))
 
     for mapping in data.get("upstreamMechanisms", []):
         if not all(isinstance(mapping.get(key), str) and mapping[key] for key in ("path", "symbol", "classification", "finding")):

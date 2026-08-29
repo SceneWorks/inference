@@ -26,6 +26,12 @@ inference revision. The manifest records the pmetal/mlx-rs pin and the exact
 macOS, Xcode, Rust, and hardware observation. These host facts identify a
 future receipt environment; they are not performance evidence.
 
+`productInferenceRevision` remains immutable provenance for that product pin;
+it is not a required local Git object. The audit checker binds its local source
+mappings to the checked-out inference files under validation and fails on a
+missing path or source needle. That keeps fetch-depth-1 PR checks meaningful
+without misrepresenting the historical pin as the current checkout.
+
 The v0.53.0-to-v0.65.0 material change is fused TurboQuant RVQ
 quantize-and-pack: it removes temporary index buffers on the *write* path. It
 also adds RocketKV/pool/profiling infrastructure. It does not turn the live

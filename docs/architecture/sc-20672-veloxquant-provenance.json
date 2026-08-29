@@ -27,6 +27,10 @@
   "localProvenance": {
     "inferenceAuditHead": "f32fce06804e21eec86d488c8ba320eaf4cbfe11",
     "productInferenceRevision": "3775a5f80a07a38071c7859f6ac565bcab5d1c7b",
+    "sourceMappingValidation": {
+      "mode": "checked-out-current-source",
+      "productInferenceRevisionRole": "immutable provenance only"
+    },
     "sceneWorksRevision": "367044f3553bbb89af4a6690aac3db5d0f40263b",
     "pmetalMlxRsRevision": "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1",
     "pmetalMlxVersion": "0.25 / MLX core 0.32.0",
