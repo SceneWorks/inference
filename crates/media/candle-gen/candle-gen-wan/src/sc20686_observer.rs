@@ -329,6 +329,18 @@ pub fn install_jsonl_with_context(
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = RefCell::new(None); }
 thread_local! { static STARTED: RefCell<Option<Instant>> = RefCell::new(None); }
+
+/// Read the backend's continuous high-water mark. A campaign receipt is never allowed to use the
+/// attributed byte sum as a substitute for a process/device measurement.
+#[cfg(feature = "cuda")]
+fn backend_peak_bytes() -> Option<u64> {
+    candle_gen::cuda_mempool::MemPool::device_default(0)?.reserved_high()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn backend_peak_bytes() -> Option<u64> {
+    None
+}
 pub struct Scope {
     started: Instant,
 }
@@ -354,6 +366,11 @@ fn install_with_context_inner(
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
+            let context = CONTEXT.with(|ctx| ctx.borrow().clone());
+            let measured_peak = backend_peak_bytes();
+            if context.is_some() && measured_peak.is_none() && !cfg!(test) {
+                return;
+            }
             let event = CacheEvent {
                 phase,
                 attention: "cross",
@@ -366,7 +383,8 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                         .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
                 }),
                 reused,
-                peak_bytes: persistent_bytes.saturating_add(transient_bytes),
+                peak_bytes: measured_peak
+                    .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
                 at_ns: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -376,7 +394,7 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 dtype: String::new(),
                 mask: String::new(),
                 rope: String::new(),
-                context: CONTEXT.with(|ctx| ctx.borrow().clone()),
+                context,
             };
             observer.record(event.clone());
             if phase == "generation-end" {
@@ -406,6 +424,11 @@ pub fn observe_tensor(
     let rope = rope.into();
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
+            let context = CONTEXT.with(|ctx| ctx.borrow().clone());
+            let measured_peak = backend_peak_bytes();
+            if context.is_some() && measured_peak.is_none() && !cfg!(test) {
+                return;
+            }
             observer.record(CacheEvent {
                 phase,
                 attention: "cross",
@@ -418,7 +441,8 @@ pub fn observe_tensor(
                         .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
                 }),
                 reused,
-                peak_bytes: persistent_bytes.saturating_add(transient_bytes),
+                peak_bytes: measured_peak
+                    .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
                 at_ns: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -428,7 +452,7 @@ pub fn observe_tensor(
                 dtype,
                 mask,
                 rope,
-                context: CONTEXT.with(|ctx| ctx.borrow().clone()),
+                context,
             });
         }
     });
