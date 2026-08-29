@@ -26,120 +26,81 @@ the same upstream all-BF16 Gemma text-encoder file through `bf16TextEncoderSubpa
 inspects every safetensors tensor dtype before CUDA loading and refuses a directory, mixed dtype, or
 Comfy/I8 encoder. Packed and BF16 comparison rows must not declare this field.
 
-## Campaign manifest and workflow
+## Autonomous campaign materialization and workflow
 
-Each row names two storage boundaries:
+The terminal workflow has no operator-provisioned manifest or snapshot prerequisite. Set the
+repository variable `CANDLE_LTX25_HF_CACHE_ROOT` to one absolute persistent cache root on the
+Windows pool. The workflow then accepts only the exact public `SceneWorks/ltx-2.5-mlx` 40-hex
+revision and one physical GPU ordinal.
 
-- `snapshotRoot` is an exact `<repo>/snapshots/<40-hex-revision>` directory. Its complete logical
-  file inventory, including followed HF blob targets, is hashed before and after generation.
-- `bundleSubdir` is a traversal-free relative directory containing exactly one selected split
-  bundle. The controller discovers there, then pins every resolved component explicitly while
-  retaining the full snapshot as the inventory boundary.
+`scripts/release/prepare_ltx25_quant_campaign.py` runs under the repository's pinned uv, reviewed
+CPython 3.12.10, and hash-locked Windows `huggingface_hub` dependency set. It requests the
+repository with `token=False`, disables implicit tokens, rejects anything except
+`private=false,gated=false`, and performs a full `snapshot_download` into this canonical layout:
 
-The v1 manifest must contain all nine cases exactly once. The shape below shows the required fields;
-repeat it for the complete matrix listed above.
-
-```json
-{
-  "schemaVersion": "sceneworks-ltx25-quant-campaign-v1",
-  "cases": [
-    {
-      "caseId": "ltx25-bf16-blackwell-v1",
-      "transformerVariant": "distilled",
-      "snapshotRoot": "D:\\hf\\source-bf16\\snapshots\\<40hex>",
-      "modelRevision": "<40hex>",
-      "bundleSubdir": "bundles/distilled/bf16"
-    },
-    {
-      "caseId": "ltx25-int8-convrot-blackwell-v1",
-      "transformerVariant": "distilled",
-      "snapshotRoot": "D:\\hf\\upstream\\snapshots\\<40hex>",
-      "modelRevision": "<40hex>",
-      "bundleSubdir": "bundles/distilled/int8-convrot",
-      "bf16TextEncoderSubpath": "shared/gemma4-bf16.safetensors"
-    },
-    {
-      "caseId": "ltx25-int8-convrot-blackwell-dev-v1",
-      "transformerVariant": "dev",
-      "snapshotRoot": "D:\\hf\\upstream\\snapshots\\<40hex>",
-      "modelRevision": "<40hex>",
-      "bundleSubdir": "bundles/dev/int8-convrot",
-      "bf16TextEncoderSubpath": "shared/gemma4-bf16.safetensors"
-    }
-  ]
-}
+```text
+<CANDLE_LTX25_HF_CACHE_ROOT>\models--SceneWorks--ltx-2.5-mlx\snapshots\<public40hex>
 ```
 
-Dispatch `.github/workflows/ltx25-quant-campaign.yml` at the exact committed inference revision
-with the absolute manifest path, a new absolute evidence root, and one numeric physical GPU
-ordinal. The workflow checks exact `sm_120`, builds once, runs both BF16 references before all
-seven candidates in one serial process, and copies the exact executable to
-`<evidenceRoot>/controller/ltx25-quant-measure.exe`. The campaign, promotion, and
-`real-weights.yml` share the repository-wide `inference-real-weights-physical-host` concurrency
-group; do not bypass that lock.
+The full repository is required (about 464 GiB logical at the SC-18777 publication), because
+promotion compares its local inventory with every sibling in the raw public API readback. A
+partial `allow_patterns` download cannot pass that check.
+
+The helper generates all nine v1 rows from a fixed table. BF16/packed rows use the public
+`distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` bundles. Advanced rows use the three
+`bundles/**` directories and bind the all-BF16 Gemma file by its snapshot-relative path inside the
+same selected bundle. Every row retains the complete public snapshot as its inventory boundary.
+
+Dispatch `.github/workflows/ltx25-quant-campaign.yml` at the exact committed inference ref with
+only `public_revision` and one numeric `physical_gpu`. The workflow checks exact `sm_120`, builds
+once, runs both BF16 references before all seven candidates in one serial process, and preserves:
+
+```text
+controller/ltx25-quant-measure.exe
+controller/campaign-manifest.json
+controller/campaign-public-readback.json
+```
+
+The artifact name includes the inference SHA, GPU ordinal, and run attempt. The campaign,
+promotion, and `real-weights.yml` share the repository-wide
+`inference-real-weights-physical-host` concurrency group; do not bypass that lock.
 
 ## Reviewed public promotion and real replay
 
-Upload only to the canonical public repository `SceneWorks/ltx-2.5-mlx`. Resolve its immutable
-revision into the canonical Hugging Face cache path:
-
-```text
-D:\hf\hub\models--SceneWorks--ltx-2.5-mlx\snapshots\<public40hex>
-```
-
-Capture the raw public API response after upload, including expanded blob metadata, and retain it
-as an absolute runner-local file. For example:
-
-```powershell
-$revision = "<public40hex>"
-Invoke-WebRequest -UseBasicParsing `
-  -Uri "https://huggingface.co/api/models/SceneWorks/ltx-2.5-mlx/revision/$revision?blobs=true" `
-  -OutFile "D:\campaign\ltx25-public-readback.json"
-```
-
-The validator requires `id=SceneWorks/ltx-2.5-mlx`, the exact revision, `private=false`, the exact
-full sibling set and sizes, and matching LFS SHA-256 values where supplied. A private repository,
-wrong cache layout, partial download, local mutation, or stale readback fails before replay.
+Upload only to the canonical public repository `SceneWorks/ltx-2.5-mlx`. The promotion workflow
+re-materializes that same exact revision anonymously into the persistent canonical cache and
+captures the raw `?blobs=true` API response itself. The validator requires the canonical ID, exact
+revision, `private=false`, `gated=false`, the complete sibling set and sizes, and matching LFS
+SHA-256 values where supplied. A private/gated repository, wrong cache layout, partial download,
+local mutation, or stale readback fails before replay.
 
 A reviewer chooses only the passing production winner(s). Selection is explicit, may contain one
-winner per transformer variant, and is not forced to promote all three advanced candidates. Record
-the reviewer and concrete quality policy in the v2 promotion input:
+winner per transformer variant, and is not forced to promote all three advanced candidates. Supply
+this compact reviewed selection JSON; the workflow constructs the path-bearing v2 document only
+after it knows the runner's canonical snapshot and raw-readback paths:
 
 ```json
 {
-  "schemaVersion": "sceneworks-ltx25-quant-promotion-v2",
-  "publicRepository": "SceneWorks/ltx-2.5-mlx",
-  "selection": {
-    "policyId": "sc-18777-reviewed-selection-v1",
-    "reviewedBy": "<reviewer identity>",
-    "selectedCaseIds": ["ltx25-int8-convrot-blackwell-v1"],
-    "minimumReferencePsnr": 20.0,
-    "minimumReferenceSsim": 0.8,
-    "maximumTemporalBoundaryDrift": 0.1,
-    "minimumReplayPsnr": 100.0,
-    "minimumReplaySsim": 0.99,
-    "maximumReplayTemporalBoundaryDrift": 0.001,
-    "requireReplayOutputHashMatch": true
-  },
-  "cases": [
-    {
-      "caseId": "ltx25-int8-convrot-blackwell-v1",
-      "transformerVariant": "distilled",
-      "publicSnapshotRoot": "D:\\hf\\hub\\models--SceneWorks--ltx-2.5-mlx\\snapshots\\<public40hex>",
-      "publicModelRevision": "<public40hex>",
-      "publicBundleSubdir": "bundles/distilled/int8-convrot",
-      "bf16TextEncoderSubpath": "shared/gemma4-bf16.safetensors",
-      "publicReadback": "D:\\campaign\\ltx25-public-readback.json"
-    }
-  ]
+  "policyId": "sc-18777-reviewed-selection-v1",
+  "reviewedBy": "<reviewer identity>",
+  "selectedCaseIds": ["ltx25-int8-convrot-blackwell-v1"],
+  "minimumReferencePsnr": 20.0,
+  "minimumReferenceSsim": 0.8,
+  "maximumTemporalBoundaryDrift": 0.1,
+  "minimumReplayPsnr": 100.0,
+  "minimumReplaySsim": 0.99,
+  "maximumReplayTemporalBoundaryDrift": 0.001,
+  "requireReplayOutputHashMatch": true
 }
 ```
 
-Dispatch `.github/workflows/ltx25-quant-promotion.yml` with the original exact 40-hex inference
-revision, campaign manifest, evidence root, reviewed promotion input, a new output directory, and
-the same physical GPU ordinal. It checks out the exact revision but does not rebuild: it runs the
-preserved campaign executable and performs a real generation from every selected public winner on
-the exact consumer `sm_120` device.
+Dispatch `.github/workflows/ltx25-quant-promotion.yml` with the original inference revision,
+successful campaign run ID and attempt, public model revision, compact reviewed selection JSON,
+and the same physical GPU ordinal (six inputs total). The workflow verifies through the GitHub API
+that the named run is a successful `ltx25-quant-campaign.yml` dispatch at the exact inference SHA,
+then downloads the exact attempt-named artifact with the pinned `actions/download-artifact` action.
+It checks out the exact revision but does not rebuild: it runs the preserved campaign executable
+and performs a real generation from every selected public winner on exact consumer `sm_120`.
 
 Promotion re-inventories the complete public snapshot before and after generation; revalidates the
 unchanged source receipt, code, executable, GPU/driver, selected components, external variant,

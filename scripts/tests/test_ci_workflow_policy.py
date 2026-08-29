@@ -1568,6 +1568,57 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
 
+    def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
+        campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
+        promotion = LTX25_QUANT_PROMOTION_WORKFLOW.read_text(encoding="utf-8")
+        campaign_inputs = yaml.safe_load(campaign)[True]["workflow_dispatch"]["inputs"]
+        promotion_inputs = yaml.safe_load(promotion)[True]["workflow_dispatch"]["inputs"]
+
+        self.assertEqual(set(campaign_inputs), {"public_revision", "physical_gpu"})
+        self.assertEqual(
+            set(promotion_inputs),
+            {
+                "inference_revision",
+                "campaign_run_id",
+                "campaign_run_attempt",
+                "public_revision",
+                "reviewed_selection_json",
+                "physical_gpu",
+            },
+        )
+        self.assertLessEqual(len(promotion_inputs), 10)
+        for workflow in (campaign, promotion):
+            self.assertIn(WINDOWS_SETUP_ACTION, workflow)
+            self.assertIn(WINDOWS_UV_VERSION, workflow)
+            self.assertIn(WINDOWS_UV_CACHE, workflow)
+            self.assertIn(WINDOWS_UV_INSTALL, workflow)
+            self.assertIn(WINDOWS_UV_FIND, workflow)
+            self.assertIn(WINDOWS_PYTHON_EXPORT, workflow)
+            self.assertIn(WINDOWS_HUB_LOCK, workflow)
+            self.assertIn("HF_HUB_DISABLE_IMPLICIT_TOKEN", workflow)
+            self.assertIn("vars.CANDLE_LTX25_HF_CACHE_ROOT", workflow)
+
+        self.assertNotIn("inputs.campaign_manifest", campaign)
+        self.assertNotIn("inputs.evidence_root", campaign)
+        self.assertIn("prepare_ltx25_quant_campaign.py campaign", campaign)
+        self.assertIn('"campaign-manifest.json"', campaign)
+        self.assertIn('"campaign-public-readback.json"', campaign)
+        self.assertIn("attempt${{ github.run_attempt }}", campaign)
+
+        for retired in ("inputs.campaign_manifest", "inputs.evidence_root", "inputs.promotion_input", "inputs.output_dir"):
+            self.assertNotIn(retired, promotion)
+        self.assertIn("actions: read", promotion)
+        self.assertIn(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+            promotion,
+        )
+        self.assertIn("run-id: ${{ inputs.campaign_run_id }}", promotion)
+        self.assertIn("github-token: ${{ github.token }}", promotion)
+        self.assertIn('$run.path -cne ".github/workflows/ltx25-quant-campaign.yml"', promotion)
+        self.assertIn("$run.head_sha -cne $env:INFERENCE_REVISION", promotion)
+        self.assertIn("$run.conclusion -cne \"success\"", promotion)
+        self.assertIn("prepare_ltx25_quant_campaign.py promotion", promotion)
+
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])

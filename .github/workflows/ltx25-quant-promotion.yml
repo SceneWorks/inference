@@ -7,20 +7,21 @@ on:
         description: Exact 40-hex inference revision used by the terminal campaign
         type: string
         required: true
-      campaign_manifest:
-        description: Absolute runner-local path to the original immutable campaign manifest
+      campaign_run_id:
+        description: Successful LTX-2.5 quant campaign Actions run ID
         type: string
         required: true
-      evidence_root:
-        description: Absolute runner-local path to the complete campaign evidence
+      campaign_run_attempt:
+        description: Successful campaign run attempt containing the exact evidence artifact
         type: string
         required: true
-      promotion_input:
-        description: Absolute runner-local path to the reviewed public promotion input
+        default: "1"
+      public_revision:
+        description: Exact public SceneWorks/ltx-2.5-mlx revision measured by the campaign
         type: string
         required: true
-      output_dir:
-        description: New absolute runner-local promotion evidence directory
+      reviewed_selection_json:
+        description: Compact JSON selection with reviewer, selected case IDs, and all quality thresholds
         type: string
         required: true
       physical_gpu:
@@ -30,6 +31,7 @@ on:
         default: "0"
 
 permissions:
+  actions: read
   contents: read
 
 # This is the same repository-wide physical-host lock as real-weights.yml and the producer
@@ -46,37 +48,106 @@ jobs:
     env:
       CUDA_COMPUTE_CAP: "120"
       INFERENCE_REVISION: ${{ inputs.inference_revision }}
-      CAMPAIGN_MANIFEST: ${{ inputs.campaign_manifest }}
-      EVIDENCE_ROOT: ${{ inputs.evidence_root }}
-      PROMOTION_INPUT: ${{ inputs.promotion_input }}
-      OUTPUT_DIR: ${{ inputs.output_dir }}
+      CAMPAIGN_RUN_ID: ${{ inputs.campaign_run_id }}
+      CAMPAIGN_RUN_ATTEMPT: ${{ inputs.campaign_run_attempt }}
+      PUBLIC_REVISION: ${{ inputs.public_revision }}
+      REVIEWED_SELECTION_JSON: ${{ inputs.reviewed_selection_json }}
       PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+      LTX25_HF_CACHE_ROOT: ${{ vars.CANDLE_LTX25_HF_CACHE_ROOT }}
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+      CAMPAIGN_ARTIFACT: ltx25-quant-campaign-${{ inputs.inference_revision }}-gpu${{ inputs.physical_gpu }}-attempt${{ inputs.campaign_run_attempt }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
           ref: ${{ inputs.inference_revision }}
-      - name: Validate immutable source and one consumer Blackwell device
+      - name: Validate immutable campaign run and one consumer Blackwell device
         shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ($env:INFERENCE_REVISION -notmatch '^[0-9a-f]{40}$') {
             throw "inference_revision must be one exact lowercase 40-hex commit"
+          }
+          if ($env:PUBLIC_REVISION -notmatch '^[0-9a-f]{40}$') {
+            throw "public_revision must be one exact lowercase 40-hex revision"
+          }
+          if ($env:CAMPAIGN_RUN_ID -notmatch '^\d+$' -or $env:CAMPAIGN_RUN_ATTEMPT -notmatch '^\d+$') {
+            throw "campaign_run_id and campaign_run_attempt must be numeric"
+          }
+          if ($env:PHYSICAL_GPU -notmatch '^\d+$') {
+            throw "physical_gpu must be one numeric physical ordinal"
+          }
+          if (-not $env:LTX25_HF_CACHE_ROOT -or
+              -not [System.IO.Path]::IsPathRooted($env:LTX25_HF_CACHE_ROOT)) {
+            throw "repository variable CANDLE_LTX25_HF_CACHE_ROOT must be an absolute persistent Windows cache root"
           }
           $head = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $head -cne $env:INFERENCE_REVISION) {
             throw "checked out revision '$head' does not equal '$env:INFERENCE_REVISION'"
           }
-          if ($env:PHYSICAL_GPU -notmatch '^\d+$') {
-            throw "physical_gpu must be one numeric physical ordinal"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
           }
-          foreach ($path in @($env:CAMPAIGN_MANIFEST, $env:EVIDENCE_ROOT, $env:PROMOTION_INPUT, $env:OUTPUT_DIR)) {
-            if (-not [System.IO.Path]::IsPathRooted($path)) {
-              throw "all promotion paths must be absolute runner-local paths; got '$path'"
-            }
+          $run = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CAMPAIGN_RUN_ID"
+          if ($run.repository.full_name -cne $env:GITHUB_REPOSITORY -or
+              $run.path -cne ".github/workflows/ltx25-quant-campaign.yml" -or
+              $run.event -cne "workflow_dispatch" -or
+              $run.conclusion -cne "success" -or
+              $run.head_sha -cne $env:INFERENCE_REVISION -or
+              [string]$run.run_attempt -cne $env:CAMPAIGN_RUN_ATTEMPT) {
+            throw "campaign run is not a successful exact-revision LTX-2.5 campaign attempt"
           }
           $capability = (nvidia-smi -i $env:PHYSICAL_GPU --query-gpu=compute_cap --format=csv,noheader,nounits).Trim()
           if ($LASTEXITCODE -ne 0 -or $capability -ne '12.0') {
             throw "LTX-2.5 public replay requires exact consumer Blackwell sm_120; got '$capability'"
+          }
+          $suffix = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $evidence = Join-Path $env:RUNNER_TEMP "ltx25-campaign-evidence-$suffix"
+          $manifest = Join-Path $evidence "controller\campaign-manifest.json"
+          $readback = Join-Path $env:RUNNER_TEMP "ltx25-public-readback-$suffix.json"
+          $promotion = Join-Path $env:RUNNER_TEMP "ltx25-promotion-input-$suffix.json"
+          $output = Join-Path $env:RUNNER_TEMP "ltx25-promotion-evidence-$suffix"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "EVIDENCE_ROOT=$evidence"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CAMPAIGN_MANIFEST=$manifest"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PUBLIC_READBACK=$readback"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PROMOTION_INPUT=$promotion"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "OUTPUT_DIR=$output"
+      - name: Download exact successful campaign evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ env.CAMPAIGN_ARTIFACT }}
+          path: ${{ runner.temp }}\ltx25-campaign-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.campaign_run_id }}
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Re-materialize full public snapshot and reviewed promotion input
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/prepare_ltx25_quant_campaign.py promotion --revision "%PUBLIC_REVISION%" --cache-root "%LTX25_HF_CACHE_ROOT%" --campaign-manifest "%CAMPAIGN_MANIFEST%" --selection-env REVIEWED_SELECTION_JSON --promotion-out "%PROMOTION_INPUT%" --readback-out "%PUBLIC_READBACK%" || exit /b 1
+      - name: Validate preserved terminal producer
+        shell: powershell
+        run: |
+          foreach ($path in @($env:CAMPAIGN_MANIFEST, $env:EVIDENCE_ROOT, $env:PROMOTION_INPUT, $env:OUTPUT_DIR)) {
+            if (-not [System.IO.Path]::IsPathRooted($path)) {
+              throw "all promotion paths must be absolute runner-local paths; got '$path'"
+            }
           }
           $producer = Join-Path $env:EVIDENCE_ROOT "controller\ltx25-quant-measure.exe"
           if (-not (Test-Path -LiteralPath $producer -PathType Leaf)) {
@@ -100,5 +171,5 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ltx25-quant-promotion-${{ inputs.inference_revision }}-gpu${{ inputs.physical_gpu }}
-          path: ${{ inputs.output_dir }}
+          path: ${{ runner.temp }}\ltx25-promotion-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
