@@ -23,6 +23,8 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "cancellation-cleanup",
     "post-run-release",
 ];
+pub const QUALITY_CONTRACT_HASH: &str =
+    "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 
@@ -418,6 +420,7 @@ impl ReceiptBuilder {
         {
             return Err("memory attribution totals must be nonzero".into());
         }
+        validate_receipt_semantics(&self.template)?;
         Ok(self.template)
     }
 }
@@ -430,6 +433,72 @@ impl Receipt {
         bytes.push(b'\n');
         Ok(bytes)
     }
+}
+
+pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
+    if receipt.schema_version != 3
+        || receipt.harness_version != "sc-20671-kv-baseline-v3"
+        || receipt.status != "complete"
+        || receipt.contract_hash != QUALITY_CONTRACT_HASH
+    {
+        return Err("receipt constants mismatch".into());
+    }
+    if receipt.run_id.is_empty()
+        || !receipt.captured_at.contains('T')
+        || !receipt.captured_at.ends_with('Z')
+    {
+        return Err("receipt timestamp/run id is malformed".into());
+    }
+    let pids: Vec<u32> = receipt.memory.phase_samples.iter().map(|p| p.pid).collect();
+    if pids.len() != 8 || pids.iter().any(|p| *p == 0 || *p != pids[0]) {
+        return Err("phase PID evidence is inconsistent".into());
+    }
+    if receipt.memory.phase_samples.windows(2).any(|w| {
+        w[0].timestamp >= w[1].timestamp
+            || w[1].phys_footprint_peak_bytes < w[0].phys_footprint_peak_bytes
+            || w[1].mlx.peak_bytes < w[0].mlx.peak_bytes
+    }) {
+        return Err("phase sequence or peak monotonicity failed".into());
+    }
+    if receipt.memory.phase_samples.iter().any(|p| {
+        p.phys_footprint_bytes < p.mlx.active_bytes || p.mlx.peak_bytes < p.mlx.active_bytes
+    }) {
+        return Err("memory containment failed".into());
+    }
+    let dense = dense_kv_bytes(
+        receipt.geometry.batch,
+        receipt.geometry.layers,
+        receipt.geometry.kv_heads,
+        receipt.geometry.capacity,
+        receipt.geometry.head_dimension,
+        receipt.geometry.element_bytes,
+    )?;
+    if receipt.memory.dense_theoretical_kv_bytes != dense
+        || receipt.memory.reconciliation.expected_dense_kv_bytes != dense
+        || receipt.memory.reconciliation.observed_persistent_kv_bytes
+            != receipt.memory.persistent_kv_bytes
+    {
+        return Err("dense KV reconciliation failed".into());
+    }
+    if receipt.timings.samples.len() != 5
+        || receipt
+            .timings
+            .summary
+            .decode_tokens_per_second_coefficient_of_variation
+            > 0.05
+    {
+        return Err("timing policy failed".into());
+    }
+    if receipt.quality.fixture_evidence.len() != 4
+        || receipt.quality.statistics.repeats != 5
+        || receipt.quality.statistics.warmups != 2
+    {
+        return Err("quality contract evidence incomplete".into());
+    }
+    if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
+        return Err("release/cancellation evidence failed".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
