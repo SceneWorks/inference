@@ -1,4 +1,5 @@
 //! Optional SC-20686 campaign observer. `None` is the production default.
+use candle_gen::gen_core::runtime::CancelFlag;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -256,6 +257,7 @@ fn source_revision(root: &Path) -> io::Result<String> {
 
 pub(crate) fn activate_requested(
     root: &Path,
+    cancel: &CancelFlag,
     variant: &str,
     batch: u32,
     frames: u32,
@@ -316,6 +318,7 @@ pub(crate) fn activate_requested(
     // Metadata is emitted exactly once, after bind_cross_kv_geometry has populated the
     // product-owned attention geometry. Never publish the zero-valued activation placeholder.
     CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = cancellation);
+    CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = Some(cancel.clone()));
     Ok(Some(scope))
 }
 
@@ -482,6 +485,7 @@ thread_local! { static START_EVENT_EMITTED: RefCell<bool> = const { RefCell::new
 thread_local! { static PENDING_START: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static LIVE_READ_SEEN: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static CAMPAIGN_CANCEL: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static CAMPAIGN_HANDLE: RefCell<Option<CancelFlag>> = const { RefCell::new(None) }; }
 thread_local! { static CURRENT_PERSISTENT: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static CURRENT_READ_TRANSIENT: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static REUSED_REQUESTS: RefCell<u64> = const { RefCell::new(0) }; }
@@ -526,6 +530,7 @@ fn install_with_context_inner(
     PENDING_START.with(|slot| *slot.borrow_mut() = false);
     LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
     CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
+    CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = None);
     CURRENT_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
     CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow_mut() = 0);
     REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = 0);
@@ -667,6 +672,11 @@ pub fn observe_timed(
         && !CANCEL_TRIGGERED.with(|slot| *slot.borrow())
     {
         CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = true);
+        CAMPAIGN_HANDLE.with(|slot| {
+            if let Some(cancel) = slot.borrow().as_ref() {
+                cancel.cancel();
+            }
+        });
         observe_cancelled();
     }
     if phase == "metadata" && PENDING_START.with(|slot| *slot.borrow()) {
@@ -829,6 +839,7 @@ impl Drop for Scope {
         PENDING_START.with(|slot| *slot.borrow_mut() = false);
         LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
         CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
+        CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = None);
         CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
         TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = false);
         GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
@@ -861,7 +872,7 @@ mod tests {
     fn context_and_tensor_metadata_are_opt_in_and_bound_to_events() {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let context = CampaignContext::from_runtime(
-            "snapshot".into(),
+            "b".repeat(40),
             "a".repeat(64),
             4096,
             "t2v".into(),
@@ -915,6 +926,17 @@ mod tests {
             latent_frames: 2,
             latent_height: 8,
             latent_width: 8,
+            prompt_sha256: "c".repeat(64),
+            guidance: "1".into(),
+            reference_count: 0,
+            layers: 1,
+            heads: 1,
+            head_dimension: 1,
+            sq: 1,
+            skv: 1,
+            dtype: "BF16".into(),
+            mask: "none".into(),
+            rope: "none".into(),
         };
         assert!(CampaignContext::from_runtime(
             "snapshot".into(),
@@ -936,7 +958,7 @@ mod tests {
 
     #[test]
     fn compressed_projection_is_checked_and_block_aligned() {
-        assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(64));
+        assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(512));
         assert_eq!(checked_compressed_bytes(0, 4, 64), None);
         assert_eq!(checked_compressed_bytes(u64::MAX, 32, 64), None);
     }
@@ -1022,9 +1044,23 @@ mod tests {
         std::fs::write(snapshot.join("config.json"), b"{\"layers\":1}").unwrap();
         let output = root.path().join("events.jsonl");
         let _request = request_output(&output).arm();
-        let scope = activate_requested(&snapshot, "wan2_2_t2v_14b", 1, 5, 64, 64, 2, 8, 8)
-            .unwrap()
-            .expect("armed output request activates at runtime");
+        let scope = activate_requested(
+            &snapshot,
+            &CancelFlag::default(),
+            "wan2_2_t2v_14b",
+            1,
+            5,
+            64,
+            64,
+            2,
+            8,
+            8,
+            "prompt",
+            Some(1.0),
+            0,
+        )
+        .unwrap()
+        .expect("armed output request activates at runtime");
         bind_cross_kv_geometry(1, 8, 64, 1, 2, "bf16");
         observe("loaded", 1, 0, 0);
         drop(scope);

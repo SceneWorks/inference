@@ -181,8 +181,8 @@ impl Pipeline {
         crate::sc20686_observer::observe_tensor(
             "prefill-peak",
             "control-mask-prepared",
-            (control_video.elem_count() as u64).saturating_mul(VAE_DTYPE.size() as u64),
-            (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size() as u64),
+            (control_video.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
+            (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
             0,
             format!("{:?};{:?}", control_video.dims(), mask.dims()),
             format!("{:?}", control_video.dtype()),
@@ -449,8 +449,16 @@ impl Generator for WanVaceGenerator {
             .ok_or_else(|| gen_core::Error::Msg("missing control clip".into()))?;
         let (latent_frames, latent_height, latent_width) =
             crate::wan14b::latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.root,
+            &req.cancel,
             MODEL_ID_VACE,
             1,
             frames,

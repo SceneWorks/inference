@@ -8,12 +8,26 @@ import importlib.util
 
 ADAPTER = Path(__file__).parents[1] / "sc20686_campaign_adapter.py"
 GEOMETRY = {"resolution": "512x512", "reference_count": 1, "frames": 1,
-            "prompt": "fake", "guidance": 1.0, "layers": 1, "heads": 2,
+            "prompt": "f" * 64, "guidance": "1.0", "layers": 1, "heads": 2,
             "head_dimension": 64, "sq": 1, "skv": 1024, "dtype": "bf16",
             "mask": "causal", "rope": "native"}
 
 
 class CampaignAdapterTests(unittest.TestCase):
+    def test_wan_manifest_requires_exact_routes_and_real_files(self):
+        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
+        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); binary = root / "wan"; binary.write_text("#!/bin/sh\n", encoding="utf-8"); binary.chmod(0o755)
+            entries = {}
+            for route in adapter.WAN_ROUTES:
+                snapshot = root / route; snapshot.mkdir(); (snapshot / "config.json").write_text("{}", encoding="utf-8")
+                entries[route] = {"entrypoint": str(binary), "snapshot": str(snapshot), "args": []}
+            manifest = root / "manifest.json"; manifest.write_text(json.dumps(entries), encoding="utf-8")
+            self.assertEqual(set(adapter.load_wan_manifest(manifest)), set(adapter.WAN_ROUTES))
+            del entries[adapter.WAN_ROUTES[-1]]; manifest.write_text(json.dumps(entries), encoding="utf-8")
+            with self.assertRaises(ValueError): adapter.load_wan_manifest(manifest)
+
     def test_dispatch_campaign_covers_each_route_and_cancel_cleanup(self):
         calls = []
         def runner(variant, arm):
@@ -26,7 +40,7 @@ class CampaignAdapterTests(unittest.TestCase):
         self.assertEqual(calls, [(route, arm) for route in adapter.WAN_ROUTES for arm in ("normal", "cancel")])
         self.assertEqual(sum(any(event["phase"] == "cancelled" for event in events) for _, arm, events in runs if arm == "cancel"), 5)
 
-    def test_weightless_jsonl_producer_contract_is_reduced(self):
+    def test_caller_authored_jsonl_is_rejected(self):
         spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
         adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
         with tempfile.TemporaryDirectory() as directory:
@@ -55,11 +69,8 @@ class CampaignAdapterTests(unittest.TestCase):
                                         "--variant", "wan2_2_t2v_14b", "--snapshot", str(root),
                                         "--events", str(events_path), "--output", str(output)],
                                        check=False, text=True, capture_output=True)
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertTrue(output.exists())
-            decision = json.loads(output.read_text())["decisions"]["wan"]
-            self.assertEqual(decision["decision"], "blocked")
-            self.assertIn("wan2_2_t2v_14b", decision["observed_variants"])
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(output.exists())
 
     def test_flux_nonpersistent_route_requires_dense_read_evidence(self):
         spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
@@ -68,7 +79,7 @@ class CampaignAdapterTests(unittest.TestCase):
         events = [
             {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
              "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": geometry,
-             "real_weights": True, "full_generation": True, "attention_kind": "joint-image-reference"},
+             "real_weights": True, "full_generation": True, "attention_kind": "cross"},
             {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
             {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},
             {"phase": "cross-kv-read", "persistent_bytes": 0, "transient_bytes": 64, "sample_kind": "allocator", "peak_bytes": 100},
@@ -94,7 +105,7 @@ class CampaignAdapterTests(unittest.TestCase):
         events = [
             {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
              "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": GEOMETRY,
-             "real_weights": True, "full_generation": True, "attention_kind": "joint-image-reference",
+             "real_weights": True, "full_generation": False, "attention_kind": "cross",
              "cancellation_armed": True, "cancellation_arm_id": "a:b"},
             {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
             {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},

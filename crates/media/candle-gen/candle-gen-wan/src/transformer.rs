@@ -187,7 +187,8 @@ impl PreparedWanCrossKv {
         for block in &self.blocks {
             for tensor in [&block.key, &block.value] {
                 bytes = bytes.saturating_add(
-                    (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size() as u64),
+                    (tensor.elem_count() as u64)
+                        .saturating_mul(tensor.dtype().size_in_bytes() as u64),
                 );
                 shapes.push(format!("{:?}", tensor.dims()));
                 dtypes.push(format!("{:?}", tensor.dtype()));
@@ -268,7 +269,7 @@ impl Attention {
         let measured = std::time::Instant::now();
         let (b, s_kv, _) = context.dims3()?;
         crate::sc20686_observer::bind_cross_kv_geometry(
-            self.blocks.len() as u32,
+            0,
             self.num_heads as u32,
             self.head_dim as u32,
             0,
@@ -664,6 +665,15 @@ impl WanTransformer {
     /// payload. The returned cache is intentionally request-scoped: callers create it after the DiT
     /// loads and retain it only for the matching denoise branch.
     pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedWanCrossKv> {
+        let (_, s_kv, _) = context.dims3()?;
+        crate::sc20686_observer::bind_cross_kv_geometry(
+            self.blocks.len() as u32,
+            0,
+            0,
+            0,
+            s_kv as u64,
+            format!("{:?}", context.dtype()),
+        );
         Ok(PreparedWanCrossKv {
             blocks: self
                 .blocks

@@ -1134,6 +1134,7 @@ impl Generator for WanGenerator {
                 pipeline::latent_dims(frames, req.width, req.height);
             let _campaign = crate::sc20686_observer::activate_requested(
                 &self.root,
+                &req.cancel,
                 MODEL_ID,
                 1,
                 frames,

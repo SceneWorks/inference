@@ -1160,6 +1160,7 @@ impl Generator for Wan14bGenerator {
             latent_dims(frames, req.width, req.height);
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.root,
+            &req.cancel,
             self.variant.id(),
             1,
             frames,

@@ -267,8 +267,9 @@ impl Pipeline {
         crate::sc20686_observer::observe_tensor(
             "prefill-peak",
             "vace-control-prepared",
-            (control.elem_count() as u64).saturating_mul(control.dtype().size() as u64),
-            (mask_latents.elem_count() as u64).saturating_mul(mask_latents.dtype().size() as u64),
+            (control.elem_count() as u64).saturating_mul(control.dtype().size_in_bytes() as u64),
+            (mask_latents.elem_count() as u64)
+                .saturating_mul(mask_latents.dtype().size_in_bytes() as u64),
             0,
             format!("{:?};{:?}", control.dims(), mask_latents.dims()),
             format!("{:?}", control.dtype()),
@@ -555,6 +556,7 @@ impl Generator for WanVaceFunGenerator {
             crate::wan14b::latent_dims(frames, req.width, req.height);
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.root,
+            &req.cancel,
             MODEL_ID_VACE_FUN,
             1,
             frames,
