@@ -51,18 +51,31 @@ pub struct CampaignContext {
 
 pub struct CampaignOutputRequest {
     path: PathBuf,
+    cancellation: bool,
 }
 
 pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
-    CampaignOutputRequest { path: path.into() }
+    CampaignOutputRequest {
+        path: path.into(),
+        cancellation: false,
+    }
 }
 
 thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = RefCell::new(None); }
+thread_local! { static PENDING_CANCELLATION: RefCell<bool> = RefCell::new(false); }
 
 impl CampaignOutputRequest {
     pub fn arm(self) -> Self {
         PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = Some(self.path.clone()));
+        PENDING_CANCELLATION.with(|slot| *slot.borrow_mut() = self.cancellation);
         self
+    }
+
+    /// Arms the deliberate cancellation campaign. This is opt-in and remains inert for ordinary
+    /// generation requests.
+    pub fn arm_cancellation(mut self) -> Self {
+        self.cancellation = true;
+        self.arm()
     }
 }
 
@@ -71,6 +84,7 @@ impl Drop for CampaignOutputRequest {
         PENDING_OUTPUT.with(|slot| {
             if slot.borrow().as_ref() == Some(&self.path) {
                 *slot.borrow_mut() = None;
+                PENDING_CANCELLATION.with(|cancel| *cancel.borrow_mut() = false);
             }
         });
     }
@@ -173,6 +187,7 @@ pub(crate) fn activate_requested(
     latent_width: u32,
 ) -> io::Result<Option<Scope>> {
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
+    let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
     let Some(path) = path else { return Ok(None) };
     let (digest, bytes) = snapshot_identity(root)?;
     let context = CampaignContext::from_runtime(
@@ -197,7 +212,7 @@ pub(crate) fn activate_requested(
         File::create(path)?
     };
     let scope = install_with_context(Box::new(JsonlObserver(file)), context);
-    observe("metadata", bytes, 0, 0);
+    observe("metadata", bytes, 0, u64::from(cancellation));
     observe("campaign-context-bound", 0, 0, 0);
     Ok(Some(scope))
 }
@@ -267,6 +282,11 @@ impl CacheObserver for JsonlObserver {
                 value["real_weights"] = serde_json::json!(true);
                 value["full_generation"] = serde_json::json!(true);
                 value["attention_kind"] = serde_json::json!("cross");
+                value["cancellation_armed"] = serde_json::json!(event.reused == 1);
+                if event.reused == 1 {
+                    value["cancellation_arm_id"] =
+                        serde_json::json!(format!("{}:{}", ctx.source_ref, ctx.variant));
+                }
             } else if event.phase == "metrics" {
                 value["current_persistent_bytes"] = serde_json::json!(event.persistent_bytes);
                 value["current_read_transient_bytes"] = serde_json::json!(event.transient_bytes);

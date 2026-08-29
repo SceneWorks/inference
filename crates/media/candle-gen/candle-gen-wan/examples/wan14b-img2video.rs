@@ -41,6 +41,18 @@ fn main() -> Result<()> {
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("WAN14B_I2V_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set WAN14B_I2V_SNAPSHOT)")?;
+    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+        let request = candle_gen_wan::sc20686_observer::request_output(
+            arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
+        );
+        Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let image_path = arg(&args, "--image").ok_or("pass --image <path-to-first-frame.png>")?;
     let prompt = arg(&args, "--prompt")
         .unwrap_or_else(|| "the camera slowly pushes in, cinematic, highly detailed".into());

@@ -78,6 +78,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("observer lifecycle/phase hooks are incomplete")
     cancelled = [i for i, e in enumerate(events) if e.get("phase") == "cancelled"]
     released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
+    if args.cancel_campaign and (metadata.get("cancellation_armed") is not True or not metadata.get("cancellation_arm_id")):
+        raise ValueError("deliberate cancellation requires producer cancellation-arm identity")
     if not released or (args.cancel_campaign and (not cancelled or max(cancelled) > min(released))):
         raise ValueError("deliberate cancellation cleanup must precede release")
     if not args.cancel_campaign and cancelled:

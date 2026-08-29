@@ -143,6 +143,18 @@ fn main() -> Result<()> {
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("VACE_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set VACE_SNAPSHOT)")?;
+    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+        let request = candle_gen_wan::sc20686_observer::request_output(
+            arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
+        );
+        Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a person walking through a sunlit garden, cinematic, highly detailed".into()
     });
