@@ -4,14 +4,14 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
@@ -371,6 +371,70 @@ impl PreparedFilePins {
     }
 }
 
+/// Everything [`ArtifactSeal::ensure_unchanged`] compares, captured before the content read.
+///
+/// Deliberately the WHOLE of the seal's own "unchanged" predicate — lexical path, every parent
+/// component's fingerprint, the no-follow entry, the resolution, and the resolved target — not a
+/// subset. Two pins agreeing on all of it are, by the seal's own definition, pins of the same
+/// unmutated object, which is what makes reusing a digest between them sound rather than merely
+/// convenient.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SealIdentity {
+    loader_path: PathBuf,
+    canonical_target_path: PathBuf,
+    path_component_fingerprints: Vec<PathComponentFingerprint>,
+    entry_fingerprint: FileStatFingerprint,
+    target_fingerprint: FileStatFingerprint,
+}
+
+/// Digests already proven for an exact [`SealIdentity`], reused for the life of the process.
+///
+/// [`ArtifactSeal`]'s own doc promises fingerprints "suitable for cache/provenance identity without
+/// hashing a multi-gigabyte checkpoint on each request". [`ArtifactSeal::pin`] hashed on every
+/// acquisition anyway, and nothing upstream pins once: a single image job acquires the same text
+/// encoder from at least two independent pre-load queries — `ProviderRegistry::footprint` and
+/// `ProviderRegistry::memory_strategy_contract` — before the loader runs at all.
+///
+/// Measured on an Apple Silicon host, one krea_2_turbo job with an 8.3 GB bf16 encoder: a 55-second
+/// stack sample spent 74% of the window under one of those queries, 97% of that subtree inside the
+/// SHA-256 compressor and 3% in `read`, while a parallel I/O trace showed the source disk idle for
+/// all 58 seconds. It was re-proving a page-cached file the previous query had just proven.
+///
+/// This does not weaken the seal. Every pin still captures and verifies the full fingerprint set
+/// before consulting the map, and a hit requires all of it to be identical — so a mutation the seal
+/// could detect is a mutation that misses the memo and re-hashes. On Unix the entry and target
+/// fingerprints carry `ctime`, which a content write always moves and which userspace cannot
+/// backdate the way it can `mtime`.
+static PROVEN_DIGESTS: OnceLock<Mutex<HashMap<SealIdentity, [u8; 32]>>> = OnceLock::new();
+
+/// Bound on retained digests. Keyed per file identity, so the live set is the number of distinct
+/// weight files a process touches — small for one model, and growing only across a long-lived worker
+/// that loads many. Clearing wholesale at the bound costs a re-hash on the next acquisition of an
+/// evicted file, which is exactly the pre-memo behaviour; an LRU would buy nothing at this size.
+const PROVEN_DIGEST_CAPACITY: usize = 1024;
+
+fn proven_digests() -> &'static Mutex<HashMap<SealIdentity, [u8; 32]>> {
+    PROVEN_DIGESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn proven_digest(identity: &SealIdentity) -> Option<[u8; 32]> {
+    proven_digests()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(identity)
+        .copied()
+}
+
+fn remember_proven_digest(identity: SealIdentity, sha256: [u8; 32]) {
+    let mut digests = proven_digests()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if digests.len() >= PROVEN_DIGEST_CAPACITY {
+        digests.clear();
+    }
+    digests.insert(identity, sha256);
+}
+
 impl ArtifactSeal {
     pub fn pin(path: impl AsRef<Path>) -> crate::Result<Self> {
         let loader_path = std::path::absolute(path.as_ref())?;
@@ -397,12 +461,26 @@ impl ArtifactSeal {
         // Prove the entry, parent chain, resolution, and target still agree after the multi-stat
         // capture. This closes persistent changes during pin construction itself.
         pinned.ensure_unchanged()?;
+        // Only AFTER that proof is the identity worth trusting as a memo key: the lookup below is
+        // allowed to stand in for the content read precisely because everything it compares has just
+        // been re-verified against the filesystem.
+        let identity = SealIdentity {
+            loader_path: pinned.loader_path.clone(),
+            canonical_target_path: pinned.canonical_target_path.clone(),
+            path_component_fingerprints: pinned.path_component_fingerprints.clone(),
+            entry_fingerprint: pinned.entry_fingerprint.clone(),
+            target_fingerprint: pinned.target_fingerprint.clone(),
+        };
+        if let Some(sha256) = proven_digest(&identity) {
+            return Ok(Self { sha256, ..pinned });
+        }
         #[cfg(test)]
         {
             pinned.hash_work.0.fetch_add(1, Ordering::Relaxed);
             record_full_hash_work();
         }
         let sha256 = pinned.read_unchanged(hash_file_sha256)?;
+        remember_proven_digest(identity, sha256);
         Ok(Self { sha256, ..pinned })
     }
 
@@ -2207,6 +2285,69 @@ mod tests {
         assert!(contradictory_refused
             .validate_load_shape_declaration()
             .is_err());
+    }
+
+    /// Re-pinning an unmutated file reuses the proven digest instead of re-reading it.
+    ///
+    /// Nothing upstream pins once: a single image job acquires the same text encoder from at least
+    /// two independent pre-load queries before the loader runs. On an 8.3 GB bf16 encoder that
+    /// second read was ~20 s of SHA-256 against an idle disk — re-proving a page-cached file the
+    /// previous query had just proven.
+    ///
+    /// Stated as a hash-work count rather than a duration: the fixture here is a few bytes, so only
+    /// the count can express the claim.
+    #[test]
+    fn a_second_pin_of_an_unchanged_file_reuses_the_proven_digest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("encoder.safetensors");
+        std::fs::write(&file, b"encoder weights").expect("write fixture");
+
+        let before = test_full_hash_work_count();
+        let first = ArtifactSeal::pin(&file).expect("pin regular file");
+        let after_first = test_full_hash_work_count();
+        assert_eq!(
+            after_first - before,
+            1,
+            "the first pin of a file has nothing to reuse and must read it"
+        );
+
+        let second = ArtifactSeal::pin(&file).expect("re-pin the same unchanged file");
+        assert_eq!(
+            test_full_hash_work_count(),
+            after_first,
+            "a file whose whole fingerprint set is unchanged must not be re-read"
+        );
+        assert_eq!(
+            first.content_sha256(),
+            second.content_sha256(),
+            "the reused digest must be the one the first pin proved"
+        );
+    }
+
+    /// The memo is keyed on the seal's own unchanged-predicate, so a mutation cannot hit it.
+    ///
+    /// Same length, different bytes: only the fingerprints can tell these apart, which is exactly
+    /// the property that makes reuse safe. A rewrite always moves `ctime`, so this is a contract
+    /// rather than a timestamp-resolution race.
+    #[test]
+    fn a_mutated_file_misses_the_memo_and_is_read_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("encoder.safetensors");
+        std::fs::write(&file, b"encoder weights").expect("write fixture");
+        let first = ArtifactSeal::pin(&file).expect("pin regular file");
+
+        std::fs::write(&file, b"ENCODER WEIGHTS").expect("mutate fixture");
+        let before = test_full_hash_work_count();
+        let second = ArtifactSeal::pin(&file).expect("re-pin the mutated file");
+        assert!(
+            test_full_hash_work_count() > before,
+            "changed bytes must send the pin back through the full read"
+        );
+        assert_ne!(
+            first.content_sha256(),
+            second.content_sha256(),
+            "the re-read must report the digest of the bytes that are there now"
+        );
     }
 
     #[test]
