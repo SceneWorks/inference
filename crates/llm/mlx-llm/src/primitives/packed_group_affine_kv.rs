@@ -2,12 +2,16 @@
 //!
 //! This module deliberately has no MLX dependency in its implementation.  It is the deterministic
 //! storage/lifecycle seam that a later Metal reader can adopt: codes are four 2-bit values per byte,
-//! while each group has an f32 scale and zero.  A dense reader is an explicit, instrumented fallback;
+//! while each group has an f16 scale and zero.  A dense reader is an explicit, instrumented fallback;
 //! this type never retains a dense mirror.
 
+use std::any::Any;
 use std::convert::TryInto;
+use std::fmt;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::primitives::kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
 use half::f16;
 
 const MAGIC: &[u8; 8] = b"SW20675\0";
@@ -45,12 +49,299 @@ pub struct DenseFallbackEvent {
     pub allocated_bytes: usize,
 }
 
+/// A retained backend object which owns the compiled reader for one cache identity.
+///
+/// SC-20675 intentionally does not manufacture a Metal object from descriptive strings.  The
+/// later SC-20776 compiler supplies its real retained pipeline/argument state through this small
+/// object-safe boundary, so a cache cannot outlive (or be rebound to) another cache's reader.
+pub trait RetainedPackedKernel: fmt::Debug + Send + Sync {
+    fn cache_identity(&self) -> &str;
+    fn backend(&self) -> &str;
+    /// Heap/device bytes retained exclusively by this compiled object, if the backend can report
+    /// them.  The storage accounting includes this value and never calls it payload bytes.
+    fn retained_bytes(&self) -> usize;
+}
+
+/// Lifetime-owned, type-erased compiled-kernel slot.  `Arc` keeps the real backend object alive
+/// across cache clones/snapshots without relying on mutable device/queue/context labels.
+#[derive(Clone)]
+pub struct CompiledKernelHandle {
+    inner: Arc<dyn RetainedPackedKernel>,
+}
+
+impl CompiledKernelHandle {
+    pub fn new(inner: Arc<dyn RetainedPackedKernel>) -> Self {
+        Self { inner }
+    }
+
+    pub fn cache_identity(&self) -> &str {
+        self.inner.cache_identity()
+    }
+
+    pub fn backend(&self) -> &str {
+        self.inner.backend()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.inner.retained_bytes()
+    }
+}
+
+impl fmt::Debug for CompiledKernelHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompiledKernelHandle")
+            .field("cache_identity", &self.cache_identity())
+            .field("backend", &self.backend())
+            .field("retained_bytes", &self.retained_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Minimal opaque carrier for a backend-owned compiled object.  It is useful to the future Metal
+/// compiler because it retains an arbitrary concrete handle, but makes no claim that the supplied
+/// `retained_bytes` includes globally shared MLX/Metal allocations.
+pub struct OpaqueCompiledKernel {
+    cache_identity: String,
+    backend: String,
+    retained_bytes: usize,
+    _keep_alive: Arc<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for OpaqueCompiledKernel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpaqueCompiledKernel")
+            .field("cache_identity", &self.cache_identity)
+            .field("backend", &self.backend)
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpaqueCompiledKernel {
+    pub fn new(
+        cache_identity: impl Into<String>,
+        backend: impl Into<String>,
+        retained_bytes: usize,
+        keep_alive: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            cache_identity: cache_identity.into(),
+            backend: backend.into(),
+            retained_bytes,
+            _keep_alive: keep_alive,
+        }
+    }
+}
+
+impl RetainedPackedKernel for OpaqueCompiledKernel {
+    fn cache_identity(&self) -> &str {
+        &self.cache_identity
+    }
+
+    fn backend(&self) -> &str {
+        &self.backend
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+/// Explicit, opt-in decoder construction request.  This is deliberately an override rather than
+/// an ambient environment switch: normal decoders construct the current contiguous cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompiledHandleMetadata {
-    pub device: String,
-    pub queue: String,
-    pub context: String,
-    pub cache_identity: String,
+pub struct PackedCacheRequest {
+    pub enabled: bool,
+    pub backend: String,
+    pub identity: String,
+    pub layers: usize,
+    pub batch: usize,
+    pub kv_heads: usize,
+    pub head_dimension: usize,
+    pub group_size: usize,
+    pub query_length: usize,
+    pub has_mask: bool,
+}
+
+impl PackedCacheRequest {
+    pub fn disabled(layers: usize) -> Self {
+        Self {
+            enabled: false,
+            backend: "disabled".into(),
+            identity: "sc-20675-default-dense".into(),
+            layers,
+            batch: 0,
+            kv_heads: 0,
+            head_dimension: 0,
+            group_size: 0,
+            query_length: 0,
+            has_mask: false,
+        }
+    }
+}
+
+/// Result of choosing a decoder cache before any K/V update.  The route is retained separately so
+/// callers can emit the fallback diagnostic without relying on a downcast.
+pub struct DecoderCacheSelection {
+    route: CacheRoute,
+    cache: Box<dyn KvCache>,
+}
+
+impl DecoderCacheSelection {
+    pub fn route(&self) -> &CacheRoute {
+        &self.route
+    }
+
+    pub fn into_cache(self) -> Box<dyn KvCache> {
+        self.cache
+    }
+}
+
+/// A decoder-facing bridge for the experimental storage.  It owns staged packed storage only
+/// after a fully supported opt-in request.  Until SC-20776 installs a retained fused reader, every
+/// lifecycle operation records the reason and delegates to dense *before* it mutates K/V state.
+/// This is intentionally not advertised as compressed-domain attention.
+#[derive(Debug)]
+pub struct DenseFallbackPackedDecoderCache {
+    dense: ContiguousKvCache,
+    staged: PackedGroupAffineKvCache,
+    reason: String,
+}
+
+impl DenseFallbackPackedDecoderCache {
+    fn dense_before_mutation(&mut self, operation: &str) {
+        self.staged
+            .dense_read_fallback(operation, self.reason.clone());
+    }
+
+    pub fn staged_representation(&self) -> RepresentationMetadata {
+        self.staged.representation()
+    }
+
+    pub fn fallback_events(&self) -> &[DenseFallbackEvent] {
+        self.staged.fallback_events()
+    }
+
+    /// SC-20776 may attach only a reader whose identity matches the staged representation.  The
+    /// current bridge remains dense until that story also installs the corresponding attention
+    /// execution path.
+    pub fn bind_compiled_handle(&mut self, handle: CompiledKernelHandle) -> Result<()> {
+        self.staged.bind_compiled_handle(handle)
+    }
+}
+
+impl KvCache for DenseFallbackPackedDecoderCache {
+    fn preflight_packed(&self, _query_length: usize, _mask: bool) -> CacheRoute {
+        CacheRoute::DenseFallback {
+            reason: self.reason.clone(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        layer: usize,
+        keys: &mlx_rs::Array,
+        values: &mlx_rs::Array,
+    ) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
+        self.dense_before_mutation("update");
+        self.dense.update(layer, keys, values)
+    }
+
+    fn offset(&self) -> i32 {
+        self.dense.offset()
+    }
+
+    fn batch_size(&self) -> i32 {
+        self.dense.batch_size()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.dense.num_layers()
+    }
+
+    fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        self.dense_before_mutation("retain_sequences");
+        self.dense.retain_sequences(keep)
+    }
+
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        self.dense_before_mutation("truncate");
+        self.dense.truncate(len)
+    }
+
+    fn reset(&mut self) {
+        self.dense_before_mutation("reset");
+        self.dense.reset();
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+fn dense_selection(layers: usize, reason: impl Into<String>) -> DecoderCacheSelection {
+    DecoderCacheSelection {
+        route: CacheRoute::DenseFallback {
+            reason: reason.into(),
+        },
+        cache: Box::new(ContiguousKvCache::new(layers)),
+    }
+}
+
+/// Construct the cache which a decoder will use, before the first append.  Disabled overrides and
+/// every unsupported geometry return the established contiguous implementation without allocating
+/// a packed cache.  A supported override stages the packed format but still deterministically uses
+/// dense until a retained SC-20776 reader is bound; this prevents a metadata-only path from being
+/// mistaken for compressed-domain execution.
+pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelection {
+    if !request.enabled {
+        return dense_selection(
+            request.layers,
+            "experimental packed cache override is disabled",
+        );
+    }
+    if request.backend != "mlx-metal" {
+        return dense_selection(request.layers, "packed cache requires mlx-metal backend");
+    }
+    if request.has_mask {
+        return dense_selection(request.layers, "masked attention requires dense fallback");
+    }
+    if request.layers == 0
+        || request.batch == 0
+        || request.kv_heads == 0
+        || request.head_dimension == 0
+        || request.group_size == 0
+        || request.query_length == 0
+    {
+        return dense_selection(
+            request.layers,
+            "packed cache geometry is unsupported before allocation",
+        );
+    }
+    let staged = match PackedGroupAffineKvCache::new(
+        request.identity,
+        request.layers,
+        request.batch,
+        request.kv_heads,
+        request.head_dimension,
+        request.group_size,
+    ) {
+        Ok(cache) => cache,
+        Err(error) => {
+            return dense_selection(request.layers, format!("packed cache rejected: {error}"))
+        }
+    };
+    let reason = "packed storage has no retained fused reader; use dense cache".to_string();
+    DecoderCacheSelection {
+        route: CacheRoute::DenseFallback {
+            reason: reason.clone(),
+        },
+        cache: Box::new(DenseFallbackPackedDecoderCache {
+            dense: ContiguousKvCache::new(request.layers),
+            staged,
+            reason,
+        }),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -371,7 +662,8 @@ pub struct PackedGroupAffineKvCache {
     layers: Vec<Option<LayerStorage>>,
     fallback_events: Vec<DenseFallbackEvent>,
     cancelled: bool,
-    handle: CompiledHandleMetadata,
+    /// No reader is installed until SC-20776 binds a retained compiled object for this identity.
+    handle: Option<CompiledKernelHandle>,
 }
 
 impl PackedGroupAffineKvCache {
@@ -398,12 +690,7 @@ impl PackedGroupAffineKvCache {
             layers: vec![None; layers],
             fallback_events: Vec::new(),
             cancelled: false,
-            handle: CompiledHandleMetadata {
-                device: "cpu-reference".into(),
-                queue: "unbound".into(),
-                context: "sc-20675-experimental".into(),
-                cache_identity: "uncompiled".into(),
-            },
+            handle: None,
         })
     }
 
@@ -564,13 +851,8 @@ impl PackedGroupAffineKvCache {
     pub fn layers(&self) -> usize {
         self.layers.len()
     }
-    pub fn allocated_bytes(&self) -> usize {
-        self.layers
-            .iter()
-            .flatten()
-            .map(|l| l.keys.logical_bytes() + l.values.bytes())
-            .sum()
-    }
+    /// Bytes logically occupied by codes, quantization metadata, and an incomplete dense key
+    /// group.  This deliberately excludes unused vector capacity and all structural allocations.
     pub fn logical_stored_bytes(&self) -> usize {
         self.layers
             .iter()
@@ -578,15 +860,60 @@ impl PackedGroupAffineKvCache {
             .map(|l| l.keys.logical_bytes() + l.values.bytes())
             .sum()
     }
-    pub fn allocated_vec_bytes(&self) -> usize {
+
+    /// Actual allocated payload capacity for codes, metadata, and the pending key tail.
+    pub fn allocated_payload_bytes(&self) -> usize {
         self.layers
             .iter()
             .flatten()
             .map(|l| l.keys.allocated_bytes() + l.values.allocated_bytes())
             .sum()
     }
+
+    /// Compatibility name for callers which need physical packed payload capacity.
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated_payload_bytes()
+    }
+
+    /// Backwards-compatible spelling for physical payload capacity.
+    pub fn allocated_vec_bytes(&self) -> usize {
+        self.allocated_payload_bytes()
+    }
+
+    /// A conservative process-visible estimate: payload capacity plus the cache object, backing
+    /// `layers`/fallback vectors, identity string capacity, and any per-cache retained reader.
+    /// It excludes allocator bookkeeping, shared backend pools, and memory owned outside the
+    /// cache, which must be measured by the process-level receipt harness.
     pub fn process_visible_bytes_estimate(&self) -> usize {
-        self.allocated_vec_bytes() + std::mem::size_of_val(self)
+        self.allocated_payload_bytes()
+            + std::mem::size_of_val(self)
+            + self.layers.capacity() * std::mem::size_of::<Option<LayerStorage>>()
+            + self.fallback_events.capacity() * std::mem::size_of::<DenseFallbackEvent>()
+            + self.identity.capacity()
+            + self
+                .fallback_events
+                .iter()
+                .map(|event| event.operation.capacity() + event.reason.capacity())
+                .sum::<usize>()
+            + self
+                .handle
+                .as_ref()
+                .map_or(0, CompiledKernelHandle::retained_bytes)
+    }
+
+    /// Dense fp16 K+V payload for the same resident layers and logical token length.  It is a
+    /// comparison baseline only: dense allocator capacity and process-wide backend pools are not
+    /// attributed to this packed-cache estimate.
+    pub fn dense_fp16_equivalent_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .count()
+            .saturating_mul(self.rows())
+            .saturating_mul(self.logical_len)
+            .saturating_mul(self.head_dimension)
+            .saturating_mul(2) // K and V
+            .saturating_mul(std::mem::size_of::<f16>())
     }
     pub fn representation(&self) -> RepresentationMetadata {
         RepresentationMetadata {
@@ -600,7 +927,7 @@ impl PackedGroupAffineKvCache {
             logical_len: self.logical_len,
             capacity: self.capacity,
             absolute_offset: self.absolute_offset,
-            allocated_bytes: self.allocated_bytes(),
+            allocated_bytes: self.allocated_payload_bytes(),
             key_grouping: "token-axis groups [B,H,ceil(S/group_size),D]",
             value_grouping: "channel-axis groups [B,H,S,ceil(D/group_size)]",
         }
@@ -629,7 +956,7 @@ impl PackedGroupAffineKvCache {
             operation: operation.into(),
             reason: reason.into(),
             logical_len: self.logical_len,
-            allocated_bytes: self.allocated_bytes(),
+            allocated_bytes: self.allocated_payload_bytes(),
         };
         self.fallback_events.push(event.clone());
         event
@@ -640,14 +967,17 @@ impl PackedGroupAffineKvCache {
     pub fn no_dense_mirror(&self) -> bool {
         true
     }
-    pub fn handle_metadata(&self) -> &CompiledHandleMetadata {
-        &self.handle
+    pub fn compiled_handle(&self) -> Option<&CompiledKernelHandle> {
+        self.handle.as_ref()
     }
-    pub fn bind_compiled_handle(&mut self, handle: CompiledHandleMetadata) -> Result<()> {
-        if handle.cache_identity != self.identity {
+    pub fn bind_compiled_handle(&mut self, handle: CompiledKernelHandle) -> Result<()> {
+        if handle.cache_identity() != self.identity {
             return Err(Error::Config("compiled handle identity mismatch".into()));
         }
-        self.handle = handle;
+        if handle.backend() != "mlx-metal" {
+            return Err(Error::Config("compiled handle backend mismatch".into()));
+        }
+        self.handle = Some(handle);
         Ok(())
     }
     pub fn preflight(
@@ -656,13 +986,15 @@ impl PackedGroupAffineKvCache {
         query_length: usize,
         mask: bool,
     ) -> crate::primitives::CacheRoute {
-        if backend != "mlx-metal" || query_length == 0 || mask {
+        if backend != "mlx-metal" || query_length == 0 || mask || self.handle.is_none() {
             let reason = if backend != "mlx-metal" {
                 "unsupported backend"
             } else if query_length == 0 {
                 "empty query"
-            } else {
+            } else if mask {
                 "mask requires dense fallback"
+            } else {
+                "no retained compiled packed reader"
             };
             self.dense_read_fallback("preflight", reason);
             crate::primitives::CacheRoute::DenseFallback {
@@ -943,6 +1275,30 @@ mod tests {
             .collect()
     }
 
+    fn pseudo_random_outliers(
+        batch: usize,
+        heads: usize,
+        step: usize,
+        width: usize,
+        seed: u64,
+    ) -> Vec<f32> {
+        let mut state = seed;
+        (0..batch * heads * step * width)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let base = ((state >> 40) as i32 - (1 << 23)) as f32 / (1 << 20) as f32;
+                match index % 29 {
+                    0 => -10_000.0,
+                    1 => 10_000.0,
+                    2 => 0.0,
+                    _ => base,
+                }
+            })
+            .collect()
+    }
+
     fn token_range(
         source: &[f32],
         batch: usize,
@@ -1010,6 +1366,18 @@ mod tests {
         restored.restore(&bytes).unwrap();
         assert_eq!(restored.representation(), c.representation());
     }
+
+    #[test]
+    fn snapshot_rejects_exact_quantization_parameter_mismatch_without_mutation() {
+        let mut source = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
+        let payload = data(3, 1, 8, -2.0);
+        source.append(0, &payload, &payload, 3).unwrap();
+        let snapshot = source.save();
+        let mut incompatible = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 3).unwrap();
+        let before = incompatible.representation();
+        assert!(incompatible.restore(&snapshot).is_err());
+        assert_eq!(incompatible.representation(), before);
+    }
     #[test]
     fn fallback_is_explicit_and_cancel_is_safe() {
         let mut c = PackedGroupAffineKvCache::new("m", 1, 1, 1, 3, 2).unwrap();
@@ -1062,16 +1430,78 @@ mod tests {
         ));
         assert!(matches!(
             c.preflight("mlx-metal", 1, false),
+            crate::primitives::CacheRoute::DenseFallback { .. }
+        ));
+        let before_handle = c.process_visible_bytes_estimate();
+        let handle = CompiledKernelHandle::new(Arc::new(OpaqueCompiledKernel::new(
+            "m",
+            "mlx-metal",
+            64,
+            Arc::new(()),
+        )));
+        c.bind_compiled_handle(handle).unwrap();
+        assert_eq!(c.compiled_handle().unwrap().backend(), "mlx-metal");
+        assert_eq!(c.process_visible_bytes_estimate(), before_handle + 64);
+        assert!(matches!(
+            c.preflight("mlx-metal", 1, false),
             crate::primitives::CacheRoute::ExperimentalPacked
         ));
-        c.bind_compiled_handle(CompiledHandleMetadata {
-            device: "metal0".into(),
-            queue: "q0".into(),
-            context: "ctx".into(),
-            cache_identity: "m".into(),
-        })
-        .unwrap();
-        assert_eq!(c.handle_metadata().device, "metal0");
+        let mismatch = CompiledKernelHandle::new(Arc::new(OpaqueCompiledKernel::new(
+            "other",
+            "mlx-metal",
+            0,
+            Arc::new(()),
+        )));
+        assert!(c.bind_compiled_handle(mismatch).is_err());
+    }
+
+    #[test]
+    fn decoder_factory_is_opt_in_and_falls_back_before_packed_mutation() {
+        let mut disabled = select_decoder_cache(PackedCacheRequest::disabled(2));
+        assert!(matches!(
+            disabled.route(),
+            CacheRoute::DenseFallback { reason } if reason.contains("disabled")
+        ));
+        assert!(disabled.cache.as_any_mut().is::<ContiguousKvCache>());
+
+        let unsupported = select_decoder_cache(PackedCacheRequest {
+            enabled: true,
+            backend: "mlx-metal".into(),
+            identity: "m".into(),
+            layers: 2,
+            batch: 1,
+            kv_heads: 1,
+            head_dimension: 0,
+            group_size: 32,
+            query_length: 1,
+            has_mask: false,
+        });
+        assert!(unsupported.cache.as_any_mut().is::<ContiguousKvCache>());
+
+        let mut staged = select_decoder_cache(PackedCacheRequest {
+            enabled: true,
+            backend: "mlx-metal".into(),
+            identity: "m".into(),
+            layers: 2,
+            batch: 1,
+            kv_heads: 2,
+            head_dimension: 8,
+            group_size: 4,
+            query_length: 1,
+            has_mask: false,
+        });
+        assert!(matches!(staged.route(), CacheRoute::DenseFallback { .. }));
+        let adapter = staged
+            .cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .expect("supported override stages storage through the decoder factory");
+        assert_eq!(adapter.staged_representation().logical_len, 0);
+        assert!(adapter.fallback_events().is_empty());
+        assert!(matches!(
+            adapter.preflight_packed(1, false),
+            CacheRoute::DenseFallback { .. }
+        ));
     }
 
     #[test]
@@ -1105,6 +1535,33 @@ mod tests {
             one.representation().key_grouping,
             "token-axis groups [B,H,ceil(S/group_size),D]"
         );
+    }
+
+    #[test]
+    fn deterministic_pseudorandom_outliers_pack_identically_across_arbitrary_chunks() {
+        let (batch, heads, step, width, group) = (2, 3, 11, 7, 4);
+        let keys = pseudo_random_outliers(batch, heads, step, width, 0x5eed_beef);
+        let values = pseudo_random_outliers(batch, heads, step, width, 0x0123_4567);
+        let mut one = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
+        one.append(0, &keys, &values, step).unwrap();
+        let mut chunks = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
+        for (start, len) in [(0, 2), (2, 1), (3, 4), (7, 1), (8, 3)] {
+            chunks
+                .append(
+                    0,
+                    &token_range(&keys, batch, heads, step, width, start, len),
+                    &token_range(&values, batch, heads, step, width, start, len),
+                    len,
+                )
+                .unwrap();
+        }
+        assert_same_rows(&one, &chunks);
+        for token in 0..step {
+            for row in 0..batch * heads {
+                let (k, v) = one.read_row(0, token, row).unwrap();
+                assert!(k.iter().chain(v.iter()).all(|value| value.is_finite()));
+            }
+        }
     }
 
     #[test]
@@ -1169,5 +1626,19 @@ mod tests {
         assert_same_rows(&cache, &restored);
         cache.clear();
         assert_eq!(cache.logical_stored_bytes(), 0);
+    }
+
+    #[test]
+    fn long_context_capacity_including_pending_tail_reduces_physical_payload_vs_dense_fp16() {
+        let (step, width, group) = (4097, 128, 32);
+        let keys = pseudo_random_outliers(1, 1, step, width, 0xfeed_face);
+        let values = pseudo_random_outliers(1, 1, step, width, 0xface_feed);
+        let mut cache = PackedGroupAffineKvCache::new("m", 1, 1, 1, width, group).unwrap();
+        cache.append(0, &keys, &values, step).unwrap();
+        let layer = cache.layers[0].as_ref().unwrap();
+        assert_eq!(layer.keys.pending_tokens, 1);
+        assert!(layer.keys.pending.len() >= width);
+        assert!(cache.allocated_payload_bytes() * 4 <= cache.dense_fp16_equivalent_bytes() * 3);
+        assert!(cache.process_visible_bytes_estimate() >= cache.allocated_payload_bytes());
     }
 }

@@ -35,7 +35,9 @@ pub use nn::{
     soft_cap,
 };
 pub use packed_group_affine_kv::{
-    DenseFallbackEvent, PackedGroupAffineKvCache, RepresentationMetadata,
+    select_decoder_cache, CompiledKernelHandle, DecoderCacheSelection, DenseFallbackEvent,
+    DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
+    PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
