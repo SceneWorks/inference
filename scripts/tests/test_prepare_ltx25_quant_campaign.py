@@ -198,7 +198,7 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
             blob.write_bytes(weights)
 
             extra = snapshot / "extra.json"
-            extra.write_text("{}")
+            extra.write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "extra=.*extra.json"):
                 MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
             extra.unlink()
