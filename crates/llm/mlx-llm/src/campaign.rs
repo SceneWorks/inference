@@ -257,6 +257,15 @@ pub struct ReceiptCancellation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ReceiptWarmup {
+    pub required: bool,
+    pub completed: bool,
+    pub worker_pid: u32,
+    pub suite_sha256: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub schema_version: u32,
     pub harness_version: String,
@@ -274,6 +283,7 @@ pub struct Receipt {
     pub quality: ReceiptQuality,
     pub lifecycle: ReceiptLifecycle,
     pub cancellation: ReceiptCancellation,
+    pub warmup: ReceiptWarmup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -916,6 +926,14 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
         return Err("release/cancellation evidence failed".into());
     }
+    let warm = &receipt.warmup;
+    if warm.worker_pid == 0
+        || (warm.required != (receipt.matrix.process_temperature == "warm"))
+        || (warm.required && (!warm.completed || warm.suite_sha256.len() != 64))
+        || (!warm.required && (warm.completed || !warm.suite_sha256.is_empty()))
+    {
+        return Err("warm worker discipline evidence failed".into());
+    }
     let lifecycle = [
         ("append", receipt.lifecycle.append),
         ("chunkedPrefill", receipt.lifecycle.chunked_prefill),
@@ -1552,22 +1570,30 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             // Warm rows run the exact same product fixture suite once before collection in this
             // child.  The measured suite is therefore a genuine same-worker warm observation;
             // cold rows intentionally skip this path and are launched in fresh children.
-            if row.coordinate.process_temperature == "warm" {
-                run_product_fixture_suite(&snapshot, &reference_snapshot, &prompt, &row.coordinate)
-                    .map_err(|e| {
-                        format!(
-                            "product warmup for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?
-                    .quality()
-                    .map_err(|e| {
-                        format!(
-                            "product warmup quality for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?;
-            }
+            let warmup_suite_sha256 = if row.coordinate.process_temperature == "warm" {
+                let suite = run_product_fixture_suite(
+                    &snapshot,
+                    &reference_snapshot,
+                    &prompt,
+                    &row.coordinate,
+                )
+                .map_err(|e| {
+                    format!(
+                        "product warmup for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?
+                .quality()
+                .map_err(|e| {
+                    format!(
+                        "product warmup quality for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?;
+                Some(seal_bytes(&canonical_json_bytes(&serde_json::json!({"workerPid": std::process::id(), "kernel": suite.kernel_candidate.output.text})).map_err(|e| e.to_string())?))
+            } else {
+                None
+            };
             let mut suites = Vec::with_capacity(5);
             for repeat in 0..5 {
                 let suite = run_product_fixture_suite(
@@ -1597,8 +1623,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             )?;
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let fixtures = sealed_product_fixture_artifacts(&suites[0])?;
-            let receipt =
-                product_receipt(&row.coordinate, &suites[0], timings, &executable, &fixtures)?;
+            let receipt = product_receipt(
+                &row.coordinate,
+                &suites[0],
+                timings,
+                &executable,
+                &fixtures,
+                warmup_suite_sha256,
+            )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
                 &PathBuf::from(required_flag(args, "--out")?),
@@ -3014,6 +3046,7 @@ fn product_receipt(
     timings: Vec<RawTiming>,
     executable: &Path,
     fixtures: &[SealedFixtureArtifact],
+    warmup_suite_sha256: Option<String>,
 ) -> Result<Receipt, String> {
     let quality = suite.quality()?;
     let observation = &suite.kernel_candidate.observation;
@@ -3102,7 +3135,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:0,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true} };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:0,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_suite_sha256.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256.unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -3487,6 +3520,12 @@ mod tests {
             },
             cancellation: ReceiptCancellation {
                 cleanup_verified: true,
+            },
+            warmup: ReceiptWarmup {
+                required: false,
+                completed: false,
+                worker_pid: 7,
+                suite_sha256: String::new(),
             },
         };
         for name in REQUIRED_FIXTURES {

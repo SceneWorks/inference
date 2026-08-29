@@ -449,7 +449,7 @@ impl LlamaProvider {
     /// Exercise real contiguous-cache prefix reuse on the loaded causal decoder.  Hybrid Qwen3.6
     /// has a distinct cache contract and is rejected here rather than being mislabeled as a
     /// successful contiguous-cache observation.
-    pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<()> {
+    pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<u64> {
         let ids = self
             .tokenizer
             .encode(prompt, false)?
@@ -483,12 +483,12 @@ impl LlamaProvider {
                 "campaign prefix reuse did not produce a cache hit".into(),
             ));
         }
-        Ok(())
+        Ok(cache.stats().hits)
     }
 
     /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
     /// This is not emulated by serial `TextLlm` requests.
-    pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<()> {
+    pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
         if batch < 2 {
             return Err(CoreError::InvalidRequest(
                 "campaign supported batch requires at least two rows".into(),
@@ -525,7 +525,7 @@ impl LlamaProvider {
                 "campaign batch produced no product tokens".into(),
             ));
         }
-        Ok(())
+        Ok(outputs.len() as u64)
     }
 
     /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative
