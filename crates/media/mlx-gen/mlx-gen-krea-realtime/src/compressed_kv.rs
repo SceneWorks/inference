@@ -577,7 +577,7 @@ impl PackedAffineRows {
     }
 
     fn row_index(&self, b: usize, h: usize, s: usize) -> usize {
-        (b * self.heads + h) * self.tokens + s
+        s * self.batch * self.heads + b * self.heads + h
     }
 
     fn word_index(&self, b: usize, h: usize, s: usize, d: usize) -> (usize, u32) {
@@ -609,6 +609,30 @@ impl PackedAffineRows {
 
     fn bytes(&self) -> usize {
         self.words.len() * 4 + (self.scales_bf16.len() + self.biases_bf16.len()) * 2
+    }
+
+    fn validate_append(&self, next: &Self) -> Result<(), DispatchFailure> {
+        if self.batch != next.batch
+            || self.heads != next.heads
+            || self.head_dim != next.head_dim
+            || self.tier != next.tier
+            || self.group_size != next.group_size
+            || self.tokens.checked_add(next.tokens).is_none()
+        {
+            return Err(DispatchFailure::GeometryMismatch);
+        }
+        Ok(())
+    }
+
+    /// Extend the token axis without rebuilding the existing packed history. Rows are physically
+    /// `[token, batch, head, payload]`, so a new chunk is contiguous and can be extended in O(chunk).
+    fn append_rows(&mut self, next: &Self) -> Result<(), DispatchFailure> {
+        self.validate_append(next)?;
+        self.words.extend_from_slice(&next.words);
+        self.scales_bf16.extend_from_slice(&next.scales_bf16);
+        self.biases_bf16.extend_from_slice(&next.biases_bf16);
+        self.tokens += next.tokens;
+        Ok(())
     }
 }
 
@@ -661,6 +685,30 @@ impl CompressedKvCache {
 
     pub fn instrumentation(&self) -> &CompressedInstrumentation {
         &self.instrumentation
+    }
+
+    /// Run an accepted fused dispatch with a dense retry seam. The packed callback is allowed to
+    /// stage state, but any failure restores the pre-dispatch snapshot before the dense callback
+    /// runs, so a backend fault cannot leave K/V half-updated or charge packed telemetry.
+    pub fn dispatch_with_dense_retry<P, D>(
+        &mut self,
+        packed: P,
+        dense: D,
+    ) -> Result<CpuTensor, DispatchFailure>
+    where
+        P: FnOnce(&mut Self) -> Result<CpuTensor, DispatchFailure>,
+        D: FnOnce(&Self) -> Result<CpuTensor, DispatchFailure>,
+    {
+        let before = self.clone();
+        match packed(self) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                *self = before;
+                self.instrumentation.dense_fallbacks += 1;
+                self.instrumentation.last_fallback_reason = Some(error.as_receipt_reason());
+                dense(self)
+            }
+        }
     }
 
     pub fn decide(&mut self, geometry: AttentionGeometry, mask: KreaMask) -> DispatchDecision {
@@ -729,9 +777,33 @@ impl CompressedKvCache {
                 return Err(DispatchFailure::GeometryMismatch);
             }
         }
-        // There is no in-place partial append: a fully checked pair replaces the old snapshot.
-        self.k = Some(concat_packed(self.k.as_ref(), next_k));
-        self.v = Some(concat_packed(self.v.as_ref(), next_v));
+        if let Some(old) = &self.v {
+            if old.batch != next_v.batch
+                || old.heads != next_v.heads
+                || old.head_dim != next_v.head_dim
+            {
+                return Err(DispatchFailure::GeometryMismatch);
+            }
+        }
+        if let Some(old) = &self.k {
+            old.validate_append(&next_k)?;
+        }
+        if let Some(old) = &self.v {
+            old.validate_append(&next_v)?;
+        }
+        // Packing both chunks above is the validation/transaction boundary. Append each
+        // already-packed head block directly; rebuilding the complete history on every decode
+        // step would make repeated updates O(history²) and allocate a full-history copy.
+        if let Some(existing) = &mut self.k {
+            existing.append_rows(&next_k)?;
+        } else {
+            self.k = Some(next_k);
+        }
+        if let Some(existing) = &mut self.v {
+            existing.append_rows(&next_v)?;
+        } else {
+            self.v = Some(next_v);
+        }
         self.instrumentation.persistent_bytes = self.k.as_ref().map_or(0, PackedAffineRows::bytes)
             + self.v.as_ref().map_or(0, PackedAffineRows::bytes);
         Ok(())
@@ -886,18 +958,20 @@ fn concat_packed(previous: Option<&PackedAffineRows>, next: PackedAffineRows) ->
     let Some(old) = previous else {
         return next;
     };
-    // Rows are B/H-major, then token-major.  Concatenating the backing vectors would
-    // interleave a later H's old rows before an earlier H's appended rows, corrupting
-    // multi-head reads.  Keep the token-axis physical order exact.
+    // Rows are token-major, then B/H. Keep the token-axis physical order exact.
     let mut words = Vec::with_capacity(old.words.len() + next.words.len());
     let mut scales_bf16 = Vec::with_capacity(old.scales_bf16.len() + next.scales_bf16.len());
     let mut biases_bf16 = Vec::with_capacity(old.biases_bf16.len() + next.biases_bf16.len());
-    for b in 0..old.batch {
-        for h in 0..old.heads {
-            for s in 0..old.tokens {
+    for s in 0..old.tokens {
+        for b in 0..old.batch {
+            for h in 0..old.heads {
                 append_packed_row(old, b, h, s, &mut words, &mut scales_bf16, &mut biases_bf16);
             }
-            for s in 0..next.tokens {
+        }
+    }
+    for s in 0..next.tokens {
+        for b in 0..next.batch {
+            for h in 0..next.heads {
                 append_packed_row(
                     &next,
                     b,
@@ -955,9 +1029,9 @@ fn slice_packed(
         scales_bf16: Vec::with_capacity(rows.batch * rows.heads * tokens * rows.groups_per_row()),
         biases_bf16: Vec::with_capacity(rows.batch * rows.heads * tokens * rows.groups_per_row()),
     };
-    for b in 0..rows.batch {
-        for h in 0..rows.heads {
-            for s in start..rows.tokens {
+    for s in start..rows.tokens {
+        for b in 0..rows.batch {
+            for h in 0..rows.heads {
                 if cancel.cancelled() {
                     return Err(DispatchFailure::Cancelled);
                 }
@@ -1124,6 +1198,35 @@ mod tests {
             Err(DispatchFailure::Cancelled)
         );
         assert_eq!(outstanding_scratch(), 0);
+    }
+
+    #[test]
+    fn injected_dispatch_fault_retries_dense_without_partial_packed_mutation() {
+        let keys = tensor(3, 0.0);
+        let values = tensor(3, 0.5);
+        let mut cache = cache(CompressedTier::Q8);
+        append(&mut cache, &keys, &values);
+        let stored_before = cache.stored_tokens();
+        let packed_before = cache.instrumentation().compressed_dispatches;
+        let dense_result = tensor(1, 9.0);
+        let actual = cache
+            .dispatch_with_dense_retry(
+                |state| {
+                    state.k = None;
+                    state.instrumentation.compressed_dispatches += 1;
+                    Err(DispatchFailure::GeometryMismatch)
+                },
+                |_| Ok(dense_result.clone()),
+            )
+            .unwrap();
+        assert_eq!(actual, dense_result);
+        assert_eq!(cache.stored_tokens(), stored_before);
+        assert_eq!(cache.instrumentation().compressed_dispatches, packed_before);
+        assert_eq!(cache.instrumentation().dense_fallbacks, 1);
+        assert_eq!(
+            cache.instrumentation().last_fallback_reason,
+            Some("geometry-mismatch")
+        );
     }
 
     #[test]
