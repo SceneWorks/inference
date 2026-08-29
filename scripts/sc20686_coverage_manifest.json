@@ -2,7 +2,7 @@
   "schema": "sc-20686-supported-coverage-v1",
   "families": {
     "flux2-klein": ["klein-9b", "flux2_klein_9b_edit", "flux2_klein_9b_reference", "flux2_klein_9b_character", "flux2_klein_9b_style"],
-    "wan": ["wan2.2-t2v-a14b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan2_2_ti2v_5b", "wan2_2_vace_fun_14b"]
+    "wan": ["wan2.2-t2v-a14b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan2_2_ti2v_5b", "wan_vace", "wan2_2_vace_fun_14b"]
   },
   "required_geometry_axes": ["resolution", "reference_count", "frames", "prompt", "guidance", "layers", "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope"]
 }
