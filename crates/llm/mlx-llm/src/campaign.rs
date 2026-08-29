@@ -886,9 +886,19 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         }
         phases.values().copied().max().unwrap_or(0)
     };
+    let max_transient = {
+        let mut phases = std::collections::BTreeMap::<&str, u64>::new();
+        for event in receipt.memory.allocation_events.iter().filter(|e| {
+            e.lifetime == "transient"
+                && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
+        }) {
+            *phases.entry(event.phase.as_str()).or_default() += event.bytes;
+        }
+        phases.values().copied().max().unwrap_or(0)
+    };
     if max_role("weights", "persistent") != receipt.memory.model_weights_bytes
         || max_role("cache", "persistent") != receipt.memory.persistent_kv_bytes
-        || max_role("attention-workspace", "transient") != receipt.memory.transient_workspace_bytes
+        || max_transient != receipt.memory.transient_workspace_bytes
     {
         return Err("allocation totals do not reconcile".into());
     }
@@ -4236,12 +4246,14 @@ fn product_receipt(
         .map(|e| e.bytes)
         .max()
         .ok_or("coordinate produced no persistent cache snapshot")?;
-    let workspace = observation
-        .allocations
-        .iter()
-        .filter(|e| e.role == "attention-workspace" && e.lifetime == "transient")
-        .map(|e| e.bytes)
-        .sum::<u64>();
+    let mut transient_by_phase = std::collections::BTreeMap::<&str, u64>::new();
+    for event in observation.allocations.iter().filter(|e| {
+        e.lifetime == "transient"
+            && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
+    }) {
+        *transient_by_phase.entry(event.phase.as_str()).or_default() += event.bytes;
+    }
+    let workspace = transient_by_phase.values().copied().max().unwrap_or(0);
     let release = observation.phases.last().ok_or("release phase")?;
     let start = observation.phases.first().ok_or("start phase")?;
     let mut fixture_evidence = std::collections::BTreeMap::new();

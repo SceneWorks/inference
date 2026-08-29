@@ -277,8 +277,10 @@ impl KvCache for ContiguousKvCache {
             self.events.push(CacheEvent {
                 layer: usize::MAX,
                 operation: "reset",
-                role: "kv-cache",
-                lifetime: "released",
+                // Release is represented as a classified transient cache event so the
+                // campaign observer can retain exact bytes without violating the receipt schema.
+                role: "cache",
+                lifetime: "transient",
                 bytes,
                 tokens: 0,
             });
