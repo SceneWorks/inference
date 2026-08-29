@@ -175,7 +175,9 @@ impl Attention {
             &mut self.to_out,
             &mut self.gate,
         ] {
-            f(linear.lora_mut())?;
+            if let Some(linear) = linear.lora_mut() {
+                f(linear)?;
+            }
         }
         Ok(())
     }
@@ -295,7 +297,9 @@ impl FeedForward {
 
     fn visit_lora_mut(&mut self, f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>) -> Result<()> {
         for linear in [&mut self.proj_in, &mut self.proj_out] {
-            f(linear.lora_mut())?;
+            if let Some(linear) = linear.lora_mut() {
+                f(linear)?;
+            }
         }
         Ok(())
     }

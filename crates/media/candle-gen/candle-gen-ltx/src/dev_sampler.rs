@@ -6,12 +6,14 @@
 
 use candle_gen::candle_core::{DType, Error, Result, Tensor};
 use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent};
+use serde::{Deserialize, Serialize};
 
 use crate::config::STAGE1_SIGMAS;
 use crate::params::{GuiderParams, LTX_2_5_PARAMS};
 
 /// Transformer identity declared on the split transformer safetensors file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TransformerVariant {
     Distilled,
     Dev,
@@ -46,6 +48,13 @@ impl TransformerVariant {
 
     pub const fn is_dev(self) -> bool {
         matches!(self, Self::Dev)
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Distilled => "distilled",
+            Self::Dev => "dev",
+        }
     }
 }
 
