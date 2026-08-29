@@ -291,6 +291,41 @@ pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
     if bundle.receipt.is_empty() || bundle.human.is_empty() {
         return Err("partial artifact bundle".into());
     }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bundle.receipt).map_err(|e| e.to_string())?;
+    let object = value.as_object().ok_or("receipt is not an object")?;
+    for key in ["memory", "timings", "quality", "lifecycle", "cancellation"] {
+        if !object.contains_key(key) {
+            return Err(format!("receipt missing {key}"));
+        }
+    }
+    let memory = object["memory"]
+        .as_object()
+        .ok_or("memory is not an object")?;
+    if memory["phaseSamples"]
+        .as_array()
+        .map_or(true, |v| v.len() != 8)
+        || memory["allocationEvents"]
+            .as_array()
+            .map_or(true, |v| v.is_empty())
+    {
+        return Err("receipt memory evidence is incomplete".into());
+    }
+    let timings = object["timings"]
+        .as_object()
+        .ok_or("timings is not an object")?;
+    if timings["samples"].as_array().map_or(true, |v| v.len() != 5) {
+        return Err("receipt timing samples are incomplete".into());
+    }
+    let quality = object["quality"]
+        .as_object()
+        .ok_or("quality is not an object")?;
+    if quality["fixtureEvidence"]
+        .as_object()
+        .map_or(true, |v| v.len() != 4)
+    {
+        return Err("receipt fixture evidence is incomplete".into());
+    }
     Ok(())
 }
 
@@ -619,12 +654,21 @@ pub trait Observer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemorySample {
+    pub captured_at: String,
     pub pid: u32,
     pub current_bytes: u64,
     pub peak_bytes: u64,
     pub mlx_active_bytes: u64,
     pub mlx_cache_bytes: u64,
     pub mlx_peak_bytes: u64,
+}
+
+fn timestamp_now() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{seconds}")
 }
 
 pub trait CampaignSampler {
@@ -646,11 +690,7 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
             pid: None,
         }
     }
-    pub fn capture(
-        &mut self,
-        phase: &'static str,
-        timestamp: impl Into<String>,
-    ) -> Result<(), String> {
+    pub fn capture(&mut self, phase: &'static str) -> Result<(), String> {
         let sample = self.sampler.sample(phase)?;
         if let Some(pid) = self.pid {
             if pid != sample.pid {
@@ -666,7 +706,7 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
             phase: phase.into(),
             pid: sample.pid,
             source: "footprint -p".into(),
-            timestamp: timestamp.into(),
+            timestamp: sample.captured_at,
             phys_footprint_bytes: sample.current_bytes,
             phys_footprint_peak_bytes: sample.peak_bytes,
             mlx: ReceiptMlx {
@@ -686,6 +726,18 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
             if sample.phase != expected {
                 return Err(format!("phase order mismatch: expected {expected}"));
             }
+            if sample.phys_footprint_bytes < sample.mlx.active_bytes
+                || sample.phys_footprint_peak_bytes < sample.phys_footprint_bytes
+            {
+                return Err(format!("invalid memory attribution at {expected}"));
+            }
+        }
+        if self
+            .samples
+            .windows(2)
+            .any(|w| w[0].timestamp >= w[1].timestamp)
+        {
+            return Err("phase timestamps are not strictly increasing".into());
         }
         Ok(self.samples)
     }
@@ -701,28 +753,7 @@ where
     F: FnMut(&mut PhaseRecorder<S>) -> Result<(), String>,
 {
     let mut recorder = PhaseRecorder::new(sampler);
-    for phase in ["process-start", "weights-loaded", "prefill-peak"] {
-        recorder.capture(
-            phase,
-            format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
-        )?;
-    }
     operation(&mut recorder)?;
-    if recorder.samples.len() < 5 {
-        return Err("operation omitted first-token/decode observations".into());
-    }
-    recorder.capture(
-        "prompt-cache-reuse",
-        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
-    )?;
-    recorder.capture(
-        "cancellation-cleanup",
-        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
-    )?;
-    recorder.capture(
-        "post-run-release",
-        format!("2026-01-01T00:00:0{}.000Z", recorder.samples.len()),
-    )?;
     recorder.finish()
 }
 
@@ -760,6 +791,7 @@ pub fn sample_memory(pid: u32) -> std::io::Result<MemorySample> {
             .and_then(parse_footprint_value)
     };
     Ok(MemorySample {
+        captured_at: timestamp_now(),
         pid,
         current_bytes: field("phys_footprint:")
             .ok_or_else(|| std::io::Error::other("missing phys_footprint"))?,
@@ -931,6 +963,7 @@ mod tests {
     impl CampaignSampler for FakeSampler {
         fn sample(&mut self, _phase: &'static str) -> Result<MemorySample, String> {
             Ok(MemorySample {
+                captured_at: "2026-01-01T00:00:00Z".into(),
                 pid: 7,
                 current_bytes: 100,
                 peak_bytes: 100,
@@ -944,8 +977,14 @@ mod tests {
     #[test]
     fn fake_runner_requires_and_orders_all_phases() {
         let phases = run_lifecycle(FakeSampler, |recorder| {
-            recorder.capture("first-token", "2026-01-01T00:00:03.000Z")?;
-            recorder.capture("decode-steady", "2026-01-01T00:00:04.000Z")?;
+            recorder.capture("process-start")?;
+            recorder.capture("weights-loaded")?;
+            recorder.capture("prefill-peak")?;
+            recorder.capture("first-token")?;
+            recorder.capture("decode-steady")?;
+            recorder.capture("prompt-cache-reuse")?;
+            recorder.capture("cancellation-cleanup")?;
+            recorder.capture("post-run-release")?;
             Ok(())
         })
         .unwrap();
