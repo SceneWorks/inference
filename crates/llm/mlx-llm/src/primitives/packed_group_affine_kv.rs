@@ -511,6 +511,7 @@ impl TokenGroupKeyTensor {
         let code_start = self.codes.len();
         self.codes
             .resize(code_start + self.rows * self.code_bytes_per_group(), 0);
+        let code_bytes_per_group = self.code_bytes_per_group();
         let group_index = self.complete_groups();
         for row in 0..self.rows {
             for channel in 0..self.width {
@@ -527,7 +528,7 @@ impl TokenGroupKeyTensor {
                     let value = self.pending[(token * self.rows + row) * self.width + channel];
                     let code = ((value - min) / scale).round().clamp(0.0, 3.0) as u8;
                     let code_index = (token * self.width) + channel;
-                    self.codes[code_start + row * self.code_bytes_per_group() + code_index / 4] |=
+                    self.codes[code_start + row * code_bytes_per_group + code_index / 4] |=
                         code << ((code_index % 4) * 2);
                 }
             }
@@ -814,9 +815,10 @@ impl PackedGroupAffineKvCache {
         if len > self.logical_len {
             return Err(Error::Config("trim exceeds logical length".into()));
         }
+        let rows = self.rows();
         for layer in self.layers.iter_mut().flatten() {
             layer.keys.truncate(len)?;
-            layer.values.truncate(len * self.rows());
+            layer.values.truncate(len * rows);
         }
         self.logical_len = len;
         Ok(())
