@@ -1466,7 +1466,7 @@ mod tests {
         ));
         assert!(disabled.cache.as_any_mut().is::<ContiguousKvCache>());
 
-        let unsupported = select_decoder_cache(PackedCacheRequest {
+        let mut unsupported = select_decoder_cache(PackedCacheRequest {
             enabled: true,
             backend: "mlx-metal".into(),
             identity: "m".into(),
@@ -1607,7 +1607,8 @@ mod tests {
         let keys = bhst_data(batch, heads, step, width, 0.0);
         let mut values = bhst_data(batch, heads, step, width, 0.0);
         values[0] = -1000.0;
-        values[values.len() - 1] = 1000.0;
+        let last = values.len() - 1;
+        values[last] = 1000.0;
         let mut cache = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
         cache.append(0, &keys, &values, step).unwrap();
         let bytes_before = cache.logical_stored_bytes();
@@ -1623,7 +1624,8 @@ mod tests {
             restored.logical_stored_bytes()
         );
         let mut corrupt = snapshot.clone();
-        corrupt[corrupt.len() / 2] ^= 0x01;
+        let midpoint = corrupt.len() / 2;
+        corrupt[midpoint] ^= 0x01;
         assert!(restored.restore(&corrupt).is_err());
         assert_same_rows(&cache, &restored);
         cache.clear();
