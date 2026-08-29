@@ -11,6 +11,7 @@ pub mod llama;
 pub mod qwen35;
 pub mod qwen35_vision;
 pub mod siglip;
+pub mod starcoder2;
 
 use candle_core::Tensor;
 
@@ -30,6 +31,7 @@ pub use qwen35_vision::{Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutpu
 pub use siglip::{
     select_vision_feature, SiglipVisionConfig, SiglipVisionOutput, SiglipVisionTower,
 };
+pub use starcoder2::{StarCoder2, StarCoder2Config};
 pub use starvector::{StarVectorAdapter, StarVectorClip, StarVectorDecoder, StarVectorModel};
 
 /// The backend-neutral multimodal seam over a loaded decoder. Both Qwen-VL backbones — the Qwen3.6
