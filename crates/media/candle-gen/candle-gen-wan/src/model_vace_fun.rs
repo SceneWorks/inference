@@ -104,9 +104,15 @@ struct Pipeline {
     vae_cfg: Vae16Config,
     vace_cfg: WanVaceConfig,
     adapters: Vec<AdapterSpec>,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 impl Pipeline {
+    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
+
     fn new(
         root: &Path,
         device: &Device,
@@ -121,6 +127,7 @@ impl Pipeline {
             vae_cfg: Vae16Config::wan21(),
             vace_cfg: WanVaceConfig::vace_14b(),
             adapters,
+            campaign_context: None,
         }
     }
 
@@ -264,6 +271,17 @@ impl Pipeline {
         let mask_latents = prepare_masks(&mask, self.vace_cfg.base.patch.1, num_ref)?;
         let control = build_vace_control(&video_latents, &mask_latents)?;
         let (_, _, t, h, w) = control.dims5()?;
+        crate::sc20686_observer::observe_tensor(
+            "prefill-peak",
+            "vace-control-prepared",
+            (control.elem_count() as u64).saturating_mul(control.dtype().size() as u64),
+            (mask_latents.elem_count() as u64).saturating_mul(mask_latents.dtype().size() as u64),
+            0,
+            format!("{:?};{:?}", control.dims(), mask_latents.dims()),
+            format!("{:?}", control.dtype()),
+            "control-mask",
+            "applied",
+        );
         let (pt, ph, pw) = self.vace_cfg.base.patch;
         let (cos, sin) =
             WanRope::new(&self.vace_cfg.base).cos_sin(t / pt, h / ph, w / pw, &self.device)?;
@@ -403,6 +421,17 @@ pub struct WanVaceFunGenerator {
     shared: Mutex<Option<SharedComponents>>,
     experts: Mutex<Option<ExpertComponents>>,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
+}
+
+impl WanVaceFunGenerator {
+    pub fn with_campaign_context(
+        mut self,
+        context: crate::sc20686_observer::CampaignContext,
+    ) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
 }
 
 impl WanVaceFunGenerator {
@@ -548,6 +577,13 @@ impl Generator for WanVaceFunGenerator {
             self.adapters.clone(),
             self.tier.clone(),
         );
+        let pipeline = self
+            .campaign_context
+            .clone()
+            .map_or(pipeline, |context| pipeline.with_campaign_context(context));
+        if pipeline.campaign_context.is_some() {
+            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
+        }
         // Sequential follows Wan14B's staged residency: the heavy UMT5 + encoder VAE are local to
         // control preparation and drop before either expert loads. Resident keeps the shared cache.
         let (mut prepared, resident_shared) = match effective_offload {
@@ -656,7 +692,13 @@ impl Generator for WanVaceFunGenerator {
             }
         };
         on_progress(Progress::Decoding);
-        let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
+        let (frames, fps) = match pipeline.finish(prepared, &vae, &req.cancel, decode_cap) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::sc20686_observer::observe_cancelled();
+                return Err(error.into());
+            }
+        };
         crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
@@ -781,6 +823,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         shared: Mutex::new(None),
         experts: Mutex::new(None),
         i2v_memory,
+        campaign_context: None,
     }))
 }
 

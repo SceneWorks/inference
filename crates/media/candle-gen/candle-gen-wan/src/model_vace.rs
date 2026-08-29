@@ -77,9 +77,15 @@ struct Pipeline {
     vae_cfg: Vae16Config,
     root: PathBuf,
     device: Device,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 impl Pipeline {
+    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
+
     fn load(root: &Path, device: &Device) -> Self {
         Self {
             te_cfg: TextEncoderConfig::umt5_xxl(),
@@ -87,6 +93,7 @@ impl Pipeline {
             vae_cfg: Vae16Config::wan21(),
             root: root.to_path_buf(),
             device: device.clone(),
+            campaign_context: None,
         }
     }
 
@@ -156,6 +163,9 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
         crate::sc20686_observer::observe("process-start", 0, 0, 0);
+        if self.campaign_context.is_some() {
+            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
+        }
         let clip = req
             .control_clip()
             .ok_or_else(|| CandleError::Msg("wan-vace: requires a ControlClip".into()))?;
@@ -178,6 +188,17 @@ impl Pipeline {
         // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [1,3,F,H,W].
         let control_video = self.preprocess_clip(clip.frames, width, height)?;
         let mask = self.preprocess_clip(clip.mask, width, height)?;
+        crate::sc20686_observer::observe_tensor(
+            "prefill-peak",
+            "control-mask-prepared",
+            (control_video.elem_count() as u64).saturating_mul(VAE_DTYPE.size() as u64),
+            (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size() as u64),
+            0,
+            format!("{:?};{:?}", control_video.dims(), mask.dims()),
+            format!("{:?}", control_video.dtype()),
+            "control-mask",
+            "applied",
+        );
         let mask = ((mask + 1.0)? * 0.5)?; // (m+1)/2 ∈ [0,1]
 
         // Reference images (optional) → [1,3,1,H,W] each.
@@ -288,6 +309,17 @@ pub struct WanVaceGenerator {
     device: Device,
     components: Mutex<Option<Components>>,
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
+}
+
+impl WanVaceGenerator {
+    pub fn with_campaign_context(
+        mut self,
+        context: crate::sc20686_observer::CampaignContext,
+    ) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
 }
 
 impl WanVaceGenerator {
@@ -433,8 +465,18 @@ impl Generator for WanVaceGenerator {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
         let pipe = Pipeline::load(&self.root, &self.device);
+        let pipe = self
+            .campaign_context
+            .clone()
+            .map_or(pipe, |context| pipe.with_campaign_context(context));
         let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
+        let (frames, fps) = match pipe.render(req, &components, on_progress) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::sc20686_observer::observe_cancelled();
+                return Err(error.into());
+            }
+        };
         crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
@@ -537,6 +579,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         components: Mutex::new(None),
         i2v_memory,
+        campaign_context: None,
     }))
 }
 

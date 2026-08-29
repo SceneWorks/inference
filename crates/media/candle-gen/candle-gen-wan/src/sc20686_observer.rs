@@ -1,4 +1,5 @@
 //! Optional SC-20686 campaign observer. `None` is the production default.
+use serde::Serialize;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Write};
@@ -26,7 +27,7 @@ pub trait CacheObserver {
 }
 /// Product-owned identity captured after Wan model loading; campaign callers must not populate
 /// evidence fields from CLI claims.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CampaignContext {
     pub source_ref: String,
     pub snapshot_sha256: String,
@@ -37,7 +38,8 @@ pub struct CampaignContext {
 pub struct JsonlObserver(File);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
-        let line = format!("{{\"phase\":\"{}\",\"attention\":\"{}\",\"operation\":\"{}\",\"tensor_shape\":\"{}\",\"dtype\":\"{}\",\"mask\":\"{}\",\"rope\":\"{}\",\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"elapsed_ms\":{},\"at_ns\":{}}}\n", event.phase, event.attention, event.operation, event.tensor_shape, event.dtype, event.mask, event.rope, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.elapsed_ms, event.at_ns);
+        let context = serde_json::to_string(&event.context).unwrap_or_else(|_| "null".into());
+        let line = format!("{{\"phase\":\"{}\",\"attention\":\"{}\",\"operation\":\"{}\",\"tensor_shape\":\"{}\",\"dtype\":\"{}\",\"mask\":\"{}\",\"rope\":\"{}\",\"context\":{},\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"elapsed_ms\":{},\"at_ns\":{}}}\n", event.phase, event.attention, event.operation, event.tensor_shape, event.dtype, event.mask, event.rope, context, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.elapsed_ms, event.at_ns);
         let _ = self.0.write_all(line.as_bytes());
         let _ = self.0.flush();
     }
