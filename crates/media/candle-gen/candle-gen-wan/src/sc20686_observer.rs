@@ -29,6 +29,48 @@ pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
 }
 
+/// The complete source-owned arm plan. It is inert until a caller explicitly arms an output
+/// request; keeping it here prevents individual examples from silently omitting a route or arm.
+pub const CAMPAIGN_ROUTES: [&str; 5] = [
+    "wan2_2_ti2v_5b",
+    "wan2_2_t2v_14b",
+    "wan2_2_i2v_14b",
+    "wan_vace",
+    "wan2_2_vace_fun_14b",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CampaignArm {
+    Normal,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CampaignCoordinate {
+    pub variant: &'static str,
+    pub arm: CampaignArm,
+}
+
+pub fn campaign_plan() -> [CampaignCoordinate; 10] {
+    let mut plan = [CampaignCoordinate {
+        variant: CAMPAIGN_ROUTES[0],
+        arm: CampaignArm::Normal,
+    }; 10];
+    let mut index = 0;
+    for variant in CAMPAIGN_ROUTES {
+        plan[index] = CampaignCoordinate {
+            variant,
+            arm: CampaignArm::Normal,
+        };
+        plan[index + 1] = CampaignCoordinate {
+            variant,
+            arm: CampaignArm::Cancel,
+        };
+        index += 2;
+    }
+    plan
+}
+
 /// Checked projection for the campaign's explicit block-quant contract. The producer supplies the
 /// measured dense element count; no caller-provided byte estimate is accepted.
 pub fn checked_compressed_bytes(
@@ -683,6 +725,26 @@ mod tests {
         assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(64));
         assert_eq!(checked_compressed_bytes(0, 4, 64), None);
         assert_eq!(checked_compressed_bytes(u64::MAX, 32, 64), None);
+    }
+
+    #[test]
+    fn campaign_plan_covers_each_route_once_per_arm() {
+        let plan = campaign_plan();
+        assert_eq!(plan.len(), CAMPAIGN_ROUTES.len() * 2);
+        for route in CAMPAIGN_ROUTES {
+            assert_eq!(
+                plan.iter()
+                    .filter(|item| item.variant == route && item.arm == CampaignArm::Normal)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                plan.iter()
+                    .filter(|item| item.variant == route && item.arm == CampaignArm::Cancel)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
