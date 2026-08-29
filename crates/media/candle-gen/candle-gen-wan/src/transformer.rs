@@ -265,6 +265,7 @@ impl Attention {
     /// Project a step-invariant cross-attention source into K/V heads once per request conditioning
     /// payload.  The resulting tensors remain owned by the caller's request scope.
     fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        let measured = std::time::Instant::now();
         let (b, s_kv, _) = context.dims3()?;
         let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
         let v = self.to_v.forward(context)?;
@@ -273,11 +274,12 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
-        crate::sc20686_observer::observe(
+        crate::sc20686_observer::observe_timed(
             "cross-kv-created",
             (k.elem_count() + v.elem_count()) as u64 * 2,
             0,
             1,
+            Some(measured),
         );
         Ok(PreparedBlockCrossKv {
             key: to_heads(&k)?,
@@ -293,6 +295,7 @@ impl Attention {
         kv: &PreparedBlockCrossKv,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
+        let measured = std::time::Instant::now();
         let (b, s, _) = hidden.dims3()?;
         let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
@@ -308,7 +311,13 @@ impl Attention {
         }
         let scale = (self.head_dim as f64).powf(-0.5);
         let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
-        crate::sc20686_observer::observe("cross-kv-read", 0, (q.elem_count() as u64) * 4, 1);
+        crate::sc20686_observer::observe_timed(
+            "cross-kv-read",
+            0,
+            (q.elem_count() as u64) * 4,
+            1,
+            Some(measured),
+        );
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;

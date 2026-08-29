@@ -28,6 +28,24 @@ pub struct CacheEvent {
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
 }
+
+/// Checked projection for the campaign's explicit block-quant contract. The producer supplies the
+/// measured dense element count; no caller-provided byte estimate is accepted.
+pub fn checked_compressed_bytes(
+    elements: u64,
+    bits_per_element: u8,
+    block_bytes: u64,
+) -> Option<u64> {
+    if elements == 0 || bits_per_element == 0 || bits_per_element > 32 || block_bytes == 0 {
+        return None;
+    }
+    let bits = elements.checked_mul(u64::from(bits_per_element))?;
+    let payload = bits.checked_add(7)?.checked_div(8)?;
+    let blocks = payload
+        .checked_add(block_bytes - 1)?
+        .checked_div(block_bytes)?;
+    blocks.checked_mul(block_bytes)
+}
 /// Product-owned identity captured after Wan model loading; campaign callers must not populate
 /// evidence fields from CLI claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -356,6 +374,17 @@ fn install_with_context_inner(
     }
 }
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
+    observe_timed(phase, persistent_bytes, transient_bytes, reused, None);
+}
+
+/// Record a producer-measured operation duration. `None` retains the lifecycle elapsed time.
+pub fn observe_timed(
+    phase: &'static str,
+    persistent_bytes: u64,
+    transient_bytes: u64,
+    reused: u64,
+    measured: Option<Instant>,
+) {
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
             let context = CONTEXT.with(|ctx| ctx.borrow().clone());
@@ -368,12 +397,17 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 attention: "cross",
                 persistent_bytes,
                 transient_bytes,
-                elapsed_ms: STARTED.with(|started| {
-                    started
-                        .borrow()
-                        .as_ref()
-                        .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
-                }),
+                elapsed_ms: measured.map_or_else(
+                    || {
+                        STARTED.with(|started| {
+                            started
+                                .borrow()
+                                .as_ref()
+                                .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                        })
+                    },
+                    |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                ),
                 reused,
                 peak_bytes: measured_peak
                     .unwrap_or_else(|| persistent_bytes.saturating_add(transient_bytes)),
@@ -548,6 +582,13 @@ mod tests {
             geometry,
         )
         .is_err());
+    }
+
+    #[test]
+    fn compressed_projection_is_checked_and_block_aligned() {
+        assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(64));
+        assert_eq!(checked_compressed_bytes(0, 4, 64), None);
+        assert_eq!(checked_compressed_bytes(u64::MAX, 32, 64), None);
     }
 
     #[test]
