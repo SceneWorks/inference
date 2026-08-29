@@ -29,6 +29,11 @@ REQUIRED_MAPPINGS = {
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn tiled_online_attention"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn append_after_decision"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn trim_prefix"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub struct KreaPackedMetalKernel"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "pub fn enable_experimental_packed_metal"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "fn prepare_packed_window"),
+    ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub trait CausalPackedAttention"),
+    ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub fn forward_causal_chunk_with_packed_attention"),
 }
 REQUIRED_FALLBACKS = {"disabled", "q4-quality", "handle", "geometry", "mask", "cancellation", "receipt"}
 REQUIRED_RECEIPT_FIELDS = {
@@ -118,7 +123,10 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
         for needle in (*forbidden, "let mut scores"):
             if needle in production_source:
                 errors.append(f"compressed POC must not allocate a dense K/V window or score route: {needle}")
-        required = ("TILE_ROWS", "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision")
+        required = (
+            "TILE_ROWS", "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision",
+            "simdgroup_matrix", "KreaPackedMetalKernel", "current_k", "current_v",
+        )
         for needle in required:
             if needle not in source:
                 errors.append(f"compressed POC structural guard missing: {needle}")

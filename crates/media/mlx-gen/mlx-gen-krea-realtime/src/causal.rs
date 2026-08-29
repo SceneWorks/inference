@@ -36,10 +36,11 @@
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
-use mlx_gen_wan::{normalize_wan_key, WanTransformer};
+use mlx_gen_wan::{normalize_wan_key, CausalPackedAttention, WanTransformer};
 use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
+use crate::compressed_kv::{CompressedTier, KreaPackedMetalKernel};
 use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
 #[cfg(test)]
@@ -59,6 +60,46 @@ fn mask_materialization_count() -> usize {
 /// This is the **dense** form the attention path produces and consumes. The cache may store it
 /// group-wise-quantized ([`KvCacheQuant`]) and dequantize on read — see [`CausalKvCache`].
 pub type LayerKv = (Array, Array);
+
+/// One forward's borrowed adapter from Wan's projected q/current-K/current-V into Krea's retained
+/// packed history. It declines unsupported masks before dispatch; Wan then uses its unchanged dense
+/// path with the normal window it was given.
+struct PackedKreaAttentionBackend<'a> {
+    cache: &'a CausalKvCache,
+    query_positions: Array,
+    key_positions: Array,
+}
+
+impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
+    fn attend(
+        &mut self,
+        layer: usize,
+        q: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        mask: Option<&Array>,
+        _scale: f32,
+    ) -> Result<Option<Array>> {
+        // Krea's `block_causal_mask` is exact only when it returns None for one all-allowed
+        // frame block. Any materialized additive mask falls back before the experimental cache
+        // window is prepared, rather than pretending per-token causal masking is equivalent.
+        let shape = q.shape();
+        if mask.is_some() || shape.len() != 4 || shape[0] != 1 || shape[1] != 40 || shape[3] != 128
+        {
+            return Ok(None);
+        }
+        self.cache
+            .dispatch_experimental_packed_layer(
+                layer,
+                q,
+                current_k,
+                current_v,
+                &self.query_positions,
+                &self.key_positions,
+            )
+            .map(Some)
+    }
+}
 
 /// One group-wise affine-quantized cached tensor: the packed payload plus its per-group scales and
 /// biases (sc-17807).
@@ -194,6 +235,15 @@ impl StoredKv {
             (Self::Packed { .. }, None) => Err(Error::Msg(
                 "krea causal: KV cache holds quantized layers but carries no quantization tier"
                     .into(),
+            )),
+        }
+    }
+
+    fn packed(&self) -> Result<(&PackedKv, &PackedKv)> {
+        match self {
+            Self::Packed { k, v } => Ok((k, v)),
+            Self::Dense { .. } => Err(Error::Msg(
+                "krea packed Metal POC was selected for a dense cache".into(),
             )),
         }
     }
@@ -372,6 +422,9 @@ pub struct CausalKvCache {
     /// Storage tier for the retained K/V: `None` = bf16 (the shipped default), `Some(q)` = group-wise
     /// affine-quantized, dequantized on read (sc-17807).
     quant: Option<KvCacheQuant>,
+    /// Retained only after an explicit experimental caller enables the packed Metal path. The
+    /// default cache never constructs this object and therefore stays on the existing dense SDPA.
+    packed_metal_kernel: Option<KreaPackedMetalKernel>,
     /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
     /// eager max-window eviction exactly; production builds do not carry this field or branch.
     #[cfg(test)]
@@ -401,6 +454,7 @@ impl CausalKvCache {
             max_attention_size,
             sink_tokens,
             quant,
+            packed_metal_kernel: None,
             #[cfg(test)]
             evict_to_next_read: true,
         }
@@ -422,6 +476,136 @@ impl CausalKvCache {
     /// The storage tier this cache retains K/V at — `None` for the shipped bf16 cache.
     pub fn quant(&self) -> Option<KvCacheQuant> {
         self.quant
+    }
+
+    /// Explicitly construct and retain the MLX custom kernel for an already-quantized Krea cache.
+    /// This is intentionally separate from [`Self::new`]: production configuration remains dense
+    /// unless an experiment opts in and handles construction failure before any cache mutation.
+    pub fn enable_experimental_packed_metal(&mut self, allow_q4_quality_arm: bool) -> Result<()> {
+        let tier = match self.quant {
+            Some(KvCacheQuant {
+                bits: 8,
+                group_size: 64,
+            }) => CompressedTier::Q8,
+            Some(KvCacheQuant {
+                bits: 4,
+                group_size: 64,
+            }) if allow_q4_quality_arm => CompressedTier::Q4,
+            Some(KvCacheQuant {
+                bits: 4,
+                group_size: 64,
+            }) => {
+                return Err(Error::Msg(
+                    "krea packed Metal Q4 requires the separate quality-arm acknowledgement".into(),
+                ))
+            }
+            _ => {
+                return Err(Error::Msg(
+                    "krea packed Metal POC requires Q8/Q4 group-64 cache storage".into(),
+                ))
+            }
+        };
+        self.packed_metal_kernel = Some(KreaPackedMetalKernel::new(tier)?);
+        Ok(())
+    }
+
+    /// Whether this cache owns the experimental retained packed-attention kernel. This reports
+    /// construction, not successful JIT compilation or device dispatch.
+    pub fn experimental_packed_metal_enabled(&self) -> bool {
+        self.packed_metal_kernel.is_some()
+    }
+
+    fn preview_window_positions(&self, s_new: usize) -> Result<Vec<i64>> {
+        let positions = self.window_positions(s_new);
+        let sink_kept = self.sink_kept();
+        if let Some(requested) = positions
+            .iter()
+            .map(|&g| g as usize)
+            .find(|&g| g >= sink_kept && g < self.tail_base)
+        {
+            return Err(Error::Msg(format!(
+                "krea causal: packed reread needs evicted token {requested}; retained tail starts at {}",
+                self.tail_base
+            )));
+        }
+        Ok(positions)
+    }
+
+    /// Materialize the *packed* physical read window only.  This is the companion to
+    /// [`Self::window_prev`], but deliberately has no `StoredKv::dense` call: it gathers uint32
+    /// payload and bf16 metadata in-place for the retained custom kernel.
+    fn prepare_packed_window(&mut self, s_new: usize) -> Result<Vec<i64>> {
+        let positions = self.preview_window_positions(s_new)?;
+        let sink_kept = self.sink_kept();
+        let phys: Vec<i32> = positions
+            .iter()
+            .map(|&g| self.phys_index(g as usize) as i32)
+            .collect();
+        let whole = phys.len() == self.retained_tokens()
+            && phys.iter().enumerate().all(|(i, &p)| p as usize == i);
+        if !whole {
+            let idx = Array::from_slice(&phys, &[phys.len() as i32]);
+            for slot in self.layers.iter_mut() {
+                let stored = slot.as_ref().ok_or_else(|| {
+                    Error::Msg("krea packed window has tokens but a layer slot is empty".into())
+                })?;
+                // Fail before replacing any slot when the cache was not Q8/Q4 packed.
+                stored.packed()?;
+            }
+            for slot in self.layers.iter_mut() {
+                let stored = slot.take().expect("checked populated packed cache slot");
+                *slot = Some(stored.take(&idx)?);
+            }
+        }
+        self.tail_base = positions
+            .iter()
+            .map(|&g| g as usize)
+            .find(|&g| g >= sink_kept)
+            .unwrap_or(self.committed_tokens);
+        Ok(positions)
+    }
+
+    /// Direct packed-cache dispatch seam used by the experimental Wan attention backend. The
+    /// caller supplies only this layer's projected current K/V and O(S) global positions; historical
+    /// cache storage remains Krea's uint32/bf16 packed rows for the kernel to decode itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_experimental_packed_layer(
+        &self,
+        layer: usize,
+        q: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        query_positions: &Array,
+        key_positions: &Array,
+    ) -> Result<Array> {
+        let kernel = self.packed_metal_kernel.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "krea packed Metal dispatch requested without an enabled retained kernel".into(),
+            )
+        })?;
+        let stored = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "krea packed Metal dispatch missing cached layer {layer}"
+                ))
+            })?;
+        let (k, v) = stored.packed()?;
+        kernel.dispatch(
+            q,
+            &k.w,
+            &k.scales,
+            &k.biases,
+            &v.w,
+            &v.scales,
+            &v.biases,
+            current_k,
+            current_v,
+            query_positions,
+            key_positions,
+        )
     }
 
     /// Bytes **physically retained** right now, summed over every layer, in the representation the
@@ -853,23 +1037,51 @@ impl CausalKreaTransformer {
             .inner
             .prepare_rope_with_frame_offset(grid, start_frame)?;
 
-        // Windowed cache + the block-causal mask over [prev-window ‖ this-chunk].
-        let (prev_kv, prev_positions) = cache.window_prev(s_new)?;
+        // Preflight the exact logical window and block mask before a packed cache is gathered.
+        // A nontrivial additive mask must retain the current dense route rather than mutate state
+        // and discover only later that the experimental kernel cannot represent it.
+        let preview_positions = cache.preview_window_positions(s_new)?;
         let q_positions: Vec<i64> =
             (current_start_token as i64..(current_start_token + s_new) as i64).collect();
-        let mut kv_positions = prev_positions;
+        let mut kv_positions = preview_positions.clone();
         kv_positions.extend(q_positions.iter().copied());
         let mask = block_causal_mask(&q_positions, &kv_positions, self.block_size)?;
-
-        let (velocity, new_kv) = self.inner.forward_causal_chunk(
-            &tokens,
-            t,
-            cross_kv,
-            &cos,
-            &sin,
-            &prev_kv,
-            mask.as_ref(),
-        )?;
+        let packed_eligible = cache.experimental_packed_metal_enabled()
+            && !preview_positions.is_empty()
+            && mask.is_none();
+        let (velocity, new_kv) = if packed_eligible {
+            let packed_positions = cache.prepare_packed_window(s_new)?;
+            let query_positions = Array::from_slice(&q_positions, &[q_positions.len() as i32]);
+            let mut key_positions = packed_positions;
+            key_positions.extend(q_positions.iter().copied());
+            let key_positions = Array::from_slice(&key_positions, &[key_positions.len() as i32]);
+            let mut backend = PackedKreaAttentionBackend {
+                cache,
+                query_positions,
+                key_positions,
+            };
+            self.inner.forward_causal_chunk_with_packed_attention(
+                &tokens,
+                t,
+                cross_kv,
+                &cos,
+                &sin,
+                &[],
+                None,
+                &mut backend,
+            )?
+        } else {
+            let (prev_kv, _) = cache.window_prev(s_new)?;
+            self.inner.forward_causal_chunk(
+                &tokens,
+                t,
+                cross_kv,
+                &cos,
+                &sin,
+                &prev_kv,
+                mask.as_ref(),
+            )?
+        };
 
         // Unpatchify the per-token velocity [1, S, out_dim·∏patch] → [out_dim, F_chunk, H, W].
         let op = velocity.shape()[2];

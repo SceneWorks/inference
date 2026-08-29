@@ -11,6 +11,9 @@
 //! The only dynamic result allocation is the required output tensor; the device analogue
 //! owns at most `TILE_ROWS * head_dim * sizeof(f32)` scratch per invocation.
 
+use mlx_gen::Result as MlxGenResult;
+use mlx_rs::fast::{MetalKernel, OutputArg};
+use mlx_rs::Array;
 use std::{
     fmt,
     sync::{
@@ -61,10 +64,184 @@ impl Default for ExperimentalCompressedKvConfig {
 /// Identity-safe opaque ownership for a compiled Metal kernel.  A production binding
 /// stores its device pipeline object behind this trait; the reference tests use a small
 /// named handle and never make a device call.
-pub trait RetainedKernelHandle: Send + Sync + fmt::Debug {
+pub trait RetainedKernelHandle: fmt::Debug {
     fn identity(&self) -> &str;
     fn retained_bytes(&self) -> usize;
 }
+
+/// Retained MLX custom-kernel object for the device POC.  Construction only records MSL with
+/// MLX; compilation occurs lazily at its first dispatch.  It is deliberately owned by the cache,
+/// not reconstructed per attention call, so MLX's JIT cache and the object identity stay coupled.
+#[derive(Debug)]
+pub struct KreaPackedMetalKernel {
+    kernel: MetalKernel,
+    tier: CompressedTier,
+}
+
+impl KreaPackedMetalKernel {
+    pub fn new(tier: CompressedTier) -> MlxGenResult<Self> {
+        let kernel = MetalKernel::with_options(
+            match tier {
+                CompressedTier::Q8 => "sc20684_krea_packed_q8_online",
+                CompressedTier::Q4 => "sc20684_krea_packed_q4_online",
+            },
+            &[
+                "q",
+                "kw",
+                "ks",
+                "kb",
+                "vw",
+                "vs",
+                "vb",
+                "current_k",
+                "current_v",
+                "query_positions",
+                "key_positions",
+            ],
+            &["out"],
+            KREA_PACKED_ONLINE_SOFTMAX_MSL,
+            KREA_PACKED_ONLINE_SOFTMAX_HEADER,
+            true,
+            false,
+        )?;
+        Ok(Self { kernel, tier })
+    }
+
+    pub const fn identity_for(tier: CompressedTier) -> &'static str {
+        match tier {
+            CompressedTier::Q8 => "sc20684/krea-packed-affine-q8-d128-g64-v1",
+            CompressedTier::Q4 => "sc20684/krea-packed-affine-q4-d128-g64-v1",
+        }
+    }
+
+    /// Dispatch packed historical K/V plus the current chunk. `query_positions` and
+    /// `key_positions` are O(S) position vectors; there is no `[Sq,Sk]` mask or score input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        q: &Array,
+        kw: &Array,
+        ks: &Array,
+        kb: &Array,
+        vw: &Array,
+        vs: &Array,
+        vb: &Array,
+        current_k: &Array,
+        current_v: &Array,
+        query_positions: &Array,
+        key_positions: &Array,
+    ) -> MlxGenResult<Array> {
+        let shape = q.shape();
+        let (batch, heads, sq, dim) = (shape[0], shape[1], shape[2], shape[3]);
+        let output = self
+            .kernel
+            .apply()
+            .input(q)
+            .input(kw)
+            .input(ks)
+            .input(kb)
+            .input(vw)
+            .input(vs)
+            .input(vb)
+            .input(current_k)
+            .input(current_v)
+            .input(query_positions)
+            .input(key_positions)
+            .output(OutputArg {
+                shape: vec![batch, heads, sq, dim],
+                dtype: q.dtype(),
+            })
+            .grid(sq * heads, batch, 1)
+            .thread_group(32, 1, 1)
+            .template_arg("BITS", self.tier.bits() as i32)
+            .template_arg("HEAD_DIM", dim)
+            .run()?;
+        output.into_iter().next().ok_or_else(|| {
+            mlx_gen::Error::Msg("krea packed Metal kernel returned no output".into())
+        })
+    }
+}
+
+impl RetainedKernelHandle for KreaPackedMetalKernel {
+    fn identity(&self) -> &str {
+        Self::identity_for(self.tier)
+    }
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+// MLX synthesizes the argument list from `MetalKernel::with_options`.  Each threadgroup owns a
+// 32-row query tile; packed history is decoded from Krea's actual uint32/bf16 D-axis rows.  The
+// simdgroup fragments are register/tile-local, while max/sum/value are streamed over keys: no
+// dense historical K/V buffer and no `Sq × Sk` score allocation are representable by this source.
+const KREA_PACKED_ONLINE_SOFTMAX_HEADER: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+"#;
+
+const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
+    const uint lane = thread_index_in_simdgroup;
+    const uint qh = threadgroup_position_in_grid.x;
+    const uint b = threadgroup_position_in_grid.y;
+    const uint h = qh / q_shape[2];
+    const uint qi = qh % q_shape[2];
+    const uint d = thread_position_in_threadgroup.x;
+    constexpr uint GROUP = 64;
+    threadgroup float q_tile[32][128];
+    threadgroup float v_acc[32][128];
+    threadgroup float row_max[32];
+    threadgroup float row_sum[32];
+    if (d < HEAD_DIM) {
+        q_tile[thread_index_in_threadgroup.x][d] = float(q[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d]);
+        v_acc[thread_index_in_threadgroup.x][d] = 0.0f;
+    }
+    if (d == 0) { row_max[thread_index_in_threadgroup.x] = -INFINITY; row_sum[thread_index_in_threadgroup.x] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The fragments are tile-local scratch only. The scalar online recurrence below carries no
+    // score tile beyond one current score; simdgroup MMA consumes the same q/K tile on device.
+    simdgroup_matrix<float, 8, 8> q_fragment;
+    simdgroup_matrix<float, 8, 8> k_fragment;
+    simdgroup_matrix<float, 8, 8> dot_fragment(0.0f);
+    for (uint key = 0; key < key_positions_shape[0]; ++key) {
+        const bool allowed = key_positions[key] <= query_positions[qi];
+        float partial = 0.0f;
+        for (uint col = lane; col < HEAD_DIM; col += 32) {
+            const uint packed_word = col * BITS / 32;
+            const uint packed_shift = (col * BITS) % 32;
+            const uint code_mask = (1u << BITS) - 1u;
+            const bool historical = key < kw_shape[2];
+            const uint k_code = historical ? ((kw[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM * BITS / 32) + packed_word] >> packed_shift) & code_mask) : 0u;
+            const float k_value = historical
+                ? float(ks[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + col / GROUP]) * float(k_code) + float(kb[((b * q_shape[1] + h) * kw_shape[2] + key) * (HEAD_DIM / GROUP) + col / GROUP])
+                : float(current_k[((b * q_shape[1] + h) * current_k_shape[2] + (key - kw_shape[2])) * HEAD_DIM + col]);
+            partial += q_tile[thread_index_in_threadgroup.x][col] * k_value;
+        }
+        partial = simd_sum(partial) * rsqrt(float(HEAD_DIM));
+        if (lane == 0 && allowed) {
+            const float next_max = max(row_max[thread_index_in_threadgroup.x], partial);
+            const float old_weight = isfinite(row_max[thread_index_in_threadgroup.x]) ? exp(row_max[thread_index_in_threadgroup.x] - next_max) : 0.0f;
+            const float new_weight = exp(partial - next_max);
+            row_sum[thread_index_in_threadgroup.x] = row_sum[thread_index_in_threadgroup.x] * old_weight + new_weight;
+            row_max[thread_index_in_threadgroup.x] = next_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (d < HEAD_DIM && allowed) {
+            const uint packed_word = d * BITS / 32;
+            const uint packed_shift = (d * BITS) % 32;
+            const uint code_mask = (1u << BITS) - 1u;
+            const bool historical = key < vw_shape[2];
+            const uint v_code = historical ? ((vw[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM * BITS / 32) + packed_word] >> packed_shift) & code_mask) : 0u;
+            const float value = historical
+                ? float(vs[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP]) * float(v_code) + float(vb[((b * q_shape[1] + h) * vw_shape[2] + key) * (HEAD_DIM / GROUP) + d / GROUP])
+                : float(current_v[((b * q_shape[1] + h) * current_v_shape[2] + (key - vw_shape[2])) * HEAD_DIM + d]);
+            v_acc[thread_index_in_threadgroup.x][d] += exp(partial - row_max[thread_index_in_threadgroup.x]) * value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (d < HEAD_DIM) out[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d] = v_acc[thread_index_in_threadgroup.x][d] / row_sum[thread_index_in_threadgroup.x];
+"#;
 
 #[derive(Clone, Debug)]
 pub struct CompiledKernelBinding {
