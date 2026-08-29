@@ -589,6 +589,12 @@ impl Flux2Edit {
             drop(vae);
             result?
         };
+        crate::sc20686_observer::observe(
+            "reference-encode",
+            (ref_tokens.elem_count() as u64).saturating_mul(ref_tokens.dtype().size() as u64),
+            0,
+            0,
+        );
 
         // The staged heavy phase starts only after both conditioning owners have synchronized and
         // dropped. The base DiT may be a one-block window over host-backed weights; the decode VAE
@@ -683,7 +689,15 @@ impl Flux2Edit {
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 // Joint image stream [target, refs] — references re-concatenated with the current target.
+                let recompute_started = std::time::Instant::now();
                 let hidden = Tensor::cat(&[latents, &ref_tokens], 1)?;
+                crate::sc20686_observer::observe_timed(
+                    "joint-reconcat",
+                    (hidden.elem_count() as u64).saturating_mul(hidden.dtype().size() as u64),
+                    0,
+                    1,
+                    Some(recompute_started),
+                );
                 if embedded_guidance {
                     // dev: a single forward feeding the embedded guidance scalar to the DiT.
                     return self.velocity(

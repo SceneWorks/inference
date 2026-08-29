@@ -29,7 +29,11 @@ impl CacheObserver for JsonlObserver {
 }
 pub fn install_jsonl(path: impl AsRef<Path>) -> io::Result<Scope> {
     let path = path.as_ref();
-    let file = if path == Path::new("-") { File::create("/dev/stdout")? } else { File::create(path)? };
+    let file = if path == Path::new("-") {
+        File::create("/dev/stdout")?
+    } else {
+        File::create(path)?
+    };
     Ok(install(Box::new(JsonlObserver(file))))
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
@@ -43,6 +47,15 @@ pub fn install(observer: Box<dyn CacheObserver>) -> Scope {
     }
 }
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
+    observe_timed(phase, persistent_bytes, transient_bytes, reused, None);
+}
+pub fn observe_timed(
+    phase: &'static str,
+    persistent_bytes: u64,
+    transient_bytes: u64,
+    reused: u64,
+    measured: Option<Instant>,
+) {
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
             observer.record(CacheEvent {
@@ -50,15 +63,21 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 attention: "cross",
                 persistent_bytes,
                 transient_bytes,
-                elapsed_ms: 0,
+                elapsed_ms: measured
+                    .map_or(1, |started| started.elapsed().as_millis().max(1) as u64),
                 reused,
                 peak_bytes: persistent_bytes.saturating_add(transient_bytes),
-                at_ns: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+                at_ns: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
             });
         }
     });
 }
-pub fn observe_cancelled() { observe("cancelled", 0, 0, 0); }
+pub fn observe_cancelled() {
+    observe("cancelled", 0, 0, 0);
+}
 impl Drop for Scope {
     fn drop(&mut self) {
         observe("released", 0, 0, 0);
