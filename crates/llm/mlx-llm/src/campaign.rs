@@ -573,6 +573,19 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV reconciliation failed".into());
     }
+    if receipt
+        .memory
+        .allocation_events
+        .iter()
+        .filter(|e| {
+            e.lifetime == "transient" && (e.role == "cache" || e.role == "attention-workspace")
+        })
+        .map(|e| e.bytes)
+        .sum::<u64>()
+        >= dense
+    {
+        return Err("aggregate full-cache temporary detected".into());
+    }
     if receipt.mode == "dense"
         && receipt.memory.persistent_kv_bytes.abs_diff(dense)
             > receipt.memory.reconciliation.tolerance_bytes
@@ -608,6 +621,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         / 5.0;
     if (receipt.timings.decode_tokens_per_second - decode_mean).abs() > 1e-9 {
         return Err("timing mean is not derived".into());
+    }
+    let average = |f: fn(&ReceiptTimingSample) -> f64| {
+        receipt.timings.samples.iter().map(f).sum::<f64>() / 5.0
+    };
+    if (receipt.timings.load_ms - average(|s| s.load_ms)).abs() > 1e-9
+        || (receipt.timings.prefill_ms - average(|s| s.prefill_ms)).abs() > 1e-9
+        || (receipt.timings.ttft_ms - average(|s| s.ttft_ms)).abs() > 1e-9
+        || (receipt.timings.first_token_ms - average(|s| s.first_token_ms)).abs() > 1e-9
+        || (receipt.timings.cold_compile_ms - average(|s| s.cold_compile_ms)).abs() > 1e-9
+        || (receipt.timings.warm_compile_ms - average(|s| s.warm_compile_ms)).abs() > 1e-9
+    {
+        return Err("timing field is not derived".into());
     }
     let variance = receipt
         .timings
