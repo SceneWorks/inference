@@ -1,0 +1,199 @@
+{
+  "schemaVersion": 1,
+  "story": "SC-20672",
+  "auditDate": "2026-08-29",
+  "integrity": {
+    "canonicalEncoding": "UTF-8, LF line endings, two-space JSON indentation, trailing newline",
+    "sha256Sidecar": "docs/architecture/sc-20672-veloxquant-provenance.json.sha256"
+  },
+  "upstream": {
+    "repository": "https://github.com/rajveer43/VeloxQuant-MLX",
+    "license": "MIT",
+    "frozenTag": "v0.65.0",
+    "tagObject": "94b7cf8be96331127ef9fd7e04b436232b7882b0",
+    "commit": "54989ee223611627592f7f9bd925e924658f1f22",
+    "taggedAt": "2026-08-28T22:55:50Z",
+    "planningBaseline": {
+      "tag": "v0.53.0",
+      "tagObject": "5c3c30cc360f96aa4702ccc0e5265009647df6c8",
+      "commit": "92909d441cfe1cad6693d9eec5cbf6f57a1d8ff4"
+    },
+    "materialDelta": [
+      "fused TurboQuant RVQ quantize-and-pack write path",
+      "RocketKV, pool-backed cache, profiling, and warmup infrastructure",
+      "no live TurboQuant direct compressed-domain attention dispatch"
+    ]
+  },
+  "localProvenance": {
+    "inferenceAuditHead": "f32fce06804e21eec86d488c8ba320eaf4cbfe11",
+    "productInferenceRevision": "3775a5f80a07a38071c7859f6ac565bcab5d1c7b",
+    "sceneWorksRevision": "367044f3553bbb89af4a6690aac3db5d0f40263b",
+    "pmetalMlxRsRevision": "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1",
+    "pmetalMlxVersion": "0.25 / MLX core 0.32.0",
+    "host": {
+      "macos": "26.5.2 (25F84)",
+      "xcode": "26.5 (17F42)",
+      "rust": "1.96.0",
+      "architecture": "arm64",
+      "chip": "Apple M5 Max",
+      "unifiedMemoryBytes": 137438953472
+    }
+  },
+  "localSourceMappings": [
+    {
+      "path": "crates/llm/mlx-llm/src/primitives/kv_cache.rs",
+      "symbol": "KvCache::update",
+      "sourceNeedle": "fn update",
+      "finding": "returns full dense cached K/V in [batch, kv_heads, seq, head_dim] layout"
+    },
+    {
+      "path": "crates/llm/mlx-llm/src/primitives/attention.rs",
+      "symbol": "sdpa",
+      "sourceNeedle": "pub fn sdpa",
+      "finding": "MLX fused SDPA seam; preserves q_len > 8 correctness mitigation"
+    },
+    {
+      "path": "crates/llm/mlx-llm/src/primitives/paged_kv_cache.rs",
+      "symbol": "PagedKvCache::gather",
+      "sourceNeedle": "fn gather",
+      "finding": "gather-then-SDPA, not scattered compressed attention"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
+      "symbol": "CausalKvCache::window_prev",
+      "sourceNeedle": "fn window_prev",
+      "finding": "packed group-affine cache dequantizes the read window before dense SDPA"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
+      "symbol": "Flux2KvCache::apply",
+      "sourceNeedle": "fn apply",
+      "finding": "persistent reference-image K/V extract and splice seam"
+    },
+    {
+      "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+      "symbol": "build_cache",
+      "sourceNeedle": "fn build_cache",
+      "finding": "per-generate evaluated text cross-K/V seam"
+    }
+  ],
+  "upstreamMechanisms": [
+    {
+      "path": "veloxquant_mlx/cache/turboquant_rvq_cache.py",
+      "symbol": "TurboQuantRVQKVCache.update_and_fetch",
+      "classification": "live-cache-storage-unsafe-for-promotion",
+      "finding": "packed keys, full dense K reconstruction on fetch, fp16 values"
+    },
+    {
+      "path": "veloxquant_mlx/metal/_rvq_quant_pack.py",
+      "symbol": "rvq_quant_pack",
+      "classification": "live-write-path-helper",
+      "finding": "removes RVQ index intermediates but does not dispatch compressed attention"
+    },
+    {
+      "path": "veloxquant_mlx/integration/mlx_lm_patch.py",
+      "symbol": "patch_model_kv_cache",
+      "classification": "live-cache-factory-hook",
+      "finding": "constructs fresh cache lists but leaves attention dispatch unchanged"
+    },
+    {
+      "path": "veloxquant_mlx/metal/fused_sdpa.py",
+      "symbol": "patch_mlx_lm_for_fused_sdpa",
+      "classification": "standalone-kernel-dispatch-no-op",
+      "finding": "explicitly delegates to default live generation SDPA"
+    },
+    {
+      "path": "veloxquant_mlx/metal/_scalar_attend.py",
+      "symbol": "scalar_fused_decode_attend",
+      "classification": "standalone-callable-kernel",
+      "finding": "group-affine direct decode candidate mechanism"
+    },
+    {
+      "path": "veloxquant_mlx/metal/_rabitq_attend.py",
+      "symbol": "rabitq_fused_attend",
+      "classification": "standalone-callable-kernel",
+      "finding": "packed-key online-softmax decode, D <= 256"
+    },
+    {
+      "path": "veloxquant_mlx/metal/_rabitq_prefill.py",
+      "symbol": "rabitq_prefill_attend",
+      "classification": "standalone-callable-kernel",
+      "finding": "tiled non-causal cross-attention, D <= 128, nibble-packed values"
+    },
+    {
+      "path": "veloxquant_mlx/cache/kivi_cache.py",
+      "symbol": "KIVIKVCache",
+      "classification": "live-cache-wrapper",
+      "finding": "source material, not a direct fused SceneWorks read path"
+    },
+    {
+      "path": "veloxquant_mlx/integration/mlx_vlm_patch.py",
+      "symbol": "patch_vlm_kv_cache",
+      "classification": "live-cache-factory-hook",
+      "finding": "VLM wrapper construction only"
+    },
+    {
+      "path": "veloxquant_mlx/cache/rocketkv_cache.py",
+      "symbol": "RocketKVKVCache",
+      "classification": "true-resident-eviction-dense-fetch",
+      "finding": "not a compressed-domain attention representation"
+    },
+    {
+      "path": "veloxquant_mlx/memory/pool_backed_cache.py",
+      "symbol": "PoolBackedKVCache",
+      "classification": "accounting-memory-utility",
+      "finding": "does not alter attention dispatch"
+    },
+    {
+      "path": "veloxquant_mlx/tests/metal",
+      "symbol": "Metal tests and benchmark scripts",
+      "classification": "test-benchmark-only",
+      "finding": "requires SC-20673 reproduction before promotion"
+    }
+  ],
+  "candidateMatrix": [
+    {
+      "name": "group-affine-kivi-style",
+      "status": "fallback",
+      "residentRepresentation": "packed K and V plus group scales and biases",
+      "requiredPromotionEvidence": [
+        "register-dequantized direct attention without a dense window",
+        "complete lifecycle and fallback semantics",
+        "model and shape qualification"
+      ]
+    },
+    {
+      "name": "packed-turboquant-rvq",
+      "status": "not-eligible-as-is",
+      "residentRepresentation": "two packed key index streams plus norm; fp16 values today",
+      "requiredPromotionEvidence": [
+        "fused read replacing full key reconstruction",
+        "compressed value representation",
+        "complete lifecycle and fallback semantics"
+      ]
+    },
+    {
+      "name": "asymmetric-rabitq",
+      "status": "provisional-poc-candidate",
+      "residentRepresentation": "one-bit packed keys and nibble-packed values",
+      "requiredPromotionEvidence": [
+        "supported-shape parity and quality",
+        "resident-byte and process-footprint reduction",
+        "decode and large-query compatibility evidence"
+      ]
+    }
+  ],
+  "nonGoals": [
+    "full-cache dequantize-then-SDPA",
+    "materialized S_q by S_kv score matrices",
+    "treating kernel presence or upstream synthetic metrics as SceneWorks evidence",
+    "porting the complete VeloxQuant registry",
+    "claiming Metal kernel portability to Candle or CUDA",
+    "ordinary per-denoise self-attention without demonstrated cache reuse"
+  ],
+  "evidenceStatus": {
+    "localMetalOrMlxExecution": "not-run-cpu-only-story",
+    "localRealWeightExecution": "not-run-cpu-only-story",
+    "candidateDecision": "provisional-pending-sc-20673"
+  }
+}
