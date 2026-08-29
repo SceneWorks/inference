@@ -17,8 +17,8 @@ pub mod attention;
 pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
-pub mod packed_group_affine_kv;
 pub mod packed_attention;
+pub mod packed_group_affine_kv;
 pub mod packed_metal;
 pub mod paged_kv_cache;
 pub mod projection;
@@ -41,6 +41,7 @@ pub use packed_group_affine_kv::{
     DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
     PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
 };
+pub use packed_metal::{PackedMask, PackedMetalKernel};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;

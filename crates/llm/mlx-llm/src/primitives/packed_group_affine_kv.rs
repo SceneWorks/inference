@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::primitives::kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
 use half::f16;
+use mlx_rs::Array;
 
 const MAGIC: &[u8; 8] = b"SW20675\0";
 const VERSION: u32 = 2;
@@ -54,12 +55,23 @@ pub struct DenseFallbackEvent {
 /// SC-20675 intentionally does not manufacture a Metal object from descriptive strings.  The
 /// later SC-20676 compiler supplies its real retained pipeline/argument state through this small
 /// object-safe boundary, so a cache cannot outlive (or be rebound to) another cache's reader.
-pub trait RetainedPackedKernel: fmt::Debug + Send + Sync {
+pub trait RetainedPackedKernel: fmt::Debug {
     fn cache_identity(&self) -> &str;
     fn backend(&self) -> &str;
     /// Heap/device bytes retained exclusively by this compiled object, if the backend can report
     /// them.  The storage accounting includes this value and never calls it payload bytes.
     fn retained_bytes(&self) -> usize;
+    fn dispatch(
+        &self,
+        query: &Array,
+        k_codes: &Array,
+        k_scale: &Array,
+        k_zero: &Array,
+        v_codes: &Array,
+        v_scale: &Array,
+        v_zero: &Array,
+        mask: crate::primitives::packed_metal::PackedMask,
+    ) -> Result<Array>;
 }
 
 /// Lifetime-owned, type-erased compiled-kernel slot.  `Arc` keeps the real backend object alive
@@ -145,6 +157,22 @@ impl RetainedPackedKernel for OpaqueCompiledKernel {
     fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
+
+    fn dispatch(
+        &self,
+        _query: &Array,
+        _k_codes: &Array,
+        _k_scale: &Array,
+        _k_zero: &Array,
+        _v_codes: &Array,
+        _v_scale: &Array,
+        _v_zero: &Array,
+        _mask: crate::primitives::packed_metal::PackedMask,
+    ) -> Result<Array> {
+        Err(Error::Unsupported(
+            "opaque packed reader cannot dispatch".into(),
+        ))
+    }
 }
 
 /// Explicit, opt-in decoder construction request.  This is deliberately an override rather than
@@ -228,12 +256,29 @@ impl DenseFallbackPackedDecoderCache {
     pub fn bind_compiled_handle(&mut self, handle: CompiledKernelHandle) -> Result<()> {
         self.staged.bind_compiled_handle(handle)
     }
+
+    /// Install-time decoder seam for the retained reader.  The dense cache remains the
+    /// compatibility implementation until this explicit opt-in succeeds; thereafter callers can
+    /// dispatch attention directly from the staged packed cache without asking `update` for a
+    /// reconstructed full K/V tensor.
+    pub fn dispatch_packed(
+        &mut self,
+        layer: usize,
+        query: &mlx_rs::Array,
+        mask: crate::primitives::packed_metal::PackedMask,
+    ) -> Result<mlx_rs::Array> {
+        self.staged.dispatch_packed(layer, query, mask)
+    }
 }
 
 impl KvCache for DenseFallbackPackedDecoderCache {
-    fn preflight_packed(&self, _query_length: usize, _mask: bool) -> CacheRoute {
-        CacheRoute::DenseFallback {
-            reason: self.reason.clone(),
+    fn preflight_packed(&self, _query_length: usize, mask: bool) -> CacheRoute {
+        if self.staged.compiled_handle().is_some() && !mask {
+            CacheRoute::ExperimentalPacked
+        } else {
+            CacheRoute::DenseFallback {
+                reason: self.reason.clone(),
+            }
         }
     }
 
@@ -665,6 +710,10 @@ pub struct PackedGroupAffineKvCache {
     cancelled: bool,
     /// No reader is installed until SC-20676 binds a retained compiled object for this identity.
     handle: Option<CompiledKernelHandle>,
+    /// Counters are cache-owned so a successful packed dispatch cannot be confused with a
+    /// dense reconstruction performed by a caller.
+    direct_dispatches: usize,
+    full_cache_dequantizations: usize,
 }
 
 impl PackedGroupAffineKvCache {
@@ -692,6 +741,8 @@ impl PackedGroupAffineKvCache {
             fallback_events: Vec::new(),
             cancelled: false,
             handle: None,
+            direct_dispatches: 0,
+            full_cache_dequantizations: 0,
         })
     }
 
@@ -982,6 +1033,98 @@ impl PackedGroupAffineKvCache {
         self.handle = Some(handle);
         Ok(())
     }
+
+    /// Materialize only the packed MLX buffers for a resident layer.  This is an argument
+    /// adapter, not a dequantizer: codes remain 2-bit packed and scales/zeros remain f16.
+    /// Incomplete token groups are rejected because the Metal reader has no dense pending-tail
+    /// mirror to consult.
+    pub fn packed_mlx_arguments(
+        &self,
+        layer: usize,
+    ) -> Result<(Array, Array, Array, Array, Array, Array)> {
+        let storage = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::Config("packed layer is not resident".into()))?;
+        if storage.keys.pending_tokens != 0 {
+            return Err(Error::Unsupported(
+                "packed Metal reader requires complete key groups".into(),
+            ));
+        }
+        let groups = self.logical_len.div_ceil(self.group_size);
+        let rows = self.rows();
+        let key_bytes = storage.keys.code_bytes_per_group();
+        let key_codes = Array::from_slice(
+            &storage.keys.codes,
+            &[self.batch, self.kv_heads, groups, key_bytes].map(|v| v as i32),
+        );
+        let key_shape = [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
+        let key_scale = Array::from_slice(&storage.keys.scales, &key_shape);
+        let key_zero = Array::from_slice(&storage.keys.zeros, &key_shape);
+        let value_bytes = storage.values.code_bytes_per_group();
+        let value_codes = Array::from_slice(
+            &storage.values.codes,
+            &[self.batch, self.kv_heads, self.logical_len, value_bytes].map(|v| v as i32),
+        );
+        let value_groups = self.head_dimension.div_ceil(self.group_size);
+        let value_shape =
+            [self.batch, self.kv_heads, self.logical_len, value_groups].map(|v| v as i32);
+        let value_scale = Array::from_slice(&storage.values.scales, &value_shape);
+        let value_zero = Array::from_slice(&storage.values.zeros, &value_shape);
+        debug_assert_eq!(rows * groups * key_bytes, storage.keys.codes.len());
+        Ok((
+            key_codes,
+            key_scale,
+            key_zero,
+            value_codes,
+            value_scale,
+            value_zero,
+        ))
+    }
+
+    /// Run the retained reader against the cache's actual packed layer buffers.  Selection must
+    /// happen before mutation; this method therefore accepts an immutable cache reference and
+    /// increments the direct-path counter only after MLX returns an output.
+    pub fn dispatch_packed(
+        &mut self,
+        layer: usize,
+        query: &Array,
+        mask: crate::primitives::packed_metal::PackedMask,
+    ) -> Result<Array> {
+        if self.handle.is_none() {
+            return Err(Error::Unsupported("no retained packed reader".into()));
+        }
+        if self.logical_len == 0 {
+            return Err(Error::Config(
+                "cannot dispatch an empty packed cache".into(),
+            ));
+        }
+        if self.logical_len % self.group_size != 0 {
+            return Err(Error::Unsupported(
+                "incomplete key group requires dense fallback".into(),
+            ));
+        }
+        let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
+        let output = self
+            .handle
+            .as_ref()
+            .expect("checked above")
+            .inner
+            .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
+        self.direct_dispatches += 1;
+        Ok(output)
+    }
+
+    pub fn direct_dispatches(&self) -> usize {
+        self.direct_dispatches
+    }
+    pub fn full_cache_dequantizations(&self) -> usize {
+        self.full_cache_dequantizations
+    }
+    pub fn record_dense_dequantization(&mut self) {
+        self.full_cache_dequantizations += 1;
+    }
     pub fn preflight(
         &mut self,
         backend: &str,
@@ -1005,6 +1148,27 @@ impl PackedGroupAffineKvCache {
         } else {
             crate::primitives::CacheRoute::ExperimentalPacked
         }
+    }
+
+    /// Capability-aware preflight used by the decoder seam.  Causal and bounded sliding masks
+    /// are handled by the retained reader; arbitrary additive masks remain a dense fallback and
+    /// are reported before any cache mutation.
+    pub fn preflight_mask(
+        &mut self,
+        backend: &str,
+        query_length: usize,
+        mask: crate::primitives::packed_metal::PackedMask,
+    ) -> crate::primitives::CacheRoute {
+        if matches!(
+            mask,
+            crate::primitives::packed_metal::PackedMask::AdditiveUnsupported
+        ) {
+            self.dense_read_fallback("preflight", "additive mask requires dense fallback");
+            return crate::primitives::CacheRoute::DenseFallback {
+                reason: "additive mask requires dense fallback".into(),
+            };
+        }
+        self.preflight(backend, query_length, false)
     }
 
     /// Versioned, identity-bound snapshot. Restore is all-or-nothing and rejects mismatched shape,
