@@ -301,6 +301,14 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         self.dense.update(layer, keys, values)
     }
 
+    fn offset(&self) -> i32 {
+        self.staged.logical_len() as i32
+    }
+
+    fn batch_size(&self) -> i32 {
+        self.staged.batch_size() as i32
+    }
+
     fn try_packed_attention(
         &mut self,
         layer: usize,
@@ -311,7 +319,15 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         _scale: f32,
         retained_for_sharing: bool,
     ) -> Result<Option<mlx_rs::Array>> {
-        if retained_for_sharing || self.staged.compiled_handle().is_none() {
+        if retained_for_sharing {
+            return Ok(None);
+        }
+        if self.staged.logical_len() != 0 && self.staged.compiled_handle().is_none() {
+            return Err(Error::Unsupported(
+                "packed history cannot silently transition to an empty dense cache".into(),
+            ));
+        }
+        if self.staged.compiled_handle().is_none() {
             return Ok(None);
         }
         let packed_mask = match mask {
@@ -322,7 +338,14 @@ impl KvCache for DenseFallbackPackedDecoderCache {
             crate::primitives::kv_cache::PackedAttentionMask::SlidingWindow(window) => {
                 crate::primitives::packed_metal::PackedMask::SlidingWindow(window)
             }
-            crate::primitives::kv_cache::PackedAttentionMask::Additive => return Ok(None),
+            crate::primitives::kv_cache::PackedAttentionMask::Additive => {
+                if self.staged.logical_len() != 0 {
+                    return Err(Error::Unsupported(
+                        "packed history cannot transition to additive dense attention".into(),
+                    ));
+                }
+                return Ok(None);
+            }
         };
         let keys = keys.as_dtype(mlx_rs::Dtype::Float32)?;
         let values = values.as_dtype(mlx_rs::Dtype::Float32)?;
@@ -337,16 +360,11 @@ impl KvCache for DenseFallbackPackedDecoderCache {
             step,
         )?;
         let output = staged.dispatch_packed(layer, query, packed_mask)?;
+        // MLX dispatch is lazy; force completion before publishing the staged cache so a device
+        // fault cannot leave lifecycle state committed for an output that never completed.
+        output.eval()?;
         self.staged = staged;
         Ok(Some(output))
-    }
-
-    fn offset(&self) -> i32 {
-        self.dense.offset()
-    }
-
-    fn batch_size(&self) -> i32 {
-        self.dense.batch_size()
     }
 
     fn num_layers(&self) -> usize {
@@ -354,16 +372,27 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        if self.staged.logical_len() != 0 {
+            self.staged.dense_read_fallback(
+                "retain_sequences",
+                "packed lifecycle requires dense fallback",
+            );
+            return Err(Error::Unsupported(
+                "retain_sequences is not supported after packed dispatch".into(),
+            ));
+        }
         self.dense_before_mutation("retain_sequences");
         self.dense.retain_sequences(keep)
     }
 
     fn truncate(&mut self, len: i32) -> Result<()> {
+        self.staged.truncate(len as usize)?;
         self.dense_before_mutation("truncate");
         self.dense.truncate(len)
     }
 
     fn reset(&mut self) {
+        self.staged.clear();
         self.dense_before_mutation("reset");
         self.dense.reset();
     }
@@ -968,6 +997,9 @@ impl PackedGroupAffineKvCache {
     pub fn logical_len(&self) -> usize {
         self.logical_len
     }
+    pub fn batch_size(&self) -> usize {
+        self.batch
+    }
     pub fn allocated_len(&self) -> usize {
         self.capacity
     }
@@ -1140,7 +1172,8 @@ impl PackedGroupAffineKvCache {
                 keys.append(&last, 1)?;
             }
         }
-        let groups = self.logical_len.div_ceil(self.group_size);
+        let logical_len = storage.keys.logical_tokens();
+        let groups = logical_len.div_ceil(self.group_size);
         let rows = self.rows();
         let key_bytes = storage.keys.code_bytes_per_group();
         let key_codes = Array::from_slice(
@@ -1153,11 +1186,10 @@ impl PackedGroupAffineKvCache {
         let value_bytes = self.head_dimension.div_ceil(4);
         let value_codes = Array::from_slice(
             &storage.values.codes,
-            &[self.batch, self.kv_heads, self.logical_len, value_bytes].map(|v| v as i32),
+            &[self.batch, self.kv_heads, logical_len, value_bytes].map(|v| v as i32),
         );
         let value_groups = self.head_dimension.div_ceil(self.group_size);
-        let value_shape =
-            [self.batch, self.kv_heads, self.logical_len, value_groups].map(|v| v as i32);
+        let value_shape = [self.batch, self.kv_heads, logical_len, value_groups].map(|v| v as i32);
         let value_scale = Array::from_slice(&storage.values.scales, &value_shape);
         let value_zero = Array::from_slice(&storage.values.zeros, &value_shape);
         debug_assert_eq!(rows * groups * key_bytes, keys.codes.len());
@@ -1183,7 +1215,12 @@ impl PackedGroupAffineKvCache {
         if self.handle.is_none() {
             return Err(Error::Unsupported("no retained packed reader".into()));
         }
-        if self.logical_len == 0 {
+        let layer_len = self
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map_or(0, |storage| storage.keys.logical_tokens());
+        if layer_len == 0 {
             return Err(Error::Config(
                 "cannot dispatch an empty packed cache".into(),
             ));
