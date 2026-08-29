@@ -22,7 +22,7 @@ pub trait CacheObserver {
 pub struct JsonlObserver(File);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
-        let line = format!("{{\"phase\":\"{}\",\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"at_ns\":{}}}\n", event.phase, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.at_ns);
+        let line = format!("{{\"phase\":\"{}\",\"attention\":\"{}\",\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"elapsed_ms\":{},\"at_ns\":{}}}\n", event.phase, event.attention, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.elapsed_ms, event.at_ns);
         let _ = self.0.write_all(line.as_bytes());
         let _ = self.0.flush();
     }
@@ -58,9 +58,9 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
         }
     });
 }
+pub fn observe_cancelled() { observe("cancelled", 0, 0, 0); }
 impl Drop for Scope {
     fn drop(&mut self) {
-        observe("cancelled", 0, 0, 0);
         observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         let _ = self.started;

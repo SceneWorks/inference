@@ -67,12 +67,14 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
     if any(not isinstance(metrics.get(k), (int, float)) for k in metric_keys):
         raise ValueError("entrypoint metrics are incomplete")
     phases = {e.get("phase") for e in events}
-    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "cancelled", "released"} <= phases:
+    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "released"} <= phases:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
     cancelled = [i for i, e in enumerate(events) if e.get("phase") == "cancelled"]
     released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
-    if not cancelled or not released or max(cancelled) > min(released):
-        raise ValueError("cancellation cleanup must precede release")
+    if not released or (args.cancel_campaign and (not cancelled or max(cancelled) > min(released))):
+        raise ValueError("deliberate cancellation cleanup must precede release")
+    if not args.cancel_campaign and cancelled:
+        raise ValueError("normal generation cannot contain cancellation")
     samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events if "peak_bytes" in e]
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "source_ref": source_ref,
@@ -91,7 +93,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--campaign", action="store_true"); p.add_argument("--family", choices=("flux2-klein", "wan"), required=True)
     p.add_argument("--snapshot", type=Path, required=True); p.add_argument("--output", type=Path, required=True); p.add_argument("--variant", required=True)
-    p.add_argument("--geometry", type=Path); p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--fake", action="store_true"); args = p.parse_args()
+    p.add_argument("--geometry", type=Path); p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--cancel-campaign", action="store_true"); p.add_argument("--fake", action="store_true"); args = p.parse_args()
     if not args.campaign: p.error("SC-20686 adapter requires explicit --campaign")
     root = args.snapshot.resolve(); config_path = root / "config.json"
     try:

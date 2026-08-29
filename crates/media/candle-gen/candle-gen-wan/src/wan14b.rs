@@ -549,13 +549,13 @@ impl Pipeline {
         crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
-        check_cancel(cancel)?;
+        if let Err(error) = check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
         let neg_kv = ctx_neg
             .map(|context| expert.prepare_cross_kv(context))
             .transpose()?;
         for i in range {
-            check_cancel(cancel)?;
+            if let Err(error) = check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
             let t = sched.timestep(i);
             // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
             let x = match y {

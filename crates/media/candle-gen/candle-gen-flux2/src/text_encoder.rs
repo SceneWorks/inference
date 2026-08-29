@@ -522,7 +522,7 @@ impl Flux2PromptEncoder {
                 "flux2 caption-upsample: expected batch 1, got {batch}"
             )));
         }
-        candle_gen::check_cancel(cancel)?;
+        if let Err(error) = candle_gen::check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
         let mut cache = ContiguousKvCache::new(self.layers.len());
         let mut rng = SplitMix64::new(sampling.seed);
         let params = SamplingParams {
@@ -535,7 +535,7 @@ impl Flux2PromptEncoder {
         let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
         let mut generated = Vec::new();
         for step in 0..sampling.max_new_tokens {
-            candle_gen::check_cancel(cancel)?;
+            if let Err(error) = candle_gen::check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
             let next = sample(&logits, &[], &params, &mut rng, None)
                 .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
             if next == eos_token {
