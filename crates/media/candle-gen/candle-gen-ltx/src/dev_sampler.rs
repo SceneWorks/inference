@@ -1,8 +1,10 @@
 //! The non-distilled LTX-2.5 stage-one execution contract.
 //!
-//! A split LTX-2.5 transformer carries an explicit safetensors `variant` identity.  The dev
-//! checkpoint is not compatible with the eight-transition distilled trajectory: it runs thirty
-//! guided transitions and evaluates the joint DiT four times at each transition.
+//! A split LTX-2.5 transformer needs an explicit, immutable `variant` identity. Upstream headers
+//! may omit it, so terminal cases and promoted runtime bindings provide it without rewriting the
+//! weight bytes; present header metadata must still agree. The dev checkpoint is not compatible
+//! with the eight-transition distilled trajectory: it runs thirty guided transitions and evaluates
+//! the joint DiT four times at each transition.
 
 use candle_gen::candle_core::{DType, Error, Result, Tensor};
 use candle_gen::gen_core::ltx_checkpoint::{LtxBundle, LtxComponent};
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::STAGE1_SIGMAS;
 use crate::params::{GuiderParams, LTX_2_5_PARAMS};
 
-/// Transformer identity declared on the split transformer safetensors file.
+/// Transformer identity declared by a split-transformer header or a separately reviewed binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransformerVariant {
@@ -44,6 +46,29 @@ impl TransformerVariant {
             .require(LtxComponent::Transformer)
             .map_err(|error| Error::Msg(error.to_string()))?;
         Self::from_metadata(transformer.metadata().raw_value(Self::METADATA_KEY))
+    }
+
+    /// Apply a separately identity-bound variant declaration without rewriting upstream weight
+    /// headers. If the transformer does carry metadata it must agree exactly; only an absent value
+    /// may be supplied by the terminal case / promoted runtime binding.
+    pub fn from_bundle_with_binding(bundle: &LtxBundle, binding: Self) -> Result<Self> {
+        let transformer = bundle
+            .require(LtxComponent::Transformer)
+            .map_err(|error| Error::Msg(error.to_string()))?;
+        match transformer.metadata().raw_value(Self::METADATA_KEY) {
+            Some(value) => {
+                let declared = Self::from_metadata(Some(value))?;
+                if declared != binding {
+                    return Err(Error::Msg(format!(
+                        "ltx_2_5: transformer metadata variant {} disagrees with external binding {}",
+                        declared.id(),
+                        binding.id()
+                    )));
+                }
+                Ok(declared)
+            }
+            None => Ok(binding),
+        }
     }
 
     pub const fn is_dev(self) -> bool {
@@ -230,6 +255,23 @@ mod tests {
         );
         assert!(TransformerVariant::from_bundle(&transformer_bundle(None)).is_err());
         assert!(TransformerVariant::from_bundle(&transformer_bundle(Some("unknown"))).is_err());
+    }
+
+    #[test]
+    fn external_variant_binding_only_fills_absent_upstream_metadata() {
+        let upstream = transformer_bundle(None);
+        assert!(TransformerVariant::from_bundle(&upstream).is_err());
+        assert_eq!(
+            TransformerVariant::from_bundle_with_binding(&upstream, TransformerVariant::Dev)
+                .unwrap(),
+            TransformerVariant::Dev
+        );
+
+        let declared = transformer_bundle(Some("distilled"));
+        let error =
+            TransformerVariant::from_bundle_with_binding(&declared, TransformerVariant::Dev)
+                .expect_err("a binding may not override transformer metadata");
+        assert!(error.to_string().contains("disagrees"));
     }
 
     #[test]

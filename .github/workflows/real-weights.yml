@@ -242,7 +242,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: inference-real-weights-${{ github.ref }}-${{ inputs.profile || 'schedule' }}
+  group: inference-real-weights-physical-host
   cancel-in-progress: false
 
 # BUILD ARTIFACTS OUTSIDE THE DIRECTORY `actions/checkout` CLEANS.
