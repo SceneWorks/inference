@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::primitives::kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
 use half::f16;
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 const MAGIC: &[u8; 8] = b"SW20675\0";
@@ -37,6 +38,10 @@ pub struct RepresentationMetadata {
     pub logical_len: usize,
     pub capacity: usize,
     pub absolute_offset: usize,
+    pub host_allocated_payload_bytes: usize,
+    pub retained_device_packed_logical_bytes: usize,
+    /// Total cache-attributable packed bytes: host vector capacity plus live device-array payload.
+    /// Backend allocator overhead and shared pools require process-level measurement.
     pub allocated_bytes: usize,
     pub key_grouping: &'static str,
     pub value_grouping: &'static str,
@@ -54,8 +59,23 @@ pub struct DenseFallbackEvent {
 pub struct PackedDispatchTelemetry {
     pub cold_dispatches: u64,
     pub steady_dispatches: u64,
+    /// End-to-end first successful packed dispatch latency, including packed argument sync,
+    /// immutable MLX concatenation, lazy pipeline compilation, execution, and synchronization.
+    /// This is deliberately not presented as compile-only time because MLX does not expose that
+    /// boundary independently.
     pub cold_elapsed_ms: f64,
+    /// Sum of the same end-to-end latency for successful dispatches after the first.
     pub steady_elapsed_ms: f64,
+    /// Cumulative packed payload copied from host into MLX arrays. This includes newly appended
+    /// persistent chunks, retained-prefix rebuilds after trim/restore, and transient padded key
+    /// tails. Packed-domain device-to-device concatenation is not host upload traffic.
+    pub uploaded_packed_bytes: u64,
+    /// Logical payload currently retained by the cache-owned device arrays. Backend allocator
+    /// overhead and shared pools remain process-level receipt measurements.
+    pub retained_device_packed_logical_bytes: u64,
+    /// Largest packed argument payload presented to one kernel dispatch. This is not allocator
+    /// usage; the sealed process harness measures the actual transient high-water mark.
+    pub peak_packed_argument_logical_bytes: u64,
 }
 
 /// A retained backend object which owns the compiled reader for one cache identity.
@@ -68,7 +88,7 @@ pub trait RetainedPackedKernel: fmt::Debug {
     fn backend(&self) -> &str;
     /// Heap/device bytes retained exclusively by this compiled object, if the backend can report
     /// them.  The storage accounting includes this value and never calls it payload bytes.
-    fn retained_bytes(&self) -> usize;
+    fn retained_host_bytes_estimate(&self) -> usize;
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
@@ -103,8 +123,8 @@ impl CompiledKernelHandle {
         self.inner.backend()
     }
 
-    pub fn retained_bytes(&self) -> usize {
-        self.inner.retained_bytes()
+    pub fn retained_host_bytes_estimate(&self) -> usize {
+        self.inner.retained_host_bytes_estimate()
     }
 }
 
@@ -113,18 +133,21 @@ impl fmt::Debug for CompiledKernelHandle {
         f.debug_struct("CompiledKernelHandle")
             .field("cache_identity", &self.cache_identity())
             .field("backend", &self.backend())
-            .field("retained_bytes", &self.retained_bytes())
+            .field(
+                "retained_host_bytes_estimate",
+                &self.retained_host_bytes_estimate(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 /// Minimal opaque carrier for a backend-owned compiled object.  It is useful to the future Metal
 /// compiler because it retains an arbitrary concrete handle, but makes no claim that the supplied
-/// `retained_bytes` includes globally shared MLX/Metal allocations.
+/// The host estimate deliberately excludes globally shared MLX/Metal allocations.
 pub struct OpaqueCompiledKernel {
     cache_identity: String,
     backend: String,
-    retained_bytes: usize,
+    retained_host_bytes_estimate: usize,
     _keep_alive: Arc<dyn Any + Send + Sync>,
 }
 
@@ -133,7 +156,10 @@ impl fmt::Debug for OpaqueCompiledKernel {
         f.debug_struct("OpaqueCompiledKernel")
             .field("cache_identity", &self.cache_identity)
             .field("backend", &self.backend)
-            .field("retained_bytes", &self.retained_bytes)
+            .field(
+                "retained_host_bytes_estimate",
+                &self.retained_host_bytes_estimate,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -142,13 +168,13 @@ impl OpaqueCompiledKernel {
     pub fn new(
         cache_identity: impl Into<String>,
         backend: impl Into<String>,
-        retained_bytes: usize,
+        retained_host_bytes_estimate: usize,
         keep_alive: Arc<dyn Any + Send + Sync>,
     ) -> Self {
         Self {
             cache_identity: cache_identity.into(),
             backend: backend.into(),
-            retained_bytes,
+            retained_host_bytes_estimate,
             _keep_alive: keep_alive,
         }
     }
@@ -163,8 +189,8 @@ impl RetainedPackedKernel for OpaqueCompiledKernel {
         &self.backend
     }
 
-    fn retained_bytes(&self) -> usize {
-        self.retained_bytes
+    fn retained_host_bytes_estimate(&self) -> usize {
+        self.retained_host_bytes_estimate
     }
 
     fn dispatch(
@@ -239,10 +265,17 @@ impl DecoderCacheSelection {
 /// lifecycle operation records the reason and delegates to dense *before* it mutates K/V state.
 /// This is intentionally not advertised as compressed-domain attention.
 #[derive(Debug)]
+struct PendingPackedStep {
+    original_len: usize,
+    next_layer: usize,
+    step: usize,
+}
+
+#[derive(Debug)]
 pub struct DenseFallbackPackedDecoderCache {
     dense: ContiguousKvCache,
     staged: PackedGroupAffineKvCache,
-    pending_step: Option<Box<PackedGroupAffineKvCache>>,
+    pending_step: Option<PendingPackedStep>,
     reason: String,
 }
 
@@ -265,6 +298,32 @@ impl DenseFallbackPackedDecoderCache {
     /// execution path.
     pub fn bind_compiled_handle(&mut self, handle: CompiledKernelHandle) -> Result<()> {
         self.staged.bind_compiled_handle(handle)
+    }
+
+    fn rollback_pending(&mut self, operation: &str, reason: impl Into<String>) -> Result<()> {
+        let Some(pending) = self.pending_step.take() else {
+            return Ok(());
+        };
+        self.staged.trim(pending.original_len)?;
+        self.staged.dense_read_fallback(operation, reason);
+        Ok(())
+    }
+
+    fn decline_before_packed_mutation(
+        &mut self,
+        operation: &str,
+        reason: impl Into<String>,
+    ) -> Result<Option<Array>> {
+        let reason = reason.into();
+        if self.pending_step.is_some() || self.staged.logical_len() != 0 {
+            return Err(Error::Unsupported(format!(
+                "packed history cannot transition to unsupported {operation}: {reason}"
+            )));
+        }
+        self.staged.handle = None;
+        self.reason = reason.clone();
+        self.staged.dense_read_fallback(operation, reason);
+        Ok(None)
     }
 
     /// Install-time decoder seam for the retained reader.  The dense cache remains the
@@ -298,6 +357,24 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         keys: &mlx_rs::Array,
         values: &mlx_rs::Array,
     ) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
+        if self.pending_step.is_some() {
+            self.rollback_pending(
+                "update",
+                "dense update attempted while a packed whole-step transaction was pending",
+            )?;
+            return Err(Error::Unsupported(
+                "dense update cannot continue a partially executed packed step".into(),
+            ));
+        }
+        if self.staged.logical_len() != 0 {
+            return Err(Error::Unsupported(
+                "dense update cannot continue after packed history is resident".into(),
+            ));
+        }
+        if self.staged.compiled_handle().is_some() {
+            self.reason = "decoder layer requires dense attention before packed mutation".into();
+            self.staged.handle = None;
+        }
         self.dense_before_mutation("update");
         self.dense.update(layer, keys, values)
     }
@@ -320,81 +397,192 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         scale: f32,
         retained_for_sharing: bool,
     ) -> Result<Option<mlx_rs::Array>> {
-        if retained_for_sharing {
-            return Ok(None);
-        }
-        if self.staged.logical_len() != 0 && self.staged.compiled_handle().is_none() {
-            return Err(Error::Unsupported(
-                "packed history cannot silently transition to an empty dense cache".into(),
-            ));
-        }
-        if self.staged.compiled_handle().is_none() {
-            return Ok(None);
-        }
-        let expected_scale = (query.shape().get(3).copied().unwrap_or_default() as f32).powf(-0.5);
-        if scale.to_bits() != expected_scale.to_bits() {
-            if self.staged.logical_len() != 0 {
+        let outcome = (|| -> Result<Option<mlx_rs::Array>> {
+            if self.staged.logical_len() != 0 && self.staged.compiled_handle().is_none() {
                 return Err(Error::Unsupported(
-                    "packed history cannot transition to an unsupported attention scale".into(),
+                    "packed history cannot silently transition to an empty dense cache".into(),
                 ));
             }
-            return Ok(None);
-        }
-        let packed_mask = match mask {
-            crate::primitives::kv_cache::PackedAttentionMask::None
-            | crate::primitives::kv_cache::PackedAttentionMask::Causal => {
-                crate::primitives::packed_metal::PackedMask::Causal
-            }
-            crate::primitives::kv_cache::PackedAttentionMask::SlidingWindow(window) => {
-                crate::primitives::packed_metal::PackedMask::SlidingWindow(window)
-            }
-            crate::primitives::kv_cache::PackedAttentionMask::Additive => {
-                if self.staged.logical_len() != 0 {
-                    return Err(Error::Unsupported(
-                        "packed history cannot transition to additive dense attention".into(),
-                    ));
-                }
+            if self.staged.compiled_handle().is_none() {
                 return Ok(None);
             }
-        };
-        let keys = keys.as_dtype(mlx_rs::Dtype::Float32)?;
-        let values = values.as_dtype(mlx_rs::Dtype::Float32)?;
-        keys.eval()?;
-        values.eval()?;
-        let step = keys.shape()[2] as usize;
-        let mut staged = self.staged.clone();
-        if self.pending_step.is_none() && layer != 0 {
-            return Err(Error::Config(
-                "packed step must begin at layer zero for atomic commit".into(),
-            ));
+            if retained_for_sharing {
+                return self.decline_before_packed_mutation(
+                    "shared-kv attention",
+                    "the retained packed reader cannot publish K/V for a sharing tail",
+                );
+            }
+
+            // Validate the complete accepted surface before converting K/V, opening a transaction,
+            // appending host storage, or synchronizing any MLX device array.
+            let q_shape = query.shape();
+            let k_shape = keys.shape();
+            let v_shape = values.shape();
+            let supported_dtype = |dtype| {
+                matches!(
+                    dtype,
+                    mlx_rs::Dtype::Float16 | mlx_rs::Dtype::Bfloat16 | mlx_rs::Dtype::Float32
+                )
+            };
+            let shape_reason = if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
+                Some("query, key, and value tensors must all have rank four")
+            } else if layer >= self.staged.layers() {
+                Some("layer index is out of range")
+            } else if q_shape[0] != self.staged.batch
+                || k_shape[0] != self.staged.batch
+                || v_shape[0] != self.staged.batch
+            {
+                Some("query, key, and value batch dimensions must match the packed cache")
+            } else if k_shape[1] != self.staged.kv_heads
+                || v_shape[1] != self.staged.kv_heads
+                || q_shape[1] == 0
+                || q_shape[1] % self.staged.kv_heads != 0
+            {
+                Some("query heads must map evenly onto the packed K/V heads")
+            } else if !matches!(self.staged.head_dimension, 64 | 128 | 256)
+                || q_shape[3] != self.staged.head_dimension
+                || k_shape[3] != self.staged.head_dimension
+                || v_shape[3] != self.staged.head_dimension
+            {
+                Some("packed Metal head dimension must be 64, 128, or 256 and match all tensors")
+            } else if q_shape[2] == 0 || k_shape[2] == 0 || v_shape[2] != k_shape[2] {
+                Some("packed attention requires a non-empty, equal K/V token step")
+            } else if q_shape[2] != k_shape[2] {
+                Some("packed causal queries must cover exactly the newly appended K/V step")
+            } else if !supported_dtype(query.dtype())
+                || !supported_dtype(keys.dtype())
+                || !supported_dtype(values.dtype())
+            {
+                Some(
+                    "packed attention accepts only f16, bf16, or f32 query, key, and value tensors",
+                )
+            } else {
+                None
+            };
+            if let Some(reason) = shape_reason {
+                return self.decline_before_packed_mutation("geometry/dtype", reason);
+            }
+
+            let step = k_shape[2];
+            let (original_len, expected_layer, expected_step) = self
+                .pending_step
+                .as_ref()
+                .map_or((self.staged.logical_len(), 0, step), |pending| {
+                    (pending.original_len, pending.next_layer, pending.step)
+                });
+            if (self.pending_step.is_none() && layer != 0)
+                || expected_layer != layer
+                || expected_step != step
+            {
+                return Err(Error::Config(
+                    "packed step layer order or token length mismatch".into(),
+                ));
+            }
+            let expected_cache_len = original_len
+                .checked_add(step)
+                .ok_or_else(|| Error::Config("packed cache length overflow".into()))?;
+            if q_shape[2] > expected_cache_len {
+                return self.decline_before_packed_mutation(
+                    "query/cache length",
+                    "query length exceeds the post-append packed cache length",
+                );
+            }
+
+            let expected_scale = (q_shape[3] as f32).powf(-0.5);
+            if scale.to_bits() != expected_scale.to_bits() {
+                return self.decline_before_packed_mutation(
+                    "attention scale",
+                    "attention scale does not match inverse square-root head dimension",
+                );
+            }
+            let packed_mask = match mask {
+                crate::primitives::kv_cache::PackedAttentionMask::None
+                | crate::primitives::kv_cache::PackedAttentionMask::Causal => {
+                    crate::primitives::packed_metal::PackedMask::Causal
+                }
+                crate::primitives::kv_cache::PackedAttentionMask::SlidingWindow(window)
+                    if window > 0 && i32::try_from(window).is_ok() =>
+                {
+                    crate::primitives::packed_metal::PackedMask::SlidingWindow(window)
+                }
+                crate::primitives::kv_cache::PackedAttentionMask::SlidingWindow(_) => {
+                    return self.decline_before_packed_mutation(
+                        "sliding-window mask",
+                        "sliding window must be in 1..=i32::MAX",
+                    );
+                }
+                crate::primitives::kv_cache::PackedAttentionMask::Additive => {
+                    return self.decline_before_packed_mutation(
+                        "additive mask",
+                        "additive masks require dense attention",
+                    );
+                }
+            };
+
+            let keys = keys.as_dtype(mlx_rs::Dtype::Float32)?;
+            let values = values.as_dtype(mlx_rs::Dtype::Float32)?;
+            keys.eval()?;
+            values.eval()?;
+
+            // Mutate the packed cache in place and retain only the pre-step logical length for
+            // rollback. Cloning the full packed history once per token would make host work O(S^2).
+            if layer == 0 {
+                self.pending_step = Some(PendingPackedStep {
+                    original_len,
+                    next_layer: 0,
+                    step,
+                });
+            }
+            self.staged.append(
+                layer,
+                keys.as_slice::<f32>(),
+                values.as_slice::<f32>(),
+                step,
+            )?;
+            let output = match self.staged.dispatch_packed(layer, query, packed_mask) {
+                Ok(output) => output,
+                Err(error) if layer == 0 && original_len == 0 => {
+                    // Before any packed output is published, a device/JIT fault can still select
+                    // the ordinary dense path result-equivalently for this complete model step.
+                    self.rollback_pending("dispatch-fault", error.to_string())?;
+                    self.staged.handle = None;
+                    self.reason = format!("packed dispatch unavailable: {error}");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if layer + 1 == self.staged.layers() {
+                if self.staged.logical_len() != expected_cache_len {
+                    return Err(Error::Msg(
+                        "packed whole-step transaction did not commit".into(),
+                    ));
+                }
+                self.pending_step = None;
+            } else {
+                self.pending_step
+                    .as_mut()
+                    .expect("installed above")
+                    .next_layer += 1;
+            }
+            Ok(Some(output))
+        })();
+
+        match outcome {
+            Ok(None) if self.pending_step.is_some() => {
+                self.rollback_pending(
+                    "packed-transaction",
+                    "packed route declined after an earlier layer had appended",
+                )?;
+                Err(Error::Unsupported(
+                    "packed route declined during a whole-step transaction".into(),
+                ))
+            }
+            Err(error) if self.pending_step.is_some() => {
+                self.rollback_pending("packed-transaction", error.to_string())?;
+                Err(error)
+            }
+            other => other,
         }
-        if self.pending_step.is_some() && layer == 0 {
-            return Err(Error::Config(
-                "packed step transaction already has an outstanding layer".into(),
-            ));
-        }
-        staged = self
-            .pending_step
-            .take()
-            .map(|candidate| *candidate)
-            .unwrap_or(staged);
-        staged.append(
-            layer,
-            keys.as_slice::<f32>(),
-            values.as_slice::<f32>(),
-            step,
-        )?;
-        let output = staged.dispatch_packed(layer, query, packed_mask)?;
-        if layer + 1 == staged.layers() {
-            // All earlier packed outputs are graph dependencies of this last layer. One evaluation
-            // therefore catches any lazy JIT/device fault before publishing the whole-step cache,
-            // without imposing a synchronizing evaluation after every layer.
-            output.eval()?;
-            self.staged = staged;
-        } else {
-            self.pending_step = Some(Box::new(staged));
-        }
-        Ok(Some(output))
     }
 
     fn num_layers(&self) -> usize {
@@ -421,7 +609,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn truncate(&mut self, len: i32) -> Result<()> {
-        if self.pending_step.take().is_some() {
+        if let Some(pending) = self.pending_step.take() {
+            self.staged.trim(pending.original_len)?;
             self.staged
                 .dense_read_fallback("truncate", "discarded pending packed step");
         }
@@ -431,7 +620,10 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn reset(&mut self) {
-        if self.pending_step.take().is_some() {
+        if let Some(pending) = self.pending_step.take() {
+            self.staged
+                .trim(pending.original_len)
+                .expect("pending packed rollback remains in bounds");
             self.staged
                 .dense_read_fallback("reset", "discarded pending packed step");
         }
@@ -842,6 +1034,68 @@ struct LayerStorage {
     values: PackedTensor,
 }
 
+/// Evaluated MLX packed prefixes. The CPU representation is append-friendly and physically ordered
+/// `[group_or_token,row,payload]`; the Metal contract is row-major
+/// `[batch,head,group_or_token,payload]`. Monotonic extension uploads only new chunks; trim/restore
+/// rebuilds the retained prefix and telemetry counts that historical upload. MLX arrays are
+/// immutable, so extension uses a packed-domain concatenate whose real transient allocator peak is
+/// measured by the sealed process harness.
+#[derive(Clone, Debug)]
+struct DevicePackedLayer {
+    key_groups: usize,
+    value_tokens: usize,
+    key_codes: Option<Array>,
+    key_scales: Option<Array>,
+    key_zeros: Option<Array>,
+    value_codes: Option<Array>,
+    value_scales: Option<Array>,
+    value_zeros: Option<Array>,
+}
+
+impl DevicePackedLayer {
+    fn empty() -> Self {
+        Self {
+            key_groups: 0,
+            value_tokens: 0,
+            key_codes: None,
+            key_scales: None,
+            key_zeros: None,
+            value_codes: None,
+            value_scales: None,
+            value_zeros: None,
+        }
+    }
+}
+
+fn row_major_outer_rows<T: Copy>(
+    source: &[T],
+    outer: usize,
+    rows: usize,
+    payload: usize,
+) -> Result<Vec<T>> {
+    if source.len() != outer.saturating_mul(rows).saturating_mul(payload) {
+        return Err(Error::Config("packed storage layout mismatch".into()));
+    }
+    let mut reordered = Vec::with_capacity(source.len());
+    for row in 0..rows {
+        for item in 0..outer {
+            let start = (item * rows + row) * payload;
+            reordered.extend_from_slice(&source[start..start + payload]);
+        }
+    }
+    Ok(reordered)
+}
+
+fn joined_device_axis(prefix: Option<&Array>, chunk: Array) -> Result<Array> {
+    chunk.eval()?;
+    let joined = match prefix {
+        Some(prefix) => concatenate_axis(&[prefix, &chunk], 2)?,
+        None => chunk,
+    };
+    joined.eval()?;
+    Ok(joined)
+}
+
 #[derive(Clone, Debug)]
 pub struct PackedGroupAffineKvCache {
     identity: String,
@@ -853,6 +1107,7 @@ pub struct PackedGroupAffineKvCache {
     logical_len: usize,
     absolute_offset: usize,
     layers: Vec<Option<LayerStorage>>,
+    device_layers: Vec<Option<DevicePackedLayer>>,
     fallback_events: Vec<DenseFallbackEvent>,
     cancelled: bool,
     /// No reader is installed until SC-20676 binds a retained compiled object for this identity.
@@ -886,6 +1141,7 @@ impl PackedGroupAffineKvCache {
             logical_len: 0,
             absolute_offset: 0,
             layers: vec![None; layers],
+            device_layers: vec![None; layers],
             fallback_events: Vec::new(),
             cancelled: false,
             handle: None,
@@ -1021,6 +1277,15 @@ impl PackedGroupAffineKvCache {
             layer.values.truncate(len * rows);
         }
         self.logical_len = len;
+        for device in &mut self.device_layers {
+            if device.as_ref().is_some_and(|device| {
+                device.value_tokens > len || device.key_groups > len.div_ceil(self.group_size)
+            }) {
+                *device = None;
+            }
+        }
+        self.telemetry.retained_device_packed_logical_bytes =
+            self.retained_device_packed_logical_bytes() as u64;
         Ok(())
     }
     pub fn rollback(&mut self, len: usize) -> Result<()> {
@@ -1028,15 +1293,21 @@ impl PackedGroupAffineKvCache {
     }
     pub fn clear(&mut self) {
         self.layers.iter_mut().for_each(|l| *l = None);
+        self.device_layers.iter_mut().for_each(|l| *l = None);
         self.logical_len = 0;
         self.capacity = 0;
         self.cancelled = false;
+        self.telemetry.retained_device_packed_logical_bytes = 0;
     }
     pub fn cancel(&mut self) {
         self.cancelled = true;
         self.layers.iter_mut().for_each(|layer| *layer = None);
+        self.device_layers
+            .iter_mut()
+            .for_each(|layer| *layer = None);
         self.logical_len = 0;
         self.capacity = 0;
+        self.telemetry.retained_device_packed_logical_bytes = 0;
     }
     pub fn logical_len(&self) -> usize {
         self.logical_len
@@ -1067,12 +1338,18 @@ impl PackedGroupAffineKvCache {
     }
 
     /// Actual allocated payload capacity for codes, metadata, and the pending key tail.
-    pub fn allocated_payload_bytes(&self) -> usize {
+    pub fn host_allocated_payload_bytes(&self) -> usize {
         self.layers
             .iter()
             .flatten()
             .map(|l| l.keys.allocated_bytes() + l.values.allocated_bytes())
             .sum()
+    }
+
+    /// Cache-attributable packed bytes retained across host vectors and live MLX arrays.
+    pub fn allocated_payload_bytes(&self) -> usize {
+        self.host_allocated_payload_bytes()
+            .saturating_add(self.retained_device_packed_logical_bytes())
     }
 
     /// Compatibility name for callers which need physical packed payload capacity.
@@ -1082,7 +1359,7 @@ impl PackedGroupAffineKvCache {
 
     /// Backwards-compatible spelling for physical payload capacity.
     pub fn allocated_vec_bytes(&self) -> usize {
-        self.allocated_payload_bytes()
+        self.host_allocated_payload_bytes()
     }
 
     /// A conservative process-visible estimate: payload capacity plus the cache object, backing
@@ -1093,6 +1370,7 @@ impl PackedGroupAffineKvCache {
         self.allocated_payload_bytes()
             + std::mem::size_of_val(self)
             + self.layers.capacity() * std::mem::size_of::<Option<LayerStorage>>()
+            + self.device_layers.capacity() * std::mem::size_of::<Option<DevicePackedLayer>>()
             + self.fallback_events.capacity() * std::mem::size_of::<DenseFallbackEvent>()
             + self.identity.capacity()
             + self
@@ -1103,7 +1381,7 @@ impl PackedGroupAffineKvCache {
             + self
                 .handle
                 .as_ref()
-                .map_or(0, CompiledKernelHandle::retained_bytes)
+                .map_or(0, CompiledKernelHandle::retained_host_bytes_estimate)
     }
 
     /// Dense fp16 K+V payload for the same resident layers and logical token length.  It is a
@@ -1132,6 +1410,8 @@ impl PackedGroupAffineKvCache {
             logical_len: self.logical_len,
             capacity: self.capacity,
             absolute_offset: self.absolute_offset,
+            host_allocated_payload_bytes: self.host_allocated_payload_bytes(),
+            retained_device_packed_logical_bytes: self.retained_device_packed_logical_bytes(),
             allocated_bytes: self.allocated_payload_bytes(),
             key_grouping: "token-axis groups [B,H,ceil(S/group_size),D]",
             value_grouping: "channel-axis groups [B,H,S,ceil(D/group_size)]",
@@ -1191,57 +1471,305 @@ impl PackedGroupAffineKvCache {
         Ok(())
     }
 
-    /// Materialize only the packed MLX buffers for a resident layer.  This is an argument
-    /// adapter, not a dequantizer: codes remain 2-bit packed and scales/zeros remain f16.
-    /// Incomplete token groups are rejected because the Metal reader has no dense pending-tail
-    /// mirror to consult.
-    pub fn packed_mlx_arguments(
-        &self,
-        layer: usize,
-    ) -> Result<(Array, Array, Array, Array, Array, Array)> {
+    fn sync_device_layer(&mut self, layer: usize) -> Result<u64> {
         let storage = self
             .layers
             .get(layer)
             .and_then(Option::as_ref)
             .ok_or_else(|| Error::Config("packed layer is not resident".into()))?;
-        // The retained reader uses a physically padded final token group.  Padding is made on a
-        // short-lived argument copy and the logical sequence length remains the real bound used by
-        // the kernel, so first-token/tail calls never expose synthetic values to attention.
-        let mut keys = storage.keys.clone();
-        if keys.pending_tokens != 0 {
-            let pad = keys.group_size - keys.pending_tokens;
-            let mut last = vec![0.0; self.rows() * self.head_dimension];
-            let start = (keys.pending_tokens - 1) * self.rows() * self.head_dimension;
-            for row in 0..self.rows() {
-                let row_start = start + row * self.head_dimension;
-                last[row * self.head_dimension..(row + 1) * self.head_dimension]
-                    .copy_from_slice(&keys.pending[row_start..row_start + self.head_dimension]);
-            }
-            for _ in 0..pad {
-                keys.append(&last, 1)?;
+        let rows = self.rows();
+        let complete_groups = storage.keys.complete_groups();
+        let value_tokens = storage.keys.logical_tokens();
+        let key_bytes = storage.keys.code_bytes_per_group();
+        let value_bytes = self.head_dimension.div_ceil(4);
+        let value_groups = self.head_dimension.div_ceil(self.group_size);
+        let (old_key_groups, old_value_tokens) = self
+            .device_layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map_or((0, 0), |device| (device.key_groups, device.value_tokens));
+        if old_key_groups > complete_groups || old_value_tokens > value_tokens {
+            self.device_layers[layer] = None;
+        }
+        let (old_key_groups, old_value_tokens) = self
+            .device_layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map_or((0, 0), |device| (device.key_groups, device.value_tokens));
+
+        let key_delta = if old_key_groups < complete_groups {
+            let groups = complete_groups - old_key_groups;
+            let code_range = old_key_groups * rows * key_bytes..complete_groups * rows * key_bytes;
+            let metadata_range = old_key_groups * rows * self.head_dimension
+                ..complete_groups * rows * self.head_dimension;
+            let shape_codes = [self.batch, self.kv_heads, groups, key_bytes].map(|v| v as i32);
+            let shape_metadata =
+                [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
+            Some((
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.keys.codes[code_range],
+                        groups,
+                        rows,
+                        key_bytes,
+                    )?,
+                    &shape_codes,
+                ),
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.keys.scales[metadata_range.clone()],
+                        groups,
+                        rows,
+                        self.head_dimension,
+                    )?,
+                    &shape_metadata,
+                ),
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.keys.zeros[metadata_range],
+                        groups,
+                        rows,
+                        self.head_dimension,
+                    )?,
+                    &shape_metadata,
+                ),
+            ))
+        } else {
+            None
+        };
+        let value_delta = if old_value_tokens < value_tokens {
+            let tokens = value_tokens - old_value_tokens;
+            let code_range =
+                old_value_tokens * rows * value_bytes..value_tokens * rows * value_bytes;
+            let metadata_range =
+                old_value_tokens * rows * value_groups..value_tokens * rows * value_groups;
+            let shape_codes = [self.batch, self.kv_heads, tokens, value_bytes].map(|v| v as i32);
+            let shape_metadata =
+                [self.batch, self.kv_heads, tokens, value_groups].map(|v| v as i32);
+            Some((
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.values.codes[code_range],
+                        tokens,
+                        rows,
+                        value_bytes,
+                    )?,
+                    &shape_codes,
+                ),
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.values.scales[metadata_range.clone()],
+                        tokens,
+                        rows,
+                        value_groups,
+                    )?,
+                    &shape_metadata,
+                ),
+                Array::from_slice(
+                    &row_major_outer_rows(
+                        &storage.values.zeros[metadata_range],
+                        tokens,
+                        rows,
+                        value_groups,
+                    )?,
+                    &shape_metadata,
+                ),
+            ))
+        } else {
+            None
+        };
+
+        let uploaded_key_groups = complete_groups - old_key_groups;
+        let uploaded_value_tokens = value_tokens - old_value_tokens;
+        let uploaded_bytes =
+            uploaded_key_groups
+                .saturating_mul(rows)
+                .saturating_mul(
+                    key_bytes.saturating_add(
+                        self.head_dimension
+                            .saturating_mul(2 * std::mem::size_of::<f16>()),
+                    ),
+                )
+                .saturating_add(uploaded_value_tokens.saturating_mul(rows).saturating_mul(
+                    value_bytes.saturating_add(
+                        value_groups.saturating_mul(2 * std::mem::size_of::<f16>()),
+                    ),
+                ));
+
+        // Build and evaluate a complete replacement off to the side. Publishing arrays one by one
+        // would let a concatenate/eval fault drop or length-skew an otherwise valid resident prefix.
+        let current = self.device_layers[layer]
+            .clone()
+            .unwrap_or_else(DevicePackedLayer::empty);
+        let mut next = current.clone();
+        if let Some((codes, scales, zeros)) = key_delta {
+            let next_codes = joined_device_axis(current.key_codes.as_ref(), codes)?;
+            let next_scales = joined_device_axis(current.key_scales.as_ref(), scales)?;
+            let next_zeros = joined_device_axis(current.key_zeros.as_ref(), zeros)?;
+            next.key_codes = Some(next_codes);
+            next.key_scales = Some(next_scales);
+            next.key_zeros = Some(next_zeros);
+            next.key_groups = complete_groups;
+        }
+        if let Some((codes, scales, zeros)) = value_delta {
+            let next_codes = joined_device_axis(current.value_codes.as_ref(), codes)?;
+            let next_scales = joined_device_axis(current.value_scales.as_ref(), scales)?;
+            let next_zeros = joined_device_axis(current.value_zeros.as_ref(), zeros)?;
+            next.value_codes = Some(next_codes);
+            next.value_scales = Some(next_scales);
+            next.value_zeros = Some(next_zeros);
+            next.value_tokens = value_tokens;
+        }
+        self.device_layers[layer] = Some(next);
+        Ok(uploaded_bytes as u64)
+    }
+
+    pub fn retained_device_packed_logical_bytes(&self) -> usize {
+        let rows = self.rows();
+        let key_bytes = (self.group_size * self.head_dimension).div_ceil(4);
+        let value_bytes = self.head_dimension.div_ceil(4);
+        let value_groups = self.head_dimension.div_ceil(self.group_size);
+        self.device_layers
+            .iter()
+            .flatten()
+            .map(|device| {
+                device
+                    .key_groups
+                    .saturating_mul(rows)
+                    .saturating_mul(
+                        key_bytes.saturating_add(
+                            self.head_dimension
+                                .saturating_mul(2 * std::mem::size_of::<f16>()),
+                        ),
+                    )
+                    .saturating_add(device.value_tokens.saturating_mul(rows).saturating_mul(
+                        value_bytes.saturating_add(
+                            value_groups.saturating_mul(2 * std::mem::size_of::<f16>()),
+                        ),
+                    ))
+            })
+            .sum()
+    }
+
+    fn padded_pending_key_arrays(
+        &self,
+        storage: &LayerStorage,
+    ) -> Result<Option<(Array, Array, Array, u64)>> {
+        let pending = storage.keys.pending_tokens;
+        if pending == 0 {
+            return Ok(None);
+        }
+        let rows = self.rows();
+        let width = self.head_dimension;
+        let mut input = vec![0.0f32; rows * pending * width];
+        for row in 0..rows {
+            for token in 0..pending {
+                let source = (token * rows + row) * width;
+                let target = (row * pending + token) * width;
+                input[target..target + width]
+                    .copy_from_slice(&storage.keys.pending[source..source + width]);
             }
         }
-        let logical_len = storage.keys.logical_tokens();
-        let groups = logical_len.div_ceil(self.group_size);
-        let rows = self.rows();
-        let key_bytes = storage.keys.code_bytes_per_group();
-        let key_codes = Array::from_slice(
-            &keys.codes,
-            &[self.batch, self.kv_heads, groups, key_bytes].map(|v| v as i32),
-        );
-        let key_shape = [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
-        let key_scale = Array::from_slice(&keys.scales, &key_shape);
-        let key_zero = Array::from_slice(&keys.zeros, &key_shape);
-        let value_bytes = self.head_dimension.div_ceil(4);
-        let value_codes = Array::from_slice(
-            &storage.values.codes,
-            &[self.batch, self.kv_heads, logical_len, value_bytes].map(|v| v as i32),
-        );
-        let value_groups = self.head_dimension.div_ceil(self.group_size);
-        let value_shape = [self.batch, self.kv_heads, logical_len, value_groups].map(|v| v as i32);
-        let value_scale = Array::from_slice(&storage.values.scales, &value_shape);
-        let value_zero = Array::from_slice(&storage.values.zeros, &value_shape);
-        debug_assert_eq!(rows * groups * key_bytes, keys.codes.len());
+        let mut tail = TokenGroupKeyTensor::new(rows, width, self.group_size, self.group_size);
+        tail.append(&input, pending)?;
+        let mut last = vec![0.0f32; rows * width];
+        for row in 0..rows {
+            let source = (row * pending + pending - 1) * width;
+            last[row * width..(row + 1) * width].copy_from_slice(&input[source..source + width]);
+        }
+        for _ in pending..self.group_size {
+            tail.append(&last, 1)?;
+        }
+        let key_bytes = tail.code_bytes_per_group();
+        let code_shape = [self.batch, self.kv_heads, 1, key_bytes].map(|value| value as i32);
+        let metadata_shape = [self.batch, self.kv_heads, 1, width].map(|value| value as i32);
+        let codes = Array::from_slice(&tail.codes, &code_shape);
+        let scales = Array::from_slice(&tail.scales, &metadata_shape);
+        let zeros = Array::from_slice(&tail.zeros, &metadata_shape);
+        codes.eval()?;
+        scales.eval()?;
+        zeros.eval()?;
+        let uploaded_bytes = rows.saturating_mul(
+            key_bytes.saturating_add(width.saturating_mul(2 * std::mem::size_of::<f16>())),
+        ) as u64;
+        Ok(Some((codes, scales, zeros, uploaded_bytes)))
+    }
+
+    /// Return evaluated packed MLX buffers for a resident layer. Codes remain 2-bit packed and
+    /// scales/zeros remain f16. Monotonic prefix extension uploads only the new host chunk, then
+    /// performs an MLX packed-domain concatenate; an incomplete key group contributes one padded
+    /// packed tail whose upload is included in telemetry.
+    pub fn packed_mlx_arguments(
+        &mut self,
+        layer: usize,
+    ) -> Result<(Array, Array, Array, Array, Array, Array)> {
+        let persistent_uploaded_bytes = self.sync_device_layer(layer)?;
+        self.telemetry.retained_device_packed_logical_bytes =
+            self.retained_device_packed_logical_bytes() as u64;
+        let storage = self.layers[layer]
+            .as_ref()
+            .ok_or_else(|| Error::Config("packed layer is not resident".into()))?;
+        let pending = self.padded_pending_key_arrays(storage)?;
+        let pending_uploaded_bytes = pending.as_ref().map_or(0, |item| item.3);
+        self.telemetry.uploaded_packed_bytes = self
+            .telemetry
+            .uploaded_packed_bytes
+            .saturating_add(persistent_uploaded_bytes)
+            .saturating_add(pending_uploaded_bytes);
+        let device = self.device_layers[layer]
+            .as_ref()
+            .ok_or_else(|| Error::Config("packed device layer is not resident".into()))?;
+        let combine_key = |prefix: &Option<Array>, tail: Option<&Array>| -> Result<Array> {
+            let result = match (prefix, tail) {
+                (Some(prefix), Some(tail)) => concatenate_axis(&[prefix, tail], 2)?,
+                (Some(prefix), None) => prefix.clone(),
+                (None, Some(tail)) => tail.clone(),
+                (None, None) => return Err(Error::Config("packed key cache is empty".into())),
+            };
+            result.eval()?;
+            Ok(result)
+        };
+        let key_codes = combine_key(&device.key_codes, pending.as_ref().map(|item| &item.0))?;
+        let key_scale = combine_key(&device.key_scales, pending.as_ref().map(|item| &item.1))?;
+        let key_zero = combine_key(&device.key_zeros, pending.as_ref().map(|item| &item.2))?;
+        let value_codes = device
+            .value_codes
+            .clone()
+            .ok_or_else(|| Error::Config("packed value codes are empty".into()))?;
+        let value_scale = device
+            .value_scales
+            .clone()
+            .ok_or_else(|| Error::Config("packed value scales are empty".into()))?;
+        let value_zero = device
+            .value_zeros
+            .clone()
+            .ok_or_else(|| Error::Config("packed value zeros are empty".into()))?;
+        let key_groups = storage.keys.logical_tokens().div_ceil(self.group_size);
+        let argument_bytes = key_groups
+            .saturating_mul(self.rows())
+            .saturating_mul(
+                storage.keys.code_bytes_per_group().saturating_add(
+                    self.head_dimension
+                        .saturating_mul(2 * std::mem::size_of::<f16>()),
+                ),
+            )
+            .saturating_add(
+                storage
+                    .keys
+                    .logical_tokens()
+                    .saturating_mul(self.rows())
+                    .saturating_mul(
+                        self.head_dimension.div_ceil(4).saturating_add(
+                            self.head_dimension
+                                .div_ceil(self.group_size)
+                                .saturating_mul(2 * std::mem::size_of::<f16>()),
+                        ),
+                    ),
+            );
+        self.telemetry.peak_packed_argument_logical_bytes = self
+            .telemetry
+            .peak_packed_argument_logical_bytes
+            .max(argument_bytes as u64);
         Ok((
             key_codes,
             key_scale,
@@ -1274,15 +1802,21 @@ impl PackedGroupAffineKvCache {
                 "cannot dispatch an empty packed cache".into(),
             ));
         }
-        let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
         let cold = self.telemetry.cold_dispatches == 0;
+        let dense_dequantizations_before = self.full_cache_dequantizations;
         let started = std::time::Instant::now();
+        let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
         let output = self
             .handle
             .as_ref()
             .expect("checked above")
             .inner
             .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
+        output.eval()?;
+        debug_assert_eq!(
+            self.full_cache_dequantizations, dense_dequantizations_before,
+            "accepted fused packed dispatch must not reconstruct the full cache"
+        );
         self.direct_dispatches += 1;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         if cold {
@@ -1597,6 +2131,8 @@ impl PackedGroupAffineKvCache {
         self.logical_len = nums[5] as usize;
         self.absolute_offset = nums[6] as usize;
         self.layers = restored;
+        self.device_layers = vec![None; self.layers.len()];
+        self.telemetry.retained_device_packed_logical_bytes = 0;
         self.reserve_storage_for_capacity();
         Ok(())
     }
@@ -1621,7 +2157,7 @@ mod tests {
         fn backend(&self) -> &str {
             "mlx-metal"
         }
-        fn retained_bytes(&self) -> usize {
+        fn retained_host_bytes_estimate(&self) -> usize {
             0
         }
         #[allow(clippy::too_many_arguments)]
@@ -1767,11 +2303,14 @@ mod tests {
         let mut c = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
         let x = data(1, 1, 8, 1.0);
         c.append(0, &x, &x, 1).unwrap();
+        c.packed_mlx_arguments(0).unwrap();
+        assert!(c.device_layers[0].is_some());
         let bytes = c.save();
         let mut other = PackedGroupAffineKvCache::new("wrong", 1, 1, 1, 8, 4).unwrap();
         assert!(other.restore(&bytes).is_err());
         let mut restored = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
         restored.restore(&bytes).unwrap();
+        assert!(restored.device_layers[0].is_none());
         // Snapshot semantics include the versioned layout and logical/token capacity, but not the
         // allocator-dependent capacity of each backing Vec. Restore must report the physical
         // allocation it actually received instead of replaying a stale byte count from another
@@ -1785,14 +2324,28 @@ mod tests {
         assert_eq!(
             RepresentationMetadata {
                 allocated_bytes: 0,
+                host_allocated_payload_bytes: 0,
+                retained_device_packed_logical_bytes: 0,
                 ..restored.representation()
             },
             RepresentationMetadata {
                 allocated_bytes: 0,
+                host_allocated_payload_bytes: 0,
+                retained_device_packed_logical_bytes: 0,
                 ..c.representation()
             }
         );
         assert_same_rows(&restored, &c);
+        restored.packed_mlx_arguments(0).unwrap();
+        assert!(restored.device_layers[0].is_some());
+        restored.restore(&bytes).unwrap();
+        assert!(restored.device_layers[0].is_none());
+        assert_eq!(
+            restored
+                .dispatch_telemetry()
+                .retained_device_packed_logical_bytes,
+            0
+        );
     }
 
     #[test]
@@ -2090,6 +2643,34 @@ mod tests {
     }
 
     #[test]
+    fn first_packed_dispatch_fault_disables_route_and_falls_back_before_mutation() {
+        let mut cache = hook_cache(2, Some(1));
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        assert!(packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
+            .unwrap()
+            .is_none());
+        assert_eq!(packed.offset(), 0);
+        assert!(packed.staged.compiled_handle().is_none());
+        assert!(packed
+            .fallback_events()
+            .iter()
+            .any(|event| event.operation == "dispatch-fault"));
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
+            .unwrap()
+            .is_none());
+        packed.update(0, &kv, &kv).unwrap();
+        packed.update(1, &kv, &kv).unwrap();
+        assert_eq!(packed.dense.offset(), 1);
+    }
+
+    #[test]
     fn pending_packed_step_rejects_retain_and_is_observably_discarded_by_truncate_and_reset() {
         let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
         let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
@@ -2119,6 +2700,123 @@ mod tests {
             .fallback_events()
             .iter()
             .any(|event| event.operation == "reset"));
+    }
+
+    #[test]
+    fn every_pre_dispatch_error_rolls_back_the_pending_whole_step() {
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let q_two = Array::from_slice(&vec![1.0f32; 128], &[1, 1, 2, 64]);
+        let kv_two = Array::from_slice(&vec![2.0f32; 128], &[1, 1, 2, 64]);
+        let unsupported_q = Array::from_slice(&[1u8; 64], &[1, 1, 1, 64]);
+        let mut cache = hook_cache(2, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+
+        let start_pending = |packed: &mut DenseFallbackPackedDecoderCache| {
+            assert!(packed
+                .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
+                .unwrap()
+                .is_some());
+            assert!(packed.pending_step.is_some());
+            assert_eq!(packed.offset(), 0);
+        };
+        let assert_rolled_back = |packed: &DenseFallbackPackedDecoderCache| {
+            assert!(packed.pending_step.is_none());
+            assert_eq!(packed.offset(), 0);
+            assert_eq!(
+                packed.staged.layers[0]
+                    .as_ref()
+                    .unwrap()
+                    .keys
+                    .logical_tokens(),
+                0
+            );
+        };
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, true,)
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false,)
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Additive, 0.125, false,)
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(
+                1,
+                &q_two,
+                &kv_two,
+                &kv_two,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed
+            .try_packed_attention(
+                1,
+                &unsupported_q,
+                &kv,
+                &kv,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .is_err());
+        assert_rolled_back(packed);
+
+        start_pending(packed);
+        assert!(packed.update(1, &kv, &kv).is_err());
+        assert_rolled_back(packed);
+    }
+
+    #[test]
+    fn unsupported_geometry_dtype_and_window_decline_before_first_append() {
+        let valid_q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let valid_kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let unsupported_q = Array::from_slice(&[1u8; 64], &[1, 1, 1, 64]);
+        for (query, mask) in [
+            (&unsupported_q, PackedAttentionMask::Causal),
+            (&valid_q, PackedAttentionMask::SlidingWindow(0)),
+            (&valid_q, PackedAttentionMask::SlidingWindow(usize::MAX)),
+        ] {
+            let mut cache = hook_cache(2, None);
+            let packed = cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap();
+            assert!(packed
+                .try_packed_attention(0, query, &valid_kv, &valid_kv, mask, 0.125, false)
+                .unwrap()
+                .is_none());
+            assert_eq!(packed.offset(), 0);
+            assert!(packed.pending_step.is_none());
+            assert!(packed.staged.layers.iter().all(Option::is_none));
+            assert!(packed.staged.compiled_handle().is_none());
+        }
     }
 
     #[test]
@@ -2152,6 +2850,185 @@ mod tests {
             one.representation().key_grouping,
             "token-axis groups [B,H,ceil(S/group_size),D]"
         );
+    }
+
+    #[test]
+    fn packed_argument_adapter_reorders_multi_batch_multi_head_storage_row_major() {
+        let (batch, heads, step, width, group) = (2, 3, 8, 8, 4);
+        let keys = bhst_data(batch, heads, step, width, -17.0);
+        let values = bhst_data(batch, heads, step, width, 23.0);
+        let mut cache =
+            PackedGroupAffineKvCache::new("layout", 1, batch, heads, width, group).unwrap();
+        cache.append(0, &keys, &values, step).unwrap();
+        let (kc, ks, kz, vc, vs, vz) = cache.packed_mlx_arguments(0).unwrap();
+        for array in [&kc, &ks, &kz, &vc, &vs, &vz] {
+            array.eval().unwrap();
+        }
+        let storage = cache.layers[0].as_ref().unwrap();
+        let key_bytes = storage.keys.code_bytes_per_group();
+        let value_bytes = width.div_ceil(4);
+        let value_groups = width.div_ceil(group);
+        let groups = step.div_ceil(group);
+        let expected_kc =
+            row_major_outer_rows(&storage.keys.codes, groups, batch * heads, key_bytes).unwrap();
+        let expected_ks =
+            row_major_outer_rows(&storage.keys.scales, groups, batch * heads, width).unwrap();
+        let expected_kz =
+            row_major_outer_rows(&storage.keys.zeros, groups, batch * heads, width).unwrap();
+        let expected_vc =
+            row_major_outer_rows(&storage.values.codes, step, batch * heads, value_bytes).unwrap();
+        let expected_vs =
+            row_major_outer_rows(&storage.values.scales, step, batch * heads, value_groups)
+                .unwrap();
+        let expected_vz =
+            row_major_outer_rows(&storage.values.zeros, step, batch * heads, value_groups).unwrap();
+        assert_eq!(kc.as_slice::<u8>(), expected_kc);
+        assert_eq!(ks.as_slice::<f16>(), expected_ks);
+        assert_eq!(kz.as_slice::<f16>(), expected_kz);
+        assert_eq!(vc.as_slice::<u8>(), expected_vc);
+        assert_eq!(vs.as_slice::<f16>(), expected_vs);
+        assert_eq!(vz.as_slice::<f16>(), expected_vz);
+        let device = cache.device_layers[0].as_ref().unwrap();
+        assert_eq!(device.key_groups, groups);
+        assert_eq!(device.value_tokens, step);
+        let initial = cache.dispatch_telemetry();
+        assert_eq!(
+            initial.uploaded_packed_bytes,
+            initial.retained_device_packed_logical_bytes
+        );
+        let initial_representation = cache.representation();
+        assert_eq!(
+            initial_representation.allocated_bytes,
+            initial_representation.host_allocated_payload_bytes
+                + initial_representation.retained_device_packed_logical_bytes
+        );
+
+        let extra_keys = bhst_data(batch, heads, 4, width, 101.0);
+        let extra_values = bhst_data(batch, heads, 4, width, -203.0);
+        cache.append(0, &extra_keys, &extra_values, 4).unwrap();
+        cache.packed_mlx_arguments(0).unwrap();
+        let extended = cache.dispatch_telemetry();
+        assert!(
+            extended.retained_device_packed_logical_bytes
+                > initial.retained_device_packed_logical_bytes
+        );
+        assert_eq!(
+            extended.uploaded_packed_bytes - initial.uploaded_packed_bytes,
+            extended.retained_device_packed_logical_bytes
+                - initial.retained_device_packed_logical_bytes,
+            "extending a resident cache host-uploads only the new packed group/token payload"
+        );
+
+        cache.trim(5).unwrap();
+        assert!(cache.device_layers[0].is_none());
+        let uploaded_before_rebuild = cache.dispatch_telemetry().uploaded_packed_bytes;
+        cache.packed_mlx_arguments(0).unwrap();
+        let after_trim = cache.dispatch_telemetry();
+        let rebuilt = cache.device_layers[0].as_ref().unwrap();
+        assert_eq!(rebuilt.key_groups, 1);
+        assert_eq!(rebuilt.value_tokens, 5);
+        assert!(
+            after_trim.peak_packed_argument_logical_bytes
+                > after_trim.retained_device_packed_logical_bytes,
+            "the padded pending-key argument is transient and separately accounted"
+        );
+        let pending_key_bytes = batch * heads * (width + width * 2 * std::mem::size_of::<f16>());
+        assert_eq!(
+            after_trim.uploaded_packed_bytes - uploaded_before_rebuild,
+            after_trim.retained_device_packed_logical_bytes + pending_key_bytes as u64,
+            "trim rebuilds retained history and uploads the transient padded key tail explicitly"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn real_metal_adapter_dispatch_matches_nonuniform_fp32_reference_with_gqa_and_tail() {
+        use crate::primitives::packed_metal::{PackedMask, PackedMetalKernel};
+
+        let (batch, kv_heads, q_heads, step, width, group) = (2, 2, 4, 5, 64, 4);
+        // Construct values exactly representable by the two independent 2-bit groupings: key
+        // levels advance uniformly across each four-token group, while value levels advance
+        // uniformly across each four-channel group. The dense oracle below never reads packed
+        // arguments, so a shared metadata/layout permutation cannot make both sides pass.
+        let mut keys = Vec::with_capacity(batch * kv_heads * step * width);
+        let mut values = Vec::with_capacity(batch * kv_heads * step * width);
+        for row in 0..batch * kv_heads {
+            for token in 0..step {
+                for channel in 0..width {
+                    keys.push(
+                        row as f32 * 32.0
+                            + (token / group) as f32 * 8.0
+                            + (token % group) as f32 * 2.0
+                            + channel as f32,
+                    );
+                    values.push(
+                        row as f32 * 32.0
+                            + token as f32 * 8.0
+                            + (channel / group) as f32 * 4.0
+                            + (channel % group) as f32,
+                    );
+                }
+            }
+        }
+        let mut cache =
+            PackedGroupAffineKvCache::new("device-layout", 1, batch, kv_heads, width, group)
+                .unwrap();
+        cache.append(0, &keys, &values, step).unwrap();
+        let query_values = (0..batch * q_heads * width)
+            .map(|index| (index as i32 % 7 - 3) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let query = Array::from_slice(
+            &query_values,
+            &[batch as i32, q_heads as i32, 1, width as i32],
+        );
+        let mut expected = vec![0.0f32; batch * q_heads * width];
+        for b in 0..batch {
+            for qh in 0..q_heads {
+                let kh = qh / (q_heads / kv_heads);
+                let row = b * kv_heads + kh;
+                let q_base = (b * q_heads + qh) * width;
+                let mut scores = Vec::with_capacity(step);
+                for token in 0..step {
+                    let mut dot = 0.0f32;
+                    for channel in 0..width {
+                        dot += query_values[q_base + channel]
+                            * keys[(row * step + token) * width + channel];
+                    }
+                    scores.push(dot / (width as f32).sqrt());
+                }
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores
+                    .iter()
+                    .map(|score| (*score - maximum).exp())
+                    .collect::<Vec<_>>();
+                let norm = weights.iter().sum::<f32>();
+                for channel in 0..width {
+                    let mut total = 0.0f32;
+                    for token in 0..step {
+                        total += weights[token] * values[(row * step + token) * width + channel];
+                    }
+                    expected[q_base + channel] = total / norm;
+                }
+            }
+        }
+        cache
+            .bind_compiled_handle(CompiledKernelHandle::new(Arc::new(
+                PackedMetalKernel::for_identity("device-layout").unwrap(),
+            )))
+            .unwrap();
+        let output = cache
+            .dispatch_packed(0, &query, PackedMask::Causal)
+            .unwrap();
+        let actual = output.as_slice::<f32>();
+        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2e-3,
+                "index {index}: {actual} != {expected}"
+            );
+        }
+        assert_eq!(cache.direct_dispatches(), 1);
+        assert_eq!(cache.full_cache_dequantizations(), 0);
     }
 
     #[test]

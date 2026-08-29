@@ -72,7 +72,7 @@ impl crate::primitives::packed_group_affine_kv::RetainedPackedKernel for PackedM
         "mlx-metal"
     }
 
-    fn retained_bytes(&self) -> usize {
+    fn retained_host_bytes_estimate(&self) -> usize {
         std::mem::size_of::<Self>()
     }
 
@@ -188,7 +188,11 @@ impl PackedMetalKernel {
         }
         let (mask_mode, window) = match mask {
             PackedMask::Causal => (1, 0),
-            PackedMask::SlidingWindow(window) if window > 0 => (2, window as i32),
+            PackedMask::SlidingWindow(window) if window > 0 => (
+                2,
+                i32::try_from(window)
+                    .map_err(|_| Error::Unsupported("sliding window exceeds i32".into()))?,
+            ),
             PackedMask::SlidingWindow(_) => {
                 return Err(Error::Unsupported("empty sliding window".into()))
             }
@@ -310,6 +314,74 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_window_larger_than_msl_i32_fails_before_dispatch() {
+        let q = Array::from_slice(&[0.0f32; 64], &[1, 1, 1, 64]);
+        let key_codes = Array::from_slice(&[0u8; 64], &[1, 1, 1, 64]);
+        let key_scale = half(vec![0.0; 64], &[1, 1, 1, 64]);
+        let key_zero = half(vec![0.0; 64], &[1, 1, 1, 64]);
+        let value_codes = Array::from_slice(&[0u8; 16], &[1, 1, 1, 16]);
+        let value_scale = half(vec![0.0; 16], &[1, 1, 1, 16]);
+        let value_zero = half(vec![0.0; 16], &[1, 1, 1, 16]);
+        let error = PackedMetalKernel::new()
+            .unwrap()
+            .dispatch(
+                &q,
+                &key_codes,
+                &key_scale,
+                &key_zero,
+                &value_codes,
+                &value_scale,
+                &value_zero,
+                PackedMask::SlidingWindow(usize::MAX),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("sliding window exceeds i32"));
+    }
+
+    #[test]
+    fn real_metal_kernel_accepts_every_advertised_query_dtype_and_head_dimension() {
+        for dtype in [Dtype::Float16, Dtype::Bfloat16, Dtype::Float32] {
+            for dimension in [64usize, 128, 256] {
+                let q = Array::from_slice(&vec![0.0f32; dimension], &[1, 1, 1, dimension as i32])
+                    .as_dtype(dtype)
+                    .unwrap();
+                let key_codes =
+                    Array::from_slice(&vec![0u8; dimension], &[1, 1, 1, dimension as i32]);
+                let key_scale = half(vec![0.0; dimension], &[1, 1, 1, dimension as i32]);
+                let key_zero = half(vec![0.0; dimension], &[1, 1, 1, dimension as i32]);
+                let value_words = dimension.div_ceil(4);
+                let value_codes =
+                    Array::from_slice(&vec![0u8; value_words], &[1, 1, 1, value_words as i32]);
+                let value_scale = half(vec![0.0; value_words], &[1, 1, 1, value_words as i32]);
+                let value_zero = half(vec![0.0; value_words], &[1, 1, 1, value_words as i32]);
+                let output = PackedMetalKernel::new()
+                    .unwrap()
+                    .dispatch(
+                        &q,
+                        &key_codes,
+                        &key_scale,
+                        &key_zero,
+                        &value_codes,
+                        &value_scale,
+                        &value_zero,
+                        PackedMask::Causal,
+                    )
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap();
+                output.eval().unwrap();
+                assert!(
+                    output
+                        .as_slice::<f32>()
+                        .iter()
+                        .all(|value| value.abs() <= f32::EPSILON),
+                    "dtype={dtype:?} dimension={dimension}"
+                );
             }
         }
     }
