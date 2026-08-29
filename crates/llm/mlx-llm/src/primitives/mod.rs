@@ -17,6 +17,7 @@ pub mod attention;
 pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
+pub mod packed_group_affine_kv;
 pub mod paged_kv_cache;
 pub mod projection;
 pub mod quant;
@@ -28,10 +29,13 @@ pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_ma
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use kv_cache::{ContiguousKvCache, KvCache};
+pub use kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
 pub use nn::{
     conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
     soft_cap,
+};
+pub use packed_group_affine_kv::{
+    DenseFallbackEvent, PackedGroupAffineKvCache, RepresentationMetadata,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
