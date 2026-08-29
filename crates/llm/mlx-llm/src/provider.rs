@@ -463,25 +463,8 @@ impl LlamaProvider {
         context_band: &str,
     ) -> CoreResult<(String, u64, u64)> {
         let context_window = self.campaign_context_window()?;
-        let medium = (context_window / 16).clamp(128, 1_024);
-        let memory_material = context_window / 4;
-        let fit_boundary = context_window.saturating_sub(512);
-        if !(32 < medium && medium < memory_material && memory_material < fit_boundary) {
-            return Err(CoreError::Load(format!(
-                "loaded context window {context_window} cannot represent four distinct bands"
-            )));
-        }
-        let target = match context_band {
-            "short" => 32,
-            "medium" => medium,
-            "memory-material" => memory_material,
-            "fit-boundary" => fit_boundary,
-            _ => {
-                return Err(CoreError::InvalidRequest(format!(
-                    "unknown context band {context_band}"
-                )))
-            }
-        };
+        let target = crate::campaign::context_band_target(context_window, context_band)
+            .map_err(CoreError::Load)?;
         let header = format!("SC20671-CONTEXT-BAND-{context_band}");
         let mut lower = 0usize;
         let mut upper = usize::try_from(target)

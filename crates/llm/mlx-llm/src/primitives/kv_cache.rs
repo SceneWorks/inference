@@ -148,30 +148,63 @@ impl ContiguousKvCache {
 
 impl KvCache for ContiguousKvCache {
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
-        let merged = match self.layers[layer].take() {
+        let array_bytes = |array: &Array| -> Result<u64> {
+            u64::try_from(array.size())
+                .ok()
+                .and_then(|elements| elements.checked_mul(u64::try_from(array.item_size()).ok()?))
+                .ok_or_else(|| {
+                    crate::error::Error::Msg("KV shape overflows byte accounting".into())
+                })
+        };
+        let prior = self.layers[layer].as_ref();
+        let prior_bytes = prior
+            .as_ref()
+            .map(|(key, value)| {
+                array_bytes(key)?
+                    .checked_add(array_bytes(value)?)
+                    .ok_or_else(|| {
+                        crate::error::Error::Msg("prior KV byte accounting overflows u64".into())
+                    })
+            })
+            .transpose()?;
+        let appended_bytes = array_bytes(keys)?
+            .checked_add(array_bytes(values)?)
+            .ok_or_else(|| crate::error::Error::Msg("appended KV bytes overflow u64".into()))?;
+        let merged = match prior {
             Some((pk, pv)) => (
-                concatenate_axis(&[&pk, keys], SEQ_AXIS)?,
-                concatenate_axis(&[&pv, values], SEQ_AXIS)?,
+                concatenate_axis(&[pk, keys], SEQ_AXIS)?,
+                concatenate_axis(&[pv, values], SEQ_AXIS)?,
             ),
             None => (keys.clone(), values.clone()),
         };
+        let merged_bytes = array_bytes(&merged.0)?
+            .checked_add(array_bytes(&merged.1)?)
+            .ok_or_else(|| crate::error::Error::Msg("merged KV bytes overflow u64".into()))?;
+        if let Some(prior_bytes) = prior_bytes {
+            let coexistence_bytes = prior_bytes
+                .checked_add(appended_bytes)
+                .and_then(|bytes| bytes.checked_add(merged_bytes))
+                .ok_or_else(|| {
+                    crate::error::Error::Msg("dense concat coexistence bytes overflow u64".into())
+                })?;
+            self.events.push(CacheEvent {
+                layer,
+                operation: "dense_concat_coexistence",
+                role: "output",
+                lifetime: "transient",
+                bytes: coexistence_bytes,
+                tokens: u64::try_from(merged.0.shape()[SEQ_AXIS as usize]).map_err(|_| {
+                    crate::error::Error::Msg("KV sequence length overflows u64".into())
+                })?,
+            });
+        }
         self.layers[layer] = Some((merged.0.clone(), merged.1.clone()));
-        let elements = merged
-            .0
-            .shape()
-            .iter()
-            .try_fold(1_u64, |n, v| n.checked_mul(u64::try_from(*v).ok()?))
-            .ok_or_else(|| crate::error::Error::Msg("KV shape overflows byte accounting".into()))?;
-        let bytes = elements
-            .checked_mul(2)
-            .and_then(|n| n.checked_mul(2))
-            .ok_or_else(|| crate::error::Error::Msg("KV byte accounting overflows u64".into()))?;
         self.events.push(CacheEvent {
             layer,
             operation: "append",
             role: "cache",
             lifetime: "persistent",
-            bytes,
+            bytes: merged_bytes,
             tokens: u64::try_from(merged.0.shape()[SEQ_AXIS as usize])
                 .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?,
         });
@@ -296,6 +329,14 @@ mod tests {
         let (ka, _) = cache.update(0, &k1, &k1).unwrap();
         assert_eq!(ka.shape(), &[1, 2, 4, 4]); // 3 + 1 along seq
         assert_eq!(cache.offset(), 4);
+        let event = cache
+            .events()
+            .iter()
+            .find(|event| event.operation == "dense_concat_coexistence")
+            .expect("the immutable concat must publish its real coexistence bytes");
+        assert_eq!(event.role, "output");
+        assert_eq!(event.lifetime, "transient");
+        assert_eq!(event.bytes, 512);
     }
 
     #[test]

@@ -29,6 +29,54 @@ pub const QUALITY_CONTRACT_HASH: &str =
     "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d2";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
+pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
+pub const FIT_BOUNDARY_MIN_CONTEXT_BPS: u64 = 9_000;
+pub const SCENEWORKS_REPOSITORY: &str = "github.com/SceneWorks/SceneWorks";
+pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
+pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
+
+pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u64, String> {
+    if context_window < 1_024 {
+        return Err("SC-20671 requires a context window of at least 1024 tokens".into());
+    }
+    let medium = (context_window / 16).clamp(128, 1_024);
+    let memory_material = context_window / 4;
+    let fit_by_ratio = context_window
+        .checked_mul(FIT_BOUNDARY_MIN_CONTEXT_BPS)
+        .and_then(|tokens| tokens.checked_add(9_999))
+        .map(|tokens| tokens / 10_000)
+        .ok_or("fit-boundary target overflows u64")?;
+    let fit_boundary = context_window.saturating_sub(512).max(fit_by_ratio);
+    if !(32 < medium && medium < memory_material && memory_material < fit_boundary) {
+        return Err(format!(
+            "loaded context window {context_window} cannot represent four distinct bands"
+        ));
+    }
+    match context_band {
+        "short" => Ok(32),
+        "medium" => Ok(medium),
+        "memory-material" => Ok(memory_material),
+        "fit-boundary" => Ok(fit_boundary),
+        _ => Err(format!("unknown context band {context_band}")),
+    }
+}
+
+fn valid_locked_mlx_fields(version: &str, source: &str, revision: &str) -> bool {
+    !version.is_empty()
+        && revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && source == format!("git+{PMETAL_MLX_REPOSITORY}?rev={revision}#{revision}")
+}
+
+fn valid_locked_mlx_identity(provenance: &ReceiptProvenance) -> bool {
+    valid_locked_mlx_fields(
+        &provenance.mlx_version,
+        &provenance.mlx_source,
+        &provenance.mlx_revision,
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +86,8 @@ pub struct ReceiptProvenance {
     pub inference_repository: String,
     pub scene_works_revision: String,
     pub inference_revision: String,
+    pub mlx_version: String,
+    pub mlx_source: String,
     pub mlx_revision: String,
     pub dependency_lock_sha256: String,
     pub os: String,
@@ -46,6 +96,9 @@ pub struct ReceiptProvenance {
     pub model_id: String,
     pub model_file_sha256: String,
     pub model_file_bytes: u64,
+    pub reference_model_id: String,
+    pub reference_model_sha256: String,
+    pub reference_model_bytes: u64,
     pub power_mode: String,
     pub thermal_state: String,
     pub command_template: String,
@@ -77,6 +130,7 @@ pub struct ReceiptGeometry {
     pub layers: u64,
     pub element_bytes: u64,
     pub capacity: u64,
+    pub context_window_tokens: u64,
     pub context_target_tokens: u64,
     pub context_payload_tokens: u64,
 }
@@ -409,15 +463,17 @@ impl ReceiptBuilder {
         if !digest(&self.template.contract_hash)
             || !digest(&self.template.provenance.dependency_lock_sha256)
             || !digest(&self.template.provenance.model_file_sha256)
+            || !digest(&self.template.provenance.reference_model_sha256)
             || !revision(&self.template.provenance.scene_works_revision)
             || !revision(&self.template.provenance.inference_revision)
+            || !valid_locked_mlx_identity(&self.template.provenance)
+            || self.template.provenance.reference_model_bytes == 0
+            || self.template.provenance.reference_model_id.is_empty()
         {
             return Err("malformed receipt identity".into());
         }
-        if self.template.provenance.scene_works_repository
-            != "git@github.com:SceneWorks/SceneWorks.git"
-            || self.template.provenance.inference_repository
-                != "git@github.com:SceneWorks/inference.git"
+        if self.template.provenance.scene_works_repository != SCENEWORKS_REPOSITORY
+            || self.template.provenance.inference_repository != INFERENCE_REPOSITORY
         {
             return Err("receipt repository identity is not paired SceneWorks".into());
         }
@@ -442,13 +498,21 @@ impl ReceiptBuilder {
         }
         if self.template.geometry.query_heads == 0
             || self.template.geometry.kv_heads == 0
+            || self.template.geometry.context_window_tokens == 0
+            || self.template.geometry.context_target_tokens == 0
+            || self.template.geometry.context_payload_tokens == 0
             || self.template.geometry.query_heads % self.template.geometry.kv_heads != 0
             || self.template.geometry.capacity < self.template.geometry.kv_length
         {
             return Err("invalid geometry".into());
         }
-        if self.template.geometry.context_payload_tokens
-            > self.template.geometry.context_target_tokens
+        if self.template.geometry.context_target_tokens
+            != context_band_target(
+                self.template.geometry.context_window_tokens,
+                &self.template.matrix.context_band,
+            )?
+            || self.template.geometry.context_payload_tokens
+                > self.template.geometry.context_target_tokens
             || self.template.geometry.context_payload_tokens
                 < self.template.geometry.context_target_tokens / 2
         {
@@ -687,8 +751,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("receipt timestamp/run id is malformed".into());
     }
     let p = &receipt.provenance;
-    if p.scene_works_repository != "git@github.com:SceneWorks/SceneWorks.git"
-        || p.inference_repository != "git@github.com:SceneWorks/inference.git"
+    if p.scene_works_repository != SCENEWORKS_REPOSITORY
+        || p.inference_repository != INFERENCE_REPOSITORY
     {
         return Err("provenance repository identity is not paired SceneWorks".into());
     }
@@ -696,12 +760,17 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || !revision(&p.inference_revision)
         || !lowercase_hex(&p.dependency_lock_sha256, 64)
         || !lowercase_hex(&p.model_file_sha256, 64)
+        || !lowercase_hex(&p.reference_model_sha256, 64)
+        || !valid_locked_mlx_identity(p)
         || [
+            p.mlx_version.as_str(),
+            p.mlx_source.as_str(),
             p.mlx_revision.as_str(),
             p.os.as_str(),
             p.xcode.as_str(),
             p.hardware.as_str(),
             p.model_id.as_str(),
+            p.reference_model_id.as_str(),
             p.power_mode.as_str(),
             p.thermal_state.as_str(),
             p.command_template.as_str(),
@@ -711,6 +780,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .iter()
         .any(|v| v.is_empty())
         || p.model_file_bytes == 0
+        || p.reference_model_bytes == 0
         || !lowercase_hex(&p.campaign_session_id, 64)
         || !lowercase_hex(&p.coordinate_operation_sha256, 64)
         || p.campaign_cache_state_version == 0
@@ -731,6 +801,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         g.layers,
         g.element_bytes,
         g.capacity,
+        g.context_window_tokens,
+        g.context_target_tokens,
+        g.context_payload_tokens,
     ]
     .into_iter()
     .any(|v| v == 0)
@@ -749,7 +822,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("matrix coordinate or geometry relationship is invalid".into());
     }
-    if receipt.geometry.context_payload_tokens > receipt.geometry.context_target_tokens
+    if receipt.geometry.context_target_tokens
+        != context_band_target(
+            receipt.geometry.context_window_tokens,
+            &receipt.matrix.context_band,
+        )?
+        || receipt.geometry.context_payload_tokens > receipt.geometry.context_target_tokens
         || receipt.geometry.context_payload_tokens < receipt.geometry.context_target_tokens / 2
     {
         return Err("context band token measurement is outside producer bounds".into());
@@ -829,6 +907,28 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV reconciliation failed".into());
     }
+    let prefill_footprint = receipt
+        .memory
+        .phase_samples
+        .iter()
+        .find(|sample| sample.phase == "prefill-peak")
+        .ok_or("missing prefill-peak materiality evidence")?
+        .phys_footprint_bytes;
+    if receipt.matrix.context_band == "memory-material"
+        && u128::from(dense).saturating_mul(10_000)
+            < u128::from(prefill_footprint)
+                .saturating_mul(u128::from(MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS))
+    {
+        return Err("memory-material dense KV is below the frozen process-footprint share".into());
+    }
+    if receipt.matrix.context_band == "fit-boundary"
+        && (receipt.geometry.capacity > receipt.geometry.context_window_tokens
+            || u128::from(receipt.geometry.capacity).saturating_mul(10_000)
+                < u128::from(receipt.geometry.context_window_tokens)
+                    .saturating_mul(u128::from(FIT_BOUNDARY_MIN_CONTEXT_BPS)))
+    {
+        return Err("fit-boundary cache occupancy is below the frozen admission ratio".into());
+    }
     let mut transient_by_phase = std::collections::BTreeMap::<&str, u128>::new();
     for event in receipt.memory.allocation_events.iter().filter(|e| {
         e.lifetime == "transient"
@@ -839,10 +939,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .checked_add(u128::from(event.bytes))
             .ok_or("transient allocation total overflow")?;
     }
-    if transient_by_phase
-        .values()
-        .copied()
-        .any(|bytes| bytes.saturating_mul(10) >= u128::from(dense).saturating_mul(9))
+    if receipt.mode == "compressed"
+        && transient_by_phase
+            .values()
+            .copied()
+            .any(|bytes| bytes.saturating_mul(10) >= u128::from(dense).saturating_mul(9))
     {
         return Err("aggregate full-cache temporary detected".into());
     }
@@ -1162,7 +1263,7 @@ fn assemble_artifacts_with_fixtures_named(
     receipt.receipt_sha256 = seal_bytes(&semantic);
     let bytes = receipt.bytes().map_err(|e| e.to_string())?;
     let human = format!(
-        "# {} KV receipt\\n\\n- Run: {}\\n- Mode: {}\\n- Receipt hash: {}\\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -1367,7 +1468,7 @@ pub fn validate_artifact_bundle_named(
         return Err("receipt semantic hash mismatch".into());
     }
     let human = std::str::from_utf8(&bundle.human).map_err(|_| "human receipt is not UTF-8")?;
-    if !human.contains(&format!("- Receipt hash: {expected}\\n")) {
+    if !human.contains(&format!("- Receipt hash: {expected}\n")) {
         return Err("human receipt is not bound to the sealed JSON receipt".into());
     }
     Ok(())
@@ -1433,18 +1534,12 @@ fn validate_fixture_binding(
     let field = |object: &serde_json::Map<String, serde_json::Value>, key: &str| {
         object.get(key).and_then(serde_json::Value::as_str)
     };
-    let (reference_inventory, reference_session) = receipt
-        .provenance
-        .model_id
-        .rsplit_once(";reference=")
-        .and_then(|(_, binding)| binding.split_once(";referenceSession="))
-        .filter(|(digest, session)| {
-            digest.len() == 64
-                && session.len() == 64
-                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && session.bytes().all(|byte| byte.is_ascii_hexdigit())
+    let reference_inventory = receipt.provenance.reference_model_sha256.as_str();
+    let reference_session = field(reference, "coordinateSessionId")
+        .filter(|session| {
+            session.len() == 64 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
-        .ok_or_else(|| format!("fixture {name} receipt lacks reference inventory binding"))?;
+        .ok_or_else(|| format!("fixture {name} lacks per-run reference session evidence"))?;
     let expected_operation = if receipt.matrix.request_mode == "supported-batch" {
         "supported-batch"
     } else if receipt.matrix.prefill_mode == "chunked" {
@@ -1512,7 +1607,6 @@ fn validate_fixture_binding(
         || !valid_secondary(candidate)
         || field(reference, "coordinateInventorySha256") != Some(reference_inventory)
         || field(reference, "qualityInventorySha256") != Some(reference_inventory)
-        || field(reference, "coordinateSessionId") != Some(reference_session)
         || field(reference, "qualitySessionId") != Some(reference_session)
         || field(reference, "operation") != Some(expected_operation)
         || field(reference, "operationOutputSha256").is_none_or(|hash| hash.len() != 64)
@@ -1553,6 +1647,48 @@ fn coordinate_slug(coordinate: &Coordinate) -> String {
     )
 }
 
+fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
+    let provenance = &receipt.provenance;
+    canonical_json_bytes(&serde_json::json!({
+        "sceneWorksRepository": provenance.scene_works_repository,
+        "inferenceRepository": provenance.inference_repository,
+        "sceneWorksRevision": provenance.scene_works_revision,
+        "inferenceRevision": provenance.inference_revision,
+        "mlxVersion": provenance.mlx_version,
+        "mlxSource": provenance.mlx_source,
+        "mlxRevision": provenance.mlx_revision,
+        "dependencyLockSha256": provenance.dependency_lock_sha256,
+        "os": provenance.os,
+        "xcode": provenance.xcode,
+        "hardware": provenance.hardware,
+        "powerMode": provenance.power_mode,
+        "thermalState": provenance.thermal_state,
+        "commandTemplate": provenance.command_template,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
+    let provenance = &receipt.provenance;
+    let geometry = &receipt.geometry;
+    canonical_json_bytes(&serde_json::json!({
+        "family": receipt.matrix.family,
+        "modelId": provenance.model_id,
+        "modelFileSha256": provenance.model_file_sha256,
+        "modelFileBytes": provenance.model_file_bytes,
+        "referenceModelId": provenance.reference_model_id,
+        "referenceModelSha256": provenance.reference_model_sha256,
+        "referenceModelBytes": provenance.reference_model_bytes,
+        "queryHeads": geometry.query_heads,
+        "kvHeads": geometry.kv_heads,
+        "headDimension": geometry.head_dimension,
+        "layers": geometry.layers,
+        "elementBytes": geometry.element_bytes,
+        "contextWindowTokens": geometry.context_window_tokens,
+    }))
+    .map_err(|error| error.to_string())
+}
+
 /// Atomically publish the *whole* 64-coordinate receipt collection.  Individual worker output is
 /// intentionally not a campaign result; only this function creates `destination`, and it does so
 /// after every receipt, sidecar, coordinate, and product-owned worker PID has been validated.
@@ -1569,10 +1705,33 @@ pub fn publish_complete_campaign(
     }
     let mut outcomes = Vec::with_capacity(prepared.len());
     let mut seen = std::collections::BTreeSet::new();
+    let mut global_identity = None;
+    let mut family_identities = std::collections::BTreeMap::new();
     for item in prepared {
         validate_artifact_bundle(&item.bundle)?;
         let receipt: Receipt = serde_json::from_slice(&item.bundle.receipt)
             .map_err(|e| format!("prepared receipt is not decodable: {e}"))?;
+        let identity = campaign_global_identity(&receipt)?;
+        if global_identity
+            .as_ref()
+            .is_some_and(|expected| expected != &identity)
+        {
+            return Err("campaign source/toolchain/hardware identity drift".into());
+        }
+        global_identity.get_or_insert(identity);
+        let family_identity = campaign_family_identity(&receipt)?;
+        if family_identities
+            .get(&receipt.matrix.family)
+            .is_some_and(|expected| expected != &family_identity)
+        {
+            return Err(format!(
+                "campaign model/reference identity drift within {}",
+                receipt.matrix.family
+            ));
+        }
+        family_identities
+            .entry(receipt.matrix.family.clone())
+            .or_insert(family_identity);
         let coordinate = Coordinate {
             family: match receipt.matrix.family.as_str() {
                 "llama" => "llama",
@@ -2551,6 +2710,15 @@ pub fn sequence_marker() -> u64 {
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
+    fn allocation_event(
+        &mut self,
+        _kind: &'static str,
+        role: &'static str,
+        lifetime: &'static str,
+        bytes: u64,
+    ) {
+        self.allocation(role, lifetime, bytes);
+    }
     /// Wall-clock duration of the real snapshot inventory plus provider/model load that created
     /// the bound campaign session.
     fn load_duration(&mut self, _milliseconds: f64) {}
@@ -2768,6 +2936,16 @@ impl Observer for ProductObserver {
     }
 
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
+        self.allocation_event(role, role, lifetime, bytes);
+    }
+
+    fn allocation_event(
+        &mut self,
+        kind: &'static str,
+        role: &'static str,
+        lifetime: &'static str,
+        bytes: u64,
+    ) {
         let Some(phase) = self.phase else {
             self.error = Some("allocation observed before a product phase".into());
             return;
@@ -2776,7 +2954,7 @@ impl Observer for ProductObserver {
             return;
         }
         self.allocations.push(ReceiptAllocation {
-            kind: format!("product-{role}"),
+            kind: format!("product-{kind}"),
             role: role.into(),
             lifetime: lifetime.into(),
             phase: phase.into(),
@@ -3533,6 +3711,7 @@ pub struct ProductFixtureSuite {
     pub cache_candidate: ProductFixtureResult,
     pub cache_reference: ProductFixtureResult,
     pub needle: String,
+    pub context_window_tokens: u64,
     pub context_target_tokens: u64,
     pub context_payload_tokens: u64,
 }
@@ -3648,6 +3827,7 @@ pub fn run_product_fixture_suite_on_sessions(
         cache_candidate,
         cache_reference,
         needle,
+        context_window_tokens: candidate_window,
         context_target_tokens,
         context_payload_tokens,
     })
@@ -3804,44 +3984,94 @@ fn checked_git_revision(root: &Path) -> Result<String, String> {
     Ok(revision)
 }
 
-fn checked_repository_identity(root: &Path, expected: &str) -> Result<(), String> {
+fn canonical_github_repository(remote: &str) -> Result<String, String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote.strip_prefix("ssh://git@github.com/") {
+        path
+    } else if let Some(path) = remote.strip_prefix("https://github.com/") {
+        path
+    } else {
+        return Err(format!(
+            "repository origin is not an authenticated GitHub URL: {remote}"
+        ));
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let components = path.split('/').collect::<Vec<_>>();
+    if components.len() != 2
+        || components.iter().any(|component| {
+            component.is_empty()
+                || *component == "."
+                || *component == ".."
+                || component
+                    .chars()
+                    .any(|character| matches!(character, '?' | '#' | '\\'))
+        })
+    {
+        return Err(format!(
+            "repository origin has a non-canonical GitHub path: {remote}"
+        ));
+    }
+    Ok(format!("github.com/{}/{}", components[0], components[1]))
+}
+
+fn checked_repository_identity(root: &Path, expected: &str) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["config", "--get", "remote.origin.url"])
         .output()
         .map_err(|e| e.to_string())?;
-    let remote = String::from_utf8(output.stdout)
-        .map_err(|e| e.to_string())?
-        .trim()
-        .to_ascii_lowercase();
-    if !output.status.success() || !remote.ends_with(&format!("{expected}.git")) {
+    let remote = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("cannot read repository origin".into());
+    }
+    let canonical = canonical_github_repository(&remote)?;
+    if canonical != expected {
         return Err(format!(
-            "repository origin is not SceneWorks/{expected}: {remote}"
+            "repository origin is {canonical}, expected {expected}"
         ));
     }
-    Ok(())
+    Ok(canonical)
 }
 
-fn locked_mlx_identity(lock: &[u8]) -> Result<String, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LockedMlxIdentity {
+    version: String,
+    source: String,
+    revision: String,
+}
+
+fn locked_mlx_identity(lock: &[u8]) -> Result<LockedMlxIdentity, String> {
     let text = std::str::from_utf8(lock).map_err(|e| e.to_string())?;
-    let mut package = None;
-    for line in text.lines() {
-        if line == "name = \"pmetal-mlx-rs\"" {
-            package = Some(String::from("pmetal-mlx-rs"));
-        } else if package.is_some() && line.starts_with("version = ") {
-            let version = line
-                .trim_start_matches("version = \"")
-                .trim_end_matches('\"');
-            return Ok(format!(
-                "{}@{};lockSha256={}",
-                package.unwrap(),
-                version,
-                seal_bytes(lock)
-            ));
-        } else if line.starts_with("[[package]]") {
-            package = None;
+    let quoted = |block: &str, key: &str| {
+        block.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(&format!("{key} = \""))
+                .and_then(|value| value.strip_suffix('\"'))
+                .map(str::to_owned)
+        })
+    };
+    for block in text.split("[[package]]") {
+        if quoted(block, "name").as_deref() != Some("pmetal-mlx-rs") {
+            continue;
         }
+        let version = quoted(block, "version").ok_or("pmetal-mlx-rs lock entry has no version")?;
+        let source = quoted(block, "source").ok_or("pmetal-mlx-rs lock entry has no source")?;
+        let revision = source
+            .rsplit_once('#')
+            .map(|(_, revision)| revision.to_owned())
+            .ok_or("pmetal-mlx-rs lock source has no immutable revision")?;
+        let identity = LockedMlxIdentity {
+            version,
+            source,
+            revision,
+        };
+        if !valid_locked_mlx_fields(&identity.version, &identity.source, &identity.revision) {
+            return Err("pmetal-mlx-rs lock identity is not the frozen Git source/revision".into());
+        }
+        return Ok(identity);
     }
     Err("Cargo.lock does not contain pmetal-mlx-rs identity".into())
 }
@@ -3961,8 +4191,9 @@ fn product_receipt(
         .ok_or("inference root")?;
     let _ = fs::metadata(executable).map_err(|e| e.to_string())?;
     let scene_works_root = PathBuf::from(required_campaign_env("SCENEWORKS_ROOT")?);
-    checked_repository_identity(&scene_works_root, "SceneWorks")?;
-    checked_repository_identity(inference_root, "inference")?;
+    let scene_works_repository =
+        checked_repository_identity(&scene_works_root, SCENEWORKS_REPOSITORY)?;
+    let inference_repository = checked_repository_identity(inference_root, INFERENCE_REPOSITORY)?;
     let scene_works_revision = checked_git_revision(&scene_works_root)?;
     let inference_revision = checked_git_revision(inference_root)?;
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
@@ -3970,6 +4201,7 @@ fn product_receipt(
     let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
     let thermal_state = probed_command("pmset", &["-g", "therm"], "thermal state")?;
     let normalized_thermal_state = normalize_pmset_thermal(&thermal_state)?;
+    let mlx = locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?;
     let transcript = format!(
         "{}\n{}\n{}\n{}",
         suite.kernel_candidate.output.text,
@@ -4007,7 +4239,7 @@ fn product_receipt(
     let workspace = observation
         .allocations
         .iter()
-        .filter(|e| e.lifetime == "transient")
+        .filter(|e| e.role == "attention-workspace" && e.lifetime == "transient")
         .map(|e| e.bytes)
         .sum::<u64>();
     let release = observation.phases.last().ok_or("release phase")?;
@@ -4036,9 +4268,9 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository: "git@github.com:SceneWorks/SceneWorks.git".into(), inference_repository: "git@github.com:SceneWorks/inference.git".into(), scene_works_revision, inference_revision, mlx_revision: locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};architecture={};tokenizer={};reference={};referenceSession={}", model.root.display(), coordinate.family, model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};architecture={};inventory={}", model.root.display(), coordinate.family, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{};architecture={};inventory={}", reference.root.display(), coordinate.family, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
-        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
+        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
@@ -4316,11 +4548,17 @@ mod tests {
             contract_hash: QUALITY_CONTRACT_HASH.into(),
             receipt_sha256: String::new(),
             provenance: ReceiptProvenance {
-                scene_works_repository: "git@github.com:SceneWorks/SceneWorks.git".into(),
-                inference_repository: "git@github.com:SceneWorks/inference.git".into(),
+                scene_works_repository: SCENEWORKS_REPOSITORY.into(),
+                inference_repository: INFERENCE_REPOSITORY.into(),
                 scene_works_revision: "a".repeat(40),
                 inference_revision: "b".repeat(40),
-                mlx_revision: "mlx".into(),
+                mlx_version: "0.25.8".into(),
+                mlx_source: format!(
+                    "git+{PMETAL_MLX_REPOSITORY}?rev={}#{}",
+                    "1".repeat(40),
+                    "1".repeat(40)
+                ),
+                mlx_revision: "1".repeat(40),
                 dependency_lock_sha256: "c".repeat(64),
                 os: "macOS".into(),
                 xcode: "xcode".into(),
@@ -4328,6 +4566,9 @@ mod tests {
                 model_id: "model".into(),
                 model_file_sha256: "d".repeat(64),
                 model_file_bytes: 1,
+                reference_model_id: "reference-model".into(),
+                reference_model_sha256: "9".repeat(64),
+                reference_model_bytes: 1,
                 power_mode: "nominal".into(),
                 thermal_state: "nominal".into(),
                 command_template: "run --mode {mode}".into(),
@@ -4353,6 +4594,7 @@ mod tests {
                 layers: 1,
                 element_bytes: 2,
                 capacity: 1,
+                context_window_tokens: 4096,
                 context_target_tokens: 32,
                 context_payload_tokens: 32,
             },
@@ -4532,6 +4774,19 @@ mod tests {
         }
         .finish()
         .expect("builder must produce a complete v3 receipt");
+        let mut different_session = receipt.clone();
+        different_session.provenance.campaign_session_id = "7".repeat(64);
+        assert_eq!(
+            campaign_family_identity(&receipt).unwrap(),
+            campaign_family_identity(&different_session).unwrap(),
+            "volatile product sessions must not alter stable family/model identity"
+        );
+        let mut source_drift = receipt.clone();
+        source_drift.provenance.inference_revision = "8".repeat(40);
+        assert_ne!(
+            campaign_global_identity(&receipt).unwrap(),
+            campaign_global_identity(&source_drift).unwrap()
+        );
         let mut tampered = receipt.clone();
         tampered.geometry.capacity = 2;
         assert!(validate_receipt_semantics(&tampered).is_err());
@@ -4555,6 +4810,7 @@ mod tests {
         command_tampered.provenance.command = "run --dense".into();
         assert!(validate_receipt_semantics(&command_tampered).is_err());
         let mut threshold_tampered = receipt.clone();
+        threshold_tampered.mode = "compressed".into();
         threshold_tampered
             .memory
             .allocation_events
@@ -4567,6 +4823,29 @@ mod tests {
                 bytes: 4,
             });
         assert!(validate_receipt_semantics(&threshold_tampered).is_err());
+        let mut zero_context = receipt.clone();
+        zero_context.geometry.context_window_tokens = 0;
+        zero_context.geometry.context_target_tokens = 0;
+        zero_context.geometry.context_payload_tokens = 0;
+        assert!(validate_receipt_semantics(&zero_context).is_err());
+        let mut non_material = receipt.clone();
+        non_material.matrix.context_band = "memory-material".into();
+        non_material.geometry.context_target_tokens = context_band_target(
+            non_material.geometry.context_window_tokens,
+            "memory-material",
+        )
+        .unwrap();
+        non_material.geometry.context_payload_tokens =
+            non_material.geometry.context_target_tokens / 2;
+        assert!(validate_receipt_semantics(&non_material).is_err());
+        let mut not_near_fit = receipt.clone();
+        not_near_fit.matrix.context_band = "fit-boundary".into();
+        not_near_fit.geometry.context_target_tokens =
+            context_band_target(not_near_fit.geometry.context_window_tokens, "fit-boundary")
+                .unwrap();
+        not_near_fit.geometry.context_payload_tokens =
+            not_near_fit.geometry.context_target_tokens / 2;
+        assert!(validate_receipt_semantics(&not_near_fit).is_err());
         let mut split_prefill = receipt.clone();
         split_prefill.memory.phase_samples[2].mlx.active_bytes = 3;
         split_prefill.memory.phase_samples[2].mlx.peak_bytes = 4;
@@ -4582,6 +4861,10 @@ mod tests {
         partial.timings.samples.pop();
         assert!(validate_receipt_semantics(&partial).is_err());
         let bundle = assemble_artifacts(receipt).expect("receipt bytes must assemble");
+        assert!(std::str::from_utf8(&bundle.human)
+            .unwrap()
+            .contains("\n- Receipt hash: "));
+        assert!(!std::str::from_utf8(&bundle.human).unwrap().contains("\\n"));
         assert!(
             validate_artifact_bundle(&bundle).is_err(),
             "campaign receipts require published fixture bytes"
@@ -4640,5 +4923,38 @@ mod tests {
                 "invalid thermal probe unexpectedly accepted: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn repository_and_pmetal_lock_identities_are_exact() {
+        for remote in [
+            "git@github.com:SceneWorks/inference.git",
+            "ssh://git@github.com/SceneWorks/inference.git",
+            "https://github.com/SceneWorks/inference.git",
+        ] {
+            assert_eq!(
+                canonical_github_repository(remote).unwrap(),
+                INFERENCE_REPOSITORY
+            );
+        }
+        for remote in [
+            "git@evil.example:SceneWorks/inference.git",
+            "https://github.com/not-SceneWorks/inference.git",
+            "https://github.com/SceneWorks/other/inference.git",
+        ] {
+            assert!(canonical_github_repository(remote)
+                .map(|identity| identity != INFERENCE_REPOSITORY)
+                .unwrap_or(true));
+        }
+        let identity = locked_mlx_identity(include_bytes!("../../../../Cargo.lock")).unwrap();
+        assert_eq!(identity.version, "0.25.8");
+        assert_eq!(
+            identity.revision,
+            "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
+        );
+        assert_eq!(
+            identity.source,
+            format!("git+{PMETAL_MLX_REPOSITORY}?rev={0}#{0}", identity.revision)
+        );
     }
 }

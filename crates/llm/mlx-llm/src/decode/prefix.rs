@@ -304,6 +304,8 @@ fn observe_cache_events(
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
             latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else {
+            observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
         }
     }
     *seen = cache.events().len();
