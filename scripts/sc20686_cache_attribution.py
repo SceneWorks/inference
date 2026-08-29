@@ -54,7 +54,11 @@ def reduce(rows):
     for family in FAMILIES:
         rs=[r for r in rows if r["family"]==family]
         variants={r["variant"] for r in rs}
-        if not rs or len(variants)<1: decisions[family]={"decision":"blocked","reason":"required real-weight family coverage missing"}; continue
+        required_variants = set(manifest.get("families", {}).get(family, ()))
+        if not rs or variants != required_variants:
+            decisions[family]={"decision":"blocked","reason":"sealed manifest requires every registered variant",
+                               "observed_variants":sorted(variants), "required_variants":sorted(required_variants)}
+            continue
         peak=max(max(s["peak_bytes"] for s in r["process_samples"]) for r in rs)
         current=max(r["current_persistent_bytes"]+r["current_read_transient_bytes"] for r in rs)
         candidate=max(r["candidate_persistent_bytes"]+r["candidate_read_transient_bytes"] for r in rs)

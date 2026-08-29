@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Campaign-only producer for SC-20686 sealed attribution rows."""
-import argparse, hashlib, json, os, subprocess, sys, tempfile, time
+import argparse, hashlib, json, os, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
@@ -14,11 +14,15 @@ def digest(data):
 def snapshot_identity(root):
     files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.parts)
     if not files: raise ValueError("snapshot inventory is empty")
-    rows, total = [], 0
+    aggregate, total = hashlib.sha256(), 0
     for path in files:
-        data = path.read_bytes(); size = len(data)
-        rows.append((str(path.relative_to(root)), digest(data), size)); total += size
-    return digest("".join(f"{n}:{h}:{s}\n" for n, h, s in rows).encode()), total
+        file_hash, size = hashlib.sha256(), 0
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk); total += len(chunk); file_hash.update(chunk)
+        aggregate.update(str(path.relative_to(root)).encode())
+        aggregate.update(b"\0" + struct.pack("<Q", size) + b"\0" + file_hash.digest() + b"\n")
+    return aggregate.hexdigest(), total
 
 def canonical(row):
     return (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
@@ -41,10 +45,11 @@ def atomic_pair(raw, row, sidecar):
             try: os.unlink(handle.name)
             except FileNotFoundError: pass
 
-def geometry_from(config, supplied):
-    geometry = supplied if supplied is not None else config.get("sc20686_geometry")
+def geometry_from(events):
+    metadata = next((e for e in events if e.get("phase") == "metadata"), None)
+    geometry = metadata.get("geometry") if metadata else None
     if not isinstance(geometry, dict) or any(k not in geometry for k in GEOMETRY):
-        raise ValueError("exact geometry (all required axes) is missing")
+        raise ValueError("producer metadata must contain all typed geometry axes")
     return {k: geometry[k] for k in GEOMETRY}
 
 def fake_events():
@@ -53,7 +58,7 @@ def fake_events():
              "transient_bytes": 32 * 1024**2 if p == "cross-kv-read" else 0,
              "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "cancelled", "released"))]
 
-def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
+def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if args.fake:
         raise ValueError("fake evidence is test-only and cannot produce a receipt")
     metadata = next((e for e in events if e.get("phase") == "metadata"), None)
@@ -63,6 +68,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
     source_ref = metadata.get("source_ref")
     if not isinstance(source_ref, str) or len(source_ref) != 40 or any(c not in "0123456789abcdef" for c in source_ref):
         raise ValueError("entrypoint must emit immutable 40-hex source ref")
+    if metadata.get("variant") != args.variant:
+        raise ValueError("producer variant does not match requested route")
     metric_keys = ("current_persistent_bytes", "current_read_transient_bytes", "candidate_persistent_bytes", "candidate_read_transient_bytes", "generation_duration_ms", "cache_read_duration_ms", "reused_requests")
     if any(not isinstance(metrics.get(k), (int, float)) for k in metric_keys):
         raise ValueError("entrypoint metrics are incomplete")
@@ -75,6 +82,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
         raise ValueError("deliberate cancellation cleanup must precede release")
     if not args.cancel_campaign and cancelled:
         raise ValueError("normal generation cannot contain cancellation")
+    geometry = geometry_from(events)
     samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events if "peak_bytes" in e]
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "source_ref": source_ref,
@@ -93,23 +101,23 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--campaign", action="store_true"); p.add_argument("--family", choices=("flux2-klein", "wan"), required=True)
     p.add_argument("--snapshot", type=Path, required=True); p.add_argument("--output", type=Path, required=True); p.add_argument("--variant", required=True)
-    p.add_argument("--geometry", type=Path); p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--cancel-campaign", action="store_true"); p.add_argument("--fake", action="store_true"); args = p.parse_args()
+    p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--cancel-campaign", action="store_true"); p.add_argument("--fake", action="store_true"); args = p.parse_args()
     if not args.campaign: p.error("SC-20686 adapter requires explicit --campaign")
     root = args.snapshot.resolve(); config_path = root / "config.json"
     try:
         if not root.is_dir() or not config_path.is_file(): raise ValueError("snapshot must contain config.json")
-        config = json.loads(config_path.read_text(encoding="utf-8")); supplied = json.loads(args.geometry.read_text(encoding="utf-8")) if args.geometry else None
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         if args.fake:
             events = fake_events()
         elif args.entrypoint:
-            completed = subprocess.run([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-"], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            completed = subprocess.run([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-", "--snapshot", str(root)], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if completed.returncode: raise ValueError(f"campaign entrypoint failed: {completed.stderr.strip()}")
             events = [json.loads(line) for line in completed.stdout.splitlines()
                       if line.lstrip().startswith("{")]
         else:
             events = json.loads(args.events.read_text(encoding="utf-8")) if args.events else None
         if not isinstance(events, list): raise ValueError("real entrypoint must provide observer events")
-        row = make_row(args, config, *snapshot_identity(root), events, geometry_from(config, supplied))
+        row = make_row(args, config, *snapshot_identity(root), events)
         raw = args.output.with_suffix(".raw.json"); sealed, sidecar = seal(row, raw.name); atomic_pair(raw, [sealed], sidecar)
         result = subprocess.run([sys.executable, str(REDUCER), str(raw), str(args.output), "--sidecar", str(raw) + ".sha256"], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(result.stdout, end="")

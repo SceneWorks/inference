@@ -34,14 +34,22 @@ fn arg(args: &[String], key: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let _campaign_scope = if args.iter().any(|arg| arg == "--sc20686-campaign") {
-        Some(candle_gen_wan::sc20686_observer::install_jsonl(
-            arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
-        )?)
-    } else { None };
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("WAN14B_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set WAN14B_SNAPSHOT)")?;
+    // Campaign observation is armed before loading but activated only by the producer after the
+    // registry has resolved the real snapshot and request geometry.  This keeps caller flags from
+    // becoming evidence and ensures the scope covers generation and release.
+    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+        Some(
+            candle_gen_wan::sc20686_observer::request_output(
+                arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
+            )
+            .arm(),
+        )
+    } else {
+        None
+    };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a fluffy cat walking across a sunny garden, gentle camera pan, cinematic, highly detailed"
             .into()

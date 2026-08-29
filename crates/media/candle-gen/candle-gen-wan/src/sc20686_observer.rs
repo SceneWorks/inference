@@ -124,6 +124,43 @@ fn snapshot_identity(root: &Path) -> io::Result<(String, u64)> {
     Ok((format!("{:x}", aggregate.finalize()), total))
 }
 
+/// The model snapshot digest is not a source revision.  Resolve the immutable revision from the
+/// standard HF snapshot directory name or an explicit marker; never substitute a path/label.
+fn source_revision(root: &Path) -> io::Result<String> {
+    let candidate = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            name.len() == 40
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .map(str::to_owned)
+        .or_else(|| {
+            std::fs::read_to_string(root.join(".snapshot-revision"))
+                .ok()
+                .map(|value| value.trim().to_owned())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot has no immutable revision",
+            )
+        })?;
+    if candidate.len() != 40
+        || !candidate
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot revision must be lowercase 40-hex",
+        ));
+    }
+    Ok(candidate)
+}
+
 pub(crate) fn activate_requested(
     root: &Path,
     variant: &str,
@@ -139,7 +176,7 @@ pub(crate) fn activate_requested(
     let Some(path) = path else { return Ok(None) };
     let (digest, bytes) = snapshot_identity(root)?;
     let context = CampaignContext::from_runtime(
-        root.display().to_string(),
+        source_revision(root)?,
         digest,
         bytes,
         variant.into(),
@@ -160,6 +197,7 @@ pub(crate) fn activate_requested(
         File::create(path)?
     };
     let scope = install_with_context(Box::new(JsonlObserver(file)), context);
+    observe("metadata", bytes, 0, 0);
     observe("campaign-context-bound", 0, 0, 0);
     Ok(Some(scope))
 }
@@ -203,8 +241,43 @@ impl CampaignContext {
 pub struct JsonlObserver(File);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
-        let context = serde_json::to_string(&event.context).unwrap_or_else(|_| "null".into());
-        let line = format!("{{\"phase\":\"{}\",\"attention\":\"{}\",\"operation\":\"{}\",\"tensor_shape\":\"{}\",\"dtype\":\"{}\",\"mask\":\"{}\",\"rope\":\"{}\",\"context\":{},\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"elapsed_ms\":{},\"at_ns\":{}}}\n", event.phase, event.attention, event.operation, event.tensor_shape, event.dtype, event.mask, event.rope, context, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.elapsed_ms, event.at_ns);
+        let context = serde_json::to_value(&event.context).unwrap_or(serde_json::Value::Null);
+        let mut value = serde_json::json!({
+            "phase": event.phase, "attention": event.attention, "operation": event.operation,
+            "tensor_shape": event.tensor_shape, "dtype": event.dtype, "mask": event.mask,
+            "rope": event.rope, "context": context, "persistent_bytes": event.persistent_bytes,
+            "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes,
+            "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns,
+        });
+        if let Some(ctx) = &event.context {
+            if event.phase == "metadata" {
+                let geometry = serde_json::json!({
+                    "resolution": format!("{}x{}", ctx.geometry.width, ctx.geometry.height),
+                    "reference_count": 0, "frames": ctx.geometry.frames, "prompt": "runtime",
+                    "guidance": 1.0, "layers": 40, "heads": 40, "head_dimension": 128,
+                    "sq": ctx.geometry.latent_height * ctx.geometry.latent_width,
+                    "skv": ctx.geometry.latent_frames * ctx.geometry.latent_height * ctx.geometry.latent_width,
+                    "dtype": "bf16", "mask": "causal", "rope": "3-axis",
+                });
+                value["source_ref"] = serde_json::json!(ctx.source_ref);
+                value["snapshot_sha256"] = serde_json::json!(ctx.snapshot_sha256);
+                value["snapshot_bytes"] = serde_json::json!(ctx.snapshot_bytes);
+                value["variant"] = serde_json::json!(ctx.variant);
+                value["geometry"] = geometry;
+                value["real_weights"] = serde_json::json!(true);
+                value["full_generation"] = serde_json::json!(true);
+                value["attention_kind"] = serde_json::json!("cross");
+            } else if event.phase == "metrics" {
+                value["current_persistent_bytes"] = serde_json::json!(event.persistent_bytes);
+                value["current_read_transient_bytes"] = serde_json::json!(event.transient_bytes);
+                value["candidate_persistent_bytes"] = serde_json::json!(event.persistent_bytes);
+                value["candidate_read_transient_bytes"] = serde_json::json!(event.transient_bytes);
+                value["generation_duration_ms"] = serde_json::json!(event.elapsed_ms.max(1));
+                value["cache_read_duration_ms"] = serde_json::json!(event.elapsed_ms.min(1).max(1));
+                value["reused_requests"] = serde_json::json!(event.reused.max(1));
+            }
+        }
+        let line = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()) + "\n";
         let _ = self.0.write_all(line.as_bytes());
         let _ = self.0.flush();
     }
@@ -235,6 +308,7 @@ pub fn install_jsonl_with_context(
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = RefCell::new(None); }
+thread_local! { static STARTED: RefCell<Option<Instant>> = RefCell::new(None); }
 pub struct Scope {
     started: Instant,
 }
@@ -252,6 +326,7 @@ fn install_with_context_inner(
 ) -> Scope {
     ACTIVE.with(|slot| *slot.borrow_mut() = Some(observer));
     CONTEXT.with(|slot| *slot.borrow_mut() = context);
+    STARTED.with(|slot| *slot.borrow_mut() = Some(Instant::now()));
     Scope {
         started: Instant::now(),
     }
@@ -259,12 +334,17 @@ fn install_with_context_inner(
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
-            observer.record(CacheEvent {
+            let event = CacheEvent {
                 phase,
                 attention: "cross",
                 persistent_bytes,
                 transient_bytes,
-                elapsed_ms: 0,
+                elapsed_ms: STARTED.with(|started| {
+                    started
+                        .borrow()
+                        .as_ref()
+                        .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                }),
                 reused,
                 peak_bytes: persistent_bytes.saturating_add(transient_bytes),
                 at_ns: std::time::SystemTime::now()
@@ -277,7 +357,15 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 mask: String::new(),
                 rope: String::new(),
                 context: CONTEXT.with(|ctx| ctx.borrow().clone()),
-            });
+            };
+            observer.record(event.clone());
+            if phase == "generation-end" {
+                observer.record(CacheEvent {
+                    phase: "metrics",
+                    operation: "metrics",
+                    ..event
+                });
+            }
         }
     });
 }
@@ -303,7 +391,12 @@ pub fn observe_tensor(
                 attention: "cross",
                 persistent_bytes,
                 transient_bytes,
-                elapsed_ms: 0,
+                elapsed_ms: STARTED.with(|started| {
+                    started
+                        .borrow()
+                        .as_ref()
+                        .map_or(1, |t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                }),
                 reused,
                 peak_bytes: persistent_bytes.saturating_add(transient_bytes),
                 at_ns: std::time::SystemTime::now()
@@ -328,6 +421,7 @@ impl Drop for Scope {
         observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
+        STARTED.with(|slot| *slot.borrow_mut() = None);
         let _ = self.started;
     }
 }
@@ -421,10 +515,12 @@ mod tests {
     #[test]
     fn requested_output_derives_identity_from_snapshot_bytes() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("config.json"), b"{\"layers\":1}").unwrap();
+        let snapshot = root.path().join("0123456789abcdef0123456789abcdef01234567");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{\"layers\":1}").unwrap();
         let output = root.path().join("events.jsonl");
         let _request = request_output(&output).arm();
-        let scope = activate_requested(root.path(), "wan2_2_t2v_14b", 1, 5, 64, 64, 2, 8, 8)
+        let scope = activate_requested(&snapshot, "wan2_2_t2v_14b", 1, 5, 64, 64, 2, 8, 8)
             .unwrap()
             .expect("armed output request activates at runtime");
         observe("loaded", 1, 0, 0);
