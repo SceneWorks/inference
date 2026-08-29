@@ -5,6 +5,7 @@
 //! geometry, or lifecycle observations.  Device collection is supplied by the campaign runner;
 //! these helpers make its inputs deterministic and testable without weights or Metal.
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
@@ -24,6 +25,269 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 ];
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptProvenance {
+    pub scene_works_revision: String,
+    pub inference_revision: String,
+    pub mlx_revision: String,
+    pub dependency_lock_sha256: String,
+    pub os: String,
+    pub xcode: String,
+    pub hardware: String,
+    pub model_id: String,
+    pub model_file_sha256: String,
+    pub model_file_bytes: u64,
+    pub power_mode: String,
+    pub thermal_state: String,
+    pub command_template: String,
+    pub command: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptMatrix {
+    pub family: String,
+    pub context_band: String,
+    pub request_mode: String,
+    pub prefill_mode: String,
+    pub process_temperature: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptGeometry {
+    pub batch: u64,
+    pub query_heads: u64,
+    pub kv_heads: u64,
+    pub head_dimension: u64,
+    pub query_length: u64,
+    pub kv_length: u64,
+    pub layers: u64,
+    pub element_bytes: u64,
+    pub capacity: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptMlx {
+    pub source: String,
+    pub active_bytes: u64,
+    pub cache_bytes: u64,
+    pub peak_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptPhase {
+    pub phase: String,
+    pub pid: u32,
+    pub source: String,
+    pub timestamp: String,
+    pub phys_footprint_bytes: u64,
+    pub phys_footprint_peak_bytes: u64,
+    pub mlx: ReceiptMlx,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptAllocation {
+    pub kind: String,
+    pub role: String,
+    pub lifetime: String,
+    pub phase: String,
+    pub timestamp: String,
+    pub bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptReconciliation {
+    pub expected_dense_kv_bytes: u64,
+    pub observed_persistent_kv_bytes: u64,
+    pub tolerance_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptRelease {
+    pub verified: bool,
+    pub phys_footprint_tolerance_bytes: u64,
+    pub mlx_active_tolerance_bytes: u64,
+    pub mlx_cache_tolerance_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptMemory {
+    pub model_weights_bytes: u64,
+    pub persistent_kv_bytes: u64,
+    pub transient_workspace_bytes: u64,
+    pub dense_theoretical_kv_bytes: u64,
+    pub phase_samples: Vec<ReceiptPhase>,
+    pub allocation_events: Vec<ReceiptAllocation>,
+    pub reconciliation: ReceiptReconciliation,
+    pub release: ReceiptRelease,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptTimingSample {
+    pub load_ms: f64,
+    pub prefill_ms: f64,
+    pub ttft_ms: f64,
+    pub first_token_ms: f64,
+    pub decode_tokens_per_second: f64,
+    pub cold_compile_ms: f64,
+    pub warm_compile_ms: f64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptTimingSummary {
+    pub decode_tokens_per_second_mean: f64,
+    pub decode_tokens_per_second_p95: f64,
+    pub decode_tokens_per_second_variance: f64,
+    pub decode_tokens_per_second_coefficient_of_variation: f64,
+    pub confidence_interval_low: f64,
+    pub confidence_interval_high: f64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptTimings {
+    pub load_ms: f64,
+    pub prefill_ms: f64,
+    pub ttft_ms: f64,
+    pub first_token_ms: f64,
+    pub decode_tokens_per_second: f64,
+    pub cold_compile_ms: f64,
+    pub warm_compile_ms: f64,
+    pub samples: Vec<ReceiptTimingSample>,
+    pub summary: ReceiptTimingSummary,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptFixture {
+    pub passed: bool,
+    pub artifact_sha256: String,
+    pub independent_reference: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptQualityStatistics {
+    pub repeats: u64,
+    pub warmups: u64,
+    pub confidence_interval: String,
+    pub outlier_policy: String,
+    pub variance_policy: String,
+    pub max_coefficient_of_variation: f64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ReceiptQuality {
+    #[serde(rename = "parityMaxError")]
+    pub parity_max_error: f64,
+    #[serde(rename = "perplexityDelta")]
+    pub perplexity_delta: f64,
+    #[serde(rename = "greedyTokenAgreement")]
+    pub greedy_token_agreement: f64,
+    #[serde(rename = "structuredToolAgreement")]
+    pub structured_tool_agreement: f64,
+    #[serde(rename = "needleRetrieval")]
+    pub needle_retrieval: f64,
+    #[serde(rename = "multiTurnPromptCache")]
+    pub multi_turn_prompt_cache: f64,
+    pub statistics: ReceiptQualityStatistics,
+    #[serde(rename = "fixtureEvidence")]
+    pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptLifecycle {
+    pub append: bool,
+    pub chunked_prefill: bool,
+    pub single_shot_prefill: bool,
+    pub prompt_cache_reuse: bool,
+    pub trim: bool,
+    pub rollback: bool,
+    pub clear: bool,
+    pub cancel: bool,
+    pub clone: bool,
+    pub batch_split: bool,
+    pub batch_merge: bool,
+    pub prefix_copy_on_write: bool,
+    pub page_import: bool,
+    pub page_export: bool,
+    pub serialization: bool,
+    pub restore: bool,
+    pub dense_fallback: bool,
+    pub post_run_release: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptCancellation {
+    pub cleanup_verified: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Receipt {
+    pub schema_version: u32,
+    pub harness_version: String,
+    pub run_id: String,
+    pub captured_at: String,
+    pub mode: String,
+    pub status: String,
+    pub contract_hash: String,
+    pub receipt_sha256: String,
+    pub provenance: ReceiptProvenance,
+    pub matrix: ReceiptMatrix,
+    pub geometry: ReceiptGeometry,
+    pub memory: ReceiptMemory,
+    pub timings: ReceiptTimings,
+    pub quality: ReceiptQuality,
+    pub lifecycle: ReceiptLifecycle,
+    pub cancellation: ReceiptCancellation,
+}
+
+impl Receipt {
+    /// Serialize the exact receipt bytes; `receipt_sha256` is filled by the caller after clearing
+    /// that field according to the SceneWorks semantic-core convention.
+    pub fn bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactBundle {
+    pub receipt: Vec<u8>,
+    pub receipt_sidecar: String,
+    pub human: Vec<u8>,
+    pub human_sidecar: String,
+}
+
+/// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
+/// partially-written receipt directory from being mistaken for a campaign result.
+pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String> {
+    receipt.receipt_sha256.clear();
+    let semantic = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+    receipt.receipt_sha256 = seal_bytes(&semantic);
+    let bytes = receipt.bytes().map_err(|e| e.to_string())?;
+    let human = format!(
+        "SC-20671 {} {} {}\n",
+        receipt.run_id, receipt.mode, receipt.status
+    )
+    .into_bytes();
+    Ok(ArtifactBundle {
+        receipt_sidecar: seal_bytes(&bytes),
+        human_sidecar: seal_bytes(&human),
+        receipt: bytes,
+        human,
+    })
+}
+
+pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
+    if seal_bytes(&bundle.receipt) != bundle.receipt_sidecar
+        || seal_bytes(&bundle.human) != bundle.human_sidecar
+    {
+        return Err("artifact sidecar does not match exact bytes".into());
+    }
+    if bundle.receipt.is_empty() || bundle.human.is_empty() {
+        return Err("partial artifact bundle".into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coordinate {
@@ -572,5 +836,135 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(validate_fixture_evidence(&evidence).is_ok());
         assert!(validate_fixture_evidence(&evidence[..3]).is_err());
+    }
+
+    #[test]
+    fn artifact_bundle_rejects_tampering_and_partial_outputs() {
+        let receipt = Receipt {
+            schema_version: 3,
+            harness_version: "sc-20671-kv-baseline-v3".into(),
+            run_id: "run".into(),
+            captured_at: "2026-01-01T00:00:00Z".into(),
+            mode: "dense".into(),
+            status: "complete".into(),
+            contract_hash: "a".repeat(64),
+            receipt_sha256: String::new(),
+            provenance: ReceiptProvenance {
+                scene_works_revision: "a".repeat(40),
+                inference_revision: "b".repeat(40),
+                mlx_revision: "mlx".into(),
+                dependency_lock_sha256: "c".repeat(64),
+                os: "macOS".into(),
+                xcode: "xcode".into(),
+                hardware: "hardware".into(),
+                model_id: "model".into(),
+                model_file_sha256: "d".repeat(64),
+                model_file_bytes: 1,
+                power_mode: "nominal".into(),
+                thermal_state: "nominal".into(),
+                command_template: "run --mode {mode}".into(),
+                command: "run --mode dense".into(),
+            },
+            matrix: ReceiptMatrix {
+                family: "llama".into(),
+                context_band: "short".into(),
+                request_mode: "single".into(),
+                prefill_mode: "single-shot".into(),
+                process_temperature: "cold".into(),
+            },
+            geometry: ReceiptGeometry {
+                batch: 1,
+                query_heads: 1,
+                kv_heads: 1,
+                head_dimension: 1,
+                query_length: 1,
+                kv_length: 1,
+                layers: 1,
+                element_bytes: 2,
+                capacity: 1,
+            },
+            memory: ReceiptMemory {
+                model_weights_bytes: 1,
+                persistent_kv_bytes: 4,
+                transient_workspace_bytes: 0,
+                dense_theoretical_kv_bytes: 4,
+                phase_samples: vec![],
+                allocation_events: vec![],
+                reconciliation: ReceiptReconciliation {
+                    expected_dense_kv_bytes: 4,
+                    observed_persistent_kv_bytes: 4,
+                    tolerance_bytes: 0,
+                },
+                release: ReceiptRelease {
+                    verified: true,
+                    phys_footprint_tolerance_bytes: 0,
+                    mlx_active_tolerance_bytes: 0,
+                    mlx_cache_tolerance_bytes: 0,
+                },
+            },
+            timings: ReceiptTimings {
+                load_ms: 1.0,
+                prefill_ms: 1.0,
+                ttft_ms: 1.0,
+                first_token_ms: 1.0,
+                decode_tokens_per_second: 1.0,
+                cold_compile_ms: 1.0,
+                warm_compile_ms: 1.0,
+                samples: vec![],
+                summary: ReceiptTimingSummary {
+                    decode_tokens_per_second_mean: 1.0,
+                    decode_tokens_per_second_p95: 1.0,
+                    decode_tokens_per_second_variance: 0.0,
+                    decode_tokens_per_second_coefficient_of_variation: 0.0,
+                    confidence_interval_low: 1.0,
+                    confidence_interval_high: 1.0,
+                },
+            },
+            quality: ReceiptQuality {
+                parity_max_error: 0.0,
+                perplexity_delta: 0.0,
+                greedy_token_agreement: 1.0,
+                structured_tool_agreement: 1.0,
+                needle_retrieval: 1.0,
+                multi_turn_prompt_cache: 1.0,
+                statistics: ReceiptQualityStatistics {
+                    repeats: 5,
+                    warmups: 2,
+                    confidence_interval: "95% bootstrap".into(),
+                    outlier_policy: "report all samples; no silent deletion".into(),
+                    variance_policy: "all raw repeats retained".into(),
+                    max_coefficient_of_variation: 0.05,
+                },
+                fixture_evidence: std::collections::BTreeMap::new(),
+            },
+            lifecycle: ReceiptLifecycle {
+                append: true,
+                chunked_prefill: true,
+                single_shot_prefill: true,
+                prompt_cache_reuse: true,
+                trim: true,
+                rollback: true,
+                clear: true,
+                cancel: true,
+                clone: true,
+                batch_split: true,
+                batch_merge: true,
+                prefix_copy_on_write: true,
+                page_import: true,
+                page_export: true,
+                serialization: true,
+                restore: true,
+                dense_fallback: true,
+                post_run_release: true,
+            },
+            cancellation: ReceiptCancellation {
+                cleanup_verified: true,
+            },
+        };
+        let bundle = assemble_artifacts(receipt).unwrap();
+        assert!(validate_artifact_bundle(&bundle).is_ok());
+        let mut tampered = bundle.clone();
+        tampered.receipt.push(b'x');
+        assert!(validate_artifact_bundle(&tampered).is_err());
     }
 }
