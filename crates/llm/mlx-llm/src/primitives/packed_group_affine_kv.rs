@@ -52,7 +52,7 @@ pub struct DenseFallbackEvent {
 /// A retained backend object which owns the compiled reader for one cache identity.
 ///
 /// SC-20675 intentionally does not manufacture a Metal object from descriptive strings.  The
-/// later SC-20776 compiler supplies its real retained pipeline/argument state through this small
+/// later SC-20676 compiler supplies its real retained pipeline/argument state through this small
 /// object-safe boundary, so a cache cannot outlive (or be rebound to) another cache's reader.
 pub trait RetainedPackedKernel: fmt::Debug + Send + Sync {
     fn cache_identity(&self) -> &str;
@@ -198,7 +198,7 @@ impl DecoderCacheSelection {
 }
 
 /// A decoder-facing bridge for the experimental storage.  It owns staged packed storage only
-/// after a fully supported opt-in request.  Until SC-20776 installs a retained fused reader, every
+/// after a fully supported opt-in request.  Until SC-20676 installs a retained fused reader, every
 /// lifecycle operation records the reason and delegates to dense *before* it mutates K/V state.
 /// This is intentionally not advertised as compressed-domain attention.
 #[derive(Debug)]
@@ -222,7 +222,7 @@ impl DenseFallbackPackedDecoderCache {
         self.staged.fallback_events()
     }
 
-    /// SC-20776 may attach only a reader whose identity matches the staged representation.  The
+    /// SC-20676 may attach only a reader whose identity matches the staged representation.  The
     /// current bridge remains dense until that story also installs the corresponding attention
     /// execution path.
     pub fn bind_compiled_handle(&mut self, handle: CompiledKernelHandle) -> Result<()> {
@@ -291,7 +291,7 @@ fn dense_selection(layers: usize, reason: impl Into<String>) -> DecoderCacheSele
 /// Construct the cache which a decoder will use, before the first append.  Disabled overrides and
 /// every unsupported geometry return the established contiguous implementation without allocating
 /// a packed cache.  A supported override stages the packed format but still deterministically uses
-/// dense until a retained SC-20776 reader is bound; this prevents a metadata-only path from being
+/// dense until a retained SC-20676 reader is bound; this prevents a metadata-only path from being
 /// mistaken for compressed-domain execution.
 pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelection {
     if !request.enabled {
@@ -662,7 +662,7 @@ pub struct PackedGroupAffineKvCache {
     layers: Vec<Option<LayerStorage>>,
     fallback_events: Vec<DenseFallbackEvent>,
     cancelled: bool,
-    /// No reader is installed until SC-20776 binds a retained compiled object for this identity.
+    /// No reader is installed until SC-20676 binds a retained compiled object for this identity.
     handle: Option<CompiledKernelHandle>,
 }
 
