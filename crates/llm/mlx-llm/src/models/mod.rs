@@ -7,15 +7,18 @@
 
 pub(crate) mod deepstack;
 pub mod gemma4_mm;
+pub mod gpt_bigcode;
 pub mod llama;
 pub mod qwen35;
 pub mod qwen35_vision;
 pub mod siglip;
+pub mod starvector_vision;
 
 pub use gemma4_mm::{
     Gemma4AudioConfig, Gemma4AudioEmbedder, Gemma4Layout, Gemma4Mm, Gemma4MmConfig,
     Gemma4VisionConfig, Gemma4VisionEmbedder,
 };
+pub use gpt_bigcode::{GptBigCode, GptBigCodeConfig};
 pub use llama::CausalLm;
 pub use qwen35::{Qwen35Cache, Qwen35Config, Qwen35Model};
 pub use qwen35_vision::{
@@ -23,6 +26,7 @@ pub use qwen35_vision::{
     Qwen3VLVisionModel, Qwen3VLVisionOutput,
 };
 pub use siglip::{SiglipVisionConfig, SiglipVisionTower};
+pub use starvector_vision::{StarVectorAdapter, StarVectorClipVision, IMAGE_SIZE, IMAGE_TOKENS};
 
 use mlx_rs::Array;
 
