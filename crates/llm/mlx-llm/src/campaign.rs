@@ -23,6 +23,50 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "post-run-release",
 ];
 
+pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coordinate {
+    pub family: &'static str,
+    pub context_band: &'static str,
+    pub request_mode: &'static str,
+    pub prefill_mode: &'static str,
+    pub process_temperature: &'static str,
+}
+
+/// The exact required dense campaign frontier (2 × 4 × 2 × 2 × 2).
+pub fn required_coordinates() -> Vec<Coordinate> {
+    ["llama", "qwen"]
+        .into_iter()
+        .flat_map(|family| {
+            CONTEXT_BANDS
+                .into_iter()
+                .map(move |context_band| (family, context_band))
+        })
+        .flat_map(|(family, context_band)| {
+            ["single", "supported-batch"]
+                .into_iter()
+                .map(move |request_mode| (family, context_band, request_mode))
+        })
+        .flat_map(|(family, context_band, request_mode)| {
+            ["chunked", "single-shot"]
+                .into_iter()
+                .map(move |prefill_mode| (family, context_band, request_mode, prefill_mode))
+        })
+        .flat_map(|(family, context_band, request_mode, prefill_mode)| {
+            ["cold", "warm"]
+                .into_iter()
+                .map(move |process_temperature| Coordinate {
+                    family,
+                    context_band,
+                    request_mode,
+                    prefill_mode,
+                    process_temperature,
+                })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventoryFile {
     pub path: String,
@@ -212,6 +256,66 @@ pub struct FixtureEvidence {
     pub artifact_sha256: String,
     pub independent_reference: String,
     pub passed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QualityObservation {
+    pub parity_errors: Vec<f64>,
+    pub reference_perplexity: f64,
+    pub candidate_perplexity: f64,
+    pub greedy_matches: u64,
+    pub greedy_total: u64,
+    pub tool_matches: u64,
+    pub tool_total: u64,
+    pub needle_matches: u64,
+    pub needle_total: u64,
+    pub cache_matches: u64,
+    pub cache_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QualityMetrics {
+    pub parity_max_error: f64,
+    pub perplexity_delta: f64,
+    pub greedy_token_agreement: f64,
+    pub structured_tool_agreement: f64,
+    pub needle_retrieval: f64,
+    pub multi_turn_prompt_cache: f64,
+}
+
+/// Compute quality from raw reference/candidate observations; no caller-supplied pass flag exists.
+pub fn compute_quality(raw: &QualityObservation) -> Result<QualityMetrics, String> {
+    let ratio = |matched: u64, total: u64| {
+        if total == 0 {
+            Err("quality observation has zero denominator".into())
+        } else {
+            Ok(matched as f64 / total as f64)
+        }
+    };
+    if !raw.reference_perplexity.is_finite()
+        || !raw.candidate_perplexity.is_finite()
+        || raw.parity_errors.iter().any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err("quality observation contains non-finite values".into());
+    }
+    Ok(QualityMetrics {
+        parity_max_error: raw.parity_errors.iter().copied().fold(0.0, f64::max),
+        perplexity_delta: raw.candidate_perplexity - raw.reference_perplexity,
+        greedy_token_agreement: ratio(raw.greedy_matches, raw.greedy_total)?,
+        structured_tool_agreement: ratio(raw.tool_matches, raw.tool_total)?,
+        needle_retrieval: ratio(raw.needle_matches, raw.needle_total)?,
+        multi_turn_prompt_cache: ratio(raw.cache_matches, raw.cache_total)?,
+    })
+}
+
+/// Build and seal a producer-owned fixture artifact from raw observations.
+pub fn fixture_artifact(name: &str, raw: &QualityObservation) -> Result<(Vec<u8>, String), String> {
+    if !REQUIRED_FIXTURES.contains(&name) {
+        return Err(format!("unknown fixture {name}"));
+    }
+    let metrics = compute_quality(raw)?;
+    let value = serde_json::json!({ "fixture": name, "metrics": { "parityMaxError": metrics.parity_max_error, "perplexityDelta": metrics.perplexity_delta, "greedyTokenAgreement": metrics.greedy_token_agreement, "structuredToolAgreement": metrics.structured_tool_agreement, "needleRetrieval": metrics.needle_retrieval, "multiTurnPromptCache": metrics.multi_turn_prompt_cache } });
+    Ok(sealed_json(&value))
 }
 
 pub fn validate_fixture_evidence(evidence: &[FixtureEvidence]) -> Result<(), String> {
@@ -418,6 +522,41 @@ mod tests {
         assert_eq!(parse_footprint_value("2 MB"), Some(2 * 1024 * 1024));
         assert!(parse_footprint_value("nan B").is_none());
         assert!(parse_footprint_value("4 TB").is_none());
+    }
+
+    #[test]
+    fn required_matrix_is_exactly_64_coordinates() {
+        let coordinates = required_coordinates();
+        assert_eq!(coordinates.len(), 64);
+        for (index, coordinate) in coordinates.iter().enumerate() {
+            assert!(!coordinates[index + 1..].contains(coordinate));
+        }
+    }
+
+    #[test]
+    fn quality_metrics_are_derived_from_raw_observations() {
+        let raw = QualityObservation {
+            parity_errors: vec![0.0, 0.0002],
+            reference_perplexity: 10.0,
+            candidate_perplexity: 9.5,
+            greedy_matches: 9,
+            greedy_total: 10,
+            tool_matches: 1,
+            tool_total: 1,
+            needle_matches: 1,
+            needle_total: 1,
+            cache_matches: 1,
+            cache_total: 1,
+        };
+        let metrics = compute_quality(&raw).unwrap();
+        assert_eq!(metrics.parity_max_error, 0.0002);
+        assert_eq!(metrics.perplexity_delta, -0.5);
+        assert_eq!(metrics.greedy_token_agreement, 0.9);
+        assert!(compute_quality(&QualityObservation {
+            greedy_total: 0,
+            ..raw
+        })
+        .is_err());
     }
 
     #[test]
