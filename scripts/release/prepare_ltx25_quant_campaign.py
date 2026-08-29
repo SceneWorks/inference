@@ -11,13 +11,15 @@ partial download pattern.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import urllib.request
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -118,17 +120,118 @@ def fetch_public_readback(
             "public readback must report the canonical repository, exact revision, "
             "private=false, and gated=false"
         )
+    readback_inventory(raw, revision)
+    return raw
+
+
+def readback_inventory(raw: bytes, revision: str) -> dict[str, tuple[int, str | None]]:
+    """Return exact public paths mapped to size and optional LFS SHA-256."""
+    document = json.loads(raw)
+    if (
+        document.get("id") != PUBLIC_REPOSITORY
+        or document.get("sha") != revision
+        or document.get("private") is not False
+        or document.get("gated") is not False
+    ):
+        raise ValueError("public readback identity/privacy changed before inventory validation")
     siblings = document.get("siblings")
     if not isinstance(siblings, list) or not siblings:
         raise ValueError("public readback must contain the expanded non-empty sibling inventory")
+    inventory: dict[str, tuple[int, str | None]] = {}
     for sibling in siblings:
-        if (
-            not isinstance(sibling, dict)
-            or not isinstance(sibling.get("rfilename"), str)
-            or not isinstance(sibling.get("size"), int)
-        ):
-            raise ValueError("every public readback sibling must contain rfilename and size")
-    return raw
+        if not isinstance(sibling, dict):
+            raise ValueError("every public readback sibling must be an object")
+        name = sibling.get("rfilename")
+        size = sibling.get("size")
+        if not isinstance(name, str) or not name:
+            raise ValueError("every public readback sibling must contain rfilename")
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or str(relative) != name or ".." in relative.parts or "\\" in name:
+            raise ValueError(f"public readback contains unsafe sibling path: {name!r}")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"public readback sibling {name!r} has invalid size")
+        lfs = sibling.get("lfs")
+        sha256 = None
+        if lfs is not None:
+            if not isinstance(lfs, dict) or lfs.get("size") != size:
+                raise ValueError(f"public readback sibling {name!r} has invalid LFS size")
+            sha256 = lfs.get("sha256")
+            if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+                raise ValueError(f"public readback sibling {name!r} has invalid LFS SHA-256")
+        if name in inventory:
+            raise ValueError(f"public readback repeats sibling path: {name!r}")
+        inventory[name] = (size, sha256)
+    return inventory
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _sha256_and_size(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def validate_snapshot_against_readback(snapshot: Path, revision: str, raw: bytes) -> None:
+    """Prove the canonical snapshot is an exact, non-escaping copy of the public revision."""
+    snapshot = require_absolute(snapshot, "snapshot").resolve(strict=True)
+    if snapshot.name != require_revision(revision) or snapshot.parent.name != "snapshots":
+        raise ValueError("snapshot must be the exact canonical snapshots/<revision> directory")
+    repo_root = snapshot.parent.parent.resolve(strict=True)
+    blob_root = (repo_root / "blobs").resolve(strict=True)
+    expected = readback_inventory(raw, revision)
+    actual: dict[str, Path] = {}
+    for directory, directories, files in os.walk(snapshot, topdown=True, followlinks=False):
+        root = Path(directory)
+        for name in directories:
+            candidate = root / name
+            if candidate.is_symlink():
+                raise ValueError(f"snapshot contains a directory symlink: {candidate}")
+        for name in files:
+            logical = root / name
+            metadata = logical.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                physical = logical.resolve(strict=True)
+                if not physical.is_file() or not _within(physical, blob_root):
+                    raise ValueError(
+                        f"snapshot symlink resolves outside canonical blob store: {logical}"
+                    )
+            elif stat.S_ISREG(metadata.st_mode):
+                physical = logical
+            else:
+                raise ValueError(f"snapshot contains unsupported filesystem entry: {logical}")
+            relative = logical.relative_to(snapshot).as_posix()
+            actual[relative] = physical
+    expected_paths = set(expected)
+    actual_paths = set(actual)
+    if expected_paths != actual_paths:
+        raise ValueError(
+            "snapshot sibling set differs from public readback: "
+            f"missing={sorted(expected_paths - actual_paths)!r} "
+            f"extra={sorted(actual_paths - expected_paths)!r}"
+        )
+    for name in sorted(expected):
+        expected_size, expected_sha256 = expected[name]
+        physical = actual[name]
+        actual_size = physical.stat().st_size
+        if actual_size != expected_size:
+            raise ValueError(
+                f"snapshot sibling {name!r} size differs: expected {expected_size}, got {actual_size}"
+            )
+        if expected_sha256 is not None:
+            actual_sha256, hashed_size = _sha256_and_size(physical)
+            if hashed_size != expected_size or actual_sha256 != expected_sha256:
+                raise ValueError(f"snapshot sibling {name!r} LFS SHA-256 differs from public readback")
 
 
 def materialize_public_snapshot(
@@ -310,6 +413,7 @@ def main() -> int:
     from huggingface_hub import snapshot_download
 
     snapshot = materialize_public_snapshot(args.revision, args.cache_root, snapshot_download)
+    validate_snapshot_against_readback(snapshot, args.revision, raw_readback)
     if args.command == "campaign":
         write_new(args.readback_out, raw_readback)
         write_json(args.manifest_out, campaign_manifest(snapshot, args.revision))

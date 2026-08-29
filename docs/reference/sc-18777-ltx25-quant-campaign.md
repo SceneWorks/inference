@@ -46,6 +46,12 @@ The full repository is required (about 464 GiB logical at the SC-18777 publicati
 promotion compares its local inventory with every sibling in the raw public API readback. A
 partial `allow_patterns` download cannot pass that check.
 
+Before it writes the campaign manifest or starts the GPU producer, the helper walks the canonical
+snapshot without following directory symlinks and compares its exact logical path set and sizes to
+the expanded readback. Every available LFS SHA-256 is recomputed from the resolved bytes. A file
+symlink is accepted only when it resolves inside that repository's canonical `blobs` directory;
+missing, extra, mutated, special, parent-symlinked, or escaping entries fail before measurement.
+
 The helper generates all nine v1 rows from a fixed table. BF16/packed rows use the public
 `distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` bundles. Advanced rows use the three
 `bundles/**` directories and bind the all-BF16 Gemma file by its snapshot-relative path inside the
@@ -101,6 +107,12 @@ that the named run is a successful `ltx25-quant-campaign.yml` dispatch at the ex
 then downloads the exact attempt-named artifact with the pinned `actions/download-artifact` action.
 It checks out the exact revision but does not rebuild: it runs the preserved campaign executable
 and performs a real generation from every selected public winner on exact consumer `sm_120`.
+
+The producer copies the exact reviewed input bytes and newly fetched raw readback into
+`promotion-sources/`. `promotion-manifest.json` records their paths, lengths, and SHA-256 values
+alongside the replay receipts, runtime bindings, and staged allowlist hash. These source artifacts
+and the manifest are fully written before the final atomic rename publishes
+`accepted_quant_receipts.allowlist`; no workflow post-processing may add or reseal them.
 
 Promotion re-inventories the complete public snapshot before and after generation; revalidates the
 unchanged source receipt, code, executable, GPU/driver, selected components, external variant,

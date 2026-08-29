@@ -350,8 +350,18 @@ struct PublicReplayReceipt {
 #[serde(rename_all = "camelCase")]
 struct PromotionManifest {
     schema_version: &'static str,
+    reviewed_promotion_input: EvidenceArtifact,
+    public_readbacks: Vec<PromotionPublicReadback>,
     accepted_allowlist: EvidenceArtifact,
     snapshots: Vec<PromotionSnapshot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromotionPublicReadback {
+    public_repository: &'static str,
+    model_revision: String,
+    artifact: EvidenceArtifact,
 }
 
 #[derive(Serialize)]
@@ -1606,8 +1616,8 @@ pub fn materialize_campaign_promotion(
     let campaign: TerminalCampaignManifest =
         serde_json::from_slice(&fs::read(campaign_manifest_path)?)?;
     let source_cases = validated_campaign_cases(&campaign)?;
-    let promotion: TerminalPromotionInput =
-        serde_json::from_slice(&fs::read(promotion_input_path)?)?;
+    let promotion_input_bytes = fs::read(promotion_input_path)?;
+    let promotion: TerminalPromotionInput = serde_json::from_slice(&promotion_input_bytes)?;
     let public_cases = validated_promotion_cases(&promotion)?;
     std::env::set_var("CUDA_VISIBLE_DEVICES", physical_gpu_ordinal.to_string());
 
@@ -1615,9 +1625,14 @@ pub fn materialize_campaign_promotion(
     fs::create_dir(output_dir)?;
     let replay_root = output_dir.join("public-replays");
     fs::create_dir(&replay_root)?;
+    let source_root = output_dir.join("promotion-sources");
+    fs::create_dir(&source_root)?;
+    let reviewed_promotion_input_path = source_root.join("reviewed-promotion-input.json");
+    write_bytes(&reviewed_promotion_input_path, &promotion_input_bytes)?;
 
     let mut accepted = Vec::new();
     let mut groups = BTreeMap::<(String, String), PromotionGroup>::new();
+    let mut preserved_readbacks = BTreeMap::<String, (String, PathBuf)>::new();
     for case in TERMINAL_MEASUREMENT_CASES
         .iter()
         .filter(|case| public_cases.contains_key(case.id))
@@ -1653,6 +1668,33 @@ pub fn materialize_campaign_promotion(
             &public.public_model_revision,
             &public_observation.inventory,
         )?;
+        match preserved_readbacks.get(&public.public_model_revision) {
+            Some((sha256, _)) if sha256 != &public_readback_sha256 => {
+                return Err(invalid(
+                    "one public revision resolved to multiple raw public readback documents",
+                )
+                .into());
+            }
+            Some(_) => {}
+            None => {
+                let preserved = source_root.join(format!(
+                    "{}-public-readback.json",
+                    public.public_model_revision
+                ));
+                write_bytes(&preserved, &fs::read(&public.public_readback)?)?;
+                let preserved_artifact = artifact(output_dir, &preserved)?;
+                if preserved_artifact.sha256 != public_readback_sha256 {
+                    return Err(invalid(
+                        "preserved raw public readback differs from the validated source",
+                    )
+                    .into());
+                }
+                preserved_readbacks.insert(
+                    public.public_model_revision.clone(),
+                    (public_readback_sha256.clone(), preserved),
+                );
+            }
+        }
         let reference_case = TERMINAL_MEASUREMENT_CASES
             .iter()
             .find(|candidate| {
@@ -1762,10 +1804,22 @@ pub fn materialize_campaign_promotion(
         });
     }
     snapshots.sort_by(|left, right| left.model_revision.cmp(&right.model_revision));
+    let public_readbacks = preserved_readbacks
+        .into_iter()
+        .map(|(model_revision, (_, path))| {
+            Ok(PromotionPublicReadback {
+                public_repository: LTX25_PUBLIC_REPOSITORY,
+                model_revision,
+                artifact: artifact(output_dir, &path)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     write_json(
         &output_dir.join("promotion-manifest.json"),
         &PromotionManifest {
             schema_version: PROMOTION_SCHEMA,
+            reviewed_promotion_input: artifact(output_dir, &reviewed_promotion_input_path)?,
+            public_readbacks,
             accepted_allowlist: allowlist_artifact,
             snapshots,
         },
@@ -2282,8 +2336,12 @@ fn artifact(root: &Path, path: &Path) -> Result<EvidenceArtifact> {
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
+    write_bytes(path, &bytes)
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = File::create(path)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
 }
@@ -2725,6 +2783,73 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("manifest length/hash"));
+    }
+
+    #[test]
+    fn promotion_manifest_seals_exact_reviewed_input_and_raw_readback() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = root.path().join("promotion-sources");
+        fs::create_dir(&sources).unwrap();
+        let reviewed = sources.join("reviewed-promotion-input.json");
+        let readback = sources.join(format!("{}-public-readback.json", "b".repeat(40)));
+        let reviewed_bytes = b"{\"reviewedBy\":\"independent-review\"}\n";
+        let readback_bytes = b"{\"private\":false,\"gated\":false}\n";
+        write_bytes(&reviewed, reviewed_bytes).unwrap();
+        write_bytes(&readback, readback_bytes).unwrap();
+        let manifest = PromotionManifest {
+            schema_version: PROMOTION_SCHEMA,
+            reviewed_promotion_input: artifact(root.path(), &reviewed).unwrap(),
+            public_readbacks: vec![PromotionPublicReadback {
+                public_repository: LTX25_PUBLIC_REPOSITORY,
+                model_revision: "b".repeat(40),
+                artifact: artifact(root.path(), &readback).unwrap(),
+            }],
+            accepted_allowlist: EvidenceArtifact {
+                path: "accepted_quant_receipts.allowlist".to_owned(),
+                bytes: 3,
+                sha256: sha256_hex(b"[]\n"),
+            },
+            snapshots: Vec::new(),
+        };
+        let manifest_path = root.path().join("promotion-manifest.json");
+        write_json(&manifest_path, &manifest).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            document["reviewedPromotionInput"]["sha256"],
+            sha256_hex(reviewed_bytes)
+        );
+        assert_eq!(
+            document["publicReadbacks"][0]["artifact"]["sha256"],
+            sha256_hex(readback_bytes)
+        );
+        assert_eq!(fs::read(reviewed).unwrap(), reviewed_bytes);
+        assert_eq!(fs::read(readback).unwrap(), readback_bytes);
+    }
+
+    #[test]
+    fn promotion_sources_and_manifest_precede_atomic_allowlist_publication() {
+        let source = include_str!("quant_measurement.rs");
+        let body = &source[source
+            .find("pub fn materialize_campaign_promotion")
+            .expect("promotion producer")..];
+        let reviewed = body
+            .find("reviewed-promotion-input.json")
+            .expect("reviewed input preservation");
+        let readback = body
+            .find("-public-readback.json")
+            .expect("raw readback preservation");
+        let staged = body
+            .find("let staged_allowlist_path")
+            .expect("staged allowlist");
+        let manifest = body
+            .find("promotion-manifest.json")
+            .expect("promotion manifest");
+        let publish = body
+            .find("fs::rename(staged_allowlist_path, allowlist_path)")
+            .expect("atomic allowlist publication");
+        assert!(reviewed < staged && readback < staged);
+        assert!(staged < manifest && manifest < publish);
     }
 
     #[test]

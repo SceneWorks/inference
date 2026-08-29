@@ -1,6 +1,7 @@
 """Tests for autonomous LTX-2.5 terminal campaign input preparation."""
 
 import importlib.util
+import hashlib
 import io
 import json
 import tempfile
@@ -116,11 +117,39 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
         snapshot = Path("/cache/models--SceneWorks--ltx-2.5-mlx/snapshots") / REVISION
         document = MODULE.campaign_manifest(snapshot, REVISION)
         self.assertEqual(document["schemaVersion"], MODULE.CAMPAIGN_SCHEMA)
-        self.assertEqual(len(document["cases"]), 9)
         self.assertEqual(
-            {case["caseId"] for case in document["cases"]},
-            {case[0] for case in MODULE.TERMINAL_CASES},
+            MODULE.TERMINAL_CASES,
+            (
+                ("ltx25-bf16-blackwell-v1", "distilled", "distilled/bf16", None),
+                ("ltx25-packed-q4-blackwell-v1", "distilled", "distilled/q4", None),
+                ("ltx25-packed-q8-blackwell-v1", "distilled", "distilled/q8", None),
+                (
+                    "ltx25-int8-convrot-blackwell-v1",
+                    "distilled",
+                    "bundles/distilled/int8-convrot",
+                    "bundles/distilled/int8-convrot/text_encoders/"
+                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+                ),
+                (
+                    "ltx25-nvfp4-blackwell-v1",
+                    "distilled",
+                    "bundles/distilled/nvfp4",
+                    "bundles/distilled/nvfp4/text_encoders/"
+                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+                ),
+                ("ltx25-bf16-blackwell-dev-v1", "dev", "dev/bf16", None),
+                ("ltx25-packed-q4-blackwell-dev-v1", "dev", "dev/q4", None),
+                ("ltx25-packed-q8-blackwell-dev-v1", "dev", "dev/q8", None),
+                (
+                    "ltx25-int8-convrot-blackwell-dev-v1",
+                    "dev",
+                    "bundles/dev/int8-convrot",
+                    "bundles/dev/int8-convrot/text_encoders/"
+                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+                ),
+            ),
         )
+        self.assertEqual(len(document["cases"]), 9)
         advanced = [
             case for case in document["cases"] if "bf16TextEncoderSubpath" in case
         ]
@@ -129,6 +158,74 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
             all("text_encoders/gemma4-12b-with-proj" in case["bf16TextEncoderSubpath"] for case in advanced)
         )
         self.assertEqual({case["snapshotRoot"] for case in document["cases"]}, {str(snapshot)})
+
+    def test_snapshot_inventory_matches_sizes_lfs_hashes_and_canonical_blob_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "models--SceneWorks--ltx-2.5-mlx"
+            blobs = repo / "blobs"
+            snapshot = repo / "snapshots" / REVISION
+            blobs.mkdir(parents=True)
+            snapshot.mkdir(parents=True)
+            weights = b"reviewed public weights"
+            digest = hashlib.sha256(weights).hexdigest()
+            blob = blobs / digest
+            blob.write_bytes(weights)
+            (snapshot / "weights.safetensors").symlink_to(Path("../../blobs") / digest)
+            (snapshot / "README.md").write_bytes(b"public readme")
+            raw = json.dumps(
+                {
+                    "id": MODULE.PUBLIC_REPOSITORY,
+                    "sha": REVISION,
+                    "private": False,
+                    "gated": False,
+                    "siblings": [
+                        {"rfilename": "README.md", "size": 13},
+                        {
+                            "rfilename": "weights.safetensors",
+                            "size": len(weights),
+                            "lfs": {"size": len(weights), "sha256": digest},
+                        },
+                    ],
+                }
+            ).encode()
+            MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+
+            blob.write_bytes(b"reviewed public weightz")
+            with self.assertRaisesRegex(ValueError, "LFS SHA-256 differs"):
+                MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+            blob.write_bytes(weights)
+
+            extra = snapshot / "extra.json"
+            extra.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "extra=.*extra.json"):
+                MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+            extra.unlink()
+            (snapshot / "README.md").unlink()
+            with self.assertRaisesRegex(ValueError, "missing=.*README.md"):
+                MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
+
+    def test_snapshot_inventory_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "models--SceneWorks--ltx-2.5-mlx"
+            (repo / "blobs").mkdir(parents=True)
+            snapshot = repo / "snapshots" / REVISION
+            snapshot.mkdir(parents=True)
+            outside = root / "outside.safetensors"
+            outside.write_bytes(b"weights")
+            (snapshot / "weights.safetensors").symlink_to(outside)
+            raw = json.dumps(
+                {
+                    "id": MODULE.PUBLIC_REPOSITORY,
+                    "sha": REVISION,
+                    "private": False,
+                    "gated": False,
+                    "siblings": [{"rfilename": "weights.safetensors", "size": 7}],
+                }
+            ).encode()
+            with self.assertRaisesRegex(ValueError, "outside canonical blob store"):
+                MODULE.validate_snapshot_against_readback(snapshot, REVISION, raw)
 
     def test_promotion_input_contains_only_explicit_reviewed_winners(self):
         snapshot = Path("/cache/models--SceneWorks--ltx-2.5-mlx/snapshots") / REVISION
