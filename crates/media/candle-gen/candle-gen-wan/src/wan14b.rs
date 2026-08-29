@@ -550,7 +550,6 @@ impl Pipeline {
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
         if let Err(error) = check_cancel(cancel) {
-            crate::sc20686_observer::observe_cancelled();
             return Err(error);
         }
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;

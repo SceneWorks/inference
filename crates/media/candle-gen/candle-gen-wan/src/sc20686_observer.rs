@@ -271,6 +271,12 @@ pub(crate) fn activate_requested(
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
     let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
     let Some(path) = path else { return Ok(None) };
+    if !cfg!(test) && backend_peak_bytes().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SC-20686 requires a live backend allocator high-water mark",
+        ));
+    }
     let (digest, bytes) = snapshot_identity(root)?;
     let context = CampaignContext::from_runtime(
         source_revision(root)?,
@@ -307,8 +313,9 @@ pub(crate) fn activate_requested(
         File::create(path)?
     };
     let scope = install_with_context(Box::new(JsonlObserver(file)), context);
-    observe("metadata", bytes, 0, u64::from(cancellation));
-    observe("campaign-context-bound", 0, 0, 0);
+    // Metadata is emitted exactly once, after bind_cross_kv_geometry has populated the
+    // product-owned attention geometry. Never publish the zero-valued activation placeholder.
+    CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = cancellation);
     Ok(Some(scope))
 }
 
@@ -370,9 +377,13 @@ impl CacheObserver for JsonlObserver {
                 value["snapshot_bytes"] = serde_json::json!(ctx.snapshot_bytes);
                 value["variant"] = serde_json::json!(ctx.variant);
                 value["geometry"] = serde_json::json!({
+                    "batch": ctx.geometry.batch,
                     "resolution": format!("{}x{}", ctx.geometry.width, ctx.geometry.height),
                     "reference_count": ctx.geometry.reference_count,
                     "frames": ctx.geometry.frames,
+                    "latent_frames": ctx.geometry.latent_frames,
+                    "latent_height": ctx.geometry.latent_height,
+                    "latent_width": ctx.geometry.latent_width,
                     "prompt": ctx.geometry.prompt_sha256,
                     "guidance": ctx.geometry.guidance,
                     "layers": ctx.geometry.layers,
@@ -389,7 +400,44 @@ impl CacheObserver for JsonlObserver {
                     value["cancellation_arm_id"] =
                         serde_json::json!(format!("{}:{}", ctx.source_ref, ctx.variant));
                 }
+                value["real_weights"] = serde_json::json!(true);
+                value["full_generation"] = serde_json::json!(event.reused != 1);
+                value["attention_kind"] = serde_json::json!("cross");
             }
+        }
+        if event.phase == "metrics" {
+            let current = CURRENT_PERSISTENT.with(|slot| *slot.borrow());
+            let transient = CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow());
+            let reused = REUSED_REQUESTS.with(|slot| *slot.borrow());
+            let generation_ms = GENERATION_DURATION_MS.with(|slot| *slot.borrow());
+            let read_ms = CACHE_READ_DURATION_MS.with(|slot| *slot.borrow());
+            // This is a checked geometry-derived projection for the qualified 2-bit format; it is
+            // intentionally emitted separately from measured current allocation.
+            let candidate = event
+                .context
+                .as_ref()
+                .and_then(|ctx| {
+                    let g = &ctx.geometry;
+                    let elements = u64::from(g.batch)
+                        .checked_mul(u64::from(g.layers))?
+                        .checked_mul(u64::from(g.heads))?
+                        .checked_mul(g.skv)?
+                        .checked_mul(u64::from(g.head_dimension))?
+                        .checked_mul(2)?;
+                    checked_compressed_bytes(elements, 2, 64)
+                })
+                .unwrap_or(0);
+            value["current_persistent_bytes"] = serde_json::json!(current);
+            value["current_read_transient_bytes"] = serde_json::json!(transient);
+            value["candidate_persistent_bytes"] = serde_json::json!(candidate);
+            value["candidate_read_transient_bytes"] = serde_json::json!(0);
+            value["generation_duration_ms"] = serde_json::json!(generation_ms);
+            value["cache_read_duration_ms"] = serde_json::json!(read_ms);
+            value["reused_requests"] = serde_json::json!(reused);
+            value["real_weights"] = serde_json::json!(true);
+            value["full_generation"] =
+                serde_json::json!(!CAMPAIGN_CANCEL.with(|slot| *slot.borrow()));
+            value["attention_kind"] = serde_json::json!("cross");
         }
         let line = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()) + "\n";
         let _ = self.0.write_all(line.as_bytes());
@@ -423,6 +471,16 @@ pub fn install_jsonl_with_context(
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = RefCell::new(None); }
 thread_local! { static STARTED: RefCell<Option<Instant>> = RefCell::new(None); }
+thread_local! { static METADATA_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static START_EVENT_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static PENDING_START: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static LIVE_READ_SEEN: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static CAMPAIGN_CANCEL: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static CURRENT_PERSISTENT: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static CURRENT_READ_TRANSIENT: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static REUSED_REQUESTS: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static GENERATION_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static CACHE_READ_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
 
 /// Read the backend's continuous high-water mark. A campaign receipt is never allowed to use the
 /// attributed byte sum as a substitute for a process/device measurement.
@@ -453,6 +511,16 @@ fn install_with_context_inner(
     ACTIVE.with(|slot| *slot.borrow_mut() = Some(observer));
     CONTEXT.with(|slot| *slot.borrow_mut() = context);
     STARTED.with(|slot| *slot.borrow_mut() = Some(Instant::now()));
+    METADATA_EMITTED.with(|slot| *slot.borrow_mut() = false);
+    START_EVENT_EMITTED.with(|slot| *slot.borrow_mut() = false);
+    PENDING_START.with(|slot| *slot.borrow_mut() = false);
+    LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
+    CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
+    CURRENT_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
+    CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow_mut() = 0);
+    REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = 0);
+    GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
+    CACHE_READ_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
     Scope {
         started: Instant::now(),
     }
@@ -469,6 +537,47 @@ pub fn observe_timed(
     reused: u64,
     measured: Option<Instant>,
 ) {
+    if phase == "generation-start" {
+        let metadata = METADATA_EMITTED.with(|slot| *slot.borrow());
+        if !metadata {
+            PENDING_START.with(|slot| *slot.borrow_mut() = true);
+            return;
+        }
+        START_EVENT_EMITTED.with(|slot| *slot.borrow_mut() = true);
+    }
+    if phase == "cross-kv-read" {
+        LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = true);
+        CURRENT_READ_TRANSIENT
+            .with(|slot| *slot.borrow_mut() = (*slot.borrow()).max(transient_bytes));
+        REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = slot.borrow().saturating_add(reused));
+        CACHE_READ_DURATION_MS.with(|slot| {
+            *slot.borrow_mut() =
+                (*slot.borrow()).max(measured.map_or(0, |t| t.elapsed().as_millis() as u64))
+        });
+    }
+    if phase == "cross-kv-created" {
+        CURRENT_PERSISTENT.with(|slot| *slot.borrow_mut() = (*slot.borrow()).max(persistent_bytes));
+    }
+    if phase == "generation-end" {
+        GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = elapsed_ms_for(measured));
+    }
+    if phase == "metadata" {
+        let ready = CONTEXT.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|context| {
+                let g = &context.geometry;
+                g.layers != 0
+                    && g.heads != 0
+                    && g.head_dimension != 0
+                    && g.sq != 0
+                    && g.skv != 0
+                    && !g.dtype.is_empty()
+            })
+        });
+        if !ready || METADATA_EMITTED.with(|slot| *slot.borrow()) {
+            return;
+        }
+        METADATA_EMITTED.with(|slot| *slot.borrow_mut() = true);
+    }
     ACTIVE.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
             let context = CONTEXT.with(|ctx| ctx.borrow().clone());
@@ -517,6 +626,24 @@ pub fn observe_timed(
             }
         }
     });
+    if phase == "metadata" && PENDING_START.with(|slot| *slot.borrow()) {
+        PENDING_START.with(|slot| *slot.borrow_mut() = false);
+        observe("generation-start", 0, 0, 0);
+    }
+}
+
+fn elapsed_ms_for(measured: Option<Instant>) -> u64 {
+    measured.map_or_else(
+        || {
+            STARTED.with(|started| {
+                started
+                    .borrow()
+                    .as_ref()
+                    .map_or(1, |t| t.elapsed().as_millis() as u64)
+            })
+        },
+        |t| t.elapsed().as_millis() as u64,
+    )
 }
 pub fn observe_tensor(
     phase: &'static str,
@@ -570,7 +697,12 @@ pub fn observe_tensor(
     });
 }
 pub fn observe_cancelled() {
-    observe("cancelled", 0, 0, 0);
+    // A deliberate cancellation arm is only meaningful after a product-owned live K/V read.
+    // This prevents preflight/request validation failures from masquerading as cancellation runs.
+    if LIVE_READ_SEEN.with(|slot| *slot.borrow()) {
+        observe("cancelled", 0, 0, 0);
+        observe("metrics", 0, 0, 0);
+    }
 }
 
 /// Bind geometry from the live prepared K/V arrays. This is deliberately producer-only; callers
@@ -610,15 +742,27 @@ pub(crate) fn bind_cross_kv_geometry(
         }
     });
     if bound {
-        observe("metadata", 0, 0, 0);
+        let cancellation = CAMPAIGN_CANCEL.with(|slot| *slot.borrow());
+        observe("metadata", 0, 0, u64::from(cancellation));
+        if !START_EVENT_EMITTED.with(|slot| *slot.borrow())
+            && !PENDING_START.with(|slot| *slot.borrow())
+        {
+            observe("generation-start", 0, 0, 0);
+        }
     }
 }
 impl Drop for Scope {
     fn drop(&mut self) {
+        observe("invalidated", 0, 0, 0);
         observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         STARTED.with(|slot| *slot.borrow_mut() = None);
+        METADATA_EMITTED.with(|slot| *slot.borrow_mut() = false);
+        START_EVENT_EMITTED.with(|slot| *slot.borrow_mut() = false);
+        PENDING_START.with(|slot| *slot.borrow_mut() = false);
+        LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
+        CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
         let _ = self.started;
     }
 }
@@ -758,13 +902,21 @@ mod tests {
         let scope = activate_requested(&snapshot, "wan2_2_t2v_14b", 1, 5, 64, 64, 2, 8, 8)
             .unwrap()
             .expect("armed output request activates at runtime");
+        bind_cross_kv_geometry(1, 8, 64, 1, 2, "bf16");
         observe("loaded", 1, 0, 0);
         drop(scope);
         let lines = std::fs::read_to_string(output).unwrap();
         assert!(lines.contains("wan2_2_t2v_14b"));
+        assert_eq!(
+            lines
+                .lines()
+                .filter(|line| line.contains("\"phase\":\"metadata\""))
+                .count(),
+            1
+        );
         assert!(lines
             .lines()
-            .any(|line| line.contains("campaign-context-bound") && line.contains("t2v")));
+            .any(|line| line.contains("\"attention_kind\":\"cross\"")));
         assert!(lines
             .lines()
             .any(|line| line.contains("released") && line.contains("t2v")));
