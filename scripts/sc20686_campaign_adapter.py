@@ -85,7 +85,8 @@ def main():
         elif args.entrypoint:
             completed = subprocess.run([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-"], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if completed.returncode: raise ValueError(f"campaign entrypoint failed: {completed.stderr.strip()}")
-            events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+            events = [json.loads(line) for line in completed.stdout.splitlines()
+                      if line.lstrip().startswith("{")]
         else:
             events = json.loads(args.events.read_text(encoding="utf-8")) if args.events else None
         if not isinstance(events, list): raise ValueError("real entrypoint must provide observer events")
