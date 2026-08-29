@@ -75,6 +75,9 @@ fn main() -> Result<()> {
             PathBuf::from(value(&args, "--promotion-input")?).as_path(),
             PathBuf::from(value(&args, "--evidence-root")?).as_path(),
             PathBuf::from(value(&args, "--output-dir")?).as_path(),
+            value(&args, "--physical-gpu")?
+                .parse::<usize>()
+                .map_err(|_| "--physical-gpu must be one numeric physical ordinal")?,
         )?;
         println!("materialized verified LTX-2.5 promotion artifacts");
         return Ok(());
@@ -99,6 +102,8 @@ fn main() -> Result<()> {
         bundle_subdir: PathBuf::from(value(&args, "--bundle-subdir")?),
         model_revision: value(&args, "--model-revision")?,
         output_dir: PathBuf::from(value(&args, "--output-dir")?),
+        bf16_text_encoder_subpath: optional_value(&args, "--bf16-text-encoder-subpath")
+            .map(PathBuf::from),
         reference_snapshot: optional_value(&args, "--reference-snapshot-root").map(PathBuf::from),
         reference_bundle_subdir: optional_value(&args, "--reference-bundle-subdir")
             .map(PathBuf::from),

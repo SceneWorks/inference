@@ -28,15 +28,17 @@ use crate::quant_eval::{
     bundle_identity_sha256, inventory_for_snapshot, measurement_case, promotion_copy_sha256,
     selected_bundle_identity_sha256, snapshot_inventory_sha256, Ltx25GpuGeneration,
     Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt, Ltx25QuantMode, Ltx25QuantQuality,
-    Ltx25QuantRuntimeBindings, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
-    RUNTIME_BINDING_SCHEMA, TERMINAL_MEASUREMENT_CASES,
+    Ltx25QuantRuntimeBindings, Ltx25QuantRuntimeIdentity, LTX25_PUBLIC_REPOSITORY,
+    RUNTIME_BINDING_FILE, RUNTIME_BINDING_SCHEMA, TERMINAL_MEASUREMENT_CASES,
 };
 
 pub const TERMINAL_ACKNOWLEDGEMENT: &str = "I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY";
-pub const HARNESS_VERSION: &str = "sc-18777-terminal-v5";
+pub const HARNESS_VERSION: &str = "sc-18777-terminal-v6";
 pub const CAMPAIGN_SCHEMA: &str = "sceneworks-ltx25-quant-campaign-v1";
-pub const PROMOTION_SCHEMA: &str = "sceneworks-ltx25-quant-promotion-v1";
+pub const PROMOTION_SCHEMA: &str = "sceneworks-ltx25-quant-promotion-v2";
 const EVIDENCE_SCHEMA: &str = "sceneworks-ltx25-quant-evidence-v3";
+const PUBLIC_REPLAY_SCHEMA: &str = "sceneworks-ltx25-public-replay-v1";
+const REVIEWED_POLICY_ID: &str = "sc-18777-reviewed-selection-v1";
 const PROMPT: &str =
     "a red fox walking through snowy pines, slow cinematic dolly, detailed natural motion";
 const OUTPUT_MAGIC: &[u8] = b"LTX25-QUANT-OUTPUT-V1\0";
@@ -45,6 +47,160 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+impl TerminalPromotionSelection {
+    fn validate(&self) -> Result<()> {
+        if self.policy_id != REVIEWED_POLICY_ID {
+            return Err(invalid(format!(
+                "promotion policy id must equal {REVIEWED_POLICY_ID:?}"
+            ))
+            .into());
+        }
+        if self.reviewed_by.trim().is_empty() {
+            return Err(invalid("promotion selection requires a non-empty reviewedBy").into());
+        }
+        for (label, value) in [
+            ("minimumReferencePsnr", self.minimum_reference_psnr),
+            ("minimumReferenceSsim", self.minimum_reference_ssim),
+            (
+                "maximumTemporalBoundaryDrift",
+                self.maximum_temporal_boundary_drift,
+            ),
+            ("minimumReplayPsnr", self.minimum_replay_psnr),
+            ("minimumReplaySsim", self.minimum_replay_ssim),
+            (
+                "maximumReplayTemporalBoundaryDrift",
+                self.maximum_replay_temporal_boundary_drift,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(invalid(format!(
+                    "promotion policy {label} must be finite and non-negative"
+                ))
+                .into());
+            }
+        }
+        if self.minimum_reference_psnr == 0.0
+            || self.minimum_replay_psnr == 0.0
+            || !(0.0..=1.0).contains(&self.minimum_reference_ssim)
+            || self.minimum_reference_ssim == 0.0
+            || !(0.0..=1.0).contains(&self.minimum_replay_ssim)
+            || self.minimum_replay_ssim == 0.0
+            || self.maximum_temporal_boundary_drift > 1.0
+            || self.maximum_replay_temporal_boundary_drift > 1.0
+            || !self.require_replay_output_hash_match
+        {
+            return Err(invalid(
+                "promotion policy requires positive PSNR/SSIM floors, drift ceilings in [0,1], and exact replay output-hash matching",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn require_quality(
+        &self,
+        label: &str,
+        quality: &Ltx25QuantQuality,
+        replay: bool,
+    ) -> Result<()> {
+        let (minimum_psnr, minimum_ssim, maximum_drift) = if replay {
+            (
+                self.minimum_replay_psnr,
+                self.minimum_replay_ssim,
+                self.maximum_replay_temporal_boundary_drift,
+            )
+        } else {
+            (
+                self.minimum_reference_psnr,
+                self.minimum_reference_ssim,
+                self.maximum_temporal_boundary_drift,
+            )
+        };
+        if !quality.reference_psnr.is_finite()
+            || !quality.reference_ssim.is_finite()
+            || !quality.temporal_boundary_drift.is_finite()
+            || quality.reference_psnr < minimum_psnr
+            || quality.reference_ssim < minimum_ssim
+            || quality.temporal_boundary_drift > maximum_drift
+            || !quality.silent_zero_video_passed
+            || !quality.silent_zero_audio_passed
+        {
+            return Err(invalid(format!(
+                "{label} fails reviewed quality policy: psnr={} (min {minimum_psnr}), ssim={} (min {minimum_ssim}), temporalDrift={} (max {maximum_drift}), videoGate={}, audioGate={}",
+                quality.reference_psnr,
+                quality.reference_ssim,
+                quality.temporal_boundary_drift,
+                quality.silent_zero_video_passed,
+                quality.silent_zero_audio_passed,
+            ))
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl PublicReplayReceipt {
+    fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        let mut unsealed = self.clone();
+        unsealed.receipt_sha256.clear();
+        Ok(serde_json::to_vec(&unsealed)?)
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.receipt_sha256 = sha256_hex(&self.canonical_bytes()?);
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (label, value) in [
+            ("public readback", self.public_readback_sha256.as_str()),
+            ("source receipt", self.source_receipt_sha256.as_str()),
+            (
+                "public measurement receipt",
+                self.public_measurement_receipt_sha256.as_str(),
+            ),
+            ("measured output", self.measured_output_sha256.as_str()),
+            ("replay output", self.replay_output_sha256.as_str()),
+            (
+                "pre-public inventory",
+                self.pre_public_inventory_sha256.as_str(),
+            ),
+            (
+                "post-public inventory",
+                self.post_public_inventory_sha256.as_str(),
+            ),
+            (
+                "pre-public inventory artifact",
+                self.pre_public_inventory_artifact_sha256.as_str(),
+            ),
+            (
+                "post-public inventory artifact",
+                self.post_public_inventory_artifact_sha256.as_str(),
+            ),
+            ("operator contract", self.operator_contract_sha256.as_str()),
+            (
+                "operator weight inventory",
+                self.operator_weight_inventory_sha256.as_str(),
+            ),
+            ("public replay receipt", self.receipt_sha256.as_str()),
+        ] {
+            require_lower_hex(&format!("{label} SHA-256"), value, 64)?;
+        }
+        if self.schema_version != PUBLIC_REPLAY_SCHEMA
+            || measurement_case(&self.case_id).is_none()
+            || self.public_repository != LTX25_PUBLIC_REPOSITORY
+            || self.measured_output_sha256 != self.replay_output_sha256
+            || self.pre_public_inventory_sha256 != self.post_public_inventory_sha256
+            || self.pre_public_inventory_artifact_sha256
+                != self.post_public_inventory_artifact_sha256
+            || self.receipt_sha256 != sha256_hex(&self.canonical_bytes()?)
+        {
+            return Err(invalid("public replay receipt identity/seal is invalid").into());
+        }
+        Ok(())
+    }
 }
 
 fn quant_for_mode(mode: Ltx25QuantMode) -> Option<Quant> {
@@ -56,6 +212,48 @@ fn quant_for_mode(mode: Ltx25QuantMode) -> Option<Quant> {
     }
 }
 
+fn select_case_bundle(
+    snapshot: &Path,
+    bundle_subdir: &Path,
+    bf16_text_encoder_subpath: Option<&Path>,
+    case: &crate::quant_eval::Ltx25QuantMeasurementCase,
+) -> Result<(candle_gen::gen_core::LoadSpec, String)> {
+    let advanced = matches!(
+        case.mode,
+        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+    );
+    if advanced != bf16_text_encoder_subpath.is_some() {
+        return Err(invalid(format!(
+            "case {} {} an explicit bf16TextEncoderSubpath",
+            case.id,
+            if advanced {
+                "requires"
+            } else {
+                "must not declare"
+            }
+        ))
+        .into());
+    }
+    let (mut spec, logical) = crate::bundle::select_snapshot_bundle(snapshot, bundle_subdir)?;
+    if let Some(subpath) = bf16_text_encoder_subpath {
+        let encoder =
+            crate::quant_eval::snapshot_bound_file(snapshot, subpath, "bf16TextEncoderSubpath")?;
+        spec.components.insert(
+            candle_gen::gen_core::LtxComponent::TextEncoder
+                .id()
+                .to_owned(),
+            candle_gen::gen_core::WeightsSource::File(encoder),
+        );
+    }
+    spec.quantize = quant_for_mode(case.mode);
+    let bundle = crate::bundle::resolve_split_bundle(&spec)?;
+    TransformerVariant::from_bundle_with_binding(&bundle, case.transformer_variant)?;
+    if advanced {
+        crate::bundle::assert_bf16_text_encoder(&bundle)?;
+    }
+    Ok((spec, logical))
+}
+
 #[derive(Clone, Debug)]
 pub struct TerminalMeasurementConfig {
     pub acknowledgement: String,
@@ -64,6 +262,7 @@ pub struct TerminalMeasurementConfig {
     pub bundle_subdir: PathBuf,
     pub model_revision: String,
     pub output_dir: PathBuf,
+    pub bf16_text_encoder_subpath: Option<PathBuf>,
     pub reference_snapshot: Option<PathBuf>,
     pub reference_bundle_subdir: Option<PathBuf>,
     pub reference_model_revision: Option<String>,
@@ -82,25 +281,69 @@ pub struct TerminalCampaignManifest {
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCampaignCase {
     pub case_id: String,
+    pub transformer_variant: TransformerVariant,
     pub snapshot_root: PathBuf,
     pub model_revision: String,
     pub bundle_subdir: PathBuf,
+    pub bf16_text_encoder_subpath: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPromotionInput {
     pub schema_version: String,
+    pub public_repository: String,
+    pub selection: TerminalPromotionSelection,
     pub cases: Vec<TerminalPromotionCase>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPromotionSelection {
+    pub policy_id: String,
+    pub reviewed_by: String,
+    pub selected_case_ids: Vec<String>,
+    pub minimum_reference_psnr: f64,
+    pub minimum_reference_ssim: f64,
+    pub maximum_temporal_boundary_drift: f64,
+    pub minimum_replay_psnr: f64,
+    pub minimum_replay_ssim: f64,
+    pub maximum_replay_temporal_boundary_drift: f64,
+    pub require_replay_output_hash_match: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalPromotionCase {
     pub case_id: String,
+    pub transformer_variant: TransformerVariant,
     pub public_snapshot_root: PathBuf,
     pub public_model_revision: String,
     pub public_bundle_subdir: PathBuf,
+    pub bf16_text_encoder_subpath: PathBuf,
+    pub public_readback: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicReplayReceipt {
+    schema_version: String,
+    case_id: String,
+    public_repository: String,
+    public_readback_sha256: String,
+    source_receipt_sha256: String,
+    public_measurement_receipt_sha256: String,
+    measured_output_sha256: String,
+    replay_output_sha256: String,
+    pre_public_inventory_sha256: String,
+    post_public_inventory_sha256: String,
+    pre_public_inventory_artifact_sha256: String,
+    post_public_inventory_artifact_sha256: String,
+    replay_quality: Ltx25QuantQuality,
+    operator_kind: String,
+    operator_contract_sha256: String,
+    operator_weight_inventory_sha256: String,
+    receipt_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -114,15 +357,19 @@ struct PromotionManifest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PromotionSnapshot {
+    public_repository: String,
+    public_readback_sha256: String,
     model_revision: String,
     model_inventory_sha256: String,
     public_snapshot_root: String,
     runtime_binding: EvidenceArtifact,
+    replay_receipts: Vec<EvidenceArtifact>,
     case_ids: Vec<String>,
 }
 
 struct BundleObservation {
     snapshot_root: PathBuf,
+    inventory: crate::quant_eval::SnapshotInventory,
     model_inventory_sha256: String,
     bundle_subdir: String,
     runtime_bundle_sha256: String,
@@ -132,9 +379,11 @@ struct BundleObservation {
 
 struct PromotionGroup {
     public_snapshot_root: PathBuf,
+    public_readback_sha256: String,
     model_revision: String,
     model_inventory_sha256: String,
     bindings: Vec<Ltx25QuantRuntimeIdentity>,
+    replay_receipts: Vec<PathBuf>,
     case_ids: Vec<String>,
 }
 
@@ -165,6 +414,28 @@ struct EvidenceManifest {
     case_id: String,
     run_nonce_sha256: String,
     artifacts: Vec<EvidenceArtifact>,
+}
+
+#[derive(Deserialize)]
+struct HuggingFaceReadback {
+    id: String,
+    sha: String,
+    private: bool,
+    siblings: Vec<HuggingFaceSibling>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HuggingFaceSibling {
+    rfilename: String,
+    size: Option<u64>,
+    lfs: Option<HuggingFaceLfs>,
+}
+
+#[derive(Deserialize)]
+struct HuggingFaceLfs {
+    sha256: String,
+    size: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,9 +507,12 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let executable_sha256 = sha256_file(&executable)?;
     let snapshot = canonical_snapshot(&config.snapshot, &config.model_revision, "candidate")?;
-    let (mut inspection_spec, bundle_subdir) =
-        crate::bundle::select_snapshot_bundle(&snapshot, &config.bundle_subdir)?;
-    inspection_spec.quantize = quant_for_mode(case.mode);
+    let (inspection_spec, bundle_subdir) = select_case_bundle(
+        &snapshot,
+        &config.bundle_subdir,
+        config.bf16_text_encoder_subpath.as_deref(),
+        case,
+    )?;
     let output_parent = config
         .output_dir
         .parent()
@@ -284,7 +558,8 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     }
 
     let resolved = crate::bundle::resolve_split_bundle(&inspection_spec)?;
-    let observed_variant = TransformerVariant::from_bundle(&resolved)?;
+    let observed_variant =
+        TransformerVariant::from_bundle_with_binding(&resolved, case.transformer_variant)?;
     if observed_variant != case.transformer_variant {
         return Err(invalid(format!(
             "case {} requires transformer variant {}, bundle declares {}",
@@ -498,6 +773,11 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         model_revision: config.model_revision,
         model_inventory_sha256,
         bundle_subdir,
+        bf16_text_encoder_subpath: config
+            .bf16_text_encoder_subpath
+            .as_ref()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default(),
         runtime_bundle_sha256,
         selected_bundle_sha256,
         reference_model_revision: reference.model_revision,
@@ -557,13 +837,19 @@ fn runtime_identity_from_receipt(
         source_model_revision: receipt.model_revision.clone(),
         source_model_inventory_sha256: receipt.model_inventory_sha256.clone(),
         source_bundle_subdir: receipt.bundle_subdir.clone(),
+        source_bf16_text_encoder_subpath: receipt.bf16_text_encoder_subpath.clone(),
         source_runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
         source_selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
         model_revision: receipt.model_revision.clone(),
         model_inventory_sha256: receipt.model_inventory_sha256.clone(),
         bundle_subdir: receipt.bundle_subdir.clone(),
+        bf16_text_encoder_subpath: receipt.bf16_text_encoder_subpath.clone(),
         runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
         selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
+        public_repository: String::new(),
+        public_readback_sha256: String::new(),
+        public_replay_receipt_sha256: String::new(),
+        public_replay_output_sha256: String::new(),
         promotion_copy_sha256: String::new(),
         reference_model_revision: receipt.reference_model_revision.clone(),
         reference_model_inventory_sha256: receipt.reference_model_inventory_sha256.clone(),
@@ -594,10 +880,35 @@ fn validated_campaign_cases(
     }
     let mut cases = BTreeMap::new();
     for entry in &manifest.cases {
-        if measurement_case(&entry.case_id).is_none() {
+        let Some(case) = measurement_case(&entry.case_id) else {
             return Err(invalid(format!(
                 "campaign manifest contains unknown case {:?}",
                 entry.case_id
+            ))
+            .into());
+        };
+        if entry.transformer_variant != case.transformer_variant {
+            return Err(invalid(format!(
+                "campaign case {} binds transformer variant {}, expected {}",
+                case.id,
+                entry.transformer_variant.id(),
+                case.transformer_variant.id()
+            ))
+            .into());
+        }
+        let requires_bf16_text_encoder = matches!(
+            case.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        );
+        if requires_bf16_text_encoder != entry.bf16_text_encoder_subpath.is_some() {
+            return Err(invalid(format!(
+                "campaign case {} {} bf16TextEncoderSubpath",
+                case.id,
+                if requires_bf16_text_encoder {
+                    "requires an explicit upstream"
+                } else {
+                    "must not declare"
+                }
             ))
             .into());
         }
@@ -634,6 +945,117 @@ fn campaign_order() -> impl Iterator<Item = &'static crate::quant_eval::Ltx25Qua
                 .iter()
                 .filter(|case| case.mode != Ltx25QuantMode::Bf16),
         )
+}
+
+fn canonical_public_snapshot(path: &Path, revision: &str, repository: &str) -> Result<PathBuf> {
+    if repository != LTX25_PUBLIC_REPOSITORY {
+        return Err(invalid(format!(
+            "SC-18777 public repository must equal {LTX25_PUBLIC_REPOSITORY:?}"
+        ))
+        .into());
+    }
+    let root = canonical_snapshot(path, revision, "public destination")?;
+    let expected_repo_dir = format!("models--{}", repository.replace('/', "--"));
+    let actual_repo_dir = root
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    if actual_repo_dir != Some(expected_repo_dir.as_str()) {
+        return Err(invalid(format!(
+            "public snapshot {} must use canonical Hugging Face cache repository directory {expected_repo_dir:?}",
+            root.display()
+        ))
+        .into());
+    }
+    Ok(root)
+}
+
+fn validate_public_readback(
+    path: &Path,
+    repository: &str,
+    revision: &str,
+    inventory: &crate::quant_eval::SnapshotInventory,
+) -> Result<String> {
+    if !path.is_absolute() || !path.is_file() {
+        return Err(invalid(
+            "publicReadback must be an absolute raw Hugging Face API response file",
+        )
+        .into());
+    }
+    let bytes = fs::read(path)?;
+    let readback: HuggingFaceReadback = serde_json::from_slice(&bytes).map_err(|error| {
+        invalid(format!(
+            "public readback {} is not the required expanded Hugging Face model response: {error}",
+            path.display()
+        ))
+    })?;
+    if readback.id != repository || readback.sha != revision || readback.private {
+        return Err(invalid(format!(
+            "public readback must report id={repository:?}, sha={revision:?}, private=false"
+        ))
+        .into());
+    }
+    let mut siblings = BTreeMap::new();
+    for sibling in readback.siblings {
+        let size = sibling.size.ok_or_else(|| {
+            invalid(format!(
+                "public readback sibling {:?} omits size; capture the expanded siblings response",
+                sibling.rfilename
+            ))
+        })?;
+        if siblings
+            .insert(sibling.rfilename.clone(), (size, sibling.lfs))
+            .is_some()
+        {
+            return Err(invalid(format!(
+                "public readback repeats sibling {:?}",
+                sibling.rfilename
+            ))
+            .into());
+        }
+    }
+    let expected_paths = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual_paths = siblings.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual_paths != expected_paths {
+        let missing = actual_paths
+            .difference(&expected_paths)
+            .copied()
+            .collect::<Vec<_>>();
+        let local_only = expected_paths
+            .difference(&actual_paths)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(invalid(format!(
+            "public snapshot is not a full readback inventory; notDownloaded={missing:?} localOnly={local_only:?}"
+        ))
+        .into());
+    }
+    for entry in &inventory.entries {
+        let (size, lfs) = &siblings[&entry.path];
+        if *size != entry.bytes {
+            return Err(invalid(format!(
+                "public readback sibling {:?} reports {size} bytes, local full inventory reports {}",
+                entry.path, entry.bytes
+            ))
+            .into());
+        }
+        if let Some(lfs) = lfs {
+            require_lower_hex("public readback LFS SHA-256", &lfs.sha256, 64)?;
+            if lfs.size != entry.bytes || lfs.sha256 != entry.sha256 {
+                return Err(invalid(format!(
+                    "public readback LFS identity for {:?} differs from local bytes",
+                    entry.path
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(sha256_hex(&bytes))
 }
 
 /// Run the complete physical campaign serially in one already-built executable.
@@ -684,6 +1106,7 @@ pub fn run_campaign(
             bundle_subdir: entry.bundle_subdir.clone(),
             model_revision: entry.model_revision.clone(),
             output_dir: output_root.join(case.id),
+            bf16_text_encoder_subpath: entry.bf16_text_encoder_subpath.clone(),
             reference_snapshot: reference_entry.map(|entry| entry.snapshot_root.clone()),
             reference_bundle_subdir: reference_entry.map(|entry| entry.bundle_subdir.clone()),
             reference_model_revision: reference_entry.map(|entry| entry.model_revision.clone()),
@@ -700,17 +1123,21 @@ fn observe_bundle(
     snapshot: &Path,
     revision: &str,
     bundle_subdir: &Path,
+    bf16_text_encoder_subpath: Option<&Path>,
     case: &crate::quant_eval::Ltx25QuantMeasurementCase,
     label: &str,
 ) -> Result<BundleObservation> {
     let snapshot_root = canonical_snapshot(snapshot, revision, label)?;
     let inventory = inventory_for_snapshot(&snapshot_root)?;
     let model_inventory_sha256 = snapshot_inventory_sha256(&inventory)?;
-    let (mut spec, bundle_subdir) =
-        crate::bundle::select_snapshot_bundle(&snapshot_root, bundle_subdir)?;
-    spec.quantize = quant_for_mode(case.mode);
+    let (spec, bundle_subdir) = select_case_bundle(
+        &snapshot_root,
+        bundle_subdir,
+        bf16_text_encoder_subpath,
+        case,
+    )?;
     let bundle = crate::bundle::resolve_split_bundle(&spec)?;
-    let variant = TransformerVariant::from_bundle(&bundle)?;
+    let variant = TransformerVariant::from_bundle_with_binding(&bundle, case.transformer_variant)?;
     if variant != case.transformer_variant {
         return Err(invalid(format!(
             "{label} bundle declares transformer variant {}, expected {}",
@@ -741,6 +1168,7 @@ fn observe_bundle(
     )?;
     Ok(BundleObservation {
         snapshot_root,
+        inventory,
         model_inventory_sha256,
         bundle_subdir,
         runtime_bundle_sha256,
@@ -896,7 +1324,14 @@ fn validated_promotion_cases(
         ))
         .into());
     }
-    let expected = TERMINAL_MEASUREMENT_CASES
+    if input.public_repository != LTX25_PUBLIC_REPOSITORY {
+        return Err(invalid(format!(
+            "promotion publicRepository must equal {LTX25_PUBLIC_REPOSITORY:?}"
+        ))
+        .into());
+    }
+    input.selection.validate()?;
+    let promotable = TERMINAL_MEASUREMENT_CASES
         .iter()
         .filter(|case| {
             matches!(
@@ -906,12 +1341,58 @@ fn validated_promotion_cases(
         })
         .map(|case| case.id)
         .collect::<BTreeSet<_>>();
+    let selected = input
+        .selection
+        .selected_case_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if selected.is_empty() || selected.len() != input.selection.selected_case_ids.len() {
+        return Err(
+            invalid("promotion selection must contain at least one unique selectedCaseId").into(),
+        );
+    }
+    if !selected.is_subset(&promotable) {
+        let invalid_cases = selected
+            .difference(&promotable)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(invalid(format!(
+            "promotion selection contains non-promotable cases {invalid_cases:?}"
+        ))
+        .into());
+    }
+    let mut selected_variants = Vec::new();
+    for id in &selected {
+        let variant = measurement_case(id)
+            .expect("selected id was checked against terminal cases")
+            .transformer_variant;
+        if selected_variants.contains(&variant) {
+            return Err(invalid(format!(
+                "promotion selection must name at most one measured winner per transformer variant; repeated {}",
+                variant.id()
+            ))
+            .into());
+        }
+        selected_variants.push(variant);
+    }
     let mut cases = BTreeMap::new();
     for entry in &input.cases {
-        if !expected.contains(entry.case_id.as_str()) {
+        if !selected.contains(entry.case_id.as_str()) {
             return Err(invalid(format!(
-                "promotion input contains non-promotable case {:?}",
+                "promotion input contains unselected case {:?}",
                 entry.case_id
+            ))
+            .into());
+        }
+        let case = measurement_case(&entry.case_id)
+            .expect("selected promotion case was checked against terminal cases");
+        if entry.transformer_variant != case.transformer_variant {
+            return Err(invalid(format!(
+                "public promotion case {} binds transformer variant {}, expected {}",
+                case.id,
+                entry.transformer_variant.id(),
+                case.transformer_variant.id()
             ))
             .into());
         }
@@ -922,9 +1403,9 @@ fn validated_promotion_cases(
         }
     }
     let actual = cases.keys().copied().collect::<BTreeSet<_>>();
-    if actual != expected {
+    if actual != selected {
         return Err(invalid(format!(
-            "promotion input must contain the exact production advanced case set; expected={expected:?} actual={actual:?}"
+            "promotion cases must exactly match the reviewed selectedCaseIds; selected={selected:?} actual={actual:?}"
         ))
         .into());
     }
@@ -947,17 +1428,164 @@ fn require_identical_selected_copy(
     Ok(())
 }
 
-/// Verify a completed campaign against separately published immutable public snapshots and
-/// materialize the non-Rust accepted allowlist. Measured receipts are never restamped: each runtime
-/// row carries the original source identity, the independently inventoried public identity, and a
-/// SHA-256 copy proof. Selected component ids, bundle-relative paths, byte lengths, and hashes must
-/// be identical across source and public roots.
+#[allow(clippy::too_many_arguments)]
+fn run_public_replay_case(
+    acknowledgement: &str,
+    case: &crate::quant_eval::Ltx25QuantMeasurementCase,
+    source_receipt: &Ltx25QuantMeasurementReceipt,
+    reference_source: &TerminalCampaignCase,
+    public: &TerminalPromotionCase,
+    public_observation: &BundleObservation,
+    public_readback_sha256: &str,
+    evidence_root: &Path,
+    replay_dir: &Path,
+    policy: &TerminalPromotionSelection,
+) -> Result<(PublicReplayReceipt, PathBuf)> {
+    policy.require_quality(
+        &format!("{} measured source", case.id),
+        &source_receipt.quality,
+        false,
+    )?;
+    let reference_case = TERMINAL_MEASUREMENT_CASES
+        .iter()
+        .find(|candidate| {
+            candidate.mode == Ltx25QuantMode::Bf16
+                && candidate.transformer_variant == case.transformer_variant
+        })
+        .expect("validated terminal matrix has one bf16 reference per variant");
+    let reference_evidence = evidence_root.join(reference_case.id);
+    let public_receipt = run(TerminalMeasurementConfig {
+        acknowledgement: acknowledgement.to_owned(),
+        case_id: case.id.to_owned(),
+        snapshot: public.public_snapshot_root.clone(),
+        bundle_subdir: public.public_bundle_subdir.clone(),
+        model_revision: public.public_model_revision.clone(),
+        output_dir: replay_dir.to_path_buf(),
+        bf16_text_encoder_subpath: Some(public.bf16_text_encoder_subpath.clone()),
+        reference_snapshot: Some(reference_source.snapshot_root.clone()),
+        reference_bundle_subdir: Some(reference_source.bundle_subdir.clone()),
+        reference_model_revision: Some(reference_source.model_revision.clone()),
+        reference_output: Some(reference_evidence.join("generated-output.bin")),
+        reference_receipt: Some(reference_evidence.join("receipt.json")),
+    })?;
+    policy.require_quality(
+        &format!("{} public replay against bf16", case.id),
+        &public_receipt.quality,
+        false,
+    )?;
+
+    let post_inventory = inventory_for_snapshot(&public_observation.snapshot_root)?;
+    let post_inventory_sha256 = snapshot_inventory_sha256(&post_inventory)?;
+    if post_inventory != public_observation.inventory
+        || post_inventory_sha256 != public_observation.model_inventory_sha256
+    {
+        return Err(invalid(format!(
+            "{} public full inventory changed during/after replay",
+            case.id
+        ))
+        .into());
+    }
+    if public_receipt.case_id != source_receipt.case_id
+        || public_receipt.mode != source_receipt.mode
+        || public_receipt.gpu_generation != Ltx25GpuGeneration::ConsumerBlackwellSm120
+        || public_receipt.transformer_variant != source_receipt.transformer_variant
+        || public_receipt.fixture != source_receipt.fixture
+        || public_receipt.inference_revision != source_receipt.inference_revision
+        || public_receipt.executable_contract_sha256 != source_receipt.executable_contract_sha256
+        || public_receipt.executable_sha256 != source_receipt.executable_sha256
+        || public_receipt.gpu_name != source_receipt.gpu_name
+        || public_receipt.compute_capability != "sm_120"
+        || public_receipt.driver_version != source_receipt.driver_version
+        || public_receipt.model_revision != public.public_model_revision
+        || public_receipt.model_inventory_sha256 != public_observation.model_inventory_sha256
+        || public_receipt.bundle_subdir != public_observation.bundle_subdir
+        || public_receipt.runtime_bundle_sha256 != public_observation.runtime_bundle_sha256
+        || public_receipt.selected_bundle_sha256 != public_observation.selected_bundle_sha256
+        || public_receipt.operator_kind != source_receipt.operator_kind
+        || public_receipt.operator_contract_sha256 != source_receipt.operator_contract_sha256
+        || public_receipt.operator_weight_inventory_sha256
+            != source_receipt.operator_weight_inventory_sha256
+        || public_receipt.executed_projection_count != source_receipt.executed_projection_count
+        || public_receipt.declared_projection_count != source_receipt.declared_projection_count
+    {
+        return Err(invalid(format!(
+            "{} public replay differs from measured code/GPU/case/operator or public bundle identity",
+            case.id
+        ))
+        .into());
+    }
+
+    let measured_output_path = evidence_root.join(case.id).join("generated-output.bin");
+    let replay_output_path = replay_dir.join("generated-output.bin");
+    if sha256_file(&measured_output_path)? != source_receipt.output_sha256
+        || sha256_file(&replay_output_path)? != public_receipt.output_sha256
+    {
+        return Err(invalid(format!(
+            "{} measured or public replay output differs from its sealed hash",
+            case.id
+        ))
+        .into());
+    }
+    let measured_output = read_captured_output(&measured_output_path)?;
+    let replay_output = read_captured_output(&replay_output_path)?;
+    let replay_quality = compare_outputs(&replay_output, &measured_output)?;
+    policy.require_quality(
+        &format!("{} public replay against measured winner", case.id),
+        &replay_quality,
+        true,
+    )?;
+    if policy.require_replay_output_hash_match
+        && public_receipt.output_sha256 != source_receipt.output_sha256
+    {
+        return Err(invalid(format!(
+            "{} public replay output hash differs from the measured selected winner",
+            case.id
+        ))
+        .into());
+    }
+
+    let pre_inventory_path = replay_dir.join("pre-public-inventory.json");
+    let post_inventory_path = replay_dir.join("post-public-inventory.json");
+    write_json(&pre_inventory_path, &public_observation.inventory)?;
+    write_json(&post_inventory_path, &post_inventory)?;
+
+    let replay = PublicReplayReceipt {
+        schema_version: PUBLIC_REPLAY_SCHEMA.to_owned(),
+        case_id: case.id.to_owned(),
+        public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
+        public_readback_sha256: public_readback_sha256.to_owned(),
+        source_receipt_sha256: source_receipt.receipt_sha256.clone(),
+        public_measurement_receipt_sha256: public_receipt.receipt_sha256.clone(),
+        measured_output_sha256: source_receipt.output_sha256.clone(),
+        replay_output_sha256: public_receipt.output_sha256.clone(),
+        pre_public_inventory_sha256: public_observation.model_inventory_sha256.clone(),
+        post_public_inventory_sha256: post_inventory_sha256,
+        pre_public_inventory_artifact_sha256: sha256_file(&pre_inventory_path)?,
+        post_public_inventory_artifact_sha256: sha256_file(&post_inventory_path)?,
+        replay_quality,
+        operator_kind: public_receipt.operator_kind,
+        operator_contract_sha256: public_receipt.operator_contract_sha256,
+        operator_weight_inventory_sha256: public_receipt.operator_weight_inventory_sha256,
+        receipt_sha256: String::new(),
+    }
+    .seal()?;
+    replay.validate()?;
+    let replay_receipt_path = replay_dir.join("public-replay-receipt.json");
+    write_json(&replay_receipt_path, &replay)?;
+    Ok((replay, replay_receipt_path))
+}
+
+/// Replay each explicitly reviewed winner from the final public snapshot on the same exact consumer
+/// Blackwell lane, then materialize the non-Rust accepted allowlist. Measured receipts are never
+/// restamped. The allowlist is written only after every selected row passes source/public copy,
+/// readback, quality, output, operator, pre/post inventory, and real-generation replay checks.
 pub fn materialize_campaign_promotion(
     acknowledgement: &str,
     campaign_manifest_path: &Path,
     promotion_input_path: &Path,
     evidence_root: &Path,
     output_dir: &Path,
+    physical_gpu_ordinal: usize,
 ) -> Result<()> {
     if acknowledgement != TERMINAL_ACKNOWLEDGEMENT {
         return Err(invalid(format!(
@@ -981,40 +1609,85 @@ pub fn materialize_campaign_promotion(
     let promotion: TerminalPromotionInput =
         serde_json::from_slice(&fs::read(promotion_input_path)?)?;
     let public_cases = validated_promotion_cases(&promotion)?;
+    std::env::set_var("CUDA_VISIBLE_DEVICES", physical_gpu_ordinal.to_string());
+
+    // A failed replay may leave reviewable partial evidence, but can never leave an allowlist.
+    fs::create_dir(output_dir)?;
+    let replay_root = output_dir.join("public-replays");
+    fs::create_dir(&replay_root)?;
 
     let mut accepted = Vec::new();
     let mut groups = BTreeMap::<(String, String), PromotionGroup>::new();
-    for case in TERMINAL_MEASUREMENT_CASES.iter().filter(|case| {
-        matches!(
-            case.mode,
-            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
-        )
-    }) {
+    for case in TERMINAL_MEASUREMENT_CASES
+        .iter()
+        .filter(|case| public_cases.contains_key(case.id))
+    {
         let source = source_cases[case.id];
         let public = public_cases[case.id];
         let source_observation = observe_bundle(
             &source.snapshot_root,
             &source.model_revision,
             &source.bundle_subdir,
+            source.bf16_text_encoder_subpath.as_deref(),
             case,
             "measured source",
         )?;
         let receipt = verified_evidence_receipt(evidence_root, case, source, &source_observation)?;
-        let public_observation = observe_bundle(
+        let public_snapshot = canonical_public_snapshot(
             &public.public_snapshot_root,
             &public.public_model_revision,
+            &promotion.public_repository,
+        )?;
+        let public_observation = observe_bundle(
+            &public_snapshot,
+            &public.public_model_revision,
             &public.public_bundle_subdir,
+            Some(&public.bf16_text_encoder_subpath),
             case,
             "public destination",
         )?;
         require_identical_selected_copy(case.id, &source_observation, &public_observation)?;
+        let public_readback_sha256 = validate_public_readback(
+            &public.public_readback,
+            &promotion.public_repository,
+            &public.public_model_revision,
+            &public_observation.inventory,
+        )?;
+        let reference_case = TERMINAL_MEASUREMENT_CASES
+            .iter()
+            .find(|candidate| {
+                candidate.mode == Ltx25QuantMode::Bf16
+                    && candidate.transformer_variant == case.transformer_variant
+            })
+            .expect("validated matrix has one bf16 row per variant");
+        let replay_dir = replay_root.join(case.id);
+        let (public_replay, replay_receipt_path) = run_public_replay_case(
+            acknowledgement,
+            case,
+            &receipt,
+            source_cases[reference_case.id],
+            public,
+            &public_observation,
+            &public_readback_sha256,
+            evidence_root,
+            &replay_dir,
+            &promotion.selection,
+        )?;
 
         let mut runtime = runtime_identity_from_receipt(&receipt);
         runtime.model_revision = public.public_model_revision.clone();
         runtime.model_inventory_sha256 = public_observation.model_inventory_sha256.clone();
         runtime.bundle_subdir = public_observation.bundle_subdir.clone();
+        runtime.bf16_text_encoder_subpath = public
+            .bf16_text_encoder_subpath
+            .to_string_lossy()
+            .replace('\\', "/");
         runtime.runtime_bundle_sha256 = public_observation.runtime_bundle_sha256.clone();
         runtime.selected_bundle_sha256 = public_observation.selected_bundle_sha256.clone();
+        runtime.public_repository = promotion.public_repository.clone();
+        runtime.public_readback_sha256 = public_readback_sha256.clone();
+        runtime.public_replay_receipt_sha256 = public_replay.receipt_sha256.clone();
+        runtime.public_replay_output_sha256 = public_replay.replay_output_sha256.clone();
         runtime.promotion_copy_sha256 = promotion_copy_sha256(&receipt, &runtime);
         accepted.push(crate::quant_eval::Ltx25QuantAcceptedMeasurement {
             receipt,
@@ -1027,28 +1700,42 @@ pub fn materialize_campaign_promotion(
         );
         let group = groups.entry(key).or_insert_with(|| PromotionGroup {
             public_snapshot_root: public_observation.snapshot_root.clone(),
+            public_readback_sha256: public_readback_sha256.clone(),
             model_revision: public.public_model_revision.clone(),
             model_inventory_sha256: public_observation.model_inventory_sha256.clone(),
             bindings: Vec::new(),
+            replay_receipts: Vec::new(),
             case_ids: Vec::new(),
         });
-        if group.public_snapshot_root != public_observation.snapshot_root {
+        if group.public_snapshot_root != public_observation.snapshot_root
+            || group.public_readback_sha256 != public_readback_sha256
+        {
             return Err(invalid(
-                "one public revision/inventory pair resolved to multiple snapshot roots",
+                "one public revision/inventory pair resolved to multiple roots/readbacks",
             )
             .into());
         }
         group.bindings.push(runtime);
+        group.replay_receipts.push(replay_receipt_path);
         group.case_ids.push(case.id.to_owned());
     }
 
-    fs::create_dir(output_dir)?;
+    // Stage the payload under a non-runtime filename. The canonical allowlist rename is the final
+    // operation, after every binding and manifest write succeeds, so any earlier failure remains
+    // fail-closed even when it leaves reviewable diagnostics in this output directory.
     let allowlist_path = output_dir.join("accepted_quant_receipts.allowlist");
-    write_json(&allowlist_path, &accepted)?;
-    let allowlist_artifact = artifact(output_dir, &allowlist_path)?;
+    let staged_allowlist_path = output_dir.join(".accepted_quant_receipts.allowlist.tmp");
+    write_json(&staged_allowlist_path, &accepted)?;
+    let staged_allowlist_artifact = artifact(output_dir, &staged_allowlist_path)?;
+    let allowlist_artifact = EvidenceArtifact {
+        path: "accepted_quant_receipts.allowlist".to_owned(),
+        bytes: staged_allowlist_artifact.bytes,
+        sha256: staged_allowlist_artifact.sha256,
+    };
     let mut snapshots = Vec::new();
     for ((revision, inventory), mut group) in groups {
         group.case_ids.sort();
+        group.replay_receipts.sort();
         let directory = output_dir.join(format!("{revision}-{}", &inventory[..12]));
         fs::create_dir(&directory)?;
         let binding_path = directory.join(RUNTIME_BINDING_FILE);
@@ -1060,10 +1747,17 @@ pub fn materialize_campaign_promotion(
             },
         )?;
         snapshots.push(PromotionSnapshot {
+            public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
+            public_readback_sha256: group.public_readback_sha256,
             model_revision: group.model_revision,
             model_inventory_sha256: group.model_inventory_sha256,
             public_snapshot_root: group.public_snapshot_root.to_string_lossy().into_owned(),
             runtime_binding: artifact(output_dir, &binding_path)?,
+            replay_receipts: group
+                .replay_receipts
+                .iter()
+                .map(|path| artifact(output_dir, path))
+                .collect::<Result<Vec<_>>>()?,
             case_ids: group.case_ids,
         });
     }
@@ -1076,6 +1770,7 @@ pub fn materialize_campaign_promotion(
             snapshots,
         },
     )?;
+    fs::rename(staged_allowlist_path, allowlist_path)?;
     Ok(())
 }
 
@@ -1338,7 +2033,8 @@ fn load_and_copy_reference(
         .into());
     }
     let reference_bundle = crate::bundle::resolve_split_bundle(&reference_spec)?;
-    let reference_variant = TransformerVariant::from_bundle(&reference_bundle)?;
+    let reference_variant =
+        TransformerVariant::from_bundle_with_binding(&reference_bundle, case.transformer_variant)?;
     if reference_variant != case.transformer_variant {
         return Err(invalid(
             "bf16 reference bundle transformer variant differs from candidate case",
@@ -1645,9 +2341,15 @@ mod tests {
                 .iter()
                 .map(|case| TerminalCampaignCase {
                     case_id: case.id.to_owned(),
+                    transformer_variant: case.transformer_variant,
                     snapshot_root: PathBuf::from(format!("/snapshots/{}", "a".repeat(40))),
                     model_revision: "a".repeat(40),
                     bundle_subdir: PathBuf::from(case.id),
+                    bf16_text_encoder_subpath: matches!(
+                        case.mode,
+                        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+                    )
+                    .then(|| PathBuf::from("shared/gemma4-bf16.safetensors")),
                 })
                 .collect(),
         }
@@ -1672,6 +2374,7 @@ mod tests {
             model_revision: "c".repeat(40),
             model_inventory_sha256: "d".repeat(64),
             bundle_subdir: "bundles/distilled/bf16".to_owned(),
+            bf16_text_encoder_subpath: String::new(),
             runtime_bundle_sha256: "e".repeat(64),
             selected_bundle_sha256: "7".repeat(64),
             reference_model_revision: "c".repeat(40),
@@ -1705,6 +2408,39 @@ mod tests {
                 silent_zero_audio_passed: true,
             },
         })
+    }
+
+    fn reviewed_promotion_input() -> TerminalPromotionInput {
+        let cases = TERMINAL_MEASUREMENT_CASES
+            .iter()
+            .filter(|case| case.mode == Ltx25QuantMode::Int8ConvRot)
+            .map(|case| TerminalPromotionCase {
+                case_id: case.id.to_owned(),
+                transformer_variant: case.transformer_variant,
+                public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
+                public_model_revision: "b".repeat(40),
+                public_bundle_subdir: PathBuf::from(case.id),
+                bf16_text_encoder_subpath: PathBuf::from("shared/gemma4-bf16.safetensors"),
+                public_readback: PathBuf::from("/public/readback.json"),
+            })
+            .collect::<Vec<_>>();
+        TerminalPromotionInput {
+            schema_version: PROMOTION_SCHEMA.to_owned(),
+            public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
+            selection: TerminalPromotionSelection {
+                policy_id: REVIEWED_POLICY_ID.to_owned(),
+                reviewed_by: "reviewer@example.com".to_owned(),
+                selected_case_ids: cases.iter().map(|case| case.case_id.clone()).collect(),
+                minimum_reference_psnr: 20.0,
+                minimum_reference_ssim: 0.8,
+                maximum_temporal_boundary_drift: 0.1,
+                minimum_replay_psnr: 100.0,
+                minimum_replay_ssim: 0.99,
+                maximum_replay_temporal_boundary_drift: 0.001,
+                require_replay_output_hash_match: true,
+            },
+            cases,
+        }
     }
 
     fn image(values: &[u8]) -> ImageRecord {
@@ -1744,6 +2480,15 @@ mod tests {
     fn campaign_plan_is_exact_and_runs_both_bf16_references_before_candidates() {
         let manifest = campaign_manifest();
         assert_eq!(validated_campaign_cases(&manifest).unwrap().len(), 9);
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .filter(|case| case.bf16_text_encoder_subpath.is_some())
+                .count(),
+            3,
+            "all three advanced rows must use an explicit upstream BF16 Gemma encoder"
+        );
         let order = campaign_order().collect::<Vec<_>>();
         assert_eq!(order.len(), 9);
         assert!(order[..2]
@@ -1759,44 +2504,171 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exact terminal case set"));
+
+        let mut missing_encoder = campaign_manifest();
+        missing_encoder
+            .cases
+            .iter_mut()
+            .find(|case| case.case_id == "ltx25-nvfp4-blackwell-v1")
+            .unwrap()
+            .bf16_text_encoder_subpath = None;
+        assert!(validated_campaign_cases(&missing_encoder)
+            .unwrap_err()
+            .to_string()
+            .contains("requires an explicit upstream"));
     }
 
     #[test]
-    fn promotion_input_accepts_only_the_three_production_advanced_rows() {
-        let advanced = TERMINAL_MEASUREMENT_CASES
-            .iter()
-            .filter(|case| {
-                matches!(
-                    case.mode,
-                    Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
-                )
-            })
-            .map(|case| TerminalPromotionCase {
-                case_id: case.id.to_owned(),
-                public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
-                public_model_revision: "b".repeat(40),
-                public_bundle_subdir: PathBuf::from(case.id),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(advanced.len(), 3);
-        let input = TerminalPromotionInput {
-            schema_version: PROMOTION_SCHEMA.to_owned(),
-            cases: advanced,
-        };
-        assert_eq!(validated_promotion_cases(&input).unwrap().len(), 3);
+    fn promotion_input_accepts_only_explicit_reviewed_winners() {
+        let input = reviewed_promotion_input();
+        assert_eq!(validated_promotion_cases(&input).unwrap().len(), 2);
 
-        let mut packed = input;
+        let mut packed = input.clone();
         packed.cases[0].case_id = "ltx25-packed-q8-blackwell-v1".to_owned();
         assert!(validated_promotion_cases(&packed)
             .unwrap_err()
             .to_string()
-            .contains("non-promotable"));
+            .contains("unselected"));
+
+        let mut forced_all_three = input;
+        let nvfp4 = measurement_case("ltx25-nvfp4-blackwell-v1").unwrap();
+        forced_all_three
+            .selection
+            .selected_case_ids
+            .push(nvfp4.id.to_owned());
+        forced_all_three.cases.push(TerminalPromotionCase {
+            case_id: nvfp4.id.to_owned(),
+            transformer_variant: nvfp4.transformer_variant,
+            public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
+            public_model_revision: "b".repeat(40),
+            public_bundle_subdir: PathBuf::from(nvfp4.id),
+            bf16_text_encoder_subpath: PathBuf::from("shared/gemma4-bf16.safetensors"),
+            public_readback: PathBuf::from("/public/readback.json"),
+        });
+        assert!(validated_promotion_cases(&forced_all_three)
+            .unwrap_err()
+            .to_string()
+            .contains("at most one measured winner per transformer variant"));
+    }
+
+    #[test]
+    fn reviewed_selection_thresholds_fail_closed_before_replay() {
+        let input = reviewed_promotion_input();
+        input.selection.validate().unwrap();
+        let poor = Ltx25QuantQuality {
+            reference_psnr: 19.9,
+            reference_ssim: 0.99,
+            temporal_boundary_drift: 0.0,
+            silent_zero_video_passed: true,
+            silent_zero_audio_passed: true,
+        };
+        assert!(input
+            .selection
+            .require_quality("candidate", &poor, false)
+            .unwrap_err()
+            .to_string()
+            .contains("fails reviewed quality policy"));
+
+        let mut invalid = input.selection;
+        invalid.require_replay_output_hash_match = false;
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn public_readback_binds_exact_public_repo_revision_inventory_and_lfs_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let revision = "b".repeat(40);
+        let inventory = crate::quant_eval::SnapshotInventory {
+            schema_version: "sceneworks-model-inventory-v1",
+            entries: vec![crate::quant_eval::SnapshotInventoryEntry {
+                path: "transformer.safetensors".to_owned(),
+                bytes: 7,
+                sha256: "c".repeat(64),
+                symlink_target: Some("../../blobs/object".to_owned()),
+            }],
+        };
+        let path = dir.path().join("hf-readback.json");
+        let write = |private: bool, sha256: &str| {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "id": LTX25_PUBLIC_REPOSITORY,
+                    "sha": revision,
+                    "private": private,
+                    "siblings": [{
+                        "rfilename": "transformer.safetensors",
+                        "size": 7,
+                        "lfs": {"sha256": sha256, "size": 7}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write(false, &"c".repeat(64));
+        assert!(
+            validate_public_readback(&path, LTX25_PUBLIC_REPOSITORY, &revision, &inventory).is_ok()
+        );
+
+        write(true, &"c".repeat(64));
+        assert!(
+            validate_public_readback(&path, LTX25_PUBLIC_REPOSITORY, &revision, &inventory)
+                .unwrap_err()
+                .to_string()
+                .contains("private=false")
+        );
+        write(false, &"d".repeat(64));
+        assert!(
+            validate_public_readback(&path, LTX25_PUBLIC_REPOSITORY, &revision, &inventory)
+                .unwrap_err()
+                .to_string()
+                .contains("differs from local bytes")
+        );
+    }
+
+    #[test]
+    fn public_replay_receipt_seals_output_and_pre_post_inventory_artifacts() {
+        let mut replay = PublicReplayReceipt {
+            schema_version: PUBLIC_REPLAY_SCHEMA.to_owned(),
+            case_id: "ltx25-int8-convrot-blackwell-v1".to_owned(),
+            public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
+            public_readback_sha256: "1".repeat(64),
+            source_receipt_sha256: "2".repeat(64),
+            public_measurement_receipt_sha256: "3".repeat(64),
+            measured_output_sha256: "4".repeat(64),
+            replay_output_sha256: "4".repeat(64),
+            pre_public_inventory_sha256: "5".repeat(64),
+            post_public_inventory_sha256: "5".repeat(64),
+            pre_public_inventory_artifact_sha256: "6".repeat(64),
+            post_public_inventory_artifact_sha256: "6".repeat(64),
+            replay_quality: Ltx25QuantQuality {
+                reference_psnr: 120.0,
+                reference_ssim: 1.0,
+                temporal_boundary_drift: 0.0,
+                silent_zero_video_passed: true,
+                silent_zero_audio_passed: true,
+            },
+            operator_kind: "int8-convrot-rht-cublaslt-igemm".to_owned(),
+            operator_contract_sha256: "7".repeat(64),
+            operator_weight_inventory_sha256: "8".repeat(64),
+            receipt_sha256: String::new(),
+        }
+        .seal()
+        .unwrap();
+        replay.validate().unwrap();
+
+        replay.post_public_inventory_artifact_sha256 = "9".repeat(64);
+        assert!(replay.validate().is_err());
     }
 
     #[test]
     fn promotion_copy_gate_rejects_selected_bytes_or_operator_mutation() {
         let observation = || BundleObservation {
             snapshot_root: PathBuf::from("/snapshot"),
+            inventory: crate::quant_eval::SnapshotInventory {
+                schema_version: "sceneworks-model-inventory-v1",
+                entries: Vec::new(),
+            },
             model_inventory_sha256: "a".repeat(64),
             bundle_subdir: "bundles/distilled/int8".to_owned(),
             runtime_bundle_sha256: "b".repeat(64),
@@ -1857,21 +2729,35 @@ mod tests {
 
     #[test]
     fn windows_workflow_builds_once_and_dispatches_one_serial_sm120_campaign() {
-        let workflow = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../.github/workflows/ltx25-quant-campaign.yml"),
-        )
-        .unwrap();
-        assert_eq!(workflow.matches("cargo build ").count(), 1);
-        assert!(!workflow.contains("cargo run"));
+        let workflow_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../.github/workflows");
+        let campaign = fs::read_to_string(workflow_root.join("ltx25-quant-campaign.yml")).unwrap();
+        assert_eq!(campaign.matches("cargo build ").count(), 1);
+        assert!(!campaign.contains("cargo run"));
         for required in [
             "CUDA_COMPUTE_CAP: \"120\"",
             "capability -ne '12.0'",
             "--campaign-manifest",
             "--physical-gpu",
+            "Copy-Item -LiteralPath $producer",
+            "\"ltx25-quant-measure.exe\"",
+            "group: inference-real-weights-physical-host",
             "cancel-in-progress: false",
         ] {
-            assert!(workflow.contains(required), "missing {required:?}");
+            assert!(campaign.contains(required), "missing {required:?}");
+        }
+
+        let promotion =
+            fs::read_to_string(workflow_root.join("ltx25-quant-promotion.yml")).unwrap();
+        assert!(!promotion.contains("cargo build"));
+        for required in [
+            "--materialize-promotion",
+            "--physical-gpu",
+            "controller\\ltx25-quant-measure.exe",
+            "ref: ${{ inputs.inference_revision }}",
+            "group: inference-real-weights-physical-host",
+        ] {
+            assert!(promotion.contains(required), "missing {required:?}");
         }
     }
 
@@ -2009,6 +2895,7 @@ mod tests {
             bundle_subdir: PathBuf::from("."),
             model_revision: "0".repeat(40),
             output_dir: PathBuf::from("/unused"),
+            bf16_text_encoder_subpath: None,
             reference_snapshot: None,
             reference_bundle_subdir: None,
             reference_model_revision: None,

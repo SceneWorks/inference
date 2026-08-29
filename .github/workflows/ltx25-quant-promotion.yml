@@ -1,0 +1,104 @@
+name: LTX-2.5 public quant promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      inference_revision:
+        description: Exact 40-hex inference revision used by the terminal campaign
+        type: string
+        required: true
+      campaign_manifest:
+        description: Absolute runner-local path to the original immutable campaign manifest
+        type: string
+        required: true
+      evidence_root:
+        description: Absolute runner-local path to the complete campaign evidence
+        type: string
+        required: true
+      promotion_input:
+        description: Absolute runner-local path to the reviewed public promotion input
+        type: string
+        required: true
+      output_dir:
+        description: New absolute runner-local promotion evidence directory
+        type: string
+        required: true
+      physical_gpu:
+        description: One physical consumer-Blackwell GPU ordinal (no list)
+        type: string
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+# This is the same repository-wide physical-host lock as real-weights.yml and the producer
+# campaign. Public replay performs real generation and cannot overlap any other real-weight job.
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Replay selected public winners on consumer Blackwell
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 1440
+    env:
+      CUDA_COMPUTE_CAP: "120"
+      INFERENCE_REVISION: ${{ inputs.inference_revision }}
+      CAMPAIGN_MANIFEST: ${{ inputs.campaign_manifest }}
+      EVIDENCE_ROOT: ${{ inputs.evidence_root }}
+      PROMOTION_INPUT: ${{ inputs.promotion_input }}
+      OUTPUT_DIR: ${{ inputs.output_dir }}
+      PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.inference_revision }}
+      - name: Validate immutable source and one consumer Blackwell device
+        shell: powershell
+        run: |
+          if ($env:INFERENCE_REVISION -notmatch '^[0-9a-f]{40}$') {
+            throw "inference_revision must be one exact lowercase 40-hex commit"
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:INFERENCE_REVISION) {
+            throw "checked out revision '$head' does not equal '$env:INFERENCE_REVISION'"
+          }
+          if ($env:PHYSICAL_GPU -notmatch '^\d+$') {
+            throw "physical_gpu must be one numeric physical ordinal"
+          }
+          foreach ($path in @($env:CAMPAIGN_MANIFEST, $env:EVIDENCE_ROOT, $env:PROMOTION_INPUT, $env:OUTPUT_DIR)) {
+            if (-not [System.IO.Path]::IsPathRooted($path)) {
+              throw "all promotion paths must be absolute runner-local paths; got '$path'"
+            }
+          }
+          $capability = (nvidia-smi -i $env:PHYSICAL_GPU --query-gpu=compute_cap --format=csv,noheader,nounits).Trim()
+          if ($LASTEXITCODE -ne 0 -or $capability -ne '12.0') {
+            throw "LTX-2.5 public replay requires exact consumer Blackwell sm_120; got '$capability'"
+          }
+          $producer = Join-Path $env:EVIDENCE_ROOT "controller\ltx25-quant-measure.exe"
+          if (-not (Test-Path -LiteralPath $producer -PathType Leaf)) {
+            throw "campaign evidence is missing exact preserved producer '$producer'"
+          }
+      - name: Re-inventory, replay selected public winners, and materialize allowlist
+        shell: powershell
+        run: |
+          $producer = Join-Path $env:EVIDENCE_ROOT "controller\ltx25-quant-measure.exe"
+          & $producer `
+            --acknowledgement I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY `
+            --materialize-promotion `
+            --campaign-manifest $env:CAMPAIGN_MANIFEST `
+            --promotion-input $env:PROMOTION_INPUT `
+            --evidence-root $env:EVIDENCE_ROOT `
+            --output-dir $env:OUTPUT_DIR `
+            --physical-gpu $env:PHYSICAL_GPU
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload sealed public replay and promotion evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ltx25-quant-promotion-${{ inputs.inference_revision }}-gpu${{ inputs.physical_gpu }}
+          path: ${{ inputs.output_dir }}
+          if-no-files-found: error

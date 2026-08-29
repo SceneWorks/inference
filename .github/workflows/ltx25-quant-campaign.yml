@@ -23,7 +23,7 @@ permissions:
 # The Windows host may expose more than one listener/GPU. Only one complete campaign is allowed to
 # occupy it at a time; the driver additionally makes exactly one physical ordinal visible.
 concurrency:
-  group: ltx25-quant-campaign-physical-host
+  group: inference-real-weights-physical-host
   cancel-in-progress: false
 
 jobs:
@@ -34,8 +34,8 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "12"
       CUDA_COMPUTE_CAP: "120"
-      CUDA_PATH: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
-      VCVARS: "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
       CAMPAIGN_MANIFEST: ${{ inputs.campaign_manifest }}
       EVIDENCE_ROOT: ${{ inputs.evidence_root }}
       PHYSICAL_GPU: ${{ inputs.physical_gpu }}
@@ -75,6 +75,9 @@ jobs:
             --output-root $env:EVIDENCE_ROOT `
             --physical-gpu $env:PHYSICAL_GPU
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $controller = Join-Path $env:EVIDENCE_ROOT "controller"
+          New-Item -ItemType Directory -Path $controller -Force | Out-Null
+          Copy-Item -LiteralPath $producer -Destination (Join-Path $controller "ltx25-quant-measure.exe")
       - name: Upload sealed campaign evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

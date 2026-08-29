@@ -17,11 +17,13 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::gen_core::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
     LtxComponent,
 };
 use candle_gen::gen_core::{self, LoadSpec, WeightsSource};
+use safetensors::Dtype as SafetensorDtype;
 
 /// The `model_version` a checkpoint location declares — the `split_model.json` manifest of a packed
 /// MLX tier first, then any component file's `__metadata__`. `None` when nothing declares one.
@@ -174,6 +176,34 @@ pub fn assert_gemma_version(bundle: &LtxBundle) -> gen_core::Result<GemmaVersion
     bundle.check_gemma_version(&encoder)
 }
 
+/// Require the advanced CUDA lane's explicitly selected upstream Gemma-4 text encoder to be a
+/// genuinely dense BF16 safetensors source. Comfy's I8 encoder must never be interpreted through the
+/// Candle dense path merely because it declares the same Gemma generation.
+pub fn assert_bf16_text_encoder(bundle: &LtxBundle) -> gen_core::Result<()> {
+    let path = bundle.require(LtxComponent::TextEncoder)?.path();
+    if !path.is_file() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 advanced text encoder {} must be one explicit BF16 safetensors file",
+            path.display()
+        )));
+    }
+    // SAFETY: read-only safetensors header inspection; no tensor/device allocation occurs.
+    let safetensors = unsafe { MmapedSafetensors::new(path) }
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let tensors = safetensors.tensors();
+    if tensors.is_empty()
+        || tensors
+            .iter()
+            .any(|(_, tensor)| tensor.dtype() != SafetensorDtype::BF16)
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 advanced text encoder {} is not an all-BF16 upstream Gemma source; Comfy/I8 or mixed sources are forbidden",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +275,18 @@ mod tests {
                 ),
             ],
         );
+    }
+
+    fn write_typed_safetensors(path: &Path, dtype: &str, payload: &[u8]) {
+        let header = format!(
+            r#"{{"weight":{{"dtype":"{dtype}","shape":[1],"data_offsets":[0,{}]}}}}"#,
+            payload.len()
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(payload);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -419,6 +461,28 @@ mod tests {
             assert_gemma_version(&bundle).unwrap(),
             GemmaVersionCheck::Matched(_)
         ));
+    }
+
+    #[test]
+    fn advanced_text_encoder_accepts_only_explicit_all_bf16_upstream_weights() {
+        let dir = tempfile::tempdir().unwrap();
+        let bf16 = dir.path().join("upstream-gemma4-bf16.safetensors");
+        write_typed_safetensors(&bf16, "BF16", &[0, 0]);
+        let bundle = LtxBundleBuilder::new()
+            .with_component(LtxComponent::TextEncoder, bf16)
+            .build()
+            .unwrap();
+        assert_bf16_text_encoder(&bundle).unwrap();
+
+        let int8 = dir.path().join("comfy-gemma4-int8.safetensors");
+        write_typed_safetensors(&int8, "I8", &[0]);
+        let bundle = LtxBundleBuilder::new()
+            .with_component(LtxComponent::TextEncoder, int8)
+            .build()
+            .unwrap();
+        let error = assert_bf16_text_encoder(&bundle)
+            .expect_err("the Comfy I8 text encoder must fail before device loading");
+        assert!(error.to_string().contains("Comfy/I8"));
     }
 
     #[test]

@@ -2154,8 +2154,8 @@ pub struct Ltx25Generator {
     bundle: LtxBundle,
     device: Device,
     use_diffusion_decoder: bool,
-    /// Parsed from the split transformer metadata at ordinary provider load time and re-threaded
-    /// through the request-local pipeline materializer.
+    /// Bound from split-transformer metadata or the exact promoted production identity, then
+    /// re-threaded through the request-local pipeline materializer.
     transformer_variant: TransformerVariant,
     /// Exact selected source mode; retained by the ordinary provider so a later load cannot
     /// silently report q4/bf16 after a distinct selector was requested.
@@ -2193,40 +2193,73 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             return Err(gen_core::Error::Unsupported(reason));
         }
     }
+    if matches!(
+        quant_mode,
+        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+    ) {
+        let mut matches = Vec::new();
+        let mut errors = Vec::new();
+        for accepted in quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS
+            .iter()
+            .filter(|accepted| {
+                accepted.receipt.mode == quant_mode && accepted.receipt.gpu_generation == gpu
+            })
+        {
+            let candidate = (|| {
+                let staged = quant_eval::stage_public_runtime_spec(spec, &accepted.runtime)?;
+                let resolved = bundle::resolve_split_bundle(&staged)?;
+                let variant = TransformerVariant::from_bundle_with_binding(
+                    &resolved,
+                    accepted.receipt.transformer_variant,
+                )
+                .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+                bundle::assert_bf16_text_encoder(&resolved)?;
+                let bound =
+                    quant_eval::bind_public_runtime_spec(&staged, &resolved, &accepted.runtime)?;
+                Ok::<_, gen_core::Error>((accepted, bound, resolved, variant))
+            })();
+            match candidate {
+                Ok(candidate) => matches.push(candidate),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if matches.len() != 1 {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: advanced public runtime must match exactly one reviewed variant/bundle/text-encoder binding; matches={} errors={errors:?}",
+                matches.len()
+            )));
+        }
+        let (accepted, bound_spec, resolved, transformer_variant) = matches.remove(0);
+        let runtime_identity = quant_eval::runtime_identity_from_bundle(
+            &bound_spec,
+            &resolved,
+            quant_mode,
+            transformer_variant,
+            &accepted.runtime,
+        )?;
+        match quant_eval::admit(
+            quant_mode,
+            gpu,
+            transformer_variant,
+            Some(&runtime_identity),
+            quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
+        ) {
+            Ltx25QuantAdmission::Admitted => {}
+            Ltx25QuantAdmission::Refused { reason } => {
+                return Err(gen_core::Error::Unsupported(reason));
+            }
+        }
+        return load_25_selected(&bound_spec, quant_mode, transformer_variant, device);
+    }
+
     let resolved = bundle::resolve_split_bundle(spec)?;
     let transformer_variant = TransformerVariant::from_bundle(&resolved)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
-    let accepted = quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS
-        .iter()
-        .find(|accepted| {
-            accepted.receipt.mode == quant_mode
-                && accepted.receipt.gpu_generation == gpu
-                && accepted.receipt.transformer_variant == transformer_variant
-        });
-    let runtime_identity = if matches!(
-        quant_mode,
-        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
-    ) && !quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.is_empty()
-    {
-        accepted
-            .map(|accepted| {
-                quant_eval::runtime_identity_from_bundle(
-                    spec,
-                    &resolved,
-                    quant_mode,
-                    transformer_variant,
-                    &accepted.runtime,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
     match quant_eval::admit(
         quant_mode,
         gpu,
         transformer_variant,
-        runtime_identity.as_ref(),
+        None,
         quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
     ) {
         Ltx25QuantAdmission::Admitted => {}
@@ -2234,7 +2267,7 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             return Err(gen_core::Error::Unsupported(reason));
         }
     }
-    load_25_selected(spec, quant_mode, device)
+    load_25_selected(spec, quant_mode, transformer_variant, device)
 }
 
 /// The only admission bypass in this crate. It is compiled solely for the terminal controller,
@@ -2257,8 +2290,9 @@ fn load_25_for_terminal_measurement(
         )));
     }
     let resolved = bundle::resolve_split_bundle(spec)?;
-    let observed_variant = TransformerVariant::from_bundle(&resolved)
-        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let observed_variant =
+        TransformerVariant::from_bundle_with_binding(&resolved, case.transformer_variant)
+            .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
     if observed_variant != case.transformer_variant {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_25_ID}: terminal case {} requires transformer variant {}, bundle declares {}",
@@ -2267,12 +2301,19 @@ fn load_25_for_terminal_measurement(
             observed_variant.id()
         )));
     }
-    load_25_selected(spec, case.mode, device)
+    if matches!(
+        case.mode,
+        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+    ) {
+        bundle::assert_bf16_text_encoder(&resolved)?;
+    }
+    load_25_selected(spec, case.mode, observed_variant, device)
 }
 
 fn load_25_selected(
     spec: &LoadSpec,
     quant_mode: Ltx25QuantMode,
+    transformer_variant: TransformerVariant,
     device: Device,
 ) -> gen_core::Result<Box<dyn Generator>> {
     let known = bundle::split_component_ids();
@@ -2284,8 +2325,9 @@ fn load_25_selected(
             resolved.layout().id()
         )));
     }
-    let transformer_variant = TransformerVariant::from_bundle(&resolved)
-        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let transformer_variant =
+        TransformerVariant::from_bundle_with_binding(&resolved, transformer_variant)
+            .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
     bundle::assert_gemma_version(&resolved)?;
     let use_diffusion_decoder = spec
         .components

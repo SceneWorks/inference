@@ -17,6 +17,8 @@ from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 REAL_WEIGHTS_WORKFLOW = WORKFLOW.with_name("real-weights.yml")
+LTX25_QUANT_CAMPAIGN_WORKFLOW = WORKFLOW.with_name("ltx25-quant-campaign.yml")
+LTX25_QUANT_PROMOTION_WORKFLOW = WORKFLOW.with_name("ltx25-quant-promotion.yml")
 KREA_ALTERNATE_DECODER_SMOKE = (
     WORKFLOW.parents[2] / "scripts" / "ci" / "run_krea_alternate_decoder_smoke.sh"
 )
@@ -1552,13 +1554,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("test_sa3_ci_target_coverage.py", workflow[start:run])
         self.assertIn("SC_16605_REAL_WEIGHT_WORKFLOW_CLEANUP.md", workflow[start:run])
 
-    def test_real_weight_concurrency_is_scoped_by_profile(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn(
-            "group: inference-real-weights-${{ github.ref }}-"
-            "${{ inputs.profile || 'schedule' }}",
-            workflow,
-        )
+    def test_real_weight_workflows_share_one_physical_host_lock(self) -> None:
+        for path in (
+            REAL_WEIGHTS_WORKFLOW,
+            LTX25_QUANT_CAMPAIGN_WORKFLOW,
+            LTX25_QUANT_PROMOTION_WORKFLOW,
+        ):
+            with self.subTest(workflow=path.name):
+                workflow = path.read_text(encoding="utf-8")
+                self.assertEqual(
+                    workflow.count("group: inference-real-weights-physical-host"),
+                    1,
+                )
+                self.assertIn("cancel-in-progress: false", workflow)
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
