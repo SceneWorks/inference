@@ -24,19 +24,25 @@ REQUIRED_MAPPINGS = {
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs", "fn run_ar_loop_conditioned"),
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "fn forward_causal("),
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub fn forward_causal_chunk"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub struct ExperimentalCompressedKvConfig"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub trait RetainedKernelHandle"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn tiled_online_attention"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn append_after_decision"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "pub fn trim_prefix"),
 }
-REQUIRED_FALLBACKS = {"format", "mask", "head-dimension", "lifecycle", "receipt"}
+REQUIRED_FALLBACKS = {"disabled", "q4-quality", "handle", "geometry", "mask", "cancellation", "receipt"}
 REQUIRED_RECEIPT_FIELDS = {
     "modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability",
-    "representationIdentity", "persistentBytes", "transientBytes", "fallbackReason",
-    "parity", "quality", "cancellation",
+    "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes",
+    "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity",
+    "quality", "cancellation", "timingLabel",
 }
 REQUIRED_UPSTREAM_MECHANISMS = {"scalar_fused_decode_attend", "rabitq_prefill_attend"}
 REQUIRED_HEADINGS = (
     "## Proven current route",
     "## Existing evidence boundary",
     "## Frozen upstream comparison and decision",
-    "## First implementation blocker",
+    "## Experimental source POC",
 )
 
 
@@ -46,8 +52,8 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
         errors.append("schema or story mismatch")
     if data.get("validation") != "checked-out-current-source":
         errors.append("validation must bind checked-out current source")
-    if data.get("decision") != "do-not-implement-until-format-and-mask-route-are-proven":
-        errors.append("decision must remain fail-closed")
+    if data.get("decision") != "experimental-krea-owned-packed-affine-online-softmax-poc":
+        errors.append("decision must name the checked-in experimental POC")
     upstream = data.get("upstream")
     if (
         not isinstance(upstream, dict)
@@ -59,7 +65,7 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
     poc = data.get("poc")
     if (
         not isinstance(poc, dict)
-        or poc.get("status") != "blocked-before-implementation"
+        or poc.get("status") != "implemented-source-only-device-unverified"
         or poc.get("nonGoal") != "full-cache dequantize-then-SDPA is not compressed-domain execution"
     ):
         errors.append("POC boundary mismatch")
@@ -81,7 +87,7 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
     fields = set(receipt.get("requiredFields", [])) if isinstance(receipt, dict) else set()
     if (
         not isinstance(receipt, dict)
-        or receipt.get("status") != "not-produced"
+        or receipt.get("status") != "schema-only-not-produced"
         or fields != REQUIRED_RECEIPT_FIELDS
         or len(receipt.get("requiredFields", [])) != len(REQUIRED_RECEIPT_FIELDS)
     ):
@@ -104,6 +110,18 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
             errors.append(f"stale source mapping: {path}")
         elif needle not in source.read_text(encoding="utf-8"):
             errors.append(f"stale source needle: {path}: {needle}")
+    poc_source = source_root / "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs"
+    if poc_source.is_file():
+        source = poc_source.read_text(encoding="utf-8")
+        production_source = source.split("#[cfg(test)]", 1)[0]
+        forbidden = ("dequantize(", "scaled_dot_product_attention", "build_block_causal_mask(")
+        for needle in (*forbidden, "let mut scores"):
+            if needle in production_source:
+                errors.append(f"compressed POC must not allocate a dense K/V window or score route: {needle}")
+        required = ("TILE_ROWS", "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision")
+        for needle in required:
+            if needle not in source:
+                errors.append(f"compressed POC structural guard missing: {needle}")
     return errors
 
 

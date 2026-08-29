@@ -114,6 +114,7 @@
 //! SceneWorks HF org is the gated S2 remainder (sc-8435).
 
 pub mod causal;
+pub mod compressed_kv;
 pub mod config;
 pub mod convert;
 pub mod generate;
@@ -146,6 +147,11 @@ pub fn conservative_video_decode_memory_profile(
 
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
+};
+pub use compressed_kv::{
+    AttentionGeometry, CancellationProbe, CompiledKernelBinding, CompressedInstrumentation,
+    CompressedKvCache, CompressedTier, CpuTensor, DispatchDecision, DispatchFailure,
+    ExperimentalCompressedKvConfig, KreaMask, RetainedKernelHandle, TILE_ROWS,
 };
 pub use config::{KreaArConfig, KreaRealtimeConfig, KvCacheQuant, MODEL_ID};
 pub use convert::{

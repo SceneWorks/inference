@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "story": "SC-20684",
   "validation": "checked-out-current-source",
-  "decision": "do-not-implement-until-format-and-mask-route-are-proven",
+  "decision": "experimental-krea-owned-packed-affine-online-softmax-poc",
   "upstream": {
     "repository": "https://github.com/rajveer43/VeloxQuant-MLX",
     "tag": "v0.65.0",
@@ -19,22 +19,24 @@
     "qualityEvidence": "Q8 existing-route drift measured; Q4 existing-route quality unvalidated"
   },
   "poc": {
-    "candidate": "RaBitQ tiled large-Sq prefill only as a new Krea-owned format",
-    "status": "blocked-before-implementation",
-    "nativeGeometry": "B/H/Sq/D query tiles; D divisible by 8 and D <= 128; unmasked all-keys attention",
-    "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant group-affine K token-axis layout",
+    "candidate": "Krea-owned D-axis affine Q8 packed K/V with tiled online softmax; Q4 is a separately acknowledged quality arm",
+    "status": "implemented-source-only-device-unverified",
+    "nativeGeometry": "B=1, H=40, D=128, group=64, Q8 by default; query tiles of 32 and exact none/block-causal mask metadata",
+    "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant token-axis K grouping; the POC reads Krea's own uint32 plus bf16 scale/bias rows",
     "nonGoal": "full-cache dequantize-then-SDPA is not compressed-domain execution"
   },
   "rejectionFallbacks": [
-    {"id": "format", "reason": "current Q8/Q4 packed layout is incompatible with frozen direct-kernel inputs"},
-    {"id": "mask", "reason": "RaBitQ tiled prefill is unmasked cross-attention only; additive block-causal masks require dense fallback"},
-    {"id": "head-dimension", "reason": "RaBitQ tiled prefill requires D divisible by 8 and D <= 128"},
-    {"id": "lifecycle", "reason": "append, window eviction, RoPE offset, readonly/recompute, and cancellation have no implemented compressed route"},
+    {"id": "disabled", "reason": "the feature is off by default and returns the unchanged dense route before packed-state mutation"},
+    {"id": "q4-quality", "reason": "Q4 has no product-quality receipt and requires a separate explicit quality-arm acknowledgement"},
+    {"id": "handle", "reason": "a retained identity-safe compiled Metal handle is required before compressed dispatch"},
+    {"id": "geometry", "reason": "only B=1, D=128, group=64, matching packed K/V and exact query/key shapes may dispatch"},
+    {"id": "mask", "reason": "only none or analytic nonzero block-causal metadata is supported; all other masks fall back before mutation"},
+    {"id": "cancellation", "reason": "a cancelled read or trim returns without partial packed-state mutation and releases bounded scratch"},
     {"id": "receipt", "reason": "no device-produced parity, quality, resident-byte, transient-byte, or dispatch receipt exists"}
   ],
   "receipt": {
-    "status": "not-produced",
-    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "persistentBytes", "transientBytes", "fallbackReason", "parity", "quality", "cancellation"],
+    "status": "schema-only-not-produced",
+    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel"],
     "forbiddenClaims": ["local performance", "local memory reduction", "local quality parity", "compressed-domain execution"]
   },
   "sourceMappings": [
@@ -48,6 +50,11 @@
     {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/t2v.rs", "needle": "fn resolve_request_config"},
     {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs", "needle": "fn run_ar_loop_conditioned"},
     {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "fn forward_causal("},
-    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk"}
+    {"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub struct ExperimentalCompressedKvConfig"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub trait RetainedKernelHandle"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn tiled_online_attention"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn append_after_decision"},
+    {"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs", "needle": "pub fn trim_prefix"}
   ]
 }

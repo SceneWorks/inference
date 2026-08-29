@@ -74,6 +74,17 @@ class KreaRealtimeContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manifest checksum mismatch", result.stdout)
 
+    def test_mutated_copy_rejects_missing_device_receipt_axis_even_when_resealed(self) -> None:
+        temp, root = self.copied_contract_root()
+        self.addCleanup(temp.cleanup)
+        manifest = root / "docs/architecture" / MANIFEST_NAME
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["receipt"]["requiredFields"].remove("scoreMatrixBytes")
+        write_sealed_manifest(root, data)
+        result = self.run_checker(root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("receipt contract must remain unproduced and complete", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
