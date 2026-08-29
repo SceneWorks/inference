@@ -18,6 +18,7 @@ pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
 pub mod packed_group_affine_kv;
+pub mod packed_attention;
 pub mod paged_kv_cache;
 pub mod projection;
 pub mod quant;
