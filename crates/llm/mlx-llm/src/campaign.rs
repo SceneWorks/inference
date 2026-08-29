@@ -697,12 +697,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("weights-loaded MLX active bytes do not contain weights".into());
     }
     let prefill = sample_for("prefill-peak")?;
-    if prefill
-        .mlx
-        .active_bytes
-        .saturating_add(prefill.mlx.peak_bytes)
-        < weights.saturating_add(kv).saturating_add(workspace)
-    {
+    let prefill_total = weights.saturating_add(kv).saturating_add(workspace);
+    if prefill.mlx.active_bytes < prefill_total || prefill.mlx.peak_bytes < prefill_total {
         return Err("prefill MLX samples do not contain attributed allocations".into());
     }
     let decode = sample_for("decode-steady")?;
@@ -2032,6 +2028,11 @@ mod tests {
                 bytes: 4,
             });
         assert!(validate_receipt_semantics(&threshold_tampered).is_err());
+        let mut split_prefill = receipt.clone();
+        split_prefill.memory.phase_samples[2].mlx.active_bytes = 3;
+        split_prefill.memory.phase_samples[2].mlx.peak_bytes = 4;
+        assert!(3 + 4 > 1 + 4 + 1);
+        assert!(validate_receipt_semantics(&split_prefill).is_err());
         let mut fixture_tampered = receipt.clone();
         fixture_tampered
             .quality
