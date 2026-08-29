@@ -1892,6 +1892,56 @@ pub fn fixture_artifact(name: &str, raw: &QualityObservation) -> Result<(Vec<u8>
     Ok(sealed_json(&value))
 }
 
+/// Seal the evidence belonging to one product fixture.  The aggregate quality row is not a
+/// substitute for this: each artifact carries the source/reference facts that were actually
+/// compared for its named fixture.
+fn product_fixture_artifact(
+    name: &str,
+    suite: &ProductFixtureSuite,
+) -> Result<(Vec<u8>, String), String> {
+    let quality = suite.quality()?;
+    let (evidence, reference) = match name {
+        "kernel-fp32-reference" => (
+            serde_json::json!({
+                "candidatePerplexity": quality.candidate_perplexity,
+                "referencePerplexity": quality.reference_perplexity,
+                "parityErrors": quality.parity_errors,
+                "greedyMatches": quality.greedy_matches,
+                "greedyTotal": quality.greedy_total,
+            }),
+            suite.kernel_reference.observation.snapshot.sha256.clone(),
+        ),
+        "structured-tool-call" => (
+            serde_json::json!({ "matches": quality.tool_matches, "total": quality.tool_total }),
+            suite.tool_reference.observation.snapshot.sha256.clone(),
+        ),
+        "long-context-needle" => (
+            serde_json::json!({ "matches": quality.needle_matches, "total": quality.needle_total }),
+            suite.needle_reference.observation.snapshot.sha256.clone(),
+        ),
+        "multi-turn-prompt-cache" => (
+            serde_json::json!({ "matches": quality.cache_matches, "total": quality.cache_total }),
+            suite.cache_reference.observation.snapshot.sha256.clone(),
+        ),
+        _ => return Err(format!("unknown fixture {name}")),
+    };
+    let metrics = compute_quality(&quality)?;
+    let value = serde_json::json!({
+        "fixture": name,
+        "independentReference": format!("fp32-snapshot:{reference}"),
+        "evidence": evidence,
+        "metrics": {
+            "parityMaxError": metrics.parity_max_error,
+            "perplexityDelta": metrics.perplexity_delta,
+            "greedyTokenAgreement": metrics.greedy_token_agreement,
+            "structuredToolAgreement": metrics.structured_tool_agreement,
+            "needleRetrieval": metrics.needle_retrieval,
+            "multiTurnPromptCache": metrics.multi_turn_prompt_cache,
+        },
+    });
+    Ok(sealed_json(&value))
+}
+
 pub fn validate_fixture_evidence(evidence: &[FixtureEvidence]) -> Result<(), String> {
     if evidence.len() != REQUIRED_FIXTURES.len() || !evidence.iter().all(|e| e.passed) {
         return Err("all four independent quality fixtures must pass".into());
@@ -2748,6 +2798,35 @@ fn checked_git_revision(root: &Path) -> Result<String, String> {
     Ok(revision)
 }
 
+fn required_campaign_env(name: &str) -> Result<String, String> {
+    let value =
+        std::env::var(name).map_err(|_| format!("missing required campaign environment {name}"))?;
+    if value.trim().is_empty() || value.contains("product-probed-at-worker") {
+        return Err(format!(
+            "campaign environment {name} is not a real probed value"
+        ));
+    }
+    Ok(value)
+}
+
+fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("probe {label}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("probe {label} failed"));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|e| format!("probe {label} output: {e}"))?
+        .trim()
+        .to_string();
+    if value.is_empty() || value.contains("product-probed-at-worker") {
+        return Err(format!("probe {label} returned no real value"));
+    }
+    Ok(value)
+}
+
 fn product_receipt(
     coordinate: &Coordinate,
     suite: &ProductFixtureSuite,
@@ -2762,7 +2841,13 @@ fn product_receipt(
         .ancestors()
         .nth(3)
         .ok_or("inference root")?;
-    let executable_bytes = fs::read(executable).map_err(|e| e.to_string())?;
+    let _ = fs::metadata(executable).map_err(|e| e.to_string())?;
+    let scene_works_root = PathBuf::from(required_campaign_env("SCENEWORKS_ROOT")?);
+    let scene_works_revision = checked_git_revision(&scene_works_root)?;
+    let inference_revision = checked_git_revision(inference_root)?;
+    let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
+    let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
+    let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
     let transcript = format!(
         "{}\n{}\n{}\n{}",
         suite.kernel_candidate.output.text,
@@ -2806,7 +2891,7 @@ fn product_receipt(
     let start = observation.phases.first().ok_or("start phase")?;
     let mut fixture_evidence = std::collections::BTreeMap::new();
     for name in REQUIRED_FIXTURES {
-        let (_, hash) = fixture_artifact(name, &quality)?;
+        let (_, hash) = product_fixture_artifact(name, suite)?;
         fixture_evidence.insert(
             name.into(),
             ReceiptFixture {
@@ -2818,7 +2903,7 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision: checked_git_revision(inference_root)?, inference_revision: checked_git_revision(inference_root)?, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode: "product-probed-at-worker".into(), hardware: "product-probed-at-worker".into(), model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode: "product-probed-at-worker".into(), thermal_state: "nominal".into(), command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
+        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: "nominal".into(), command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
