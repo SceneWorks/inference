@@ -85,14 +85,19 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if not args.cancel_campaign and cancelled:
         raise ValueError("normal generation cannot contain cancellation")
     geometry = geometry_from(events)
-    samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events if "peak_bytes" in e]
+    allocator = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events
+                 if e.get("sample_kind") == "allocator" and "peak_bytes" in e]
+    process = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events
+               if e.get("sample_kind") == "process" and "peak_bytes" in e]
+    if not allocator or not process:
+        raise ValueError("producer must provide distinct allocator and process samples")
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "source_ref": source_ref,
             "model_snapshot_sha256": snapshot_hash, "model_snapshot_bytes": snapshot_bytes,
             "geometry": geometry,
             "lifecycle": {"created": sum(e["phase"] == "cross-kv-created" for e in events), "reused": sum(e["phase"] == "cross-kv-read" for e in events),
                            "invalidated": sum(e["phase"] == "invalidated" for e in events), "cancelled": sum(e["phase"] == "cancelled" for e in events), "released": sum(e["phase"] == "released" for e in events)},
-            "allocator_samples": samples, "process_samples": samples,
+            "allocator_samples": allocator, "process_samples": process,
             "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
             "real_weights": metadata.get("real_weights") is True, "full_generation": metadata.get("full_generation") is True, "attention_kind": metadata.get("attention_kind"),
             "current_persistent_bytes": metrics["current_persistent_bytes"], "current_read_transient_bytes": metrics["current_read_transient_bytes"],
@@ -112,10 +117,21 @@ def main():
         if args.fake:
             events = fake_events()
         elif args.entrypoint:
-            completed = subprocess.run([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-", "--snapshot", str(root)], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if completed.returncode: raise ValueError(f"campaign entrypoint failed: {completed.stderr.strip()}")
-            events = [json.loads(line) for line in completed.stdout.splitlines()
+            child = subprocess.Popen([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-", "--snapshot", str(root)], text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process_samples = []
+            while child.poll() is None:
+                try:
+                    rss_kib = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(child.pid)], text=True).strip() or "0")
+                    if rss_kib > 0:
+                        process_samples.append({"phase": "process-sample", "sample_kind": "process", "peak_bytes": rss_kib * 1024, "at_ns": time.time_ns()})
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+                time.sleep(0.05)
+            stdout, stderr = child.communicate()
+            if child.returncode: raise ValueError(f"campaign entrypoint failed: {stderr.strip()}")
+            events = [json.loads(line) for line in stdout.splitlines()
                       if line.lstrip().startswith("{")]
+            events.extend(process_samples)
         else:
             events = json.loads(args.events.read_text(encoding="utf-8")) if args.events else None
         if not isinstance(events, list): raise ValueError("real entrypoint must provide observer events")
