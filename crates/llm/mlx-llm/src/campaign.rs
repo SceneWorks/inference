@@ -537,7 +537,10 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             || !["cache", "attention-workspace", "weights", "output"].contains(&event.role.as_str())
             || !["persistent", "transient"].contains(&event.lifetime.as_str())
             || event.phase.is_empty()
-            || event.timestamp.is_empty()
+            || event.kind.is_empty()
+            || !REQUIRED_PHASES.contains(&event.phase.as_str())
+            || !event.timestamp.contains('T')
+            || !event.timestamp.ends_with('Z')
         {
             return Err("allocation event is malformed".into());
         }
@@ -655,7 +658,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("timing summary derivation failed".into());
     }
-    if receipt.quality.parity_max_error < 0.0
+    if !receipt.quality.parity_max_error.is_finite()
+        || !receipt.quality.perplexity_delta.is_finite()
+        || receipt.quality.parity_max_error < 0.0
         || receipt.quality.parity_max_error > 0.0001
         || receipt.quality.perplexity_delta > 0.01
         || [
