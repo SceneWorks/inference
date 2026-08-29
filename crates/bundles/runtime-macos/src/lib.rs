@@ -132,7 +132,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -145,7 +145,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
         )
     }
