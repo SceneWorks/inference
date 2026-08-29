@@ -51,11 +51,16 @@ def fake_events():
     now = time.monotonic_ns()
     return [{"phase": p, "persistent_bytes": 600 * 1024**2 if p in ("cross-kv-created", "cross-kv-read") else 0,
              "transient_bytes": 32 * 1024**2 if p == "cross-kv-read" else 0,
-             "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "released"))]
+             "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "cancelled", "released"))]
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
-    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "released"} <= {e.get("phase") for e in events}:
+    phases = {e.get("phase") for e in events}
+    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "cancelled", "released"} <= phases:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
+    cancelled = [i for i, e in enumerate(events) if e.get("phase") == "cancelled"]
+    released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
+    if not cancelled or not released or max(cancelled) > min(released):
+        raise ValueError("cancellation cleanup must precede release")
     samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events]
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "source_ref": config.get("source_ref", "entrypoint-observer"),

@@ -59,6 +59,7 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
 }
 impl Drop for Scope {
     fn drop(&mut self) {
+        observe("cancelled", 0, 0, 0);
         observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         let _ = self.started;
