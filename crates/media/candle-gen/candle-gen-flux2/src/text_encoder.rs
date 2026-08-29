@@ -515,6 +515,7 @@ impl Flux2PromptEncoder {
         sampling: UpsampleSampling,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Vec<i32>> {
+        crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         let (batch, prompt_len, _) = prompt_embeds.dims3()?;
         if batch != 1 {
             return Err(candle_gen::CandleError::Msg(format!(
@@ -548,6 +549,7 @@ impl Flux2PromptEncoder {
             let embeds = self.embed(&ids)?;
             logits = self.decode_logits_from_embeds(&embeds, &mut cache, prompt_len + step)?;
         }
+        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(generated)
     }
 }

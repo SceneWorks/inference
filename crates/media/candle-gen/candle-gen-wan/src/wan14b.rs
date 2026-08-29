@@ -546,6 +546,7 @@ impl Pipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
+        crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
         check_cancel(cancel)?;
@@ -577,6 +578,7 @@ impl Pipeline {
                 total,
             });
         }
+        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(())
     }
 

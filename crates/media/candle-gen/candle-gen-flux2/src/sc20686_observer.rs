@@ -1,5 +1,8 @@
 //! Optional SC-20686 campaign observer. `None` is the production default.
 use std::cell::RefCell;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
 use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10,9 +13,22 @@ pub struct CacheEvent {
     pub transient_bytes: u64,
     pub elapsed_ms: u64,
     pub reused: u64,
+    pub peak_bytes: u64,
+    pub at_ns: u128,
 }
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
+}
+pub struct JsonlObserver(File);
+impl CacheObserver for JsonlObserver {
+    fn record(&mut self, event: CacheEvent) {
+        let line = format!("{{\"phase\":\"{}\",\"persistent_bytes\":{},\"transient_bytes\":{},\"peak_bytes\":{},\"reused\":{},\"at_ns\":{}}}\n", event.phase, event.persistent_bytes, event.transient_bytes, event.peak_bytes, event.reused, event.at_ns);
+        let _ = self.0.write_all(line.as_bytes());
+        let _ = self.0.flush();
+    }
+}
+pub fn install_jsonl(path: impl AsRef<Path>) -> io::Result<Scope> {
+    Ok(install(Box::new(JsonlObserver(File::create(path)?))))
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 pub struct Scope {
@@ -34,12 +50,15 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 transient_bytes,
                 elapsed_ms: 0,
                 reused,
+                peak_bytes: persistent_bytes.saturating_add(transient_bytes),
+                at_ns: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
             });
         }
     });
 }
 impl Drop for Scope {
     fn drop(&mut self) {
+        observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         let _ = self.started;
     }

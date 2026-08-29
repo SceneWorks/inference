@@ -49,19 +49,19 @@ def geometry_from(config, supplied):
 
 def fake_events():
     now = time.monotonic_ns()
-    return [{"phase": p, "persistent_bytes": 600 * 1024**2 if p in ("created", "reuse") else 0,
-             "transient_bytes": 32 * 1024**2 if p == "reuse" else 0,
-             "peak_bytes": 10 * 1024**3, "at_ns": now + i} for i, p in enumerate(("created", "reuse", "invalidated", "released"))]
+    return [{"phase": p, "persistent_bytes": 600 * 1024**2 if p in ("cross-kv-created", "cross-kv-read") else 0,
+             "transient_bytes": 32 * 1024**2 if p == "cross-kv-read" else 0,
+             "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "released"))]
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
-    if not {"created", "reuse", "invalidated", "released"} <= {e.get("phase") for e in events}:
+    if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "released"} <= {e.get("phase") for e in events}:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
     samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events]
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "source_ref": config.get("source_ref", "entrypoint-observer"),
             "model_snapshot_sha256": snapshot_hash, "model_snapshot_bytes": snapshot_bytes,
             "geometry": geometry,
-            "lifecycle": {"created": sum(e["phase"] == "created" for e in events), "reused": sum(e["phase"] == "reuse" for e in events),
+            "lifecycle": {"created": sum(e["phase"] == "cross-kv-created" for e in events), "reused": sum(e["phase"] == "cross-kv-read" for e in events),
                            "invalidated": sum(e["phase"] == "invalidated" for e in events), "cancelled": sum(e["phase"] == "cancelled" for e in events), "released": sum(e["phase"] == "released" for e in events)},
             "allocator_samples": samples, "process_samples": samples,
             "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
@@ -74,13 +74,20 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--campaign", action="store_true"); p.add_argument("--family", choices=("flux2-klein", "wan"), required=True)
     p.add_argument("--snapshot", type=Path, required=True); p.add_argument("--output", type=Path, required=True); p.add_argument("--variant", required=True)
-    p.add_argument("--geometry", type=Path); p.add_argument("--events", type=Path); p.add_argument("--fake", action="store_true"); args = p.parse_args()
+    p.add_argument("--geometry", type=Path); p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--fake", action="store_true"); args = p.parse_args()
     if not args.campaign: p.error("SC-20686 adapter requires explicit --campaign")
     root = args.snapshot.resolve(); config_path = root / "config.json"
     try:
         if not root.is_dir() or not config_path.is_file(): raise ValueError("snapshot must contain config.json")
         config = json.loads(config_path.read_text(encoding="utf-8")); supplied = json.loads(args.geometry.read_text(encoding="utf-8")) if args.geometry else None
-        events = fake_events() if args.fake else (json.loads(args.events.read_text(encoding="utf-8")) if args.events else None)
+        if args.fake:
+            events = fake_events()
+        elif args.entrypoint:
+            completed = subprocess.run([str(args.entrypoint), "--sc20686-campaign", "--sc20686-events", "-"], check=False, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if completed.returncode: raise ValueError(f"campaign entrypoint failed: {completed.stderr.strip()}")
+            events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        else:
+            events = json.loads(args.events.read_text(encoding="utf-8")) if args.events else None
         if not isinstance(events, list): raise ValueError("real entrypoint must provide observer events")
         row = make_row(args, config, *snapshot_identity(root), events, geometry_from(config, supplied))
         raw = args.output.with_suffix(".raw.json"); sealed, sidecar = seal(row, raw.name); atomic_pair(raw, [sealed], sidecar)
