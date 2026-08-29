@@ -41,6 +41,7 @@
 //! decode path for a conv-VAE checkpoint.
 
 pub mod adapters;
+mod advanced_quant;
 pub mod audio_vae;
 pub mod block_stream;
 pub mod bundle;
@@ -216,6 +217,7 @@ struct Pipeline {
     /// Exact transformer identity read from the split safetensors metadata.  Dense LTX-2.3 is
     /// always the historical distilled route; split LTX-2.5 must provide this explicitly.
     transformer_variant: TransformerVariant,
+    quant_mode: Ltx25QuantMode,
     use_diffusion_decoder: bool,
 }
 
@@ -276,6 +278,7 @@ impl Pipeline {
             upsampler_override,
             split_bundle: None,
             transformer_variant: TransformerVariant::Distilled,
+            quant_mode: Ltx25QuantMode::Bf16,
             use_diffusion_decoder: false,
         }
     }
@@ -326,6 +329,7 @@ impl Pipeline {
             upsampler_override: None,
             split_bundle: Some(bundle),
             transformer_variant,
+            quant_mode,
             use_diffusion_decoder,
         })
     }
@@ -475,11 +479,32 @@ impl Pipeline {
         }
         let dit_all = candle_gen::mmap_var_builder(&dit_files, DIT_DTYPE, &self.device)?;
         let dit_vb = dit_all.pp("model.diffusion_model");
-        let mut avdit = if execution.is_streamed() {
-            let stream = LtxBlockStream::new(dit_vb.clone(), self.av_cfg.clone(), adapters)?;
-            AvDiT::new_block_streamed(dit_vb.clone(), &self.av_cfg, stream)?
+        let advanced_source = if matches!(
+            self.quant_mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        ) {
+            Some(advanced_quant::AdvancedQuantSource::open(
+                transformer,
+                self.quant_mode,
+                &self.device,
+            )?)
         } else {
-            AvDiT::new(dit_vb.clone(), &self.av_cfg)?
+            None
+        };
+        let mut avdit = if execution.is_streamed() {
+            let stream = LtxBlockStream::new_with_advanced(
+                dit_vb.clone(),
+                self.av_cfg.clone(),
+                adapters,
+                advanced_source.clone(),
+            )?;
+            advanced_quant::with_advanced_source(advanced_source, || {
+                AvDiT::new_block_streamed(dit_vb.clone(), &self.av_cfg, stream)
+            })?
+        } else {
+            advanced_quant::with_advanced_source(advanced_source, || {
+                AvDiT::new(dit_vb.clone(), &self.av_cfg)
+            })?
         };
         adapters::install_ltx25_adapters(&mut avdit, adapters)?;
         if let Some(chunk) = execution.attention_chunk_size {
@@ -2154,7 +2179,44 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let quant_mode = Ltx25QuantMode::from_load_spec(spec)?;
     let device = candle_gen::default_device()?;
     let gpu = Ltx25GpuGeneration::from_device(&device)?;
-    match quant_eval::admit(quant_mode, gpu, quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS) {
+    // Preserve the cheap fail-closed boundary: while no reviewed receipt exists, advanced modes are
+    // refused before even resolving a bundle. Once a receipt is deliberately compiled in, the full
+    // variant + live runtime identity comparison below becomes mandatory.
+    if quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.is_empty() {
+        if let Ltx25QuantAdmission::Refused { reason } = quant_eval::admit(
+            quant_mode,
+            gpu,
+            TransformerVariant::Distilled,
+            None,
+            quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS,
+        ) {
+            return Err(gen_core::Error::Unsupported(reason));
+        }
+    }
+    let resolved = bundle::resolve_split_bundle(spec)?;
+    let transformer_variant = TransformerVariant::from_bundle(&resolved)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let runtime_identity = if matches!(
+        quant_mode,
+        Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+    ) && !quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.is_empty()
+    {
+        Some(quant_eval::runtime_identity_from_bundle(
+            spec,
+            &resolved,
+            quant_mode,
+            transformer_variant,
+        )?)
+    } else {
+        None
+    };
+    match quant_eval::admit(
+        quant_mode,
+        gpu,
+        transformer_variant,
+        runtime_identity.as_ref(),
+        quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS,
+    ) {
         Ltx25QuantAdmission::Admitted => {}
         Ltx25QuantAdmission::Refused { reason } => {
             return Err(gen_core::Error::Unsupported(reason));
@@ -2180,6 +2242,17 @@ fn load_25_for_terminal_measurement(
             case.id,
             case.gpu.id(),
             observed_gpu.id(),
+        )));
+    }
+    let resolved = bundle::resolve_split_bundle(spec)?;
+    let observed_variant = TransformerVariant::from_bundle(&resolved)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    if observed_variant != case.transformer_variant {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: terminal case {} requires transformer variant {}, bundle declares {}",
+            case.id,
+            case.transformer_variant.id(),
+            observed_variant.id()
         )));
     }
     load_25_selected(spec, case.mode, device)
@@ -2633,7 +2706,7 @@ mod tests {
         // mutation-sensitive companion to `AvDiT::is_block_streamed`'s behavioral tests.
         let source = include_str!("lib.rs");
         let loader = function_body(source, "load_components_split");
-        assert!(loader.contains("LtxBlockStream::new("));
+        assert!(loader.contains("LtxBlockStream::new_with_advanced("));
         assert!(loader.contains("AvDiT::new_block_streamed("));
         assert!(loader.contains("AvDiT::new("));
         assert!(loader.contains("avdit.set_attention_budget("));
@@ -2723,7 +2796,8 @@ mod tests {
             .nth(1)
             .expect("LTX-2.5 registry loader exists");
         assert!(loader.contains("Ltx25QuantMode::from_load_spec(spec)"));
-        assert!(loader.contains("quant_eval::admit(quant_mode"));
+        assert!(loader.contains("quant_eval::admit("));
+        assert!(loader.contains("runtime_identity_from_bundle("));
         let split_loader = source
             .split("fn load_split(")
             .nth(1)

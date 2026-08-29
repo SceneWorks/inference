@@ -32,6 +32,7 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::AdapterSpec;
 use candle_gen::{CandleError, Result};
 
+use crate::advanced_quant::{with_advanced_source, AdvancedQuantSource};
 use crate::config::AvConfig;
 use crate::transformer::AvBlock;
 
@@ -81,6 +82,7 @@ pub struct LtxBlockStream {
     /// every window rebuilds a block at the unbounded default — bounded weights, unbounded scores,
     /// identical output.
     attn_budget: usize,
+    advanced_source: Option<std::sync::Arc<AdvancedQuantSource>>,
 }
 
 impl LtxBlockStream {
@@ -92,6 +94,15 @@ impl LtxBlockStream {
     /// wrong weights. Refusing to construct is the only honest answer; the contract then declares
     /// rung 4 unavailable for an adapted load rather than bounding an un-adapted stack.
     pub fn new(vb: VarBuilder<'static>, cfg: AvConfig, adapters: &[AdapterSpec]) -> Result<Self> {
+        Self::new_with_advanced(vb, cfg, adapters, None)
+    }
+
+    pub(crate) fn new_with_advanced(
+        vb: VarBuilder<'static>,
+        cfg: AvConfig,
+        adapters: &[AdapterSpec],
+        advanced_source: Option<std::sync::Arc<AdvancedQuantSource>>,
+    ) -> Result<Self> {
         if !adapters.is_empty() {
             return Err(CandleError::Msg(format!(
                 "ltx block stream: {} adapter file(s) are installed, and LTX applies adapters to \
@@ -105,6 +116,7 @@ impl LtxBlockStream {
             vb,
             cfg,
             attn_budget: candle_gen::ATTN_SCORES_BUDGET,
+            advanced_source,
         })
     }
 
@@ -151,7 +163,9 @@ impl LtxBlockStream {
                 self.n_blocks()
             )));
         }
-        let mut block = AvBlock::load(view.pp(format!("transformer_blocks.{index}")), &self.cfg)?;
+        let mut block = with_advanced_source(self.advanced_source.clone(), || {
+            AvBlock::load(view.pp(format!("transformer_blocks.{index}")), &self.cfg)
+        })?;
         block.set_attention_budget(self.attn_budget);
         BLOCK_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
         Ok(block)

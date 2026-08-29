@@ -6,14 +6,53 @@
 //! ordinary catalog. Advanced production modes remain fail-closed until a same-run, identity-bound
 //! receipt is deliberately copied into [`ACCEPTED_MEASUREMENT_RECEIPTS`].
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{self, ltx_checkpoint::LtxBundle, LoadSpec, LtxComponent, Quant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::MODEL_25_ID;
+use crate::{dev_sampler::TransformerVariant, MODEL_25_ID};
+
+pub const RUNTIME_BINDING_FILE: &str = "ltx25-quant-runtime-binding.json";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ltx25QuantRuntimeIdentity {
+    pub mode: Ltx25QuantMode,
+    pub transformer_variant: TransformerVariant,
+    pub inference_revision: String,
+    pub executable_contract_sha256: String,
+    pub model_revision: String,
+    pub model_inventory_sha256: String,
+    pub runtime_bundle_sha256: String,
+    pub receipt_sha256: String,
+    pub transcript_sha256: String,
+    pub evidence_manifest_sha256: String,
+    pub output_sha256: String,
+    pub reference_output_sha256: String,
+    pub operator_kind: String,
+    pub operator_contract_sha256: String,
+    pub operator_weight_inventory_sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeInventoryEntry {
+    path: String,
+    bytes: u64,
+    sha256: String,
+    symlink_target: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeInventory {
+    schema_version: &'static str,
+    entries: Vec<RuntimeInventoryEntry>,
+}
 
 /// Every numeric source compared by the terminal controller.
 ///
@@ -50,41 +89,18 @@ impl Ltx25QuantMode {
         }
     }
 
-    /// Bind the declared mode to the physical transformer/text-encoder artifact names.
+    /// Bind the declared mode to the transformer's actual tensor encoding and quant descriptors.
+    /// File names are not evidence and are deliberately ignored.
     pub fn validate_bundle_source(self, bundle: &LtxBundle) -> gen_core::Result<()> {
         let transformer = bundle.require(LtxComponent::Transformer)?.path();
-        let text_encoder = bundle.require(LtxComponent::TextEncoder)?.path();
-        let has = |path: &Path, marker: &str| {
-            path.to_string_lossy().to_ascii_lowercase().contains(marker)
-        };
-        match self {
-            Self::Bf16 | Self::Q4 => Ok(()),
-            Self::PackedQ8 if has(transformer, "q8") && has(text_encoder, "q8") => Ok(()),
-            Self::PackedQ8 => Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_25_ID}: terminal packed-q8 measurement requires q8 transformer and text \
-                 encoder artifacts; got '{}' / '{}'",
-                transformer.display(),
-                text_encoder.display(),
-            ))),
-            Self::Int8ConvRot
-                if has(transformer, "int8-convrot") && has(text_encoder, "int8-convrot") =>
-            {
-                Ok(())
-            }
-            Self::Int8ConvRot => Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_25_ID}: requested int8-convrot but transformer '{}' and text encoder '{}' \
-                 are not the released matching ConvRot artifacts; refusing a bf16/q4/q8 fallback",
-                transformer.display(),
-                text_encoder.display(),
-            ))),
-            Self::Nvfp4 if has(transformer, "nvfp4") && has(text_encoder, "bf16") => Ok(()),
-            Self::Nvfp4 => Err(gen_core::Error::Unsupported(format!(
-                "{MODEL_25_ID}: requested nvfp4 but transformer '{}' / text encoder '{}' do not \
-                 match the released nvfp4-transformer + bf16-Gemma pairing; refusing a fallback",
-                transformer.display(),
-                text_encoder.display(),
-            ))),
-        }
+        crate::advanced_quant::inspect_transformer_source(transformer, self)
+            .map(|_| ())
+            .map_err(|error| {
+                gen_core::Error::Unsupported(format!(
+                    "{MODEL_25_ID}: transformer does not satisfy the semantic {} source contract: {error}",
+                    self.id()
+                ))
+            })
     }
 }
 
@@ -164,6 +180,7 @@ pub struct Ltx25QuantMeasurementCase {
     pub id: &'static str,
     pub mode: Ltx25QuantMode,
     pub gpu: Ltx25GpuGeneration,
+    pub transformer_variant: TransformerVariant,
     pub fixture: &'static str,
     pub width: u32,
     pub height: u32,
@@ -181,6 +198,7 @@ const fn terminal_case(
         id,
         mode,
         gpu,
+        transformer_variant: TransformerVariant::Distilled,
         fixture: "ltx25-production-latent-v1",
         width: 512,
         height: 512,
@@ -188,6 +206,16 @@ const fn terminal_case(
         fps: 24,
         seed: 18777,
     }
+}
+
+const fn terminal_dev_case(
+    id: &'static str,
+    mode: Ltx25QuantMode,
+    gpu: Ltx25GpuGeneration,
+) -> Ltx25QuantMeasurementCase {
+    let mut case = terminal_case(id, mode, gpu);
+    case.transformer_variant = TransformerVariant::Dev;
+    case
 }
 
 /// Both current physical generations compare bf16, packed q4/q8, and ConvRot. Native NVFP4 exists
@@ -238,6 +266,51 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
         Ltx25QuantMode::Nvfp4,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
+    terminal_dev_case(
+        "ltx25-bf16-ada-dev-v1",
+        Ltx25QuantMode::Bf16,
+        Ltx25GpuGeneration::AdaSm89,
+    ),
+    terminal_dev_case(
+        "ltx25-packed-q4-ada-dev-v1",
+        Ltx25QuantMode::Q4,
+        Ltx25GpuGeneration::AdaSm89,
+    ),
+    terminal_dev_case(
+        "ltx25-packed-q8-ada-dev-v1",
+        Ltx25QuantMode::PackedQ8,
+        Ltx25GpuGeneration::AdaSm89,
+    ),
+    terminal_dev_case(
+        "ltx25-int8-convrot-ada-dev-v1",
+        Ltx25QuantMode::Int8ConvRot,
+        Ltx25GpuGeneration::AdaSm89,
+    ),
+    terminal_dev_case(
+        "ltx25-bf16-blackwell-dev-v1",
+        Ltx25QuantMode::Bf16,
+        Ltx25GpuGeneration::ConsumerBlackwellSm120,
+    ),
+    terminal_dev_case(
+        "ltx25-packed-q4-blackwell-dev-v1",
+        Ltx25QuantMode::Q4,
+        Ltx25GpuGeneration::ConsumerBlackwellSm120,
+    ),
+    terminal_dev_case(
+        "ltx25-packed-q8-blackwell-dev-v1",
+        Ltx25QuantMode::PackedQ8,
+        Ltx25GpuGeneration::ConsumerBlackwellSm120,
+    ),
+    terminal_dev_case(
+        "ltx25-int8-convrot-blackwell-dev-v1",
+        Ltx25QuantMode::Int8ConvRot,
+        Ltx25GpuGeneration::ConsumerBlackwellSm120,
+    ),
+    terminal_dev_case(
+        "ltx25-nvfp4-blackwell-dev-v1",
+        Ltx25QuantMode::Nvfp4,
+        Ltx25GpuGeneration::ConsumerBlackwellSm120,
+    ),
 ];
 
 pub fn measurement_case(id: &str) -> Option<&'static Ltx25QuantMeasurementCase> {
@@ -264,15 +337,19 @@ pub struct Ltx25QuantMeasurementReceipt {
     pub case_id: String,
     pub mode: Ltx25QuantMode,
     pub gpu_generation: Ltx25GpuGeneration,
+    pub transformer_variant: TransformerVariant,
     pub fixture: String,
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub fps: u32,
+    pub observed_width: u32,
+    pub observed_height: u32,
+    pub observed_frames: u32,
+    pub observed_fps: u32,
     pub seed: u64,
     pub inference_revision: String,
+    pub executable_contract_sha256: String,
+    pub executable_sha256: String,
     pub model_revision: String,
     pub model_inventory_sha256: String,
+    pub runtime_bundle_sha256: String,
     pub gpu_name: String,
     pub compute_capability: String,
     pub driver_version: String,
@@ -282,6 +359,12 @@ pub struct Ltx25QuantMeasurementReceipt {
     pub evidence_manifest_sha256: String,
     pub output_sha256: String,
     pub reference_output_sha256: String,
+    pub reference_receipt_sha256: String,
+    pub operator_kind: String,
+    pub operator_contract_sha256: String,
+    pub operator_weight_inventory_sha256: String,
+    pub materialized_projection_count: u32,
+    pub declared_projection_count: u32,
     pub baseline_vram_bytes: u64,
     pub peak_vram_bytes: u64,
     pub wall_clock_ms: u64,
@@ -295,15 +378,19 @@ pub(crate) struct Ltx25QuantMeasurementDraft {
     pub case_id: String,
     pub mode: Ltx25QuantMode,
     pub gpu_generation: Ltx25GpuGeneration,
+    pub transformer_variant: TransformerVariant,
     pub fixture: String,
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub fps: u32,
+    pub observed_width: u32,
+    pub observed_height: u32,
+    pub observed_frames: u32,
+    pub observed_fps: u32,
     pub seed: u64,
     pub inference_revision: String,
+    pub executable_contract_sha256: String,
+    pub executable_sha256: String,
     pub model_revision: String,
     pub model_inventory_sha256: String,
+    pub runtime_bundle_sha256: String,
     pub gpu_name: String,
     pub compute_capability: String,
     pub driver_version: String,
@@ -313,6 +400,12 @@ pub(crate) struct Ltx25QuantMeasurementDraft {
     pub evidence_manifest_sha256: String,
     pub output_sha256: String,
     pub reference_output_sha256: String,
+    pub reference_receipt_sha256: String,
+    pub operator_kind: String,
+    pub operator_contract_sha256: String,
+    pub operator_weight_inventory_sha256: String,
+    pub materialized_projection_count: u32,
+    pub declared_projection_count: u32,
     pub baseline_vram_bytes: u64,
     pub peak_vram_bytes: u64,
     pub wall_clock_ms: u64,
@@ -340,18 +433,34 @@ impl Ltx25QuantMeasurementReceipt {
         push_string(&mut fields, "case", &self.case_id);
         push_string(&mut fields, "mode", self.mode.id());
         push_string(&mut fields, "gpu_generation", self.gpu_generation.id());
+        push_string(
+            &mut fields,
+            "transformer_variant",
+            self.transformer_variant.id(),
+        );
         push_string(&mut fields, "fixture", &self.fixture);
         fields.push(format!(
             "geometry:{}x{}x{}@{}",
-            self.width, self.height, self.frames, self.fps
+            self.observed_width, self.observed_height, self.observed_frames, self.observed_fps
         ));
         fields.push(format!("seed:{}", self.seed));
         push_string(&mut fields, "inference_revision", &self.inference_revision);
+        push_string(
+            &mut fields,
+            "executable_contract_sha256",
+            &self.executable_contract_sha256,
+        );
+        push_string(&mut fields, "executable_sha256", &self.executable_sha256);
         push_string(&mut fields, "model_revision", &self.model_revision);
         push_string(
             &mut fields,
             "model_inventory_sha256",
             &self.model_inventory_sha256,
+        );
+        push_string(
+            &mut fields,
+            "runtime_bundle_sha256",
+            &self.runtime_bundle_sha256,
         );
         push_string(&mut fields, "gpu_name", &self.gpu_name);
         push_string(&mut fields, "compute_capability", &self.compute_capability);
@@ -364,6 +473,26 @@ impl Ltx25QuantMeasurementReceipt {
             "evidence_manifest_sha256",
             &self.evidence_manifest_sha256,
         );
+        push_string(
+            &mut fields,
+            "reference_receipt_sha256",
+            &self.reference_receipt_sha256,
+        );
+        push_string(&mut fields, "operator_kind", &self.operator_kind);
+        push_string(
+            &mut fields,
+            "operator_contract_sha256",
+            &self.operator_contract_sha256,
+        );
+        push_string(
+            &mut fields,
+            "operator_weight_inventory_sha256",
+            &self.operator_weight_inventory_sha256,
+        );
+        fields.push(format!(
+            "operator_counts:{}:{}",
+            self.materialized_projection_count, self.declared_projection_count
+        ));
         push_string(&mut fields, "output_sha256", &self.output_sha256);
         push_string(
             &mut fields,
@@ -386,19 +515,23 @@ impl Ltx25QuantMeasurementReceipt {
 
     pub(crate) fn seal(draft: Ltx25QuantMeasurementDraft) -> Self {
         let mut receipt = Self {
-            schema_version: "sceneworks-ltx25-quant-receipt-v2".to_owned(),
+            schema_version: "sceneworks-ltx25-quant-receipt-v3".to_owned(),
             case_id: draft.case_id,
             mode: draft.mode,
             gpu_generation: draft.gpu_generation,
+            transformer_variant: draft.transformer_variant,
             fixture: draft.fixture,
-            width: draft.width,
-            height: draft.height,
-            frames: draft.frames,
-            fps: draft.fps,
+            observed_width: draft.observed_width,
+            observed_height: draft.observed_height,
+            observed_frames: draft.observed_frames,
+            observed_fps: draft.observed_fps,
             seed: draft.seed,
             inference_revision: draft.inference_revision,
+            executable_contract_sha256: draft.executable_contract_sha256,
+            executable_sha256: draft.executable_sha256,
             model_revision: draft.model_revision,
             model_inventory_sha256: draft.model_inventory_sha256,
+            runtime_bundle_sha256: draft.runtime_bundle_sha256,
             gpu_name: draft.gpu_name,
             compute_capability: draft.compute_capability,
             driver_version: draft.driver_version,
@@ -408,6 +541,12 @@ impl Ltx25QuantMeasurementReceipt {
             evidence_manifest_sha256: draft.evidence_manifest_sha256,
             output_sha256: draft.output_sha256,
             reference_output_sha256: draft.reference_output_sha256,
+            reference_receipt_sha256: draft.reference_receipt_sha256,
+            operator_kind: draft.operator_kind,
+            operator_contract_sha256: draft.operator_contract_sha256,
+            operator_weight_inventory_sha256: draft.operator_weight_inventory_sha256,
+            materialized_projection_count: draft.materialized_projection_count,
+            declared_projection_count: draft.declared_projection_count,
             baseline_vram_bytes: draft.baseline_vram_bytes,
             peak_vram_bytes: draft.peak_vram_bytes,
             wall_clock_ms: draft.wall_clock_ms,
@@ -444,11 +583,19 @@ impl Ltx25QuantMeasurementReceipt {
                     self.gpu_generation.id()
                 ));
             }
+            if self.transformer_variant != case.transformer_variant {
+                errors.push(format!(
+                    "case {} requires transformer variant {}, got {}",
+                    case.id,
+                    case.transformer_variant.id(),
+                    self.transformer_variant.id()
+                ));
+            }
             if self.fixture != case.fixture
-                || self.width != case.width
-                || self.height != case.height
-                || self.frames != case.frames
-                || self.fps != case.fps
+                || self.observed_width != case.width
+                || self.observed_height != case.height
+                || self.observed_frames != case.frames
+                || self.observed_fps != case.fps
                 || self.seed != case.seed
             {
                 errors.push(format!(
@@ -457,15 +604,26 @@ impl Ltx25QuantMeasurementReceipt {
                 ));
             }
         }
-        if self.schema_version != "sceneworks-ltx25-quant-receipt-v2" {
+        if self.schema_version != "sceneworks-ltx25-quant-receipt-v3" {
             errors.push("unknown receipt schema version".to_owned());
         }
         for (label, value, expected) in [
             ("inference revision", self.inference_revision.as_str(), 40),
+            (
+                "executable contract SHA-256",
+                self.executable_contract_sha256.as_str(),
+                64,
+            ),
+            ("executable SHA-256", self.executable_sha256.as_str(), 64),
             ("model revision", self.model_revision.as_str(), 40),
             (
                 "model inventory SHA-256",
                 self.model_inventory_sha256.as_str(),
+                64,
+            ),
+            (
+                "runtime bundle SHA-256",
+                self.runtime_bundle_sha256.as_str(),
                 64,
             ),
             ("run nonce SHA-256", self.run_nonce_sha256.as_str(), 64),
@@ -481,6 +639,21 @@ impl Ltx25QuantMeasurementReceipt {
                 self.reference_output_sha256.as_str(),
                 64,
             ),
+            (
+                "reference receipt SHA-256",
+                self.reference_receipt_sha256.as_str(),
+                64,
+            ),
+            (
+                "operator contract SHA-256",
+                self.operator_contract_sha256.as_str(),
+                64,
+            ),
+            (
+                "operator weight inventory SHA-256",
+                self.operator_weight_inventory_sha256.as_str(),
+                64,
+            ),
             ("receipt SHA-256", self.receipt_sha256.as_str(), 64),
         ] {
             if !is_lower_hex(value, expected) {
@@ -488,6 +661,31 @@ impl Ltx25QuantMeasurementReceipt {
                     "{label} must be {expected} lowercase hexadecimal characters"
                 ));
             }
+        }
+        let expected_operator = match self.mode {
+            Ltx25QuantMode::Bf16 => "dense-linear",
+            Ltx25QuantMode::Q4 | Ltx25QuantMode::PackedQ8 => "mlx-affine-dequant",
+            Ltx25QuantMode::Int8ConvRot => "int8-convrot-rht-cublaslt-igemm",
+            Ltx25QuantMode::Nvfp4 => "native-nvfp4-cublaslt-w4a4",
+        };
+        if self.operator_kind != expected_operator {
+            errors.push(format!(
+                "mode {} requires operator {expected_operator}, got {}",
+                self.mode.id(),
+                self.operator_kind
+            ));
+        }
+        if self.materialized_projection_count == 0 {
+            errors.push("materialized projection count must be positive".to_owned());
+        }
+        if matches!(
+            self.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        ) && (self.declared_projection_count == 0
+            || self.declared_projection_count > self.materialized_projection_count)
+        {
+            errors
+                .push("advanced receipt did not materialize every declared projection".to_owned());
         }
         for (label, value) in [
             ("GPU name", self.gpu_name.as_str()),
@@ -574,6 +772,8 @@ pub const ACCEPTED_MEASUREMENT_RECEIPTS: &[Ltx25QuantMeasurementReceipt] = &[];
 pub fn admit(
     mode: Ltx25QuantMode,
     gpu: Ltx25GpuGeneration,
+    variant: TransformerVariant,
+    runtime: Option<&Ltx25QuantRuntimeIdentity>,
     receipts: &[Ltx25QuantMeasurementReceipt],
 ) -> Ltx25QuantAdmission {
     if mode == Ltx25QuantMode::PackedQ8 {
@@ -587,7 +787,7 @@ pub fn admit(
     }
     let Some(case) = TERMINAL_MEASUREMENT_CASES
         .iter()
-        .find(|case| case.mode == mode && case.gpu == gpu)
+        .find(|case| case.mode == mode && case.gpu == gpu && case.transformer_variant == variant)
     else {
         return Ltx25QuantAdmission::Refused {
             reason: format!(
@@ -598,14 +798,216 @@ pub fn admit(
         };
     };
     match receipts.iter().find(|receipt| receipt.case_id == case.id) {
-        Some(receipt) if receipt.validation_errors().is_empty() => Ltx25QuantAdmission::Admitted,
-        Some(receipt) => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} measurement receipt is invalid: {}", case.id, receipt.validation_errors().join("; ")) },
+        Some(receipt)
+            if receipt.validation_errors().is_empty()
+                && runtime.is_some_and(|runtime| receipt_matches_runtime(receipt, runtime)) =>
+        {
+            Ltx25QuantAdmission::Admitted
+        }
+        Some(receipt) if !receipt.validation_errors().is_empty() => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} measurement receipt is invalid: {}", case.id, receipt.validation_errors().join("; ")) },
+        Some(_) => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} receipt does not match the active code/model/bundle/evidence runtime identity; replay is refused", case.id) },
         None => Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: {} is selectable but not catalog-adopted until the terminal campaign records the {} receipt (exact code/model/GPU, VRAM, wall-clock, output, transcript, and quality)", mode.id(), case.id) },
     }
 }
 
+fn receipt_matches_runtime(
+    receipt: &Ltx25QuantMeasurementReceipt,
+    runtime: &Ltx25QuantRuntimeIdentity,
+) -> bool {
+    receipt.mode == runtime.mode
+        && receipt.transformer_variant == runtime.transformer_variant
+        && receipt.inference_revision == runtime.inference_revision
+        && receipt.executable_contract_sha256 == runtime.executable_contract_sha256
+        && receipt.model_revision == runtime.model_revision
+        && receipt.model_inventory_sha256 == runtime.model_inventory_sha256
+        && receipt.runtime_bundle_sha256 == runtime.runtime_bundle_sha256
+        && receipt.receipt_sha256 == runtime.receipt_sha256
+        && receipt.transcript_sha256 == runtime.transcript_sha256
+        && receipt.evidence_manifest_sha256 == runtime.evidence_manifest_sha256
+        && receipt.output_sha256 == runtime.output_sha256
+        && receipt.reference_output_sha256 == runtime.reference_output_sha256
+        && receipt.operator_kind == runtime.operator_kind
+        && receipt.operator_contract_sha256 == runtime.operator_contract_sha256
+        && receipt.operator_weight_inventory_sha256 == runtime.operator_weight_inventory_sha256
+}
+
 pub const fn catalog_advertised(mode: Ltx25QuantMode) -> bool {
     matches!(mode, Ltx25QuantMode::Q4)
+}
+
+fn file_sha256(path: &Path) -> gen_core::Result<String> {
+    let bytes = fs::read(path).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "read runtime identity file {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn snapshot_root(spec: &LoadSpec) -> gen_core::Result<PathBuf> {
+    let root = match &spec.weights {
+        gen_core::WeightsSource::Dir(path) => path.clone(),
+        gen_core::WeightsSource::File(path) => path
+            .parent()
+            .ok_or_else(|| gen_core::Error::Msg("weights file has no parent".into()))?
+            .to_path_buf(),
+    };
+    fs::canonicalize(&root).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize model snapshot {}: {error}",
+            root.display()
+        ))
+    })
+}
+
+fn runtime_inventory_sha256(root: &Path) -> gen_core::Result<String> {
+    fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> gen_core::Result<()> {
+        for entry in fs::read_dir(dir).map_err(|error| gen_core::Error::Msg(error.to_string()))? {
+            let entry = entry.map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+            let path = entry.path();
+            if path == root.join(RUNTIME_BINDING_FILE) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+            if metadata.file_type().is_symlink() {
+                if fs::metadata(&path)
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+                    .is_file()
+                {
+                    files.push(path);
+                } else {
+                    return Err(gen_core::Error::Msg(format!(
+                        "runtime inventory refuses non-file symlink {}",
+                        path.display()
+                    )));
+                }
+            } else if metadata.is_dir() {
+                visit(root, &path, files)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files)?;
+    files.sort();
+    let entries = files
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+            Ok(RuntimeInventoryEntry {
+                path: path
+                    .strip_prefix(root)
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                bytes: fs::metadata(&path)
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+                    .len(),
+                sha256: file_sha256(&path)?,
+                symlink_target: metadata
+                    .file_type()
+                    .is_symlink()
+                    .then(|| {
+                        fs::read_link(&path)
+                            .map(|target| target.to_string_lossy().replace('\\', "/"))
+                            .map_err(|error| gen_core::Error::Msg(error.to_string()))
+                    })
+                    .transpose()?,
+            })
+        })
+        .collect::<gen_core::Result<Vec<_>>>()?;
+    let inventory = RuntimeInventory {
+        schema_version: "sceneworks-model-inventory-v1",
+        entries,
+    };
+    serde_json::to_vec_pretty(&inventory)
+        .map(|mut bytes| {
+            bytes.push(b'\n');
+            sha256_hex(&bytes)
+        })
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))
+}
+
+fn runtime_bundle_hash(
+    bundle: &LtxBundle,
+    root: &Path,
+    inventory: &str,
+    variant: TransformerVariant,
+    mode: Ltx25QuantMode,
+) -> gen_core::Result<String> {
+    let mut rows = Vec::new();
+    for component in bundle.components() {
+        let path = fs::canonicalize(component.path())
+            .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+        let logical = path.strip_prefix(root).map_err(|_| {
+            gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: resolved component {} escapes the identity-bound snapshot {}",
+                path.display(),
+                root.display()
+            ))
+        })?;
+        rows.push(format!(
+            "{}:{}",
+            component.component().id(),
+            logical.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    rows.sort();
+    rows.insert(0, format!("mode:{}", mode.id()));
+    rows.insert(0, format!("variant:{}", variant.id()));
+    rows.insert(0, format!("inventory:{inventory}"));
+    Ok(sha256_hex(rows.join("\n").as_bytes()))
+}
+
+/// Reconstruct the active production identity from the exact bundle on disk. The binding sidecar is
+/// only a carrier for the evidence hashes/model revision; live code, inventory, bundle resolution,
+/// transformer descriptor contract, and sidecar agreement are all re-verified here.
+pub fn runtime_identity_from_bundle(
+    spec: &LoadSpec,
+    bundle: &LtxBundle,
+    mode: Ltx25QuantMode,
+    variant: TransformerVariant,
+) -> gen_core::Result<Ltx25QuantRuntimeIdentity> {
+    let root = snapshot_root(spec)?;
+    let binding_path = root.join(RUNTIME_BINDING_FILE);
+    let mut identity: Ltx25QuantRuntimeIdentity =
+        serde_json::from_slice(&fs::read(&binding_path).map_err(|error| {
+            gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: advanced quant bundle lacks readable {}: {error}",
+                binding_path.display()
+            ))
+        })?)
+        .map_err(|error| {
+            gen_core::Error::Unsupported(format!(
+                "{MODEL_25_ID}: parse runtime binding {}: {error}",
+                binding_path.display()
+            ))
+        })?;
+    let inventory = runtime_inventory_sha256(&root)?;
+    let bundle_hash = runtime_bundle_hash(bundle, &root, &inventory, variant, mode)?;
+    let transformer = bundle.require(LtxComponent::Transformer)?.path();
+    let inspection = crate::advanced_quant::inspect_transformer_source(transformer, mode)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    if identity.mode != mode
+        || identity.transformer_variant != variant
+        || identity.inference_revision != env!("LTX25_BUILD_INFERENCE_REVISION")
+        || identity.executable_contract_sha256 != env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
+        || identity.model_inventory_sha256 != inventory
+        || identity.runtime_bundle_sha256 != bundle_hash
+        || identity.operator_contract_sha256 != inspection.operator_contract_sha256
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: runtime binding disagrees with active code/model/bundle/operator identity; receipt replay is refused"
+        )));
+    }
+    identity.model_inventory_sha256 = inventory;
+    identity.runtime_bundle_sha256 = bundle_hash;
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -623,15 +1025,19 @@ mod tests {
             case_id: case.id.to_owned(),
             mode: case.mode,
             gpu_generation: case.gpu,
+            transformer_variant: case.transformer_variant,
             fixture: case.fixture.to_owned(),
-            width: case.width,
-            height: case.height,
-            frames: case.frames,
-            fps: case.fps,
+            observed_width: case.width,
+            observed_height: case.height,
+            observed_frames: case.frames,
+            observed_fps: case.fps,
             seed: case.seed,
             inference_revision: "a".repeat(40),
+            executable_contract_sha256: "3".repeat(64),
+            executable_sha256: "4".repeat(64),
             model_revision: "b".repeat(40),
             model_inventory_sha256: "c".repeat(64),
+            runtime_bundle_sha256: "5".repeat(64),
             gpu_name: if case.gpu == Ltx25GpuGeneration::AdaSm89 {
                 "NVIDIA GeForce RTX 4090".to_owned()
             } else {
@@ -645,6 +1051,25 @@ mod tests {
             evidence_manifest_sha256: "f".repeat(64),
             output_sha256: "1".repeat(64),
             reference_output_sha256: "2".repeat(64),
+            reference_receipt_sha256: "6".repeat(64),
+            operator_kind: match case.mode {
+                Ltx25QuantMode::Bf16 => "dense-linear",
+                Ltx25QuantMode::Q4 | Ltx25QuantMode::PackedQ8 => "mlx-affine-dequant",
+                Ltx25QuantMode::Int8ConvRot => "int8-convrot-rht-cublaslt-igemm",
+                Ltx25QuantMode::Nvfp4 => "native-nvfp4-cublaslt-w4a4",
+            }
+            .to_owned(),
+            operator_contract_sha256: "7".repeat(64),
+            operator_weight_inventory_sha256: "8".repeat(64),
+            materialized_projection_count: 2,
+            declared_projection_count: if matches!(
+                case.mode,
+                Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+            ) {
+                1
+            } else {
+                0
+            },
             baseline_vram_bytes: 1,
             peak_vram_bytes: 2,
             wall_clock_ms: 1,
@@ -656,6 +1081,26 @@ mod tests {
                 silent_zero_audio_passed: true,
             },
         })
+    }
+
+    fn runtime(receipt: &Ltx25QuantMeasurementReceipt) -> Ltx25QuantRuntimeIdentity {
+        Ltx25QuantRuntimeIdentity {
+            mode: receipt.mode,
+            transformer_variant: receipt.transformer_variant,
+            inference_revision: receipt.inference_revision.clone(),
+            executable_contract_sha256: receipt.executable_contract_sha256.clone(),
+            model_revision: receipt.model_revision.clone(),
+            model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+            runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+            receipt_sha256: receipt.receipt_sha256.clone(),
+            transcript_sha256: receipt.transcript_sha256.clone(),
+            evidence_manifest_sha256: receipt.evidence_manifest_sha256.clone(),
+            output_sha256: receipt.output_sha256.clone(),
+            reference_output_sha256: receipt.reference_output_sha256.clone(),
+            operator_kind: receipt.operator_kind.clone(),
+            operator_contract_sha256: receipt.operator_contract_sha256.clone(),
+            operator_weight_inventory_sha256: receipt.operator_weight_inventory_sha256.clone(),
+        }
     }
 
     #[test]
@@ -679,7 +1124,7 @@ mod tests {
         );
         assert_ne!(Ltx25QuantMode::PackedQ8, Ltx25QuantMode::Int8ConvRot);
         assert!(
-            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::AdaSm89, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
+            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::AdaSm89, TransformerVariant::Distilled, None, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
         );
     }
 
@@ -705,7 +1150,13 @@ mod tests {
             Ltx25GpuGeneration::AdaSm89,
             Ltx25GpuGeneration::OtherCuda,
         ] {
-            let result = admit(Ltx25QuantMode::Nvfp4, gpu, &[]);
+            let result = admit(
+                Ltx25QuantMode::Nvfp4,
+                gpu,
+                TransformerVariant::Distilled,
+                None,
+                &[],
+            );
             assert!(
                 matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("exact consumer Blackwell sm_120")),
                 "{gpu:?}: {result:?}"
@@ -719,7 +1170,7 @@ mod tests {
         assert!(!catalog_advertised(Ltx25QuantMode::Int8ConvRot));
         assert!(!catalog_advertised(Ltx25QuantMode::Nvfp4));
         assert!(
-            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::AdaSm89, ACCEPTED_MEASUREMENT_RECEIPTS), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
+            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::AdaSm89, TransformerVariant::Distilled, None, ACCEPTED_MEASUREMENT_RECEIPTS), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
         );
     }
 
@@ -754,6 +1205,9 @@ mod tests {
         let mut code = original.clone();
         code.inference_revision = "9".repeat(40);
         mutations.push(code);
+        let mut executable = original.clone();
+        executable.executable_contract_sha256 = "0".repeat(64);
+        mutations.push(executable);
         let mut model = original.clone();
         model.model_inventory_sha256 = "8".repeat(64);
         mutations.push(model);
@@ -763,9 +1217,58 @@ mod tests {
         let mut case = original.clone();
         case.case_id = "ltx25-int8-convrot-blackwell-v1".to_owned();
         mutations.push(case);
+        let mut variant = original.clone();
+        variant.transformer_variant = TransformerVariant::Dev;
+        mutations.push(variant);
         for replay in mutations {
             let errors = replay.validation_errors().join("; ");
             assert!(errors.contains("receipt seal"), "{errors}");
+        }
+    }
+
+    #[test]
+    fn production_admission_compares_every_replay_sensitive_runtime_field() {
+        let accepted = receipt("ltx25-int8-convrot-ada-v1");
+        let identity = runtime(&accepted);
+        assert_eq!(
+            admit(
+                accepted.mode,
+                accepted.gpu_generation,
+                accepted.transformer_variant,
+                Some(&identity),
+                std::slice::from_ref(&accepted),
+            ),
+            Ltx25QuantAdmission::Admitted
+        );
+        let mutations: Vec<fn(&mut Ltx25QuantRuntimeIdentity)> = vec![
+            |value| value.inference_revision = "0".repeat(40),
+            |value| value.executable_contract_sha256 = "0".repeat(64),
+            |value| value.model_revision = "0".repeat(40),
+            |value| value.model_inventory_sha256 = "0".repeat(64),
+            |value| value.runtime_bundle_sha256 = "0".repeat(64),
+            |value| value.receipt_sha256 = "0".repeat(64),
+            |value| value.transcript_sha256 = "0".repeat(64),
+            |value| value.evidence_manifest_sha256 = "0".repeat(64),
+            |value| value.output_sha256 = "0".repeat(64),
+            |value| value.reference_output_sha256 = "0".repeat(64),
+            |value| value.operator_kind = "dense-linear".to_owned(),
+            |value| value.operator_contract_sha256 = "0".repeat(64),
+            |value| value.operator_weight_inventory_sha256 = "0".repeat(64),
+        ];
+        for mutate in mutations {
+            let mut replay = identity.clone();
+            mutate(&mut replay);
+            let result = admit(
+                accepted.mode,
+                accepted.gpu_generation,
+                accepted.transformer_variant,
+                Some(&replay),
+                std::slice::from_ref(&accepted),
+            );
+            assert!(
+                matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("replay")),
+                "{result:?}"
+            );
         }
     }
 

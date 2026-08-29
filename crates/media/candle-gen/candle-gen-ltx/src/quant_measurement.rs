@@ -9,6 +9,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
 use std::process::Command;
 use std::time::Instant;
 
@@ -22,13 +23,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::dev_sampler::TransformerVariant;
 use crate::quant_eval::{
     measurement_case, Ltx25GpuGeneration, Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt,
-    Ltx25QuantMode, Ltx25QuantQuality,
+    Ltx25QuantMode, Ltx25QuantQuality, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
 };
 
 pub const TERMINAL_ACKNOWLEDGEMENT: &str = "I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY";
-pub const HARNESS_VERSION: &str = "sc-18777-terminal-v2";
+pub const HARNESS_VERSION: &str = "sc-18777-terminal-v3";
 const PROMPT: &str =
     "a red fox walking through snowy pines, slow cinematic dolly, detailed natural motion";
 const OUTPUT_MAGIC: &[u8] = b"LTX25-QUANT-OUTPUT-V1\0";
@@ -50,15 +52,16 @@ pub struct TerminalMeasurementConfig {
     pub reference_receipt: Option<PathBuf>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InventoryEntry {
     path: String,
     bytes: u64,
     sha256: String,
+    symlink_target: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelInventory {
     schema_version: &'static str,
@@ -134,8 +137,22 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
 
-    let repo_root = git_repo_root()?;
-    let inference_revision = clean_git_revision(&repo_root)?;
+    if env!("LTX25_BUILD_SOURCE_DIRTY") != "0" {
+        return Err(invalid(
+            "terminal measurement executable was built from a dirty source tree; rebuild from the committed revision",
+        )
+        .into());
+    }
+    let inference_revision = env!("LTX25_BUILD_INFERENCE_REVISION").to_owned();
+    require_lower_hex("build-time inference revision", &inference_revision, 40)?;
+    let executable_contract_sha256 = env!("LTX25_EXECUTABLE_CONTRACT_SHA256").to_owned();
+    require_lower_hex(
+        "executable contract SHA-256",
+        &executable_contract_sha256,
+        64,
+    )?;
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let executable_sha256 = sha256_file(&executable)?;
     let snapshot = fs::canonicalize(&config.snapshot).map_err(|error| {
         invalid(format!(
             "cannot canonicalize snapshot {}: {error}",
@@ -167,11 +184,8 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .ok_or_else(|| invalid("output directory has no parent"))?;
     fs::create_dir_all(output_parent)?;
     let output_parent = fs::canonicalize(output_parent)?;
-    if output_parent.starts_with(&repo_root) || output_parent.starts_with(&snapshot) {
-        return Err(invalid(
-            "evidence output must be outside both the inference worktree and model snapshot",
-        )
-        .into());
+    if output_parent.starts_with(&snapshot) {
+        return Err(invalid("evidence output must be outside the model snapshot").into());
     }
 
     let hardware = hardware_identity()?;
@@ -202,6 +216,37 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     write_json(&inventory_path, &inventory)?;
     let model_inventory_sha256 = sha256_file(&inventory_path)?;
 
+    let mut inspection_spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
+    inspection_spec.quantize = match case.mode {
+        Ltx25QuantMode::Bf16 => None,
+        Ltx25QuantMode::Q4 => Some(Quant::Q4),
+        Ltx25QuantMode::PackedQ8 | Ltx25QuantMode::Int8ConvRot => Some(Quant::Q8),
+        Ltx25QuantMode::Nvfp4 => Some(Quant::Nvfp4),
+    };
+    let resolved = crate::bundle::resolve_split_bundle(&inspection_spec)?;
+    let observed_variant = TransformerVariant::from_bundle(&resolved)?;
+    if observed_variant != case.transformer_variant {
+        return Err(invalid(format!(
+            "case {} requires transformer variant {}, bundle declares {}",
+            case.id,
+            case.transformer_variant.id(),
+            observed_variant.id()
+        ))
+        .into());
+    }
+    let transformer = resolved
+        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .path();
+    let source_inspection =
+        crate::advanced_quant::inspect_transformer_source(transformer, case.mode)?;
+    let runtime_bundle_sha256 = runtime_bundle_sha256(
+        &resolved,
+        &snapshot,
+        &model_inventory_sha256,
+        observed_variant,
+        case.mode,
+    )?;
+
     let mut transcript = vec![
         json!({
             "event": "start",
@@ -209,7 +254,11 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
             "caseId": case.id,
             "runNonceSha256": run_nonce_sha256,
             "inferenceRevision": inference_revision,
+            "executableContractSha256": executable_contract_sha256,
+            "executableSha256": executable_sha256,
             "modelRevision": config.model_revision,
+            "transformerVariant": observed_variant.id(),
+            "runtimeBundleSha256": runtime_bundle_sha256,
         }),
         json!({
             "event": "hardware",
@@ -237,13 +286,8 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .ok_or_else(|| invalid("trusted nvidia-smi could not read the pre-run VRAM baseline"))?;
     let sampler = candle_gen::testkit::PeakSampler::start(hardware.physical_ordinal);
     let started = Instant::now();
-    let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
-    spec.quantize = match case.mode {
-        Ltx25QuantMode::Bf16 => None,
-        Ltx25QuantMode::Q4 => Some(Quant::Q4),
-        Ltx25QuantMode::PackedQ8 | Ltx25QuantMode::Int8ConvRot => Some(Quant::Q8),
-        Ltx25QuantMode::Nvfp4 => Some(Quant::Nvfp4),
-    };
+    crate::advanced_quant::begin_operator_attestation(case.mode);
+    let spec = inspection_spec;
     let generator = crate::load_25_for_terminal_measurement(&spec, case)?;
     let request = GenerationRequest {
         prompt: PROMPT.to_owned(),
@@ -260,6 +304,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     let output = generator.generate(&request, &mut |event: Progress| {
         progress.push(format!("{event:?}"));
     })?;
+    let operator = crate::advanced_quant::finish_operator_attestation()?;
     let wall_clock_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let peak_mib = sampler.stop();
     if peak_mib == 0 || peak_mib < baseline_mib {
@@ -269,13 +314,40 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
     let captured = capture_output(output)?;
+    let observed = observed_geometry(&captured)?;
+    if observed != (case.width, case.height, case.frames, case.fps) {
+        return Err(invalid(format!(
+            "observed output geometry {}x{}x{}@{} does not equal case {}x{}x{}@{}",
+            observed.0,
+            observed.1,
+            observed.2,
+            observed.3,
+            case.width,
+            case.height,
+            case.frames,
+            case.fps
+        ))
+        .into());
+    }
+    let post_inventory = inventory_for(&snapshot)?;
+    if post_inventory != inventory {
+        return Err(invalid(
+            "model inventory changed during generation, including a file or followed symlink target",
+        )
+        .into());
+    }
     let output_path = config.output_dir.join("generated-output.bin");
     write_captured_output(&output_path, &captured)?;
     let output_sha256 = sha256_file(&output_path)?;
 
-    let (reference, reference_output_sha256, mut reference_artifacts) =
+    let (reference, reference_output_sha256, reference_receipt_sha256, mut reference_artifacts) =
         if case.mode == Ltx25QuantMode::Bf16 {
-            (captured.clone(), output_sha256.clone(), Vec::new())
+            (
+                captured.clone(),
+                output_sha256.clone(),
+                sha256_hex(b"bf16-self-reference-no-prior-receipt"),
+                Vec::new(),
+            )
         } else {
             load_and_copy_reference(
                 &config,
@@ -283,6 +355,8 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
                 case,
                 &hardware,
                 &inference_revision,
+                &executable_sha256,
+                &model_inventory_sha256,
             )?
         };
     let quality = compare_outputs(&captured, &reference)?;
@@ -299,6 +373,12 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         "outputSha256": output_sha256,
         "referenceOutputSha256": reference_output_sha256,
         "quality": quality,
+        "observedWidth": observed.0,
+        "observedHeight": observed.1,
+        "observedFrames": observed.2,
+        "observedFps": observed.3,
+        "operatorKind": operator.operator_kind,
+        "operatorWeightInventorySha256": operator.weight_inventory_sha256,
     }));
     let transcript_path = config.output_dir.join("transcript.jsonl");
     write_transcript(&transcript_path, &transcript)?;
@@ -325,15 +405,19 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         case_id: case.id.to_owned(),
         mode: case.mode,
         gpu_generation: case.gpu,
+        transformer_variant: observed_variant,
         fixture: case.fixture.to_owned(),
-        width: case.width,
-        height: case.height,
-        frames: case.frames,
-        fps: case.fps,
+        observed_width: observed.0,
+        observed_height: observed.1,
+        observed_frames: observed.2,
+        observed_fps: observed.3,
         seed: case.seed,
         inference_revision,
+        executable_contract_sha256,
+        executable_sha256,
         model_revision: config.model_revision,
         model_inventory_sha256,
+        runtime_bundle_sha256,
         gpu_name: hardware.gpu_name,
         compute_capability: format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1),
         driver_version: hardware.driver_version,
@@ -343,6 +427,12 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         evidence_manifest_sha256,
         output_sha256,
         reference_output_sha256,
+        reference_receipt_sha256,
+        operator_kind: operator.operator_kind,
+        operator_contract_sha256: source_inspection.operator_contract_sha256,
+        operator_weight_inventory_sha256: operator.weight_inventory_sha256,
+        materialized_projection_count: operator.materialized_projection_count,
+        declared_projection_count: operator.declared_projection_count,
         baseline_vram_bytes: baseline_mib * 1024 * 1024,
         peak_vram_bytes: peak_mib * 1024 * 1024,
         wall_clock_ms,
@@ -357,6 +447,27 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
     write_json(&config.output_dir.join("receipt.json"), &receipt)?;
+    let runtime_binding = Ltx25QuantRuntimeIdentity {
+        mode: receipt.mode,
+        transformer_variant: receipt.transformer_variant,
+        inference_revision: receipt.inference_revision.clone(),
+        executable_contract_sha256: receipt.executable_contract_sha256.clone(),
+        model_revision: receipt.model_revision.clone(),
+        model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+        runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+        receipt_sha256: receipt.receipt_sha256.clone(),
+        transcript_sha256: receipt.transcript_sha256.clone(),
+        evidence_manifest_sha256: receipt.evidence_manifest_sha256.clone(),
+        output_sha256: receipt.output_sha256.clone(),
+        reference_output_sha256: receipt.reference_output_sha256.clone(),
+        operator_kind: receipt.operator_kind.clone(),
+        operator_contract_sha256: receipt.operator_contract_sha256.clone(),
+        operator_weight_inventory_sha256: receipt.operator_weight_inventory_sha256.clone(),
+    };
+    write_json(
+        &config.output_dir.join(RUNTIME_BINDING_FILE),
+        &runtime_binding,
+    )?;
     Ok(receipt)
 }
 
@@ -411,51 +522,14 @@ fn hardware_identity() -> Result<HardwareIdentity> {
     Err(invalid("terminal quant measurement requires the cuda feature").into())
 }
 
-fn git_repo_root() -> Result<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()?;
-    if !output.status.success() {
-        return Err(invalid("run the controller from an inference git worktree").into());
-    }
-    Ok(fs::canonicalize(String::from_utf8(output.stdout)?.trim())?)
-}
-
-fn clean_git_revision(root: &Path) -> Result<String> {
-    let revision = git_output(root, &["rev-parse", "HEAD"])?;
-    require_lower_hex("inference revision", &revision, 40)?;
-    let status = git_output(root, &["status", "--porcelain", "--untracked-files=no"])?;
-    if !status.is_empty() {
-        return Err(invalid(format!(
-            "inference worktree is dirty; commit the exact controller/runtime before measuring:\n{status}"
-        ))
-        .into());
-    }
-    Ok(revision)
-}
-
-fn git_output(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        ))
-        .into());
-    }
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
 fn inventory_for(root: &Path) -> Result<ModelInventory> {
     fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if path == root.join(crate::quant_eval::RUNTIME_BINDING_FILE) {
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.file_type().is_symlink() {
                 if fs::metadata(&path)?.is_file() {
@@ -495,12 +569,76 @@ fn inventory_for(root: &Path) -> Result<ModelInventory> {
             path: relative,
             bytes: path.metadata()?.len(),
             sha256: sha256_file(&path)?,
+            symlink_target: fs::symlink_metadata(&path)?
+                .file_type()
+                .is_symlink()
+                .then(|| {
+                    fs::read_link(&path).map(|target| target.to_string_lossy().replace('\\', "/"))
+                })
+                .transpose()?,
         });
     }
     Ok(ModelInventory {
         schema_version: "sceneworks-model-inventory-v1",
         entries,
     })
+}
+
+fn observed_geometry(output: &CapturedOutput) -> Result<(u32, u32, u32, u32)> {
+    let first = output
+        .frames
+        .first()
+        .ok_or_else(|| invalid("LTX terminal output contained zero frames"))?;
+    if first.width == 0 || first.height == 0 || output.fps == 0 {
+        return Err(invalid("LTX terminal output reported zero width, height, or FPS").into());
+    }
+    for frame in &output.frames {
+        if frame.width != first.width
+            || frame.height != first.height
+            || frame.pixels.len() != frame.width as usize * frame.height as usize * 3
+        {
+            return Err(invalid(
+                "LTX terminal output frame dimensions are inconsistent or malformed",
+            )
+            .into());
+        }
+    }
+    Ok((
+        first.width,
+        first.height,
+        u32::try_from(output.frames.len())?,
+        output.fps,
+    ))
+}
+
+fn runtime_bundle_sha256(
+    bundle: &candle_gen::gen_core::ltx_checkpoint::LtxBundle,
+    snapshot: &Path,
+    model_inventory_sha256: &str,
+    variant: TransformerVariant,
+    mode: Ltx25QuantMode,
+) -> Result<String> {
+    let mut rows = Vec::new();
+    for resolved in bundle.components() {
+        let canonical = fs::canonicalize(resolved.path())?;
+        let logical = canonical
+            .strip_prefix(snapshot)
+            .map_err(|_| {
+                invalid(format!(
+                    "resolved component {} escapes the declared snapshot {}",
+                    canonical.display(),
+                    snapshot.display()
+                ))
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        rows.push(format!("{}:{logical}", resolved.component().id()));
+    }
+    rows.sort();
+    rows.insert(0, format!("mode:{}", mode.id()));
+    rows.insert(0, format!("variant:{}", variant.id()));
+    rows.insert(0, format!("inventory:{model_inventory_sha256}"));
+    Ok(sha256_hex(rows.join("\n").as_bytes()))
 }
 
 fn capture_output(output: GenerationOutput) -> Result<CapturedOutput> {
@@ -587,7 +725,9 @@ fn load_and_copy_reference(
     case: &crate::quant_eval::Ltx25QuantMeasurementCase,
     hardware: &HardwareIdentity,
     inference_revision: &str,
-) -> Result<(CapturedOutput, String, Vec<EvidenceArtifact>)> {
+    executable_sha256: &str,
+    model_inventory_sha256: &str,
+) -> Result<(CapturedOutput, String, String, Vec<EvidenceArtifact>)> {
     let source_output = config.reference_output.as_ref().ok_or_else(|| {
         invalid("non-bf16 cases require --reference-output from the matching sealed bf16 case")
     })?;
@@ -610,12 +750,16 @@ fn load_and_copy_reference(
             != format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1)
         || receipt.driver_version != hardware.driver_version
         || receipt.inference_revision != inference_revision
+        || receipt.executable_contract_sha256 != env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
+        || receipt.executable_sha256 != executable_sha256
         || receipt.model_revision != config.model_revision
+        || receipt.model_inventory_sha256 != model_inventory_sha256
+        || receipt.transformer_variant != case.transformer_variant
         || receipt.fixture != case.fixture
-        || receipt.width != case.width
-        || receipt.height != case.height
-        || receipt.frames != case.frames
-        || receipt.fps != case.fps
+        || receipt.observed_width != case.width
+        || receipt.observed_height != case.height
+        || receipt.observed_frames != case.frames
+        || receipt.observed_fps != case.fps
         || receipt.seed != case.seed
     {
         return Err(invalid("bf16 reference receipt does not match this exact code/model/GPU/driver/fixture identity").into());
@@ -632,6 +776,7 @@ fn load_and_copy_reference(
     Ok((
         reference,
         source_hash,
+        sha256_file(source_receipt)?,
         vec![
             artifact(output_dir, &copied_output)?,
             artifact(output_dir, &copied_receipt)?,
@@ -873,6 +1018,41 @@ mod tests {
     }
 
     #[test]
+    fn observed_geometry_comes_from_output_and_rejects_malformed_frames() {
+        let output = CapturedOutput {
+            frames: vec![
+                ImageRecord {
+                    width: 2,
+                    height: 1,
+                    pixels: vec![1; 6],
+                },
+                ImageRecord {
+                    width: 2,
+                    height: 1,
+                    pixels: vec![2; 6],
+                },
+            ],
+            fps: 24,
+            audio: None,
+        };
+        assert_eq!(observed_geometry(&output).unwrap(), (2, 1, 2, 24));
+
+        let mut changed = output.clone();
+        changed.frames[1].width = 1;
+        assert!(observed_geometry(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent or malformed"));
+
+        let mut truncated = output;
+        truncated.frames[0].pixels.pop();
+        assert!(observed_geometry(&truncated)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent or malformed"));
+    }
+
+    #[test]
     fn terminal_acknowledgement_is_explicit_and_stable() {
         assert_eq!(
             TERMINAL_ACKNOWLEDGEMENT,
@@ -909,9 +1089,27 @@ mod tests {
         let inventory = inventory_for(root.path()).unwrap();
         assert_eq!(inventory.entries.len(), 1);
         assert_eq!(inventory.entries[0].path, "nested/transformer.safetensors");
+        let first_target = blobs.path().join("blob").to_string_lossy().into_owned();
+        assert_eq!(
+            inventory.entries[0].symlink_target.as_deref(),
+            Some(first_target.as_str())
+        );
         assert_eq!(
             inventory.entries[0].sha256,
             sha256_hex(b"exact-model-bytes")
+        );
+
+        fs::write(blobs.path().join("second-blob"), b"exact-model-bytes").unwrap();
+        fs::remove_file(root.path().join("nested/transformer.safetensors")).unwrap();
+        symlink(
+            blobs.path().join("second-blob"),
+            root.path().join("nested/transformer.safetensors"),
+        )
+        .unwrap();
+        let retargeted = inventory_for(root.path()).unwrap();
+        assert_ne!(
+            inventory, retargeted,
+            "retargeting a model symlink must invalidate the pre-generation inventory even when the followed bytes match"
         );
     }
 }

@@ -46,9 +46,10 @@ fn main() -> Result<()> {
     if args.iter().any(|arg| arg == "--list-cases") {
         for case in candle_gen_ltx::quant_eval::TERMINAL_MEASUREMENT_CASES {
             println!(
-                "{} mode={} gpu={} {}x{}x{}@{} seed={}",
+                "{} mode={} variant={} gpu={} {}x{}x{}@{} seed={}",
                 case.id,
                 case.mode.id(),
+                case.transformer_variant.id(),
                 case.gpu.id(),
                 case.width,
                 case.height,

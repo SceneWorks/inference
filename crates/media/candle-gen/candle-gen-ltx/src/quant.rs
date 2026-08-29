@@ -57,11 +57,17 @@
 //! with **synthetic** packed fixtures built on the **real** AvDiT block-0 key layout the hf-header audit
 //! captured — they prove the packed-detect seam fires on that layout, not that a real tier was ingested.
 
+use std::sync::OnceLock;
+
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
 use candle_gen::quant as shared;
-use candle_gen::quant::LokrFactors;
+#[cfg(feature = "cuda")]
+use candle_gen::quant::Int8Linear;
+use candle_gen::quant::{ActPrecision, LokrFactors, Nvfp4Linear, Nvfp4Regime};
 use candle_gen::train::lora::LoraLinear;
+
+use crate::advanced_quant::{active_source, record_projection, AdvancedOperatorKind};
 
 /// The LTX MLX tier's quant group size (read from `quantize_config.json`'s `quantization.group_size`;
 /// the hosted q4/q8 tiers pack at 64, MLX's default). Threaded through the shared group-size-aware
@@ -72,30 +78,89 @@ pub const GROUP_SIZE: usize = shared::MLX_GROUP_SIZE; // 64
 /// path) or **packed** (loaded straight from the MLX-packed tier via the shared
 /// [`candle_gen::quant::QLinear`], sc-9417). The shared [`LoraLinear`] wrapper makes either base
 /// inference-adaptable without changing its adapter-free forward.
-pub struct QLinear(LoraLinear);
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+enum QLinearBase {
+    Adapt(LoraLinear),
+    ConvRot(ConvRotLinear),
+    Nvfp4(Nvfp4Linear),
+}
+
+/// LTX projection dispatch. Advanced arms are materially different operators, not labels over the
+/// dense/MLX-affine loader. They are only constructible from an active, descriptor-validated source.
+pub struct QLinear {
+    base: QLinearBase,
+    path: String,
+    in_features: usize,
+    out_features: usize,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct ConvRotLinear {
+    group_size: usize,
+    rotation: OnceLock<Tensor>,
+    #[cfg(feature = "cuda")]
+    linear: Int8Linear,
+}
+
+impl ConvRotLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        {
+            let rotation = if let Some(rotation) = self.rotation.get() {
+                rotation
+            } else {
+                let rotation = shared::regular_hadamard(self.group_size, x.device())?;
+                self.rotation.get_or_init(|| rotation)
+            };
+            let rotated = shared::convrot_rotate(x, rotation)?;
+            return self.linear.forward(&rotated);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = x;
+            candle_gen::candle_core::bail!(
+                "LTX INT8-ConvRot has no dense CPU fallback; build with cuda and run its IGEMM operator"
+            )
+        }
+    }
+}
 
 impl QLinear {
     /// `x·Wᵀ + b` plus any inference residuals. The frozen dense/packed base dispatch is owned by the
     /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.0.forward(x)
+        match &self.base {
+            QLinearBase::Adapt(linear) => linear.forward(x),
+            QLinearBase::ConvRot(linear) => linear.forward(x),
+            QLinearBase::Nvfp4(linear) => linear.forward(x),
+        }
     }
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
     /// tests to assert a packed tier fired the packed path (not a silent dense fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        self.0.is_packed()
+        matches!(&self.base, QLinearBase::Adapt(linear) if linear.is_packed())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn operator_kind(&self) -> AdvancedOperatorKind {
+        match &self.base {
+            QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
+            QLinearBase::Adapt(_) => AdvancedOperatorKind::Dense,
+            QLinearBase::ConvRot(_) => AdvancedOperatorKind::Int8ConvRotIgemm,
+            QLinearBase::Nvfp4(_) => AdvancedOperatorKind::Nvfp4W4A4,
+        }
     }
 
     /// Canonical PEFT path captured from the projection's loading builder.
     pub(crate) fn path(&self) -> &str {
-        self.0.path()
+        &self.path
     }
 
     /// Logical `(out_features, in_features)` for adapter factor validation.
     pub(crate) fn base_shape(&self) -> (usize, usize) {
-        (self.0.out_features(), self.0.in_features())
+        (self.out_features, self.in_features)
     }
 
     /// Attach a LoRA residual with one strength per distilled denoise pass.
@@ -105,9 +170,14 @@ impl QLinear {
         b: Tensor,
         scales: Vec<f64>,
     ) -> Result<()> {
-        self.0
-            .push_additive_lora_per_pass(a, b, scales)
-            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+        match &mut self.base {
+            QLinearBase::Adapt(linear) => linear
+                .push_additive_lora_per_pass(a, b, scales)
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string())),
+            QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "LTX advanced native quant projections refuse adapters; no dense merge/fallback is permitted"
+            ),
+        }
     }
 
     /// Attach a structured LoKr residual with one user strength per distilled denoise pass.
@@ -116,14 +186,21 @@ impl QLinear {
         factors: LokrFactors,
         scales: Vec<f64>,
     ) -> Result<()> {
-        self.0
-            .push_additive_lokr_per_pass(factors, scales)
-            .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string()))
+        match &mut self.base {
+            QLinearBase::Adapt(linear) => linear
+                .push_additive_lokr_per_pass(factors, scales)
+                .map_err(|error| candle_gen::candle_core::Error::Msg(error.to_string())),
+            QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => candle_gen::candle_core::bail!(
+                "LTX advanced native quant projections refuse adapters; no dense merge/fallback is permitted"
+            ),
+        }
     }
 
     /// Select the active distilled denoise pass for this projection's additive residuals.
     pub(crate) fn set_additive_pass(&self, pass: usize) {
-        self.0.set_additive_pass(pass);
+        if let QLinearBase::Adapt(linear) = &self.base {
+            linear.set_additive_pass(pass);
+        }
     }
 
     /// Wrap this frozen projection in the shared training-time LoRA seam without changing its
@@ -135,17 +212,25 @@ impl QLinear {
         out_features: usize,
         path: String,
     ) -> LoraLinear {
-        debug_assert_eq!(self.0.in_features(), in_features);
-        debug_assert_eq!(self.0.out_features(), out_features);
-        debug_assert_eq!(self.0.path(), path);
-        self.0
+        debug_assert_eq!(self.in_features, in_features);
+        debug_assert_eq!(self.out_features, out_features);
+        debug_assert_eq!(self.path, path);
+        match self.base {
+            QLinearBase::Adapt(linear) => linear,
+            QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => {
+                panic!("advanced native quant projections are inference-only")
+            }
+        }
     }
 
     /// Expose the same trainable residual seam used by the standalone training DiT.  Keeping this
     /// on the packed-aware wrapper is what makes full AV QLoRA train the actual loaded projection
     /// instead of rebuilding a dense video-only shadow model.
-    pub(crate) fn lora_mut(&mut self) -> &mut LoraLinear {
-        &mut self.0
+    pub(crate) fn lora_mut(&mut self) -> Option<&mut LoraLinear> {
+        match &mut self.base {
+            QLinearBase::Adapt(linear) => Some(linear),
+            QLinearBase::ConvRot(_) | QLinearBase::Nvfp4(_) => None,
+        }
     }
 }
 
@@ -166,8 +251,100 @@ impl Module for QLinear {
 ///
 /// The dense fallback reads the weight shape from the file (`get_unchecked`), not threaded config dims,
 /// so it drops in for the old `linear(vb, key) -> Linear` helpers without plumbing `in_dim`/`out_dim`.
+#[allow(unused_variables)]
 pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
     let path = vb.pp(key).prefix();
+    if let Some(source) = active_source() {
+        if source.is_advanced_projection(&path) {
+            let bias_tensor = if bias {
+                Some(
+                    vb.get_unchecked(&format!("{key}.bias"))?
+                        .to_dtype(vb.dtype())?,
+                )
+            } else {
+                None
+            };
+            let loaded = source.load_projection(&path, vb.device())?;
+            let (base, in_features, out_features, attestation) = match loaded {
+                crate::advanced_quant::LoadedAdvancedProjection::Int8ConvRot {
+                    codes,
+                    scale,
+                    group_size,
+                    context,
+                    attestation,
+                } => {
+                    if !vb.device().is_cuda() || !context.is_int8() {
+                        candle_gen::candle_core::bail!(
+                            "LTX INT8-ConvRot projection `{path}` requires a live CUDA cuBLASLt IGEMM context; dense fallback is forbidden"
+                        );
+                    }
+                    let (out_features, in_features) = codes.dims2()?;
+                    #[cfg(feature = "cuda")]
+                    let linear = Int8Linear::from_per_channel_parts(
+                        codes,
+                        scale,
+                        bias_tensor,
+                        context.handle_for(vb.device())?.clone(),
+                    )?;
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        let _ = (codes, scale, bias_tensor, context);
+                        candle_gen::candle_core::bail!(
+                            "LTX INT8-ConvRot requires a cuda-enabled executable"
+                        );
+                    }
+                    #[cfg(feature = "cuda")]
+                    {
+                        (
+                            QLinearBase::ConvRot(ConvRotLinear {
+                                group_size,
+                                rotation: OnceLock::new(),
+                                linear,
+                            }),
+                            in_features,
+                            out_features,
+                            attestation,
+                        )
+                    }
+                }
+                crate::advanced_quant::LoadedAdvancedProjection::Nvfp4 {
+                    packed,
+                    context,
+                    attestation,
+                } => {
+                    let out_features = packed.rows;
+                    let in_features = packed.cols;
+                    let linear = Nvfp4Linear::from_packed_in(
+                        packed,
+                        bias_tensor,
+                        vb.device(),
+                        ActPrecision::W4A4,
+                        &context,
+                    )?;
+                    if linear.regime() != Nvfp4Regime::Fp4W4A4 {
+                        candle_gen::candle_core::bail!(
+                            "LTX NVFP4 projection `{path}` did not construct the native W4A4 operator ({:?}); dense BF16 fallback is forbidden",
+                            linear.fallback_cause()
+                        );
+                    }
+                    (
+                        QLinearBase::Nvfp4(linear),
+                        in_features,
+                        out_features,
+                        attestation,
+                    )
+                }
+            };
+            record_projection(path.clone(), loaded_kind(&base), attestation);
+            return Ok(QLinear {
+                base,
+                path,
+                in_features,
+                out_features,
+            });
+        }
+        source.refuse_undeclared_advanced_tensor(&path)?;
+    }
     let scales_key = format!("{key}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -184,12 +361,22 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         };
         let out_features = scales.dim(0)?;
         let in_features = scales.dim(1)? * GROUP_SIZE;
-        return Ok(QLinear(LoraLinear::from_qlinear(
-            shared::QLinear::from_packed_gs(&wq, &scales, &biases, bias, GROUP_SIZE, &device)?,
+        record_projection(
+            path.clone(),
+            AdvancedOperatorKind::MlxAffine,
+            "mlx-affine-triple".into(),
+        );
+        return Ok(QLinear {
+            base: QLinearBase::Adapt(LoraLinear::from_qlinear(
+                shared::QLinear::from_packed_gs(&wq, &scales, &biases, bias, GROUP_SIZE, &device)?,
+                in_features,
+                out_features,
+                path.clone(),
+            )),
+            path,
             in_features,
             out_features,
-            path,
-        )));
+        });
     }
     // Dense path, byte-identical to the legacy `linear`: read `{key}.weight` [+ `.bias`], cast to the
     // vb dtype (bf16). `get_unchecked` (no shape validation) matches the old helper's behavior.
@@ -205,12 +392,31 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         None
     };
     let (out_features, in_features) = w.dims2()?;
-    Ok(QLinear(LoraLinear::from_linear(
-        Linear::new(w, b),
+    record_projection(
+        path.clone(),
+        AdvancedOperatorKind::Dense,
+        "dense-weight".into(),
+    );
+    Ok(QLinear {
+        base: QLinearBase::Adapt(LoraLinear::from_linear(
+            Linear::new(w, b),
+            in_features,
+            out_features,
+            path.clone(),
+        )),
+        path,
         in_features,
         out_features,
-        path,
-    )))
+    })
+}
+
+fn loaded_kind(base: &QLinearBase) -> AdvancedOperatorKind {
+    match base {
+        QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
+        QLinearBase::Adapt(_) => AdvancedOperatorKind::Dense,
+        QLinearBase::ConvRot(_) => AdvancedOperatorKind::Int8ConvRotIgemm,
+        QLinearBase::Nvfp4(_) => AdvancedOperatorKind::Nvfp4W4A4,
+    }
 }
 
 /// A resolved token-embedding **table** (`[vocab, hidden]`), loaded either dense (`{key}.weight`, cast
@@ -405,15 +611,20 @@ mod tests {
         );
 
         // The packed forward reproduces the affine grid (+ the dense bias) bit-exactly.
-        let grid_lin = QLinear(LoraLinear::from_linear(
-            Linear::new(
-                Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-                Some(out_bias),
-            ),
-            in_dim,
-            out_dim,
-            "grid".into(),
-        ));
+        let grid_lin = QLinear {
+            base: QLinearBase::Adapt(LoraLinear::from_linear(
+                Linear::new(
+                    Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
+                    Some(out_bias),
+                ),
+                in_dim,
+                out_dim,
+                "grid".into(),
+            )),
+            path: "grid".into(),
+            in_features: in_dim,
+            out_features: out_dim,
+        };
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let base = packed.forward(&x)?;
         let cos = cosine(&base, &grid_lin.forward(&x)?);
