@@ -163,7 +163,10 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 40);
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
-        assert_eq!(snapshot.text_llm_ids, ["candle-llama", "candle-llava"]);
+        assert_eq!(
+            snapshot.text_llm_ids,
+            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
         // ordered id surface is the audio catalog's — shipped generators kokoro_82m (sc-12836),
