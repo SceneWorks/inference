@@ -187,6 +187,7 @@ struct Common {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let cancel_campaign = args.iter().any(|arg| arg == "--sc20686-cancel");
     let _campaign_scope = if args.iter().any(|arg| arg == "--sc20686-campaign") {
         Some(candle_gen_flux2::sc20686_observer::install_jsonl(
             arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
@@ -302,7 +303,13 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
         // an inert sink is byte-identical to a render with no preview at all.
         preview: PreviewSink::default(),
-        cancel: CancelFlag::new(),
+        cancel: {
+            let cancel = CancelFlag::new();
+            if cancel_campaign {
+                cancel.cancel();
+            }
+            cancel
+        },
     };
 
     // 1) Single-reference edit.
@@ -471,7 +478,13 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         // Inert preview sink (epic 16948, sc-16955): this smoke driver wants the finished image, and
         // an inert sink is byte-identical to a render with no preview at all.
         preview: PreviewSink::default(),
-        cancel: CancelFlag::new(),
+        cancel: {
+            let cancel = CancelFlag::new();
+            if cancel_campaign {
+                cancel.cancel();
+            }
+            cancel
+        },
     };
     let mut prog = step_progress("edit");
     let t0 = std::time::Instant::now();
