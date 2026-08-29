@@ -532,6 +532,32 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }) {
         return Err("memory containment failed".into());
     }
+    for event in &receipt.memory.allocation_events {
+        if event.bytes == 0
+            || !["cache", "attention-workspace", "weights", "output"].contains(&event.role.as_str())
+            || !["persistent", "transient"].contains(&event.lifetime.as_str())
+            || event.phase.is_empty()
+            || event.timestamp.is_empty()
+        {
+            return Err("allocation event is malformed".into());
+        }
+    }
+    let max_role = |role: &str, lifetime: &str| {
+        receipt
+            .memory
+            .allocation_events
+            .iter()
+            .filter(|e| e.role == role && e.lifetime == lifetime)
+            .map(|e| e.bytes)
+            .max()
+            .unwrap_or(0)
+    };
+    if max_role("weights", "persistent") != receipt.memory.model_weights_bytes
+        || max_role("cache", "persistent") != receipt.memory.persistent_kv_bytes
+        || max_role("attention-workspace", "transient") != receipt.memory.transient_workspace_bytes
+    {
+        return Err("allocation totals do not reconcile".into());
+    }
     let dense = dense_kv_bytes(
         receipt.geometry.batch,
         receipt.geometry.layers,
@@ -556,6 +582,16 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("timing policy failed".into());
     }
+    let decode_mean = receipt
+        .timings
+        .samples
+        .iter()
+        .map(|s| s.decode_tokens_per_second)
+        .sum::<f64>()
+        / 5.0;
+    if (receipt.timings.decode_tokens_per_second - decode_mean).abs() > 1e-9 {
+        return Err("timing mean is not derived".into());
+    }
     if receipt.quality.parity_max_error < 0.0
         || receipt.quality.parity_max_error > 0.0001
         || receipt.quality.perplexity_delta > 0.01
@@ -575,6 +611,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || receipt.quality.statistics.warmups != 2
     {
         return Err("quality contract evidence incomplete".into());
+    }
+    if receipt.quality.greedy_token_agreement < 0.999
+        || receipt.quality.structured_tool_agreement < 1.0
+        || receipt.quality.needle_retrieval < 1.0
+        || receipt.quality.multi_turn_prompt_cache < 1.0
+        || REQUIRED_FIXTURES.iter().any(|name| {
+            receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
+                !f.passed || f.artifact_sha256.len() != 64 || f.independent_reference.is_empty()
+            })
+        })
+    {
+        return Err("quality threshold or fixture evidence failed".into());
     }
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
         return Err("release/cancellation evidence failed".into());
