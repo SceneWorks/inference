@@ -124,9 +124,20 @@ def publish_matrix_campaign(runner, row_builder, destination):
     if final.exists(): raise ValueError("campaign destination already exists")
     try:
         staging.mkdir(parents=False)
-        result = {"schema": "sc-20686-cache-attribution-v2", "rows": rows}
+        # Validate the complete sealed set before any publication is made.
+        import importlib.util
+        reducer_spec = importlib.util.spec_from_file_location("sc20686_reducer", REDUCER)
+        reducer = importlib.util.module_from_spec(reducer_spec); reducer_spec.loader.exec_module(reducer)
+        sealed_rows = []
+        for index, row in enumerate(rows):
+            sealed, _ = seal(row, f"row-{index:02d}.json")
+            sealed_rows.append(sealed)
+        decision = reducer.reduce(sealed_rows)
+        result = {"schema": "sc-20686-cache-attribution-v2", "decision": decision, "rows": sealed_rows}
         raw = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode()
-        markdown = ("# SC-20686 campaign\n\n" + json.dumps({"coordinates": keys}, indent=2, sort_keys=True) + "\n").encode()
+        markdown = ("# SC-20686 campaign\n\n" + "\n".join(
+            f"- {family}/{variant} coordinate={coordinate} arm={arm}" for family, variant, coordinate, arm in keys
+        ) + "\n\n## Decisions\n\n" + json.dumps(decision["decisions"], indent=2, sort_keys=True) + "\n").encode()
         for name, payload in (("campaign.json", raw), ("campaign.md", markdown)):
             (staging / name).write_bytes(payload)
             (staging / f"{name}.sha256").write_text(f"{hashlib.sha256(payload).hexdigest()}  {name}\n", encoding="utf-8")
@@ -188,10 +199,31 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
             "observer_events": events}
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--campaign", action="store_true"); p.add_argument("--family", choices=("flux2-klein", "wan"), required=True)
-    p.add_argument("--snapshot", type=Path, required=True); p.add_argument("--output", type=Path, required=True); p.add_argument("--variant", required=True)
+    p = argparse.ArgumentParser(); p.add_argument("--campaign", action="store_true"); p.add_argument("--matrix", action="store_true"); p.add_argument("--family", choices=("flux2-klein", "wan"))
+    p.add_argument("--snapshot", type=Path); p.add_argument("--output", type=Path); p.add_argument("--variant")
+    p.add_argument("--wan-entrypoint", type=Path); p.add_argument("--wan-snapshot", type=Path); p.add_argument("--flux-entrypoint", type=Path); p.add_argument("--flux-snapshot", type=Path); p.add_argument("--matrix-output", type=Path)
     p.add_argument("--events", type=Path); p.add_argument("--entrypoint", type=Path); p.add_argument("--cancel-campaign", action="store_true"); p.add_argument("--fake", action="store_true"); args = p.parse_args()
     if not args.campaign: p.error("SC-20686 adapter requires explicit --campaign")
+    if args.matrix:
+        if not all((args.wan_entrypoint, args.wan_snapshot, args.flux_entrypoint, args.flux_snapshot, args.matrix_output)):
+            p.error("matrix mode requires separate Wan/FLUX entrypoints and snapshots plus --matrix-output")
+        wan_runner = entrypoint_campaign_runner(args.wan_entrypoint, args.wan_snapshot)
+        flux_runner = entrypoint_campaign_runner(args.flux_entrypoint, args.flux_snapshot)
+        def runner(variant, arm):
+            return (flux_runner if variant in FLUX_ROUTES else wan_runner)(variant, arm)
+        def build_row(variant, arm, events):
+            family = "flux2-klein" if variant in FLUX_ROUTES else "wan"
+            snapshot = args.flux_snapshot if family == "flux2-klein" else args.wan_snapshot
+            snapshot_hash, snapshot_bytes = snapshot_identity(snapshot.resolve())
+            row_args = argparse.Namespace(fake=False, family=family, variant=variant, cancel_campaign=arm == "cancel")
+            return make_row(row_args, {}, snapshot_hash, snapshot_bytes, events)
+        try:
+            publish_matrix_campaign(runner, build_row, args.matrix_output)
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"SC-20686 matrix refused: {exc}", file=sys.stderr); return 1
+    if not all((args.family, args.snapshot, args.output, args.variant)):
+        p.error("single mode requires --family, --snapshot, --output, and --variant")
     root = args.snapshot.resolve(); config_path = root / "config.json"
     try:
         if not root.is_dir() or not config_path.is_file(): raise ValueError("snapshot must contain config.json")
