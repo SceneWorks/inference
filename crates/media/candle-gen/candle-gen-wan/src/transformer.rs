@@ -253,6 +253,12 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
+        crate::sc20686_observer::observe(
+            "cross-kv-created",
+            (k.elem_count() + v.elem_count()) as u64 * 2,
+            0,
+            1,
+        );
         Ok(PreparedBlockCrossKv {
             key: to_heads(&k)?,
             value: to_heads(&v)?,
@@ -282,6 +288,7 @@ impl Attention {
         }
         let scale = (self.head_dim as f64).powf(-0.5);
         let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
+        crate::sc20686_observer::observe("cross-kv-read", 0, (q.elem_count() as u64) * 4, 1);
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;

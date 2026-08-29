@@ -49,6 +49,7 @@ pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
 pub mod quant;
+pub mod sc20686_observer;
 pub mod single_file;
 pub mod text_encoder;
 pub mod transformer;

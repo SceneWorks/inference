@@ -193,6 +193,7 @@ impl Attention {
         .transpose(1, 2)?;
         let v = v.transpose(1, 2)?.contiguous()?;
         let (q, k) = rotary.apply_at(&q, &k, offset)?;
+        // This is changing decoder self-attention, deliberately excluded from SC-20686 reuse.
         let (k, v) = cache
             .update(layer, &k, &v)
             .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;

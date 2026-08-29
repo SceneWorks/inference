@@ -54,6 +54,7 @@ pub mod model_vace;
 pub mod model_vace_fun;
 pub mod pipeline;
 pub mod quant;
+pub mod sc20686_observer;
 pub mod rope;
 pub mod scheduler;
 mod text_encode;
