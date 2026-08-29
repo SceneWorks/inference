@@ -22,7 +22,7 @@ pub fn validate(shape: PackedAttentionShape) -> Result<()> {
         || shape.query_len == 0
         || shape.kv_len == 0
         || shape.head_dim == 0
-        || shape.query_heads % shape.kv_heads != 0
+        || !shape.query_heads.is_multiple_of(shape.kv_heads)
     {
         return Err(Error::Config("unsupported packed attention shape".into()));
     }
@@ -77,8 +77,8 @@ pub fn attention_f32(
                         dot += query[base + d] * key(b, kh, ks, d);
                     }
                     let weight = (dot * scale - max).exp() / norm;
-                    for d in 0..shape.head_dim {
-                        weighted[d] += weight * value(b, kh, ks, d);
+                    for (d, output) in weighted.iter_mut().enumerate() {
+                        *output += weight * value(b, kh, ks, d);
                     }
                 }
                 out[base..base + shape.head_dim].copy_from_slice(&weighted);
@@ -101,7 +101,7 @@ mod tests {
             kv_len: 5,
             head_dim: 3,
         };
-        let q = vec![1.0; 1 * 4 * 3 * 3];
+        let q = vec![1.0; 36];
         let out = attention_f32(shape, &q, |_, _, _, _| 1.0, |_, _, _, d| d as f32, 0.5).unwrap();
         assert_eq!(out.len(), q.len());
     }

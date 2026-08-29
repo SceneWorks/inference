@@ -183,8 +183,8 @@ impl PackedMetalKernel {
             .grid(shape[1] * shape[2], shape[0], 1)
             .thread_group(shape[3], 1, 1)
             .template_arg("GROUP", 4)
-            .template_arg("K_WORDS", ((4 * shape[3] + 3) / 4) as i32)
-            .template_arg("V_WORDS", ((shape[3] + 3) / 4) as i32)
+            .template_arg("K_WORDS", (4 * shape[3] + 3) / 4)
+            .template_arg("V_WORDS", (shape[3] + 3) / 4)
             .template_arg("MASK_MODE", mask_mode)
             .template_arg("WINDOW", window)
             .run()?

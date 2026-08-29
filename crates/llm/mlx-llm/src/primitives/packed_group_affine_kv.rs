@@ -61,6 +61,7 @@ pub trait RetainedPackedKernel: fmt::Debug {
     /// Heap/device bytes retained exclusively by this compiled object, if the backend can report
     /// them.  The storage accounting includes this value and never calls it payload bytes.
     fn retained_bytes(&self) -> usize;
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &self,
         query: &Array,
@@ -1087,7 +1088,7 @@ impl PackedGroupAffineKvCache {
         let key_shape = [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
         let key_scale = Array::from_slice(&storage.keys.scales, &key_shape);
         let key_zero = Array::from_slice(&storage.keys.zeros, &key_shape);
-        let value_bytes = storage.values.code_bytes_per_group();
+        let value_bytes = self.head_dimension.div_ceil(4);
         let value_codes = Array::from_slice(
             &storage.values.codes,
             &[self.batch, self.kv_heads, self.logical_len, value_bytes].map(|v| v as i32),
@@ -1125,7 +1126,7 @@ impl PackedGroupAffineKvCache {
                 "cannot dispatch an empty packed cache".into(),
             ));
         }
-        if self.logical_len % self.group_size != 0 {
+        if !self.logical_len.is_multiple_of(self.group_size) {
             return Err(Error::Unsupported(
                 "incomplete key group requires dense fallback".into(),
             ));
@@ -1765,7 +1766,7 @@ mod tests {
             1,
             Arc::new(()),
         )));
-        let selection = select_decoder_cache_with_reader(
+        let mut selection = select_decoder_cache_with_reader(
             PackedCacheRequest {
                 enabled: true,
                 backend: "mlx-metal".into(),
