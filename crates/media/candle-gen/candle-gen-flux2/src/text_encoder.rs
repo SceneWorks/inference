@@ -515,14 +515,15 @@ impl Flux2PromptEncoder {
         sampling: UpsampleSampling,
         cancel: &candle_gen::gen_core::CancelFlag,
     ) -> candle_gen::Result<Vec<i32>> {
-        crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         let (batch, prompt_len, _) = prompt_embeds.dims3()?;
         if batch != 1 {
             return Err(candle_gen::CandleError::Msg(format!(
                 "flux2 caption-upsample: expected batch 1, got {batch}"
             )));
         }
-        if let Err(error) = candle_gen::check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
+        if let Err(error) = candle_gen::check_cancel(cancel) {
+            return Err(error);
+        }
         let mut cache = ContiguousKvCache::new(self.layers.len());
         let mut rng = SplitMix64::new(sampling.seed);
         let params = SamplingParams {
@@ -535,7 +536,9 @@ impl Flux2PromptEncoder {
         let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
         let mut generated = Vec::new();
         for step in 0..sampling.max_new_tokens {
-            if let Err(error) = candle_gen::check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
+            if let Err(error) = candle_gen::check_cancel(cancel) {
+                return Err(error);
+            }
             let next = sample(&logits, &[], &params, &mut rng, None)
                 .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
             if next == eos_token {
@@ -549,7 +552,6 @@ impl Flux2PromptEncoder {
             let embeds = self.embed(&ids)?;
             logits = self.decode_logits_from_embeds(&embeds, &mut cache, prompt_len + step)?;
         }
-        crate::sc20686_observer::observe("generation-end", 0, 0, 0);
         Ok(generated)
     }
 }

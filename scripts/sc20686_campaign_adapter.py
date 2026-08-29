@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Campaign-only producer for SC-20686 sealed attribution rows."""
-import argparse, hashlib, json, os, struct, subprocess, sys, tempfile, time
+import argparse, hashlib, json, math, os, struct, subprocess, sys, tempfile, time
 from pathlib import Path
 
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
@@ -165,7 +165,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("fake evidence is test-only and cannot produce a receipt")
     metadata = next((e for e in events if e.get("phase") == "metadata"), None)
     metrics = next((e for e in events if e.get("phase") == "metrics"), None)
-    if not metadata or not metrics or metadata.get("snapshot_sha256") != snapshot_hash:
+    if (not metadata or not metrics or metadata.get("snapshot_sha256") != snapshot_hash
+            or metadata.get("snapshot_bytes") != snapshot_bytes):
         raise ValueError("entrypoint must emit matching model identity metadata")
     source_ref = metadata.get("source_ref")
     if not isinstance(source_ref, str) or len(source_ref) != 40 or any(c not in "0123456789abcdef" for c in source_ref):
@@ -173,7 +174,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if metadata.get("variant") != args.variant:
         raise ValueError("producer variant does not match requested route")
     metric_keys = ("current_persistent_bytes", "current_read_transient_bytes", "candidate_persistent_bytes", "candidate_read_transient_bytes", "generation_duration_ms", "cache_read_duration_ms", "reused_requests")
-    if any(not isinstance(metrics.get(k), (int, float)) for k in metric_keys):
+    if any(not isinstance(metrics.get(k), (int, float)) or isinstance(metrics.get(k), bool)
+           or not math.isfinite(metrics[k]) or metrics[k] < 0 for k in metric_keys):
         raise ValueError("entrypoint metrics are incomplete")
     phases = {e.get("phase") for e in events}
     required = {"generation-start", "cross-kv-created", "cross-kv-read", "invalidated", "released"}
@@ -183,6 +185,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         required.add("generation-end")
     if not required <= phases:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
+    if not metadata.get("real_weights") or not metadata.get("full_generation") or not metadata.get("attention_kind"):
+        raise ValueError("entrypoint must identify a real full product route")
     cancelled = [i for i, e in enumerate(events) if e.get("phase") == "cancelled"]
     released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
     if args.cancel_campaign and (metadata.get("cancellation_armed") is not True or not metadata.get("cancellation_arm_id")):
@@ -193,6 +197,17 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("normal generation cannot contain cancellation")
     if args.cancel_campaign and "generation-end" in phases:
         raise ValueError("cancel arm cannot claim successful generation completion")
+    if not args.cancel_campaign and metrics["generation_duration_ms"] <= 0:
+        raise ValueError("normal arm must record a positive product generation duration")
+    reads = [event for event in events if event.get("phase") == "cross-kv-read"]
+    if not reads or not any(isinstance(event.get("transient_bytes"), (int, float)) and event["transient_bytes"] > 0 for event in reads):
+        raise ValueError("entrypoint must provide a measured dense reference read")
+    creates = [event for event in events if event.get("phase") == "cross-kv-created"]
+    if args.family == "flux2-klein":
+        if metrics["current_persistent_bytes"] != 0 or any(event.get("persistent_bytes") != 0 for event in creates):
+            raise ValueError("FLUX edit must report its non-persistent reference route honestly")
+    elif metrics["current_persistent_bytes"] == 0:
+        raise ValueError("persistent-cache routes cannot claim zero current persistence")
     geometry = geometry_from(events)
     coordinate_id = digest(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode())[:16]
     arm = "cancel" if args.cancel_campaign else "normal"
@@ -200,7 +215,9 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
                  if e.get("sample_kind") == "allocator" and "peak_bytes" in e]
     process = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events
                if e.get("sample_kind") == "process" and "peak_bytes" in e]
-    if not allocator or not process:
+    if (not allocator or not process
+            or any(not isinstance(sample["peak_bytes"], (int, float)) or sample["peak_bytes"] <= 0
+                   for sample in allocator + process)):
         raise ValueError("producer must provide distinct allocator and process samples")
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
             "coordinate_id": coordinate_id, "arm": arm,

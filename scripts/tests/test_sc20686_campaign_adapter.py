@@ -61,6 +61,59 @@ class CampaignAdapterTests(unittest.TestCase):
             self.assertEqual(decision["decision"], "blocked")
             self.assertIn("wan2_2_t2v_14b", decision["observed_variants"])
 
+    def test_flux_nonpersistent_route_requires_dense_read_evidence(self):
+        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
+        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
+        geometry = {**GEOMETRY, "sq": 64, "skv": 16}
+        events = [
+            {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
+             "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": geometry,
+             "real_weights": True, "full_generation": True, "attention_kind": "joint-image-reference"},
+            {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "cross-kv-read", "persistent_bytes": 0, "transient_bytes": 64, "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "generation-end", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "invalidated", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "released", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 100},
+            {"phase": "metrics", "current_persistent_bytes": 0, "current_read_transient_bytes": 64,
+             "candidate_persistent_bytes": 32, "candidate_read_transient_bytes": 0,
+             "generation_duration_ms": 10, "cache_read_duration_ms": 1, "reused_requests": 0},
+        ]
+        args = type("Args", (), {"fake": False, "family": "flux2-klein",
+                                   "variant": "flux2_klein_9b_edit", "cancel_campaign": False})()
+        row = adapter.make_row(args, {}, "b" * 64, 1, events)
+        self.assertEqual(row["current_persistent_bytes"], 0)
+        events[2]["persistent_bytes"] = 1
+        with self.assertRaisesRegex(ValueError, "non-persistent"):
+            adapter.make_row(args, {}, "b" * 64, 1, events)
+
+    def test_cancel_arm_requires_product_metrics_and_cancel_identity(self):
+        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
+        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
+        events = [
+            {"phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
+             "snapshot_bytes": 1, "variant": "flux2_klein_9b_edit", "geometry": GEOMETRY,
+             "real_weights": True, "full_generation": True, "attention_kind": "joint-image-reference",
+             "cancellation_armed": True, "cancellation_arm_id": "a:b"},
+            {"phase": "generation-start", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "cross-kv-created", "persistent_bytes": 0, "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "cross-kv-read", "persistent_bytes": 0, "transient_bytes": 64, "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "cancelled", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "invalidated", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "released", "sample_kind": "allocator", "peak_bytes": 100},
+            {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 100},
+            {"phase": "metrics", "current_persistent_bytes": 0, "current_read_transient_bytes": 64,
+             "candidate_persistent_bytes": 32, "candidate_read_transient_bytes": 0,
+             "generation_duration_ms": 2, "cache_read_duration_ms": 1, "reused_requests": 0},
+        ]
+        args = type("Args", (), {"fake": False, "family": "flux2-klein",
+                                   "variant": "flux2_klein_9b_edit", "cancel_campaign": True})()
+        self.assertEqual(adapter.make_row(args, {}, "b" * 64, 1, events)["arm"], "cancel")
+        events[-1].pop("generation_duration_ms")
+        with self.assertRaisesRegex(ValueError, "metrics"):
+            adapter.make_row(args, {}, "b" * 64, 1, events)
+
     def test_fake_both_families_emit_sealed_rows(self):
         for family in ("flux2-klein", "wan"):
             with self.subTest(family=family), tempfile.TemporaryDirectory() as directory:
