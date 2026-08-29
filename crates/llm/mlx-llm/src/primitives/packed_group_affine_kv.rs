@@ -50,6 +50,14 @@ pub struct DenseFallbackEvent {
     pub allocated_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PackedDispatchTelemetry {
+    pub cold_dispatches: u64,
+    pub steady_dispatches: u64,
+    pub cold_elapsed_ms: f64,
+    pub steady_elapsed_ms: f64,
+}
+
 /// A retained backend object which owns the compiled reader for one cache identity.
 ///
 /// SC-20675 intentionally does not manufacture a Metal object from descriptive strings.  The
@@ -740,6 +748,7 @@ pub struct PackedGroupAffineKvCache {
     /// dense reconstruction performed by a caller.
     direct_dispatches: usize,
     full_cache_dequantizations: usize,
+    telemetry: PackedDispatchTelemetry,
 }
 
 impl PackedGroupAffineKvCache {
@@ -769,6 +778,7 @@ impl PackedGroupAffineKvCache {
             handle: None,
             direct_dispatches: 0,
             full_cache_dequantizations: 0,
+            telemetry: PackedDispatchTelemetry::default(),
         })
     }
 
@@ -1139,6 +1149,8 @@ impl PackedGroupAffineKvCache {
             ));
         }
         let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
+        let cold = self.telemetry.cold_dispatches == 0;
+        let started = std::time::Instant::now();
         let output = self
             .handle
             .as_ref()
@@ -1146,6 +1158,14 @@ impl PackedGroupAffineKvCache {
             .inner
             .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
         self.direct_dispatches += 1;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if cold {
+            self.telemetry.cold_dispatches += 1;
+            self.telemetry.cold_elapsed_ms = elapsed_ms;
+        } else {
+            self.telemetry.steady_dispatches += 1;
+            self.telemetry.steady_elapsed_ms += elapsed_ms;
+        }
         Ok(output)
     }
 
@@ -1157,6 +1177,9 @@ impl PackedGroupAffineKvCache {
     }
     pub fn record_dense_dequantization(&mut self) {
         self.full_cache_dequantizations += 1;
+    }
+    pub fn dispatch_telemetry(&self) -> PackedDispatchTelemetry {
+        self.telemetry
     }
     pub fn preflight(
         &mut self,
