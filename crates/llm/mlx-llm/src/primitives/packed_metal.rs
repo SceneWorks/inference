@@ -1,0 +1,127 @@
+//! Retained MLX Metal reader for SC-20675's packed K/V layout.
+//!
+//! K codes are token-group packed (`[B,H,ceil(S/group),D]`) and V codes are
+//! channel-group packed (`[B,H,S,ceil(D/group)]`). The kernel streams keys and
+//! values and keeps only one output accumulator per thread; it never constructs
+//! dense historical K/V or a score matrix.
+use crate::error::{Error, Result};
+use mlx_rs::fast::{MetalKernel, OutputArg};
+use mlx_rs::Array;
+
+const HEADER: &str = r#"#include <metal_stdlib>
+using namespace metal;
+"#;
+
+const MSL: &str = r#"
+    const uint b = thread_position_in_grid.y;
+    const uint qh = thread_position_in_grid.x / q_shape[2];
+    const uint qi = thread_position_in_grid.x % q_shape[2];
+    const uint kh = qh / (q_shape[1] / kv_shape[1]);
+    const uint d = thread_position_in_threadgroup.x;
+    if (qi >= q_shape[2] || d >= q_shape[3]) return;
+    float outv = 0.0f, norm = 0.0f, maxv = -INFINITY;
+    for (uint ks = 0; ks < kv_shape[2]; ++ks) {
+        float dot = 0.0f;
+        for (uint j = 0; j < q_shape[3]; ++j) {
+            const uint qidx = ((b*q_shape[1]+qh)*q_shape[2]+qi)*q_shape[3]+j;
+            const uint group = j / GROUP;
+            const uint kg = ks / GROUP;
+            const uint kbit = (ks % GROUP) * q_shape[3] + j;
+            const uint kc = (k_codes[((b*kv_shape[1]+kh)*kg+kg)*K_WORDS + kbit/4] >> ((kbit%4)*2)) & 3;
+            const float kval = k_zero[((b*kv_shape[1]+kh)*((kv_shape[2]+GROUP-1)/GROUP)+kg)*q_shape[3]+j] + float(k_scale[((b*kv_shape[1]+kh)*((kv_shape[2]+GROUP-1)/GROUP)+kg)*q_shape[3]+j]) * float(kc);
+            dot += float(q[qidx]) * kval;
+        }
+        const float score = dot * rsqrt(float(q_shape[3]));
+        maxv = max(maxv, score);
+    }
+    for (uint ks = 0; ks < kv_shape[2]; ++ks) {
+        float dot = 0.0f;
+        for (uint j = 0; j < q_shape[3]; ++j) {
+            const uint qidx = ((b*q_shape[1]+qh)*q_shape[2]+qi)*q_shape[3]+j;
+            const uint kg = ks / GROUP, kbit = (ks % GROUP) * q_shape[3] + j;
+            const uint kc = (k_codes[((b*kv_shape[1]+kh)*kg+kg)*K_WORDS+kbit/4] >> ((kbit%4)*2)) & 3;
+            dot += float(q[qidx]) * (k_zero[((b*kv_shape[1]+kh)*((kv_shape[2]+GROUP-1)/GROUP)+kg)*q_shape[3]+j] + float(k_scale[((b*kv_shape[1]+kh)*((kv_shape[2]+GROUP-1)/GROUP)+kg)*q_shape[3]+j]) * float(kc));
+        }
+        const float w = exp(dot * rsqrt(float(q_shape[3])) - maxv);
+        norm += w;
+        const uint vbit = d;
+        const uint vc = (v_codes[((b*kv_shape[1]+kh)*kv_shape[2]+ks)*V_WORDS+vbit/4] >> ((vbit%4)*2)) & 3;
+        outv += w * (v_zero[((b*kv_shape[1]+kh)*kv_shape[2]+ks)*((q_shape[3]+GROUP-1)/GROUP)+d/GROUP] + float(v_scale[((b*kv_shape[1]+kh)*kv_shape[2]+ks)*((q_shape[3]+GROUP-1)/GROUP)+d/GROUP]) * float(vc);
+    }
+    out[((b*q_shape[1]+qh)*q_shape[2]+qi)*q_shape[3]+d] = outv / norm;
+"#;
+
+/// Retained kernel object; MLX performs cold compilation on first `.run()` and
+/// reuses the same compiled pipeline for subsequent dispatches.
+pub struct PackedMetalKernel {
+    kernel: MetalKernel,
+}
+
+impl std::fmt::Debug for PackedMetalKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedMetalKernel").finish_non_exhaustive()
+    }
+}
+
+impl PackedMetalKernel {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            kernel: MetalKernel::with_options(
+                "sc20676_group_affine_online",
+                &[
+                    "q", "k_codes", "k_scale", "k_zero", "v_codes", "v_scale", "v_zero",
+                ],
+                &["out"],
+                MSL,
+                HEADER,
+                true,
+                false,
+            )?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &self,
+        q: &Array,
+        k_codes: &Array,
+        k_scale: &Array,
+        k_zero: &Array,
+        v_codes: &Array,
+        v_scale: &Array,
+        v_zero: &Array,
+    ) -> Result<Array> {
+        let shape = q.shape();
+        if shape.len() != 4
+            || !matches!(shape[3], 64 | 128 | 256)
+            || shape[1] == 0
+            || shape[1] % k_codes.shape()[1] != 0
+        {
+            return Err(Error::Unsupported("SC-20676 packed Metal geometry".into()));
+        }
+        let out = self
+            .kernel
+            .apply()
+            .input(q)
+            .input(k_codes)
+            .input(k_scale)
+            .input(k_zero)
+            .input(v_codes)
+            .input(v_scale)
+            .input(v_zero)
+            .output(OutputArg {
+                shape: shape.to_vec(),
+                dtype: q.dtype(),
+            })
+            .grid(shape[1] * shape[2], shape[0], 1)
+            .thread_group(shape[3], 1, 1)
+            .template_arg("GROUP", 4)
+            .template_arg("K_WORDS", ((shape[3] * 2 + 31) / 32) as i32)
+            .template_arg("V_WORDS", ((shape[3] * 2 + 31) / 32) as i32)
+            .run()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Msg("SC-20676 kernel returned no output".into()))?;
+        Ok(out)
+    }
+}
