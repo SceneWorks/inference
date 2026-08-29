@@ -12,7 +12,7 @@
 
 use mlx_gen::Result as MlxGenResult;
 use mlx_rs::fast::{MetalKernel, OutputArg};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 use std::{
     fmt,
     sync::{
@@ -116,7 +116,7 @@ impl KreaPackedMetalKernel {
     /// Dispatch packed historical K/V plus the current chunk. `query_positions` and
     /// `key_positions` are O(S) position vectors; there is no `[Sq,Sk]` mask or score input.
     #[allow(clippy::too_many_arguments)]
-    pub fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         q: &Array,
         kw: &Array,
@@ -129,6 +129,7 @@ impl KreaPackedMetalKernel {
         current_v: &Array,
         query_positions: &Array,
         key_positions: &Array,
+        block_size: usize,
     ) -> MlxGenResult<Array> {
         let shape = q.shape();
         if shape.len() != 4 || shape[0] != 1 || shape[1] != 40 || shape[3] != 128 {
@@ -136,13 +137,40 @@ impl KreaPackedMetalKernel {
                 "krea packed Metal POC supports only B=1/H=40/D=128".into(),
             ));
         }
+        let history_tokens = kw.shape().get(2).copied().unwrap_or_default();
+        let current_tokens = current_k.shape().get(2).copied().unwrap_or_default();
+        let words_per_row = 128 * self.tier.bits() / 32;
+        let metadata_per_row = 128 / 64;
+        let packed_shape = [1, 40, history_tokens, words_per_row as i32];
+        let metadata_shape = [1, 40, history_tokens, metadata_per_row];
         if current_k.shape() != current_v.shape()
             || current_k.shape().len() != 4
             || current_k.shape()[0] != 1
             || current_k.shape()[1] != 40
             || current_k.shape()[3] != 128
+            || current_tokens != shape[2]
+            || kw.shape() != packed_shape
+            || vw.shape() != packed_shape
+            || ks.shape() != metadata_shape
+            || kb.shape() != metadata_shape
+            || vs.shape() != metadata_shape
+            || vb.shape() != metadata_shape
             || key_positions.shape().len() != 1
             || query_positions.shape().len() != 1
+            || query_positions.shape()[0] != shape[2]
+            || key_positions.shape()[0] != history_tokens + current_tokens
+            || block_size == 0
+            || kw.dtype() != Dtype::Uint32
+            || vw.dtype() != Dtype::Uint32
+            || ks.dtype() != Dtype::Bfloat16
+            || kb.dtype() != Dtype::Bfloat16
+            || vs.dtype() != Dtype::Bfloat16
+            || vb.dtype() != Dtype::Bfloat16
+            || q.dtype() != Dtype::Bfloat16
+            || current_k.dtype() != Dtype::Bfloat16
+            || current_v.dtype() != Dtype::Bfloat16
+            || query_positions.dtype() != Dtype::Int64
+            || key_positions.dtype() != Dtype::Int64
         {
             return Err(mlx_gen::Error::Msg(
                 "krea packed Metal POC received incompatible current-K/V or position geometry"
@@ -172,6 +200,7 @@ impl KreaPackedMetalKernel {
             .thread_group(256, 1, 1)
             .template_arg("BITS", self.tier.bits() as i32)
             .template_arg("HEAD_DIM", dim)
+            .template_arg("BLOCK_SIZE", block_size as i32)
             .run()?;
         output.into_iter().next().ok_or_else(|| {
             mlx_gen::Error::Msg("krea packed Metal kernel returned no output".into())
@@ -219,13 +248,16 @@ const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
     threadgroup float row_max[Q_TILE];
     threadgroup float row_sum[Q_TILE];
     threadgroup float old_weight[Q_TILE];
-    threadgroup float new_weight[Q_TILE];
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     if (q_row < Q_TILE && qi < q_shape[2]) {
         for (uint j = 0; j < 4; ++j) {
             const uint d = lane * 4 + j;
             q_tile[q_row][d] = float(q[((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + d]);
         }
+    } else if (q_row < Q_TILE) {
+        // Matrix loads cover the complete 8-row fragment. Zero inactive tail rows so the final
+        // partial query tile never reads indeterminate threadgroup storage.
+        for (uint j = 0; j < 4; ++j) q_tile[q_row][lane * 4 + j] = 0.0f;
     }
     if (lane == 0) { row_max[q_row] = -INFINITY; row_sum[q_row] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -256,10 +288,20 @@ const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
         if (lane == 0 && qi < q_shape[2]) {
             const uint valid = min(K_TILE, key_positions_shape[0] - key_base);
             float next_max = row_max[q_row];
-            for (uint kr = 0; kr < valid; ++kr) next_max = max(next_max, scores[q_row][kr] * rsqrt(float(HEAD_DIM)));
+            for (uint kr = 0; kr < valid; ++kr) {
+                const long q_position = query_positions[qi];
+                const long k_position = key_positions[key_base + kr];
+                if (k_position / long(BLOCK_SIZE) > q_position / long(BLOCK_SIZE)) continue;
+                next_max = max(next_max, scores[q_row][kr] * rsqrt(float(HEAD_DIM)));
+            }
             old_weight[q_row] = isfinite(row_max[q_row]) ? exp(row_max[q_row] - next_max) : 0.0f;
             row_sum[q_row] *= old_weight[q_row];
-            for (uint kr = 0; kr < valid; ++kr) row_sum[q_row] += exp(scores[q_row][kr] * rsqrt(float(HEAD_DIM)) - next_max);
+            for (uint kr = 0; kr < valid; ++kr) {
+                const long q_position = query_positions[qi];
+                const long k_position = key_positions[key_base + kr];
+                if (k_position / long(BLOCK_SIZE) > q_position / long(BLOCK_SIZE)) continue;
+                row_sum[q_row] += exp(scores[q_row][kr] * rsqrt(float(HEAD_DIM)) - next_max);
+            }
             row_max[q_row] = next_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -267,6 +309,9 @@ const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
             const uint valid = min(K_TILE, key_positions_shape[0] - key_base);
             acc0 *= old_weight[q_row]; acc1 *= old_weight[q_row]; acc2 *= old_weight[q_row]; acc3 *= old_weight[q_row];
             for (uint kr = 0; kr < valid; ++kr) {
+                const long q_position = query_positions[qi];
+                const long k_position = key_positions[key_base + kr];
+                if (k_position / long(BLOCK_SIZE) > q_position / long(BLOCK_SIZE)) continue;
                 const float w = exp(scores[q_row][kr] * rsqrt(float(HEAD_DIM)) - row_max[q_row]);
                 acc0 += w * v_tile[kr][lane * 4 + 0]; acc1 += w * v_tile[kr][lane * 4 + 1];
                 acc2 += w * v_tile[kr][lane * 4 + 2]; acc3 += w * v_tile[kr][lane * 4 + 3];
@@ -276,8 +321,10 @@ const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
     }
     if (qi < q_shape[2]) {
         const uint o = ((b * q_shape[1] + h) * q_shape[2] + qi) * HEAD_DIM + lane * 4;
-        out[o + 0] = acc0 / row_sum[q_row]; out[o + 1] = acc1 / row_sum[q_row];
-        out[o + 2] = acc2 / row_sum[q_row]; out[o + 3] = acc3 / row_sum[q_row];
+        out[o + 0] = bfloat16_t(acc0 / row_sum[q_row]);
+        out[o + 1] = bfloat16_t(acc1 / row_sum[q_row]);
+        out[o + 2] = bfloat16_t(acc2 / row_sum[q_row]);
+        out[o + 3] = bfloat16_t(acc3 / row_sum[q_row]);
     }
 "#;
 
@@ -1116,6 +1163,100 @@ mod tests {
             DispatchDecision::DenseFallback(DispatchFailure::Q4QualityArmNotAcknowledged)
         );
         assert_eq!(cache.stored_tokens(), 0);
+    }
+
+    #[test]
+    fn real_metal_kernel_jits_and_matches_block_causal_uniform_value_oracle() {
+        const HEADS: usize = 40;
+        const DIM: usize = 128;
+        const HISTORY: usize = 9;
+        const SQ: usize = 9;
+        const GROUPS: usize = DIM / 64;
+
+        let bf16 = |values: Vec<f32>, shape: &[i32]| {
+            Array::from_slice(&values, shape)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let q = bf16(vec![0.0; HEADS * SQ * DIM], &[1, 40, 9, 128]);
+        let current_k = bf16(vec![0.0; HEADS * SQ * DIM], &[1, 40, 9, 128]);
+        let mut current_v_values = vec![0.0; HEADS * SQ * DIM];
+        for h in 0..HEADS {
+            for s in 0..SQ {
+                for d in 0..DIM {
+                    current_v_values[(h * SQ + s) * DIM + d] = 100.0 + s as f32;
+                }
+            }
+        }
+        let current_v = bf16(current_v_values, &[1, 40, 9, 128]);
+        let query_positions = Array::from_slice(&(9i64..18).collect::<Vec<_>>(), &[9]);
+        let key_positions = Array::from_slice(&(0i64..18).collect::<Vec<_>>(), &[18]);
+
+        for (tier, bits) in [(CompressedTier::Q8, 8usize), (CompressedTier::Q4, 4)] {
+            let words = DIM * bits / 32;
+            let kw = Array::from_slice(
+                &vec![0u32; HEADS * HISTORY * words],
+                &[1, 40, 9, words as i32],
+            );
+            let mut packed_values = vec![0u32; HEADS * HISTORY * words];
+            for h in 0..HEADS {
+                for s in 0..HISTORY {
+                    let code = (s + 1) as u32;
+                    let mut word = 0u32;
+                    for field in 0..(32 / bits) {
+                        word |= code << (field * bits);
+                    }
+                    packed_values[(h * HISTORY + s) * words..(h * HISTORY + s + 1) * words]
+                        .fill(word);
+                }
+            }
+            let vw = Array::from_slice(&packed_values, &[1, 40, 9, words as i32]);
+            let zero_meta = bf16(vec![0.0; HEADS * HISTORY * GROUPS], &[1, 40, 9, 2]);
+            let unit_scales = bf16(vec![1.0; HEADS * HISTORY * GROUPS], &[1, 40, 9, 2]);
+            let kernel = KreaPackedMetalKernel::new(tier).unwrap();
+            let dispatch = || {
+                kernel
+                    .dispatch(
+                        &q,
+                        &kw,
+                        &zero_meta,
+                        &zero_meta,
+                        &vw,
+                        &unit_scales,
+                        &zero_meta,
+                        &current_k,
+                        &current_v,
+                        &query_positions,
+                        &key_positions,
+                        4,
+                    )
+                    .unwrap()
+            };
+
+            // The first evaluation forces lazy Metal compilation; the second covers the retained
+            // steady dispatch. SQ=9 exercises both a full query tile and the zero-filled tail tile.
+            for output in [dispatch(), dispatch()] {
+                let output = output.as_dtype(Dtype::Float32).unwrap();
+                output.eval().unwrap();
+                let values = output.as_slice::<f32>();
+                for h in 0..HEADS {
+                    for qi in 0..SQ {
+                        let q_position = 9 + qi;
+                        let allowed_current = ((q_position / 4 + 1) * 4).min(18) - 9;
+                        let expected_sum = (1..=HISTORY).map(|v| v as f32).sum::<f32>()
+                            + (0..allowed_current).map(|s| 100.0 + s as f32).sum::<f32>();
+                        let expected = expected_sum / (HISTORY + allowed_current) as f32;
+                        for d in 0..DIM {
+                            let actual = values[(h * SQ + qi) * DIM + d];
+                            assert!(
+                                (actual - expected).abs() <= 0.25,
+                                "tier={tier:?} h={h} qi={qi} d={d}: {actual} != {expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn dense_reference(

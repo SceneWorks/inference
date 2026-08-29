@@ -8,7 +8,7 @@ The sealed companion is [`sc-20684-krea-realtime-compressed-kv-contract.json`](s
 
 Krea's `krea_realtime_14b` T2V, I2V, and V2V modes share one persistent self-attention cache; prompt cross-K/V is separate and out of scope. `PackedKv::pack` stores post-RoPE K and raw V from `[B,H,S,D]` along **D**, as uint32 words plus bf16 scale/bias `[B,H,S,D/group]`. `window_prev` currently gathers then dequantizes a full dense cache window before Wan's fused SDPA. `denoise_chunk_inner` supplies a frame-aligned absolute RoPE offset and optional block-causal mask; `run_ar_loop_conditioned` has readonly denoise followed by exactly one clean-context/final append with cancellation checks.
 
-The Krea 14B backbone is normally B=1, H=40, D=128 and uses group 64. `S_q` is request-derived (the canonical three-frame chunk is 4680); `S_kv` is the retained history plus current chunk. The POC keeps that shape identity and supports only none or analytic nonzero block-causal masking, never an allocated mask tensor.
+The Krea 14B backbone is normally B=1, H=40, D=128 and uses group 64. `S_q` is request-derived (the canonical three-frame chunk is 4680); `S_kv` is the retained history plus current chunk. The POC keeps that shape identity and implements the product's nonzero block-causal rule analytically from O(S) query/key position vectors, never by passing an allocated mask tensor to the packed kernel.
 
 ## Existing evidence boundary
 
@@ -22,19 +22,19 @@ Accordingly the implementation is Krea-owned: `compressed_kv.rs` packs K/V in Kr
 
 ## Experimental source POC
 
-`ExperimentalCompressedKvConfig::default()` is disabled. `CompressedKvCache::decide` checks the feature flag, Q4 acknowledgement, compiled handle, B=1/D=128/group=64, and exact mask descriptor **before append/trim changes packed state**. Unsupported conditions return a named dense fallback reason for the existing route.
+`ExperimentalCompressedKvConfig::default()` is disabled. `CompressedKvCache::decide` checks the feature flag, Q4 acknowledgement, compiled handle, B=1/D=128/group=64, and exact mask descriptor **before append/trim changes packed state**. Device dispatch additionally validates every packed/current/metadata dtype and dimension, exact history/current position-vector lengths, and a nonzero product block size before lazy JIT. Unsupported conditions return a named dense fallback reason for the existing route.
 
 `append_after_decision` quantizes a full K/V pair before replacement; no half-written layer is observable. `trim_prefix` copies only retained packed words and metadata, checks cancellation before state replacement, and does not dequantize a historical window. `tiled_online_attention` is the CPU parity oracle. The retained Metal path uses `KreaPackedMetalKernel::dispatch` over actual `PackedKv` uint32/bf16 arrays, current K/V, and O(S) global position vectors; it allocates neither a dense historical K/V window nor an `Sq × Sk` score/mask array.
 
 The Metal POC accepts only an already-physical global packed window. It rejects sliding/sink gathers before dispatch, so MLX lazy-JIT or command-buffer failure cannot strand a partially gathered cache; the caller can retry the unchanged dense path from the same cache state. Its bounded MSL tile is eight queries by eight keys, with 256 threads (eight simdgroups), real `simdgroup_matrix` MMA for the score tile, lane-owned four-channel value accumulators, and online max rescaling on every key tile.
 
-Absolute RoPE remains the Wan/Krea producer's responsibility: keys passed to append are post-RoPE and `query_start`/`key_start` make block-mask comparison global. The opt-in `CausalPackedAttention` seam now wires the retained Krea kernel into Wan's per-layer causal forward. It only dispatches the exact B=1/H=40/D=128, all-allowed block; any materialized block mask, missing packed history, Q4 without acknowledgement, unsupported shape, or kernel setup failure stays on the pre-existing dense route before the packed read window is prepared.
+Absolute RoPE remains the Wan/Krea producer's responsibility: keys passed to append are post-RoPE and `query_start`/`key_start` make block-mask comparison global. The opt-in `CausalPackedAttention` seam now wires the retained Krea kernel into Wan's per-layer causal forward. It only dispatches the exact B=1/H=40/D=128 product scale and represents the product block-causal rule from absolute position vectors; missing packed history, Q4 without acknowledgement, unsupported geometry/scale, or kernel setup failure stays on the pre-existing dense route. Every lazy custom-kernel result is forced before the caller can commit new cache state, so a JIT or command-buffer failure retries from the unchanged dense cache.
 
 ## Receipt and migration contract
 
 A future same-run device receipt must name the model/snapshot, exact B/H/Sq/Skv/D and mask, representation/version, compiled-handle identity, packed persistent bytes, retained-handle bytes, bounded scratch bytes, zero/nonzero dense-window and score-matrix bytes, timing label, fallback reason, parity, quality, and cancellation outcome. Q4 cannot be promoted using Q8 evidence. Dense full-cache dequantize-then-SDPA remains a non-goal for compressed-domain execution.
 
-The source tests cover Q8 tiled/tail/block-mask/outlier parity against an independent dense oracle, arbitrary append boundaries, packed trim, disabled pre-mutation fallback, and cancellation scratch cleanup. They are weightless but are not executed in this resource-held lane; the Python checker rejects missing source mappings, fallback axes, receipt axes, checksum drift, or dense-window/score-route needles.
+The source tests cover Q8 tiled/tail/block-mask/outlier parity against an independent dense oracle, arbitrary append boundaries, packed trim, disabled pre-mutation fallback, and cancellation scratch cleanup. The focused Rust suite and strict package clippy pass locally; the Python checker rejects missing source mappings, fallback axes, receipt axes, checksum drift, or dense-window/score-route needles.
 
 ## Source-only validation
 

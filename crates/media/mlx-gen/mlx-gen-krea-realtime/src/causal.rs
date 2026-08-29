@@ -68,7 +68,11 @@ struct PackedKreaAttentionBackend<'a> {
     cache: &'a CausalKvCache,
     query_positions: Array,
     key_positions: Array,
+    block_size: usize,
+    dispatched_outputs: Vec<Array>,
 }
+
+const PACKED_DISPATCH_ERROR_PREFIX: &str = "SC-20684 packed dispatch failed: ";
 
 impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
     fn attend(
@@ -77,18 +81,23 @@ impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
         q: &Array,
         current_k: &Array,
         current_v: &Array,
-        mask: Option<&Array>,
-        _scale: f32,
+        _mask: Option<&Array>,
+        scale: f32,
     ) -> Result<Option<Array>> {
-        // Krea's `block_causal_mask` is exact only when it returns None for one all-allowed
-        // frame block. Any materialized additive mask falls back before the experimental cache
-        // window is prepared, rather than pretending per-token causal masking is equivalent.
+        // The packed kernel represents Krea's block-causal mask analytically from the O(S)
+        // position vectors and the product block size. No additive [Sq,Sk] tensor is consumed.
         let shape = q.shape();
-        if mask.is_some() || shape.len() != 4 || shape[0] != 1 || shape[1] != 40 || shape[3] != 128
+        let expected_scale = (shape.get(3).copied().unwrap_or_default() as f32).powf(-0.5);
+        if shape.len() != 4
+            || shape[0] != 1
+            || shape[1] != 40
+            || shape[3] != 128
+            || scale.to_bits() != expected_scale.to_bits()
         {
             return Ok(None);
         }
-        self.cache
+        let output = self
+            .cache
             .dispatch_experimental_packed_layer(
                 layer,
                 q,
@@ -96,8 +105,11 @@ impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
                 current_v,
                 &self.query_positions,
                 &self.key_positions,
+                self.block_size,
             )
-            .map(Some)
+            .map_err(|error| Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")))?;
+        self.dispatched_outputs.push(output.clone());
+        Ok(Some(output))
     }
 }
 
@@ -425,6 +437,11 @@ pub struct CausalKvCache {
     /// Retained only after an explicit experimental caller enables the packed Metal path. The
     /// default cache never constructs this object and therefore stays on the existing dense SDPA.
     packed_metal_kernel: Option<KreaPackedMetalKernel>,
+    /// Product-boundary counters for the experimental route. A runtime/JIT dispatch fault is
+    /// retried through unchanged dense SDPA and remains visible here for the device receipt.
+    packed_metal_accepted_forwards: usize,
+    packed_metal_dense_fallbacks: usize,
+    last_packed_metal_fallback: Option<String>,
     /// Test-only switch for the real-weight before/after oracle. `false` reproduces the pre-sc-17894
     /// eager max-window eviction exactly; production builds do not carry this field or branch.
     #[cfg(test)]
@@ -455,6 +472,9 @@ impl CausalKvCache {
             sink_tokens,
             quant,
             packed_metal_kernel: None,
+            packed_metal_accepted_forwards: 0,
+            packed_metal_dense_fallbacks: 0,
+            last_packed_metal_fallback: None,
             #[cfg(test)]
             evict_to_next_read: true,
         }
@@ -476,6 +496,14 @@ impl CausalKvCache {
     /// The storage tier this cache retains K/V at — `None` for the shipped bf16 cache.
     pub fn quant(&self) -> Option<KvCacheQuant> {
         self.quant
+    }
+
+    pub fn packed_metal_route_stats(&self) -> (usize, usize, Option<&str>) {
+        (
+            self.packed_metal_accepted_forwards,
+            self.packed_metal_dense_fallbacks,
+            self.last_packed_metal_fallback.as_deref(),
+        )
     }
 
     /// Explicitly construct and retain the MLX custom kernel for an already-quantized Krea cache.
@@ -565,6 +593,7 @@ impl CausalKvCache {
         current_v: &Array,
         query_positions: &Array,
         key_positions: &Array,
+        block_size: usize,
     ) -> Result<Array> {
         let kernel = self.packed_metal_kernel.as_ref().ok_or_else(|| {
             Error::Msg(
@@ -593,6 +622,7 @@ impl CausalKvCache {
             current_v,
             query_positions,
             key_positions,
+            block_size,
         )
     }
 
@@ -820,34 +850,54 @@ impl CausalKvCache {
                 new_kv.len()
             )));
         }
-        // Concatenate this chunk's K/V onto the physical tail (each layer identically). When the cache
-        // is quantized the chunk is packed **here**, at commit — once per chunk, not once per denoise
-        // step, since only the committing forward reaches `append` (sc-17807).
-        let mut s_new = 0usize;
-        for (slot, kv) in self.layers.iter_mut().zip(new_kv) {
-            s_new = kv.0.shape()[2] as usize;
+        let expected_shape = new_kv
+            .first()
+            .map(|(k, _)| k.shape().to_vec())
+            .ok_or_else(|| Error::Msg("krea causal: append requires at least one layer".into()))?;
+        if expected_shape.len() != 4 || expected_shape.contains(&0) {
+            return Err(Error::Msg(format!(
+                "krea causal: append requires nonempty [B,H,S,D] tensors, got {expected_shape:?}"
+            )));
+        }
+        for (layer, (k, v)) in new_kv.iter().enumerate() {
+            if k.shape() != expected_shape || v.shape() != expected_shape || k.dtype() != v.dtype()
+            {
+                return Err(Error::Msg(format!(
+                    "krea causal: append layer {layer} must match K/V geometry and dtype {:?}/{:?}; expected shape {expected_shape:?}",
+                    k.shape(), v.shape()
+                )));
+            }
+        }
+        let s_new = expected_shape[2] as usize;
+        let committed_after = self
+            .committed_tokens
+            .checked_add(s_new)
+            .ok_or_else(|| Error::Msg("krea causal: committed token count overflow".into()))?;
+
+        // Build every layer's packed/concatenated successor without touching observable cache state.
+        // A late pack/concat failure therefore leaves all layers and counters at the old boundary.
+        let mut staged_layers = Vec::with_capacity(self.layers.len());
+        for (slot, kv) in self.layers.iter().zip(new_kv) {
             let incoming = StoredKv::store(kv, self.quant)?;
-            *slot = Some(match slot.take() {
+            let staged = match slot {
                 None => incoming,
-                Some(prev) => prev.concat(&incoming)?,
-            });
+                Some(previous) => previous.concat(&incoming)?,
+            };
+            staged_layers.push(Some(staged));
         }
 
         #[cfg(test)]
         let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
-        self.committed_tokens += s_new;
         #[cfg(test)]
         if !self.evict_to_next_read {
-            let sink_kept = self.sink_kept();
-            let tail_base_new = sink_kept.max(
-                self.committed_tokens
-                    .saturating_sub(self.max_attention_size),
-            );
+            let sink_kept = self.sink_tokens.min(committed_after);
+            let tail_base_new =
+                sink_kept.max(committed_after.saturating_sub(self.max_attention_size));
             let drop_start = tail_base_old.max(sink_kept);
             if tail_base_new > drop_start {
                 let sink_kept_prev = self.sink_tokens.min(committed_before);
                 let keep: Vec<i32> = (0..sink_kept)
-                    .chain(tail_base_new..self.committed_tokens)
+                    .chain(tail_base_new..committed_after)
                     .map(|g| {
                         if g < sink_kept_prev {
                             g as i32
@@ -857,19 +907,24 @@ impl CausalKvCache {
                     })
                     .collect();
                 let idx = Array::from_slice(&keep, &[keep.len() as i32]);
-                for slot in self.layers.iter_mut() {
+                for slot in &mut staged_layers {
                     if let Some(stored) = slot.as_ref() {
                         *slot = Some(stored.take(&idx)?);
                     }
                 }
             }
+            self.layers = staged_layers;
+            self.committed_tokens = committed_after;
             self.tail_base = tail_base_new;
             return Ok(());
         }
         // While the sink is still filling, newly appended contiguous tokens become part of it.
         // Advancing the logical tail start needs no gather: the physical layout remains
         // `[sink prefix | rolling tail]` in global order.
-        self.tail_base = self.tail_base.max(self.sink_kept());
+        let tail_base_after = self.tail_base.max(self.sink_tokens.min(committed_after));
+        self.layers = staged_layers;
+        self.committed_tokens = committed_after;
+        self.tail_base = tail_base_after;
         Ok(())
     }
 }
@@ -1035,8 +1090,7 @@ impl CausalKreaTransformer {
         kv_positions.extend(q_positions.iter().copied());
         let mask = block_causal_mask(&q_positions, &kv_positions, self.block_size)?;
         let packed_positions = (cache.experimental_packed_metal_enabled()
-            && !preview_positions.is_empty()
-            && mask.is_none())
+            && !preview_positions.is_empty())
         .then(|| cache.prepare_packed_window(s_new))
         .transpose()?;
         let (velocity, new_kv) = if let Some(packed_positions) = packed_positions {
@@ -1048,17 +1102,49 @@ impl CausalKreaTransformer {
                 cache,
                 query_positions,
                 key_positions,
+                block_size: self.block_size,
+                dispatched_outputs: Vec::with_capacity(40),
             };
-            self.inner.forward_causal_chunk_with_packed_attention(
+            let mut packed_result = self.inner.forward_causal_chunk_with_packed_attention(
                 &tokens,
                 t,
                 cross_kv,
                 &cos,
                 &sin,
                 &[],
-                None,
+                mask.as_ref(),
                 &mut backend,
-            )?
+            );
+            // MLX custom kernels compile and execute lazily. Force every packed layer output while
+            // the unchanged dense cache is still available, so a JIT/command-buffer failure is
+            // observed inside this fallback boundary instead of surfacing after the caller commits.
+            if packed_result.is_ok() {
+                if let Err(error) = mlx_rs::transforms::eval(backend.dispatched_outputs.iter()) {
+                    packed_result =
+                        Err(Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")));
+                }
+            }
+            match packed_result {
+                Ok(result) => {
+                    cache.packed_metal_accepted_forwards += 1;
+                    result
+                }
+                Err(error) if error.to_string().contains(PACKED_DISPATCH_ERROR_PREFIX) => {
+                    cache.packed_metal_dense_fallbacks += 1;
+                    cache.last_packed_metal_fallback = Some(error.to_string());
+                    let (prev_kv, _) = cache.window_prev(s_new)?;
+                    self.inner.forward_causal_chunk(
+                        &tokens,
+                        t,
+                        cross_kv,
+                        &cos,
+                        &sin,
+                        &prev_kv,
+                        mask.as_ref(),
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             let (prev_kv, _) = cache.window_prev(s_new)?;
             self.inner.forward_causal_chunk(
@@ -1576,6 +1662,65 @@ mod tests {
         let k = Array::from_slice(pos_values, &[1, 1, s, 1]);
         let v = Array::from_slice(pos_values, &[1, 1, s, 1]);
         vec![(k, v)]
+    }
+
+    #[test]
+    fn append_rejects_cross_layer_geometry_before_mutation() {
+        let mut cache = CausalKvCache::new(2, 64, 0, None);
+        let first = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
+        cache
+            .append(vec![
+                (first.clone(), first.clone()),
+                (first.clone(), first.clone()),
+            ])
+            .unwrap();
+        let before_bytes = cache.retained_bytes();
+
+        let two = Array::from_slice(&[2.0f32, 3.0], &[1, 1, 2, 1]);
+        let one = Array::from_slice(&[4.0f32], &[1, 1, 1, 1]);
+        let error = cache
+            .append(vec![(two.clone(), two), (one.clone(), one)])
+            .expect_err("every layer must commit the same token geometry");
+        assert!(error.to_string().contains("layer 1"), "{error:?}");
+        assert_eq!(cache.stored_tokens(), 1);
+        assert_eq!(cache.retained_bytes(), before_bytes);
+        for layer in 0..2 {
+            assert_eq!(
+                cache.layer_kv(layer).unwrap().unwrap().0.shape(),
+                &[1, 1, 1, 1]
+            );
+        }
+    }
+
+    #[test]
+    fn append_late_concat_failure_does_not_publish_earlier_layers() {
+        let mut cache = CausalKvCache::new(2, 64, 0, None);
+        let scalar = Array::from_slice(&[1.0f32], &[1, 1, 1, 1]);
+        let incompatible = Array::from_slice(&[2.0f32, 3.0], &[1, 1, 1, 2]);
+        cache.layers = vec![
+            Some(StoredKv::Dense {
+                k: scalar.clone(),
+                v: scalar.clone(),
+            }),
+            Some(StoredKv::Dense {
+                k: incompatible.clone(),
+                v: incompatible,
+            }),
+        ];
+        cache.committed_tokens = 1;
+        let before_bytes = cache.retained_bytes();
+        let incoming = Array::from_slice(&[4.0f32], &[1, 1, 1, 1]);
+        cache
+            .append(vec![
+                (incoming.clone(), incoming.clone()),
+                (incoming.clone(), incoming),
+            ])
+            .expect_err("the second layer's incompatible concat must fail");
+
+        assert_eq!(cache.stored_tokens(), 1);
+        assert_eq!(cache.retained_bytes(), before_bytes);
+        assert_eq!(cache.layer_kv(0).unwrap().unwrap().0.shape(), &[1, 1, 1, 1]);
+        assert_eq!(cache.layer_kv(1).unwrap().unwrap().0.shape(), &[1, 1, 1, 2]);
     }
 
     fn retained_key_values(cache: &CausalKvCache) -> Vec<f32> {

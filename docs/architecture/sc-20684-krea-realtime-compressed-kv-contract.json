@@ -21,7 +21,7 @@
   "poc": {
     "candidate": "Krea-owned D-axis affine Q8 packed K/V with tiled online softmax; Q4 is a separately acknowledged quality arm",
     "status": "implemented-source-only-device-unverified",
-    "nativeGeometry": "B=1, H=40, D=128, group=64, Q8 by default; query tiles of 32 and exact none/block-causal mask metadata",
+    "nativeGeometry": "B=1, H=40, D=128, group=64, Q8 by default; query tiles of 8 and analytic block-causal masking from O(S) positions",
     "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant token-axis K grouping; the POC reads Krea's own uint32 plus bf16 scale/bias rows",
     "nonGoal": "full-cache dequantize-then-SDPA is not compressed-domain execution"
   },
