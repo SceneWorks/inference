@@ -4,15 +4,14 @@
   "title": "StarVector cross-repository terminal campaign receipt",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "runs", "eight_b_uplift"],
+  "required": ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "runs"],
   "properties": {
     "schema_version": { "const": 1 },
     "campaign_run_id": { "type": "string", "minLength": 1 },
     "inference_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "sceneworks_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "corpus_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "runs": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/run" } },
-    "eight_b_uplift": { "$ref": "#/$defs/uplift" }
+    "runs": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/run" } }
   },
   "$defs": {
     "run": {
@@ -32,10 +31,10 @@
       }
     },
     "model": { "type": "object", "additionalProperties": false, "required": ["key", "repository", "revision", "inventory_sha256"], "properties": { "key": {"type":"string"}, "repository": {"type":"string"}, "revision": {"type":"string","pattern":"^[0-9a-f]{40}$"}, "inventory_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"} } },
-    "image_quality": { "type":"object", "additionalProperties":false, "required":["case_count","validity_rate","median_ssim","median_lpips","p95_latency_seconds","memory_headroom_percent"], "properties": { "case_count":{"type":"integer"}, "validity_rate":{"type":"number"}, "median_ssim":{"type":"number"}, "median_lpips":{"type":"number"}, "p95_latency_seconds":{"type":"number"}, "memory_headroom_percent":{"type":"number"} } },
+    "image_quality": { "type":"object", "additionalProperties":false, "required":["cases","memory_headroom_percent"], "properties": { "cases":{"type":"array","minItems":120,"maxItems":120,"items":{"$ref":"#/$defs/image_case"}}, "memory_headroom_percent":{"type":"number"} } },
+    "image_case": { "type":"object", "additionalProperties":false, "required":["case_index","accepted","ssim","lpips","latency_seconds"], "properties": { "case_index":{"type":"integer","minimum":0,"maximum":119}, "accepted":{"type":"boolean"}, "ssim":{"type":["number","null"]}, "lpips":{"type":["number","null"]}, "latency_seconds":{"type":"number"} } },
     "parity": { "type":"object", "additionalProperties":false, "required":["case_count","rendered_ssim"], "properties": { "case_count":{"const":20}, "rendered_ssim":{"type":"array","minItems":20,"maxItems":20,"items":{"type":"number"} } } },
     "lifecycle": { "type":"object", "additionalProperties":false, "required":["load","unload","reload","memory_reported"], "properties": { "load":{"type":"boolean"}, "unload":{"type":"boolean"}, "reload":{"type":"boolean"}, "memory_reported":{"type":"boolean"} } },
-    "limits": { "type":"object", "additionalProperties":false, "required":["complete_root","eos","token","byte","wall_time","cancellation"], "properties": { "complete_root":{"type":"boolean"}, "eos":{"type":"boolean"}, "token":{"type":"boolean"}, "byte":{"type":"boolean"}, "wall_time":{"type":"boolean"}, "cancellation":{"type":"boolean"} } },
-    "uplift": { "type":"object", "additionalProperties":false, "required":["bootstrap_confidence","by_backend"], "properties": { "bootstrap_confidence":{"const":0.95}, "by_backend":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"object","additionalProperties":false,"required":["backend","median_lpips_improvement","validity_delta","bootstrap_lower_bound"],"properties":{"backend":{"enum":["mlx","candle-cuda"]},"median_lpips_improvement":{"type":"number"},"validity_delta":{"type":"number"},"bootstrap_lower_bound":{"type":"number"}}} } } }
+    "limits": { "type":"object", "additionalProperties":false, "required":["complete_root","eos","token","byte","wall_time","cancellation"], "properties": { "complete_root":{"type":"boolean"}, "eos":{"type":"boolean"}, "token":{"type":"boolean"}, "byte":{"type":"boolean"}, "wall_time":{"type":"boolean"}, "cancellation":{"type":"boolean"} } }
   }
 }

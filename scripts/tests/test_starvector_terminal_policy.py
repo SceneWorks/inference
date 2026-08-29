@@ -112,13 +112,14 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
         self.assertEqual(schema["properties"]["runs"]["maxItems"], 4)
-        self.assertEqual(schema["$defs"]["uplift"]["properties"]["bootstrap_confidence"]["const"], 0.95)
+        self.assertNotIn("eight_b_uplift", schema["properties"])
         image_quality = schema["$defs"]["image_quality"]["properties"]
-        self.assertEqual(image_quality["case_count"]["type"], "integer")
-        self.assertIn("median_ssim", image_quality)
-        self.assertIn("median_lpips", image_quality)
-        self.assertIn("p95_latency_seconds", image_quality)
-        self.assertNotIn("mean_ssim", image_quality)
+        self.assertEqual(image_quality["cases"]["minItems"], 120)
+        self.assertEqual(image_quality["cases"]["maxItems"], 120)
+        self.assertNotIn("median_ssim", image_quality)
+        case = schema["$defs"]["image_case"]["properties"]
+        self.assertEqual(case["case_index"]["maximum"], 119)
+        self.assertEqual(case["ssim"]["type"], ["number", "null"])
         parity = schema["$defs"]["parity"]["properties"]
         self.assertEqual(parity["case_count"]["const"], 20)
         self.assertEqual(parity["rendered_ssim"]["minItems"], 20)

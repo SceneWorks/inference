@@ -40,6 +40,28 @@ function onlyKeys(value, keys, label) {
 function positiveInt(value, label) { if (!Number.isInteger(value) || value < 1) fail(`${label} must be a positive integer`); }
 function unitInterval(value, label) { if (typeof value !== "number" || value < 0 || value > 1) fail(`${label} must be in [0, 1]`); }
 function sha(value, label) { if (typeof value !== "string" || !SHA256.test(value)) fail(`${label} must be a lowercase SHA-256`); }
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = sorted.length / 2;
+  return sorted.length % 2 ? sorted[Math.floor(middle)] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+function p95(values) { return [...values].sort((left, right) => left - right)[Math.ceil(values.length * 0.95) - 1]; }
+function pairedBootstrapLowerBound(pairs) {
+  // A reproducible one-sided 95% paired bootstrap: 10,000 full-size resamples, Numerical
+  // Recipes LCG seed 0x5a17c0de, statistic=(median(1B)-median(8B))/median(1B), 5th percentile.
+  let state = 0x5a17c0de; const statistics = [];
+  for (let iteration = 0; iteration < 10_000; iteration += 1) {
+    const one = []; const eight = [];
+    for (let draw = 0; draw < pairs.length; draw += 1) {
+      state = (Math.imul(1664525, state) + 1013904223) >>> 0;
+      const pair = pairs[state % pairs.length]; one.push(pair.one); eight.push(pair.eight);
+    }
+    const baseline = median(one);
+    if (baseline <= 0) fail("paired 1B bootstrap median LPIPS is not positive");
+    statistics.push((baseline - median(eight)) / baseline);
+  }
+  return statistics.sort((left, right) => left - right)[499];
+}
 
 export function validatePlan(corpus) {
   onlyKeys(corpus, ["schema_version", "purpose", "upstream_image_quality_cases", "deterministic_parity_cases", "sceneworks_owned_suites", "excluded_upstream_sources"], "corpus");
@@ -71,7 +93,7 @@ export function validatePlan(corpus) {
   return hash(stable(corpus));
 }
 
-function validateRun(run, expectedCorpusHash) {
+function validateRun(run) {
   onlyKeys(run, ["backend", "provider_id", "tier", "device", "model", "image_quality", "deterministic_parity", "lifecycle", "limits"], "run");
   const runKey = `${run.backend}:${run.tier}`;
   if (EXPECTED_RUNS.get(runKey) !== run.provider_id || !run.device) fail(`unexpected provider identity ${runKey}`);
@@ -79,11 +101,25 @@ function validateRun(run, expectedCorpusHash) {
   onlyKeys(run.model, ["key", "repository", "revision", "inventory_sha256"], `${runKey} model`);
   if (run.model.key !== expectedModel.key || run.model.repository !== expectedModel.repository || run.model.revision !== expectedModel.revision) fail(`${runKey} model identity does not match its immutable pin`);
   sha(run.model.inventory_sha256, `${runKey} model inventory`);
-  onlyKeys(run.image_quality, ["case_count", "validity_rate", "median_ssim", "median_lpips", "p95_latency_seconds", "memory_headroom_percent"], `${runKey} image quality`);
-  if (run.image_quality.case_count !== 120) fail(`${runKey} did not record all 120 image cases`);
-  unitInterval(run.image_quality.validity_rate, `${runKey} validity`); unitInterval(run.image_quality.median_ssim, `${runKey} median SSIM`); unitInterval(run.image_quality.median_lpips, `${runKey} median LPIPS`);
-  if (run.image_quality.validity_rate < 0.95 || run.image_quality.median_ssim < 0.85 || run.image_quality.median_lpips > 0.20) fail(`${runKey} image-quality threshold failed`);
-  if (typeof run.image_quality.p95_latency_seconds !== "number" || run.image_quality.p95_latency_seconds > 120) fail(`${runKey} p95 latency exceeds 120 seconds`);
+  onlyKeys(run.image_quality, ["cases", "memory_headroom_percent"], `${runKey} image quality`);
+  if (!Array.isArray(run.image_quality.cases) || run.image_quality.cases.length !== 120) fail(`${runKey} did not record all 120 ordered image cases`);
+  const accepted = [];
+  const latencies = [];
+  for (const [index, record] of run.image_quality.cases.entries()) {
+    onlyKeys(record, ["case_index", "accepted", "ssim", "lpips", "latency_seconds"], `${runKey} case ${index}`);
+    if (record.case_index !== index || typeof record.accepted !== "boolean" || typeof record.latency_seconds !== "number" || record.latency_seconds < 0) fail(`${runKey} image-case order or latency is invalid`);
+    if (!record.accepted) {
+      if (record.ssim !== null || record.lpips !== null) fail(`${runKey} rejected case ${index} carries fabricated quality metrics`);
+    } else {
+      unitInterval(record.ssim, `${runKey} case ${index} SSIM`); unitInterval(record.lpips, `${runKey} case ${index} LPIPS`);
+      accepted.push(record);
+    }
+    latencies.push(record.latency_seconds);
+  }
+  if (accepted.length < 114) fail(`${runKey} validity is below 95%`);
+  const metrics = { validity_rate: accepted.length / 120, median_ssim: median(accepted.map((record) => record.ssim)), median_lpips: median(accepted.map((record) => record.lpips)), p95_latency_seconds: p95(latencies), cases: run.image_quality.cases };
+  if (metrics.median_ssim < 0.85 || metrics.median_lpips > 0.20) fail(`${runKey} image-quality threshold failed`);
+  if (metrics.p95_latency_seconds > 120) fail(`${runKey} p95 latency exceeds 120 seconds`);
   if (typeof run.image_quality.memory_headroom_percent !== "number" || run.image_quality.memory_headroom_percent < (run.tier === "1b" ? 15 : 10)) fail(`${runKey} memory-headroom threshold failed`);
   onlyKeys(run.deterministic_parity, ["case_count", "rendered_ssim"], `${runKey} parity`);
   if (run.deterministic_parity.case_count !== 20 || !Array.isArray(run.deterministic_parity.rendered_ssim) || run.deterministic_parity.rendered_ssim.length !== 20 || run.deterministic_parity.rendered_ssim.some((value) => typeof value !== "number" || value < 0.995 || value > 1)) fail(`${runKey} deterministic rendered-SSIM threshold failed`);
@@ -91,41 +127,34 @@ function validateRun(run, expectedCorpusHash) {
   if (Object.values(run.lifecycle).some((value) => value !== true)) fail(`${runKey} lifecycle evidence is incomplete`);
   onlyKeys(run.limits, REQUIRED_LIMITS, `${runKey} limits`);
   if (Object.values(run.limits).some((value) => value !== true)) fail(`${runKey} limit outcome evidence is incomplete`);
-  return { runKey, inventory: run.model.inventory_sha256, corpus: expectedCorpusHash };
+  return { runKey, inventory: run.model.inventory_sha256, metrics };
 }
 
 export function validateReceipt(receipt, corpusHash, inferenceRevision, sceneworksRevision) {
-  onlyKeys(receipt, ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "runs", "eight_b_uplift"], "receipt");
+  onlyKeys(receipt, ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "runs"], "receipt");
   if (receipt.schema_version !== 1 || !receipt.campaign_run_id) fail("receipt version or run id is missing");
   if (receipt.inference_revision !== inferenceRevision || receipt.sceneworks_revision !== sceneworksRevision || !REVISION.test(receipt.inference_revision) || !REVISION.test(receipt.sceneworks_revision)) fail("receipt has a mixed inference/SceneWorks revision");
   if (receipt.corpus_sha256 !== corpusHash) fail("receipt corpus hash does not match the exact selected corpus");
   if (!Array.isArray(receipt.runs) || receipt.runs.length !== EXPECTED_RUNS.size) fail("receipt must include exactly four backend/tier runs");
-  const seen = new Set(); const inventories = new Map();
+  const seen = new Set(); const inventories = new Map(); const analyses = new Map();
   for (const run of receipt.runs) {
-    const result = validateRun(run, corpusHash);
+    const result = validateRun(run);
     if (seen.has(result.runKey)) fail(`duplicate backend/tier evidence ${result.runKey}`);
     seen.add(result.runKey);
     const prior = inventories.get(run.tier);
     if (prior && prior !== result.inventory) fail(`mixed snapshot inventory for ${run.tier}`);
     inventories.set(run.tier, result.inventory);
+    analyses.set(result.runKey, result);
   }
   if (seen.size !== EXPECTED_RUNS.size || [...EXPECTED_RUNS].some(([key]) => !seen.has(key))) fail("missing required MLX/Candle run");
-  onlyKeys(receipt.eight_b_uplift, ["bootstrap_confidence", "by_backend"], "8B uplift");
-  if (receipt.eight_b_uplift.bootstrap_confidence !== 0.95 || !Array.isArray(receipt.eight_b_uplift.by_backend) || receipt.eight_b_uplift.by_backend.length !== 2) fail("8B bootstrap confidence/backend evidence is incomplete");
-  const records = new Map();
-  for (const record of receipt.eight_b_uplift.by_backend) {
-    onlyKeys(record, ["backend", "median_lpips_improvement", "validity_delta", "bootstrap_lower_bound"], "8B backend uplift");
-    if (!EXPECTED_RUNS.has(`${record.backend}:1b`) || records.has(record.backend)) fail("8B uplift has a duplicate or unknown backend");
-    records.set(record.backend, record);
-  }
   for (const backend of ["mlx", "candle-cuda"]) {
-    const one = receipt.runs.find((run) => run.backend === backend && run.tier === "1b").image_quality;
-    const eight = receipt.runs.find((run) => run.backend === backend && run.tier === "8b").image_quality;
-    const record = records.get(backend);
-    if (!record || one.median_lpips <= 0) fail(`8B ${backend} has no comparable 1B median LPIPS`);
+    const one = analyses.get(`${backend}:1b`).metrics;
+    const eight = analyses.get(`${backend}:8b`).metrics;
+    if (one.median_lpips <= 0) fail(`8B ${backend} has no comparable 1B median LPIPS`);
     const improvement = (one.median_lpips - eight.median_lpips) / one.median_lpips;
     const validityDelta = eight.validity_rate - one.validity_rate;
-    if (Math.abs(record.median_lpips_improvement - improvement) > 1e-12 || Math.abs(record.validity_delta - validityDelta) > 1e-12 || improvement < 0.10 || validityDelta < -0.02 || record.bootstrap_lower_bound <= 0) fail(`8B ${backend} LPIPS/validity/bootstrap threshold failed`);
+    const pairs = one.cases.flatMap((record, index) => record.accepted && eight.cases[index].accepted ? [{ one: record.lpips, eight: eight.cases[index].lpips }] : []);
+    if (pairs.length < 114 || improvement < 0.10 || validityDelta < -0.02 || pairedBootstrapLowerBound(pairs) <= 0) fail(`8B ${backend} LPIPS/validity/bootstrap threshold failed`);
   }
 }
 
