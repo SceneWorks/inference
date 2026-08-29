@@ -23,6 +23,7 @@ pub struct CacheEvent {
     pub mask: String,
     pub rope: String,
     pub context: Option<CampaignContext>,
+    pub sample_kind: &'static str,
 }
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
@@ -96,8 +97,15 @@ fn snapshot_identity(root: &Path) -> io::Result<(String, u64)> {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
                 files(root, &path, out)?;
-            } else if path.is_file() {
+            } else if path.is_file()
+                && !path
+                    .components()
+                    .any(|component| component.as_os_str() == ".git")
+            {
                 out.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
             }
         }
@@ -227,7 +235,10 @@ impl CampaignContext {
         variant: String,
         geometry: CampaignGeometry,
     ) -> Result<Self, String> {
-        if source_ref.trim().is_empty()
+        if source_ref.len() != 40
+            || !source_ref
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
             || variant.trim().is_empty()
             || snapshot_bytes == 0
             || snapshot_sha256.len() != 64
@@ -263,38 +274,19 @@ impl CacheObserver for JsonlObserver {
             "rope": event.rope, "context": context, "persistent_bytes": event.persistent_bytes,
             "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes,
             "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns,
+            "sample_kind": event.sample_kind,
         });
         if let Some(ctx) = &event.context {
             if event.phase == "metadata" {
-                let geometry = serde_json::json!({
-                    "resolution": format!("{}x{}", ctx.geometry.width, ctx.geometry.height),
-                    "reference_count": 0, "frames": ctx.geometry.frames, "prompt": "runtime",
-                    "guidance": 1.0, "layers": 40, "heads": 40, "head_dimension": 128,
-                    "sq": ctx.geometry.latent_height * ctx.geometry.latent_width,
-                    "skv": ctx.geometry.latent_frames * ctx.geometry.latent_height * ctx.geometry.latent_width,
-                    "dtype": "bf16", "mask": "causal", "rope": "3-axis",
-                });
                 value["source_ref"] = serde_json::json!(ctx.source_ref);
                 value["snapshot_sha256"] = serde_json::json!(ctx.snapshot_sha256);
                 value["snapshot_bytes"] = serde_json::json!(ctx.snapshot_bytes);
                 value["variant"] = serde_json::json!(ctx.variant);
-                value["geometry"] = geometry;
-                value["real_weights"] = serde_json::json!(true);
-                value["full_generation"] = serde_json::json!(true);
-                value["attention_kind"] = serde_json::json!("cross");
                 value["cancellation_armed"] = serde_json::json!(event.reused == 1);
                 if event.reused == 1 {
                     value["cancellation_arm_id"] =
                         serde_json::json!(format!("{}:{}", ctx.source_ref, ctx.variant));
                 }
-            } else if event.phase == "metrics" {
-                value["current_persistent_bytes"] = serde_json::json!(event.persistent_bytes);
-                value["current_read_transient_bytes"] = serde_json::json!(event.transient_bytes);
-                value["candidate_persistent_bytes"] = serde_json::json!(event.persistent_bytes);
-                value["candidate_read_transient_bytes"] = serde_json::json!(event.transient_bytes);
-                value["generation_duration_ms"] = serde_json::json!(event.elapsed_ms.max(1));
-                value["cache_read_duration_ms"] = serde_json::json!(event.elapsed_ms.min(1).max(1));
-                value["reused_requests"] = serde_json::json!(event.reused.max(1));
             }
         }
         let line = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into()) + "\n";
@@ -395,6 +387,7 @@ pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64,
                 mask: String::new(),
                 rope: String::new(),
                 context,
+                sample_kind: "allocator",
             };
             observer.record(event.clone());
             if phase == "generation-end" {
@@ -453,6 +446,7 @@ pub fn observe_tensor(
                 mask,
                 rope,
                 context,
+                sample_kind: "allocator",
             });
         }
     });

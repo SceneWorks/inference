@@ -55,11 +55,7 @@ def reduce(rows):
         rs=[r for r in rows if r["family"]==family]
         variants={r["variant"] for r in rs}
         required_variants = set(manifest.get("families", {}).get(family, ()))
-        # Only sealed producer rows participate in the campaign manifest gate.  The reducer's
-        # small legacy unit fixtures intentionally exercise arithmetic without pretending to be a
-        # complete campaign receipt.
-        producer_campaign = any("observer_events" in r for r in rs)
-        if not rs or (producer_campaign and variants != required_variants):
+        if not rs or variants != required_variants:
             decisions[family]={"decision":"blocked","reason":"sealed manifest requires every registered variant",
                                "observed_variants":sorted(variants), "required_variants":sorted(required_variants)}
             continue
