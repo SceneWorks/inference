@@ -63,12 +63,24 @@ pub trait KvCache {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
+/// Producer-only ownership evidence emitted by the contiguous cache.  This is intentionally a
+/// value type: campaign code can serialize it without exposing MLX arrays or changing the public
+/// decoder contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEvent {
+    pub operation: &'static str,
+    pub role: &'static str,
+    pub lifetime: &'static str,
+    pub bytes: u64,
+}
+
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
 /// axis each step. Correctness-first; the paged cache (P4) is the throughput replacement behind
 /// the same trait.
 #[derive(Debug)]
 pub struct ContiguousKvCache {
     layers: Vec<Option<(Array, Array)>>,
+    events: Vec<CacheEvent>,
 }
 
 impl ContiguousKvCache {
@@ -76,6 +88,7 @@ impl ContiguousKvCache {
     pub fn new(num_layers: usize) -> Self {
         Self {
             layers: (0..num_layers).map(|_| None).collect(),
+            events: Vec::new(),
         }
     }
 
@@ -92,7 +105,13 @@ impl ContiguousKvCache {
     pub fn seeded(layers: Vec<(Array, Array)>) -> Self {
         Self {
             layers: layers.into_iter().map(Some).collect(),
+            events: Vec::new(),
         }
+    }
+
+    /// Ownership events since construction, for the campaign producer only.
+    pub fn events(&self) -> &[CacheEvent] {
+        &self.events
     }
 
     /// Snapshot every layer's cached `(keys, values)` as clones (MLX arrays are refcounted, so this
@@ -115,6 +134,22 @@ impl KvCache for ContiguousKvCache {
             None => (keys.clone(), values.clone()),
         };
         self.layers[layer] = Some((merged.0.clone(), merged.1.clone()));
+        let elements = merged
+            .0
+            .shape()
+            .iter()
+            .try_fold(1_u64, |n, v| n.checked_mul(u64::try_from(*v).ok()?))
+            .ok_or_else(|| crate::error::Error::Msg("KV shape overflows byte accounting".into()))?;
+        let bytes = elements
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| crate::error::Error::Msg("KV byte accounting overflows u64".into()))?;
+        self.events.push(CacheEvent {
+            operation: "append",
+            role: "kv-cache",
+            lifetime: "persistent",
+            bytes,
+        });
         Ok(merged)
     }
 
@@ -168,6 +203,26 @@ impl KvCache for ContiguousKvCache {
     }
 
     fn reset(&mut self) {
+        let bytes = self
+            .layers
+            .iter()
+            .flatten()
+            .map(|(k, _)| {
+                k.shape()
+                    .iter()
+                    .try_fold(1_u64, |n, v| n.checked_mul(u64::try_from(*v).ok()?))
+                    .and_then(|n| n.checked_mul(4))
+            })
+            .flatten()
+            .sum();
+        if bytes > 0 {
+            self.events.push(CacheEvent {
+                operation: "reset",
+                role: "kv-cache",
+                lifetime: "released",
+                bytes,
+            });
+        }
         for slot in &mut self.layers {
             *slot = None;
         }

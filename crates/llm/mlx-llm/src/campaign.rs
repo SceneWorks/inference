@@ -244,6 +244,68 @@ pub trait Observer {
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemorySample {
+    pub pid: u32,
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub mlx_active_bytes: u64,
+    pub mlx_cache_bytes: u64,
+    pub mlx_peak_bytes: u64,
+}
+
+/// Parse Darwin footprint fields while accepting the units emitted by different macOS releases.
+pub fn parse_footprint_value(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let number: f64 = parts.next()?.parse().ok()?;
+    let unit = parts.next().unwrap_or("B").to_ascii_uppercase();
+    let multiplier = match unit.as_str() {
+        "B" => 1.0,
+        "KB" => 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    (number * multiplier).round().try_into().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn sample_memory(pid: u32) -> std::io::Result<MemorySample> {
+    use std::process::Command;
+    let output = Command::new("/usr/bin/footprint")
+        .args(["--pid", &pid.to_string(), "--noCategories", "--wired"])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("footprint failed"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name))
+            .and_then(parse_footprint_value)
+    };
+    Ok(MemorySample {
+        pid,
+        current_bytes: field("phys_footprint:")
+            .ok_or_else(|| std::io::Error::other("missing phys_footprint"))?,
+        peak_bytes: field("phys_footprint_peak:")
+            .ok_or_else(|| std::io::Error::other("missing phys_footprint_peak"))?,
+        mlx_active_bytes: mlx_rs::memory::get_active_memory() as u64,
+        mlx_cache_bytes: mlx_rs::memory::get_cache_memory() as u64,
+        mlx_peak_bytes: mlx_rs::memory::get_peak_memory() as u64,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn sample_memory(_pid: u32) -> std::io::Result<MemorySample> {
+    Err(std::io::Error::other(
+        "SC-20671 memory sampling requires macOS",
+    ))
+}
+
 /// Run one dense product-path coordinate.  This intentionally loads through `LlamaProvider` and
 /// `core-llm::TextLlm`, rather than a test double or HTTP route.  The lower-level cache observation
 /// callbacks remain a separate seam because MLX arrays are backend-owned and cannot cross the
@@ -348,6 +410,14 @@ mod tests {
         let (bytes, digest) = sealed_json(&serde_json::json!({"b": 2, "a": 1}));
         assert_eq!(digest, seal_bytes(&bytes));
         assert_ne!(digest, seal_bytes(&bytes[..bytes.len() - 1]));
+    }
+
+    #[test]
+    fn footprint_units_are_deterministic() {
+        assert_eq!(parse_footprint_value("1664 KB"), Some(1_703_936));
+        assert_eq!(parse_footprint_value("2 MB"), Some(2 * 1024 * 1024));
+        assert!(parse_footprint_value("nan B").is_none());
+        assert!(parse_footprint_value("4 TB").is_none());
     }
 
     #[test]

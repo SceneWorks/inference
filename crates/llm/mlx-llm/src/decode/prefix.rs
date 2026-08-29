@@ -58,6 +58,13 @@ pub struct PrefixCache {
     /// Full-sequence per-layer `(keys, values)` for each live entry, keyed by the index's handle.
     kv: HashMap<PrefixId, Vec<(Array, Array)>>,
     stats: PrefixStats,
+    reuse_events: Vec<PrefixReuseEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixReuseEvent {
+    pub matched_tokens: usize,
+    pub stored_sequences: usize,
 }
 
 impl PrefixCache {
@@ -67,12 +74,18 @@ impl PrefixCache {
             index: PrefixIndex::new(capacity),
             kv: HashMap::new(),
             stats: PrefixStats::default(),
+            reuse_events: Vec::new(),
         }
     }
 
     /// Cumulative reuse accounting since construction.
     pub fn stats(&self) -> PrefixStats {
         self.stats
+    }
+
+    /// Producer-only evidence of actual prefix reuse (not a caller-supplied boolean).
+    pub fn reuse_events(&self) -> &[PrefixReuseEvent] {
+        &self.reuse_events
     }
 
     /// Number of stored sequences currently held.
@@ -111,6 +124,10 @@ impl PrefixCache {
                 self.stats.hits += 1;
                 self.stats.reused_prefix_tokens += len;
                 self.stats.computed_prefill_tokens += prompt_len - len;
+                self.reuse_events.push(PrefixReuseEvent {
+                    matched_tokens: len,
+                    stored_sequences: self.kv.len(),
+                });
                 Ok(Some((ContiguousKvCache::seeded(layers), len)))
             }
             None => {
