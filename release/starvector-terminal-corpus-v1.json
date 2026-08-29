@@ -57,12 +57,18 @@
     "hostile_sanitizer": {
       "required_count": 200,
       "owner": "SceneWorks",
-      "purpose": "security/sanitizer acceptance; not an SVG-Bench image-quality case"
+      "purpose": "security/sanitizer acceptance; not an SVG-Bench image-quality case",
+      "generator": "starvector-terminal-hostile-v1",
+      "content_identity_sha256": "5aa20542d80d215cf3c6840316ee94233e6cd682018ef17c76deb43e32416fc7",
+      "selection_rule": "Generate ten hostile SVG construct families (script, event-handler, javascript-url, foreign-object, external-use, active-animation, css-import, xml-pi, cdata, doctype), twenty canonical payloads per family, in listed family then ordinal order. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 payload identities."
     },
     "prompt_composition": {
       "required_count": 60,
       "owner": "SceneWorks",
-      "purpose": "text/prompt composition acceptance; not an upstream image-quality case"
+      "purpose": "text/prompt composition acceptance; not an upstream image-quality case",
+      "generator": "starvector-terminal-prompt-v1",
+      "content_identity_sha256": "b40c9d6cbf460924833865aa152bc9aae200fd2f1d59e3c3731303b069a73d1f",
+      "selection_rule": "Generate ten canonical prompt variants for each of six compositions (geometric badge, isometric folder, rounded calendar, minimal rocket, layered landscape, abstract flower), in listed composition then ordinal order. content_identity_sha256 is SHA-256 of newline-delimited SHA-256 prompt identities."
     }
   },
   "excluded_upstream_sources": [

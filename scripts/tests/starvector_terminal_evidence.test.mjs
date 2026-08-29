@@ -1,130 +1,22 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { validatePlan, validateReceipt } from "../release/starvector_terminal_evidence.mjs";
+import { buildArtifactManifest, validatePlan, validateReceipt } from "../release/starvector_terminal_evidence.mjs";
 
 const corpus = JSON.parse(readFileSync("release/starvector-terminal-corpus-v1.json", "utf8"));
-const INFERENCE = "1".repeat(40);
-const SCENEWORKS = "2".repeat(40);
-const INVENTORY = "3".repeat(64);
-
-function cases(tier) {
-  return Array.from({ length: 120 }, (_, case_index) => ({
-    case_index,
-    accepted: true,
-    ssim: 0.90,
-    lpips: tier === "1b" ? 0.10 : 0.08,
-    latency_seconds: 119,
-  }));
-}
-
-function run(backend, tier) {
-  const provider = {
-    "mlx:1b": "mlx-starvector-1b",
-    "mlx:8b": "mlx-starvector-8b",
-    "candle-cuda:1b": "candle-starvector-1b",
-    "candle-cuda:8b": "candle-starvector-8b",
-  }[`${backend}:${tier}`];
-  return {
-    backend,
-    provider_id: provider,
-    tier,
-    device: backend === "mlx" ? "Apple Metal" : "CUDA:0",
-    model: {
-      key: `starvector-${tier}-im2svg`,
-      repository: `starvector/starvector-${tier}-im2svg`,
-      revision: tier === "1b" ? "380ab95d25a8e9ab1dc825debe238b4953ae13b9" : "518beea8dcb5f7a37c5911e92d1d62a76beee7f9",
-      inventory_sha256: INVENTORY,
-    },
-    image_quality: { cases: cases(tier), memory_headroom_percent: tier === "1b" ? 15 : 10 },
-    deterministic_parity: { case_count: 20, rendered_ssim: Array(20).fill(0.996) },
-    lifecycle: { load: true, unload: true, reload: true, memory_reported: true },
-    limits: { complete_root: true, eos: true, token: true, byte: true, wall_time: true, cancellation: true },
-  };
-}
-
-function receipt() {
-  return {
-    schema_version: 1,
-    campaign_run_id: "single-terminal-run",
-    inference_revision: INFERENCE,
-    sceneworks_revision: SCENEWORKS,
-    corpus_sha256: validatePlan(corpus),
-    runs: [run("mlx", "1b"), run("mlx", "8b"), run("candle-cuda", "1b"), run("candle-cuda", "8b")],
-  };
-}
-
-test("checked-in corpus has exact selected counts and immutable identities", () => {
-  assert.match(validatePlan(corpus), /^[0-9a-f]{64}$/);
-});
-
-test("receipt accepts exactly the four native backend/tier runs", () => {
-  validateReceipt(receipt(), validatePlan(corpus), INFERENCE, SCENEWORKS);
-});
-
-test("receipt rejects duplicate, mixed revision/inventory, and threshold mutations", () => {
-  let mutated = receipt();
-  mutated.runs[3] = { ...mutated.runs[2], tier: "1b" };
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /duplicate/);
-
-  mutated = receipt();
-  mutated.runs[2].model.inventory_sha256 = "4".repeat(64);
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /mixed snapshot inventory/);
-
-  mutated = receipt();
-  mutated.inference_revision = "0".repeat(40);
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /mixed inference/);
-
-  mutated = receipt();
-  for (const record of mutated.runs[0].image_quality.cases.slice(0, 61)) record.ssim = 0.849;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /image-quality threshold/);
-
-  mutated = receipt();
-  for (const record of mutated.runs[0].image_quality.cases.slice(113)) record.latency_seconds = 120.001;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /p95 latency/);
-
-  mutated = receipt();
-  mutated.runs[0].deterministic_parity.rendered_ssim[19] = 0.994;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /rendered-SSIM/);
-
-  mutated = receipt();
-  for (const record of mutated.runs[1].image_quality.cases) record.lpips = 0.091;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /LPIPS/);
-
-  mutated = receipt();
-  for (const record of mutated.runs[1].image_quality.cases) record.lpips = 0.10;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /bootstrap/);
-
-  mutated = receipt();
-  for (const record of mutated.runs[1].image_quality.cases.slice(0, 7)) {
-    record.accepted = false; record.ssim = null; record.lpips = null;
-  }
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /image-quality threshold|validity/);
-});
-
-test("receipt rejects aggregate spoofing and omitted or duplicated ordered cases", () => {
-  let mutated = receipt();
-  mutated.runs[0].image_quality.median_ssim = 0.99;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /keys differ/);
-
-  mutated = receipt();
-  mutated.runs[0].image_quality.cases.pop();
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /120 ordered/);
-
-  mutated = receipt();
-  mutated.runs[0].image_quality.cases[119].case_index = 118;
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /order/);
-
-  mutated = receipt();
-  mutated.eight_b_uplift = { bootstrap_confidence: 0.95, bootstrap_lower_bound: 1 };
-  assert.throws(() => validateReceipt(mutated, validatePlan(corpus), INFERENCE, SCENEWORKS), /receipt keys differ/);
-});
-
-test("corpus rejects count and immutable-row mutations", () => {
-  const mutated = structuredClone(corpus);
-  mutated.upstream_image_quality_cases.sources[0].row_count = 29;
-  assert.throws(() => validatePlan(mutated), /exact first thirty/);
-  mutated.upstream_image_quality_cases.sources[0].row_count = 30;
-  mutated.upstream_image_quality_cases.sources[0].parquet_sha256 = "0".repeat(64);
-  assert.throws(() => validatePlan(mutated), /immutable identity/);
-});
+const INFERENCE = "1".repeat(40), SCENEWORKS = "2".repeat(40), h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
+const source = (index) => [["starvector/svg-stack-simple","1d2a96a17cc0c4c1f337b7631adc8c5885bc72ea"],["starvector/svg-icons-simple","e1918a27ba6649e856e5db0710d8a6c7046762c1"],["starvector/svg-emoji-simple","fa75b3617872ae57e6f3cb450aee65dbccbd69e0"],["starvector/svg-fonts-simple","453c739ea13ad2685127f721c333f14d99485299"]][Math.floor(index / 30)];
+const hostileKinds = ["script","event-handler","javascript-url","foreign-object","external-use","active-animation","css-import","xml-pi","cdata","doctype"];
+function hostilePayload(index) { const n = index % 20; switch (hostileKinds[Math.floor(index / 20)]) { case "script": return `<svg><script>terminal_${n}()</script></svg>`; case "event-handler": return `<svg onload="terminal_${n}()"><path d="M0 0"/></svg>`; case "javascript-url": return `<svg><a href="javascript:terminal_${n}()"><path d="M0 0"/></a></svg>`; case "foreign-object": return `<svg><foreignObject><body>terminal_${n}</body></foreignObject></svg>`; case "external-use": return `<svg><use href="https://invalid.example/${n}.svg#x"/></svg>`; case "active-animation": return `<svg><animate attributeName="x" values="0;${n}"/></svg>`; case "css-import": return `<svg><style>@import url(https://invalid.example/${n}.css);</style></svg>`; case "xml-pi": return `<?xml-stylesheet href="https://invalid.example/${n}.css"?><svg/>`; case "cdata": return `<svg><![CDATA[<script>terminal_${n}()</script>]]></svg>`; default: return `<!DOCTYPE svg SYSTEM "https://invalid.example/${n}.dtd"><svg/>`; } }
+const prompts = ["geometric badge","isometric folder","rounded calendar","minimal rocket","layered landscape","abstract flower"];
+const promptPayload = (index) => `Create a ${prompts[Math.floor(index / 10)]} vector illustration, variant ${index % 10}, with clear silhouette, balanced composition, and no text.`;
+function imageCases(tier, backend) { return Array.from({ length: 120 }, (_, case_index) => ({ case_index, source: { dataset: source(case_index)[0], revision: source(case_index)[1], row_index: case_index % 30 }, source_svg_sha256: d(`${backend}-${tier}-source-${case_index}`), input_png_sha256: d(`${backend}-${tier}-png-${case_index}`), provider_transcript_sha256: d(`${backend}-${tier}-transcript-${case_index}`), finish_reason: "complete_root", canonical_svg_sha256: d(`${backend}-${tier}-svg-${case_index}`), preview_png_sha256: d(`${backend}-${tier}-preview-${case_index}`), accepted: true, ssim: .90, lpips: tier === "1b" ? .10 : .08, latency_seconds: 119 })); }
+function run(backend, tier) { return { backend, provider_id: {"mlx:1b":"mlx-starvector-1b","mlx:8b":"mlx-starvector-8b","candle-cuda:1b":"candle-starvector-1b","candle-cuda:8b":"candle-starvector-8b"}[`${backend}:${tier}`], tier, device: backend === "mlx" ? "Apple Metal" : "CUDA:0", model: { key:`starvector-${tier}-im2svg`, repository:`starvector/starvector-${tier}-im2svg`, revision:tier === "1b" ? "380ab95d25a8e9ab1dc825debe238b4953ae13b9":"518beea8dcb5f7a37c5911e92d1d62a76beee7f9", inventory_sha256:d(`inventory-${tier}`) }, hardware: { runner_name:"fixture",os:"test",arch:"arm64",system_memory_total_bytes:1000,baseline_available_bytes:900,peak_process_rss_bytes:500,accelerator:{name:"fixture",uuid:null,driver_runtime:"fixture",total_bytes:1000,baseline_free_bytes:900,peak_used_bytes:tier === "1b" ? 850 : 880,raw_probe_sha256:d(`probe-${backend}-${tier}`)}}, image_quality:{cases:imageCases(tier,backend)}, deterministic_parity:{case_count:20,cases:Array.from({length:20},(_,case_index)=>({case_index,seed:case_index,first_preview_png_sha256:d(`${backend}-${tier}-first-${case_index}`),second_preview_png_sha256:d(`${backend}-${tier}-second-${case_index}`),rendered_ssim:.996}))}, lifecycle:{load:true,unload:true,reload:true,memory_reported:true},limits:{complete_root:true,eos:true,token:true,byte:true,wall_time:true,cancellation:true},lifecycle_memory_transcript_sha256:d(`lifecycle-${backend}-${tier}`) }; }
+function hostile() { return { corpus_sha256:corpus.sceneworks_owned_suites.hostile_sanitizer.content_identity_sha256, sanitizer_version:"fixture", cases:Array.from({length:200},(_,case_index)=>({case_index,case_id:`hostile-v1-${case_index}`,input_sha256:h(hostilePayload(case_index)),expected_policy:"reject_or_sanitize_inert",outcome:"rejected",error_code:"rejected",canonical_svg_sha256:null,preview_png_sha256:null,published_paths:[],staging_residue:[],result_contains_inline_svg:false}))}; }
+function prompt() { return { corpus_sha256:corpus.sceneworks_owned_suites.prompt_composition.content_identity_sha256,raster_provider_id:"fixture",raster_model:"fixture",raster_revision:"fixture",raster_inventory_sha256:d("raster-inventory"),clip_provider_id:"fixture",clip_model:"fixture",clip_revision:"fixture",clip_inventory_sha256:d("clip-inventory"),metric_transcript_sha256:d("prompt-metric"),cases:Array.from({length:60},(_,case_index)=>({case_index,case_id:`prompt-v1-${case_index}`,prompt_sha256:h(promptPayload(case_index)),raster_png_sha256:d(`raster-${case_index}`),vector_provider_transcript_sha256:d(`vector-${case_index}`),canonical_svg_sha256:d(`prompt-svg-${case_index}`),preview_png_sha256:d(`prompt-preview-${case_index}`),accepted:true,raster_prompt_cosine:.90,preview_prompt_cosine:.89,alignment_loss:.01}))}; }
+function receipt() { const value={schema_version:1,campaign_run_id:"terminal-fixture",inference_revision:INFERENCE,sceneworks_revision:SCENEWORKS,corpus_sha256:validatePlan(corpus),execution:{repository:"SceneWorks/SceneWorks",workflow_run_id:"1",workflow_run_attempt:1,head_sha:SCENEWORKS,started_at:"2026-08-29T00:00:00Z",completed_at:"2026-08-29T00:01:00Z",clean_tree:true},producer:{command:"fixture",artifact_name:"fixture",transcript_sha256:d("producer"),artifact_manifest_sha256:d("pending")},metric_identity:{ssim_algorithm:"fixture",ssim_version:"1",lpips_implementation:"fixture",lpips_version:"1",lpips_network:"alex",dependency_lock_sha256:d("lock"),lpips_weights_sha256:d("weights"),clip_implementation:"fixture",clip_version:"1",metric_transcript_sha256:d("metric")},inference_preflight:{workflow_run_id:"1",workflow_run_attempt:1,head_sha:INFERENCE,inventory_artifacts:[{tier:"1b",sha256:d("preflight-1b")},{tier:"8b",sha256:d("preflight-8b")}],hook_logs:["mlx:1b","mlx:8b","candle-cuda:1b","candle-cuda:8b"].map((key)=>{const [backend,tier]=key.split(":");return {backend,tier,sha256:d(`hook-${key}`)};})},runs:[run("mlx","1b"),run("mlx","8b"),run("candle-cuda","1b"),run("candle-cuda","8b")],hostile_sanitizer:hostile(),prompt_composition:prompt()}; value.artifact_manifest=buildArtifactManifest(value,corpus); value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256; return value; }
+test("checked-in corpus carries exact selected and generated content identities",()=>assert.match(validatePlan(corpus),/^[0-9a-f]{64}$/));
+test("receipt accepts raw evidence for four providers, hostile suite, and prompt lineage",()=>validateReceipt(receipt(),validatePlan(corpus),INFERENCE,SCENEWORKS,corpus));
+test("receipt rejects omitted/duplicated content, forged summaries, and false acceptance",()=>{let value=receipt();value.runs[0].image_quality.cases.pop();assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/120 ordered/);value=receipt();value.runs[0].image_quality.cases[119].case_index=118;assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/order/);value=receipt();value.runs[0].image_quality.median_ssim=.99;assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/keys differ/);value=receipt();value.hostile_sanitizer.cases[3].result_contains_inline_svg=true;assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/hostile evidence/);value=receipt();value.prompt_composition.cases[0].alignment_loss=.001;assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/forged alignment/);});
+test("receipt rejects corpus drift, mixed artifacts/transcripts, and run provenance",()=>{let value=receipt();value.hostile_sanitizer.cases[0].input_sha256=d("drift");assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/hostile evidence/);value=receipt();value.runs[0].image_quality.cases[0].provider_transcript_sha256=d("foreign");assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/artifact manifest missing/);value=receipt();value.artifact_manifest.campaign_run_id="other";assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/mixed run/);value=receipt();value.execution.clean_tree=false;assert.throws(()=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus),/execution provenance/);});

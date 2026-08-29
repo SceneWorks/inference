@@ -122,12 +122,19 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         self.assertEqual(case["ssim"]["type"], ["number", "null"])
         parity = schema["$defs"]["parity"]["properties"]
         self.assertEqual(parity["case_count"]["const"], 20)
-        self.assertEqual(parity["rendered_ssim"]["minItems"], 20)
+        self.assertEqual(parity["cases"]["minItems"], 20)
+        self.assertIn("hostile_sanitizer", schema["properties"])
+        self.assertIn("prompt_composition", schema["properties"])
+        self.assertIn("artifact_manifest", schema["properties"])
+        self.assertEqual(schema["$defs"]["hostile"]["properties"]["cases"]["minItems"], 200)
+        self.assertEqual(schema["$defs"]["prompt"]["properties"]["cases"]["minItems"], 60)
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
         self.assertEqual(corpus["upstream_image_quality_cases"]["required_count"], 120)
         self.assertEqual(corpus["deterministic_parity_cases"]["required_count_per_backend"], 20)
         self.assertEqual(corpus["sceneworks_owned_suites"]["hostile_sanitizer"]["required_count"], 200)
         self.assertEqual(corpus["sceneworks_owned_suites"]["prompt_composition"]["required_count"], 60)
+        self.assertRegex(corpus["sceneworks_owned_suites"]["hostile_sanitizer"]["content_identity_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(corpus["sceneworks_owned_suites"]["prompt_composition"]["content_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(corpus["upstream_image_quality_cases"]["sources"]), 4)
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
@@ -143,7 +150,7 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
                 check=False,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("exact first thirty", result.stderr)
+        self.assertIn("immutable source identity", result.stderr)
 
 
 if __name__ == "__main__":
