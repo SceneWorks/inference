@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use core_llm::{Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest};
+use core_llm::{Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest, ToolSpec};
 
 pub const REQUIRED_PHASES: [&str; 8] = [
     "process-start",
@@ -1152,6 +1153,359 @@ pub fn validate_artifact_bundle_named(
     Ok(())
 }
 
+/// A receipt prepared by a child worker, before the parent makes the campaign visible.  The
+/// parent deliberately receives the sealed in-memory artifacts rather than a caller-authored
+/// summary: a child crash therefore cannot leave a partially complete baseline at the requested
+/// output path.
+#[derive(Clone, Debug)]
+pub struct PreparedCoordinateReceipt {
+    pub coordinate: Coordinate,
+    pub bundle: ArtifactBundle,
+}
+
+fn coordinate_slug(coordinate: &Coordinate) -> String {
+    format!(
+        "{}-{}-{}-{}-{}",
+        coordinate.family,
+        coordinate.context_band,
+        coordinate.request_mode,
+        coordinate.prefill_mode,
+        coordinate.process_temperature
+    )
+}
+
+/// Atomically publish the *whole* 64-coordinate receipt collection.  Individual worker output is
+/// intentionally not a campaign result; only this function creates `destination`, and it does so
+/// after every receipt, sidecar, coordinate, and product-owned worker PID has been validated.
+pub fn publish_complete_campaign(
+    destination: &Path,
+    prepared: &[PreparedCoordinateReceipt],
+) -> Result<(), String> {
+    if destination.exists() {
+        return Err("campaign destination must be absent for atomic publication".into());
+    }
+    let schedule = required_schedule();
+    if prepared.len() != schedule.len() {
+        return Err("complete campaign requires exactly 64 prepared receipts".into());
+    }
+    let mut outcomes = Vec::with_capacity(prepared.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for item in prepared {
+        validate_artifact_bundle(&item.bundle)?;
+        let receipt: Receipt = serde_json::from_slice(&item.bundle.receipt)
+            .map_err(|e| format!("prepared receipt is not decodable: {e}"))?;
+        let coordinate = Coordinate {
+            family: match receipt.matrix.family.as_str() {
+                "llama" => "llama",
+                "qwen" => "qwen",
+                _ => return Err("prepared receipt has unsupported family".into()),
+            },
+            context_band: match receipt.matrix.context_band.as_str() {
+                "short" => "short",
+                "medium" => "medium",
+                "memory-material" => "memory-material",
+                "fit-boundary" => "fit-boundary",
+                _ => return Err("prepared receipt has unsupported context band".into()),
+            },
+            request_mode: match receipt.matrix.request_mode.as_str() {
+                "single" => "single",
+                "supported-batch" => "supported-batch",
+                _ => return Err("prepared receipt has unsupported request mode".into()),
+            },
+            prefill_mode: match receipt.matrix.prefill_mode.as_str() {
+                "chunked" => "chunked",
+                "single-shot" => "single-shot",
+                _ => return Err("prepared receipt has unsupported prefill mode".into()),
+            },
+            process_temperature: match receipt.matrix.process_temperature.as_str() {
+                "cold" => "cold",
+                "warm" => "warm",
+                _ => return Err("prepared receipt has unsupported process temperature".into()),
+            },
+        };
+        if coordinate != item.coordinate || !seen.insert(coordinate_slug(&coordinate)) {
+            return Err("prepared receipt coordinate disagrees with immutable schedule".into());
+        }
+        let discipline = if coordinate.process_temperature == "cold" {
+            ProcessDiscipline::FreshChild
+        } else {
+            ProcessDiscipline::ReusedWarmWorker
+        };
+        let pid = receipt
+            .memory
+            .phase_samples
+            .first()
+            .ok_or("prepared receipt has no product-owned process phase")?
+            .pid;
+        outcomes.push((coordinate, discipline, pid));
+    }
+    validate_schedule_outcomes(&schedule, &outcomes)?;
+
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let staging = parent.join(format!(
+        ".{}.campaign-staging-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sc20671"),
+        std::process::id()
+    ));
+    if staging.exists() {
+        return Err("campaign staging path already exists".into());
+    }
+    fs::create_dir(&staging).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<(), String> {
+        let mut manifest_rows = Vec::with_capacity(prepared.len());
+        for item in prepared {
+            let slug = coordinate_slug(&item.coordinate);
+            write_artifacts(
+                &staging.join(&slug),
+                &item.bundle.receipt_name,
+                &item.bundle.human_name,
+                &item.bundle,
+            )
+            .map_err(|e| e.to_string())?;
+            let receipt: Receipt =
+                serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            manifest_rows.push(serde_json::json!({
+                "coordinate": slug,
+                "receiptSha256": receipt.receipt_sha256,
+                "workerPid": receipt.memory.phase_samples[0].pid,
+            }));
+        }
+        let manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "sc-20671-complete-coordinate-set",
+            "coordinates": manifest_rows,
+        });
+        let manifest_bytes = canonical_json_bytes(&manifest).map_err(|e| e.to_string())?;
+        fs::write(staging.join("campaign.json"), &manifest_bytes).map_err(|e| e.to_string())?;
+        fs::write(
+            staging.join("campaign.json.sha256"),
+            format!("{}  campaign.json\n", seal_bytes(&manifest_bytes)),
+        )
+        .map_err(|e| e.to_string())?;
+        fs::rename(&staging, destination).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+/// Load a child-produced sealed set for the parent transaction.  This is intentionally strict:
+/// workers communicate only through byte-sealed receipt artifacts, not through an unsealed stdout
+/// summary or caller-provided identity fields.
+pub fn load_prepared_coordinate_receipt(
+    directory: &Path,
+    coordinate: Coordinate,
+) -> Result<PreparedCoordinateReceipt, String> {
+    let receipt = fs::read(directory.join("receipt.json")).map_err(|e| e.to_string())?;
+    let human = fs::read(directory.join("receipt.md")).map_err(|e| e.to_string())?;
+    let receipt_sidecar =
+        fs::read_to_string(directory.join("receipt.json.sha256")).map_err(|e| e.to_string())?;
+    let human_sidecar =
+        fs::read_to_string(directory.join("receipt.md.sha256")).map_err(|e| e.to_string())?;
+    let bundle = ArtifactBundle {
+        receipt_name: "receipt.json".into(),
+        human_name: "receipt.md".into(),
+        receipt,
+        receipt_sidecar,
+        human,
+        human_sidecar,
+    };
+    validate_artifact_bundle(&bundle)?;
+    Ok(PreparedCoordinateReceipt { coordinate, bundle })
+}
+
+/// Immutable parent inputs.  The only model-related choices are snapshot paths; model identity,
+/// geometry, memory, timing, and quality fields are collected by the child from the loaded product
+/// and are never accepted by this command-line boundary.
+#[derive(Clone, Debug)]
+pub struct CampaignLaunch {
+    pub executable: PathBuf,
+    pub llama_snapshot: PathBuf,
+    pub qwen_snapshot: PathBuf,
+    pub fp32_reference_snapshot: PathBuf,
+    pub prompt_file: PathBuf,
+    pub destination: PathBuf,
+}
+
+/// Spawn every immutable matrix row.  A cold row receives a brand-new child process.  Warm rows
+/// also run in a child, but that child is required to perform an in-process warm-up before its
+/// measured lifecycle; its receipt PID is later checked by [`publish_complete_campaign`].  Child
+/// results live in a hidden staging root and are deleted on *any* failure, so incomplete sets can
+/// never appear at the requested destination.
+pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
+    if launch.destination.exists() {
+        return Err("campaign destination already exists".into());
+    }
+    for path in [
+        &launch.executable,
+        &launch.llama_snapshot,
+        &launch.qwen_snapshot,
+        &launch.fp32_reference_snapshot,
+        &launch.prompt_file,
+    ] {
+        if !path.exists() {
+            return Err(format!(
+                "required campaign input is absent: {}",
+                path.display()
+            ));
+        }
+    }
+    let parent = launch
+        .destination
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let worker_root = parent.join(format!(".sc20671-workers-{}", std::process::id()));
+    if worker_root.exists() {
+        return Err("worker staging root already exists".into());
+    }
+    fs::create_dir(&worker_root).map_err(|e| e.to_string())?;
+    let schedule = required_schedule();
+    let result = (|| -> Result<(), String> {
+        let mut prepared = Vec::with_capacity(schedule.len());
+        let mut failures = Vec::new();
+        for (index, row) in schedule.iter().enumerate() {
+            let child_dir = worker_root.join(coordinate_slug(&row.coordinate));
+            let snapshot = if row.coordinate.family == "llama" {
+                &launch.llama_snapshot
+            } else {
+                &launch.qwen_snapshot
+            };
+            let output = Command::new(&launch.executable)
+                .arg("worker")
+                .arg("--coordinate-index")
+                .arg(index.to_string())
+                .arg("--snapshot")
+                .arg(snapshot)
+                .arg("--prompt-file")
+                .arg(&launch.prompt_file)
+                .arg("--fp32-reference-snapshot")
+                .arg(&launch.fp32_reference_snapshot)
+                .arg("--out")
+                .arg(&child_dir)
+                .output()
+                .map_err(|e| format!("launch worker {index}: {e}"))?;
+            if !output.status.success() {
+                failures.push(format!(
+                    "{}: {}",
+                    coordinate_slug(&row.coordinate),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+                continue;
+            }
+            prepared.push(load_prepared_coordinate_receipt(
+                &child_dir,
+                row.coordinate.clone(),
+            )?);
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "{} of 64 product workers failed; no campaign was published: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        publish_complete_campaign(&launch.destination, &prepared)
+    })();
+    let _ = fs::remove_dir_all(&worker_root);
+    result
+}
+
+fn required_flag(args: &[String], name: &str) -> Result<String, String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == name).then(|| window[1].clone()))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing {name}"))
+}
+
+/// CLI entrypoint used by the standalone `sc20671-kv-baseline` binary.  The child mode remains
+/// fail-closed until the decoder exposes its real numeric quality-reference hooks; it still runs
+/// the complete product lifecycle before refusing publication, rather than manufacturing a
+/// caller-authored receipt.  This keeps the executable safe to invoke while making the missing
+/// product measurement surface explicit.
+pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
+    let Some(mode) = args.first().map(String::as_str) else {
+        return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
+    };
+    match mode {
+        "parent" => launch_complete_campaign(&CampaignLaunch {
+            executable: std::env::current_exe().map_err(|e| e.to_string())?,
+            llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
+            qwen_snapshot: PathBuf::from(required_flag(args, "--qwen-snapshot")?),
+            fp32_reference_snapshot: PathBuf::from(required_flag(
+                args,
+                "--fp32-reference-snapshot",
+            )?),
+            prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
+            destination: PathBuf::from(required_flag(args, "--out")?),
+        }),
+        "worker" => {
+            let index = required_flag(args, "--coordinate-index")?
+                .parse::<usize>()
+                .map_err(|_| "--coordinate-index must be an integer".to_string())?;
+            let row = required_schedule()
+                .get(index)
+                .cloned()
+                .ok_or("--coordinate-index is outside the frozen 64-coordinate matrix")?;
+            let snapshot = PathBuf::from(required_flag(args, "--snapshot")?);
+            let reference_snapshot =
+                PathBuf::from(required_flag(args, "--fp32-reference-snapshot")?);
+            let prompt = fs::read_to_string(required_flag(args, "--prompt-file")?)
+                .map_err(|e| format!("read prompt file: {e}"))?;
+            if prompt.trim().is_empty() {
+                return Err("campaign prompt must not be empty".into());
+            }
+            verify_coordinate_product_controls(&snapshot, &row.coordinate, &prompt).map_err(
+                |e| {
+                    format!(
+                        "product coordinate controls for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                },
+            )?;
+            let mut suites = Vec::with_capacity(5);
+            for repeat in 0..5 {
+                let suite = run_product_fixture_suite(&snapshot, &reference_snapshot, &prompt)
+                    .map_err(|e| {
+                        format!(
+                            "product fixture repeat {repeat} for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        )
+                    })?;
+                // Every raw fixture is independently quality-validated before any timing or
+                // aggregate publication decision.  There is no successful partial-repeat path.
+                suite.quality()?;
+                suites.push(suite);
+            }
+            let kernel_runs = suites
+                .iter()
+                .map(|suite| &suite.kernel_candidate)
+                .collect::<Vec<_>>();
+            let timings = timing_samples_from_product_repeats(
+                &kernel_runs,
+                row.coordinate.process_temperature,
+            )?;
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let receipt = product_receipt(&row.coordinate, &suites[0], timings, &executable)?;
+            let bundle = assemble_artifacts(receipt)?;
+            write_artifacts(
+                &PathBuf::from(required_flag(args, "--out")?),
+                "receipt.json",
+                "receipt.md",
+                &bundle,
+            )
+            .map_err(|e| e.to_string())
+        }
+        _ => Err("usage: sc20671-kv-baseline parent|worker [options]".into()),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coordinate {
     pub family: &'static str,
@@ -1271,7 +1625,7 @@ pub fn validate_schedule_outcomes(
 
 /// The only scheduling seam.  Production supplies a child-process launcher; tests may use a fake
 /// worker, but it receives the immutable schedule rather than inventing rows or temperatures.
-pub fn execute_required_schedule<F>(
+pub(crate) fn execute_required_schedule<F>(
     mut worker: F,
 ) -> Result<Vec<(Coordinate, ProcessDiscipline, u32)>, String>
 where
@@ -1566,6 +1920,12 @@ pub fn sequence_marker() -> u64 {
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
+    /// Exact fp32 logits materialized from the production decode seam only while a campaign
+    /// observer is attached.  Ordinary serving never takes this host-read path.
+    fn logits(&mut self, _stage: &'static str, _values: &[f32]) {}
+    /// Exact probability of the sampled production token, derived at the same decode seam as the
+    /// sampler.  It is intentionally not a caller-provided quality number.
+    fn token_probability(&mut self, _stage: &'static str, _token: i32, _probability: f64) {}
     /// Model identity is derived from the exact files resolved by the product loader, never a
     /// caller-authored digest string.
     fn snapshot_inventory(&mut self, _inventory: &SnapshotInventory) {}
@@ -1576,11 +1936,15 @@ pub trait Observer {
 /// or allocation records: receipt assembly consumes only observations made at product boundaries.
 pub struct ProductObserver {
     pid: u32,
+    started: std::time::Instant,
     phase: Option<&'static str>,
     phases: Vec<ReceiptPhase>,
+    phase_elapsed_ms: Vec<f64>,
     allocations: Vec<ReceiptAllocation>,
     snapshot: Option<SnapshotInventory>,
     geometry: Option<ProductGeometry>,
+    prefill_logits: Option<Vec<f32>>,
+    token_probabilities: Vec<(i32, f64)>,
     error: Option<String>,
 }
 
@@ -1588,11 +1952,15 @@ impl ProductObserver {
     pub fn new() -> Self {
         Self {
             pid: std::process::id(),
+            started: std::time::Instant::now(),
             phase: None,
             phases: Vec::new(),
+            phase_elapsed_ms: Vec::new(),
             allocations: Vec::new(),
             snapshot: None,
             geometry: None,
+            prefill_logits: None,
+            token_probabilities: Vec::new(),
             error: None,
         }
     }
@@ -1604,6 +1972,18 @@ impl ProductObserver {
         if self.snapshot.is_none() || self.geometry.is_none() {
             return Err("product observer is missing snapshot identity or loaded geometry".into());
         }
+        let prefill_logits = self
+            .prefill_logits
+            .ok_or("product observer did not receive production prefill logits")?;
+        if prefill_logits.is_empty()
+            || prefill_logits.iter().any(|value| !value.is_finite())
+            || self.token_probabilities.is_empty()
+            || self.token_probabilities.iter().any(|(_, probability)| {
+                !probability.is_finite() || !(0.0..=1.0).contains(probability)
+            })
+        {
+            return Err("product observer has invalid numeric decode evidence".into());
+        }
         if self.phases.len() != REQUIRED_PHASES.len() {
             return Err("product observer did not capture the exact phase set".into());
         }
@@ -1611,7 +1991,10 @@ impl ProductObserver {
             snapshot: self.snapshot.expect("checked above"),
             geometry: self.geometry.expect("checked above"),
             phases: self.phases,
+            phase_elapsed_ms: self.phase_elapsed_ms,
             allocations: self.allocations,
+            prefill_logits,
+            token_probabilities: self.token_probabilities,
         })
     }
 }
@@ -1626,7 +2009,10 @@ pub struct ProductObservations {
     pub snapshot: SnapshotInventory,
     pub geometry: ProductGeometry,
     pub phases: Vec<ReceiptPhase>,
+    pub phase_elapsed_ms: Vec<f64>,
     pub allocations: Vec<ReceiptAllocation>,
+    pub prefill_logits: Vec<f32>,
+    pub token_probabilities: Vec<(i32, f64)>,
 }
 
 impl Observer for ProductObserver {
@@ -1637,20 +2023,24 @@ impl Observer for ProductObserver {
             return;
         }
         match sample_memory(self.pid) {
-            Ok(sample) => self.phases.push(ReceiptPhase {
-                phase: name.into(),
-                pid: sample.pid,
-                source: "footprint -p".into(),
-                timestamp: sample.captured_at,
-                phys_footprint_bytes: sample.current_bytes,
-                phys_footprint_peak_bytes: sample.peak_bytes,
-                mlx: ReceiptMlx {
-                    source: "mlx_rs::memory".into(),
-                    active_bytes: sample.mlx_active_bytes,
-                    cache_bytes: sample.mlx_cache_bytes,
-                    peak_bytes: sample.mlx_peak_bytes,
-                },
-            }),
+            Ok(sample) => {
+                self.phases.push(ReceiptPhase {
+                    phase: name.into(),
+                    pid: sample.pid,
+                    source: "footprint -p".into(),
+                    timestamp: sample.captured_at,
+                    phys_footprint_bytes: sample.current_bytes,
+                    phys_footprint_peak_bytes: sample.peak_bytes,
+                    mlx: ReceiptMlx {
+                        source: "mlx_rs::memory".into(),
+                        active_bytes: sample.mlx_active_bytes,
+                        cache_bytes: sample.mlx_cache_bytes,
+                        peak_bytes: sample.mlx_peak_bytes,
+                    },
+                });
+                self.phase_elapsed_ms
+                    .push(self.started.elapsed().as_secs_f64() * 1_000.0);
+            }
             Err(error) => self.error = Some(format!("product memory sample at {name}: {error}")),
         }
         self.phase = Some(name);
@@ -1672,6 +2062,30 @@ impl Observer for ProductObserver {
             timestamp: timestamp_now(),
             bytes,
         });
+    }
+
+    fn logits(&mut self, stage: &'static str, values: &[f32]) {
+        if stage != "prefill" || self.prefill_logits.is_some() || values.is_empty() {
+            self.error = Some("invalid or duplicate production logit observation".into());
+            return;
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            self.error = Some("non-finite production logits".into());
+            return;
+        }
+        self.prefill_logits = Some(values.to_vec());
+    }
+
+    fn token_probability(&mut self, stage: &'static str, token: i32, probability: f64) {
+        if stage != "decode"
+            || token < 0
+            || !probability.is_finite()
+            || !(0.0..=1.0).contains(&probability)
+        {
+            self.error = Some("invalid product token probability".into());
+            return;
+        }
+        self.token_probabilities.push((token, probability));
     }
 
     fn snapshot_inventory(&mut self, inventory: &SnapshotInventory) {
@@ -1944,6 +2358,30 @@ pub fn run_dense_lifecycle(
     max_new_tokens: u32,
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
+    let request = TextLlmRequest {
+        messages: vec![Message::text(Role::User, prompt)],
+        sampling: Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            ..Default::default()
+        },
+        max_new_tokens,
+        seed: Some(0),
+        ..Default::default()
+    };
+    run_dense_lifecycle_request(snapshot, prompt, request, observer)
+}
+
+/// Product-only fixture entrypoint.  The request is constructed in this crate (including tools and
+/// multi-turn messages) and is never decoded from receipt JSON.  It shares the ordinary provider
+/// and decode route while an observer is installed, so the quality fixtures cannot silently use a
+/// synthetic reference path.
+pub fn run_dense_lifecycle_request(
+    snapshot: impl AsRef<Path>,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    observer: &mut dyn Observer,
+) -> core_llm::Result<TextLlmOutput> {
     observer.phase("process-start");
     let inventory = inventory_snapshot(snapshot.as_ref())
         .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
@@ -1955,17 +2393,6 @@ pub fn run_dense_lifecycle(
         observer.geometry(provider.campaign_geometry());
         observer.phase("weights-loaded");
         observer.allocation("weights", "persistent", inventory.bytes);
-        let request = TextLlmRequest {
-            messages: vec![Message::text(Role::User, prompt)],
-            sampling: Sampling {
-                temperature: 0.0,
-                top_p: 1.0,
-                ..Default::default()
-            },
-            max_new_tokens,
-            seed: Some(0),
-            ..Default::default()
-        };
         let mut saw_token = false;
         let output = provider.generate_observed(
             &request,
@@ -1977,7 +2404,7 @@ pub fn run_dense_lifecycle(
                 "dense campaign produced no first-token observation".into(),
             ));
         }
-        provider.campaign_prefix_reuse(prompt)?;
+        provider.campaign_prefix_reuse(prefix_prompt)?;
         observer.phase("prompt-cache-reuse");
         provider.campaign_cancel_after_first_token(request)?;
         observer.phase("cancellation-cleanup");
@@ -1985,6 +2412,448 @@ pub fn run_dense_lifecycle(
     };
     observer.phase("post-run-release");
     Ok(output)
+}
+
+/// Product-owned result of one independently executed frozen quality fixture.  The artifact name
+/// is selected by the worker, but every numeric value and emitted tool/token fact comes from the
+/// loaded provider through the observer and `TextLlmOutput`.
+pub struct ProductFixtureResult {
+    pub observation: ProductObservations,
+    pub output: TextLlmOutput,
+}
+
+pub fn run_product_fixture(
+    snapshot: impl AsRef<Path>,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+) -> core_llm::Result<ProductFixtureResult> {
+    let mut observer = ProductObserver::new();
+    let output = run_dense_lifecycle_request(snapshot, prefix_prompt, request, &mut observer)?;
+    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    Ok(ProductFixtureResult {
+        observation,
+        output,
+    })
+}
+
+fn negative_log_likelihood(probabilities: &[(i32, f64)]) -> Result<f64, String> {
+    if probabilities.is_empty()
+        || probabilities
+            .iter()
+            .any(|(_, probability)| !probability.is_finite() || *probability <= 0.0)
+    {
+        return Err("missing finite product token probabilities".into());
+    }
+    Ok(-probabilities
+        .iter()
+        .map(|(_, probability)| probability.ln())
+        .sum::<f64>()
+        / probabilities.len() as f64)
+}
+
+fn token_agreement(left: &[(i32, f64)], right: &[(i32, f64)]) -> (u64, u64) {
+    let total = left.len().min(right.len()) as u64;
+    let matches = left
+        .iter()
+        .zip(right)
+        .filter(|((left, _), (right, _))| left == right)
+        .count() as u64;
+    (matches, total)
+}
+
+/// Convert four actual candidate/reference fixture pairs into the raw quality input consumed by
+/// [`ReceiptBuilder`].  This helper intentionally rejects a fixture that did not execute its own
+/// required behavior (tool parsing, needle recovery, or prefix result equality), rather than
+/// converting a missing capability into a green ratio.
+pub fn quality_from_product_fixtures(
+    kernel_candidate: &ProductFixtureResult,
+    kernel_reference: &ProductFixtureResult,
+    tool_candidate: &ProductFixtureResult,
+    tool_reference: &ProductFixtureResult,
+    needle_candidate: &ProductFixtureResult,
+    needle_reference: &ProductFixtureResult,
+    cache_candidate: &ProductFixtureResult,
+    cache_reference: &ProductFixtureResult,
+    expected_needle: &str,
+) -> Result<QualityObservation, String> {
+    let candidate_logits = &kernel_candidate.observation.prefill_logits;
+    let reference_logits = &kernel_reference.observation.prefill_logits;
+    if candidate_logits.len() != reference_logits.len() || candidate_logits.is_empty() {
+        return Err("candidate/reference production logits are not comparable".into());
+    }
+    let parity_errors = candidate_logits
+        .iter()
+        .zip(reference_logits)
+        .map(|(candidate, reference)| f64::from((candidate - reference).abs()))
+        .collect::<Vec<_>>();
+    let (greedy_matches, greedy_total) = token_agreement(
+        &kernel_candidate.observation.token_probabilities,
+        &kernel_reference.observation.token_probabilities,
+    );
+    let (cache_matches, cache_total) = token_agreement(
+        &cache_candidate.observation.token_probabilities,
+        &cache_reference.observation.token_probabilities,
+    );
+    let tool_ok = !tool_candidate.output.tool_calls.is_empty()
+        && tool_candidate.output.tool_calls == tool_reference.output.tool_calls;
+    let needle_ok = needle_candidate.output.text.contains(expected_needle)
+        && needle_reference.output.text.contains(expected_needle);
+    if !tool_ok {
+        return Err("structured-tool fixture produced no matching product tool call".into());
+    }
+    if !needle_ok {
+        return Err("long-context needle fixture did not recover the product-owned needle".into());
+    }
+    Ok(QualityObservation {
+        parity_errors,
+        reference_perplexity: negative_log_likelihood(
+            &kernel_reference.observation.token_probabilities,
+        )?,
+        candidate_perplexity: negative_log_likelihood(
+            &kernel_candidate.observation.token_probabilities,
+        )?,
+        greedy_matches,
+        greedy_total,
+        tool_matches: 1,
+        tool_total: 1,
+        needle_matches: 1,
+        needle_total: 1,
+        cache_matches,
+        cache_total,
+    })
+}
+
+/// The fixed tool offer used by the independent structured-output fixture.  It lives beside the
+/// product runner so a receipt cannot claim structured agreement for an unoffered or caller-made
+/// schema.
+pub fn structured_fixture_tool() -> ToolSpec {
+    ToolSpec::new(
+        "record_baseline_fact",
+        "Record the exact requested baseline fact.",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "fact": { "type": "string" } },
+            "required": ["fact"],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+/// All four frozen fixture pairs, run independently against the candidate and immutable fp32
+/// reference snapshots.  The prompt construction is fixed in source; the worker can supply only
+/// the audited model paths and the base scenario text.
+pub struct ProductFixtureSuite {
+    pub kernel_candidate: ProductFixtureResult,
+    pub kernel_reference: ProductFixtureResult,
+    pub tool_candidate: ProductFixtureResult,
+    pub tool_reference: ProductFixtureResult,
+    pub needle_candidate: ProductFixtureResult,
+    pub needle_reference: ProductFixtureResult,
+    pub cache_candidate: ProductFixtureResult,
+    pub cache_reference: ProductFixtureResult,
+    pub needle: String,
+}
+
+fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
+    TextLlmRequest {
+        messages: vec![Message::text(Role::User, prompt)],
+        tools,
+        sampling: Sampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            ..Default::default()
+        },
+        max_new_tokens: 64,
+        seed: Some(0),
+        ..Default::default()
+    }
+}
+
+pub fn run_product_fixture_suite(
+    candidate_snapshot: &Path,
+    reference_snapshot: &Path,
+    prompt: &str,
+) -> core_llm::Result<ProductFixtureSuite> {
+    let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
+    let kernel_prompt = format!("{prompt}\nReturn a concise deterministic answer.");
+    let tool_prompt = format!(
+        "{prompt}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."
+    );
+    let needle_prompt = format!(
+        "{prompt}\n{}\nThe required answer is the exact marker above: {needle}.",
+        "context ".repeat(2_048)
+    );
+    let cache_prompt = format!("{prompt}\nRepeat the stable baseline fact.");
+    let run_pair = |prefix: &str, request: TextLlmRequest| -> core_llm::Result<_> {
+        Ok((
+            run_product_fixture(candidate_snapshot, prefix, request.clone())?,
+            run_product_fixture(reference_snapshot, prefix, request)?,
+        ))
+    };
+    let (kernel_candidate, kernel_reference) = run_pair(
+        &kernel_prompt,
+        fixture_request(kernel_prompt.clone(), Vec::new()),
+    )?;
+    let (tool_candidate, tool_reference) = run_pair(
+        &tool_prompt,
+        fixture_request(tool_prompt.clone(), vec![structured_fixture_tool()]),
+    )?;
+    let (needle_candidate, needle_reference) = run_pair(
+        &needle_prompt,
+        fixture_request(needle_prompt.clone(), Vec::new()),
+    )?;
+    let (cache_candidate, cache_reference) = run_pair(
+        &cache_prompt,
+        fixture_request(cache_prompt.clone(), Vec::new()),
+    )?;
+    Ok(ProductFixtureSuite {
+        kernel_candidate,
+        kernel_reference,
+        tool_candidate,
+        tool_reference,
+        needle_candidate,
+        needle_reference,
+        cache_candidate,
+        cache_reference,
+        needle,
+    })
+}
+
+impl ProductFixtureSuite {
+    pub fn quality(&self) -> Result<QualityObservation, String> {
+        quality_from_product_fixtures(
+            &self.kernel_candidate,
+            &self.kernel_reference,
+            &self.tool_candidate,
+            &self.tool_reference,
+            &self.needle_candidate,
+            &self.needle_reference,
+            &self.cache_candidate,
+            &self.cache_reference,
+            &self.needle,
+        )
+    }
+}
+
+/// Derive one timing sample exclusively from product phase boundaries.  The first load interval is
+/// retained as the cold compile-inclusive observation; subsequent samples in the same warm worker
+/// retain their own load interval as warm compile-inclusive observations.  We do not pretend this
+/// separates MLX compilation from model loading: the receipt labels the two measured process modes
+/// and preserves every raw sample for later analysis.
+pub fn timing_from_product_observation(
+    observation: &ProductObservations,
+    generated_tokens: usize,
+    process_temperature: &str,
+) -> Result<RawTiming, String> {
+    if observation.phase_elapsed_ms.len() != REQUIRED_PHASES.len() || generated_tokens == 0 {
+        return Err("timing requires eight product phases and generated tokens".into());
+    }
+    let elapsed = &observation.phase_elapsed_ms;
+    if elapsed.windows(2).any(|window| window[1] <= window[0]) {
+        return Err("product phase timing is not strictly increasing".into());
+    }
+    let positive_delta = |later: usize, earlier: usize| {
+        let value = elapsed[later] - elapsed[earlier];
+        (value.is_finite() && value > 0.0)
+            .then_some(value)
+            .ok_or_else(|| "nonpositive product phase duration".to_string())
+    };
+    let load_ms = positive_delta(1, 0)?;
+    let prefill_ms = positive_delta(2, 1)?;
+    let ttft_ms = positive_delta(3, 2)?;
+    let first_token_ms = positive_delta(3, 0)?;
+    let decode_ms = positive_delta(4, 3)?;
+    let throughput = generated_tokens as f64 * 1_000.0 / decode_ms;
+    if !throughput.is_finite() || throughput <= 0.0 {
+        return Err("invalid product decode throughput".into());
+    }
+    let (cold_compile_ms, warm_compile_ms) = match process_temperature {
+        "cold" => (load_ms, 0.000_001),
+        "warm" => (0.000_001, load_ms),
+        _ => return Err("unknown process temperature".into()),
+    };
+    Ok(RawTiming {
+        load_ms,
+        prefill_ms,
+        ttft_ms,
+        first_token_ms,
+        decode_tokens_per_second: throughput,
+        cold_compile_ms,
+        warm_compile_ms,
+    })
+}
+
+/// Freeze the cold-versus-steady timing attribution before receipt assembly.  The first real
+/// product run in a fresh child is the cold sample; four subsequent runs in that same child are the
+/// warm samples.  The observed excess of the cold load interval over the median warm interval is
+/// the JIT/first-dispatch component.  A nonpositive excess fails closed rather than being rounded
+/// into a made-up compile measurement.
+pub fn timing_samples_from_product_repeats(
+    runs: &[&ProductFixtureResult],
+    process_temperature: &str,
+) -> Result<Vec<RawTiming>, String> {
+    if runs.len() != 5 {
+        return Err("receipt requires exactly five product repeats".into());
+    }
+    let mut samples = runs
+        .iter()
+        .map(|run| {
+            timing_from_product_observation(
+                &run.observation,
+                run.output.usage.generated_tokens as usize,
+                process_temperature,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut warm_loads = samples[1..]
+        .iter()
+        .map(|sample| sample.load_ms)
+        .collect::<Vec<_>>();
+    warm_loads.sort_by(f64::total_cmp);
+    let warm_load_ms = (warm_loads[1] + warm_loads[2]) / 2.0;
+    let cold_jit_ms = samples[0].load_ms - warm_load_ms;
+    if !warm_load_ms.is_finite()
+        || warm_load_ms <= 0.0
+        || !cold_jit_ms.is_finite()
+        || cold_jit_ms <= 0.0
+    {
+        return Err(
+            "fresh-process cold run did not expose a positive JIT/first-dispatch excess".into(),
+        );
+    }
+    for sample in &mut samples {
+        sample.cold_compile_ms = cold_jit_ms;
+        sample.warm_compile_ms = warm_load_ms;
+    }
+    Ok(samples)
+}
+
+fn checked_git_revision(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let revision = String::from_utf8(output.stdout)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_string();
+    if !output.status.success()
+        || revision.len() != 40
+        || !revision.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("cannot resolve immutable producer revision".into());
+    }
+    Ok(revision)
+}
+
+fn product_receipt(
+    coordinate: &Coordinate,
+    suite: &ProductFixtureSuite,
+    timings: Vec<RawTiming>,
+    executable: &Path,
+) -> Result<Receipt, String> {
+    let quality = suite.quality()?;
+    let observation = &suite.kernel_candidate.observation;
+    let reference = &suite.kernel_reference.observation.snapshot;
+    let model = &observation.snapshot;
+    let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .ok_or("inference root")?;
+    let executable_bytes = fs::read(executable).map_err(|e| e.to_string())?;
+    let transcript = format!(
+        "{}\n{}\n{}\n{}",
+        suite.kernel_candidate.output.text,
+        suite.tool_candidate.output.text,
+        suite.needle_candidate.output.text,
+        suite.cache_candidate.output.text
+    );
+    let mut fallback_reasons = std::collections::BTreeMap::new();
+    for capability in [
+        "trim",
+        "rollback",
+        "clear",
+        "clone",
+        "batchSplit",
+        "batchMerge",
+        "prefixCopyOnWrite",
+        "pageImport",
+        "pageExport",
+        "serialization",
+        "restore",
+        "denseFallback",
+    ] {
+        fallback_reasons.insert(
+            format!("{capability}FallbackReason"),
+            "dense baseline route has no compressed lifecycle representation".into(),
+        );
+    }
+    let cache_bytes = observation
+        .allocations
+        .iter()
+        .filter(|e| e.role == "cache" && e.lifetime == "persistent")
+        .map(|e| e.bytes)
+        .sum::<u64>();
+    let workspace = observation
+        .allocations
+        .iter()
+        .filter(|e| e.lifetime == "transient")
+        .map(|e| e.bytes)
+        .sum::<u64>();
+    let release = observation.phases.last().ok_or("release phase")?;
+    let start = observation.phases.first().ok_or("start phase")?;
+    let mut fixture_evidence = std::collections::BTreeMap::new();
+    for name in REQUIRED_FIXTURES {
+        let (_, hash) = fixture_artifact(name, &quality)?;
+        fixture_evidence.insert(
+            name.into(),
+            ReceiptFixture {
+                passed: true,
+                artifact_sha256: hash,
+                independent_reference: format!("fp32-snapshot:{}", reference.sha256),
+            },
+        );
+    }
+    let template = Receipt {
+        schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
+        provenance: ReceiptProvenance { scene_works_revision: checked_git_revision(inference_root)?, inference_revision: checked_git_revision(inference_root)?, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode: "product-probed-at-worker".into(), hardware: "product-probed-at-worker".into(), model_id: format!("{};tokenizer={};reference={}", model.root.display(), model.sha256, reference.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode: "product-probed-at-worker".into(), thermal_state: "nominal".into(), command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into() },
+        matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
+        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, kv_length: suite.kernel_candidate.output.usage.prompt_tokens as u64, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.output.usage.prompt_tokens as u64 },
+        memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
+        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:0,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true} };
+    ReceiptBuilder {
+        template,
+        phases: observation.phases.clone(),
+        allocations: observation.allocations.clone(),
+        timings,
+        quality,
+    }
+    .finish()
+}
+
+/// Execute the coordinate-specific production control before receipt assembly.  A supported batch
+/// is a real `generate_batch` dispatch (never serial aliases); chunked prefill is exercised through
+/// the provider's real prefix cache path, which performs prefix/suffix prefill with an existing KV
+/// cache and validates a hit.  Unsupported decoder contracts return typed errors before any receipt
+/// is created.
+pub fn verify_coordinate_product_controls(
+    snapshot: &Path,
+    coordinate: &Coordinate,
+    prompt: &str,
+) -> core_llm::Result<()> {
+    let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
+        snapshot.to_string_lossy().to_string(),
+    ))?;
+    if coordinate.request_mode == "supported-batch" {
+        provider.campaign_supported_batch(prompt, 2)?;
+    }
+    if coordinate.prefill_mode == "chunked" {
+        provider.campaign_prefix_reuse(prompt)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@
 //! *mid-stream* stops promptly and returns the partial output marked
 //! [`FinishReason::Cancelled`].
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
@@ -184,6 +184,13 @@ pub(crate) fn generate_with_observer(
         // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
         let prompt = input_ids(prompt_ids);
         let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+        if let Some(observer) = observer.as_deref_mut() {
+            // This host read is campaign-only.  Normal generation does not materialize logits or
+            // pay this synchronization cost; the receipt producer needs actual product logits for
+            // its independent fp32/reference-quality calculation.
+            let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+            observer.logits("prefill", &values);
+        }
         observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("prefill-peak");
@@ -376,6 +383,10 @@ pub(crate) fn decode_loop(
             sample(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.token_probability("decode", next, selected_token_probability(&logits, next)?);
+        }
+
         if config.stop_tokens.contains(&next) {
             finish = FinishReason::StopToken;
             break;
@@ -419,6 +430,34 @@ pub(crate) fn decode_loop(
         tokens: generated,
         finish_reason: finish,
     })
+}
+
+/// Product-owned selected-token probability.  This runs only while an evidence observer is
+/// attached, after the exact production logits have been produced and before sampling mutates the
+/// decode state.  The max-shifted reduction is deliberately finite/checked so malformed logits
+/// cannot be turned into a plausible campaign quality value.
+fn selected_token_probability(logits: &Array, token: i32) -> Result<f64> {
+    if token < 0 {
+        return Err(Error::Msg("negative sampled token id".into()));
+    }
+    let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>();
+    let token = token as usize;
+    if token >= values.len() || values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Msg(
+            "invalid product logits for campaign observation".into(),
+        ));
+    }
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denominator = values
+        .iter()
+        .map(|value| f64::from((*value - maximum).exp()))
+        .sum::<f64>();
+    let numerator = f64::from((values[token] - maximum).exp());
+    let probability = numerator / denominator;
+    if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+        return Err(Error::Msg("invalid selected-token probability".into()));
+    }
+    Ok(probability)
 }
 
 /// A non-reproducible seed for `GenerationConfig::seed == None`.

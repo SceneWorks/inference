@@ -24,8 +24,8 @@ use core_llm::{
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::generate_with_observer;
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_batch, generate_from_prefill, generate_with, BatchRequest, CancelFlag, ConstraintMask,
+    Decode, FinishReason, GenerationConfig, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -481,6 +481,48 @@ impl LlamaProvider {
         if cache.stats().hits == 0 {
             return Err(CoreError::Load(
                 "campaign prefix reuse did not produce a cache hit".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
+    /// This is not emulated by serial `TextLlm` requests.
+    pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<()> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = generate_batch(model, &requests, &cancel, &mut |_, event| {
+            emitted += usize::from(matches!(event, StreamEvent::Token { .. }));
+        })
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no product tokens".into(),
             ));
         }
         Ok(())
