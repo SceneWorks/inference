@@ -1133,7 +1133,7 @@ impl PackedGroupAffineKvCache {
             let pending_tokens = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
             if complete_tokens > usize::MAX as u64
                 || pending_tokens > usize::MAX as u64
-                || complete_tokens as usize % self.group_size != 0
+                || !(complete_tokens as usize).is_multiple_of(self.group_size)
                 || complete_tokens.checked_add(pending_tokens) != Some(nums[5])
                 || pending_tokens as usize >= self.group_size
             {
