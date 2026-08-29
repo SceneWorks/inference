@@ -14,6 +14,18 @@ GEOMETRY = {"resolution": "512x512", "reference_count": 1, "frames": 1,
 
 
 class CampaignAdapterTests(unittest.TestCase):
+    def test_dispatch_campaign_covers_each_route_and_cancel_cleanup(self):
+        calls = []
+        def runner(variant, arm):
+            calls.append((variant, arm))
+            return [{"phase": "cross-kv-created"}, {"phase": "cancelled" if arm == "cancel" else "generation-end"}, {"phase": "released"}]
+        spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
+        adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
+        runs = adapter.dispatch_campaign(runner)
+        self.assertEqual(len(runs), 10)
+        self.assertEqual(calls, [(route, arm) for route in adapter.WAN_ROUTES for arm in ("normal", "cancel")])
+        self.assertEqual(sum(any(event["phase"] == "cancelled" for event in events) for _, arm, events in runs if arm == "cancel"), 5)
+
     def test_weightless_jsonl_producer_contract_is_reduced(self):
         spec = importlib.util.spec_from_file_location("adapter", ADAPTER)
         adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)

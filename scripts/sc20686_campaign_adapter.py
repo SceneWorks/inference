@@ -7,6 +7,7 @@ REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
 PRODUCER = "sc20686-campaign-adapter-v1"
 GEOMETRY = ("resolution", "reference_count", "frames", "prompt", "guidance", "layers",
             "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope")
+WAN_ROUTES = ("wan2_2_ti2v_5b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan_vace", "wan2_2_vace_fun_14b")
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -57,6 +58,21 @@ def fake_events():
     return [{"phase": p, "persistent_bytes": 600 * 1024**2 if p in ("cross-kv-created", "cross-kv-read") else 0,
              "transient_bytes": 32 * 1024**2 if p == "cross-kv-read" else 0,
              "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "cancelled", "released"))]
+
+def dispatch_campaign(runner):
+    """Dispatch every registered Wan route exactly once per normal/cancel arm.
+
+    `runner` is the product-owned callback; it must return that run's observer JSONL events.
+    Keeping this seam injectable makes orchestration testable without weights or a device.
+    """
+    dispatched = []
+    for variant in WAN_ROUTES:
+        for arm in ("normal", "cancel"):
+            events = runner(variant, arm)
+            if not isinstance(events, list) or not events:
+                raise ValueError(f"{variant}/{arm} produced no observer events")
+            dispatched.append((variant, arm, events))
+    return dispatched
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if args.fake:
