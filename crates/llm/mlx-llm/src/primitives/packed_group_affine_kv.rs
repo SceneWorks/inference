@@ -242,6 +242,7 @@ impl DecoderCacheSelection {
 pub struct DenseFallbackPackedDecoderCache {
     dense: ContiguousKvCache,
     staged: PackedGroupAffineKvCache,
+    pending_step: Option<Box<PackedGroupAffineKvCache>>,
     reason: String,
 }
 
@@ -353,6 +354,21 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         values.eval()?;
         let step = keys.shape()[2] as usize;
         let mut staged = self.staged.clone();
+        if self.pending_step.is_none() && layer != 0 {
+            return Err(Error::Config(
+                "packed step must begin at layer zero for atomic commit".into(),
+            ));
+        }
+        if self.pending_step.is_some() && layer == 0 {
+            return Err(Error::Config(
+                "packed step transaction already has an outstanding layer".into(),
+            ));
+        }
+        staged = self
+            .pending_step
+            .take()
+            .map(|candidate| *candidate)
+            .unwrap_or(staged);
         staged.append(
             layer,
             keys.as_slice::<f32>(),
@@ -363,7 +379,11 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         // MLX dispatch is lazy; force completion before publishing the staged cache so a device
         // fault cannot leave lifecycle state committed for an output that never completed.
         output.eval()?;
-        self.staged = staged;
+        if layer + 1 == staged.layers() {
+            self.staged = staged;
+        } else {
+            self.pending_step = Some(Box::new(staged));
+        }
         Ok(Some(output))
     }
 
@@ -386,12 +406,14 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn truncate(&mut self, len: i32) -> Result<()> {
+        self.pending_step = None;
         self.staged.truncate(len as usize)?;
         self.dense_before_mutation("truncate");
         self.dense.truncate(len)
     }
 
     fn reset(&mut self) {
+        self.pending_step = None;
         self.staged.clear();
         self.dense_before_mutation("reset");
         self.dense.reset();
@@ -462,6 +484,7 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
         cache: Box::new(DenseFallbackPackedDecoderCache {
             dense: ContiguousKvCache::new(request.layers),
             staged,
+            pending_step: None,
             reason,
         }),
     }
