@@ -573,6 +573,23 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV reconciliation failed".into());
     }
+    if receipt.mode == "dense"
+        && receipt.memory.persistent_kv_bytes.abs_diff(dense)
+            > receipt.memory.reconciliation.tolerance_bytes
+    {
+        return Err("dense KV exceeds tolerance".into());
+    }
+    let start = &receipt.memory.phase_samples[0];
+    let end = receipt.memory.phase_samples.last().unwrap();
+    if end.phys_footprint_bytes
+        > start.phys_footprint_bytes + receipt.memory.release.phys_footprint_tolerance_bytes
+        || end.mlx.active_bytes
+            > start.mlx.active_bytes + receipt.memory.release.mlx_active_tolerance_bytes
+        || end.mlx.cache_bytes
+            > start.mlx.cache_bytes + receipt.memory.release.mlx_cache_tolerance_bytes
+    {
+        return Err("release did not return within tolerance".into());
+    }
     if receipt.timings.samples.len() != 5
         || receipt
             .timings
@@ -591,6 +608,27 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         / 5.0;
     if (receipt.timings.decode_tokens_per_second - decode_mean).abs() > 1e-9 {
         return Err("timing mean is not derived".into());
+    }
+    let variance = receipt
+        .timings
+        .samples
+        .iter()
+        .map(|s| (s.decode_tokens_per_second - decode_mean).powi(2))
+        .sum::<f64>()
+        / 5.0;
+    let cv = variance.sqrt() / decode_mean;
+    if (receipt.timings.summary.decode_tokens_per_second_variance - variance).abs() > 1e-9
+        || (receipt
+            .timings
+            .summary
+            .decode_tokens_per_second_coefficient_of_variation
+            - cv)
+            .abs()
+            > 1e-9
+        || receipt.timings.summary.confidence_interval_low > decode_mean
+        || receipt.timings.summary.confidence_interval_high < decode_mean
+    {
+        return Err("timing summary derivation failed".into());
     }
     if receipt.quality.parity_max_error < 0.0
         || receipt.quality.parity_max_error > 0.0001
@@ -627,6 +665,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
         return Err("release/cancellation evidence failed".into());
     }
+    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
     Ok(())
 }
 
