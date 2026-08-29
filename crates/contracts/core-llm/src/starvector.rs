@@ -37,7 +37,7 @@ pub enum DecoderArchitecture {
 
 /// Image preprocessing facts that a backend must reproduce before vision projection.
 ///
-/// The RGB8 [`ImageRef`] stays tensor-free. A backend turns these declared facts into its native
+/// The RGB8 [`crate::ImageRef`] stays tensor-free. A backend turns these declared facts into its native
 /// image/tensor operations at its own boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImagePreprocessing {
