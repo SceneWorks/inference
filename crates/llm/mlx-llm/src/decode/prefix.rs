@@ -214,6 +214,7 @@ pub fn generate_cached_with(
         on_event,
         constraint,
         should_stop,
+        None,
     )?;
 
     // Store the sequence whose KV the cache actually holds, so the next shared-prefix request

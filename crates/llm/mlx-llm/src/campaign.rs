@@ -6,9 +6,9 @@
 //! these helpers make its inputs deterministic and testable without weights or Metal.
 
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_llm::{Message, Role, Sampling, StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest};
 
@@ -61,8 +61,17 @@ pub fn inventory_snapshot(root: impl AsRef<Path>) -> std::io::Result<SnapshotInv
                     format!("empty snapshot file {}", path.display()),
                 ));
             }
-            let data = fs::read(&resolved)?;
-            let sha = hex(&Sha256::digest(&data));
+            let mut input = File::open(&resolved)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 1024 * 1024];
+            loop {
+                let read = input.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            let sha = hex(&digest.finalize());
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -115,14 +124,19 @@ pub fn dense_kv_bytes(
     capacity: u64,
     head_dimension: u64,
     element_bytes: u64,
-) -> u64 {
-    batch
-        .saturating_mul(layers)
-        .saturating_mul(kv_heads)
-        .saturating_mul(capacity)
-        .saturating_mul(head_dimension)
-        .saturating_mul(element_bytes)
-        .saturating_mul(2)
+) -> Result<u64, String> {
+    [
+        batch,
+        layers,
+        kv_heads,
+        capacity,
+        head_dimension,
+        element_bytes,
+        2,
+    ]
+    .into_iter()
+    .try_fold(1_u64, |value, factor| value.checked_mul(factor))
+    .ok_or_else(|| "dense KV geometry overflows u64".into())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +190,15 @@ pub fn seal_bytes(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// Serialize producer-owned artifacts once; the returned bytes are exactly what must be written
+/// and hashed in the adjacent `.sha256` sidecar.  Callers must not reseal parsed JSON.
+pub fn sealed_json(value: &serde_json::Value) -> (Vec<u8>, String) {
+    let mut bytes = serde_json::to_vec(value).expect("receipt JSON is serializable");
+    bytes.push(b'\n');
+    let digest = seal_bytes(&bytes);
+    (bytes, digest)
+}
+
 pub const REQUIRED_FIXTURES: [&str; 4] = [
     "kernel-fp32-reference",
     "structured-tool-call",
@@ -208,11 +231,10 @@ pub fn validate_fixture_evidence(evidence: &[FixtureEvidence]) -> Result<(), Str
 }
 
 /// A monotonic timestamp suitable for the producer's internal sequencing tests.
-pub fn sequence_marker() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+pub fn sequence_marker() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed).saturating_add(1)
 }
 
 /// The narrow observation seam used by a real campaign runner.  The runner owns platform probes
@@ -273,7 +295,8 @@ mod tests {
 
     #[test]
     fn formula_includes_batch_and_key_value_pair() {
-        assert_eq!(dense_kv_bytes(2, 3, 4, 5, 6, 2), 1440);
+        assert_eq!(dense_kv_bytes(2, 3, 4, 5, 6, 2), Ok(1440));
+        assert!(dense_kv_bytes(u64::MAX, 2, 1, 1, 1, 1).is_err());
     }
 
     #[test]
@@ -315,6 +338,13 @@ mod tests {
     #[test]
     fn seal_includes_exact_newline_bytes() {
         assert_ne!(seal_bytes(b"{}"), seal_bytes(b"{}\n"));
+    }
+
+    #[test]
+    fn sealed_json_hashes_written_bytes() {
+        let (bytes, digest) = sealed_json(&serde_json::json!({"b": 2, "a": 1}));
+        assert_eq!(digest, seal_bytes(&bytes));
+        assert_ne!(digest, seal_bytes(&bytes[..bytes.len() - 1]));
     }
 
     #[test]

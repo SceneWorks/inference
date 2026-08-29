@@ -141,7 +141,35 @@ pub fn generate_with(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
+    generate_with_observer(
+        decoder,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        None,
+    )
+}
+
+/// Internal campaign-only variant.  `None` preserves the ordinary zero-overhead path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_observer(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("cancellation-cleanup");
+            observer.phase("post-run-release");
+        }
         return Err(Error::Canceled); // typed pre-inference cancel
     }
     if prompt_ids.is_empty() {
@@ -153,6 +181,9 @@ pub fn generate_with(
 
     // Prefill the whole prompt at offset 0; logits are for the last prompt position.
     let prompt = input_ids(prompt_ids);
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.phase("prefill-peak");
+    }
     let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
 
     decode_loop(
@@ -166,6 +197,7 @@ pub fn generate_with(
         on_event,
         constraint,
         should_stop,
+        observer,
     )
 }
 
@@ -214,6 +246,7 @@ pub fn generate_with_cache(
         on_event,
         None,
         None,
+        None,
     )
 }
 
@@ -253,6 +286,7 @@ pub fn generate_from_prefill(
         on_event,
         constraint,
         should_stop,
+        None,
     )
 }
 
@@ -276,6 +310,7 @@ pub(crate) fn decode_loop(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
@@ -285,6 +320,9 @@ pub(crate) fn decode_loop(
         // genuinely effective despite MLX's lazy evaluation.
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("cancellation-cleanup");
+            }
             break;
         }
 
@@ -305,6 +343,11 @@ pub(crate) fn decode_loop(
         }
 
         on_event(StreamEvent::Token { id: next, step });
+        if step == 0 {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("first-token");
+            }
+        }
         generated.push(next);
         history.push(next);
 
@@ -329,6 +372,10 @@ pub(crate) fn decode_loop(
         reason: finish,
         generated: generated.len(),
     });
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.phase("decode-steady");
+        observer.phase("post-run-release");
+    }
     Ok(GenerationOutput {
         tokens: generated,
         finish_reason: finish,
