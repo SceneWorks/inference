@@ -28,7 +28,9 @@ impl CacheObserver for JsonlObserver {
     }
 }
 pub fn install_jsonl(path: impl AsRef<Path>) -> io::Result<Scope> {
-    Ok(install(Box::new(JsonlObserver(File::create(path)?))))
+    let path = path.as_ref();
+    let file = if path == Path::new("-") { File::create("/dev/stdout")? } else { File::create(path)? };
+    Ok(install(Box::new(JsonlObserver(file))))
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
 pub struct Scope {
