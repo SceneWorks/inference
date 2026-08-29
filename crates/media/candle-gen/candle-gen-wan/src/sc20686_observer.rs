@@ -28,12 +28,60 @@ pub trait CacheObserver {
 /// Product-owned identity captured after Wan model loading; campaign callers must not populate
 /// evidence fields from CLI claims.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CampaignGeometry {
+    pub(crate) batch: u32,
+    pub(crate) frames: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) latent_frames: u32,
+    pub(crate) latent_height: u32,
+    pub(crate) latent_width: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CampaignContext {
-    pub source_ref: String,
-    pub snapshot_sha256: String,
-    pub snapshot_bytes: u64,
-    pub variant: String,
-    pub geometry_json: String,
+    source_ref: String,
+    snapshot_sha256: String,
+    snapshot_bytes: u64,
+    variant: String,
+    geometry: CampaignGeometry,
+}
+
+impl CampaignContext {
+    /// Runtime-only constructor. Public callers can request observation, but cannot provide the
+    /// identity, geometry, or snapshot facts that become receipt evidence.
+    pub(crate) fn from_runtime(
+        source_ref: String,
+        snapshot_sha256: String,
+        snapshot_bytes: u64,
+        variant: String,
+        geometry: CampaignGeometry,
+    ) -> Result<Self, String> {
+        if source_ref.trim().is_empty()
+            || variant.trim().is_empty()
+            || snapshot_bytes == 0
+            || snapshot_sha256.len() != 64
+            || !snapshot_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || geometry.batch == 0
+            || geometry.frames == 0
+            || geometry.width == 0
+            || geometry.height == 0
+            || geometry.latent_frames == 0
+            || geometry.latent_height == 0
+            || geometry.latent_width == 0
+        {
+            return Err("runtime campaign facts are incomplete or malformed".into());
+        }
+        Ok(Self {
+            source_ref,
+            snapshot_sha256,
+            snapshot_bytes,
+            variant,
+            geometry,
+        })
+    }
 }
 pub struct JsonlObserver(File);
 impl CacheObserver for JsonlObserver {
@@ -190,13 +238,22 @@ mod tests {
     #[test]
     fn context_and_tensor_metadata_are_opt_in_and_bound_to_events() {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let context = CampaignContext {
-            source_ref: "snapshot".into(),
-            snapshot_sha256: "a".repeat(64),
-            snapshot_bytes: 4096,
-            variant: "t2v".into(),
-            geometry_json: "{\"layers\":1}".into(),
-        };
+        let context = CampaignContext::from_runtime(
+            "snapshot".into(),
+            "a".repeat(64),
+            4096,
+            "t2v".into(),
+            CampaignGeometry {
+                batch: 1,
+                frames: 5,
+                width: 64,
+                height: 64,
+                latent_frames: 2,
+                latent_height: 8,
+                latent_width: 8,
+            },
+        )
+        .unwrap();
         let _scope = install_with_context(Box::new(Sink(out.clone())), context);
         observe_tensor(
             "cross-kv-prepared",
@@ -213,5 +270,34 @@ mod tests {
         assert_eq!(row.operation, "prepare");
         assert_eq!(row.tensor_shape, "[1,8,64]");
         assert_eq!(row.context.unwrap().snapshot_bytes, 4096);
+    }
+
+    #[test]
+    fn runtime_context_rejects_forged_identity_and_geometry() {
+        let geometry = CampaignGeometry {
+            batch: 1,
+            frames: 5,
+            width: 64,
+            height: 64,
+            latent_frames: 2,
+            latent_height: 8,
+            latent_width: 8,
+        };
+        assert!(CampaignContext::from_runtime(
+            "snapshot".into(),
+            "A".repeat(64),
+            4096,
+            "t2v".into(),
+            geometry.clone(),
+        )
+        .is_err());
+        assert!(CampaignContext::from_runtime(
+            "snapshot".into(),
+            "a".repeat(64),
+            0,
+            "t2v".into(),
+            geometry,
+        )
+        .is_err());
     }
 }

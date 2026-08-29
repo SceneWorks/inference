@@ -923,7 +923,7 @@ pub struct WanGenerator {
 
 impl WanGenerator {
     /// Install the opt-in campaign context; ordinary registry construction leaves this unset.
-    pub fn with_campaign_context(
+    pub(crate) fn with_campaign_context(
         mut self,
         context: crate::sc20686_observer::CampaignContext,
     ) -> Self {

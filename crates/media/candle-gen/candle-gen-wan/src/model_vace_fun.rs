@@ -425,7 +425,7 @@ pub struct WanVaceFunGenerator {
 }
 
 impl WanVaceFunGenerator {
-    pub fn with_campaign_context(
+    pub(crate) fn with_campaign_context(
         mut self,
         context: crate::sc20686_observer::CampaignContext,
     ) -> Self {
