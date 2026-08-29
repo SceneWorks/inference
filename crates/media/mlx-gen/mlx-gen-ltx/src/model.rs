@@ -853,6 +853,8 @@ pub struct Ltx25 {
     descriptor: ModelDescriptor,
     spec: LoadSpec,
     variant: TransformerVariant,
+    memory_strategy: mlx_gen::gen_core::MemoryProviderContract,
+    memory_tier: mlx_gen::gen_core::MemoryNumericTier,
     enhancer_cache: Rc<RefCell<PrefixCache>>,
 }
 
@@ -894,10 +896,14 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         bundle.require(component)?;
     }
     bundle.require(ltx25_video_component(spec))?;
+    let memory_strategy = crate::memory_strategy_2_5::memory_strategy_contract(spec)?;
+    let memory_tier = crate::memory_strategy_2_5::resolved_numeric_tier(spec)?;
     Ok(Box::new(Ltx25 {
         descriptor: descriptor_25_for_variant(variant),
         spec: spec.clone(),
         variant,
+        memory_strategy,
+        memory_tier,
         enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
     }))
 }
@@ -925,7 +931,7 @@ fn ltx25_decoder_selection(spec: &LoadSpec) -> Ltx25DecoderSelection {
 
 /// Resolve the opt-in stock Gemma-4 enhancer below the one LTX-2.5 rehost.  The only accepted
 /// override is another already-staged directory; no cache/environment/network lookup exists.
-fn ltx25_enhancer_dir(spec: &LoadSpec) -> Result<PathBuf> {
+pub(crate) fn ltx25_enhancer_dir(spec: &LoadSpec) -> Result<PathBuf> {
     if let Some(source) = spec.components.get(LTX25_ENHANCER_COMPONENT) {
         return match source {
             WeightsSource::Dir(dir) => Ok(dir.clone()),
@@ -957,7 +963,7 @@ fn decode_diffvae_budgeted<T>(
 /// Converted LTX-2.5 tiers split each VAE encoder into its own file, while raw split bundles keep
 /// the encoder beside its decoder. The bundle resolver owns component discovery; after it has
 /// selected a component, prefer that component's documented tier encoder half when present.
-fn ltx25_encoder_path(
+pub(crate) fn ltx25_encoder_path(
     root: &std::path::Path,
     component: LtxComponent,
     fallback: &std::path::Path,
@@ -978,6 +984,8 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
     let bundle = crate::bundle::resolve_split_bundle(spec)?;
     let variant = crate::dev_sampler::from_bundle(&bundle)?;
     let config = LtxConfig::from_bundle(&bundle)?;
+    let memory_strategy = crate::memory_strategy_2_5::memory_strategy_contract(spec)?;
+    let memory_tier = crate::memory_strategy_2_5::resolved_numeric_tier(spec)?;
     crate::bundle::assert_gemma_version(&bundle)?;
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
@@ -1068,8 +1076,8 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
 
     Ok(Ltx {
         descriptor: descriptor_25_for_variant(variant),
-        memory_strategy: None,
-        memory_tier: None,
+        memory_strategy: Some(memory_strategy),
+        memory_tier: Some(memory_tier),
         memory_overlay: None,
         tokenizer: Tokenizer::Gemma4(tokenizer),
         transformer_path: bundle
@@ -1157,10 +1165,48 @@ impl Ltx {
     /// applying any LoRA/LoKr adapters (sc-2687/sc-2393). Called per-generate AFTER the text encoder is
     /// freed (sc-10976), so the 24 GB TE and the DiT never co-reside. LoRA is a forward-time residual
     /// over the (quantized/dense) base; `pass_scales` carries one strength per distilled denoise pass.
-    fn build_transformer(&self) -> Result<AvDiT> {
+    fn build_transformer(&self, req: &GenerationRequest) -> Result<AvDiT> {
         let transformer_w = Weights::from_file(&self.transformer_path)?;
-        let mut transformer = AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?;
-        if !self.adapters.is_empty() {
+        let memory = req.memory.unwrap_or_default();
+        let execution = if self.descriptor.id == MODEL_25_ID {
+            crate::memory_strategy_2_5::validate_request_memory(
+                self.memory_strategy
+                    .as_ref()
+                    .expect("ltx_2_5 route must retain its loaded memory contract"),
+                &memory,
+            )
+            .map_err(Error::from)?
+        } else {
+            crate::memory_strategy_2_5::TransformerExecution::default()
+        };
+        let mut transformer = if memory.stream_transformer_blocks {
+            if self.descriptor.id != MODEL_25_ID {
+                return Err(Error::Unsupported(
+                    "ltx: bounded transformer residency is implemented only for ltx_2_5".into(),
+                ));
+            }
+            let window = execution
+                .window_size
+                .expect("validated streamed execution has a window");
+            let stream = crate::block_stream::LtxBlockStream::new(
+                &self.transformer_path,
+                self.config.clone(),
+                self.dit_prec,
+                &self.adapters,
+            )?;
+            let transformer =
+                AvDiT::from_weights_streamed(&transformer_w, &self.config, self.dit_prec, stream)?;
+            transformer.set_transformer_window(window as usize)?;
+            transformer
+        } else {
+            AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?
+        };
+        if let Some(chunk) = execution.attention_chunk_size {
+            transformer.set_attention_budget(
+                mlx_gen::attention::AttentionBudget::from_score_elements(u64::from(chunk), true),
+            );
+        }
+        if !memory.stream_transformer_blocks && !self.adapters.is_empty() {
             if self.descriptor.id == MODEL_25_ID {
                 crate::adapters::apply_ltx25_adapters(
                     &mut transformer,
@@ -1585,7 +1631,7 @@ impl Ltx {
         // sc-10976: build the AvDiT now — AFTER the staged text phase freed the ~24 GB Gemma — so the
         // TE and the DiT never co-reside. Built past the curated-sampler validation above so a rejected
         // request doesn't pay the DiT load. Dropped + `clear_cache()`d below before the VAE decode.
-        let transformer = self.build_transformer()?;
+        let transformer = self.build_transformer(req)?;
         let run_dfr = |plan: &DfrPlan, on_step: &mut dyn FnMut(usize)| {
             let execution = self.ltx25_execution()?;
             let dfr = generate_dfr_av_latents(
@@ -2579,6 +2625,9 @@ impl Generator for Ltx25 {
                     .into(),
             ));
         }
+        if let Some(memory) = req.memory.as_ref() {
+            crate::memory_strategy_2_5::validate_request_memory(&self.memory_strategy, memory)?;
+        }
         Ok(())
     }
 
@@ -2595,6 +2644,25 @@ impl Generator for Ltx25 {
             .map_err(mlx_gen::gen_core::Error::from)?;
         debug_assert_eq!(route.transformer_variant(), self.variant);
         route.generate(req, on_progress)
+    }
+
+    fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
+        Some(&self.memory_strategy)
+    }
+
+    fn memory_strategy_safety_check(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::MemorySafetyDecision {
+        crate::memory_strategy_2_5::safety_check(&self.memory_strategy, self.memory_tier, context)
+    }
+
+    fn begin_memory_strategy_request(
+        &self,
+        context: &mlx_gen::gen_core::MemoryRunContext,
+    ) -> mlx_gen::gen_core::Result<Option<Box<dyn mlx_gen::gen_core::MemoryRequestScope + '_>>>
+    {
+        crate::memory_strategy_2_5::begin_request(&self.memory_strategy, self.memory_tier, context)
     }
 }
 
@@ -2884,12 +2952,22 @@ impl Generator for Ltx {
     }
 
     fn validate(&self, req: &GenerationRequest) -> mlx_gen::gen_core::Result<()> {
-        if self.descriptor.id == MODEL_ID {
-            validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
+        let result = if self.descriptor.id == MODEL_ID {
+            validate_request(&self.descriptor.capabilities, req)
+                .map_err(mlx_gen::gen_core::Error::from)
         } else {
             validate_request_for(self.descriptor.id, &self.descriptor.capabilities, req)
-                .map_err(Into::into)
+                .map_err(mlx_gen::gen_core::Error::from)
+        };
+        result?;
+        if self.descriptor.id == MODEL_25_ID {
+            if let (Some(contract), Some(memory)) =
+                (self.memory_strategy.as_ref(), req.memory.as_ref())
+            {
+                crate::memory_strategy_2_5::validate_request_memory(contract, memory)?;
+            }
         }
+        Ok(())
     }
 
     fn generate(
@@ -3051,6 +3129,21 @@ mod tests {
             frames: Some(17),
             seed: Some(0x5eed),
             ..Default::default()
+        }
+    }
+
+    fn weights_free_ltx25(variant: TransformerVariant) -> Ltx25 {
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(".")));
+        Ltx25 {
+            descriptor: descriptor_25_for_variant(variant),
+            memory_strategy: crate::memory_strategy_2_5::weights_free_memory_strategy_contract(
+                &spec,
+            )
+            .unwrap(),
+            memory_tier: crate::memory_strategy_2_5::resolved_numeric_tier(&spec).unwrap(),
+            spec,
+            variant,
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
         }
     }
 
@@ -3253,12 +3346,7 @@ mod tests {
 
     #[test]
     fn ltx25_provider_enhancement_is_registered_and_refuses_the_unlicensed_axis() {
-        let generator = Ltx25 {
-            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
-            spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
-            variant: TransformerVariant::Distilled,
-            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
-        };
+        let generator = weights_free_ltx25(TransformerVariant::Distilled);
         let enhanced = GenerationRequest {
             enhance_prompt: true,
             ..ltx25_request("a paper kite")
@@ -3322,12 +3410,7 @@ mod tests {
 
     #[test]
     fn ltx25_registered_route_enforces_geometry_and_temporal_constraints() {
-        let generator = Ltx25 {
-            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
-            spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
-            variant: TransformerVariant::Distilled,
-            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
-        };
+        let generator = weights_free_ltx25(TransformerVariant::Distilled);
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),
             width: 512,
@@ -3354,12 +3437,7 @@ mod tests {
 
     #[test]
     fn ltx25_provider_admits_only_advanced_axes_it_executes() {
-        let generator = Ltx25 {
-            descriptor: descriptor_25_for_variant(TransformerVariant::Distilled),
-            spec: LoadSpec::new(WeightsSource::Dir(PathBuf::from("."))),
-            variant: TransformerVariant::Distilled,
-            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
-        };
+        let generator = weights_free_ltx25(TransformerVariant::Distilled);
         let request = GenerationRequest {
             prompt: "a quiet moonlit harbor".into(),
             width: 512,
