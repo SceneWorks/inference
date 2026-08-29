@@ -5,7 +5,7 @@
 //! geometry, or lifecycle observations.  Device collection is supplied by the campaign runner;
 //! these helpers make its inputs deterministic and testable without weights or Metal.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
@@ -31,22 +31,6 @@ pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
 pub struct ReceiptProvenance {
     pub scene_works_revision: String,
     pub inference_revision: String,
@@ -65,6 +49,7 @@ pub struct ReceiptProvenance {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptMatrix {
     pub family: String,
     pub context_band: String,
@@ -74,6 +59,7 @@ pub struct ReceiptMatrix {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptGeometry {
     pub batch: u64,
     pub query_heads: u64,
@@ -87,6 +73,7 @@ pub struct ReceiptGeometry {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptMlx {
     pub source: String,
     pub active_bytes: u64,
@@ -95,6 +82,7 @@ pub struct ReceiptMlx {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptPhase {
     pub phase: String,
     pub pid: u32,
@@ -106,6 +94,7 @@ pub struct ReceiptPhase {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptAllocation {
     pub kind: String,
     pub role: String,
@@ -116,6 +105,7 @@ pub struct ReceiptAllocation {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptReconciliation {
     pub expected_dense_kv_bytes: u64,
     pub observed_persistent_kv_bytes: u64,
@@ -123,6 +113,7 @@ pub struct ReceiptReconciliation {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptRelease {
     pub verified: bool,
     pub phys_footprint_tolerance_bytes: u64,
@@ -131,6 +122,7 @@ pub struct ReceiptRelease {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptMemory {
     pub model_weights_bytes: u64,
     pub persistent_kv_bytes: u64,
@@ -143,6 +135,7 @@ pub struct ReceiptMemory {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptTimingSample {
     pub load_ms: f64,
     pub prefill_ms: f64,
@@ -154,6 +147,7 @@ pub struct ReceiptTimingSample {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptTimingSummary {
     pub decode_tokens_per_second_mean: f64,
     pub decode_tokens_per_second_p95: f64,
@@ -164,6 +158,7 @@ pub struct ReceiptTimingSummary {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptTimings {
     pub load_ms: f64,
     pub prefill_ms: f64,
@@ -177,6 +172,7 @@ pub struct ReceiptTimings {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptFixture {
     pub passed: bool,
     pub artifact_sha256: String,
@@ -184,6 +180,7 @@ pub struct ReceiptFixture {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptQualityStatistics {
     pub repeats: u64,
     pub warmups: u64,
@@ -193,6 +190,7 @@ pub struct ReceiptQualityStatistics {
     pub max_coefficient_of_variation: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptQuality {
     #[serde(rename = "parityMaxError")]
     pub parity_max_error: f64,
@@ -212,6 +210,7 @@ pub struct ReceiptQuality {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+// `fallback_reasons` is flattened intentionally; semantic validation below enforces its allowlist.
 pub struct ReceiptLifecycle {
     pub append: bool,
     pub chunked_prefill: bool,
@@ -237,11 +236,13 @@ pub struct ReceiptLifecycle {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptCancellation {
     pub cleanup_verified: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Receipt {
     pub schema_version: u32,
     pub harness_version: String,
@@ -284,7 +285,11 @@ impl ReceiptBuilder {
     pub fn finish(mut self) -> Result<Receipt, String> {
         self.template.schema_version = 3;
         self.template.harness_version = "sc-20671-kv-baseline-v3".into();
-        let digest = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+        let digest = |v: &str| {
+            v.len() == 64
+                && v.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
         let revision = |v: &str| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit());
         if !digest(&self.template.contract_hash)
             || !digest(&self.template.provenance.dependency_lock_sha256)
@@ -454,12 +459,32 @@ impl Receipt {
 
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let rfc3339 = |v: &str| {
-        v.len() >= 20
-            && v.as_bytes().get(4) == Some(&b'-')
-            && v.as_bytes().get(7) == Some(&b'-')
-            && v.as_bytes().get(10) == Some(&b'T')
-            && v.ends_with('Z')
+        let b = v.as_bytes();
+        let fixed = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+        (b.len() == 20 || (b.len() >= 22 && b[19] == b'.' && b[b.len() - 1] == b'Z'))
+            && b.get(4) == Some(&b'-')
+            && b.get(7) == Some(&b'-')
+            && b.get(10) == Some(&b'T')
+            && b.get(13) == Some(&b':')
+            && b.get(16) == Some(&b':')
+            && b.last() == Some(&b'Z')
+            && (0..4).all(fixed)
+            && (5..7).all(fixed)
+            && (8..10).all(fixed)
+            && (11..13).all(fixed)
+            && (14..16).all(fixed)
+            && (17..19).all(fixed)
+            && (b.len() == 20 || (20..b.len() - 1).all(fixed))
+            && b[11..13].iter().copied().collect::<Vec<_>>() < b"24".to_vec()
+            && b[14..16].iter().copied().collect::<Vec<_>>() < b"60".to_vec()
+            && b[17..19].iter().copied().collect::<Vec<_>>() < b"60".to_vec()
     };
+    let lowercase_hex = |v: &str, len: usize| {
+        v.len() == len
+            && v.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let revision = |v: &str| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit());
     if receipt.schema_version != 3
         || receipt.harness_version != "sc-20671-kv-baseline-v3"
         || receipt.status != "complete"
@@ -474,21 +499,26 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("receipt timestamp/run id is malformed".into());
     }
     let p = &receipt.provenance;
-    if [
-        p.mlx_revision.as_str(),
-        p.os.as_str(),
-        p.xcode.as_str(),
-        p.hardware.as_str(),
-        p.model_id.as_str(),
-        p.power_mode.as_str(),
-        p.thermal_state.as_str(),
-        p.command_template.as_str(),
-        p.command.as_str(),
-    ]
-    .iter()
-    .any(|v| v.is_empty())
+    if !revision(&p.scene_works_revision)
+        || !revision(&p.inference_revision)
+        || !lowercase_hex(&p.dependency_lock_sha256, 64)
+        || !lowercase_hex(&p.model_file_sha256, 64)
+        || [
+            p.mlx_revision.as_str(),
+            p.os.as_str(),
+            p.xcode.as_str(),
+            p.hardware.as_str(),
+            p.model_id.as_str(),
+            p.power_mode.as_str(),
+            p.thermal_state.as_str(),
+            p.command_template.as_str(),
+            p.command.as_str(),
+        ]
+        .iter()
+        .any(|v| v.is_empty())
         || p.model_file_bytes == 0
         || p.thermal_state != "nominal"
+        || p.command_template.replace("{mode}", &receipt.mode) != p.command
     {
         return Err("provenance is incomplete".into());
     }
@@ -509,6 +539,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("geometry contains zero".into());
     }
+    if !["llama", "qwen"].contains(&receipt.matrix.family.as_str())
+        || !CONTEXT_BANDS.contains(&receipt.matrix.context_band.as_str())
+        || !["single", "supported-batch"].contains(&receipt.matrix.request_mode.as_str())
+        || !["chunked", "single-shot"].contains(&receipt.matrix.prefill_mode.as_str())
+        || !["cold", "warm"].contains(&receipt.matrix.process_temperature.as_str())
+        || g.query_heads % g.kv_heads != 0
+        || g.capacity < g.kv_length
+        || (receipt.matrix.request_mode == "single" && g.batch != 1)
+        || (receipt.matrix.request_mode == "supported-batch" && g.batch <= 1)
+    {
+        return Err("matrix coordinate or geometry relationship is invalid".into());
+    }
     let pids: Vec<u32> = receipt.memory.phase_samples.iter().map(|p| p.pid).collect();
     if pids.len() != 8
         || pids.iter().any(|p| *p == 0 || *p != pids[0])
@@ -522,6 +564,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
                     || p.source != "footprint -p"
                     || p.mlx.source != "mlx_rs::memory"
                     || p.phys_footprint_peak_bytes < p.phys_footprint_bytes
+                    || !rfc3339(&p.timestamp)
             })
     {
         return Err("phase PID evidence is inconsistent".into());
@@ -592,9 +635,27 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if transient_by_phase
         .values()
         .copied()
-        .any(|bytes| bytes >= dense)
+        .any(|bytes| (bytes as f64) >= (dense as f64 * 0.9))
     {
         return Err("aggregate full-cache temporary detected".into());
+    }
+    let attributed = receipt
+        .memory
+        .model_weights_bytes
+        .saturating_add(receipt.memory.persistent_kv_bytes)
+        .saturating_add(receipt.memory.transient_workspace_bytes);
+    for required in ["weights-loaded", "prefill-peak", "decode-steady"] {
+        let sample = receipt
+            .memory
+            .phase_samples
+            .iter()
+            .find(|sample| sample.phase == required)
+            .ok_or_else(|| format!("missing containment phase {required}"))?;
+        if sample.mlx.active_bytes < attributed || sample.mlx.peak_bytes < attributed {
+            return Err(format!(
+                "MLX attribution does not contain {required} allocations"
+            ));
+        }
     }
     if receipt.mode == "dense"
         && receipt.memory.persistent_kv_bytes.abs_diff(dense)
@@ -614,6 +675,46 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("release did not return within tolerance".into());
     }
     if receipt.timings.samples.len() != 5
+        || !receipt
+            .timings
+            .samples
+            .iter()
+            .flat_map(|s| {
+                [
+                    s.load_ms,
+                    s.prefill_ms,
+                    s.ttft_ms,
+                    s.first_token_ms,
+                    s.decode_tokens_per_second,
+                    s.cold_compile_ms,
+                    s.warm_compile_ms,
+                ]
+            })
+            .all(|v| v.is_finite() && v > 0.0)
+        || ![
+            receipt.timings.load_ms,
+            receipt.timings.prefill_ms,
+            receipt.timings.ttft_ms,
+            receipt.timings.first_token_ms,
+            receipt.timings.decode_tokens_per_second,
+            receipt.timings.cold_compile_ms,
+            receipt.timings.warm_compile_ms,
+            receipt.timings.summary.decode_tokens_per_second_mean,
+            receipt.timings.summary.decode_tokens_per_second_p95,
+        ]
+        .into_iter()
+        .all(|v| v.is_finite() && v > 0.0)
+        || ![
+            receipt.timings.summary.decode_tokens_per_second_variance,
+            receipt
+                .timings
+                .summary
+                .decode_tokens_per_second_coefficient_of_variation,
+            receipt.timings.summary.confidence_interval_low,
+            receipt.timings.summary.confidence_interval_high,
+        ]
+        .into_iter()
+        .all(|v| v.is_finite() && v >= 0.0)
         || receipt
             .timings
             .summary
@@ -674,6 +775,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             > 1e-9
         || receipt.timings.summary.confidence_interval_low > decode_mean
         || receipt.timings.summary.confidence_interval_high < decode_mean
+        || receipt.timings.summary.confidence_interval_low
+            > receipt.timings.summary.confidence_interval_high
     {
         return Err("timing summary derivation failed".into());
     }
@@ -753,6 +856,19 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             ));
         }
     }
+    if receipt
+        .lifecycle
+        .fallback_reasons
+        .iter()
+        .any(|(key, value)| {
+            !lifecycle
+                .iter()
+                .any(|(name, _)| format!("{name}FallbackReason") == *key)
+                || value.trim().is_empty()
+        })
+    {
+        return Err("unknown or empty lifecycle fallback reason".into());
+    }
     if !receipt.lifecycle.post_run_release {
         return Err("postRunRelease is required".into());
     }
@@ -762,6 +878,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactBundle {
+    pub receipt_name: String,
+    pub human_name: String,
     pub receipt: Vec<u8>,
     pub receipt_sidecar: String,
     pub human: Vec<u8>,
@@ -791,6 +909,8 @@ pub fn assemble_artifacts_named(
         .map_err(|e| e.to_string())?
         .into_bytes();
     Ok(ArtifactBundle {
+        receipt_name: receipt_name.into(),
+        human_name: human_name.into(),
         receipt_sidecar: format!("{}  {receipt_name}\n", seal_bytes(&bytes)),
         human_sidecar: format!("{}  {human_name}\n", seal_bytes(&human)),
         receipt: bytes,
@@ -806,7 +926,43 @@ pub fn write_artifacts(
     human_name: &str,
     bundle: &ArtifactBundle,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(directory)?;
+    if directory.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "artifact destination must be absent for atomic publication",
+        ));
+    }
+    for name in [receipt_name, human_name] {
+        if Path::new(name).file_name().and_then(|n| n.to_str()) != Some(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact names must be confined basenames",
+            ));
+        }
+    }
+    if bundle.receipt_name != receipt_name || bundle.human_name != human_name {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact bundle names do not match publication names",
+        ));
+    }
+    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.staging-{}",
+        directory
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("receipt"),
+        std::process::id()
+    ));
+    if staging.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "artifact staging path already exists",
+        ));
+    }
+    fs::create_dir(&staging)?;
     let files: Vec<(String, &[u8])> = vec![
         (receipt_name.into(), &bundle.receipt),
         (human_name.into(), &bundle.human),
@@ -819,17 +975,31 @@ pub fn write_artifacts(
             bundle.human_sidecar.as_bytes(),
         ),
     ];
-    for (name, bytes) in files {
-        let tmp = directory.join(format!(".{name}.tmp"));
-        fs::write(&tmp, bytes)?;
-        fs::rename(tmp, directory.join(name))?;
+    let result = (|| {
+        for (name, bytes) in files {
+            fs::write(staging.join(&name), bytes)?;
+        }
+        fs::rename(&staging, directory)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
     }
-    Ok(())
+    result
 }
 
 pub fn validate_artifact_bundle(bundle: &ArtifactBundle) -> Result<(), String> {
-    if bundle.receipt_sidecar != format!("{}  receipt.json\n", seal_bytes(&bundle.receipt))
-        || bundle.human_sidecar != format!("{}  receipt.txt\n", seal_bytes(&bundle.human))
+    validate_artifact_bundle_named(bundle, &bundle.receipt_name, &bundle.human_name)
+}
+
+pub fn validate_artifact_bundle_named(
+    bundle: &ArtifactBundle,
+    receipt_name: &str,
+    human_name: &str,
+) -> Result<(), String> {
+    if bundle.receipt_name != receipt_name
+        || bundle.human_name != human_name
+        || bundle.receipt_sidecar != format!("{}  {receipt_name}\n", seal_bytes(&bundle.receipt))
+        || bundle.human_sidecar != format!("{}  {human_name}\n", seal_bytes(&bundle.human))
     {
         return Err("artifact sidecar does not match exact bytes".into());
     }
@@ -1798,6 +1968,13 @@ mod tests {
         assert!(validate_receipt_semantics(&partial).is_err());
         let bundle = assemble_artifacts(receipt).expect("valid receipt must assemble");
         assert!(validate_artifact_bundle(&bundle).is_ok());
+        let named = assemble_artifacts_named(
+            serde_json::from_slice(&bundle.receipt).unwrap(),
+            "baseline.json",
+            "baseline.txt",
+        )
+        .unwrap();
+        assert!(validate_artifact_bundle_named(&named, "baseline.json", "baseline.txt").is_ok());
         let mut sealed_tampered = bundle.clone();
         sealed_tampered.receipt[0] ^= 1;
         assert!(validate_artifact_bundle(&sealed_tampered).is_err());
@@ -1809,17 +1986,21 @@ mod tests {
         let receipt = b"receipt".to_vec();
         let human = b"human receipt".to_vec();
         let bundle = ArtifactBundle {
+            receipt_name: "run.json".into(),
+            human_name: "run.txt".into(),
             receipt_sidecar: format!("{}  run.json\n", seal_bytes(&receipt)),
             human_sidecar: format!("{}  run.txt\n", seal_bytes(&human)),
             receipt: receipt.clone(),
             human: human.clone(),
         };
-        write_artifacts(dir.path(), "run.json", "run.txt", &bundle).unwrap();
-        assert_eq!(fs::read(dir.path().join("run.json")).unwrap(), receipt);
+        let output = dir.path().join("run");
+        write_artifacts(&output, "run.json", "run.txt", &bundle).unwrap();
+        assert_eq!(fs::read(output.join("run.json")).unwrap(), receipt);
         assert_eq!(
-            fs::read_to_string(dir.path().join("run.json.sha256")).unwrap(),
+            fs::read_to_string(output.join("run.json.sha256")).unwrap(),
             bundle.receipt_sidecar
         );
-        assert!(dir.path().join("run.txt.sha256").is_file());
+        assert!(output.join("run.txt.sha256").is_file());
+        assert!(write_artifacts(&output, "run.json", "run.txt", &bundle).is_err());
     }
 }
