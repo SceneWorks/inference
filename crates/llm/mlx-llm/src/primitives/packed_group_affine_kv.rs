@@ -1366,7 +1366,27 @@ mod tests {
         assert!(other.restore(&bytes).is_err());
         let mut restored = PackedGroupAffineKvCache::new("m", 1, 1, 1, 8, 4).unwrap();
         restored.restore(&bytes).unwrap();
-        assert_eq!(restored.representation(), c.representation());
+        // Snapshot semantics include the versioned layout and logical/token capacity, but not the
+        // allocator-dependent capacity of each backing Vec. Restore must report the physical
+        // allocation it actually received instead of replaying a stale byte count from another
+        // process/allocation history.
+        let restored_allocated = restored.allocated_payload_bytes();
+        assert_eq!(
+            restored.representation().allocated_bytes,
+            restored_allocated
+        );
+        assert!(restored_allocated >= restored.logical_stored_bytes());
+        assert_eq!(
+            RepresentationMetadata {
+                allocated_bytes: 0,
+                ..restored.representation()
+            },
+            RepresentationMetadata {
+                allocated_bytes: 0,
+                ..c.representation()
+            }
+        );
+        assert_same_rows(&restored, &c);
     }
 
     #[test]
