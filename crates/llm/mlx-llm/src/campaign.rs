@@ -242,6 +242,142 @@ pub struct Receipt {
     pub cancellation: ReceiptCancellation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawTiming {
+    pub load_ms: f64,
+    pub prefill_ms: f64,
+    pub ttft_ms: f64,
+    pub first_token_ms: f64,
+    pub decode_tokens_per_second: f64,
+    pub cold_compile_ms: f64,
+    pub warm_compile_ms: f64,
+}
+
+pub struct ReceiptBuilder {
+    pub template: Receipt,
+    pub phases: Vec<ReceiptPhase>,
+    pub allocations: Vec<ReceiptAllocation>,
+    pub timings: Vec<RawTiming>,
+    pub quality: QualityObservation,
+}
+
+impl ReceiptBuilder {
+    pub fn finish(mut self) -> Result<Receipt, String> {
+        if self.phases.len() != 8 || self.allocations.is_empty() || self.timings.len() != 5 {
+            return Err("receipt evidence is incomplete".into());
+        }
+        for (phase, expected) in self.phases.iter().zip(REQUIRED_PHASES) {
+            if phase.phase != expected
+                || phase.pid == 0
+                || phase.source != "footprint -p"
+                || phase.mlx.source != "mlx_rs::memory"
+            {
+                return Err("invalid phase evidence".into());
+            }
+        }
+        if self
+            .phases
+            .windows(2)
+            .any(|w| w[0].timestamp >= w[1].timestamp)
+        {
+            return Err("phase timestamps are not strictly increasing".into());
+        }
+        let geometry = &self.template.geometry;
+        let dense = dense_kv_bytes(
+            geometry.batch,
+            geometry.layers,
+            geometry.kv_heads,
+            geometry.capacity,
+            geometry.head_dimension,
+            geometry.element_bytes,
+        )?;
+        let metrics = compute_quality(&self.quality)?;
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if self.timings.iter().any(|t| {
+            ![
+                t.load_ms,
+                t.prefill_ms,
+                t.ttft_ms,
+                t.first_token_ms,
+                t.decode_tokens_per_second,
+                t.cold_compile_ms,
+                t.warm_compile_ms,
+            ]
+            .into_iter()
+            .all(positive)
+        }) {
+            return Err("timing samples must be finite and positive".into());
+        }
+        let mean = |f: fn(&RawTiming) -> f64| {
+            self.timings.iter().map(f).sum::<f64>() / self.timings.len() as f64
+        };
+        let decode_mean = mean(|t| t.decode_tokens_per_second);
+        let variance = self
+            .timings
+            .iter()
+            .map(|t| (t.decode_tokens_per_second - decode_mean).powi(2))
+            .sum::<f64>()
+            / self.timings.len() as f64;
+        let mut sorted: Vec<f64> = self
+            .timings
+            .iter()
+            .map(|t| t.decode_tokens_per_second)
+            .collect();
+        sorted.sort_by(f64::total_cmp);
+        let summary = ReceiptTimingSummary {
+            decode_tokens_per_second_mean: decode_mean,
+            decode_tokens_per_second_p95: sorted[4],
+            decode_tokens_per_second_variance: variance,
+            decode_tokens_per_second_coefficient_of_variation: variance.sqrt() / decode_mean,
+            confidence_interval_low: sorted[0],
+            confidence_interval_high: sorted[4],
+        };
+        self.template.memory.phase_samples = self.phases;
+        self.template.memory.allocation_events = self.allocations;
+        self.template.memory.dense_theoretical_kv_bytes = dense;
+        self.template.memory.reconciliation.expected_dense_kv_bytes = dense;
+        self.template
+            .memory
+            .reconciliation
+            .observed_persistent_kv_bytes = self.template.memory.persistent_kv_bytes;
+        self.template.timings = ReceiptTimings {
+            load_ms: mean(|t| t.load_ms),
+            prefill_ms: mean(|t| t.prefill_ms),
+            ttft_ms: mean(|t| t.ttft_ms),
+            first_token_ms: mean(|t| t.first_token_ms),
+            decode_tokens_per_second: decode_mean,
+            cold_compile_ms: mean(|t| t.cold_compile_ms),
+            warm_compile_ms: mean(|t| t.warm_compile_ms),
+            samples: self
+                .timings
+                .into_iter()
+                .map(|t| ReceiptTimingSample {
+                    load_ms: t.load_ms,
+                    prefill_ms: t.prefill_ms,
+                    ttft_ms: t.ttft_ms,
+                    first_token_ms: t.first_token_ms,
+                    decode_tokens_per_second: t.decode_tokens_per_second,
+                    cold_compile_ms: t.cold_compile_ms,
+                    warm_compile_ms: t.warm_compile_ms,
+                })
+                .collect(),
+            summary,
+        };
+        self.template.quality.parity_max_error = metrics.parity_max_error;
+        self.template.quality.perplexity_delta = metrics.perplexity_delta;
+        self.template.quality.greedy_token_agreement = metrics.greedy_token_agreement;
+        self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
+        self.template.quality.needle_retrieval = metrics.needle_retrieval;
+        self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
+        if self.template.memory.persistent_kv_bytes == 0
+            || self.template.memory.model_weights_bytes == 0
+        {
+            return Err("memory attribution totals must be nonzero".into());
+        }
+        Ok(self.template)
+    }
+}
+
 impl Receipt {
     /// Serialize the exact receipt bytes; `receipt_sha256` is filled by the caller after clearing
     /// that field according to the SceneWorks semantic-core convention.
