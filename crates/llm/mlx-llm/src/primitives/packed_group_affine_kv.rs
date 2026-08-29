@@ -1579,6 +1579,67 @@ impl PackedGroupAffineKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::kv_cache::PackedAttentionMask;
+    use std::cell::Cell;
+
+    #[derive(Debug)]
+    struct TestPackedKernel {
+        calls: Cell<usize>,
+        fail_on: Option<usize>,
+    }
+
+    impl RetainedPackedKernel for TestPackedKernel {
+        fn cache_identity(&self) -> &str {
+            "test-packed"
+        }
+        fn backend(&self) -> &str {
+            "mlx-metal"
+        }
+        fn retained_bytes(&self) -> usize {
+            0
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch(
+            &self,
+            query: &Array,
+            _k_codes: &Array,
+            _k_scale: &Array,
+            _k_zero: &Array,
+            _v_codes: &Array,
+            _v_scale: &Array,
+            _v_zero: &Array,
+            _mask: crate::primitives::packed_metal::PackedMask,
+        ) -> Result<Array> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if self.fail_on == Some(call) {
+                return Err(Error::Msg("injected packed dispatch fault".into()));
+            }
+            Ok(query.clone())
+        }
+    }
+
+    fn hook_cache(layers: usize, fail_on: Option<usize>) -> Box<dyn KvCache> {
+        let selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "test-packed".into(),
+                layers,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: 4,
+                query_length: 1,
+                has_mask: false,
+            },
+            CompiledKernelHandle::new(Arc::new(TestPackedKernel {
+                calls: Cell::new(0),
+                fail_on,
+            })),
+        );
+        selection.into_cache()
+    }
     fn data(step: usize, rows: usize, width: usize, bias: f32) -> Vec<f32> {
         (0..step * rows * width)
             .map(|i| bias + i as f32 * 0.25)
@@ -1916,6 +1977,62 @@ mod tests {
             CacheRoute::DenseFallback { .. }
         ));
         assert!(selection.cache.as_any_mut().is::<ContiguousKvCache>());
+    }
+
+    #[test]
+    fn packed_hook_commits_only_after_all_layers_and_preserves_offset() {
+        let mut cache = hook_cache(2, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        assert!(packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(packed.offset(), 0);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(packed.offset(), 1);
+        assert_eq!(packed.staged_representation().logical_len, 1);
+        assert!(packed.staged_representation().allocated_bytes > 0);
+        assert!(packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(packed.offset(), 1);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(packed.offset(), 2);
+    }
+
+    #[test]
+    fn packed_hook_fault_discards_pending_step_and_lifecycle_stays_consistent() {
+        let mut cache = hook_cache(2, Some(2));
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        assert!(packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .unwrap()
+            .is_some());
+        assert_eq!(packed.offset(), 0);
+        assert!(packed
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .is_err());
+        assert_eq!(packed.offset(), 0);
+        packed.reset();
+        assert_eq!(packed.offset(), 0);
+        assert!(packed.retain_sequences(&[0]).is_ok());
     }
 
     #[test]
