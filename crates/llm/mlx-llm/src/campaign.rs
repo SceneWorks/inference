@@ -1566,14 +1566,14 @@ mod tests {
 
     #[test]
     fn artifact_bundle_rejects_tampering_and_partial_outputs() {
-        let receipt = Receipt {
+        let mut template = Receipt {
             schema_version: 3,
             harness_version: "sc-20671-kv-baseline-v3".into(),
             run_id: "run".into(),
             captured_at: "2026-01-01T00:00:00Z".into(),
             mode: "dense".into(),
             status: "complete".into(),
-            contract_hash: "a".repeat(64),
+            contract_hash: QUALITY_CONTRACT_HASH.into(),
             receipt_sha256: String::new(),
             provenance: ReceiptProvenance {
                 scene_works_revision: "a".repeat(40),
@@ -1612,7 +1612,7 @@ mod tests {
             memory: ReceiptMemory {
                 model_weights_bytes: 1,
                 persistent_kv_bytes: 4,
-                transient_workspace_bytes: 0,
+                transient_workspace_bytes: 1,
                 dense_theoretical_kv_bytes: 4,
                 phase_samples: vec![],
                 allocation_events: vec![],
@@ -1688,10 +1688,119 @@ mod tests {
                 cleanup_verified: true,
             },
         };
-        assert!(
-            assemble_artifacts(receipt).is_err(),
-            "incomplete handcrafted evidence must never be a happy path"
-        );
+        for name in REQUIRED_FIXTURES {
+            template.quality.fixture_evidence.insert(
+                (*name).into(),
+                ReceiptFixture {
+                    passed: true,
+                    artifact_sha256: "a".repeat(64),
+                    independent_reference: "independent-reference".into(),
+                },
+            );
+        }
+        let phases = REQUIRED_PHASES
+            .iter()
+            .enumerate()
+            .map(|(index, phase)| ReceiptPhase {
+                phase: (*phase).into(),
+                pid: 7,
+                source: "footprint -p".into(),
+                timestamp: format!("2026-01-01T00:00:0{index}.000Z"),
+                phys_footprint_bytes: 100,
+                phys_footprint_peak_bytes: 100,
+                mlx: ReceiptMlx {
+                    source: "mlx_rs::memory".into(),
+                    active_bytes: 10,
+                    cache_bytes: 1,
+                    peak_bytes: 10,
+                },
+            })
+            .collect();
+        let allocations = vec![
+            ReceiptAllocation {
+                kind: "weights-allocation".into(),
+                role: "weights".into(),
+                lifetime: "persistent".into(),
+                phase: "weights-loaded".into(),
+                timestamp: "2026-01-01T00:00:01.100Z".into(),
+                bytes: 1,
+            },
+            ReceiptAllocation {
+                kind: "dense-kv-allocation".into(),
+                role: "cache".into(),
+                lifetime: "persistent".into(),
+                phase: "prefill-peak".into(),
+                timestamp: "2026-01-01T00:00:02.100Z".into(),
+                bytes: 4,
+            },
+            ReceiptAllocation {
+                kind: "attention-workspace".into(),
+                role: "attention-workspace".into(),
+                lifetime: "transient".into(),
+                phase: "prefill-peak".into(),
+                timestamp: "2026-01-01T00:00:02.200Z".into(),
+                bytes: 1,
+            },
+        ];
+        let timings = (0..5)
+            .map(|_| RawTiming {
+                load_ms: 1.0,
+                prefill_ms: 1.0,
+                ttft_ms: 1.0,
+                first_token_ms: 1.0,
+                decode_tokens_per_second: 1.0,
+                cold_compile_ms: 1.0,
+                warm_compile_ms: 1.0,
+            })
+            .collect();
+        let quality = QualityObservation {
+            parity_errors: vec![0.0],
+            reference_perplexity: 1.0,
+            candidate_perplexity: 1.0,
+            greedy_matches: 1,
+            greedy_total: 1,
+            tool_matches: 1,
+            tool_total: 1,
+            needle_matches: 1,
+            needle_total: 1,
+            cache_matches: 1,
+            cache_total: 1,
+        };
+        let receipt = ReceiptBuilder {
+            template,
+            phases,
+            allocations,
+            timings,
+            quality,
+        }
+        .finish()
+        .expect("builder must produce a complete v3 receipt");
+        let mut tampered = receipt.clone();
+        tampered.geometry.capacity = 2;
+        assert!(validate_receipt_semantics(&tampered).is_err());
+        let mut timing_tampered = receipt.clone();
+        timing_tampered.timings.decode_tokens_per_second += 1.0;
+        assert!(validate_receipt_semantics(&timing_tampered).is_err());
+        let mut lifecycle_tampered = receipt.clone();
+        lifecycle_tampered.lifecycle.append = false;
+        assert!(validate_receipt_semantics(&lifecycle_tampered).is_err());
+        let mut phase_tampered = receipt.clone();
+        phase_tampered.memory.phase_samples[3].source = "caller-authored".into();
+        assert!(validate_receipt_semantics(&phase_tampered).is_err());
+        let mut fixture_tampered = receipt.clone();
+        fixture_tampered
+            .quality
+            .fixture_evidence
+            .remove(REQUIRED_FIXTURES[0]);
+        assert!(validate_receipt_semantics(&fixture_tampered).is_err());
+        let mut partial = receipt.clone();
+        partial.timings.samples.pop();
+        assert!(validate_receipt_semantics(&partial).is_err());
+        let bundle = assemble_artifacts(receipt).expect("valid receipt must assemble");
+        assert!(validate_artifact_bundle(&bundle).is_ok());
+        let mut sealed_tampered = bundle.clone();
+        sealed_tampered.receipt[0] ^= 1;
+        assert!(validate_artifact_bundle(&sealed_tampered).is_err());
     }
 
     #[test]
