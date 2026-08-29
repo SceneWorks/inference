@@ -11,10 +11,14 @@
 //!   --example ltx25-quant-measure -- \
 //!   --acknowledgement I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY \
 //!   --case ltx25-bf16-blackwell-v1 \
-//!   --snapshot D:\models\ltx-2.5\distilled\bf16 \
+//!   --snapshot D:\hf\models--Lightricks--LTX-Video\snapshots\791ef61731ad067bd13ebff8cc0f07532476d9ef \
 //!   --model-revision 791ef61731ad067bd13ebff8cc0f07532476d9ef \
 //!   --output-dir D:\evidence\ltx25-bf16-blackwell-v1
 //! ```
+//!
+//! Candidate runs additionally require the explicit bf16 snapshot/revision and the canonical
+//! `generated-output.bin`/`receipt.json` pair from that snapshot's evidence directory. Candidate
+//! and reference inventories are intentionally distinct and independently sealed.
 
 use std::path::PathBuf;
 
@@ -66,6 +70,8 @@ fn main() -> Result<()> {
         snapshot: PathBuf::from(value(&args, "--snapshot")?),
         model_revision: value(&args, "--model-revision")?,
         output_dir: PathBuf::from(value(&args, "--output-dir")?),
+        reference_snapshot: optional_value(&args, "--reference-snapshot").map(PathBuf::from),
+        reference_model_revision: optional_value(&args, "--reference-model-revision"),
         reference_output: optional_value(&args, "--reference-output").map(PathBuf::from),
         reference_receipt: optional_value(&args, "--reference-receipt").map(PathBuf::from),
     })?;

@@ -48,6 +48,23 @@ fn main() {
         repo.join(git_head)
     };
     println!("cargo:rerun-if-changed={}", git_head.display());
+    let head_contents = fs::read_to_string(&git_head).expect("read git HEAD");
+    if let Some(reference) = head_contents.trim().strip_prefix("ref: ") {
+        let branch_ref = PathBuf::from(git(&repo, &["rev-parse", "--git-path", reference]));
+        let branch_ref = if branch_ref.is_absolute() {
+            branch_ref
+        } else {
+            repo.join(branch_ref)
+        };
+        println!("cargo:rerun-if-changed={}", branch_ref.display());
+        let packed_refs = PathBuf::from(git(&repo, &["rev-parse", "--git-path", "packed-refs"]));
+        let packed_refs = if packed_refs.is_absolute() {
+            packed_refs
+        } else {
+            repo.join(packed_refs)
+        };
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
 
     // This digest is the immutable executable *contract*: all LTX source plus the shared operator
     // implementations it dispatches to and the dependency lock. The runtime additionally hashes the

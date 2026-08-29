@@ -25,12 +25,13 @@ use sha2::{Digest, Sha256};
 
 use crate::dev_sampler::TransformerVariant;
 use crate::quant_eval::{
-    measurement_case, Ltx25GpuGeneration, Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt,
-    Ltx25QuantMode, Ltx25QuantQuality, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
+    bundle_identity_sha256, inventory_for_snapshot, measurement_case, snapshot_inventory_sha256,
+    Ltx25GpuGeneration, Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt, Ltx25QuantMode,
+    Ltx25QuantQuality, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
 };
 
 pub const TERMINAL_ACKNOWLEDGEMENT: &str = "I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY";
-pub const HARNESS_VERSION: &str = "sc-18777-terminal-v3";
+pub const HARNESS_VERSION: &str = "sc-18777-terminal-v4";
 const PROMPT: &str =
     "a red fox walking through snowy pines, slow cinematic dolly, detailed natural motion";
 const OUTPUT_MAGIC: &[u8] = b"LTX25-QUANT-OUTPUT-V1\0";
@@ -48,24 +49,20 @@ pub struct TerminalMeasurementConfig {
     pub snapshot: PathBuf,
     pub model_revision: String,
     pub output_dir: PathBuf,
+    pub reference_snapshot: Option<PathBuf>,
+    pub reference_model_revision: Option<String>,
     pub reference_output: Option<PathBuf>,
     pub reference_receipt: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InventoryEntry {
-    path: String,
-    bytes: u64,
-    sha256: String,
-    symlink_target: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelInventory {
-    schema_version: &'static str,
-    entries: Vec<InventoryEntry>,
+struct ReferenceEvidence {
+    output: CapturedOutput,
+    output_sha256: String,
+    receipt_sha256: String,
+    model_revision: String,
+    model_inventory_sha256: String,
+    runtime_bundle_sha256: String,
+    artifacts: Vec<EvidenceArtifact>,
 }
 
 #[derive(Serialize)]
@@ -153,31 +150,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     )?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let executable_sha256 = sha256_file(&executable)?;
-    let snapshot = fs::canonicalize(&config.snapshot).map_err(|error| {
-        invalid(format!(
-            "cannot canonicalize snapshot {}: {error}",
-            config.snapshot.display()
-        ))
-    })?;
-    if !snapshot.is_dir() {
-        return Err(invalid(format!(
-            "snapshot {} is not a directory",
-            snapshot.display()
-        ))
-        .into());
-    }
-    if !snapshot.ancestors().any(|ancestor| {
-        ancestor
-            .file_name()
-            .is_some_and(|name| name == config.model_revision.as_str())
-    }) {
-        return Err(invalid(format!(
-            "snapshot {} is not nested beneath declared immutable model revision {}",
-            snapshot.display(),
-            config.model_revision
-        ))
-        .into());
-    }
+    let snapshot = canonical_snapshot(&config.snapshot, &config.model_revision, "candidate")?;
     let output_parent = config
         .output_dir
         .parent()
@@ -212,9 +185,15 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     let run_nonce_sha256 = sha256_hex(&nonce);
 
     let inventory_path = config.output_dir.join("model-inventory.json");
-    let inventory = inventory_for(&snapshot)?;
+    let inventory = inventory_for_snapshot(&snapshot)?;
     write_json(&inventory_path, &inventory)?;
     let model_inventory_sha256 = sha256_file(&inventory_path)?;
+    if model_inventory_sha256 != snapshot_inventory_sha256(&inventory)? {
+        return Err(invalid(
+            "serialized model inventory hash disagrees with runtime inventory hash",
+        )
+        .into());
+    }
 
     let mut inspection_spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
     inspection_spec.quantize = match case.mode {
@@ -239,9 +218,10 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .path();
     let source_inspection =
         crate::advanced_quant::inspect_transformer_source(transformer, case.mode)?;
-    let runtime_bundle_sha256 = runtime_bundle_sha256(
+    let runtime_bundle_sha256 = bundle_identity_sha256(
         &resolved,
         &snapshot,
+        &inventory,
         &model_inventory_sha256,
         observed_variant,
         case.mode,
@@ -329,7 +309,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         ))
         .into());
     }
-    let post_inventory = inventory_for(&snapshot)?;
+    let post_inventory = inventory_for_snapshot(&snapshot)?;
     if post_inventory != inventory {
         return Err(invalid(
             "model inventory changed during generation, including a file or followed symlink target",
@@ -340,26 +320,27 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     write_captured_output(&output_path, &captured)?;
     let output_sha256 = sha256_file(&output_path)?;
 
-    let (reference, reference_output_sha256, reference_receipt_sha256, mut reference_artifacts) =
-        if case.mode == Ltx25QuantMode::Bf16 {
-            (
-                captured.clone(),
-                output_sha256.clone(),
-                sha256_hex(b"bf16-self-reference-no-prior-receipt"),
-                Vec::new(),
-            )
-        } else {
-            load_and_copy_reference(
-                &config,
-                &config.output_dir,
-                case,
-                &hardware,
-                &inference_revision,
-                &executable_sha256,
-                &model_inventory_sha256,
-            )?
-        };
-    let quality = compare_outputs(&captured, &reference)?;
+    let mut reference = if case.mode == Ltx25QuantMode::Bf16 {
+        ReferenceEvidence {
+            output: captured.clone(),
+            output_sha256: output_sha256.clone(),
+            receipt_sha256: sha256_hex(b"bf16-self-reference-no-prior-receipt"),
+            model_revision: config.model_revision.clone(),
+            model_inventory_sha256: model_inventory_sha256.clone(),
+            runtime_bundle_sha256: runtime_bundle_sha256.clone(),
+            artifacts: Vec::new(),
+        }
+    } else {
+        load_and_copy_reference(
+            &config,
+            &config.output_dir,
+            case,
+            &hardware,
+            &inference_revision,
+            &executable_sha256,
+        )?
+    };
+    let quality = compare_outputs(&captured, &reference.output)?;
     if !quality.silent_zero_video_passed || !quality.silent_zero_audio_passed {
         return Err(invalid("generated output failed the video or audio silent-zero gate").into());
     }
@@ -371,13 +352,19 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         "peakVramBytes": peak_mib * 1024 * 1024,
         "wallClockMs": wall_clock_ms,
         "outputSha256": output_sha256,
-        "referenceOutputSha256": reference_output_sha256,
+        "referenceOutputSha256": reference.output_sha256,
+        "referenceReceiptSha256": reference.receipt_sha256,
+        "referenceModelRevision": reference.model_revision,
+        "referenceModelInventorySha256": reference.model_inventory_sha256,
+        "referenceRuntimeBundleSha256": reference.runtime_bundle_sha256,
         "quality": quality,
         "observedWidth": observed.0,
         "observedHeight": observed.1,
         "observedFrames": observed.2,
         "observedFps": observed.3,
         "operatorKind": operator.operator_kind,
+        "executedProjectionCount": operator.executed_projection_count,
+        "declaredProjectionCount": operator.declared_projection_count,
         "operatorWeightInventorySha256": operator.weight_inventory_sha256,
     }));
     let transcript_path = config.output_dir.join("transcript.jsonl");
@@ -389,10 +376,10 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         artifact(&config.output_dir, &output_path)?,
         artifact(&config.output_dir, &transcript_path)?,
     ];
-    artifacts.append(&mut reference_artifacts);
+    artifacts.append(&mut reference.artifacts);
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let evidence_manifest = EvidenceManifest {
-        schema_version: "sceneworks-ltx25-quant-evidence-v2",
+        schema_version: "sceneworks-ltx25-quant-evidence-v3",
         case_id: case.id.to_owned(),
         run_nonce_sha256: run_nonce_sha256.clone(),
         artifacts,
@@ -418,6 +405,9 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         model_revision: config.model_revision,
         model_inventory_sha256,
         runtime_bundle_sha256,
+        reference_model_revision: reference.model_revision,
+        reference_model_inventory_sha256: reference.model_inventory_sha256,
+        reference_runtime_bundle_sha256: reference.runtime_bundle_sha256,
         gpu_name: hardware.gpu_name,
         compute_capability: format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1),
         driver_version: hardware.driver_version,
@@ -426,12 +416,12 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         transcript_sha256,
         evidence_manifest_sha256,
         output_sha256,
-        reference_output_sha256,
-        reference_receipt_sha256,
+        reference_output_sha256: reference.output_sha256,
+        reference_receipt_sha256: reference.receipt_sha256,
         operator_kind: operator.operator_kind,
         operator_contract_sha256: source_inspection.operator_contract_sha256,
         operator_weight_inventory_sha256: operator.weight_inventory_sha256,
-        materialized_projection_count: operator.materialized_projection_count,
+        executed_projection_count: operator.executed_projection_count,
         declared_projection_count: operator.declared_projection_count,
         baseline_vram_bytes: baseline_mib * 1024 * 1024,
         peak_vram_bytes: peak_mib * 1024 * 1024,
@@ -452,14 +442,19 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         transformer_variant: receipt.transformer_variant,
         inference_revision: receipt.inference_revision.clone(),
         executable_contract_sha256: receipt.executable_contract_sha256.clone(),
+        executable_sha256: receipt.executable_sha256.clone(),
         model_revision: receipt.model_revision.clone(),
         model_inventory_sha256: receipt.model_inventory_sha256.clone(),
         runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+        reference_model_revision: receipt.reference_model_revision.clone(),
+        reference_model_inventory_sha256: receipt.reference_model_inventory_sha256.clone(),
+        reference_runtime_bundle_sha256: receipt.reference_runtime_bundle_sha256.clone(),
         receipt_sha256: receipt.receipt_sha256.clone(),
         transcript_sha256: receipt.transcript_sha256.clone(),
         evidence_manifest_sha256: receipt.evidence_manifest_sha256.clone(),
         output_sha256: receipt.output_sha256.clone(),
         reference_output_sha256: receipt.reference_output_sha256.clone(),
+        reference_receipt_sha256: receipt.reference_receipt_sha256.clone(),
         operator_kind: receipt.operator_kind.clone(),
         operator_contract_sha256: receipt.operator_contract_sha256.clone(),
         operator_weight_inventory_sha256: receipt.operator_weight_inventory_sha256.clone(),
@@ -522,66 +517,31 @@ fn hardware_identity() -> Result<HardwareIdentity> {
     Err(invalid("terminal quant measurement requires the cuda feature").into())
 }
 
-fn inventory_for(root: &Path) -> Result<ModelInventory> {
-    fn visit(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == root.join(crate::quant_eval::RUNTIME_BINDING_FILE) {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                if fs::metadata(&path)?.is_file() {
-                    // Hugging Face snapshots normally symlink into the content-addressed blob
-                    // store. Hash the resolved bytes under the snapshot-relative logical path;
-                    // never include the machine-specific blob-store path in the identity.
-                    files.push(path);
-                } else {
-                    return Err(invalid(format!(
-                        "model inventory refuses non-file symlink {}",
-                        path.display()
-                    ))
-                    .into());
-                }
-            } else if metadata.is_dir() {
-                visit(root, &path, files)?;
-            } else if metadata.is_file() {
-                let _ = path.strip_prefix(root)?;
-                files.push(path);
-            }
-        }
-        Ok(())
+fn canonical_snapshot(path: &Path, revision: &str, label: &str) -> Result<PathBuf> {
+    require_lower_hex(&format!("{label} model revision"), revision, 40)?;
+    let root = fs::canonicalize(path).map_err(|error| {
+        invalid(format!(
+            "cannot canonicalize {label} snapshot {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(invalid(format!(
+            "{label} snapshot {} is not a directory",
+            root.display()
+        ))
+        .into());
     }
-    let mut files = Vec::new();
-    visit(root, root, &mut files)?;
-    files.sort();
-    if files.is_empty() {
-        return Err(invalid("model snapshot inventory is empty").into());
+    if root.file_name().is_none_or(|name| name != revision)
+        || root.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("snapshots"))
+    {
+        return Err(invalid(format!(
+            "{label} snapshot {} must be the exact Hugging Face <repo>/snapshots/{revision} directory",
+            root.display()
+        ))
+        .into());
     }
-    let mut entries = Vec::with_capacity(files.len());
-    for path in files {
-        let relative = path
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        entries.push(InventoryEntry {
-            path: relative,
-            bytes: path.metadata()?.len(),
-            sha256: sha256_file(&path)?,
-            symlink_target: fs::symlink_metadata(&path)?
-                .file_type()
-                .is_symlink()
-                .then(|| {
-                    fs::read_link(&path).map(|target| target.to_string_lossy().replace('\\', "/"))
-                })
-                .transpose()?,
-        });
-    }
-    Ok(ModelInventory {
-        schema_version: "sceneworks-model-inventory-v1",
-        entries,
-    })
+    Ok(root)
 }
 
 fn observed_geometry(output: &CapturedOutput) -> Result<(u32, u32, u32, u32)> {
@@ -609,36 +569,6 @@ fn observed_geometry(output: &CapturedOutput) -> Result<(u32, u32, u32, u32)> {
         u32::try_from(output.frames.len())?,
         output.fps,
     ))
-}
-
-fn runtime_bundle_sha256(
-    bundle: &candle_gen::gen_core::ltx_checkpoint::LtxBundle,
-    snapshot: &Path,
-    model_inventory_sha256: &str,
-    variant: TransformerVariant,
-    mode: Ltx25QuantMode,
-) -> Result<String> {
-    let mut rows = Vec::new();
-    for resolved in bundle.components() {
-        let canonical = fs::canonicalize(resolved.path())?;
-        let logical = canonical
-            .strip_prefix(snapshot)
-            .map_err(|_| {
-                invalid(format!(
-                    "resolved component {} escapes the declared snapshot {}",
-                    canonical.display(),
-                    snapshot.display()
-                ))
-            })?
-            .to_string_lossy()
-            .replace('\\', "/");
-        rows.push(format!("{}:{logical}", resolved.component().id()));
-    }
-    rows.sort();
-    rows.insert(0, format!("mode:{}", mode.id()));
-    rows.insert(0, format!("variant:{}", variant.id()));
-    rows.insert(0, format!("inventory:{model_inventory_sha256}"));
-    Ok(sha256_hex(rows.join("\n").as_bytes()))
 }
 
 fn capture_output(output: GenerationOutput) -> Result<CapturedOutput> {
@@ -726,15 +656,38 @@ fn load_and_copy_reference(
     hardware: &HardwareIdentity,
     inference_revision: &str,
     executable_sha256: &str,
-    model_inventory_sha256: &str,
-) -> Result<(CapturedOutput, String, String, Vec<EvidenceArtifact>)> {
+) -> Result<ReferenceEvidence> {
+    let reference_revision = config.reference_model_revision.as_deref().ok_or_else(|| {
+        invalid("non-bf16 cases require --reference-model-revision for the bf16 snapshot")
+    })?;
+    let reference_snapshot = config.reference_snapshot.as_ref().ok_or_else(|| {
+        invalid("non-bf16 cases require --reference-snapshot for the bf16 model bundle")
+    })?;
+    let reference_snapshot =
+        canonical_snapshot(reference_snapshot, reference_revision, "reference")?;
     let source_output = config.reference_output.as_ref().ok_or_else(|| {
         invalid("non-bf16 cases require --reference-output from the matching sealed bf16 case")
     })?;
     let source_receipt = config.reference_receipt.as_ref().ok_or_else(|| {
         invalid("non-bf16 cases require --reference-receipt from the matching sealed bf16 case")
     })?;
-    let receipt: Ltx25QuantMeasurementReceipt = serde_json::from_slice(&fs::read(source_receipt)?)?;
+    let source_output = fs::canonicalize(source_output)?;
+    let source_receipt = fs::canonicalize(source_receipt)?;
+    let evidence_dir = source_receipt
+        .parent()
+        .ok_or_else(|| invalid("bf16 reference receipt has no evidence directory"))?
+        .to_path_buf();
+    if source_output.parent() != Some(evidence_dir.as_path())
+        || source_output.file_name() != Some(std::ffi::OsStr::new("generated-output.bin"))
+        || source_receipt.file_name() != Some(std::ffi::OsStr::new("receipt.json"))
+    {
+        return Err(invalid(
+            "bf16 reference output and receipt must be the canonical generated-output.bin/receipt.json pair from one evidence directory",
+        )
+        .into());
+    }
+    let receipt: Ltx25QuantMeasurementReceipt =
+        serde_json::from_slice(&fs::read(&source_receipt)?)?;
     let errors = receipt.validation_errors();
     if !errors.is_empty() {
         return Err(invalid(format!(
@@ -743,45 +696,138 @@ fn load_and_copy_reference(
         ))
         .into());
     }
-    if receipt.mode != Ltx25QuantMode::Bf16
-        || receipt.gpu_generation != case.gpu
-        || receipt.gpu_name != hardware.gpu_name
-        || receipt.compute_capability
-            != format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1)
-        || receipt.driver_version != hardware.driver_version
-        || receipt.inference_revision != inference_revision
-        || receipt.executable_contract_sha256 != env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
-        || receipt.executable_sha256 != executable_sha256
-        || receipt.model_revision != config.model_revision
-        || receipt.model_inventory_sha256 != model_inventory_sha256
-        || receipt.transformer_variant != case.transformer_variant
-        || receipt.fixture != case.fixture
-        || receipt.observed_width != case.width
-        || receipt.observed_height != case.height
-        || receipt.observed_frames != case.frames
-        || receipt.observed_fps != case.fps
-        || receipt.seed != case.seed
-    {
-        return Err(invalid("bf16 reference receipt does not match this exact code/model/GPU/driver/fixture identity").into());
+    if !reference_receipt_matches_campaign(
+        &receipt,
+        case,
+        hardware,
+        inference_revision,
+        executable_sha256,
+        reference_revision,
+    ) {
+        return Err(invalid("bf16 reference receipt does not match this exact code/reference-model/GPU/driver/fixture identity").into());
     }
-    let source_hash = sha256_file(source_output)?;
+    let reference_inventory = inventory_for_snapshot(&reference_snapshot)?;
+    let reference_inventory_sha256 = snapshot_inventory_sha256(&reference_inventory)?;
+    let inventory_path = evidence_dir.join("model-inventory.json");
+    if sha256_file(&inventory_path)? != receipt.model_inventory_sha256
+        || receipt.model_inventory_sha256 != reference_inventory_sha256
+    {
+        return Err(invalid(
+            "bf16 reference receipt/inventory artifact does not match the explicit reference snapshot",
+        )
+        .into());
+    }
+    let reference_spec = LoadSpec::new(WeightsSource::Dir(reference_snapshot.clone()));
+    let reference_bundle = crate::bundle::resolve_split_bundle(&reference_spec)?;
+    let reference_variant = TransformerVariant::from_bundle(&reference_bundle)?;
+    if reference_variant != case.transformer_variant {
+        return Err(invalid(
+            "bf16 reference bundle transformer variant differs from candidate case",
+        )
+        .into());
+    }
+    let reference_transformer = reference_bundle
+        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .path();
+    crate::advanced_quant::inspect_transformer_source(reference_transformer, Ltx25QuantMode::Bf16)?;
+    let reference_bundle_sha256 = bundle_identity_sha256(
+        &reference_bundle,
+        &reference_snapshot,
+        &reference_inventory,
+        &reference_inventory_sha256,
+        reference_variant,
+        Ltx25QuantMode::Bf16,
+    )?;
+    if !reference_receipt_matches_bundle(
+        &receipt,
+        reference_revision,
+        &reference_inventory_sha256,
+        &reference_bundle_sha256,
+    ) {
+        return Err(invalid(
+            "bf16 reference receipt is not self-bound to the explicit bf16 bundle identity",
+        )
+        .into());
+    }
+    let source_hash = sha256_file(&source_output)?;
     if source_hash != receipt.output_sha256 {
         return Err(invalid("bf16 reference output hash does not match its sealed receipt").into());
     }
+    let transcript_path = evidence_dir.join("transcript.jsonl");
+    let manifest_path = evidence_dir.join("evidence-manifest.json");
+    if sha256_file(&transcript_path)? != receipt.transcript_sha256
+        || sha256_file(&manifest_path)? != receipt.evidence_manifest_sha256
+    {
+        return Err(invalid(
+            "bf16 reference transcript or evidence manifest hash differs from its receipt",
+        )
+        .into());
+    }
+    let sources = [
+        (source_output.as_path(), "reference-output.bin"),
+        (source_receipt.as_path(), "reference-receipt.json"),
+        (inventory_path.as_path(), "reference-model-inventory.json"),
+        (transcript_path.as_path(), "reference-transcript.jsonl"),
+        (manifest_path.as_path(), "reference-evidence-manifest.json"),
+    ];
+    let mut artifacts = Vec::with_capacity(sources.len());
+    for (source, name) in sources {
+        let destination = output_dir.join(name);
+        fs::copy(source, &destination)?;
+        artifacts.push(artifact(output_dir, &destination)?);
+    }
     let copied_output = output_dir.join("reference-output.bin");
-    let copied_receipt = output_dir.join("reference-receipt.json");
-    fs::copy(source_output, &copied_output)?;
-    fs::copy(source_receipt, &copied_receipt)?;
     let reference = read_captured_output(&copied_output)?;
-    Ok((
-        reference,
-        source_hash,
-        sha256_file(source_receipt)?,
-        vec![
-            artifact(output_dir, &copied_output)?,
-            artifact(output_dir, &copied_receipt)?,
-        ],
-    ))
+    Ok(ReferenceEvidence {
+        output: reference,
+        output_sha256: source_hash,
+        receipt_sha256: sha256_file(&source_receipt)?,
+        model_revision: reference_revision.to_owned(),
+        model_inventory_sha256: reference_inventory_sha256,
+        runtime_bundle_sha256: reference_bundle_sha256,
+        artifacts,
+    })
+}
+
+fn reference_receipt_matches_campaign(
+    receipt: &Ltx25QuantMeasurementReceipt,
+    case: &crate::quant_eval::Ltx25QuantMeasurementCase,
+    hardware: &HardwareIdentity,
+    inference_revision: &str,
+    executable_sha256: &str,
+    reference_revision: &str,
+) -> bool {
+    receipt.mode == Ltx25QuantMode::Bf16
+        && receipt.gpu_generation == case.gpu
+        && receipt.gpu_name == hardware.gpu_name
+        && receipt.compute_capability
+            == format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1)
+        && receipt.driver_version == hardware.driver_version
+        && receipt.inference_revision == inference_revision
+        && receipt.executable_contract_sha256 == env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
+        && receipt.executable_sha256 == executable_sha256
+        && receipt.model_revision == reference_revision
+        && receipt.transformer_variant == case.transformer_variant
+        && receipt.fixture == case.fixture
+        && receipt.observed_width == case.width
+        && receipt.observed_height == case.height
+        && receipt.observed_frames == case.frames
+        && receipt.observed_fps == case.fps
+        && receipt.seed == case.seed
+}
+
+fn reference_receipt_matches_bundle(
+    receipt: &Ltx25QuantMeasurementReceipt,
+    reference_revision: &str,
+    reference_inventory_sha256: &str,
+    reference_bundle_sha256: &str,
+) -> bool {
+    receipt.model_revision == reference_revision
+        && receipt.model_inventory_sha256 == reference_inventory_sha256
+        && receipt.runtime_bundle_sha256 == reference_bundle_sha256
+        && receipt.reference_model_revision == receipt.model_revision
+        && receipt.reference_model_inventory_sha256 == receipt.model_inventory_sha256
+        && receipt.reference_runtime_bundle_sha256 == receipt.runtime_bundle_sha256
 }
 
 fn compare_outputs(
@@ -957,6 +1003,56 @@ fn require_lower_hex(label: &str, value: &str, length: usize) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn bf16_receipt() -> Ltx25QuantMeasurementReceipt {
+        let case = measurement_case("ltx25-bf16-ada-v1").unwrap();
+        Ltx25QuantMeasurementReceipt::seal(Ltx25QuantMeasurementDraft {
+            case_id: case.id.to_owned(),
+            mode: case.mode,
+            gpu_generation: case.gpu,
+            transformer_variant: case.transformer_variant,
+            fixture: case.fixture.to_owned(),
+            observed_width: case.width,
+            observed_height: case.height,
+            observed_frames: case.frames,
+            observed_fps: case.fps,
+            seed: case.seed,
+            inference_revision: "a".repeat(40),
+            executable_contract_sha256: env!("LTX25_EXECUTABLE_CONTRACT_SHA256").to_owned(),
+            executable_sha256: "b".repeat(64),
+            model_revision: "c".repeat(40),
+            model_inventory_sha256: "d".repeat(64),
+            runtime_bundle_sha256: "e".repeat(64),
+            reference_model_revision: "c".repeat(40),
+            reference_model_inventory_sha256: "d".repeat(64),
+            reference_runtime_bundle_sha256: "e".repeat(64),
+            gpu_name: "NVIDIA GeForce RTX 4090".to_owned(),
+            compute_capability: "sm_89".to_owned(),
+            driver_version: "580.12".to_owned(),
+            harness_version: HARNESS_VERSION.to_owned(),
+            run_nonce_sha256: "f".repeat(64),
+            transcript_sha256: "1".repeat(64),
+            evidence_manifest_sha256: "2".repeat(64),
+            output_sha256: "3".repeat(64),
+            reference_output_sha256: "3".repeat(64),
+            reference_receipt_sha256: "4".repeat(64),
+            operator_kind: "dense-linear".to_owned(),
+            operator_contract_sha256: "5".repeat(64),
+            operator_weight_inventory_sha256: "6".repeat(64),
+            executed_projection_count: 1,
+            declared_projection_count: 0,
+            baseline_vram_bytes: 1,
+            peak_vram_bytes: 2,
+            wall_clock_ms: 1,
+            quality: Ltx25QuantQuality {
+                reference_psnr: 120.0,
+                reference_ssim: 1.0,
+                temporal_boundary_drift: 0.0,
+                silent_zero_video_passed: true,
+                silent_zero_audio_passed: true,
+            },
+        })
+    }
+
     fn image(values: &[u8]) -> ImageRecord {
         ImageRecord {
             width: 1,
@@ -1053,6 +1149,60 @@ mod tests {
     }
 
     #[test]
+    fn quant_candidate_accepts_a_distinct_explicit_bf16_snapshot_identity_only() {
+        let receipt = bf16_receipt();
+        let candidate = measurement_case("ltx25-int8-convrot-ada-v1").unwrap();
+        let hardware = HardwareIdentity {
+            gpu_name: receipt.gpu_name.clone(),
+            driver_version: receipt.driver_version.clone(),
+            compute_cap: (8, 9),
+            generation: Ltx25GpuGeneration::AdaSm89,
+            physical_ordinal: 0,
+        };
+        assert!(reference_receipt_matches_campaign(
+            &receipt,
+            candidate,
+            &hardware,
+            &receipt.inference_revision,
+            &receipt.executable_sha256,
+            &receipt.model_revision,
+        ));
+        assert!(reference_receipt_matches_bundle(
+            &receipt,
+            &receipt.model_revision,
+            &receipt.model_inventory_sha256,
+            &receipt.runtime_bundle_sha256,
+        ));
+        let candidate_inventory = "9".repeat(64);
+        assert_ne!(candidate_inventory, receipt.model_inventory_sha256);
+
+        assert!(!reference_receipt_matches_campaign(
+            &receipt,
+            candidate,
+            &hardware,
+            &receipt.inference_revision,
+            &"0".repeat(64),
+            &receipt.model_revision,
+        ));
+        assert!(!reference_receipt_matches_campaign(
+            &receipt,
+            candidate,
+            &hardware,
+            &receipt.inference_revision,
+            &receipt.executable_sha256,
+            &"0".repeat(40),
+        ));
+        let mut wrong_reference = receipt.clone();
+        wrong_reference.reference_model_inventory_sha256 = "0".repeat(64);
+        assert!(!reference_receipt_matches_bundle(
+            &wrong_reference,
+            &receipt.model_revision,
+            &receipt.model_inventory_sha256,
+            &receipt.runtime_bundle_sha256,
+        ));
+    }
+
+    #[test]
     fn terminal_acknowledgement_is_explicit_and_stable() {
         assert_eq!(
             TERMINAL_ACKNOWLEDGEMENT,
@@ -1064,6 +1214,8 @@ mod tests {
             snapshot: PathBuf::from("unused"),
             model_revision: "0".repeat(40),
             output_dir: PathBuf::from("/unused"),
+            reference_snapshot: None,
+            reference_model_revision: None,
             reference_output: None,
             reference_receipt: None,
         })
@@ -1074,42 +1226,82 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn model_inventory_hashes_hf_style_file_symlinks_by_logical_snapshot_path() {
+    fn model_inventory_hashes_hf_blob_symlinks_by_logical_snapshot_path() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
-        let blobs = tempfile::tempdir().unwrap();
-        fs::write(blobs.path().join("blob"), b"exact-model-bytes").unwrap();
-        fs::create_dir(root.path().join("nested")).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let repo = cache.path().join("models--scene--ltx");
+        let blobs = repo.join("blobs");
+        let revision = "1".repeat(40);
+        let root = repo.join("snapshots").join(&revision);
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("blob"), b"exact-model-bytes").unwrap();
         symlink(
-            blobs.path().join("blob"),
-            root.path().join("nested/transformer.safetensors"),
+            "../../../blobs/blob",
+            root.join("nested/transformer.safetensors"),
         )
         .unwrap();
-        let inventory = inventory_for(root.path()).unwrap();
+        let inventory = inventory_for_snapshot(&root).unwrap();
         assert_eq!(inventory.entries.len(), 1);
         assert_eq!(inventory.entries[0].path, "nested/transformer.safetensors");
-        let first_target = blobs.path().join("blob").to_string_lossy().into_owned();
         assert_eq!(
             inventory.entries[0].symlink_target.as_deref(),
-            Some(first_target.as_str())
+            Some("blobs/blob")
         );
         assert_eq!(
             inventory.entries[0].sha256,
             sha256_hex(b"exact-model-bytes")
         );
 
-        fs::write(blobs.path().join("second-blob"), b"exact-model-bytes").unwrap();
-        fs::remove_file(root.path().join("nested/transformer.safetensors")).unwrap();
+        fs::write(blobs.join("second-blob"), b"exact-model-bytes").unwrap();
+        fs::remove_file(root.join("nested/transformer.safetensors")).unwrap();
         symlink(
-            blobs.path().join("second-blob"),
-            root.path().join("nested/transformer.safetensors"),
+            "../../../blobs/second-blob",
+            root.join("nested/transformer.safetensors"),
         )
         .unwrap();
-        let retargeted = inventory_for(root.path()).unwrap();
+        let retargeted = inventory_for_snapshot(&root).unwrap();
         assert_ne!(
             inventory, retargeted,
             "retargeting a model symlink must invalidate the pre-generation inventory even when the followed bytes match"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_inventory_rejects_a_symlink_escaping_the_hf_repository_blobs() {
+        use std::os::unix::fs::symlink;
+
+        let cache = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repo = cache.path().join("models--scene--ltx");
+        let revision = "2".repeat(40);
+        let root = repo.join("snapshots").join(revision);
+        fs::create_dir_all(repo.join("blobs")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(outside.path().join("escaped"), b"same-looking-model").unwrap();
+        symlink(
+            outside.path().join("escaped"),
+            root.join("transformer.safetensors"),
+        )
+        .unwrap();
+        let error = inventory_for_snapshot(&root).unwrap_err().to_string();
+        assert!(
+            error.contains("outside the repository blob cache"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn materialized_snapshot_files_do_not_require_a_blobs_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let revision = "3".repeat(40);
+        let root = cache.path().join("repo/snapshots").join(revision);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("transformer.safetensors"), b"materialized").unwrap();
+        let inventory = inventory_for_snapshot(&root).unwrap();
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].symlink_target, None);
     }
 }

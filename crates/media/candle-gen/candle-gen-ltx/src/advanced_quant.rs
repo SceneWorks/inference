@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
@@ -255,6 +255,18 @@ fn inspect_convrot(st: &MmapedSafetensors) -> Result<BTreeSet<String>> {
             "LTX INT8-ConvRot transformer has no validated convrot=true projection descriptors",
         ));
     }
+    for (weight_name, _) in st
+        .tensors()
+        .into_iter()
+        .filter(|(name, view)| name.ends_with(".weight") && view.dtype() == SafetensorDtype::I8)
+    {
+        let base = weight_name.strip_suffix(".weight").unwrap();
+        if !keys.contains(base) {
+            return Err(invalid(format!(
+                "LTX INT8-ConvRot source contains orphan I8 projection `{weight_name}` without a validated convrot descriptor/scale"
+            )));
+        }
+    }
     if st
         .tensors()
         .iter()
@@ -352,13 +364,7 @@ impl AdvancedQuantSource {
     pub fn refuse_undeclared_advanced_tensor(&self, base: &str) -> Result<()> {
         match &self.backend {
             AdvancedBackend::ConvRot { st, .. } => {
-                if st.get(&format!("{base}.weight_scale")).is_ok()
-                    || st.get(&format!("{base}.comfy_quant")).is_ok()
-                {
-                    return Err(invalid(format!(
-                        "LTX `{base}` has ConvRot-looking companions but no validated convrot descriptor; dense fallback refused"
-                    )));
-                }
+                refuse_undeclared_convrot_tensor(st, base)?;
             }
             AdvancedBackend::Nvfp4 { reader, .. } => {
                 if reader
@@ -462,6 +468,21 @@ impl AdvancedQuantSource {
     }
 }
 
+fn refuse_undeclared_convrot_tensor(st: &MmapedSafetensors, base: &str) -> Result<()> {
+    let is_i8_weight = st
+        .get(&format!("{base}.weight"))
+        .is_ok_and(|view| view.dtype() == SafetensorDtype::I8);
+    if is_i8_weight
+        || st.get(&format!("{base}.weight_scale")).is_ok()
+        || st.get(&format!("{base}.comfy_quant")).is_ok()
+    {
+        return Err(invalid(format!(
+            "LTX `{base}` has I8/ConvRot tensors but no validated convrot descriptor; dense cast/fallback refused"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) enum LoadedAdvancedProjection {
     Int8ConvRot {
         codes: Tensor,
@@ -504,7 +525,7 @@ pub(crate) fn active_source() -> Option<Arc<AdvancedQuantSource>> {
 pub struct OperatorAttestation {
     pub mode: Ltx25QuantMode,
     pub operator_kind: String,
-    pub materialized_projection_count: u32,
+    pub executed_projection_count: u32,
     pub declared_projection_count: u32,
     pub weight_inventory_sha256: String,
 }
@@ -513,45 +534,49 @@ pub struct OperatorAttestation {
 struct AttestationState {
     mode: Option<Ltx25QuantMode>,
     declared: BTreeSet<String>,
-    materialized: BTreeMap<String, (AdvancedOperatorKind, String)>,
+    executed: BTreeMap<String, (AdvancedOperatorKind, String)>,
 }
 
-fn attestation_state() -> &'static Mutex<AttestationState> {
-    static STATE: OnceLock<Mutex<AttestationState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(AttestationState::default()))
+thread_local! {
+    static OPERATOR_ATTESTATION: RefCell<AttestationState> = RefCell::new(AttestationState::default());
 }
 
 pub fn begin_operator_attestation(mode: Ltx25QuantMode) {
-    *attestation_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = AttestationState {
-        mode: Some(mode),
-        ..AttestationState::default()
-    };
+    OPERATOR_ATTESTATION.with(|state| {
+        *state.borrow_mut() = AttestationState {
+            mode: Some(mode),
+            ..AttestationState::default()
+        };
+    });
 }
 
 fn declare_advanced_source(mode: Ltx25QuantMode, keys: &BTreeSet<String>) {
-    let mut state = attestation_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.mode == Some(mode) {
-        state.declared.extend(keys.iter().cloned());
-    }
+    OPERATOR_ATTESTATION.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode == Some(mode) {
+            state.declared.extend(keys.iter().cloned());
+        }
+    });
 }
 
-pub(crate) fn record_projection(key: String, kind: AdvancedOperatorKind, attestation: String) {
-    let mut state = attestation_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if state.mode.is_some() {
-        state.materialized.insert(key, (kind, attestation));
-    }
+pub(crate) fn record_projection_execution(
+    key: String,
+    kind: AdvancedOperatorKind,
+    attestation: String,
+) {
+    OPERATOR_ATTESTATION.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode.is_some() {
+            state.executed.insert(key, (kind, attestation));
+        }
+    });
 }
 
 pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
-    let state = attestation_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    OPERATOR_ATTESTATION.with(|state| finish_attestation(&state.borrow()))
+}
+
+fn finish_attestation(state: &AttestationState) -> Result<OperatorAttestation> {
     let mode = state
         .mode
         .ok_or_else(|| invalid("operator attestation was not started"))?;
@@ -560,17 +585,15 @@ pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
             || state
                 .declared
                 .iter()
-                .any(|key| !state.materialized.contains_key(key)))
+                .any(|key| !state.executed.contains_key(key)))
     {
         return Err(invalid(format!(
             "LTX {} did not execute every descriptor-declared advanced projection; dense fallback/replay refused",
             mode.id()
         )));
     }
-    if state.materialized.is_empty() {
-        return Err(invalid(
-            "LTX generation materialized no attested projections",
-        ));
+    if state.executed.is_empty() {
+        return Err(invalid("LTX generation executed no attested projections"));
     }
     let expected = match mode {
         Ltx25QuantMode::Bf16 => AdvancedOperatorKind::Dense,
@@ -578,13 +601,9 @@ pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
         Ltx25QuantMode::Int8ConvRot => AdvancedOperatorKind::Int8ConvRotIgemm,
         Ltx25QuantMode::Nvfp4 => AdvancedOperatorKind::Nvfp4W4A4,
     };
-    if !state
-        .materialized
-        .values()
-        .any(|(kind, _)| *kind == expected)
-    {
+    if !state.executed.values().any(|(kind, _)| *kind == expected) {
         return Err(invalid(format!(
-            "LTX {} never materialized its required operator {}",
+            "LTX {} never executed its required operator {}",
             mode.id(),
             expected.id()
         )));
@@ -592,7 +611,7 @@ pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
     if matches!(mode, Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4)
         && state.declared.iter().any(|key| {
             state
-                .materialized
+                .executed
                 .get(key)
                 .is_some_and(|(kind, _)| *kind != expected)
         })
@@ -601,7 +620,7 @@ pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
             "descriptor-declared advanced projection executed a different operator",
         ));
     }
-    let inventory = sha256(state.materialized.iter().flat_map(|(key, (kind, hash))| {
+    let inventory = sha256(state.executed.iter().flat_map(|(key, (kind, hash))| {
         [
             key.as_bytes().to_vec(),
             kind.id().as_bytes().to_vec(),
@@ -611,7 +630,7 @@ pub fn finish_operator_attestation() -> Result<OperatorAttestation> {
     Ok(OperatorAttestation {
         mode,
         operator_kind: expected.id().to_owned(),
-        materialized_projection_count: state.materialized.len() as u32,
+        executed_projection_count: state.executed.len() as u32,
         declared_projection_count: state.declared.len() as u32,
         weight_inventory_sha256: inventory,
     })
@@ -623,6 +642,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn write_convrot(path: &Path) {
+        write_convrot_with_orphan(path, false);
+    }
+
+    fn write_convrot_with_orphan(path: &Path, include_orphan: bool) {
         let codes = vec![0u8; 16];
         let scales = [1.0f32; 4]
             .into_iter()
@@ -647,6 +670,13 @@ mod tests {
             )
             .unwrap(),
         );
+        if include_orphan {
+            tensors.insert(
+                "model.diffusion_model.block.to_k.weight",
+                safetensors::tensor::TensorView::new(SafetensorDtype::I8, vec![4, 4], &codes)
+                    .unwrap(),
+            );
+        }
         safetensors::serialize_to_file(tensors, None, path).unwrap();
     }
 
@@ -735,6 +765,27 @@ mod tests {
     }
 
     #[test]
+    fn convrot_source_rejects_an_orphan_i8_projection_before_dense_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan-i8.safetensors");
+        write_convrot_with_orphan(&path, true);
+        let error = inspect_transformer_source(&path, Ltx25QuantMode::Int8ConvRot)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("orphan I8 projection"), "{error}");
+        assert!(error.contains("to_k.weight"), "{error}");
+        // SAFETY: test-owned immutable safetensors file.
+        let st = unsafe { MmapedSafetensors::new(&path).unwrap() };
+        let fallback = refuse_undeclared_convrot_tensor(&st, "model.diffusion_model.block.to_k")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fallback.contains("dense cast/fallback refused"),
+            "{fallback}"
+        );
+    }
+
+    #[test]
     fn missing_advanced_materialization_is_a_hard_error() {
         begin_operator_attestation(Ltx25QuantMode::Int8ConvRot);
         declare_advanced_source(
@@ -750,7 +801,7 @@ mod tests {
         begin_operator_attestation(Ltx25QuantMode::Nvfp4);
         let key = "model.diffusion_model.block.to_q".to_owned();
         declare_advanced_source(Ltx25QuantMode::Nvfp4, &BTreeSet::from([key.clone()]));
-        record_projection(key, AdvancedOperatorKind::Dense, "a".repeat(64));
+        record_projection_execution(key, AdvancedOperatorKind::Dense, "a".repeat(64));
         let error = finish_operator_attestation().unwrap_err().to_string();
         assert!(error.contains("required operator"), "{error}");
     }

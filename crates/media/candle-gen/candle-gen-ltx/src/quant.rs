@@ -67,7 +67,7 @@ use candle_gen::quant::Int8Linear;
 use candle_gen::quant::{ActPrecision, LokrFactors, Nvfp4Linear, Nvfp4Regime};
 use candle_gen::train::lora::LoraLinear;
 
-use crate::advanced_quant::{active_source, record_projection, AdvancedOperatorKind};
+use crate::advanced_quant::{active_source, record_projection_execution, AdvancedOperatorKind};
 
 /// The LTX MLX tier's quant group size (read from `quantize_config.json`'s `quantization.group_size`;
 /// the hosted q4/q8 tiers pack at 64, MLX's default). Threaded through the shared group-size-aware
@@ -92,6 +92,7 @@ pub struct QLinear {
     path: String,
     in_features: usize,
     out_features: usize,
+    attestation: String,
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -129,11 +130,17 @@ impl QLinear {
     /// `x·Wᵀ + b` plus any inference residuals. The frozen dense/packed base dispatch is owned by the
     /// shared [`LoraLinear`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match &self.base {
+        let output = match &self.base {
             QLinearBase::Adapt(linear) => linear.forward(x),
             QLinearBase::ConvRot(linear) => linear.forward(x),
             QLinearBase::Nvfp4(linear) => linear.forward(x),
-        }
+        }?;
+        record_projection_execution(
+            self.path.clone(),
+            self.operator_kind(),
+            self.attestation.clone(),
+        );
+        Ok(output)
     }
 
     /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
@@ -335,12 +342,12 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
                     )
                 }
             };
-            record_projection(path.clone(), loaded_kind(&base), attestation);
             return Ok(QLinear {
                 base,
                 path,
                 in_features,
                 out_features,
+                attestation,
             });
         }
         source.refuse_undeclared_advanced_tensor(&path)?;
@@ -361,11 +368,6 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         };
         let out_features = scales.dim(0)?;
         let in_features = scales.dim(1)? * GROUP_SIZE;
-        record_projection(
-            path.clone(),
-            AdvancedOperatorKind::MlxAffine,
-            "mlx-affine-triple".into(),
-        );
         return Ok(QLinear {
             base: QLinearBase::Adapt(LoraLinear::from_qlinear(
                 shared::QLinear::from_packed_gs(&wq, &scales, &biases, bias, GROUP_SIZE, &device)?,
@@ -376,6 +378,7 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
             path,
             in_features,
             out_features,
+            attestation: "mlx-affine-triple".into(),
         });
     }
     // Dense path, byte-identical to the legacy `linear`: read `{key}.weight` [+ `.bias`], cast to the
@@ -392,11 +395,6 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         None
     };
     let (out_features, in_features) = w.dims2()?;
-    record_projection(
-        path.clone(),
-        AdvancedOperatorKind::Dense,
-        "dense-weight".into(),
-    );
     Ok(QLinear {
         base: QLinearBase::Adapt(LoraLinear::from_linear(
             Linear::new(w, b),
@@ -407,16 +405,8 @@ pub fn qlinear(vb: &VarBuilder, key: &str, bias: bool) -> Result<QLinear> {
         path,
         in_features,
         out_features,
+        attestation: "dense-weight".into(),
     })
-}
-
-fn loaded_kind(base: &QLinearBase) -> AdvancedOperatorKind {
-    match base {
-        QLinearBase::Adapt(linear) if linear.is_packed() => AdvancedOperatorKind::MlxAffine,
-        QLinearBase::Adapt(_) => AdvancedOperatorKind::Dense,
-        QLinearBase::ConvRot(_) => AdvancedOperatorKind::Int8ConvRotIgemm,
-        QLinearBase::Nvfp4(_) => AdvancedOperatorKind::Nvfp4W4A4,
-    }
 }
 
 /// A resolved token-embedding **table** (`[vocab, hidden]`), loaded either dense (`{key}.weight`, cast
@@ -624,6 +614,7 @@ mod tests {
             path: "grid".into(),
             in_features: in_dim,
             out_features: out_dim,
+            attestation: "dense-weight".into(),
         };
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let base = packed.forward(&x)?;
@@ -681,12 +672,20 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
+        crate::advanced_quant::begin_operator_attestation(crate::quant_eval::Ltx25QuantMode::Bf16);
         let lin = qlinear(&vb, "proj", true)?;
         assert!(!lin.is_packed(), "no `.scales` ⇒ dense");
+        let before_forward = crate::advanced_quant::finish_operator_attestation()
+            .unwrap_err()
+            .to_string();
+        assert!(before_forward.contains("executed no"), "{before_forward}");
         // Reference: the exact legacy read.
         let ref_lin = Linear::new(w, Some(b));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
-        let dev_max = (lin.forward(&x)?.sub(&ref_lin.forward(&x)?)?)
+        let output = lin.forward(&x)?;
+        let after_forward = crate::advanced_quant::finish_operator_attestation()?;
+        assert_eq!(after_forward.executed_projection_count, 1);
+        let dev_max = (output.sub(&ref_lin.forward(&x)?)?)
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
