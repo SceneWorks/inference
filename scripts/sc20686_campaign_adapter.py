@@ -74,6 +74,31 @@ def dispatch_campaign(runner):
             dispatched.append((variant, arm, events))
     return dispatched
 
+def entrypoint_campaign_runner(entrypoint, snapshot):
+    """Build the real-route runner used by the matrix command.
+
+    The executable owns model loading and observer production; this adapter only supplies the
+    registered route and cancellation arm. Missing executables or model paths are hard failures.
+    """
+    entrypoint = Path(entrypoint)
+    if not entrypoint.is_file() or not os.access(entrypoint, os.X_OK):
+        raise ValueError("campaign entrypoint is not executable")
+    snapshot = Path(snapshot).resolve()
+    if not snapshot.is_dir():
+        raise ValueError("campaign snapshot path is missing")
+    def run(variant, arm):
+        command = [str(entrypoint), "--sc20686-campaign", "--sc20686-events", "-",
+                   "--snapshot", str(snapshot), "--variant", variant]
+        if arm == "cancel": command.append("--sc20686-cancel")
+        completed = subprocess.run(command, check=False, text=True, encoding="utf-8",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode:
+            raise ValueError(f"{variant}/{arm} entrypoint failed: {completed.stderr.strip()}")
+        events = [json.loads(line) for line in completed.stdout.splitlines() if line.lstrip().startswith("{")]
+        if not events: raise ValueError(f"{variant}/{arm} produced no observer events")
+        return events
+    return run
+
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if args.fake:
         raise ValueError("fake evidence is test-only and cannot produce a receipt")
