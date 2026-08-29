@@ -546,14 +546,16 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         }
     }
     let max_role = |role: &str, lifetime: &str| {
-        receipt
+        let mut phases = std::collections::BTreeMap::<&str, u64>::new();
+        for event in receipt
             .memory
             .allocation_events
             .iter()
             .filter(|e| e.role == role && e.lifetime == lifetime)
-            .map(|e| e.bytes)
-            .max()
-            .unwrap_or(0)
+        {
+            *phases.entry(event.phase.as_str()).or_default() += event.bytes;
+        }
+        phases.values().copied().max().unwrap_or(0)
     };
     if max_role("weights", "persistent") != receipt.memory.model_weights_bytes
         || max_role("cache", "persistent") != receipt.memory.persistent_kv_bytes
@@ -576,16 +578,16 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV reconciliation failed".into());
     }
-    if receipt
-        .memory
-        .allocation_events
-        .iter()
-        .filter(|e| {
-            e.lifetime == "transient" && (e.role == "cache" || e.role == "attention-workspace")
-        })
-        .map(|e| e.bytes)
-        .sum::<u64>()
-        >= dense
+    let mut transient_by_phase = std::collections::BTreeMap::<&str, u64>::new();
+    for event in receipt.memory.allocation_events.iter().filter(|e| {
+        e.lifetime == "transient" && (e.role == "cache" || e.role == "attention-workspace")
+    }) {
+        *transient_by_phase.entry(event.phase.as_str()).or_default() += event.bytes;
+    }
+    if transient_by_phase
+        .values()
+        .copied()
+        .any(|bytes| bytes >= dense)
     {
         return Err("aggregate full-cache temporary detected".into());
     }
@@ -1632,5 +1634,25 @@ mod tests {
         let mut tampered = bundle.clone();
         tampered.receipt.push(b'x');
         assert!(validate_artifact_bundle(&tampered).is_err());
+    }
+
+    #[test]
+    fn atomic_writer_publishes_named_bytes_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = b"receipt".to_vec();
+        let human = b"human receipt".to_vec();
+        let bundle = ArtifactBundle {
+            receipt_sidecar: format!("{}  run.json\n", seal_bytes(&receipt)),
+            human_sidecar: format!("{}  run.txt\n", seal_bytes(&human)),
+            receipt: receipt.clone(),
+            human: human.clone(),
+        };
+        write_artifacts(dir.path(), "run.json", "run.txt", &bundle).unwrap();
+        assert_eq!(fs::read(dir.path().join("run.json")).unwrap(), receipt);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("run.json.sha256")).unwrap(),
+            bundle.receipt_sidecar
+        );
+        assert!(dir.path().join("run.txt.sha256").is_file());
     }
 }
