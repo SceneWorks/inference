@@ -113,7 +113,15 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
         self.assertEqual(schema["properties"]["runs"]["maxItems"], 4)
         self.assertEqual(schema["$defs"]["uplift"]["properties"]["bootstrap_confidence"]["const"], 0.95)
-        self.assertEqual(schema["$defs"]["image_quality"]["properties"]["case_count"]["type"], "integer")
+        image_quality = schema["$defs"]["image_quality"]["properties"]
+        self.assertEqual(image_quality["case_count"]["type"], "integer")
+        self.assertIn("median_ssim", image_quality)
+        self.assertIn("median_lpips", image_quality)
+        self.assertIn("p95_latency_seconds", image_quality)
+        self.assertNotIn("mean_ssim", image_quality)
+        parity = schema["$defs"]["parity"]["properties"]
+        self.assertEqual(parity["case_count"]["const"], 20)
+        self.assertEqual(parity["rendered_ssim"]["minItems"], 20)
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
         self.assertEqual(corpus["upstream_image_quality_cases"]["required_count"], 120)
         self.assertEqual(corpus["deterministic_parity_cases"]["required_count_per_backend"], 20)

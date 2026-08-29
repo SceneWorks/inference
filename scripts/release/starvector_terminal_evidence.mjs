@@ -79,14 +79,14 @@ function validateRun(run, expectedCorpusHash) {
   onlyKeys(run.model, ["key", "repository", "revision", "inventory_sha256"], `${runKey} model`);
   if (run.model.key !== expectedModel.key || run.model.repository !== expectedModel.repository || run.model.revision !== expectedModel.revision) fail(`${runKey} model identity does not match its immutable pin`);
   sha(run.model.inventory_sha256, `${runKey} model inventory`);
-  onlyKeys(run.image_quality, ["case_count", "validity_rate", "mean_ssim", "mean_lpips", "latency_seconds", "memory_headroom_percent"], `${runKey} image quality`);
+  onlyKeys(run.image_quality, ["case_count", "validity_rate", "median_ssim", "median_lpips", "p95_latency_seconds", "memory_headroom_percent"], `${runKey} image quality`);
   if (run.image_quality.case_count !== 120) fail(`${runKey} did not record all 120 image cases`);
-  unitInterval(run.image_quality.validity_rate, `${runKey} validity`); unitInterval(run.image_quality.mean_ssim, `${runKey} SSIM`); unitInterval(run.image_quality.mean_lpips, `${runKey} LPIPS`);
-  if (run.image_quality.validity_rate < 0.95 || run.image_quality.mean_ssim < 0.85 || run.image_quality.mean_lpips > 0.20) fail(`${runKey} image-quality threshold failed`);
-  if (typeof run.image_quality.latency_seconds !== "number" || run.image_quality.latency_seconds > 120) fail(`${runKey} latency exceeds 120 seconds`);
+  unitInterval(run.image_quality.validity_rate, `${runKey} validity`); unitInterval(run.image_quality.median_ssim, `${runKey} median SSIM`); unitInterval(run.image_quality.median_lpips, `${runKey} median LPIPS`);
+  if (run.image_quality.validity_rate < 0.95 || run.image_quality.median_ssim < 0.85 || run.image_quality.median_lpips > 0.20) fail(`${runKey} image-quality threshold failed`);
+  if (typeof run.image_quality.p95_latency_seconds !== "number" || run.image_quality.p95_latency_seconds > 120) fail(`${runKey} p95 latency exceeds 120 seconds`);
   if (typeof run.image_quality.memory_headroom_percent !== "number" || run.image_quality.memory_headroom_percent < (run.tier === "1b" ? 15 : 10)) fail(`${runKey} memory-headroom threshold failed`);
-  onlyKeys(run.deterministic_parity, ["case_count", "match_ratio"], `${runKey} parity`);
-  if (run.deterministic_parity.case_count !== 20 || run.deterministic_parity.match_ratio < 0.995 || run.deterministic_parity.match_ratio > 1) fail(`${runKey} deterministic parity threshold failed`);
+  onlyKeys(run.deterministic_parity, ["case_count", "rendered_ssim"], `${runKey} parity`);
+  if (run.deterministic_parity.case_count !== 20 || !Array.isArray(run.deterministic_parity.rendered_ssim) || run.deterministic_parity.rendered_ssim.length !== 20 || run.deterministic_parity.rendered_ssim.some((value) => typeof value !== "number" || value < 0.995 || value > 1)) fail(`${runKey} deterministic rendered-SSIM threshold failed`);
   onlyKeys(run.lifecycle, ["load", "unload", "reload", "memory_reported"], `${runKey} lifecycle`);
   if (Object.values(run.lifecycle).some((value) => value !== true)) fail(`${runKey} lifecycle evidence is incomplete`);
   onlyKeys(run.limits, REQUIRED_LIMITS, `${runKey} limits`);
@@ -110,8 +110,23 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
     inventories.set(run.tier, result.inventory);
   }
   if (seen.size !== EXPECTED_RUNS.size || [...EXPECTED_RUNS].some(([key]) => !seen.has(key))) fail("missing required MLX/Candle run");
-  onlyKeys(receipt.eight_b_uplift, ["validity_delta", "bootstrap_confidence", "bootstrap_lower_bound"], "8B uplift");
-  if (receipt.eight_b_uplift.bootstrap_confidence !== 0.95 || receipt.eight_b_uplift.bootstrap_lower_bound <= 0 || receipt.eight_b_uplift.validity_delta < -0.02) fail("8B bootstrap/validity-uplift threshold failed");
+  onlyKeys(receipt.eight_b_uplift, ["bootstrap_confidence", "by_backend"], "8B uplift");
+  if (receipt.eight_b_uplift.bootstrap_confidence !== 0.95 || !Array.isArray(receipt.eight_b_uplift.by_backend) || receipt.eight_b_uplift.by_backend.length !== 2) fail("8B bootstrap confidence/backend evidence is incomplete");
+  const records = new Map();
+  for (const record of receipt.eight_b_uplift.by_backend) {
+    onlyKeys(record, ["backend", "median_lpips_improvement", "validity_delta", "bootstrap_lower_bound"], "8B backend uplift");
+    if (!EXPECTED_RUNS.has(`${record.backend}:1b`) || records.has(record.backend)) fail("8B uplift has a duplicate or unknown backend");
+    records.set(record.backend, record);
+  }
+  for (const backend of ["mlx", "candle-cuda"]) {
+    const one = receipt.runs.find((run) => run.backend === backend && run.tier === "1b").image_quality;
+    const eight = receipt.runs.find((run) => run.backend === backend && run.tier === "8b").image_quality;
+    const record = records.get(backend);
+    if (!record || one.median_lpips <= 0) fail(`8B ${backend} has no comparable 1B median LPIPS`);
+    const improvement = (one.median_lpips - eight.median_lpips) / one.median_lpips;
+    const validityDelta = eight.validity_rate - one.validity_rate;
+    if (Math.abs(record.median_lpips_improvement - improvement) > 1e-12 || Math.abs(record.validity_delta - validityDelta) > 1e-12 || improvement < 0.10 || validityDelta < -0.02 || record.bootstrap_lower_bound <= 0) fail(`8B ${backend} LPIPS/validity/bootstrap threshold failed`);
+  }
 }
 
 function option(name) { const index = process.argv.indexOf(name); if (index < 0 || !process.argv[index + 1]) fail(`missing ${name}`); return process.argv[index + 1]; }

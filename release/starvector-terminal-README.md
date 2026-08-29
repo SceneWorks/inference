@@ -15,3 +15,9 @@ the same case identities into rasters, runs its 200 hostile-sanitizer and 60 pro
 suites, performs rendering/SSIM/LPIPS measurement, records memory and lifecycle outcomes, and
 publishes the receipt. The text-only upstream source remains excluded from image-quality acceptance
 because it can intentionally exercise sanitizer rejects.
+
+The receipt validator is intentionally stricter than a summary report: each native backend records
+120 cases with median SSIM at least 0.85, median LPIPS at most 0.20, and p95 latency at most 120
+seconds. Each backend also carries all 20 rendered parity SSIM values, each at least 0.995. The 8B
+record recomputes (rather than trusts) a per-backend median-LPIPS improvement of at least 10% over
+1B, a validity delta no worse than -0.02, and a positive 95% bootstrap lower bound.
