@@ -26,12 +26,8 @@ class CampaignAdapterTests(unittest.TestCase):
                            "--output", str(output)]
                 completed = subprocess.run(command, check=False, text=True,
                                            encoding="utf-8", capture_output=True)
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertEqual(json.loads(output.read_text())["decisions"][family]["decision"], "go")
-                raw = output.with_suffix(".raw.json")
-                row = json.loads(raw.read_text())[0]
-                self.assertEqual(row["producer"], "sc20686-campaign-adapter-v1")
-                self.assertNotEqual(row["raw_receipt_sha256"], "" * 64)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertFalse(output.exists())
 
     def test_normal_invocation_and_missing_hook_refuse(self):
         with tempfile.TemporaryDirectory() as directory:

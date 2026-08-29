@@ -54,6 +54,18 @@ def fake_events():
              "peak_bytes": 10 * 1024**3, "at_ns": now + i * 100_000_000} for i, p in enumerate(("generation-start", "cross-kv-created", "cross-kv-read", "generation-end", "invalidated", "cancelled", "released"))]
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
+    if args.fake:
+        raise ValueError("fake evidence is test-only and cannot produce a receipt")
+    metadata = next((e for e in events if e.get("phase") == "metadata"), None)
+    metrics = next((e for e in events if e.get("phase") == "metrics"), None)
+    if not metadata or not metrics or metadata.get("snapshot_sha256") != snapshot_hash:
+        raise ValueError("entrypoint must emit matching model identity metadata")
+    source_ref = metadata.get("source_ref")
+    if not isinstance(source_ref, str) or len(source_ref) != 40 or any(c not in "0123456789abcdef" for c in source_ref):
+        raise ValueError("entrypoint must emit immutable 40-hex source ref")
+    metric_keys = ("current_persistent_bytes", "current_read_transient_bytes", "candidate_persistent_bytes", "candidate_read_transient_bytes", "generation_duration_ms", "cache_read_duration_ms", "reused_requests")
+    if any(not isinstance(metrics.get(k), (int, float)) for k in metric_keys):
+        raise ValueError("entrypoint metrics are incomplete")
     phases = {e.get("phase") for e in events}
     if not {"generation-start", "generation-end", "cross-kv-created", "cross-kv-read", "invalidated", "cancelled", "released"} <= phases:
         raise ValueError("observer lifecycle/phase hooks are incomplete")
@@ -61,19 +73,19 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events, geometry):
     released = [i for i, e in enumerate(events) if e.get("phase") == "released"]
     if not cancelled or not released or max(cancelled) > min(released):
         raise ValueError("cancellation cleanup must precede release")
-    samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events]
+    samples = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events if "peak_bytes" in e]
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
-            "source_ref": config.get("source_ref", "entrypoint-observer"),
+            "source_ref": source_ref,
             "model_snapshot_sha256": snapshot_hash, "model_snapshot_bytes": snapshot_bytes,
             "geometry": geometry,
             "lifecycle": {"created": sum(e["phase"] == "cross-kv-created" for e in events), "reused": sum(e["phase"] == "cross-kv-read" for e in events),
                            "invalidated": sum(e["phase"] == "invalidated" for e in events), "cancelled": sum(e["phase"] == "cancelled" for e in events), "released": sum(e["phase"] == "released" for e in events)},
             "allocator_samples": samples, "process_samples": samples,
             "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
-            "real_weights": True, "full_generation": True, "attention_kind": "cross",
-            "current_persistent_bytes": 600 * 1024**2, "current_read_transient_bytes": 32 * 1024**2,
-            "candidate_persistent_bytes": 100 * 1024**2, "candidate_read_transient_bytes": 32 * 1024**2,
-            "generation_duration_ms": 1000, "cache_read_duration_ms": 100, "reused_requests": max(2, sum(e["phase"] == "reuse" for e in events)),
+            "real_weights": metadata.get("real_weights") is True, "full_generation": metadata.get("full_generation") is True, "attention_kind": metadata.get("attention_kind"),
+            "current_persistent_bytes": metrics["current_persistent_bytes"], "current_read_transient_bytes": metrics["current_read_transient_bytes"],
+            "candidate_persistent_bytes": metrics["candidate_persistent_bytes"], "candidate_read_transient_bytes": metrics["candidate_read_transient_bytes"],
+            "generation_duration_ms": metrics["generation_duration_ms"], "cache_read_duration_ms": metrics["cache_read_duration_ms"], "reused_requests": metrics["reused_requests"],
             "observer_events": events}
 
 def main():

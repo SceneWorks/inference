@@ -1,0 +1,8 @@
+{
+  "schema": "sc-20686-supported-coverage-v1",
+  "families": {
+    "flux2-klein": ["klein-9b"],
+    "wan": ["wan2.2-t2v-a14b"]
+  },
+  "required_geometry_axes": ["resolution", "reference_count", "frames", "prompt", "guidance", "layers", "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope"]
+}

@@ -2,6 +2,7 @@
 """Fail-closed reducer for injected, real-weight SC-20686 generation receipts."""
 import argparse, hashlib, json, sys
 from pathlib import Path
+MANIFEST=Path(__file__).with_name("sc20686_coverage_manifest.json")
 
 FAMILIES=("flux2-klein","wan")
 THRESHOLDS={"opportunity_bytes":512*1024**2,"opportunity_peak_pct":.05,"reused_requests":2,"saving_bytes":256*1024**2,"saving_peak_pct":.03,"runtime_only_pct":.05}
@@ -40,7 +41,13 @@ def verify_seal(row, sidecar):
 
 def reduce(rows):
     if not isinstance(rows,list) or not rows: fail("rows must be non-empty")
+    try: manifest=json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError,json.JSONDecodeError): fail("checked-in coverage manifest unavailable")
+    if manifest.get("schema")!="sc-20686-supported-coverage-v1": fail("invalid coverage manifest")
     for row in rows: validate(row)
+    for row in rows:
+        if row["variant"] not in manifest.get("families",{}).get(row["family"],[]): fail("variant absent from coverage manifest")
+        if any(k not in row["geometry"] for k in manifest.get("required_geometry_axes",[])): fail("coverage geometry incomplete")
     keys=[(r["family"],r["variant"],json.dumps(r["geometry"],sort_keys=True)) for r in rows]
     if len(keys)!=len(set(keys)): fail("duplicate family/variant/geometry")
     decisions={}
