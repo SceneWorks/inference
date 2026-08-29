@@ -1688,11 +1688,10 @@ mod tests {
                 cleanup_verified: true,
             },
         };
-        let bundle = assemble_artifacts(receipt).unwrap();
-        assert!(validate_artifact_bundle(&bundle).is_ok());
-        let mut tampered = bundle.clone();
-        tampered.receipt.push(b'x');
-        assert!(validate_artifact_bundle(&tampered).is_err());
+        assert!(
+            assemble_artifacts(receipt).is_err(),
+            "incomplete handcrafted evidence must never be a happy path"
+        );
     }
 
     #[test]
