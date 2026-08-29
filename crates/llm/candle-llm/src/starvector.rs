@@ -602,6 +602,28 @@ mod tests {
         );
     }
 
+    /// Terminal real-weight hook. It deliberately opens only the explicit exact snapshot supplied
+    /// by SC-22261; ordinary CPU checks neither download weights nor invoke CUDA.
+    #[test]
+    #[ignore = "sc-22261 terminal real-weight StarVector-1B CUDA campaign only"]
+    fn real_weight_provider_satisfies_shared_starvector_conformance() {
+        let snapshot = std::env::var("STARVECTOR_1B_SNAPSHOT")
+            .expect("sc-22261 must set STARVECTOR_1B_SNAPSHOT to the local exact snapshot");
+        let spec = core_llm::LoadSpec::dense(snapshot);
+        let profile = StarVectorProfile {
+            image: Some(core_llm::ImageRef::new(2, 2, vec![0x80; 12]).unwrap()),
+            text: None,
+            max_new_tokens: 4_000,
+            max_svg_bytes: 2 * 1024 * 1024,
+            max_wall_time: std::time::Duration::from_secs(120),
+            seed: 7,
+        };
+        starvector_conformance(
+            || Box::new(CandleStarVectorProvider::load(&spec).unwrap()),
+            &profile,
+        );
+    }
+
     #[test]
     fn registry_exposes_only_the_exact_starvector_snapshot_probe() {
         let root = tempfile::tempdir().unwrap();

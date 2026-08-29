@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json",
+  "title": "StarVector cross-repository terminal campaign receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "runs", "eight_b_uplift"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "campaign_run_id": { "type": "string", "minLength": 1 },
+    "inference_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sceneworks_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "corpus_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "runs": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/run" } },
+    "eight_b_uplift": { "$ref": "#/$defs/uplift" }
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "provider_id", "tier", "device", "model", "image_quality", "deterministic_parity", "lifecycle", "limits"],
+      "properties": {
+        "backend": { "enum": ["mlx", "candle-cuda"] },
+        "provider_id": { "type": "string", "minLength": 1 },
+        "tier": { "enum": ["1b", "8b"] },
+        "device": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "#/$defs/model" },
+        "image_quality": { "$ref": "#/$defs/image_quality" },
+        "deterministic_parity": { "$ref": "#/$defs/parity" },
+        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "limits": { "$ref": "#/$defs/limits" }
+      }
+    },
+    "model": { "type": "object", "additionalProperties": false, "required": ["key", "repository", "revision", "inventory_sha256"], "properties": { "key": {"type":"string"}, "repository": {"type":"string"}, "revision": {"type":"string","pattern":"^[0-9a-f]{40}$"}, "inventory_sha256": {"type":"string","pattern":"^[0-9a-f]{64}$"} } },
+    "image_quality": { "type":"object", "additionalProperties":false, "required":["case_count","validity_rate","mean_ssim","mean_lpips","latency_seconds","memory_headroom_percent"], "properties": { "case_count":{"type":"integer"}, "validity_rate":{"type":"number"}, "mean_ssim":{"type":"number"}, "mean_lpips":{"type":"number"}, "latency_seconds":{"type":"number"}, "memory_headroom_percent":{"type":"number"} } },
+    "parity": { "type":"object", "additionalProperties":false, "required":["case_count","match_ratio"], "properties": { "case_count":{"type":"integer"}, "match_ratio":{"type":"number"} } },
+    "lifecycle": { "type":"object", "additionalProperties":false, "required":["load","unload","reload","memory_reported"], "properties": { "load":{"type":"boolean"}, "unload":{"type":"boolean"}, "reload":{"type":"boolean"}, "memory_reported":{"type":"boolean"} } },
+    "limits": { "type":"object", "additionalProperties":false, "required":["complete_root","eos","token","byte","wall_time","cancellation"], "properties": { "complete_root":{"type":"boolean"}, "eos":{"type":"boolean"}, "token":{"type":"boolean"}, "byte":{"type":"boolean"}, "wall_time":{"type":"boolean"}, "cancellation":{"type":"boolean"} } },
+    "uplift": { "type":"object", "additionalProperties":false, "required":["validity_delta","bootstrap_confidence","bootstrap_lower_bound"], "properties": { "validity_delta":{"type":"number"}, "bootstrap_confidence":{"const":0.95}, "bootstrap_lower_bound":{"type":"number"} } }
+  }
+}

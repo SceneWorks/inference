@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "purpose": "SC-22261 cross-repository permanent-pin StarVector campaign contract; inference binds native snapshots/providers and SceneWorks owns rendered/security/metric acceptance",
+  "upstream_image_quality_cases": {
+    "required_count": 120,
+    "selection_rule": "The first 30 test rows from each listed immutable, path-only SVG-Bench source, in source order. Every selected upstream SVG was checked at its listed revision to exclude text and active constructs. row_identity_sha256 is SHA-256 of newline-delimited canonical {dataset,revision,row_index,filename,svg_sha256} records.",
+    "row_identity_sha256": "f9529c2e5a86bef6644054c909c4f621991f6384d9b33a029ad46ff2e6cd3b88",
+    "sources": [
+      {
+        "dataset": "starvector/svg-stack-simple",
+        "revision": "1d2a96a17cc0c4c1f337b7631adc8c5885bc72ea",
+        "split": "test",
+        "row_start": 0,
+        "row_count": 30,
+        "parquet_path": "data/test-00000-of-00001.parquet",
+        "parquet_sha256": "ed6b73f3c92277e81b244c6ab3071d0831c4820178aed072182246bab402b004",
+        "row_identity_sha256": "a8b10c66cdc3135347112d998eddc981e7b41e17133c51bb53b0f8168312dba6"
+      },
+      {
+        "dataset": "starvector/svg-icons-simple",
+        "revision": "e1918a27ba6649e856e5db0710d8a6c7046762c1",
+        "split": "test",
+        "row_start": 0,
+        "row_count": 30,
+        "parquet_path": "data/test-00000-of-00001.parquet",
+        "parquet_sha256": "02cd88a8b8f5234975024a948c80a19f7a83092247685b1bef63c3db0b957227",
+        "row_identity_sha256": "0a53bf43bdc0a3ba4db43fffdbffceb4f1075accaf928b879ffa7d80d57eb287"
+      },
+      {
+        "dataset": "starvector/svg-emoji-simple",
+        "revision": "fa75b3617872ae57e6f3cb450aee65dbccbd69e0",
+        "split": "test",
+        "row_start": 0,
+        "row_count": 30,
+        "parquet_path": "data/test-00000-of-00001.parquet",
+        "parquet_sha256": "be192dfce16b45605df62eebffeb00db2f0b80e6f4919e10cea68c311af97807",
+        "row_identity_sha256": "d0744227718ab4f20be9f63c034e5509eacb39bf16c748163952a252174c7846"
+      },
+      {
+        "dataset": "starvector/svg-fonts-simple",
+        "revision": "453c739ea13ad2685127f721c333f14d99485299",
+        "split": "test",
+        "row_start": 0,
+        "row_count": 30,
+        "parquet_path": "data/test-00000-of-00001.parquet",
+        "parquet_sha256": "86db32ae45896a18b938baba088b69d797ae2d5f6d3d79742753a0e2ea89d86d",
+        "row_identity_sha256": "766de8a23620f100c6b9c3e7ab0bbf0627c9bdc4a6a597a06d03fb101a90f1d9"
+      }
+    ]
+  },
+  "deterministic_parity_cases": {
+    "required_count_per_backend": 20,
+    "selection_rule": "The first five selected test rows from each image-quality source, in source order.",
+    "row_identity_sha256": "2e6bc719f3e891ca6e464e6ece2355d2ecf31d607a0353a9ceff69ebdd6d7d15"
+  },
+  "sceneworks_owned_suites": {
+    "hostile_sanitizer": {
+      "required_count": 200,
+      "owner": "SceneWorks",
+      "purpose": "security/sanitizer acceptance; not an SVG-Bench image-quality case"
+    },
+    "prompt_composition": {
+      "required_count": 60,
+      "owner": "SceneWorks",
+      "purpose": "text/prompt composition acceptance; not an upstream image-quality case"
+    }
+  },
+  "excluded_upstream_sources": [
+    {
+      "dataset": "starvector/text2svg-stack",
+      "revision": "c6f2bf0fffd8c1b69fcf748c97f4b0e7de6f2687",
+      "reason": "text-only corpus is not an image-quality acceptance case and may intentionally exercise sanitizer rejects"
+    }
+  ]
+}
