@@ -455,6 +455,13 @@ impl LlamaProvider {
     /// largest deterministic filler that stays below the band target, avoiding assumptions that a
     /// repeated source word maps to exactly one token for both supported families.
     pub(crate) fn campaign_context_payload(&self, context_band: &str) -> CoreResult<String> {
+        Ok(self.campaign_context_band_measurement(context_band)?.0)
+    }
+
+    pub(crate) fn campaign_context_band_measurement(
+        &self,
+        context_band: &str,
+    ) -> CoreResult<(String, u64, u64)> {
         let context_window = self.campaign_context_window()?;
         let medium = (context_window / 16).clamp(128, 1_024);
         let memory_material = context_window / 4;
@@ -495,7 +502,7 @@ impl LlamaProvider {
                 "context band {context_band} produced {observed_tokens} tokens for target {target}"
             )));
         }
-        Ok(payload)
+        Ok((payload, target, observed_tokens))
     }
 
     /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign

@@ -34,6 +34,8 @@ pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct ReceiptProvenance {
+    pub scene_works_repository: String,
+    pub inference_repository: String,
     pub scene_works_revision: String,
     pub inference_revision: String,
     pub mlx_revision: String,
@@ -75,6 +77,8 @@ pub struct ReceiptGeometry {
     pub layers: u64,
     pub element_bytes: u64,
     pub capacity: u64,
+    pub context_target_tokens: u64,
+    pub context_payload_tokens: u64,
 }
 
 /// Geometry copied from the loaded decoder configuration, not an input JSON field.  Query/KV
@@ -410,6 +414,13 @@ impl ReceiptBuilder {
         {
             return Err("malformed receipt identity".into());
         }
+        if self.template.provenance.scene_works_repository
+            != "git@github.com:SceneWorks/SceneWorks.git"
+            || self.template.provenance.inference_repository
+                != "git@github.com:SceneWorks/inference.git"
+        {
+            return Err("receipt repository identity is not paired SceneWorks".into());
+        }
         if self.template.provenance.thermal_state != "nominal"
             || !self.template.provenance.command_template.contains("{mode}")
             || self.template.provenance.command
@@ -435,6 +446,13 @@ impl ReceiptBuilder {
             || self.template.geometry.capacity < self.template.geometry.kv_length
         {
             return Err("invalid geometry".into());
+        }
+        if self.template.geometry.context_payload_tokens
+            > self.template.geometry.context_target_tokens
+            || self.template.geometry.context_payload_tokens
+                < self.template.geometry.context_target_tokens / 2
+        {
+            return Err("context band token measurement is outside producer bounds".into());
         }
         if (self.template.matrix.request_mode == "single" && self.template.geometry.batch != 1)
             || (self.template.matrix.request_mode == "supported-batch"
@@ -669,6 +687,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("receipt timestamp/run id is malformed".into());
     }
     let p = &receipt.provenance;
+    if p.scene_works_repository != "git@github.com:SceneWorks/SceneWorks.git"
+        || p.inference_repository != "git@github.com:SceneWorks/inference.git"
+    {
+        return Err("provenance repository identity is not paired SceneWorks".into());
+    }
     if !revision(&p.scene_works_revision)
         || !revision(&p.inference_revision)
         || !lowercase_hex(&p.dependency_lock_sha256, 64)
@@ -725,6 +748,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || (receipt.matrix.request_mode == "supported-batch" && g.batch <= 1)
     {
         return Err("matrix coordinate or geometry relationship is invalid".into());
+    }
+    if receipt.geometry.context_payload_tokens > receipt.geometry.context_target_tokens
+        || receipt.geometry.context_payload_tokens < receipt.geometry.context_target_tokens / 2
+    {
+        return Err("context band token measurement is outside producer bounds".into());
     }
     let pids: Vec<u32> = receipt.memory.phase_samples.iter().map(|p| p.pid).collect();
     if pids.len() != 8
@@ -803,7 +831,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }
     let mut transient_by_phase = std::collections::BTreeMap::<&str, u128>::new();
     for event in receipt.memory.allocation_events.iter().filter(|e| {
-        e.lifetime == "transient" && (e.role == "cache" || e.role == "attention-workspace")
+        e.lifetime == "transient"
+            && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
     }) {
         let total = transient_by_phase.entry(event.phase.as_str()).or_default();
         *total = total
@@ -3504,6 +3533,8 @@ pub struct ProductFixtureSuite {
     pub cache_candidate: ProductFixtureResult,
     pub cache_reference: ProductFixtureResult,
     pub needle: String,
+    pub context_target_tokens: u64,
+    pub context_payload_tokens: u64,
 }
 
 fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
@@ -3547,9 +3578,9 @@ pub fn run_product_fixture_suite_on_sessions(
             "candidate/reference context windows differ: {candidate_window} != {reference_window}"
         )));
     }
-    let band_payload = candidate_session
+    let (band_payload, context_target_tokens, context_payload_tokens) = candidate_session
         .provider
-        .campaign_context_payload(&coordinate.context_band)?;
+        .campaign_context_band_measurement(&coordinate.context_band)?;
     if candidate_session
         .provider
         .campaign_prompt_tokens(&band_payload)?
@@ -3617,6 +3648,8 @@ pub fn run_product_fixture_suite_on_sessions(
         cache_candidate,
         cache_reference,
         needle,
+        context_target_tokens,
+        context_payload_tokens,
     })
 }
 
@@ -3771,6 +3804,48 @@ fn checked_git_revision(root: &Path) -> Result<String, String> {
     Ok(revision)
 }
 
+fn checked_repository_identity(root: &Path, expected: &str) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let remote = String::from_utf8(output.stdout)
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_ascii_lowercase();
+    if !output.status.success() || !remote.ends_with(&format!("{expected}.git")) {
+        return Err(format!(
+            "repository origin is not SceneWorks/{expected}: {remote}"
+        ));
+    }
+    Ok(())
+}
+
+fn locked_mlx_identity(lock: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(lock).map_err(|e| e.to_string())?;
+    let mut package = None;
+    for line in text.lines() {
+        if line == "name = \"pmetal-mlx-rs\"" {
+            package = Some(String::from("pmetal-mlx-rs"));
+        } else if package.is_some() && line.starts_with("version = ") {
+            let version = line
+                .trim_start_matches("version = \"")
+                .trim_end_matches('\"');
+            return Ok(format!(
+                "{}@{};lockSha256={}",
+                package.unwrap(),
+                version,
+                seal_bytes(lock)
+            ));
+        } else if line.starts_with("[[package]]") {
+            package = None;
+        }
+    }
+    Err("Cargo.lock does not contain pmetal-mlx-rs identity".into())
+}
+
 fn required_campaign_env(name: &str) -> Result<String, String> {
     let value =
         std::env::var(name).map_err(|_| format!("missing required campaign environment {name}"))?;
@@ -3886,6 +3961,8 @@ fn product_receipt(
         .ok_or("inference root")?;
     let _ = fs::metadata(executable).map_err(|e| e.to_string())?;
     let scene_works_root = PathBuf::from(required_campaign_env("SCENEWORKS_ROOT")?);
+    checked_repository_identity(&scene_works_root, "SceneWorks")?;
+    checked_repository_identity(inference_root, "inference")?;
     let scene_works_revision = checked_git_revision(&scene_works_root)?;
     let inference_revision = checked_git_revision(inference_root)?;
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
@@ -3959,9 +4036,9 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={};referenceSession={}", model.root.display(), model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        provenance: ReceiptProvenance { scene_works_repository: "git@github.com:SceneWorks/SceneWorks.git".into(), inference_repository: "git@github.com:SceneWorks/inference.git".into(), scene_works_revision, inference_revision, mlx_revision: locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};architecture={};tokenizer={};reference={};referenceSession={}", model.root.display(), coordinate.family, model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
-        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens },
+        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
@@ -4239,6 +4316,8 @@ mod tests {
             contract_hash: QUALITY_CONTRACT_HASH.into(),
             receipt_sha256: String::new(),
             provenance: ReceiptProvenance {
+                scene_works_repository: "git@github.com:SceneWorks/SceneWorks.git".into(),
+                inference_repository: "git@github.com:SceneWorks/inference.git".into(),
                 scene_works_revision: "a".repeat(40),
                 inference_revision: "b".repeat(40),
                 mlx_revision: "mlx".into(),
@@ -4274,6 +4353,8 @@ mod tests {
                 layers: 1,
                 element_bytes: 2,
                 capacity: 1,
+                context_target_tokens: 32,
+                context_payload_tokens: 32,
             },
             memory: ReceiptMemory {
                 model_weights_bytes: 1,
