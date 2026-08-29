@@ -161,9 +161,15 @@ struct Pipeline {
     /// spec carries their files (sc-10909), else from `root`; the tiny tokenizer always comes from
     /// `root`. `None` on the registry path.
     comfyui: Option<std::sync::Arc<crate::comfyui::ComfyuiExperts>>,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 impl Pipeline {
+    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
+
     fn load(root: &Path, device: &Device, variant: Variant, adapters: Vec<AdapterSpec>) -> Self {
         Self {
             te_cfg: TextEncoderConfig::umt5_xxl(),
@@ -174,6 +180,7 @@ impl Pipeline {
             device: device.clone(),
             adapters,
             comfyui: None,
+            campaign_context: None,
         }
     }
 
@@ -195,6 +202,7 @@ impl Pipeline {
             device: device.clone(),
             adapters: Vec::new(),
             comfyui: Some(comfyui),
+            campaign_context: None,
         }
     }
 
@@ -547,15 +555,51 @@ impl Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<()> {
         crate::sc20686_observer::observe("generation-start", 0, 0, 0);
+        if self.campaign_context.is_some() {
+            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
+        }
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
-        if let Err(error) = check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
+        if let Err(error) = check_cancel(cancel) {
+            crate::sc20686_observer::observe_cancelled();
+            return Err(error);
+        }
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
+        let (pos_bytes, pos_shape, pos_dtype) = pos_kv.evidence();
+        crate::sc20686_observer::observe_tensor(
+            "cross-kv-prepared",
+            "prepare",
+            pos_bytes,
+            0,
+            0,
+            pos_shape,
+            pos_dtype,
+            "none",
+            "applied",
+        );
         let neg_kv = ctx_neg
             .map(|context| expert.prepare_cross_kv(context))
             .transpose()?;
+        if let Some(neg_kv) = &neg_kv {
+            let (bytes, shape, dtype) = neg_kv.evidence();
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare-negative",
+                bytes,
+                0,
+                0,
+                shape,
+                dtype,
+                "none",
+                "applied",
+            );
+        }
+        crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
         for i in range {
-            if let Err(error) = check_cancel(cancel) { crate::sc20686_observer::observe_cancelled(); return Err(error); }
+            if let Err(error) = check_cancel(cancel) {
+                crate::sc20686_observer::observe_cancelled();
+                return Err(error);
+            }
             let t = sched.timestep(i);
             // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
             let x = match y {
@@ -1047,6 +1091,18 @@ pub struct Wan14bGenerator {
     i2v_memory: Option<crate::i2v_memory_strategy::PreparedWanI2vMemory>,
     lifecycle: Mutex<()>,
     components: Mutex<Option<Components>>,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
+}
+
+impl Wan14bGenerator {
+    /// Install the opt-in campaign context; ordinary registry construction leaves this unset.
+    pub fn with_campaign_context(
+        mut self,
+        context: crate::sc20686_observer::CampaignContext,
+    ) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
 }
 
 impl Wan14bGenerator {
@@ -1134,6 +1190,10 @@ impl Generator for Wan14bGenerator {
                 self.adapters.clone(),
             ),
         };
+        let pipe = self
+            .campaign_context
+            .clone()
+            .map_or(pipe, |context| pipe.with_campaign_context(context));
         // Sequential offload (sc-12733): stage load→use→drop each heavy component so the denoise peak is
         // one expert instead of TE + both experts + VAE co-resident. Resident (default): the cached
         // `Components` bundle, unchanged path. The staged path never populates the resident cache.
@@ -1297,6 +1357,7 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
         i2v_memory,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        campaign_context: None,
     })
 }
 
@@ -1397,6 +1458,7 @@ fn build_comfyui_generator(
         i2v_memory: None,
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
+        campaign_context: None,
     })
 }
 

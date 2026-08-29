@@ -54,8 +54,8 @@ pub mod model_vace;
 pub mod model_vace_fun;
 pub mod pipeline;
 pub mod quant;
-pub mod sc20686_observer;
 pub mod rope;
+pub mod sc20686_observer;
 pub mod scheduler;
 mod text_encode;
 pub mod text_encoder;
@@ -243,6 +243,7 @@ struct Pipeline {
     /// the [`WanGenerator`] handle a worker holds (sc-11045 fix round, BLOCKER 1). The snapshot
     /// (dense/packed-tier) routes compile no plan and publish nothing.
     facts: gen_core::CheckpointFactsSink,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
 }
 
 fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
@@ -257,6 +258,11 @@ fn validate_ti2v_adapter_routing(adapters: &[AdapterSpec]) -> CResult<()> {
 }
 
 impl Pipeline {
+    fn with_campaign_context(mut self, context: crate::sc20686_observer::CampaignContext) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
+
     fn load(
         root: &Path,
         device: &Device,
@@ -273,6 +279,7 @@ impl Pipeline {
             device: device.clone(),
             dit_source,
             facts,
+            campaign_context: None,
         }
     }
 
@@ -559,9 +566,36 @@ impl Pipeline {
         // cannot outlive the request, while both CFG branches reuse their own payload exactly once.
         check_cancel(cancel)?;
         let pos_kv = dit.prepare_cross_kv(ctx_pos)?;
+        let (pos_bytes, pos_shape, pos_dtype) = pos_kv.evidence();
+        crate::sc20686_observer::observe_tensor(
+            "cross-kv-prepared",
+            "prepare",
+            pos_bytes,
+            0,
+            0,
+            pos_shape,
+            pos_dtype,
+            "none",
+            "applied",
+        );
         let neg_kv = ctx_neg
             .map(|context| dit.prepare_cross_kv(context))
             .transpose()?;
+        if let Some(neg_kv) = &neg_kv {
+            let (bytes, shape, dtype) = neg_kv.evidence();
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare-negative",
+                bytes,
+                0,
+                0,
+                shape,
+                dtype,
+                "none",
+                "applied",
+            );
+        }
+        crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
             if ti2v.is_some() {
@@ -644,10 +678,15 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
+        if self.campaign_context.is_some() {
+            crate::sc20686_observer::observe("campaign-context-bound", 0, 0, 0);
+        }
         let knobs = self.resolve_knobs(req);
 
         // Text encode (pos + optional neg for CFG), then project to the DiT context once.
         let pos_embeds = self.encode(comps, &req.prompt)?;
+        crate::sc20686_observer::observe("weights-loaded", 0, 0, 0);
         let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
         let ctx_neg = if knobs.guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
@@ -659,6 +698,7 @@ impl Pipeline {
         let (t_lat, h_lat, w_lat, cos, sin) = self.geometry(req, knobs.frames)?;
         let noise = pipeline::create_noise(knobs.seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
         let (latents0, ti2v) = self.prepare_ti2v(req, &comps.vae, &noise, t_lat, h_lat, w_lat)?;
+        crate::sc20686_observer::observe("prefill-peak", 0, 0, 0);
 
         let latents = self.denoise(
             &comps.dit,
@@ -674,6 +714,7 @@ impl Pipeline {
             &req.cancel,
             on_progress,
         )?;
+        crate::sc20686_observer::observe("decode-steady", 0, 0, 0);
 
         on_progress(Progress::Decoding);
         // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
@@ -686,6 +727,7 @@ impl Pipeline {
             decode_cap,
         )?;
         let images = pipeline::frames_to_images(&decoded)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok((images, knobs.fps))
     }
 
@@ -876,6 +918,18 @@ pub struct WanGenerator {
     /// into every [`Pipeline`] this generator builds, and the GGUF DiT load publishes into it. Read
     /// back through [`gen_core::Generator::checkpoint_weight_facts`].
     checkpoint_facts: gen_core::CheckpointFactsSink,
+    campaign_context: Option<crate::sc20686_observer::CampaignContext>,
+}
+
+impl WanGenerator {
+    /// Install the opt-in campaign context; ordinary registry construction leaves this unset.
+    pub fn with_campaign_context(
+        mut self,
+        context: crate::sc20686_observer::CampaignContext,
+    ) -> Self {
+        self.campaign_context = Some(context);
+        self
+    }
 }
 
 fn run_serialized_request<T>(
@@ -923,13 +977,16 @@ fn load_or_replace_cached_variant<T: Clone>(
 
 impl WanGenerator {
     fn pipeline(&self) -> Pipeline {
-        Pipeline::load(
+        let pipeline = Pipeline::load(
             &self.root,
             &self.device,
             self.adapters.clone(),
             self.dit_source.clone(),
             self.checkpoint_facts.clone(),
-        )
+        );
+        self.campaign_context
+            .clone()
+            .map_or(pipeline, |context| pipeline.with_campaign_context(context))
     }
 
     fn components(&self, pipe: &Pipeline, with_vae_encoder: bool) -> gen_core::Result<Components> {
@@ -1293,6 +1350,7 @@ fn build_generator_with_source(
         lifecycle: Mutex::new(()),
         components: Mutex::new(None),
         checkpoint_facts: gen_core::CheckpointFactsSink::new(),
+        campaign_context: None,
     })
 }
 
@@ -1926,6 +1984,7 @@ mod tests {
             device: Device::Cpu,
             dit_source: DitSource::Snapshot,
             facts: gen_core::CheckpointFactsSink::new(),
+            campaign_context: None,
         }
     }
 

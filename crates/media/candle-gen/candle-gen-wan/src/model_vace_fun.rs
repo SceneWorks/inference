@@ -531,6 +531,7 @@ impl Generator for WanVaceFunGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         self.validate_request(req)?;
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
@@ -656,6 +657,7 @@ impl Generator for WanVaceFunGenerator {
         };
         on_progress(Progress::Decoding);
         let (frames, fps) = pipeline.finish(prepared, &vae, &req.cancel, decode_cap)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,

@@ -177,6 +177,26 @@ pub(crate) struct PreparedWanCrossKv {
     blocks: Vec<PreparedBlockCrossKv>,
 }
 
+impl PreparedWanCrossKv {
+    /// Bytes and shape metadata are derived from the live projected tensors, never from a request
+    /// claim. The campaign observer uses this to account for the request-scoped cross-KV payload.
+    pub(crate) fn evidence(&self) -> (u64, String, String) {
+        let mut bytes = 0u64;
+        let mut shapes = Vec::new();
+        let mut dtypes = Vec::new();
+        for block in &self.blocks {
+            for tensor in [&block.key, &block.value] {
+                bytes = bytes.saturating_add(
+                    (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size() as u64),
+                );
+                shapes.push(format!("{:?}", tensor.dims()));
+                dtypes.push(format!("{:?}", tensor.dtype()));
+            }
+        }
+        (bytes, shapes.join(";"), dtypes.join(";"))
+    }
+}
+
 #[cfg(test)]
 static CROSS_KV_PREPARATION_PAIRS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);

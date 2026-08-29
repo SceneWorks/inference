@@ -155,6 +155,7 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         let clip = req
             .control_clip()
             .ok_or_else(|| CandleError::Msg("wan-vace: requires a ControlClip".into()))?;
@@ -274,6 +275,7 @@ impl Pipeline {
             decode_cap,
         )?;
         let images = frames_to_images(&decoded)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok((images, fps))
     }
 }
@@ -425,6 +427,7 @@ impl Generator for WanVaceGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         self.validate(req)?;
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
@@ -432,6 +435,7 @@ impl Generator for WanVaceGenerator {
         let pipe = Pipeline::load(&self.root, &self.device);
         let components = self.components(&pipe)?;
         let (frames, fps) = pipe.render(req, &components, on_progress)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,
