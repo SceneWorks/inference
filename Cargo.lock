@@ -735,7 +735,9 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]

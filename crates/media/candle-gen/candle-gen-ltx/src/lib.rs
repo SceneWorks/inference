@@ -62,6 +62,8 @@ pub mod params;
 pub mod pipeline;
 pub mod quant;
 pub mod quant_eval;
+#[cfg(feature = "terminal-quant-measurement")]
+pub mod quant_measurement;
 pub mod rope;
 pub mod text_encoder;
 pub mod tier;
@@ -2149,8 +2151,6 @@ pub struct Ltx25Generator {
 /// Load the split LTX-2.5 route through the standard generator registry.  The selected decoder is
 /// intentional: staging `diffusion_video_vae` selects DiffVAE; otherwise the conv decoder is used.
 pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    let known = bundle::split_component_ids();
-    gen_core::reject_unknown_components(spec, &known, MODEL_25_ID)?;
     let quant_mode = Ltx25QuantMode::from_load_spec(spec)?;
     let device = candle_gen::default_device()?;
     let gpu = Ltx25GpuGeneration::from_device(&device)?;
@@ -2160,6 +2160,38 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             return Err(gen_core::Error::Unsupported(reason));
         }
     }
+    load_25_selected(spec, quant_mode, device)
+}
+
+/// The only admission bypass in this crate. It is compiled solely for the terminal controller,
+/// verifies the immutable case against the physically bound GPU, and is never registered in the
+/// catalog. This lets the campaign produce the evidence that production admission requires without
+/// turning the evidence tool into an ordinary generator route.
+#[cfg(feature = "terminal-quant-measurement")]
+fn load_25_for_terminal_measurement(
+    spec: &LoadSpec,
+    case: &quant_eval::Ltx25QuantMeasurementCase,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let device = candle_gen::default_device()?;
+    let observed_gpu = Ltx25GpuGeneration::from_device(&device)?;
+    if observed_gpu != case.gpu {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_25_ID}: terminal case {} requires {}, but the bound device is {}",
+            case.id,
+            case.gpu.id(),
+            observed_gpu.id(),
+        )));
+    }
+    load_25_selected(spec, case.mode, device)
+}
+
+fn load_25_selected(
+    spec: &LoadSpec,
+    quant_mode: Ltx25QuantMode,
+    device: Device,
+) -> gen_core::Result<Box<dyn Generator>> {
+    let known = bundle::split_component_ids();
+    gen_core::reject_unknown_components(spec, &known, MODEL_25_ID)?;
     let resolved = bundle::resolve_split_bundle(spec)?;
     if resolved.layout() != LtxCheckpointLayout::Split {
         return Err(gen_core::Error::Msg(format!(
