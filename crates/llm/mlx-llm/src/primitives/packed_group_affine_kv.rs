@@ -2010,17 +2010,34 @@ impl PackedGroupAffineKvCache {
                 "cannot dispatch an empty packed cache".into(),
             ));
         }
+        // `packed_mlx_arguments` constructs immutable MLX successors and updates upload/peak
+        // telemetry before the retained reader runs. Keep both snapshots private until the
+        // reader has evaluated successfully: a JIT/device fault must not leave a successor
+        // device layer or its byte counters visible to a retry.
+        let prior_device_layer = self.device_layers[layer].clone();
+        let prior_telemetry = self.telemetry;
         let cold = self.telemetry.cold_dispatches == 0;
         let dense_dequantizations_before = self.full_cache_dequantizations;
         let started = std::time::Instant::now();
-        let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
-        let output = self
-            .handle
-            .as_ref()
-            .expect("checked above")
-            .inner
-            .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
-        output.eval()?;
+        let result = (|| -> Result<Array> {
+            let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
+            let output = self
+                .handle
+                .as_ref()
+                .expect("checked above")
+                .inner
+                .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
+            output.eval()?;
+            Ok(output)
+        })();
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.device_layers[layer] = prior_device_layer;
+                self.telemetry = prior_telemetry;
+                return Err(error);
+            }
+        };
         debug_assert_eq!(
             self.full_cache_dequantizations, dense_dequantizations_before,
             "accepted fused packed dispatch must not reconstruct the full cache"
@@ -2941,6 +2958,36 @@ mod tests {
         packed.reset();
         assert_eq!(packed.offset(), 0);
         assert!(packed.retain_sequences(&[0]).is_ok());
+    }
+
+    #[test]
+    fn retained_dispatch_fault_restores_device_snapshot_and_byte_telemetry() {
+        let kernel = Arc::new(TestPackedKernel {
+            calls: AtomicUsize::new(0),
+            fail_on: Some(1),
+        });
+        let mut cache = PackedGroupAffineKvCache::new("test-packed", 1, 1, 1, 64, 32).unwrap();
+        cache
+            .bind_compiled_handle(CompiledKernelHandle::new(kernel))
+            .unwrap();
+        let values = vec![2.0f32; 64];
+        cache.append(0, &values, &values, 1).unwrap();
+        let prior_telemetry = cache.dispatch_telemetry();
+        let query = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        assert!(cache
+            .dispatch_packed(
+                0,
+                &query,
+                crate::primitives::packed_metal::PackedMask::Causal,
+            )
+            .is_err());
+        assert!(cache.device_layers[0].is_none());
+        assert_eq!(cache.dispatch_telemetry(), prior_telemetry);
+        assert_eq!(cache.logical_len(), 0);
+        assert!(
+            cache.layers[0].is_some(),
+            "host append remains caller-owned"
+        );
     }
 
     #[test]
