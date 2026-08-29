@@ -54,8 +54,7 @@ use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, Mo
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
-use crate::primitives::kv_cache::KvCache;
-use crate::primitives::kv_cache::PackedAttentionMask;
+use crate::primitives::kv_cache::{KvCache, PackedAttentionMask, PackedCacheEvidence};
 use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
 };
@@ -64,7 +63,8 @@ use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
-    ContiguousKvCache, PackedCacheRequest, PagedKvCache, Weights,
+    ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedKvCache, Weights,
+    PACKED_METAL_QUANT_GROUP_SIZE,
 };
 
 /// Cached decode runs in bf16 (matching the reference engines).
@@ -948,6 +948,19 @@ impl CausalLm {
         query_length: usize,
         has_mask: bool,
     ) -> Box<dyn KvCache> {
+        self.select_cache_with_packed_reader(handle, batch, query_length, has_mask)
+            .into_cache()
+    }
+
+    /// Preflight-preserving variant for sealed harnesses. The caller can record the exact route or
+    /// fallback reason before taking ownership of the decoder cache.
+    pub fn select_cache_with_packed_reader(
+        &self,
+        handle: CompiledKernelHandle,
+        batch: usize,
+        query_length: usize,
+        has_mask: bool,
+    ) -> DecoderCacheSelection {
         select_decoder_cache_with_reader(
             PackedCacheRequest {
                 enabled: true,
@@ -957,13 +970,18 @@ impl CausalLm {
                 batch,
                 kv_heads: self.cfg.num_kv_heads as usize,
                 head_dimension: self.cfg.head_dim as usize,
-                group_size: 4,
+                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
                 query_length,
                 has_mask,
             },
             handle,
         )
-        .into_cache()
+    }
+
+    /// Immutable compressed-domain evidence at the public model/cache boundary. A sealed model
+    /// receipt can call this without downcasting to the experimental storage implementation.
+    pub fn packed_cache_evidence(&self, cache: &dyn KvCache) -> Option<PackedCacheEvidence> {
+        cache.packed_evidence()
     }
 }
 
@@ -1327,8 +1345,8 @@ impl LlamaAttention {
                         AttnMask::SlidingCausal { window } => {
                             PackedAttentionMask::SlidingWindow(window as usize)
                         }
-                        AttnMask::None if q.shape()[2] == 1 => PackedAttentionMask::Causal,
-                        AttnMask::None | AttnMask::Additive(_) => PackedAttentionMask::Additive,
+                        AttnMask::None => PackedAttentionMask::None,
+                        AttnMask::Additive(_) => PackedAttentionMask::Additive,
                     };
                     if let Some(out) = cache.try_packed_attention(
                         layer_idx,
@@ -1341,6 +1359,11 @@ impl LlamaAttention {
                     )? {
                         return self.output(&out);
                     }
+                } else if let Some(softcap) = self.softcap {
+                    let reason = format!(
+                        "attention score softcap c={softcap} requires tanh before softmax; the packed reader implements uncapped scaled dot-product attention"
+                    );
+                    cache.prepare_dense_fallback("score-softcap", &reason)?;
                 }
                 let both = cache.update(layer_idx, &k, &v)?;
                 if self.stores_kv {

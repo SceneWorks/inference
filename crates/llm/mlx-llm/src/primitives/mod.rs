@@ -31,7 +31,9 @@ pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_ma
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use kv_cache::{CacheRoute, ContiguousKvCache, KvCache, PackedAttentionMask};
+pub use kv_cache::{
+    CacheRoute, ContiguousKvCache, KvCache, PackedAttentionMask, PackedCacheEvidence,
+};
 pub use nn::{
     conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
     soft_cap,
@@ -40,9 +42,10 @@ pub use packed_group_affine_kv::{
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
     DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
     OpaqueCompiledKernel, PackedCacheRequest, PackedDispatchTelemetry, PackedGroupAffineKvCache,
-    RepresentationMetadata, RetainedPackedKernel,
+    RepresentationMetadata, RetainedPackedKernel, PACKED_CODES_PER_BYTE,
+    PACKED_METAL_QUANT_GROUP_SIZE,
 };
-pub use packed_metal::{PackedMask, PackedMetalKernel};
+pub use packed_metal::{PackedMask, PackedMetalGpuFamily, PackedMetalKernel};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
