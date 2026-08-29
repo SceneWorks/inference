@@ -74,6 +74,11 @@ struct PackedKreaAttentionBackend<'a> {
 
 const PACKED_DISPATCH_ERROR_PREFIX: &str = "SC-20684 packed dispatch failed: ";
 
+#[inline]
+fn packed_dispatch_complete(dispatched_layers: usize, intended_layers: usize) -> bool {
+    intended_layers != 0 && dispatched_layers == intended_layers
+}
+
 impl CausalPackedAttention for PackedKreaAttentionBackend<'_> {
     fn attend(
         &mut self,
@@ -267,6 +272,18 @@ impl StoredKv {
             Self::Dense { k, v } => k.nbytes() + v.nbytes(),
             Self::Packed { k, v } => k.nbytes() + v.nbytes(),
         }
+    }
+
+    /// Materialize a staged successor before it becomes observable cache state. MLX concat and
+    /// quantize are lazy, so publication without this barrier could poison a later dense retry.
+    fn eval(&self) -> Result<()> {
+        match self {
+            Self::Dense { k, v } => mlx_rs::transforms::eval([k, v])?,
+            Self::Packed { k, v } => {
+                mlx_rs::transforms::eval([&k.w, &k.scales, &k.biases, &v.w, &v.scales, &v.biases])?
+            }
+        }
+        Ok(())
     }
 }
 
@@ -886,6 +903,14 @@ impl CausalKvCache {
             staged_layers.push(Some(staged));
         }
 
+        // Concatenation and quantization only build lazy MLX graphs. Evaluate every successor
+        // before publishing any layer so a late fault leaves the old cache intact for retry. The
+        // immutable old+new graphs coexist during this bounded barrier and therefore represent
+        // the real transient/residency cost of the append.
+        for staged in staged_layers.iter().flatten() {
+            staged.eval()?;
+        }
+
         #[cfg(test)]
         let (tail_base_old, committed_before) = (self.tail_base, self.committed_tokens);
         #[cfg(test)]
@@ -1089,10 +1114,22 @@ impl CausalKreaTransformer {
         let mut kv_positions = preview_positions.clone();
         kv_positions.extend(q_positions.iter().copied());
         let mask = block_causal_mask(&q_positions, &kv_positions, self.block_size)?;
-        let packed_positions = (cache.experimental_packed_metal_enabled()
-            && !preview_positions.is_empty())
-        .then(|| cache.prepare_packed_window(s_new))
-        .transpose()?;
+        // A sliding/sink gather is outside the retained kernel's physical layout. Treat that as a
+        // capability miss and use the unchanged dense path before mutating the cache, rather than
+        // propagating a request error.
+        let packed_positions =
+            if cache.experimental_packed_metal_enabled() && !preview_positions.is_empty() {
+                match cache.prepare_packed_window(s_new) {
+                    Ok(positions) => Some(positions),
+                    Err(error) => {
+                        cache.packed_metal_dense_fallbacks += 1;
+                        cache.last_packed_metal_fallback = Some(error.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let (velocity, new_kv) = if let Some(packed_positions) = packed_positions {
             let query_positions = Array::from_slice(&q_positions, &[q_positions.len() as i32]);
             let mut key_positions = packed_positions;
@@ -1125,9 +1162,32 @@ impl CausalKreaTransformer {
                 }
             }
             match packed_result {
-                Ok(result) => {
+                Ok(result)
+                    if packed_dispatch_complete(
+                        backend.dispatched_outputs.len(),
+                        self.inner.num_blocks(),
+                    ) =>
+                {
                     cache.packed_metal_accepted_forwards += 1;
                     result
+                }
+                Ok(_result) => {
+                    cache.packed_metal_dense_fallbacks += 1;
+                    cache.last_packed_metal_fallback = Some(format!(
+                        "{PACKED_DISPATCH_ERROR_PREFIX}packed dispatch reached {}/{} layers",
+                        backend.dispatched_outputs.len(),
+                        self.inner.num_blocks()
+                    ));
+                    let (prev_kv, _) = cache.window_prev(s_new)?;
+                    self.inner.forward_causal_chunk(
+                        &tokens,
+                        t,
+                        cross_kv,
+                        &cos,
+                        &sin,
+                        &prev_kv,
+                        mask.as_ref(),
+                    )?
                 }
                 Err(error) if error.to_string().contains(PACKED_DISPATCH_ERROR_PREFIX) => {
                     cache.packed_metal_dense_fallbacks += 1;
@@ -1307,6 +1367,15 @@ impl AdaptableHost for CausalKreaTransformer {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn packed_acceptance_requires_every_intended_layer() {
+        assert!(packed_dispatch_complete(40, 40));
+        assert!(!packed_dispatch_complete(39, 40));
+        assert!(!packed_dispatch_complete(0, 40));
+        assert!(!packed_dispatch_complete(0, 0));
+        // A zero-layer model cannot produce a meaningful packed receipt.
+    }
 
     /// A Wan-2.1-14B-T2V style LoRA (musubi-tuner / diffusion-pipe / ComfyUI), once its
     /// `diffusion_model.`/`transformer.` namespace is stripped, names exactly these per-block dotted
@@ -1846,6 +1915,23 @@ mod tests {
         let back = packed.unpack(KvCacheQuant::Q8).unwrap();
         assert_eq!(back.shape(), kv[0].0.shape());
         assert_eq!(back.dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn packed_sliding_window_rejection_is_a_capability_fallback_reason() {
+        let mut cache = CausalKvCache::new(1, 2, 0, Some(KvCacheQuant::Q8));
+        cache
+            .append(wide_kv_block(&[0, 1, 2, 3], Dtype::Bfloat16))
+            .unwrap();
+        let error = cache
+            .prepare_packed_window(2)
+            .expect_err("a strict sliding read needs a nonphysical gather");
+        assert!(
+            error.to_string().contains("falls back before mutation"),
+            "capability rejection must identify the dense fallback: {error}"
+        );
+        assert_eq!(cache.stored_tokens(), 4);
+        assert_eq!(cache.retained_tokens(), 4);
     }
 
     /// A group size that does not divide `head_dim` is a **config** error, and must be reported as one

@@ -2076,6 +2076,13 @@ impl WanTransformer {
         mask: Option<&Array>,
         backend: &mut dyn CausalPackedAttention,
     ) -> Result<(Array, Vec<(Array, Array)>)> {
+        if cross_kv.len() != self.blocks.len() {
+            return Err(Error::Msg(format!(
+                "wan causal packed: expected one cross-attention cache per layer ({}), got {}",
+                self.blocks.len(),
+                cross_kv.len()
+            )));
+        }
         if !prev_self_kv.is_empty() && prev_self_kv.len() != self.blocks.len() {
             return Err(Error::Msg(format!(
                 "wan causal: prev_self_kv must be empty or one (k,v) per layer ({}), got {}",
