@@ -430,9 +430,15 @@ impl CacheObserver for JsonlObserver {
             value["current_persistent_bytes"] = serde_json::json!(current);
             value["current_read_transient_bytes"] = serde_json::json!(transient);
             value["candidate_persistent_bytes"] = serde_json::json!(candidate);
-            value["candidate_read_transient_bytes"] = serde_json::json!(0);
-            value["generation_duration_ms"] = serde_json::json!(generation_ms);
-            value["cache_read_duration_ms"] = serde_json::json!(read_ms);
+            value["candidate_read_transient_bytes"] = serde_json::json!(transient);
+            value["generation_duration_ms"] = serde_json::json!(GENERATION_DURATION_PRECISE_MS
+                .with(|slot| *slot.borrow())
+                .max(generation_ms as f64)
+                .max(0.001));
+            value["cache_read_duration_ms"] = serde_json::json!(CACHE_READ_DURATION_PRECISE_MS
+                .with(|slot| *slot.borrow())
+                .max(read_ms as f64)
+                .max(0.001));
             value["reused_requests"] = serde_json::json!(reused);
             value["real_weights"] = serde_json::json!(true);
             value["full_generation"] =
@@ -481,6 +487,10 @@ thread_local! { static CURRENT_READ_TRANSIENT: RefCell<u64> = const { RefCell::n
 thread_local! { static REUSED_REQUESTS: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static GENERATION_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static CACHE_READ_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
+thread_local! { static GENERATION_DURATION_PRECISE_MS: RefCell<f64> = const { RefCell::new(0.0) }; }
+thread_local! { static CACHE_READ_DURATION_PRECISE_MS: RefCell<f64> = const { RefCell::new(0.0) }; }
+thread_local! { static CANCEL_TRIGGERED: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static TERMINAL_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
 
 /// Read the backend's continuous high-water mark. A campaign receipt is never allowed to use the
 /// attributed byte sum as a substitute for a process/device measurement.
@@ -521,6 +531,10 @@ fn install_with_context_inner(
     REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = 0);
     GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
     CACHE_READ_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
+    GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
+    CACHE_READ_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
+    CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
+    TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = false);
     Scope {
         started: Instant::now(),
     }
@@ -538,6 +552,9 @@ pub fn observe_timed(
     measured: Option<Instant>,
 ) {
     if phase == "generation-start" {
+        if START_EVENT_EMITTED.with(|slot| *slot.borrow()) {
+            return;
+        }
         let metadata = METADATA_EMITTED.with(|slot| *slot.borrow());
         if !metadata {
             PENDING_START.with(|slot| *slot.borrow_mut() = true);
@@ -547,19 +564,38 @@ pub fn observe_timed(
     }
     if phase == "cross-kv-read" {
         LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = true);
-        CURRENT_READ_TRANSIENT
-            .with(|slot| *slot.borrow_mut() = (*slot.borrow()).max(transient_bytes));
-        REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = slot.borrow().saturating_add(reused));
+        CURRENT_READ_TRANSIENT.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = (*value).max(transient_bytes);
+        });
+        REUSED_REQUESTS.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = value.saturating_add(reused);
+        });
         CACHE_READ_DURATION_MS.with(|slot| {
-            *slot.borrow_mut() =
-                (*slot.borrow()).max(measured.map_or(0, |t| t.elapsed().as_millis() as u64))
+            let mut value = slot.borrow_mut();
+            *value = (*value).max(measured.map_or(0, |t| t.elapsed().as_millis() as u64));
+        });
+        CACHE_READ_DURATION_PRECISE_MS.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = (*value)
+                .max(measured.map_or(0.001, |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001)));
         });
     }
     if phase == "cross-kv-created" {
-        CURRENT_PERSISTENT.with(|slot| *slot.borrow_mut() = (*slot.borrow()).max(persistent_bytes));
+        CURRENT_PERSISTENT.with(|slot| {
+            let mut value = slot.borrow_mut();
+            *value = (*value).max(persistent_bytes);
+        });
     }
     if phase == "generation-end" {
+        if TERMINAL_EMITTED.with(|slot| *slot.borrow()) {
+            return;
+        }
         GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = elapsed_ms_for(measured));
+        GENERATION_DURATION_PRECISE_MS
+            .with(|slot| *slot.borrow_mut() = elapsed_precise_ms_for(measured).max(0.001));
+        TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = true);
     }
     if phase == "metadata" {
         let ready = CONTEXT.with(|slot| {
@@ -626,6 +662,13 @@ pub fn observe_timed(
             }
         }
     });
+    if phase == "cross-kv-read"
+        && CAMPAIGN_CANCEL.with(|slot| *slot.borrow())
+        && !CANCEL_TRIGGERED.with(|slot| *slot.borrow())
+    {
+        CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = true);
+        observe_cancelled();
+    }
     if phase == "metadata" && PENDING_START.with(|slot| *slot.borrow()) {
         PENDING_START.with(|slot| *slot.borrow_mut() = false);
         observe("generation-start", 0, 0, 0);
@@ -643,6 +686,19 @@ fn elapsed_ms_for(measured: Option<Instant>) -> u64 {
             })
         },
         |t| t.elapsed().as_millis() as u64,
+    )
+}
+fn elapsed_precise_ms_for(measured: Option<Instant>) -> f64 {
+    measured.map_or_else(
+        || {
+            STARTED.with(|started| {
+                started
+                    .borrow()
+                    .as_ref()
+                    .map_or(0.001, |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001))
+            })
+        },
+        |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001),
     )
 }
 pub fn observe_tensor(
@@ -699,7 +755,14 @@ pub fn observe_tensor(
 pub fn observe_cancelled() {
     // A deliberate cancellation arm is only meaningful after a product-owned live K/V read.
     // This prevents preflight/request validation failures from masquerading as cancellation runs.
-    if LIVE_READ_SEEN.with(|slot| *slot.borrow()) {
+    if CAMPAIGN_CANCEL.with(|slot| *slot.borrow())
+        && LIVE_READ_SEEN.with(|slot| *slot.borrow())
+        && !TERMINAL_EMITTED.with(|slot| *slot.borrow())
+    {
+        TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = true);
+        let elapsed = elapsed_precise_ms_for(None).max(0.001);
+        GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = elapsed);
+        GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = elapsed.ceil() as u64);
         observe("cancelled", 0, 0, 0);
         observe("metrics", 0, 0, 0);
     }
@@ -753,6 +816,9 @@ pub(crate) fn bind_cross_kv_geometry(
 }
 impl Drop for Scope {
     fn drop(&mut self) {
+        if !TERMINAL_EMITTED.with(|slot| *slot.borrow()) {
+            observe("generation-end", 0, 0, 0);
+        }
         observe("invalidated", 0, 0, 0);
         observe("released", 0, 0, 0);
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
@@ -763,6 +829,10 @@ impl Drop for Scope {
         PENDING_START.with(|slot| *slot.borrow_mut() = false);
         LIVE_READ_SEEN.with(|slot| *slot.borrow_mut() = false);
         CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = false);
+        CANCEL_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
+        TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = false);
+        GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
+        CACHE_READ_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
         let _ = self.started;
     }
 }
@@ -889,6 +959,59 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_deduplicates_start_and_triggers_cancel_once_after_read() {
+        let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let scope = install(Box::new(Sink(out.clone())));
+        CAMPAIGN_CANCEL.with(|slot| *slot.borrow_mut() = true);
+        METADATA_EMITTED.with(|slot| *slot.borrow_mut() = true);
+        observe("generation-start", 0, 0, 0);
+        observe("generation-start", 0, 0, 0);
+        observe("cross-kv-read", 1, 2, 1);
+        observe("cross-kv-read", 1, 2, 1);
+        drop(scope);
+        let rows = out.borrow();
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "generation-start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "cancelled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "generation-end")
+                .count(),
+            0
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "invalidated")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|event| event.phase == "released")
+                .count(),
+            1
+        );
+        let read = rows
+            .iter()
+            .position(|event| event.phase == "cross-kv-read")
+            .unwrap();
+        let cancelled = rows
+            .iter()
+            .position(|event| event.phase == "cancelled")
+            .unwrap();
+        assert!(read < cancelled);
     }
 
     #[test]
