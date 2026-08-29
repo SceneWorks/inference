@@ -5,6 +5,9 @@
 //! values and keeps only one output accumulator per thread; it never constructs
 //! dense historical K/V or a score matrix.
 use crate::error::{Error, Result};
+use crate::primitives::packed_group_affine_kv::{
+    packed_metal_head_dimension_supported, PACKED_METAL_GROUP_SIZE,
+};
 use mlx_rs::fast::{MetalKernel, OutputArg};
 use mlx_rs::{Array, Dtype};
 
@@ -163,16 +166,16 @@ impl PackedMetalKernel {
             || vc_shape[1] != kc_shape[1]
             || vc_shape[2] == 0
             || q_shape[2] > vc_shape[2]
-            || kc_shape[2] != (vc_shape[2] + 3) / 4
+            || kc_shape[2] != vc_shape[2].div_ceil(PACKED_METAL_GROUP_SIZE)
             || vs_shape
                 != [
                     vc_shape[0],
                     vc_shape[1],
                     vc_shape[2],
-                    (q_shape[3] + 4 - 1) / 4,
+                    q_shape[3].div_ceil(PACKED_METAL_GROUP_SIZE),
                 ]
             || vz_shape != vs_shape
-            || kc_shape[3] != ((4 * q_shape[3] + 3) / 4)
+            || kc_shape[3] != (PACKED_METAL_GROUP_SIZE * q_shape[3]).div_ceil(4)
             || vc_shape[3] != (q_shape[3] + 3) / 4
             || k_codes.dtype() != Dtype::Uint8
             || v_codes.dtype() != Dtype::Uint8
@@ -202,7 +205,11 @@ impl PackedMetalKernel {
                 ))
             }
         };
-        if shape[0] == 0 || shape[1] == 0 || shape[2] == 0 || !matches!(shape[3], 64 | 128 | 256) {
+        if shape[0] == 0
+            || shape[1] == 0
+            || shape[2] == 0
+            || !packed_metal_head_dimension_supported(shape[3])
+        {
             return Err(Error::Unsupported("SC-20676 packed Metal geometry".into()));
         }
         let out = self
@@ -221,8 +228,8 @@ impl PackedMetalKernel {
             })
             .grid(shape[1] * shape[2] * shape[3], shape[0], 1)
             .thread_group(shape[3], 1, 1)
-            .template_arg("GROUP", 4)
-            .template_arg("K_WORDS", (4 * shape[3] + 3) / 4)
+            .template_arg("GROUP", PACKED_METAL_GROUP_SIZE)
+            .template_arg("K_WORDS", (PACKED_METAL_GROUP_SIZE * shape[3]).div_ceil(4))
             .template_arg("V_WORDS", (shape[3] + 3) / 4)
             .template_arg("MASK_MODE", mask_mode)
             .template_arg("WINDOW", window)

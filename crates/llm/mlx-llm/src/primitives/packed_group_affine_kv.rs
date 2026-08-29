@@ -19,6 +19,18 @@ use mlx_rs::Array;
 const MAGIC: &[u8; 8] = b"SW20675\0";
 const VERSION: u32 = 2;
 const BITS: u8 = 2;
+pub(crate) const PACKED_METAL_GROUP_SIZE: usize = 4;
+
+pub(crate) fn packed_metal_head_dimension_supported(head_dimension: usize) -> bool {
+    matches!(head_dimension, 64 | 128 | 256)
+}
+
+pub(crate) fn packed_metal_cache_geometry_supported(
+    head_dimension: usize,
+    group_size: usize,
+) -> bool {
+    packed_metal_head_dimension_supported(head_dimension) && group_size == PACKED_METAL_GROUP_SIZE
+}
 
 fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
@@ -264,7 +276,7 @@ impl DecoderCacheSelection {
 /// after a fully supported opt-in request.  Until SC-20676 installs a retained fused reader, every
 /// lifecycle operation records the reason and delegates to dense *before* it mutates K/V state.
 /// This is intentionally not advertised as compressed-domain attention.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct PendingPackedStep {
     original_len: usize,
     next_layer: usize,
@@ -276,6 +288,7 @@ pub struct DenseFallbackPackedDecoderCache {
     dense: ContiguousKvCache,
     staged: PackedGroupAffineKvCache,
     pending_step: Option<PendingPackedStep>,
+    dense_active: bool,
     reason: String,
 }
 
@@ -301,11 +314,79 @@ impl DenseFallbackPackedDecoderCache {
     }
 
     fn rollback_pending(&mut self, operation: &str, reason: impl Into<String>) -> Result<()> {
-        let Some(pending) = self.pending_step.take() else {
+        let Some(pending) = self.pending_step else {
             return Ok(());
         };
         self.staged.trim(pending.original_len)?;
+        self.pending_step = None;
         self.staged.dense_read_fallback(operation, reason);
+        Ok(())
+    }
+
+    /// Materialize the exact packed values which have already participated in attention into a
+    /// fresh dense cache. A partially completed model step is preserved per layer: layers already
+    /// dispatched contain `original_len + step`, while later layers still contain `original_len`.
+    /// The fresh cache is published only after every reconstructed MLX array evaluates.
+    fn transition_to_dense(
+        &mut self,
+        operation: &str,
+        reason: impl Into<String>,
+        key_dtype: mlx_rs::Dtype,
+        value_dtype: mlx_rs::Dtype,
+    ) -> Result<()> {
+        if self.dense_active {
+            return Ok(());
+        }
+        let mut dense = ContiguousKvCache::new(self.staged.layers());
+        let shape_prefix = [self.staged.batch as i32, self.staged.kv_heads as i32];
+        let rows = self.staged.rows();
+        let width = self.staged.head_dimension;
+        let mut reconstructed = false;
+        for (layer_index, layer) in self.staged.layers.iter().enumerate() {
+            let Some(layer) = layer.as_ref() else {
+                continue;
+            };
+            let tokens = layer.keys.logical_tokens();
+            if tokens == 0 {
+                continue;
+            }
+            reconstructed = true;
+            let mut keys = Vec::with_capacity(rows * tokens * width);
+            let mut values = Vec::with_capacity(rows * tokens * width);
+            for row in 0..rows {
+                for token in 0..tokens {
+                    keys.extend(layer.keys.row(token, row)?);
+                    values.extend(
+                        layer
+                            .values
+                            .row(token * rows + row, self.staged.group_size)?,
+                    );
+                }
+            }
+            let shape = [
+                shape_prefix[0],
+                shape_prefix[1],
+                tokens as i32,
+                width as i32,
+            ];
+            let keys = Array::from_slice(&keys, &shape).as_dtype(key_dtype)?;
+            let values = Array::from_slice(&values, &shape).as_dtype(value_dtype)?;
+            keys.eval()?;
+            values.eval()?;
+            dense.update(layer_index, &keys, &values)?;
+        }
+
+        let reason = reason.into();
+        if reconstructed {
+            self.staged.record_dense_dequantization();
+        }
+        self.staged.dense_read_fallback(operation, reason.clone());
+        self.dense = dense;
+        self.pending_step = None;
+        self.staged.handle = None;
+        self.staged.clear();
+        self.dense_active = true;
+        self.reason = reason;
         Ok(())
     }
 
@@ -313,16 +394,11 @@ impl DenseFallbackPackedDecoderCache {
         &mut self,
         operation: &str,
         reason: impl Into<String>,
+        key_dtype: mlx_rs::Dtype,
+        value_dtype: mlx_rs::Dtype,
     ) -> Result<Option<Array>> {
         let reason = reason.into();
-        if self.pending_step.is_some() || self.staged.logical_len() != 0 {
-            return Err(Error::Unsupported(format!(
-                "packed history cannot transition to unsupported {operation}: {reason}"
-            )));
-        }
-        self.staged.handle = None;
-        self.reason = reason.clone();
-        self.staged.dense_read_fallback(operation, reason);
+        self.transition_to_dense(operation, reason, key_dtype, value_dtype)?;
         Ok(None)
     }
 
@@ -341,8 +417,12 @@ impl DenseFallbackPackedDecoderCache {
 }
 
 impl KvCache for DenseFallbackPackedDecoderCache {
-    fn preflight_packed(&self, _query_length: usize, mask: bool) -> CacheRoute {
-        if self.staged.compiled_handle().is_some() && !mask {
+    fn preflight_packed(&self, query_length: usize, mask: bool) -> CacheRoute {
+        if !self.dense_active
+            && self.staged.compiled_handle().is_some()
+            && query_length > 0
+            && !mask
+        {
             CacheRoute::ExperimentalPacked
         } else {
             CacheRoute::DenseFallback {
@@ -357,34 +437,31 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         keys: &mlx_rs::Array,
         values: &mlx_rs::Array,
     ) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
-        if self.pending_step.is_some() {
-            self.rollback_pending(
+        if !self.dense_active {
+            self.transition_to_dense(
                 "update",
-                "dense update attempted while a packed whole-step transaction was pending",
+                "decoder layer requires dense attention",
+                keys.dtype(),
+                values.dtype(),
             )?;
-            return Err(Error::Unsupported(
-                "dense update cannot continue a partially executed packed step".into(),
-            ));
         }
-        if self.staged.logical_len() != 0 {
-            return Err(Error::Unsupported(
-                "dense update cannot continue after packed history is resident".into(),
-            ));
-        }
-        if self.staged.compiled_handle().is_some() {
-            self.reason = "decoder layer requires dense attention before packed mutation".into();
-            self.staged.handle = None;
-        }
-        self.dense_before_mutation("update");
         self.dense.update(layer, keys, values)
     }
 
     fn offset(&self) -> i32 {
-        self.staged.logical_len() as i32
+        if self.dense_active {
+            self.dense.offset()
+        } else {
+            self.staged.logical_len() as i32
+        }
     }
 
     fn batch_size(&self) -> i32 {
-        self.staged.batch_size() as i32
+        if self.dense_active {
+            self.dense.batch_size()
+        } else {
+            self.staged.batch_size() as i32
+        }
     }
 
     fn try_packed_attention(
@@ -398,10 +475,16 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         retained_for_sharing: bool,
     ) -> Result<Option<mlx_rs::Array>> {
         let outcome = (|| -> Result<Option<mlx_rs::Array>> {
+            if self.dense_active {
+                return Ok(None);
+            }
             if self.staged.logical_len() != 0 && self.staged.compiled_handle().is_none() {
-                return Err(Error::Unsupported(
-                    "packed history cannot silently transition to an empty dense cache".into(),
-                ));
+                return self.decline_before_packed_mutation(
+                    "missing packed reader",
+                    "packed reader became unavailable",
+                    keys.dtype(),
+                    values.dtype(),
+                );
             }
             if self.staged.compiled_handle().is_none() {
                 return Ok(None);
@@ -410,6 +493,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 return self.decline_before_packed_mutation(
                     "shared-kv attention",
                     "the retained packed reader cannot publish K/V for a sharing tail",
+                    keys.dtype(),
+                    values.dtype(),
                 );
             }
 
@@ -439,7 +524,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 || q_shape[1] % self.staged.kv_heads != 0
             {
                 Some("query heads must map evenly onto the packed K/V heads")
-            } else if !matches!(self.staged.head_dimension, 64 | 128 | 256)
+            } else if !packed_metal_head_dimension_supported(self.staged.head_dimension)
                 || q_shape[3] != self.staged.head_dimension
                 || k_shape[3] != self.staged.head_dimension
                 || v_shape[3] != self.staged.head_dimension
@@ -460,7 +545,12 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 None
             };
             if let Some(reason) = shape_reason {
-                return self.decline_before_packed_mutation("geometry/dtype", reason);
+                return self.decline_before_packed_mutation(
+                    "geometry/dtype",
+                    reason,
+                    keys.dtype(),
+                    values.dtype(),
+                );
             }
 
             let step = k_shape[2];
@@ -485,6 +575,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 return self.decline_before_packed_mutation(
                     "query/cache length",
                     "query length exceeds the post-append packed cache length",
+                    keys.dtype(),
+                    values.dtype(),
                 );
             }
 
@@ -493,6 +585,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 return self.decline_before_packed_mutation(
                     "attention scale",
                     "attention scale does not match inverse square-root head dimension",
+                    keys.dtype(),
+                    values.dtype(),
                 );
             }
             let packed_mask = match mask {
@@ -509,12 +603,16 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                     return self.decline_before_packed_mutation(
                         "sliding-window mask",
                         "sliding window must be in 1..=i32::MAX",
+                        keys.dtype(),
+                        values.dtype(),
                     );
                 }
                 crate::primitives::kv_cache::PackedAttentionMask::Additive => {
                     return self.decline_before_packed_mutation(
                         "additive mask",
                         "additive masks require dense attention",
+                        keys.dtype(),
+                        values.dtype(),
                     );
                 }
             };
@@ -568,15 +666,6 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         })();
 
         match outcome {
-            Ok(None) if self.pending_step.is_some() => {
-                self.rollback_pending(
-                    "packed-transaction",
-                    "packed route declined after an earlier layer had appended",
-                )?;
-                Err(Error::Unsupported(
-                    "packed route declined during a whole-step transaction".into(),
-                ))
-            }
             Err(error) if self.pending_step.is_some() => {
                 self.rollback_pending("packed-transaction", error.to_string())?;
                 Err(error)
@@ -590,6 +679,9 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        if self.dense_active {
+            return self.dense.retain_sequences(keep);
+        }
         if self.pending_step.is_some() {
             return Err(Error::Unsupported(
                 "retain_sequences cannot mutate a pending packed step".into(),
@@ -609,10 +701,11 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn truncate(&mut self, len: i32) -> Result<()> {
-        if let Some(pending) = self.pending_step.take() {
-            self.staged.trim(pending.original_len)?;
-            self.staged
-                .dense_read_fallback("truncate", "discarded pending packed step");
+        if self.dense_active {
+            return self.dense.truncate(len);
+        }
+        if self.pending_step.is_some() {
+            self.rollback_pending("truncate", "discarded pending packed step")?;
         }
         self.staged.trim(len as usize)?;
         self.dense_before_mutation("truncate");
@@ -620,16 +713,17 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn reset(&mut self) {
-        if let Some(pending) = self.pending_step.take() {
+        if let Some(pending) = self.pending_step {
             self.staged
                 .trim(pending.original_len)
                 .expect("pending packed rollback remains in bounds");
+            self.pending_step = None;
             self.staged
                 .dense_read_fallback("reset", "discarded pending packed step");
         }
         self.staged.clear();
-        self.dense_before_mutation("reset");
         self.dense.reset();
+        self.dense_active = self.staged.compiled_handle().is_none();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -667,13 +761,23 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
     if request.layers == 0
         || request.batch == 0
         || request.kv_heads == 0
-        || request.head_dimension == 0
-        || request.group_size == 0
         || request.query_length == 0
     {
         return dense_selection(
             request.layers,
             "packed cache geometry is unsupported before allocation",
+        );
+    }
+    if !packed_metal_head_dimension_supported(request.head_dimension) {
+        return dense_selection(
+            request.layers,
+            "packed Metal head dimension must be 64, 128, or 256",
+        );
+    }
+    if !packed_metal_cache_geometry_supported(request.head_dimension, request.group_size) {
+        return dense_selection(
+            request.layers,
+            format!("packed Metal group size must be {PACKED_METAL_GROUP_SIZE}"),
         );
     }
     let staged = match PackedGroupAffineKvCache::new(
@@ -698,6 +802,7 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
             dense: ContiguousKvCache::new(request.layers),
             staged,
             pending_step: None,
+            dense_active: false,
             reason,
         }),
     }
@@ -1462,9 +1567,11 @@ impl PackedGroupAffineKvCache {
         if handle.backend() != "mlx-metal" {
             return Err(Error::Config("compiled handle backend mismatch".into()));
         }
-        if self.group_size != 4 {
+        if !packed_metal_cache_geometry_supported(self.head_dimension, self.group_size) {
             return Err(Error::Config(
-                "SC-20676 retained Metal reader requires packed group size 4".into(),
+                format!(
+                    "SC-20676 retained Metal reader requires head dimension 64, 128, or 256 and packed group size {PACKED_METAL_GROUP_SIZE}"
+                ),
             ));
         }
         self.handle = Some(handle);
@@ -1483,19 +1590,16 @@ impl PackedGroupAffineKvCache {
         let key_bytes = storage.keys.code_bytes_per_group();
         let value_bytes = self.head_dimension.div_ceil(4);
         let value_groups = self.head_dimension.div_ceil(self.group_size);
-        let (old_key_groups, old_value_tokens) = self
-            .device_layers
-            .get(layer)
-            .and_then(Option::as_ref)
-            .map_or((0, 0), |device| (device.key_groups, device.value_tokens));
-        if old_key_groups > complete_groups || old_value_tokens > value_tokens {
-            self.device_layers[layer] = None;
-        }
-        let (old_key_groups, old_value_tokens) = self
-            .device_layers
-            .get(layer)
-            .and_then(Option::as_ref)
-            .map_or((0, 0), |device| (device.key_groups, device.value_tokens));
+        let resident = self.device_layers.get(layer).and_then(Option::as_ref);
+        let rebuild = resident.is_some_and(|device| {
+            device.key_groups > complete_groups || device.value_tokens > value_tokens
+        });
+        let current = if rebuild {
+            DevicePackedLayer::empty()
+        } else {
+            resident.cloned().unwrap_or_else(DevicePackedLayer::empty)
+        };
+        let (old_key_groups, old_value_tokens) = (current.key_groups, current.value_tokens);
 
         let key_delta = if old_key_groups < complete_groups {
             let groups = complete_groups - old_key_groups;
@@ -1598,9 +1702,6 @@ impl PackedGroupAffineKvCache {
 
         // Build and evaluate a complete replacement off to the side. Publishing arrays one by one
         // would let a concatenate/eval fault drop or length-skew an otherwise valid resident prefix.
-        let current = self.device_layers[layer]
-            .clone()
-            .unwrap_or_else(DevicePackedLayer::empty);
         let mut next = current.clone();
         if let Some((codes, scales, zeros)) = key_delta {
             let next_codes = joined_device_axis(current.key_codes.as_ref(), codes)?;
@@ -2466,7 +2567,7 @@ mod tests {
             layers: 2,
             batch: 1,
             kv_heads: 2,
-            head_dimension: 8,
+            head_dimension: 64,
             group_size: 4,
             query_length: 1,
             has_mask: false,
@@ -2581,7 +2682,7 @@ mod tests {
         assert!(matches!(
             selection.route(),
             CacheRoute::DenseFallback { reason }
-                if reason.contains("requires packed group size 4")
+                if reason.contains("group size must be 4")
         ));
         assert_eq!(selection.cache.offset(), 0);
     }
@@ -2703,27 +2804,34 @@ mod tests {
     }
 
     #[test]
-    fn every_pre_dispatch_error_rolls_back_the_pending_whole_step() {
+    fn hard_pre_dispatch_errors_roll_back_the_pending_whole_step() {
         let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
         let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
         let q_two = Array::from_slice(&vec![1.0f32; 128], &[1, 1, 2, 64]);
         let kv_two = Array::from_slice(&vec![2.0f32; 128], &[1, 1, 2, 64]);
-        let unsupported_q = Array::from_slice(&[1u8; 64], &[1, 1, 1, 64]);
-        let mut cache = hook_cache(2, None);
-        let packed = cache
-            .as_any_mut()
-            .downcast_mut::<DenseFallbackPackedDecoderCache>()
-            .unwrap();
-
-        let start_pending = |packed: &mut DenseFallbackPackedDecoderCache| {
+        let assert_one_hard_error = |layer: usize, query: &Array, key: &Array, value: &Array| {
+            let mut cache = hook_cache(2, None);
+            let packed = cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap();
             assert!(packed
                 .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
                 .unwrap()
                 .is_some());
             assert!(packed.pending_step.is_some());
             assert_eq!(packed.offset(), 0);
-        };
-        let assert_rolled_back = |packed: &DenseFallbackPackedDecoderCache| {
+            assert!(packed
+                .try_packed_attention(
+                    layer,
+                    query,
+                    key,
+                    value,
+                    PackedAttentionMask::Causal,
+                    0.125,
+                    false,
+                )
+                .is_err());
             assert!(packed.pending_step.is_none());
             assert_eq!(packed.offset(), 0);
             assert_eq!(
@@ -2735,62 +2843,132 @@ mod tests {
                 0
             );
         };
+        assert_one_hard_error(0, &q, &kv, &kv);
+        assert_one_hard_error(1, &q_two, &kv_two, &kv_two);
+    }
 
-        start_pending(packed);
-        assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, true,)
-            .is_err());
-        assert_rolled_back(packed);
+    #[test]
+    fn late_capability_decline_preserves_partial_step_in_dense_cache() {
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let mut cache = hook_cache(2, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
 
-        start_pending(packed);
-        assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false,)
-            .is_err());
-        assert_rolled_back(packed);
+        for layer in 0..2 {
+            assert!(packed
+                .try_packed_attention(
+                    layer,
+                    &q,
+                    &kv,
+                    &kv,
+                    PackedAttentionMask::Causal,
+                    0.125,
+                    false,
+                )
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(packed.offset(), 1);
 
-        start_pending(packed);
-        assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Additive, 0.125, false,)
-            .is_err());
-        assert_rolled_back(packed);
-
-        start_pending(packed);
         assert!(packed
             .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
-            .is_err());
-        assert_rolled_back(packed);
-
-        start_pending(packed);
+            .unwrap()
+            .is_some());
+        assert!(packed.pending_step.is_some());
         assert!(packed
-            .try_packed_attention(
-                1,
-                &q_two,
-                &kv_two,
-                &kv_two,
-                PackedAttentionMask::Causal,
-                0.125,
-                false,
-            )
-            .is_err());
-        assert_rolled_back(packed);
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Additive, 0.125, false,)
+            .unwrap()
+            .is_none());
+        assert!(packed.dense_active);
+        assert!(packed.pending_step.is_none());
+        assert_eq!(packed.staged.logical_len(), 0);
+        assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 2);
+        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 1);
 
-        start_pending(packed);
+        packed.update(1, &kv, &kv).unwrap();
+        assert_eq!(packed.offset(), 2);
+        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 2);
+        assert_eq!(packed.staged.full_cache_dequantizations(), 1);
+    }
+
+    #[test]
+    fn every_late_capability_branch_transitions_the_partial_step_to_dense() {
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let unsupported_q = Array::from_slice(&[1u8; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        for (query, mask, scale, retained_for_sharing) in [
+            (&q, PackedAttentionMask::Causal, 0.125, true),
+            (&q, PackedAttentionMask::Causal, 1.0, false),
+            (&q, PackedAttentionMask::SlidingWindow(0), 0.125, false),
+            (&q, PackedAttentionMask::Additive, 0.125, false),
+            (&unsupported_q, PackedAttentionMask::Causal, 0.125, false),
+        ] {
+            let mut cache = hook_cache(2, None);
+            let packed = cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap();
+            assert!(packed
+                .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
+                .unwrap()
+                .is_some());
+            assert!(packed
+                .try_packed_attention(1, query, &kv, &kv, mask, scale, retained_for_sharing,)
+                .unwrap()
+                .is_none());
+            assert!(packed.dense_active);
+            assert!(packed.pending_step.is_none());
+            assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 1);
+            assert!(packed.dense.peek(1).is_none());
+            packed.update(1, &kv, &kv).unwrap();
+            assert_eq!(packed.offset(), 1);
+        }
+    }
+
+    #[test]
+    fn direct_dense_update_after_a_packed_layer_preserves_that_partial_step() {
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let mut cache = hook_cache(2, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
         assert!(packed
-            .try_packed_attention(
-                1,
-                &unsupported_q,
-                &kv,
-                &kv,
-                PackedAttentionMask::Causal,
-                0.125,
-                false,
-            )
-            .is_err());
-        assert_rolled_back(packed);
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false,)
+            .unwrap()
+            .is_some());
+        packed.update(1, &kv, &kv).unwrap();
+        assert!(packed.dense_active);
+        assert_eq!(packed.offset(), 1);
+        assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 1);
+        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 1);
+    }
 
-        start_pending(packed);
-        assert!(packed.update(1, &kv, &kv).is_err());
-        assert_rolled_back(packed);
+    #[test]
+    fn factory_rejects_zero_query_unsupported_dimension_and_group_before_staging() {
+        for (query_length, head_dimension, group_size) in [(0, 64, 4), (1, 32, 4), (1, 64, 8)] {
+            let mut selection = select_decoder_cache(PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "test-packed".into(),
+                layers: 2,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension,
+                group_size,
+                query_length,
+                has_mask: false,
+            });
+            assert!(selection.cache.as_any_mut().is::<ContiguousKvCache>());
+            assert!(matches!(
+                selection.route(),
+                CacheRoute::DenseFallback { .. }
+            ));
+        }
     }
 
     #[test]
