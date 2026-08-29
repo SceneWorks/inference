@@ -6,7 +6,7 @@ MANIFEST=Path(__file__).with_name("sc20686_coverage_manifest.json")
 
 FAMILIES=("flux2-klein","wan")
 THRESHOLDS={"opportunity_bytes":512*1024**2,"opportunity_peak_pct":.05,"reused_requests":2,"saving_bytes":256*1024**2,"saving_peak_pct":.03,"runtime_only_pct":.05}
-REQUIRED=("producer","family","variant","source_ref","model_snapshot_sha256","model_snapshot_bytes","geometry","lifecycle","allocator_samples","process_samples","raw_receipt_sha256","raw_receipt_sidecar_sha256","real_weights","full_generation","attention_kind","current_persistent_bytes","current_read_transient_bytes","candidate_persistent_bytes","candidate_read_transient_bytes","generation_duration_ms","cache_read_duration_ms","reused_requests")
+REQUIRED=("producer","family","variant","coordinate_id","arm","source_ref","model_snapshot_sha256","model_snapshot_bytes","geometry","lifecycle","allocator_samples","process_samples","raw_receipt_sha256","raw_receipt_sidecar_sha256","real_weights","full_generation","attention_kind","current_persistent_bytes","current_read_transient_bytes","candidate_persistent_bytes","candidate_read_transient_bytes","generation_duration_ms","cache_read_duration_ms","reused_requests")
 GEOMETRY=("resolution","reference_count","frames","prompt","guidance","layers","heads","head_dimension","sq","skv","dtype","mask","rope")
 LIFECYCLE=("created","reused","invalidated")
 
@@ -20,6 +20,8 @@ def validate(row):
     if missing: fail(f"missing fields: {sorted(missing)}")
     if row["producer"]!="sc20686-campaign-adapter-v1": fail("untrusted producer")
     if row["family"] not in FAMILIES or not isinstance(row["variant"],str) or not row["variant"]: fail("invalid family/variant")
+    if not isinstance(row["coordinate_id"], str) or len(row["coordinate_id"]) != 16 or any(c not in "0123456789abcdef" for c in row["coordinate_id"]): fail("invalid coordinate id")
+    if row["arm"] not in ("normal", "cancel"): fail("invalid campaign arm")
     digest(row["model_snapshot_sha256"],"model snapshot hash"); digest(row["raw_receipt_sha256"],"raw receipt hash"); digest(row["raw_receipt_sidecar_sha256"],"receipt sidecar hash")
     if row["real_weights"] is not True or row["full_generation"] is not True: fail("real full-generation receipt required")
     if row["attention_kind"]!="cross": fail("self-attention is excluded")
@@ -48,16 +50,19 @@ def reduce(rows):
     for row in rows:
         if row["variant"] not in manifest.get("families",{}).get(row["family"],[]): fail("variant absent from coverage manifest")
         if any(k not in row["geometry"] for k in manifest.get("required_geometry_axes",[])): fail("coverage geometry incomplete")
-    keys=[(r["family"],r["variant"],json.dumps(r["geometry"],sort_keys=True)) for r in rows]
+    keys=[(r["family"],r["variant"],r["coordinate_id"],r["arm"]) for r in rows]
     if len(keys)!=len(set(keys)): fail("duplicate family/variant/geometry")
     decisions={}
     for family in FAMILIES:
         rs=[r for r in rows if r["family"]==family]
         variants={r["variant"] for r in rs}
         required_variants = set(manifest.get("families", {}).get(family, ()))
-        if not rs or variants != required_variants:
+        arms_by_variant = {variant: {(r["coordinate_id"], r["arm"]) for r in rs if r["variant"] == variant} for variant in variants}
+        complete_arms = all({arm for _, arm in pairs} == {"normal", "cancel"} and len({coordinate for coordinate, _ in pairs}) == 1 for pairs in arms_by_variant.values())
+        if not rs or variants != required_variants or not complete_arms:
             decisions[family]={"decision":"blocked","reason":"sealed manifest requires every registered variant",
-                               "observed_variants":sorted(variants), "required_variants":sorted(required_variants)}
+                               "observed_variants":sorted(variants), "required_variants":sorted(required_variants),
+                               "complete_normal_cancel_arms":complete_arms}
             continue
         peak=max(max(s["peak_bytes"] for s in r["process_samples"]) for r in rs)
         current=max(r["current_persistent_bytes"]+r["current_read_transient_bytes"] for r in rs)

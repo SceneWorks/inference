@@ -85,6 +85,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if not args.cancel_campaign and cancelled:
         raise ValueError("normal generation cannot contain cancellation")
     geometry = geometry_from(events)
+    coordinate_id = digest(json.dumps(geometry, sort_keys=True, separators=(",", ":")).encode())[:16]
+    arm = "cancel" if args.cancel_campaign else "normal"
     allocator = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events
                  if e.get("sample_kind") == "allocator" and "peak_bytes" in e]
     process = [{"phase": e["phase"], "peak_bytes": e["peak_bytes"]} for e in events
@@ -92,6 +94,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if not allocator or not process:
         raise ValueError("producer must provide distinct allocator and process samples")
     return {"producer": PRODUCER, "family": args.family, "variant": args.variant,
+            "coordinate_id": coordinate_id, "arm": arm,
             "source_ref": source_ref,
             "model_snapshot_sha256": snapshot_hash, "model_snapshot_bytes": snapshot_bytes,
             "geometry": geometry,
