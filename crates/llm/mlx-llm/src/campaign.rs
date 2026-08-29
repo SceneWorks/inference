@@ -290,7 +290,11 @@ impl ReceiptBuilder {
                 && v.bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
-        let revision = |v: &str| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit());
+        let revision = |v: &str| {
+            v.len() == 40
+                && v.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
         if !digest(&self.template.contract_hash)
             || !digest(&self.template.provenance.dependency_lock_sha256)
             || !digest(&self.template.provenance.model_file_sha256)
@@ -461,7 +465,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let rfc3339 = |v: &str| {
         let b = v.as_bytes();
         let fixed = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
-        (b.len() == 20 || (b.len() >= 22 && b[19] == b'.' && b[b.len() - 1] == b'Z'))
+        let shape = (b.len() == 20 || (b.len() >= 22 && b[19] == b'.' && b[b.len() - 1] == b'Z'))
             && b.get(4) == Some(&b'-')
             && b.get(7) == Some(&b'-')
             && b.get(10) == Some(&b'T')
@@ -474,17 +478,51 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             && (11..13).all(fixed)
             && (14..16).all(fixed)
             && (17..19).all(fixed)
-            && (b.len() == 20 || (20..b.len() - 1).all(fixed))
-            && b[11..13].iter().copied().collect::<Vec<_>>() < b"24".to_vec()
-            && b[14..16].iter().copied().collect::<Vec<_>>() < b"60".to_vec()
-            && b[17..19].iter().copied().collect::<Vec<_>>() < b"60".to_vec()
+            && (b.len() == 20 || (20..b.len() - 1).all(fixed));
+        if !shape {
+            return false;
+        }
+        let parse =
+            |range: std::ops::Range<usize>| v.get(range).and_then(|part| part.parse::<u32>().ok());
+        let year = parse(0..4).unwrap_or(0);
+        let month = parse(5..7).unwrap_or(0);
+        let day = parse(8..10).unwrap_or(0);
+        let hour = parse(11..13).unwrap_or(99);
+        let minute = parse(14..16).unwrap_or(99);
+        let second = parse(17..19).unwrap_or(99);
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = [
+            0,
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        (1..=12).contains(&month)
+            && day >= 1
+            && day <= days[month as usize]
+            && hour < 24
+            && minute < 60
+            && second < 60
     };
     let lowercase_hex = |v: &str, len: usize| {
         v.len() == len
             && v.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
-    let revision = |v: &str| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit());
+    let revision = |v: &str| {
+        v.len() == 40
+            && v.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
     if receipt.schema_version != 3
         || receipt.harness_version != "sc-20671-kv-baseline-v3"
         || receipt.status != "complete"
@@ -518,6 +556,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .any(|v| v.is_empty())
         || p.model_file_bytes == 0
         || p.thermal_state != "nominal"
+        || !p.command_template.contains("{mode}")
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
     {
         return Err("provenance is incomplete".into());
@@ -626,36 +665,49 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV reconciliation failed".into());
     }
-    let mut transient_by_phase = std::collections::BTreeMap::<&str, u64>::new();
+    let mut transient_by_phase = std::collections::BTreeMap::<&str, u128>::new();
     for event in receipt.memory.allocation_events.iter().filter(|e| {
         e.lifetime == "transient" && (e.role == "cache" || e.role == "attention-workspace")
     }) {
-        *transient_by_phase.entry(event.phase.as_str()).or_default() += event.bytes;
+        let total = transient_by_phase.entry(event.phase.as_str()).or_default();
+        *total = total
+            .checked_add(u128::from(event.bytes))
+            .ok_or("transient allocation total overflow")?;
     }
     if transient_by_phase
         .values()
         .copied()
-        .any(|bytes| (bytes as f64) >= (dense as f64 * 0.9))
+        .any(|bytes| bytes.saturating_mul(10) >= u128::from(dense).saturating_mul(9))
     {
         return Err("aggregate full-cache temporary detected".into());
     }
-    let attributed = receipt
-        .memory
-        .model_weights_bytes
-        .saturating_add(receipt.memory.persistent_kv_bytes)
-        .saturating_add(receipt.memory.transient_workspace_bytes);
-    for required in ["weights-loaded", "prefill-peak", "decode-steady"] {
-        let sample = receipt
+    let weights = receipt.memory.model_weights_bytes;
+    let kv = receipt.memory.persistent_kv_bytes;
+    let workspace = receipt.memory.transient_workspace_bytes;
+    let sample_for = |phase: &str| {
+        receipt
             .memory
             .phase_samples
             .iter()
-            .find(|sample| sample.phase == required)
-            .ok_or_else(|| format!("missing containment phase {required}"))?;
-        if sample.mlx.active_bytes < attributed || sample.mlx.peak_bytes < attributed {
-            return Err(format!(
-                "MLX attribution does not contain {required} allocations"
-            ));
-        }
+            .find(|sample| sample.phase == phase)
+            .ok_or_else(|| format!("missing containment phase {phase}"))
+    };
+    let weights_loaded = sample_for("weights-loaded")?;
+    if weights_loaded.mlx.active_bytes < weights {
+        return Err("weights-loaded MLX active bytes do not contain weights".into());
+    }
+    let prefill = sample_for("prefill-peak")?;
+    if prefill
+        .mlx
+        .active_bytes
+        .saturating_add(prefill.mlx.peak_bytes)
+        < weights.saturating_add(kv).saturating_add(workspace)
+    {
+        return Err("prefill MLX samples do not contain attributed allocations".into());
+    }
+    let decode = sample_for("decode-steady")?;
+    if decode.mlx.active_bytes < weights.saturating_add(kv) {
+        return Err("decode MLX active bytes do not contain weights and KV".into());
     }
     if receipt.mode == "dense"
         && receipt.memory.persistent_kv_bytes.abs_diff(dense)
@@ -888,7 +940,7 @@ pub struct ArtifactBundle {
 
 /// Assemble all receipt artifacts in memory before any caller writes them. This prevents a
 /// partially-written receipt directory from being mistaken for a campaign result.
-pub fn assemble_artifacts(mut receipt: Receipt) -> Result<ArtifactBundle, String> {
+pub fn assemble_artifacts(receipt: Receipt) -> Result<ArtifactBundle, String> {
     assemble_artifacts_named(receipt, "receipt.json", "receipt.txt")
 }
 
@@ -1957,6 +2009,29 @@ mod tests {
         let mut phase_tampered = receipt.clone();
         phase_tampered.memory.phase_samples[3].source = "caller-authored".into();
         assert!(validate_receipt_semantics(&phase_tampered).is_err());
+        let mut calendar_tampered = receipt.clone();
+        calendar_tampered.memory.phase_samples[0].timestamp = "2026-02-31T00:00:00Z".into();
+        assert!(validate_receipt_semantics(&calendar_tampered).is_err());
+        let mut revision_tampered = receipt.clone();
+        revision_tampered.provenance.scene_works_revision = "A".repeat(40);
+        assert!(validate_receipt_semantics(&revision_tampered).is_err());
+        let mut command_tampered = receipt.clone();
+        command_tampered.provenance.command_template = "run --dense".into();
+        command_tampered.provenance.command = "run --dense".into();
+        assert!(validate_receipt_semantics(&command_tampered).is_err());
+        let mut threshold_tampered = receipt.clone();
+        threshold_tampered
+            .memory
+            .allocation_events
+            .push(ReceiptAllocation {
+                kind: "temporary-full-cache".into(),
+                role: "cache".into(),
+                lifetime: "transient".into(),
+                phase: "prefill-peak".into(),
+                timestamp: "2026-01-01T00:00:02.300Z".into(),
+                bytes: 4,
+            });
+        assert!(validate_receipt_semantics(&threshold_tampered).is_err());
         let mut fixture_tampered = receipt.clone();
         fixture_tampered
             .quality
