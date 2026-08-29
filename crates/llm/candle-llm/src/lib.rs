@@ -33,6 +33,7 @@ pub mod models;
 pub mod prepare;
 pub mod primitives;
 pub mod provider;
+pub mod starvector;
 
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;
@@ -56,6 +57,7 @@ pub fn register_text_providers(
     registry
         .register(provider::REGISTRATION)
         .register(llava::REGISTRATION)
+        .register(starvector::REGISTRATION)
 }
 
 /// Build the complete, explicit Candle LLM provider catalog.
@@ -110,7 +112,10 @@ mod explicit_registry_tests {
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(explicit, ["candle-llama", "candle-llava"]);
+        assert_eq!(
+            explicit,
+            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
 
         let preparers = super::snapshot_preparer_registry().unwrap();
         assert_eq!(
