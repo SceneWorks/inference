@@ -50,6 +50,7 @@ pub struct ReceiptProvenance {
     pub command: String,
     pub campaign_session_id: String,
     pub campaign_cache_state_version: u64,
+    pub coordinate_operation_sha256: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -666,6 +667,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .any(|v| v.is_empty())
         || p.model_file_bytes == 0
         || !lowercase_hex(&p.campaign_session_id, 64)
+        || !lowercase_hex(&p.coordinate_operation_sha256, 64)
         || p.campaign_cache_state_version == 0
         || p.thermal_state != "nominal"
         || !p.command_template.contains("{mode}")
@@ -1399,6 +1401,50 @@ fn validate_fixture_binding(
     } else {
         "single-shot-generation"
     };
+    let needs_secondary = receipt.matrix.request_mode == "supported-batch"
+        && receipt.matrix.prefill_mode == "chunked";
+    let valid_secondary = |object: &serde_json::Map<String, serde_json::Value>| {
+        let secondary = object
+            .get("secondaryOperation")
+            .and_then(serde_json::Value::as_object);
+        if !needs_secondary {
+            return secondary.is_none();
+        }
+        secondary.is_some_and(|secondary| {
+            secondary
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                == Some("chunked-prefix-reuse")
+                && secondary
+                    .get("outputSha256")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|hash| {
+                        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                && secondary
+                    .get("evidenceSha256")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|hash| {
+                        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                && secondary
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    == field(object, "coordinateSessionId")
+                && secondary
+                    .get("cacheStateVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|version| version > 0)
+                && secondary
+                    .get("generatedTokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|tokens| tokens > 0)
+                && secondary
+                    .get("promptTokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|tokens| tokens > 0)
+        })
+    };
     if field(candidate, "coordinateInventorySha256")
         != Some(receipt.provenance.model_file_sha256.as_str())
         || field(candidate, "qualityInventorySha256")
@@ -1409,16 +1455,28 @@ fn validate_fixture_binding(
             != Some(receipt.provenance.campaign_session_id.as_str())
         || field(candidate, "operation") != Some(expected_operation)
         || field(candidate, "operationOutputSha256").is_none_or(|hash| hash.len() != 64)
+        || field(candidate, "operationEvidenceSha256").is_none_or(|hash| hash.len() != 64)
+        || field(candidate, "coordinateEvidenceSha256").is_none_or(|hash| hash.len() != 64)
         || field(candidate, "qualityTranscriptSha256").is_none_or(|hash| hash.len() != 64)
+        || !valid_secondary(candidate)
         || field(reference, "coordinateInventorySha256") != Some(reference_inventory)
         || field(reference, "qualityInventorySha256") != Some(reference_inventory)
         || field(reference, "coordinateSessionId") != Some(reference_session)
         || field(reference, "qualitySessionId") != Some(reference_session)
         || field(reference, "operation") != Some(expected_operation)
         || field(reference, "operationOutputSha256").is_none_or(|hash| hash.len() != 64)
+        || field(reference, "operationEvidenceSha256").is_none_or(|hash| hash.len() != 64)
+        || field(reference, "coordinateEvidenceSha256").is_none_or(|hash| hash.len() != 64)
         || field(reference, "qualityTranscriptSha256").is_none_or(|hash| hash.len() != 64)
+        || !valid_secondary(reference)
     {
         return Err(format!("fixture {name} producer binding mismatch"));
+    }
+    if name == "kernel-fp32-reference"
+        && field(candidate, "coordinateEvidenceSha256")
+            != Some(receipt.provenance.coordinate_operation_sha256.as_str())
+    {
+        return Err("receipt coordinate evidence digest is not fixture-bound".into());
     }
     Ok(())
 }
@@ -2310,9 +2368,20 @@ fn product_fixture_artifact(
                 "qualitySessionId": candidate.quality_observation.session_id.as_str(),
                 "operation": candidate.coordinate_operation.as_str(),
                 "operationOutputSha256": candidate.coordinate_output_sha256.as_str(),
+                "operationEvidenceSha256": coordinate_operation_digest(candidate),
+                "coordinateEvidenceSha256": coordinate_operation_digest(candidate),
                 "operationGeneratedTokens": candidate.coordinate_generated_tokens,
                 "operationPromptTokens": candidate.coordinate_prompt_tokens,
                 "qualityTranscriptSha256": seal_bytes(candidate.output.text.as_bytes()),
+                "secondaryOperation": candidate.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
+                    "operation": secondary.operation.as_str(),
+                    "outputSha256": secondary.output_sha256.as_str(),
+                    "evidenceSha256": operation_evidence_digest(secondary),
+                    "sessionId": secondary.observation.session_id.as_str(),
+                    "cacheStateVersion": secondary.observation.cache_state_version,
+                    "generatedTokens": secondary.generated_tokens,
+                    "promptTokens": secondary.prompt_tokens,
+                })),
             },
             "reference": {
                 "coordinateInventorySha256": reference.observation.snapshot.sha256.as_str(),
@@ -2321,9 +2390,20 @@ fn product_fixture_artifact(
                 "qualitySessionId": reference.quality_observation.session_id.as_str(),
                 "operation": reference.coordinate_operation.as_str(),
                 "operationOutputSha256": reference.coordinate_output_sha256.as_str(),
+                "operationEvidenceSha256": coordinate_operation_digest(reference),
+                "coordinateEvidenceSha256": coordinate_operation_digest(reference),
                 "operationGeneratedTokens": reference.coordinate_generated_tokens,
                 "operationPromptTokens": reference.coordinate_prompt_tokens,
                 "qualityTranscriptSha256": seal_bytes(reference.output.text.as_bytes()),
+                "secondaryOperation": reference.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
+                    "operation": secondary.operation.as_str(),
+                    "outputSha256": secondary.output_sha256.as_str(),
+                    "evidenceSha256": operation_evidence_digest(secondary),
+                    "sessionId": secondary.observation.session_id.as_str(),
+                    "cacheStateVersion": secondary.observation.cache_state_version,
+                    "generatedTokens": secondary.generated_tokens,
+                    "promptTokens": secondary.prompt_tokens,
+                })),
             },
         },
         "evidence": evidence,
@@ -2984,6 +3064,63 @@ pub struct ProductFixtureResult {
     pub coordinate_generated_tokens: u64,
     pub coordinate_prompt_tokens: u64,
     pub coordinate_output_sha256: String,
+    /// Mixed batch/chunked coordinates seal a second independently observed product dispatch.
+    /// It is absent for the ordinary single-operation rows.
+    pub secondary_coordinate_operation: Option<CoordinateOperationEvidence>,
+}
+
+pub struct CoordinateOperationEvidence {
+    pub observation: ProductObservations,
+    pub operation: String,
+    pub generated_tokens: u64,
+    pub prompt_tokens: u64,
+    pub output_sha256: String,
+}
+
+fn operation_evidence_digest(evidence: &CoordinateOperationEvidence) -> String {
+    seal_bytes(
+        format!(
+            "operation={};output={};generated={};prompt={};cache={};elapsed={:?};tokens={:?};allocations={:?}",
+            evidence.operation,
+            evidence.output_sha256,
+            evidence.generated_tokens,
+            evidence.prompt_tokens,
+            evidence.observation.cache_state_version,
+            evidence.observation.phase_elapsed_ms,
+            evidence.observation.token_probabilities,
+            evidence.observation.allocations,
+        )
+        .as_bytes(),
+    )
+}
+
+fn coordinate_operation_digest(result: &ProductFixtureResult) -> String {
+    let primary = seal_bytes(
+        format!(
+            "operation={};output={};generated={};prompt={};cache={};elapsed={:?};tokens={:?};allocations={:?}",
+            result.coordinate_operation,
+            result.coordinate_output_sha256,
+            result.coordinate_generated_tokens,
+            result.coordinate_prompt_tokens,
+            result.observation.cache_state_version,
+            result.observation.phase_elapsed_ms,
+            result.observation.token_probabilities,
+            result.observation.allocations,
+        )
+        .as_bytes(),
+    );
+    let secondary = result
+        .secondary_coordinate_operation
+        .as_ref()
+        .map(operation_evidence_digest)
+        .unwrap_or_default();
+    seal_bytes(
+        format!(
+            "primary={};primaryEvidence={};secondary={secondary}",
+            result.coordinate_operation, primary,
+        )
+        .as_bytes(),
+    )
 }
 
 pub fn run_product_fixture(
@@ -3002,13 +3139,30 @@ pub fn run_product_fixture_on_session(
     request: TextLlmRequest,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
-    let (
-        observation,
-        coordinate_operation,
-        coordinate_generated_tokens,
-        coordinate_prompt_tokens,
-        coordinate_output_sha256,
-    ) = run_coordinate_operation_on_session(session, prefix_prompt, request.clone(), coordinate)?;
+    let primary_operation = if coordinate.request_mode == "supported-batch" {
+        "supported-batch"
+    } else if coordinate.prefill_mode == "chunked" {
+        "chunked-prefix-reuse"
+    } else {
+        "single-shot-generation"
+    };
+    let primary = run_coordinate_operation_on_session(
+        session,
+        prefix_prompt,
+        request.clone(),
+        primary_operation,
+    )?;
+    let secondary_coordinate_operation =
+        if coordinate.request_mode == "supported-batch" && coordinate.prefill_mode == "chunked" {
+            Some(run_coordinate_operation_on_session(
+                session,
+                prefix_prompt,
+                request.clone(),
+                "chunked-prefix-reuse",
+            )?)
+        } else {
+            None
+        };
     let mut observer = ProductObserver::new();
     let output = run_dense_lifecycle_request_on_session(
         session,
@@ -3019,13 +3173,14 @@ pub fn run_product_fixture_on_session(
     )?;
     let quality_observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(ProductFixtureResult {
-        observation,
+        observation: primary.observation,
         quality_observation,
         output,
-        coordinate_operation,
-        coordinate_generated_tokens,
-        coordinate_prompt_tokens,
-        coordinate_output_sha256,
+        coordinate_operation: primary.operation,
+        coordinate_generated_tokens: primary.generated_tokens,
+        coordinate_prompt_tokens: primary.prompt_tokens,
+        coordinate_output_sha256: primary.output_sha256,
+        secondary_coordinate_operation,
     })
 }
 
@@ -3036,14 +3191,8 @@ fn run_coordinate_operation_on_session(
     session: &CampaignSession,
     prefix_prompt: &str,
     request: TextLlmRequest,
-    coordinate: &Coordinate,
-) -> core_llm::Result<(ProductObservations, String, u64, u64, String)> {
-    if coordinate.request_mode == "supported-batch" && coordinate.prefill_mode == "chunked" {
-        return Err(core_llm::Error::Unsupported(
-            "mixed supported-batch/chunked coordinate requires two independently observed operations"
-                .into(),
-        ));
-    }
+    operation: &str,
+) -> core_llm::Result<CoordinateOperationEvidence> {
     let provider = &session.provider;
     let mut observer = ProductObserver::new();
     observer.bind_session(session.session_id());
@@ -3054,7 +3203,7 @@ fn run_coordinate_operation_on_session(
     observer.allocation("weights", "persistent", session.inventory().bytes);
 
     let (operation, generated_tokens, prompt_tokens, output_sha256) =
-        if coordinate.request_mode == "supported-batch" {
+        if operation == "supported-batch" {
             let (outputs, prompt_tokens) =
                 provider.campaign_supported_batch_observed(prefix_prompt, 2, &mut observer)?;
             let mut bytes = Vec::new();
@@ -3074,7 +3223,7 @@ fn run_coordinate_operation_on_session(
                 prompt_tokens,
                 seal_bytes(&bytes),
             )
-        } else if coordinate.prefill_mode == "chunked" {
+        } else if operation == "chunked-prefix-reuse" {
             let (output, hits, prompt_tokens) =
                 provider.campaign_prefix_reuse_observed(prefix_prompt, &mut observer)?;
             if hits == 0 {
@@ -3093,7 +3242,7 @@ fn run_coordinate_operation_on_session(
                 prompt_tokens,
                 seal_bytes(&bytes),
             )
-        } else {
+        } else if operation == "single-shot-generation" {
             let mut saw_token = false;
             let output = provider.generate_observed(
                 &request,
@@ -3112,6 +3261,10 @@ fn run_coordinate_operation_on_session(
                 output.usage.prompt_tokens as u64,
                 seal_bytes(output.text.as_bytes()),
             )
+        } else {
+            return Err(core_llm::Error::InvalidRequest(
+                "unknown campaign coordinate operation".into(),
+            ));
         };
 
     // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
@@ -3123,13 +3276,13 @@ fn run_coordinate_operation_on_session(
     observer.phase("cancellation-cleanup");
     observer.phase("post-run-release");
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
-    Ok((
+    Ok(CoordinateOperationEvidence {
         observation,
         operation,
         generated_tokens,
         prompt_tokens,
         output_sha256,
-    ))
+    })
 }
 
 fn negative_log_likelihood(probabilities: &[(i32, f64)]) -> Result<f64, String> {
@@ -3541,11 +3694,23 @@ fn product_receipt(
         ),
     ];
     for (_, required_operation) in required_operations.iter().filter(|(required, _)| *required) {
-        if !observation
+        let primary_executed = !observation
             .operations
             .iter()
-            .any(|operation| operation == *required_operation)
-        {
+            .any(|operation| operation == *required_operation);
+        let secondary_executed = suite
+            .kernel_candidate
+            .secondary_coordinate_operation
+            .as_ref()
+            .is_some_and(|secondary| {
+                secondary.operation == *required_operation
+                    && secondary
+                        .observation
+                        .operations
+                        .iter()
+                        .any(|operation| operation == *required_operation)
+            });
+        if !primary_executed && !secondary_executed {
             return Err(format!(
                 "coordinate did not execute required product operation {required_operation}"
             ));
@@ -3631,7 +3796,7 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={};referenceSession={}", model.root.display(), model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version },
+        provenance: ReceiptProvenance { scene_works_revision, inference_revision, mlx_revision: format!("pmetal-lock:{}", seal_bytes(include_bytes!("../../../../Cargo.lock"))), dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};tokenizer={};reference={};referenceSession={}", model.root.display(), model.sha256, reference.sha256, suite.kernel_reference.observation.session_id), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: suite.kernel_candidate.coordinate_prompt_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: suite.kernel_candidate.coordinate_prompt_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
@@ -3927,6 +4092,7 @@ mod tests {
                 command: "run --mode dense".into(),
                 campaign_session_id: "e".repeat(64),
                 campaign_cache_state_version: 1,
+                coordinate_operation_sha256: "f".repeat(64),
             },
             matrix: ReceiptMatrix {
                 family: "llama".into(),
