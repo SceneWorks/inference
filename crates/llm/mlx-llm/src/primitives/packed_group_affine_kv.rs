@@ -317,7 +317,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         keys: &mlx_rs::Array,
         values: &mlx_rs::Array,
         mask: crate::primitives::kv_cache::PackedAttentionMask,
-        _scale: f32,
+        scale: f32,
         retained_for_sharing: bool,
     ) -> Result<Option<mlx_rs::Array>> {
         if retained_for_sharing {
@@ -329,6 +329,15 @@ impl KvCache for DenseFallbackPackedDecoderCache {
             ));
         }
         if self.staged.compiled_handle().is_none() {
+            return Ok(None);
+        }
+        let expected_scale = (query.shape().get(3).copied().unwrap_or_default() as f32).powf(-0.5);
+        if scale.to_bits() != expected_scale.to_bits() {
+            if self.staged.logical_len() != 0 {
+                return Err(Error::Unsupported(
+                    "packed history cannot transition to an unsupported attention scale".into(),
+                ));
+            }
             return Ok(None);
         }
         let packed_mask = match mask {
@@ -376,10 +385,11 @@ impl KvCache for DenseFallbackPackedDecoderCache {
             step,
         )?;
         let output = staged.dispatch_packed(layer, query, packed_mask)?;
-        // MLX dispatch is lazy; force completion before publishing the staged cache so a device
-        // fault cannot leave lifecycle state committed for an output that never completed.
-        output.eval()?;
         if layer + 1 == staged.layers() {
+            // All earlier packed outputs are graph dependencies of this last layer. One evaluation
+            // therefore catches any lazy JIT/device fault before publishing the whole-step cache,
+            // without imposing a synchronizing evaluation after every layer.
+            output.eval()?;
             self.staged = staged;
         } else {
             self.pending_step = Some(Box::new(staged));
@@ -392,6 +402,11 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+        if self.pending_step.is_some() {
+            return Err(Error::Unsupported(
+                "retain_sequences cannot mutate a pending packed step".into(),
+            ));
+        }
         if self.staged.logical_len() != 0 {
             self.staged.dense_read_fallback(
                 "retain_sequences",
@@ -406,14 +421,20 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn truncate(&mut self, len: i32) -> Result<()> {
-        self.pending_step = None;
-        self.staged.truncate(len as usize)?;
+        if self.pending_step.take().is_some() {
+            self.staged
+                .dense_read_fallback("truncate", "discarded pending packed step");
+        }
+        self.staged.trim(len as usize)?;
         self.dense_before_mutation("truncate");
         self.dense.truncate(len)
     }
 
     fn reset(&mut self) {
-        self.pending_step = None;
+        if self.pending_step.take().is_some() {
+            self.staged
+                .dense_read_fallback("reset", "discarded pending packed step");
+        }
         self.staged.clear();
         self.dense_before_mutation("reset");
         self.dense.reset();
@@ -1161,6 +1182,11 @@ impl PackedGroupAffineKvCache {
         if handle.backend() != "mlx-metal" {
             return Err(Error::Config("compiled handle backend mismatch".into()));
         }
+        if self.group_size != 4 {
+            return Err(Error::Config(
+                "SC-20676 retained Metal reader requires packed group size 4".into(),
+            ));
+        }
         self.handle = Some(handle);
         Ok(())
     }
@@ -1580,11 +1606,11 @@ impl PackedGroupAffineKvCache {
 mod tests {
     use super::*;
     use crate::primitives::kv_cache::PackedAttentionMask;
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
     struct TestPackedKernel {
-        calls: Cell<usize>,
+        calls: AtomicUsize,
         fail_on: Option<usize>,
     }
 
@@ -1610,8 +1636,7 @@ mod tests {
             _v_zero: &Array,
             _mask: crate::primitives::packed_metal::PackedMask,
         ) -> Result<Array> {
-            let call = self.calls.get() + 1;
-            self.calls.set(call);
+            let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             if self.fail_on == Some(call) {
                 return Err(Error::Msg("injected packed dispatch fault".into()));
             }
@@ -1634,7 +1659,7 @@ mod tests {
                 has_mask: false,
             },
             CompiledKernelHandle::new(Arc::new(TestPackedKernel {
-                calls: Cell::new(0),
+                calls: AtomicUsize::new(0),
                 fail_on,
             })),
         );
@@ -1980,6 +2005,35 @@ mod tests {
     }
 
     #[test]
+    fn retained_metal_reader_rejects_non_four_group_cache_before_mutation() {
+        let handle = CompiledKernelHandle::new(Arc::new(TestPackedKernel {
+            calls: AtomicUsize::new(0),
+            fail_on: None,
+        }));
+        let selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "test-packed".into(),
+                layers: 1,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: 8,
+                query_length: 1,
+                has_mask: false,
+            },
+            handle,
+        );
+        assert!(matches!(
+            selection.route(),
+            CacheRoute::DenseFallback { reason }
+                if reason.contains("requires packed group size 4")
+        ));
+        assert_eq!(selection.cache.offset(), 0);
+    }
+
+    #[test]
     fn packed_hook_commits_only_after_all_layers_and_preserves_offset() {
         let mut cache = hook_cache(2, None);
         let packed = cache
@@ -1989,24 +2043,24 @@ mod tests {
         let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
         let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
         assert!(packed
-            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 0);
         assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 1);
         assert_eq!(packed.staged_representation().logical_len, 1);
         assert!(packed.staged_representation().allocated_bytes > 0);
         assert!(packed
-            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 1);
         assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 2);
@@ -2022,17 +2076,49 @@ mod tests {
         let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
         let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
         assert!(packed
-            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 0);
         assert!(packed
-            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 1.0, false)
+            .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .is_err());
         assert_eq!(packed.offset(), 0);
         packed.reset();
         assert_eq!(packed.offset(), 0);
         assert!(packed.retain_sequences(&[0]).is_ok());
+    }
+
+    #[test]
+    fn pending_packed_step_rejects_retain_and_is_observably_discarded_by_truncate_and_reset() {
+        let q = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let kv = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let mut cache = hook_cache(2, None);
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
+            .unwrap();
+        assert!(packed.retain_sequences(&[0]).is_err());
+        packed.truncate(0).unwrap();
+        assert_eq!(packed.offset(), 0);
+        assert!(packed
+            .staged
+            .fallback_events()
+            .iter()
+            .any(|event| event.operation == "truncate"));
+        packed
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
+            .unwrap();
+        packed.reset();
+        assert_eq!(packed.offset(), 0);
+        assert!(packed
+            .staged
+            .fallback_events()
+            .iter()
+            .any(|event| event.operation == "reset"));
     }
 
     #[test]
