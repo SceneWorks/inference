@@ -6,6 +6,7 @@
 //! then seals a receipt over those files. Candidate modes require a sealed bf16 reference from the
 //! same code/model/GPU/driver/fixture identity. Partial or failed directories never contain a receipt.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,7 @@ use std::time::Instant;
 #[cfg(feature = "cuda")]
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    AudioTrack, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, Quant,
-    WeightsSource,
+    AudioTrack, GenerationOutput, GenerationRequest, Image, Progress, Quant,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,13 +25,18 @@ use sha2::{Digest, Sha256};
 
 use crate::dev_sampler::TransformerVariant;
 use crate::quant_eval::{
-    bundle_identity_sha256, inventory_for_snapshot, measurement_case, snapshot_inventory_sha256,
-    Ltx25GpuGeneration, Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt, Ltx25QuantMode,
-    Ltx25QuantQuality, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
+    bundle_identity_sha256, inventory_for_snapshot, measurement_case, promotion_copy_sha256,
+    selected_bundle_identity_sha256, snapshot_inventory_sha256, Ltx25GpuGeneration,
+    Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt, Ltx25QuantMode, Ltx25QuantQuality,
+    Ltx25QuantRuntimeBindings, Ltx25QuantRuntimeIdentity, RUNTIME_BINDING_FILE,
+    RUNTIME_BINDING_SCHEMA, TERMINAL_MEASUREMENT_CASES,
 };
 
 pub const TERMINAL_ACKNOWLEDGEMENT: &str = "I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY";
-pub const HARNESS_VERSION: &str = "sc-18777-terminal-v4";
+pub const HARNESS_VERSION: &str = "sc-18777-terminal-v5";
+pub const CAMPAIGN_SCHEMA: &str = "sceneworks-ltx25-quant-campaign-v1";
+pub const PROMOTION_SCHEMA: &str = "sceneworks-ltx25-quant-promotion-v1";
+const EVIDENCE_SCHEMA: &str = "sceneworks-ltx25-quant-evidence-v3";
 const PROMPT: &str =
     "a red fox walking through snowy pines, slow cinematic dolly, detailed natural motion";
 const OUTPUT_MAGIC: &[u8] = b"LTX25-QUANT-OUTPUT-V1\0";
@@ -42,17 +47,95 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+fn quant_for_mode(mode: Ltx25QuantMode) -> Option<Quant> {
+    match mode {
+        Ltx25QuantMode::Bf16 => None,
+        Ltx25QuantMode::Q4 => Some(Quant::Q4),
+        Ltx25QuantMode::PackedQ8 | Ltx25QuantMode::Int8ConvRot => Some(Quant::Q8),
+        Ltx25QuantMode::Nvfp4 => Some(Quant::Nvfp4),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TerminalMeasurementConfig {
     pub acknowledgement: String,
     pub case_id: String,
     pub snapshot: PathBuf,
+    pub bundle_subdir: PathBuf,
     pub model_revision: String,
     pub output_dir: PathBuf,
     pub reference_snapshot: Option<PathBuf>,
+    pub reference_bundle_subdir: Option<PathBuf>,
     pub reference_model_revision: Option<String>,
     pub reference_output: Option<PathBuf>,
     pub reference_receipt: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCampaignManifest {
+    pub schema_version: String,
+    pub cases: Vec<TerminalCampaignCase>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCampaignCase {
+    pub case_id: String,
+    pub snapshot_root: PathBuf,
+    pub model_revision: String,
+    pub bundle_subdir: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPromotionInput {
+    pub schema_version: String,
+    pub cases: Vec<TerminalPromotionCase>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalPromotionCase {
+    pub case_id: String,
+    pub public_snapshot_root: PathBuf,
+    pub public_model_revision: String,
+    pub public_bundle_subdir: PathBuf,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromotionManifest {
+    schema_version: &'static str,
+    accepted_allowlist: EvidenceArtifact,
+    snapshots: Vec<PromotionSnapshot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromotionSnapshot {
+    model_revision: String,
+    model_inventory_sha256: String,
+    public_snapshot_root: String,
+    runtime_binding: EvidenceArtifact,
+    case_ids: Vec<String>,
+}
+
+struct BundleObservation {
+    snapshot_root: PathBuf,
+    model_inventory_sha256: String,
+    bundle_subdir: String,
+    runtime_bundle_sha256: String,
+    selected_bundle_sha256: String,
+    operator_contract_sha256: String,
+}
+
+struct PromotionGroup {
+    public_snapshot_root: PathBuf,
+    model_revision: String,
+    model_inventory_sha256: String,
+    bindings: Vec<Ltx25QuantRuntimeIdentity>,
+    case_ids: Vec<String>,
 }
 
 struct ReferenceEvidence {
@@ -61,11 +144,13 @@ struct ReferenceEvidence {
     receipt_sha256: String,
     model_revision: String,
     model_inventory_sha256: String,
+    bundle_subdir: String,
     runtime_bundle_sha256: String,
+    selected_bundle_sha256: String,
     artifacts: Vec<EvidenceArtifact>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EvidenceArtifact {
     path: String,
@@ -73,10 +158,10 @@ struct EvidenceArtifact {
     sha256: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EvidenceManifest {
-    schema_version: &'static str,
+    schema_version: String,
     case_id: String,
     run_nonce_sha256: String,
     artifacts: Vec<EvidenceArtifact>,
@@ -151,6 +236,9 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let executable_sha256 = sha256_file(&executable)?;
     let snapshot = canonical_snapshot(&config.snapshot, &config.model_revision, "candidate")?;
+    let (mut inspection_spec, bundle_subdir) =
+        crate::bundle::select_snapshot_bundle(&snapshot, &config.bundle_subdir)?;
+    inspection_spec.quantize = quant_for_mode(case.mode);
     let output_parent = config
         .output_dir
         .parent()
@@ -195,13 +283,6 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
 
-    let mut inspection_spec = LoadSpec::new(WeightsSource::Dir(snapshot.clone()));
-    inspection_spec.quantize = match case.mode {
-        Ltx25QuantMode::Bf16 => None,
-        Ltx25QuantMode::Q4 => Some(Quant::Q4),
-        Ltx25QuantMode::PackedQ8 | Ltx25QuantMode::Int8ConvRot => Some(Quant::Q8),
-        Ltx25QuantMode::Nvfp4 => Some(Quant::Nvfp4),
-    };
     let resolved = crate::bundle::resolve_split_bundle(&inspection_spec)?;
     let observed_variant = TransformerVariant::from_bundle(&resolved)?;
     if observed_variant != case.transformer_variant {
@@ -226,6 +307,14 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         observed_variant,
         case.mode,
     )?;
+    let selected_bundle_sha256 = selected_bundle_identity_sha256(
+        &resolved,
+        &snapshot,
+        &bundle_subdir,
+        &inventory,
+        observed_variant,
+        case.mode,
+    )?;
 
     let mut transcript = vec![
         json!({
@@ -237,8 +326,10 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
             "executableContractSha256": executable_contract_sha256,
             "executableSha256": executable_sha256,
             "modelRevision": config.model_revision,
+            "bundleSubdir": bundle_subdir,
             "transformerVariant": observed_variant.id(),
             "runtimeBundleSha256": runtime_bundle_sha256,
+            "selectedBundleSha256": selected_bundle_sha256,
         }),
         json!({
             "event": "hardware",
@@ -327,7 +418,9 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
             receipt_sha256: sha256_hex(b"bf16-self-reference-no-prior-receipt"),
             model_revision: config.model_revision.clone(),
             model_inventory_sha256: model_inventory_sha256.clone(),
+            bundle_subdir: bundle_subdir.clone(),
             runtime_bundle_sha256: runtime_bundle_sha256.clone(),
+            selected_bundle_sha256: selected_bundle_sha256.clone(),
             artifacts: Vec::new(),
         }
     } else {
@@ -379,7 +472,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     artifacts.append(&mut reference.artifacts);
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let evidence_manifest = EvidenceManifest {
-        schema_version: "sceneworks-ltx25-quant-evidence-v3",
+        schema_version: EVIDENCE_SCHEMA.to_owned(),
         case_id: case.id.to_owned(),
         run_nonce_sha256: run_nonce_sha256.clone(),
         artifacts,
@@ -404,10 +497,14 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         executable_sha256,
         model_revision: config.model_revision,
         model_inventory_sha256,
+        bundle_subdir,
         runtime_bundle_sha256,
+        selected_bundle_sha256,
         reference_model_revision: reference.model_revision,
         reference_model_inventory_sha256: reference.model_inventory_sha256,
+        reference_bundle_subdir: reference.bundle_subdir,
         reference_runtime_bundle_sha256: reference.runtime_bundle_sha256,
+        reference_selected_bundle_sha256: reference.selected_bundle_sha256,
         gpu_name: hardware.gpu_name,
         compute_capability: format!("sm_{}{}", hardware.compute_cap.0, hardware.compute_cap.1),
         driver_version: hardware.driver_version,
@@ -437,17 +534,40 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         .into());
     }
     write_json(&config.output_dir.join("receipt.json"), &receipt)?;
-    let runtime_binding = Ltx25QuantRuntimeIdentity {
+    let runtime_binding = runtime_identity_from_receipt(&receipt);
+    write_json(
+        &config.output_dir.join(RUNTIME_BINDING_FILE),
+        &Ltx25QuantRuntimeBindings {
+            schema_version: RUNTIME_BINDING_SCHEMA.to_owned(),
+            bindings: vec![runtime_binding],
+        },
+    )?;
+    Ok(receipt)
+}
+
+fn runtime_identity_from_receipt(
+    receipt: &Ltx25QuantMeasurementReceipt,
+) -> Ltx25QuantRuntimeIdentity {
+    let mut runtime = Ltx25QuantRuntimeIdentity {
         mode: receipt.mode,
         transformer_variant: receipt.transformer_variant,
         inference_revision: receipt.inference_revision.clone(),
         executable_contract_sha256: receipt.executable_contract_sha256.clone(),
         executable_sha256: receipt.executable_sha256.clone(),
+        source_model_revision: receipt.model_revision.clone(),
+        source_model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+        source_bundle_subdir: receipt.bundle_subdir.clone(),
+        source_runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+        source_selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
         model_revision: receipt.model_revision.clone(),
         model_inventory_sha256: receipt.model_inventory_sha256.clone(),
+        bundle_subdir: receipt.bundle_subdir.clone(),
         runtime_bundle_sha256: receipt.runtime_bundle_sha256.clone(),
+        selected_bundle_sha256: receipt.selected_bundle_sha256.clone(),
+        promotion_copy_sha256: String::new(),
         reference_model_revision: receipt.reference_model_revision.clone(),
         reference_model_inventory_sha256: receipt.reference_model_inventory_sha256.clone(),
+        reference_bundle_subdir: receipt.reference_bundle_subdir.clone(),
         reference_runtime_bundle_sha256: receipt.reference_runtime_bundle_sha256.clone(),
         receipt_sha256: receipt.receipt_sha256.clone(),
         transcript_sha256: receipt.transcript_sha256.clone(),
@@ -459,11 +579,504 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
         operator_contract_sha256: receipt.operator_contract_sha256.clone(),
         operator_weight_inventory_sha256: receipt.operator_weight_inventory_sha256.clone(),
     };
-    write_json(
-        &config.output_dir.join(RUNTIME_BINDING_FILE),
-        &runtime_binding,
+    runtime.promotion_copy_sha256 = promotion_copy_sha256(receipt, &runtime);
+    runtime
+}
+
+fn validated_campaign_cases(
+    manifest: &TerminalCampaignManifest,
+) -> Result<BTreeMap<&str, &TerminalCampaignCase>> {
+    if manifest.schema_version != CAMPAIGN_SCHEMA {
+        return Err(invalid(format!(
+            "campaign manifest schema must equal {CAMPAIGN_SCHEMA:?}"
+        ))
+        .into());
+    }
+    let mut cases = BTreeMap::new();
+    for entry in &manifest.cases {
+        if measurement_case(&entry.case_id).is_none() {
+            return Err(invalid(format!(
+                "campaign manifest contains unknown case {:?}",
+                entry.case_id
+            ))
+            .into());
+        }
+        if cases.insert(entry.case_id.as_str(), entry).is_some() {
+            return Err(invalid(format!(
+                "campaign manifest repeats case {:?}",
+                entry.case_id
+            ))
+            .into());
+        }
+    }
+    let expected = TERMINAL_MEASUREMENT_CASES
+        .iter()
+        .map(|case| case.id)
+        .collect::<BTreeSet<_>>();
+    let actual = cases.keys().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let extra = actual.difference(&expected).copied().collect::<Vec<_>>();
+        return Err(invalid(format!(
+            "campaign manifest must contain the exact terminal case set; missing={missing:?} extra={extra:?}"
+        ))
+        .into());
+    }
+    Ok(cases)
+}
+
+fn campaign_order() -> impl Iterator<Item = &'static crate::quant_eval::Ltx25QuantMeasurementCase> {
+    TERMINAL_MEASUREMENT_CASES
+        .iter()
+        .filter(|case| case.mode == Ltx25QuantMode::Bf16)
+        .chain(
+            TERMINAL_MEASUREMENT_CASES
+                .iter()
+                .filter(|case| case.mode != Ltx25QuantMode::Bf16),
+        )
+}
+
+/// Run the complete physical campaign serially in one already-built executable.
+///
+/// Both bf16 variants run first. Every candidate then consumes the matching variant's sealed bf16
+/// evidence. `CUDA_VISIBLE_DEVICES` is replaced with one numeric physical ordinal before the first
+/// CUDA call; comma-separated or multi-device execution is not representable here.
+pub fn run_campaign(
+    acknowledgement: &str,
+    manifest_path: &Path,
+    output_root: &Path,
+    physical_gpu_ordinal: usize,
+) -> Result<Vec<Ltx25QuantMeasurementReceipt>> {
+    if acknowledgement != TERMINAL_ACKNOWLEDGEMENT {
+        return Err(invalid(format!(
+            "terminal-only acknowledgement must equal {TERMINAL_ACKNOWLEDGEMENT:?}"
+        ))
+        .into());
+    }
+    if !output_root.is_absolute() || output_root.exists() {
+        return Err(invalid(
+            "campaign output root must be an absolute path that does not already exist",
+        )
+        .into());
+    }
+    let manifest: TerminalCampaignManifest = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    let cases = validated_campaign_cases(&manifest)?;
+    std::env::set_var("CUDA_VISIBLE_DEVICES", physical_gpu_ordinal.to_string());
+
+    let mut receipts = Vec::with_capacity(TERMINAL_MEASUREMENT_CASES.len());
+    for case in campaign_order() {
+        let entry = cases[case.id];
+        let reference_case = TERMINAL_MEASUREMENT_CASES.iter().find(|candidate| {
+            candidate.mode == Ltx25QuantMode::Bf16
+                && candidate.transformer_variant == case.transformer_variant
+        });
+        let reference = if case.mode == Ltx25QuantMode::Bf16 {
+            None
+        } else {
+            Some(reference_case.expect("validated matrix has one bf16 row per variant"))
+        };
+        let reference_entry = reference.map(|reference| cases[reference.id]);
+        let reference_dir = reference.map(|reference| output_root.join(reference.id));
+        receipts.push(run(TerminalMeasurementConfig {
+            acknowledgement: acknowledgement.to_owned(),
+            case_id: case.id.to_owned(),
+            snapshot: entry.snapshot_root.clone(),
+            bundle_subdir: entry.bundle_subdir.clone(),
+            model_revision: entry.model_revision.clone(),
+            output_dir: output_root.join(case.id),
+            reference_snapshot: reference_entry.map(|entry| entry.snapshot_root.clone()),
+            reference_bundle_subdir: reference_entry.map(|entry| entry.bundle_subdir.clone()),
+            reference_model_revision: reference_entry.map(|entry| entry.model_revision.clone()),
+            reference_output: reference_dir
+                .as_ref()
+                .map(|dir| dir.join("generated-output.bin")),
+            reference_receipt: reference_dir.as_ref().map(|dir| dir.join("receipt.json")),
+        })?);
+    }
+    Ok(receipts)
+}
+
+fn observe_bundle(
+    snapshot: &Path,
+    revision: &str,
+    bundle_subdir: &Path,
+    case: &crate::quant_eval::Ltx25QuantMeasurementCase,
+    label: &str,
+) -> Result<BundleObservation> {
+    let snapshot_root = canonical_snapshot(snapshot, revision, label)?;
+    let inventory = inventory_for_snapshot(&snapshot_root)?;
+    let model_inventory_sha256 = snapshot_inventory_sha256(&inventory)?;
+    let (mut spec, bundle_subdir) =
+        crate::bundle::select_snapshot_bundle(&snapshot_root, bundle_subdir)?;
+    spec.quantize = quant_for_mode(case.mode);
+    let bundle = crate::bundle::resolve_split_bundle(&spec)?;
+    let variant = TransformerVariant::from_bundle(&bundle)?;
+    if variant != case.transformer_variant {
+        return Err(invalid(format!(
+            "{label} bundle declares transformer variant {}, expected {}",
+            variant.id(),
+            case.transformer_variant.id()
+        ))
+        .into());
+    }
+    let transformer = bundle
+        .require(candle_gen::gen_core::LtxComponent::Transformer)?
+        .path();
+    let inspection = crate::advanced_quant::inspect_transformer_source(transformer, case.mode)?;
+    let runtime_bundle_sha256 = bundle_identity_sha256(
+        &bundle,
+        &snapshot_root,
+        &inventory,
+        &model_inventory_sha256,
+        variant,
+        case.mode,
     )?;
+    let selected_bundle_sha256 = selected_bundle_identity_sha256(
+        &bundle,
+        &snapshot_root,
+        &bundle_subdir,
+        &inventory,
+        variant,
+        case.mode,
+    )?;
+    Ok(BundleObservation {
+        snapshot_root,
+        model_inventory_sha256,
+        bundle_subdir,
+        runtime_bundle_sha256,
+        selected_bundle_sha256,
+        operator_contract_sha256: inspection.operator_contract_sha256,
+    })
+}
+
+fn verify_evidence_manifest(
+    evidence_dir: &Path,
+    receipt: &Ltx25QuantMeasurementReceipt,
+) -> Result<()> {
+    let manifest: EvidenceManifest =
+        serde_json::from_slice(&fs::read(evidence_dir.join("evidence-manifest.json"))?)?;
+    if manifest.schema_version != EVIDENCE_SCHEMA
+        || manifest.case_id != receipt.case_id
+        || manifest.run_nonce_sha256 != receipt.run_nonce_sha256
+    {
+        return Err(invalid(format!(
+            "{} evidence manifest identity differs from its sealed receipt",
+            receipt.case_id
+        ))
+        .into());
+    }
+
+    let expected = [
+        "generated-output.bin",
+        "model-inventory.json",
+        "reference-evidence-manifest.json",
+        "reference-model-inventory.json",
+        "reference-output.bin",
+        "reference-receipt.json",
+        "reference-transcript.jsonl",
+        "transcript.jsonl",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual != expected || actual.len() != manifest.artifacts.len() {
+        return Err(invalid(format!(
+            "{} evidence manifest must contain the exact unique advanced-campaign artifact set",
+            receipt.case_id
+        ))
+        .into());
+    }
+
+    let canonical_evidence_dir = fs::canonicalize(evidence_dir)?;
+    for artifact in manifest.artifacts {
+        if artifact.path.is_empty()
+            || artifact.path.contains('\\')
+            || artifact
+                .path
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return Err(invalid(format!(
+                "{} evidence manifest contains an unsafe artifact path {:?}",
+                receipt.case_id, artifact.path
+            ))
+            .into());
+        }
+        let path = fs::canonicalize(evidence_dir.join(&artifact.path))?;
+        if !path.starts_with(&canonical_evidence_dir) || !path.is_file() {
+            return Err(invalid(format!(
+                "{} evidence artifact {:?} escapes its evidence directory or is not a file",
+                receipt.case_id, artifact.path
+            ))
+            .into());
+        }
+        if path.metadata()?.len() != artifact.bytes || sha256_file(&path)? != artifact.sha256 {
+            return Err(invalid(format!(
+                "{} evidence artifact {:?} differs from its manifest length/hash",
+                receipt.case_id, artifact.path
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verified_evidence_receipt(
+    evidence_root: &Path,
+    case: &crate::quant_eval::Ltx25QuantMeasurementCase,
+    source: &TerminalCampaignCase,
+    observation: &BundleObservation,
+) -> Result<Ltx25QuantMeasurementReceipt> {
+    let evidence_dir = evidence_root.join(case.id);
+    let receipt_path = evidence_dir.join("receipt.json");
+    let receipt: Ltx25QuantMeasurementReceipt = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+    let errors = receipt.validation_errors();
+    if !errors.is_empty() {
+        return Err(invalid(format!(
+            "{} evidence receipt is invalid: {}",
+            case.id,
+            errors.join("; ")
+        ))
+        .into());
+    }
+    if receipt.case_id != case.id
+        || receipt.model_revision != source.model_revision
+        || receipt.model_inventory_sha256 != observation.model_inventory_sha256
+        || receipt.bundle_subdir != observation.bundle_subdir
+        || receipt.runtime_bundle_sha256 != observation.runtime_bundle_sha256
+        || receipt.selected_bundle_sha256 != observation.selected_bundle_sha256
+        || receipt.operator_contract_sha256 != observation.operator_contract_sha256
+    {
+        return Err(invalid(format!(
+            "{} receipt does not match its re-inventoried measured source bundle",
+            case.id
+        ))
+        .into());
+    }
+    for (name, expected) in [
+        ("model-inventory.json", &receipt.model_inventory_sha256),
+        ("generated-output.bin", &receipt.output_sha256),
+        ("transcript.jsonl", &receipt.transcript_sha256),
+        ("evidence-manifest.json", &receipt.evidence_manifest_sha256),
+    ] {
+        if sha256_file(&evidence_dir.join(name))? != *expected {
+            return Err(invalid(format!(
+                "{} evidence artifact {name} differs from its sealed hash",
+                case.id
+            ))
+            .into());
+        }
+    }
+    verify_evidence_manifest(&evidence_dir, &receipt)?;
+    let bindings: Ltx25QuantRuntimeBindings =
+        serde_json::from_slice(&fs::read(evidence_dir.join(RUNTIME_BINDING_FILE))?)?;
+    let expected = runtime_identity_from_receipt(&receipt);
+    if bindings.schema_version != RUNTIME_BINDING_SCHEMA
+        || bindings.bindings.as_slice() != std::slice::from_ref(&expected)
+    {
+        return Err(invalid(format!(
+            "{} measurement runtime binding differs from its sealed receipt",
+            case.id
+        ))
+        .into());
+    }
     Ok(receipt)
+}
+
+fn validated_promotion_cases(
+    input: &TerminalPromotionInput,
+) -> Result<BTreeMap<&str, &TerminalPromotionCase>> {
+    if input.schema_version != PROMOTION_SCHEMA {
+        return Err(invalid(format!(
+            "promotion input schema must equal {PROMOTION_SCHEMA:?}"
+        ))
+        .into());
+    }
+    let expected = TERMINAL_MEASUREMENT_CASES
+        .iter()
+        .filter(|case| {
+            matches!(
+                case.mode,
+                Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+            )
+        })
+        .map(|case| case.id)
+        .collect::<BTreeSet<_>>();
+    let mut cases = BTreeMap::new();
+    for entry in &input.cases {
+        if !expected.contains(entry.case_id.as_str()) {
+            return Err(invalid(format!(
+                "promotion input contains non-promotable case {:?}",
+                entry.case_id
+            ))
+            .into());
+        }
+        if cases.insert(entry.case_id.as_str(), entry).is_some() {
+            return Err(
+                invalid(format!("promotion input repeats case {:?}", entry.case_id)).into(),
+            );
+        }
+    }
+    let actual = cases.keys().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(invalid(format!(
+            "promotion input must contain the exact production advanced case set; expected={expected:?} actual={actual:?}"
+        ))
+        .into());
+    }
+    Ok(cases)
+}
+
+fn require_identical_selected_copy(
+    case_id: &str,
+    source: &BundleObservation,
+    public: &BundleObservation,
+) -> Result<()> {
+    if source.selected_bundle_sha256 != public.selected_bundle_sha256
+        || source.operator_contract_sha256 != public.operator_contract_sha256
+    {
+        return Err(invalid(format!(
+            "{case_id} public selected bundle is not a byte/path/component-identical copy of the measured source"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Verify a completed campaign against separately published immutable public snapshots and
+/// materialize the non-Rust accepted allowlist. Measured receipts are never restamped: each runtime
+/// row carries the original source identity, the independently inventoried public identity, and a
+/// SHA-256 copy proof. Selected component ids, bundle-relative paths, byte lengths, and hashes must
+/// be identical across source and public roots.
+pub fn materialize_campaign_promotion(
+    acknowledgement: &str,
+    campaign_manifest_path: &Path,
+    promotion_input_path: &Path,
+    evidence_root: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    if acknowledgement != TERMINAL_ACKNOWLEDGEMENT {
+        return Err(invalid(format!(
+            "terminal-only acknowledgement must equal {TERMINAL_ACKNOWLEDGEMENT:?}"
+        ))
+        .into());
+    }
+    if !evidence_root.is_absolute()
+        || !output_dir.is_absolute()
+        || output_dir.exists()
+        || output_dir.starts_with(evidence_root)
+    {
+        return Err(invalid(
+            "promotion requires absolute evidence/output paths, a new output directory, and output outside evidence",
+        )
+        .into());
+    }
+    let campaign: TerminalCampaignManifest =
+        serde_json::from_slice(&fs::read(campaign_manifest_path)?)?;
+    let source_cases = validated_campaign_cases(&campaign)?;
+    let promotion: TerminalPromotionInput =
+        serde_json::from_slice(&fs::read(promotion_input_path)?)?;
+    let public_cases = validated_promotion_cases(&promotion)?;
+
+    let mut accepted = Vec::new();
+    let mut groups = BTreeMap::<(String, String), PromotionGroup>::new();
+    for case in TERMINAL_MEASUREMENT_CASES.iter().filter(|case| {
+        matches!(
+            case.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        )
+    }) {
+        let source = source_cases[case.id];
+        let public = public_cases[case.id];
+        let source_observation = observe_bundle(
+            &source.snapshot_root,
+            &source.model_revision,
+            &source.bundle_subdir,
+            case,
+            "measured source",
+        )?;
+        let receipt = verified_evidence_receipt(evidence_root, case, source, &source_observation)?;
+        let public_observation = observe_bundle(
+            &public.public_snapshot_root,
+            &public.public_model_revision,
+            &public.public_bundle_subdir,
+            case,
+            "public destination",
+        )?;
+        require_identical_selected_copy(case.id, &source_observation, &public_observation)?;
+
+        let mut runtime = runtime_identity_from_receipt(&receipt);
+        runtime.model_revision = public.public_model_revision.clone();
+        runtime.model_inventory_sha256 = public_observation.model_inventory_sha256.clone();
+        runtime.bundle_subdir = public_observation.bundle_subdir.clone();
+        runtime.runtime_bundle_sha256 = public_observation.runtime_bundle_sha256.clone();
+        runtime.selected_bundle_sha256 = public_observation.selected_bundle_sha256.clone();
+        runtime.promotion_copy_sha256 = promotion_copy_sha256(&receipt, &runtime);
+        accepted.push(crate::quant_eval::Ltx25QuantAcceptedMeasurement {
+            receipt,
+            runtime: runtime.clone(),
+        });
+
+        let key = (
+            public.public_model_revision.clone(),
+            public_observation.model_inventory_sha256.clone(),
+        );
+        let group = groups.entry(key).or_insert_with(|| PromotionGroup {
+            public_snapshot_root: public_observation.snapshot_root.clone(),
+            model_revision: public.public_model_revision.clone(),
+            model_inventory_sha256: public_observation.model_inventory_sha256.clone(),
+            bindings: Vec::new(),
+            case_ids: Vec::new(),
+        });
+        if group.public_snapshot_root != public_observation.snapshot_root {
+            return Err(invalid(
+                "one public revision/inventory pair resolved to multiple snapshot roots",
+            )
+            .into());
+        }
+        group.bindings.push(runtime);
+        group.case_ids.push(case.id.to_owned());
+    }
+
+    fs::create_dir(output_dir)?;
+    let allowlist_path = output_dir.join("accepted_quant_receipts.allowlist");
+    write_json(&allowlist_path, &accepted)?;
+    let allowlist_artifact = artifact(output_dir, &allowlist_path)?;
+    let mut snapshots = Vec::new();
+    for ((revision, inventory), mut group) in groups {
+        group.case_ids.sort();
+        let directory = output_dir.join(format!("{revision}-{}", &inventory[..12]));
+        fs::create_dir(&directory)?;
+        let binding_path = directory.join(RUNTIME_BINDING_FILE);
+        write_json(
+            &binding_path,
+            &Ltx25QuantRuntimeBindings {
+                schema_version: RUNTIME_BINDING_SCHEMA.to_owned(),
+                bindings: group.bindings,
+            },
+        )?;
+        snapshots.push(PromotionSnapshot {
+            model_revision: group.model_revision,
+            model_inventory_sha256: group.model_inventory_sha256,
+            public_snapshot_root: group.public_snapshot_root.to_string_lossy().into_owned(),
+            runtime_binding: artifact(output_dir, &binding_path)?,
+            case_ids: group.case_ids,
+        });
+    }
+    snapshots.sort_by(|left, right| left.model_revision.cmp(&right.model_revision));
+    write_json(
+        &output_dir.join("promotion-manifest.json"),
+        &PromotionManifest {
+            schema_version: PROMOTION_SCHEMA,
+            accepted_allowlist: allowlist_artifact,
+            snapshots,
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -473,7 +1086,8 @@ fn hardware_identity() -> Result<HardwareIdentity> {
     let Device::Cuda(cuda) = &device else {
         return Err(invalid("terminal quant measurement requires a CUDA device").into());
     };
-    let context = cuda.cuda_stream().context();
+    let stream = cuda.cuda_stream();
+    let context = stream.context();
     let major = context.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = context.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     let generation = Ltx25GpuGeneration::from_compute_cap(Some((major, minor)));
@@ -663,8 +1277,13 @@ fn load_and_copy_reference(
     let reference_snapshot = config.reference_snapshot.as_ref().ok_or_else(|| {
         invalid("non-bf16 cases require --reference-snapshot for the bf16 model bundle")
     })?;
+    let reference_bundle_subdir = config.reference_bundle_subdir.as_ref().ok_or_else(|| {
+        invalid("non-bf16 cases require --reference-bundle-subdir for the bf16 model bundle")
+    })?;
     let reference_snapshot =
         canonical_snapshot(reference_snapshot, reference_revision, "reference")?;
+    let (reference_spec, reference_bundle_subdir) =
+        crate::bundle::select_snapshot_bundle(&reference_snapshot, reference_bundle_subdir)?;
     let source_output = config.reference_output.as_ref().ok_or_else(|| {
         invalid("non-bf16 cases require --reference-output from the matching sealed bf16 case")
     })?;
@@ -703,6 +1322,7 @@ fn load_and_copy_reference(
         inference_revision,
         executable_sha256,
         reference_revision,
+        &reference_bundle_subdir,
     ) {
         return Err(invalid("bf16 reference receipt does not match this exact code/reference-model/GPU/driver/fixture identity").into());
     }
@@ -717,7 +1337,6 @@ fn load_and_copy_reference(
         )
         .into());
     }
-    let reference_spec = LoadSpec::new(WeightsSource::Dir(reference_snapshot.clone()));
     let reference_bundle = crate::bundle::resolve_split_bundle(&reference_spec)?;
     let reference_variant = TransformerVariant::from_bundle(&reference_bundle)?;
     if reference_variant != case.transformer_variant {
@@ -738,11 +1357,20 @@ fn load_and_copy_reference(
         reference_variant,
         Ltx25QuantMode::Bf16,
     )?;
+    let reference_selected_bundle_sha256 = selected_bundle_identity_sha256(
+        &reference_bundle,
+        &reference_snapshot,
+        &reference_bundle_subdir,
+        &reference_inventory,
+        reference_variant,
+        Ltx25QuantMode::Bf16,
+    )?;
     if !reference_receipt_matches_bundle(
         &receipt,
         reference_revision,
         &reference_inventory_sha256,
         &reference_bundle_sha256,
+        &reference_selected_bundle_sha256,
     ) {
         return Err(invalid(
             "bf16 reference receipt is not self-bound to the explicit bf16 bundle identity",
@@ -784,7 +1412,9 @@ fn load_and_copy_reference(
         receipt_sha256: sha256_file(&source_receipt)?,
         model_revision: reference_revision.to_owned(),
         model_inventory_sha256: reference_inventory_sha256,
+        bundle_subdir: reference_bundle_subdir,
         runtime_bundle_sha256: reference_bundle_sha256,
+        selected_bundle_sha256: reference_selected_bundle_sha256,
         artifacts,
     })
 }
@@ -796,6 +1426,7 @@ fn reference_receipt_matches_campaign(
     inference_revision: &str,
     executable_sha256: &str,
     reference_revision: &str,
+    reference_bundle_subdir: &str,
 ) -> bool {
     receipt.mode == Ltx25QuantMode::Bf16
         && receipt.gpu_generation == case.gpu
@@ -807,6 +1438,7 @@ fn reference_receipt_matches_campaign(
         && receipt.executable_contract_sha256 == env!("LTX25_EXECUTABLE_CONTRACT_SHA256")
         && receipt.executable_sha256 == executable_sha256
         && receipt.model_revision == reference_revision
+        && receipt.bundle_subdir == reference_bundle_subdir
         && receipt.transformer_variant == case.transformer_variant
         && receipt.fixture == case.fixture
         && receipt.observed_width == case.width
@@ -821,13 +1453,16 @@ fn reference_receipt_matches_bundle(
     reference_revision: &str,
     reference_inventory_sha256: &str,
     reference_bundle_sha256: &str,
+    reference_selected_bundle_sha256: &str,
 ) -> bool {
     receipt.model_revision == reference_revision
         && receipt.model_inventory_sha256 == reference_inventory_sha256
         && receipt.runtime_bundle_sha256 == reference_bundle_sha256
+        && receipt.selected_bundle_sha256 == reference_selected_bundle_sha256
         && receipt.reference_model_revision == receipt.model_revision
         && receipt.reference_model_inventory_sha256 == receipt.model_inventory_sha256
         && receipt.reference_runtime_bundle_sha256 == receipt.runtime_bundle_sha256
+        && receipt.reference_selected_bundle_sha256 == receipt.selected_bundle_sha256
 }
 
 fn compare_outputs(
@@ -1003,8 +1638,23 @@ fn require_lower_hex(label: &str, value: &str, length: usize) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn campaign_manifest() -> TerminalCampaignManifest {
+        TerminalCampaignManifest {
+            schema_version: CAMPAIGN_SCHEMA.to_owned(),
+            cases: TERMINAL_MEASUREMENT_CASES
+                .iter()
+                .map(|case| TerminalCampaignCase {
+                    case_id: case.id.to_owned(),
+                    snapshot_root: PathBuf::from(format!("/snapshots/{}", "a".repeat(40))),
+                    model_revision: "a".repeat(40),
+                    bundle_subdir: PathBuf::from(case.id),
+                })
+                .collect(),
+        }
+    }
+
     fn bf16_receipt() -> Ltx25QuantMeasurementReceipt {
-        let case = measurement_case("ltx25-bf16-ada-v1").unwrap();
+        let case = measurement_case("ltx25-bf16-blackwell-v1").unwrap();
         Ltx25QuantMeasurementReceipt::seal(Ltx25QuantMeasurementDraft {
             case_id: case.id.to_owned(),
             mode: case.mode,
@@ -1021,12 +1671,16 @@ mod tests {
             executable_sha256: "b".repeat(64),
             model_revision: "c".repeat(40),
             model_inventory_sha256: "d".repeat(64),
+            bundle_subdir: "bundles/distilled/bf16".to_owned(),
             runtime_bundle_sha256: "e".repeat(64),
+            selected_bundle_sha256: "7".repeat(64),
             reference_model_revision: "c".repeat(40),
             reference_model_inventory_sha256: "d".repeat(64),
+            reference_bundle_subdir: "bundles/distilled/bf16".to_owned(),
             reference_runtime_bundle_sha256: "e".repeat(64),
-            gpu_name: "NVIDIA GeForce RTX 4090".to_owned(),
-            compute_capability: "sm_89".to_owned(),
+            reference_selected_bundle_sha256: "7".repeat(64),
+            gpu_name: "NVIDIA GeForce RTX 5090".to_owned(),
+            compute_capability: "sm_120".to_owned(),
             driver_version: "580.12".to_owned(),
             harness_version: HARNESS_VERSION.to_owned(),
             run_nonce_sha256: "f".repeat(64),
@@ -1084,6 +1738,141 @@ mod tests {
                 .unwrap()
                 .silent_zero_audio_passed
         );
+    }
+
+    #[test]
+    fn campaign_plan_is_exact_and_runs_both_bf16_references_before_candidates() {
+        let manifest = campaign_manifest();
+        assert_eq!(validated_campaign_cases(&manifest).unwrap().len(), 9);
+        let order = campaign_order().collect::<Vec<_>>();
+        assert_eq!(order.len(), 9);
+        assert!(order[..2]
+            .iter()
+            .all(|case| case.mode == Ltx25QuantMode::Bf16));
+        assert!(order[2..]
+            .iter()
+            .all(|case| case.mode != Ltx25QuantMode::Bf16));
+
+        let mut missing = manifest;
+        missing.cases.pop();
+        assert!(validated_campaign_cases(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("exact terminal case set"));
+    }
+
+    #[test]
+    fn promotion_input_accepts_only_the_three_production_advanced_rows() {
+        let advanced = TERMINAL_MEASUREMENT_CASES
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case.mode,
+                    Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+                )
+            })
+            .map(|case| TerminalPromotionCase {
+                case_id: case.id.to_owned(),
+                public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
+                public_model_revision: "b".repeat(40),
+                public_bundle_subdir: PathBuf::from(case.id),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(advanced.len(), 3);
+        let input = TerminalPromotionInput {
+            schema_version: PROMOTION_SCHEMA.to_owned(),
+            cases: advanced,
+        };
+        assert_eq!(validated_promotion_cases(&input).unwrap().len(), 3);
+
+        let mut packed = input;
+        packed.cases[0].case_id = "ltx25-packed-q8-blackwell-v1".to_owned();
+        assert!(validated_promotion_cases(&packed)
+            .unwrap_err()
+            .to_string()
+            .contains("non-promotable"));
+    }
+
+    #[test]
+    fn promotion_copy_gate_rejects_selected_bytes_or_operator_mutation() {
+        let observation = || BundleObservation {
+            snapshot_root: PathBuf::from("/snapshot"),
+            model_inventory_sha256: "a".repeat(64),
+            bundle_subdir: "bundles/distilled/int8".to_owned(),
+            runtime_bundle_sha256: "b".repeat(64),
+            selected_bundle_sha256: "c".repeat(64),
+            operator_contract_sha256: "d".repeat(64),
+        };
+        let source = observation();
+        let mut public = observation();
+        public.model_inventory_sha256 = "e".repeat(64);
+        assert!(require_identical_selected_copy("case", &source, &public).is_ok());
+
+        public.selected_bundle_sha256 = "f".repeat(64);
+        assert!(require_identical_selected_copy("case", &source, &public).is_err());
+        public.selected_bundle_sha256 = source.selected_bundle_sha256.clone();
+        public.operator_contract_sha256 = "f".repeat(64);
+        assert!(require_identical_selected_copy("case", &source, &public).is_err());
+    }
+
+    #[test]
+    fn promotion_rechecks_every_manifested_campaign_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = bf16_receipt();
+        let names = [
+            "generated-output.bin",
+            "model-inventory.json",
+            "reference-evidence-manifest.json",
+            "reference-model-inventory.json",
+            "reference-output.bin",
+            "reference-receipt.json",
+            "reference-transcript.jsonl",
+            "transcript.jsonl",
+        ];
+        let mut artifacts = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let path = root.path().join(name);
+            fs::write(&path, [index as u8]).unwrap();
+            artifacts.push(artifact(root.path(), &path).unwrap());
+        }
+        artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+        write_json(
+            &root.path().join("evidence-manifest.json"),
+            &EvidenceManifest {
+                schema_version: EVIDENCE_SCHEMA.to_owned(),
+                case_id: receipt.case_id.clone(),
+                run_nonce_sha256: receipt.run_nonce_sha256.clone(),
+                artifacts,
+            },
+        )
+        .unwrap();
+        verify_evidence_manifest(root.path(), &receipt).unwrap();
+
+        fs::write(root.path().join("reference-output.bin"), b"mutated").unwrap();
+        assert!(verify_evidence_manifest(root.path(), &receipt)
+            .unwrap_err()
+            .to_string()
+            .contains("manifest length/hash"));
+    }
+
+    #[test]
+    fn windows_workflow_builds_once_and_dispatches_one_serial_sm120_campaign() {
+        let workflow = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../.github/workflows/ltx25-quant-campaign.yml"),
+        )
+        .unwrap();
+        assert_eq!(workflow.matches("cargo build ").count(), 1);
+        assert!(!workflow.contains("cargo run"));
+        for required in [
+            "CUDA_COMPUTE_CAP: \"120\"",
+            "capability -ne '12.0'",
+            "--campaign-manifest",
+            "--physical-gpu",
+            "cancel-in-progress: false",
+        ] {
+            assert!(workflow.contains(required), "missing {required:?}");
+        }
     }
 
     #[test]
@@ -1151,12 +1940,12 @@ mod tests {
     #[test]
     fn quant_candidate_accepts_a_distinct_explicit_bf16_snapshot_identity_only() {
         let receipt = bf16_receipt();
-        let candidate = measurement_case("ltx25-int8-convrot-ada-v1").unwrap();
+        let candidate = measurement_case("ltx25-int8-convrot-blackwell-v1").unwrap();
         let hardware = HardwareIdentity {
             gpu_name: receipt.gpu_name.clone(),
             driver_version: receipt.driver_version.clone(),
-            compute_cap: (8, 9),
-            generation: Ltx25GpuGeneration::AdaSm89,
+            compute_cap: (12, 0),
+            generation: Ltx25GpuGeneration::ConsumerBlackwellSm120,
             physical_ordinal: 0,
         };
         assert!(reference_receipt_matches_campaign(
@@ -1166,12 +1955,14 @@ mod tests {
             &receipt.inference_revision,
             &receipt.executable_sha256,
             &receipt.model_revision,
+            &receipt.bundle_subdir,
         ));
         assert!(reference_receipt_matches_bundle(
             &receipt,
             &receipt.model_revision,
             &receipt.model_inventory_sha256,
             &receipt.runtime_bundle_sha256,
+            &receipt.selected_bundle_sha256,
         ));
         let candidate_inventory = "9".repeat(64);
         assert_ne!(candidate_inventory, receipt.model_inventory_sha256);
@@ -1183,6 +1974,7 @@ mod tests {
             &receipt.inference_revision,
             &"0".repeat(64),
             &receipt.model_revision,
+            &receipt.bundle_subdir,
         ));
         assert!(!reference_receipt_matches_campaign(
             &receipt,
@@ -1191,6 +1983,7 @@ mod tests {
             &receipt.inference_revision,
             &receipt.executable_sha256,
             &"0".repeat(40),
+            &receipt.bundle_subdir,
         ));
         let mut wrong_reference = receipt.clone();
         wrong_reference.reference_model_inventory_sha256 = "0".repeat(64);
@@ -1199,6 +1992,7 @@ mod tests {
             &receipt.model_revision,
             &receipt.model_inventory_sha256,
             &receipt.runtime_bundle_sha256,
+            &receipt.selected_bundle_sha256,
         ));
     }
 
@@ -1210,11 +2004,13 @@ mod tests {
         );
         let error = run(TerminalMeasurementConfig {
             acknowledgement: "ordinary-generation".to_owned(),
-            case_id: "ltx25-bf16-ada-v1".to_owned(),
+            case_id: "ltx25-bf16-blackwell-v1".to_owned(),
             snapshot: PathBuf::from("unused"),
+            bundle_subdir: PathBuf::from("."),
             model_revision: "0".repeat(40),
             output_dir: PathBuf::from("/unused"),
             reference_snapshot: None,
+            reference_bundle_subdir: None,
             reference_model_revision: None,
             reference_output: None,
             reference_receipt: None,

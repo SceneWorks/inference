@@ -14,7 +14,8 @@
 //! single `.safetensors`; [`declared_model_version`] handles both, so the gate is the same shape on
 //! either input.
 
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use candle_gen::gen_core::ltx_checkpoint::{
     GemmaEncoderIdentity, GemmaVersionCheck, LtxBundle, LtxBundleBuilder, LtxCheckpointLayout,
@@ -90,6 +91,73 @@ pub fn resolve_split_bundle(spec: &LoadSpec) -> gen_core::Result<LtxBundle> {
     }
 
     builder.build()
+}
+
+/// Bind an explicitly selected nested bundle to its complete immutable snapshot.
+///
+/// Discovery is confined to `bundle_subdir`, then every discovered component is copied into an
+/// explicit [`LoadSpec::components`] slot while [`LoadSpec::weights`] remains the full snapshot
+/// root. This is the terminal campaign and production-replay shape: component choice is narrow,
+/// but inventory and runtime provenance cover the complete public/upstream snapshot.
+pub fn select_snapshot_bundle(
+    snapshot_root: &Path,
+    bundle_subdir: &Path,
+) -> gen_core::Result<(LoadSpec, String)> {
+    if bundle_subdir.is_absolute()
+        || bundle_subdir.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "LTX-2.5 bundle subdir {} must be relative and cannot contain parent traversal",
+            bundle_subdir.display()
+        )));
+    }
+    let snapshot_root = fs::canonicalize(snapshot_root).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize LTX-2.5 snapshot {}: {error}",
+            snapshot_root.display()
+        ))
+    })?;
+    let bundle_root = fs::canonicalize(snapshot_root.join(bundle_subdir)).map_err(|error| {
+        gen_core::Error::Msg(format!(
+            "canonicalize selected LTX-2.5 bundle {}: {error}",
+            snapshot_root.join(bundle_subdir).display()
+        ))
+    })?;
+    if !bundle_root.is_dir() || !bundle_root.starts_with(&snapshot_root) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "selected LTX-2.5 bundle {} must be a directory inside snapshot {}",
+            bundle_root.display(),
+            snapshot_root.display()
+        )));
+    }
+    let logical = bundle_root
+        .strip_prefix(&snapshot_root)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let logical = if logical.is_empty() {
+        ".".to_owned()
+    } else {
+        logical
+    };
+
+    let discovered = resolve_split_bundle(&LoadSpec::new(WeightsSource::Dir(bundle_root)))?;
+    let mut selected = LoadSpec::new(WeightsSource::Dir(snapshot_root));
+    for component in discovered.components() {
+        let path = component.path().to_path_buf();
+        let source = if path.is_dir() {
+            WeightsSource::Dir(path)
+        } else {
+            WeightsSource::File(path)
+        };
+        selected = selected.with_component(component.component().id(), source);
+    }
+    Ok((selected, logical))
 }
 
 /// Read the text encoder's declared identity (`model_type` + `gemma_version`) from whichever layout
@@ -208,6 +276,113 @@ mod tests {
             declared_layout(dir.path()).unwrap(),
             LtxCheckpointLayout::AllInOne
         );
+    }
+
+    #[test]
+    fn nested_bundle_selection_keeps_the_full_snapshot_as_weights_and_explicitly_pins_components() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let nested = snapshot.path().join("packages/distilled-bf16");
+        write_2_5_bundle(&nested);
+        std::fs::write(snapshot.path().join("upstream-readme.md"), b"full snapshot").unwrap();
+
+        let (spec, logical) =
+            select_snapshot_bundle(snapshot.path(), Path::new("packages/distilled-bf16")).unwrap();
+        assert_eq!(logical, "packages/distilled-bf16");
+        assert_eq!(
+            spec.weights,
+            WeightsSource::Dir(std::fs::canonicalize(snapshot.path()).unwrap())
+        );
+        assert!(!spec.components.is_empty());
+        let nested = std::fs::canonicalize(nested).unwrap();
+        assert!(spec.components.values().all(|source| {
+            let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
+            path.starts_with(&nested)
+        }));
+    }
+
+    #[test]
+    fn nested_bundle_selection_refuses_parent_traversal() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let error = select_snapshot_bundle(snapshot.path(), Path::new("../outside"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("parent traversal"), "{error}");
+    }
+
+    #[test]
+    fn selected_bundle_digest_allows_unrelated_snapshot_files_but_rejects_component_mutation() {
+        use crate::dev_sampler::TransformerVariant;
+        use crate::quant_eval::{
+            inventory_for_snapshot, selected_bundle_identity_sha256, Ltx25QuantMode,
+        };
+
+        let source = tempfile::tempdir().unwrap();
+        let public = tempfile::tempdir().unwrap();
+        for root in [source.path(), public.path()] {
+            write_2_5_bundle(&root.join("packages/distilled-bf16"));
+        }
+        std::fs::write(source.path().join("source-only.txt"), b"upstream").unwrap();
+        std::fs::write(public.path().join("public-card.md"), b"SceneWorks").unwrap();
+        let (source_spec, source_subdir) =
+            select_snapshot_bundle(source.path(), Path::new("packages/distilled-bf16")).unwrap();
+        let (public_spec, public_subdir) =
+            select_snapshot_bundle(public.path(), Path::new("packages/distilled-bf16")).unwrap();
+        let source_bundle = resolve_split_bundle(&source_spec).unwrap();
+        let public_bundle = resolve_split_bundle(&public_spec).unwrap();
+        let source_root = std::fs::canonicalize(source.path()).unwrap();
+        let public_root = std::fs::canonicalize(public.path()).unwrap();
+        let source_inventory = inventory_for_snapshot(&source_root).unwrap();
+        let public_inventory = inventory_for_snapshot(&public_root).unwrap();
+        let source_digest = selected_bundle_identity_sha256(
+            &source_bundle,
+            &source_root,
+            &source_subdir,
+            &source_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        let public_digest = selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &public_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        assert_eq!(source_digest, public_digest);
+
+        let transformer = public
+            .path()
+            .join("packages/distilled-bf16/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors");
+        let mut bytes = std::fs::read(&transformer).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&transformer, bytes).unwrap();
+        let mutated_inventory = inventory_for_snapshot(&public_root).unwrap();
+        let mutated = selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &mutated_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .unwrap();
+        assert_ne!(source_digest, mutated);
+
+        let renamed = transformer.with_file_name("renamed-transformer.safetensors");
+        std::fs::rename(&transformer, renamed).unwrap();
+        let renamed_inventory = inventory_for_snapshot(&public_root).unwrap();
+        assert!(selected_bundle_identity_sha256(
+            &public_bundle,
+            &public_root,
+            &public_subdir,
+            &renamed_inventory,
+            TransformerVariant::Distilled,
+            Ltx25QuantMode::Bf16,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,0 +1,84 @@
+name: LTX-2.5 quant campaign
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign_manifest:
+        description: Absolute runner-local path to the immutable snapshot/bundle campaign manifest
+        type: string
+        required: true
+      evidence_root:
+        description: New absolute runner-local evidence directory
+        type: string
+        required: true
+      physical_gpu:
+        description: One physical Blackwell GPU ordinal (no list)
+        type: string
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+# The Windows host may expose more than one listener/GPU. Only one complete campaign is allowed to
+# occupy it at a time; the driver additionally makes exactly one physical ordinal visible.
+concurrency:
+  group: ltx25-quant-campaign-physical-host
+  cancel-in-progress: false
+
+jobs:
+  campaign:
+    name: Serial consumer-Blackwell campaign
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 1440
+    env:
+      CARGO_BUILD_JOBS: "12"
+      CUDA_COMPUTE_CAP: "120"
+      CUDA_PATH: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9"
+      VCVARS: "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+      CAMPAIGN_MANIFEST: ${{ inputs.campaign_manifest }}
+      EVIDENCE_ROOT: ${{ inputs.evidence_root }}
+      PHYSICAL_GPU: ${{ inputs.physical_gpu }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Validate one consumer Blackwell device
+        shell: powershell
+        run: |
+          if ($env:PHYSICAL_GPU -notmatch '^\d+$') {
+            throw "physical_gpu must be one numeric physical ordinal"
+          }
+          if (-not [System.IO.Path]::IsPathRooted($env:CAMPAIGN_MANIFEST) -or
+              -not [System.IO.Path]::IsPathRooted($env:EVIDENCE_ROOT)) {
+            throw "campaign_manifest and evidence_root must be absolute runner-local paths"
+          }
+          $capability = (nvidia-smi -i $env:PHYSICAL_GPU --query-gpu=compute_cap --format=csv,noheader,nounits).Trim()
+          if ($LASTEXITCODE -ne 0 -or $capability -ne '12.0') {
+            throw "LTX-2.5 terminal campaign requires exact consumer Blackwell sm_120; got '$capability'"
+          }
+      - name: Build terminal producer once
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo build --release --locked -p candle-gen-ltx --features cuda,terminal-quant-measurement --example ltx25-quant-measure || exit /b 1
+      - name: Run BF16 references then candidates serially
+        shell: powershell
+        run: |
+          $producer = Join-Path $PWD "target\release\examples\ltx25-quant-measure.exe"
+          & $producer `
+            --acknowledgement I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY `
+            --campaign-manifest $env:CAMPAIGN_MANIFEST `
+            --output-root $env:EVIDENCE_ROOT `
+            --physical-gpu $env:PHYSICAL_GPU
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload sealed campaign evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ltx25-quant-campaign-${{ github.sha }}-gpu${{ inputs.physical_gpu }}
+          path: ${{ inputs.evidence_root }}
+          if-no-files-found: error

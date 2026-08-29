@@ -2188,7 +2188,7 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             gpu,
             TransformerVariant::Distilled,
             None,
-            quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS,
+            quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
         ) {
             return Err(gen_core::Error::Unsupported(reason));
         }
@@ -2196,17 +2196,29 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let resolved = bundle::resolve_split_bundle(spec)?;
     let transformer_variant = TransformerVariant::from_bundle(&resolved)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let accepted = quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS
+        .iter()
+        .find(|accepted| {
+            accepted.receipt.mode == quant_mode
+                && accepted.receipt.gpu_generation == gpu
+                && accepted.receipt.transformer_variant == transformer_variant
+        });
     let runtime_identity = if matches!(
         quant_mode,
         Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
     ) && !quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.is_empty()
     {
-        Some(quant_eval::runtime_identity_from_bundle(
-            spec,
-            &resolved,
-            quant_mode,
-            transformer_variant,
-        )?)
+        accepted
+            .map(|accepted| {
+                quant_eval::runtime_identity_from_bundle(
+                    spec,
+                    &resolved,
+                    quant_mode,
+                    transformer_variant,
+                    &accepted.runtime,
+                )
+            })
+            .transpose()?
     } else {
         None
     };
@@ -2215,7 +2227,7 @@ pub fn load_25(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         gpu,
         transformer_variant,
         runtime_identity.as_ref(),
-        quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS,
+        quant_eval::ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
     ) {
         Ltx25QuantAdmission::Admitted => {}
         Ltx25QuantAdmission::Refused { reason } => {

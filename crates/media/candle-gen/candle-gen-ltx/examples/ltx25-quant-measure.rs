@@ -11,7 +11,8 @@
 //!   --example ltx25-quant-measure -- \
 //!   --acknowledgement I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY \
 //!   --case ltx25-bf16-blackwell-v1 \
-//!   --snapshot D:\hf\models--Lightricks--LTX-Video\snapshots\791ef61731ad067bd13ebff8cc0f07532476d9ef \
+//!   --snapshot-root D:\hf\models--Lightricks--LTX-Video\snapshots\791ef61731ad067bd13ebff8cc0f07532476d9ef \
+//!   --bundle-subdir bundles\distilled\bf16 \
 //!   --model-revision 791ef61731ad067bd13ebff8cc0f07532476d9ef \
 //!   --output-dir D:\evidence\ltx25-bf16-blackwell-v1
 //! ```
@@ -22,7 +23,9 @@
 
 use std::path::PathBuf;
 
-use candle_gen_ltx::quant_measurement::{run, TerminalMeasurementConfig};
+use candle_gen_ltx::quant_measurement::{
+    materialize_campaign_promotion, run, run_campaign, TerminalMeasurementConfig,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -64,13 +67,41 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let acknowledgement = value(&args, "--acknowledgement")?;
+    if args.iter().any(|arg| arg == "--materialize-promotion") {
+        materialize_campaign_promotion(
+            &acknowledgement,
+            PathBuf::from(value(&args, "--campaign-manifest")?).as_path(),
+            PathBuf::from(value(&args, "--promotion-input")?).as_path(),
+            PathBuf::from(value(&args, "--evidence-root")?).as_path(),
+            PathBuf::from(value(&args, "--output-dir")?).as_path(),
+        )?;
+        println!("materialized verified LTX-2.5 promotion artifacts");
+        return Ok(());
+    }
+    if let Some(manifest) = optional_value(&args, "--campaign-manifest") {
+        let physical_gpu = value(&args, "--physical-gpu")?
+            .parse::<usize>()
+            .map_err(|_| "--physical-gpu must be one numeric physical ordinal")?;
+        let receipts = run_campaign(
+            &acknowledgement,
+            PathBuf::from(manifest).as_path(),
+            PathBuf::from(value(&args, "--output-root")?).as_path(),
+            physical_gpu,
+        )?;
+        println!("sealed {} serial LTX-2.5 campaign receipts", receipts.len());
+        return Ok(());
+    }
     let receipt = run(TerminalMeasurementConfig {
-        acknowledgement: value(&args, "--acknowledgement")?,
+        acknowledgement,
         case_id: value(&args, "--case")?,
-        snapshot: PathBuf::from(value(&args, "--snapshot")?),
+        snapshot: PathBuf::from(value(&args, "--snapshot-root")?),
+        bundle_subdir: PathBuf::from(value(&args, "--bundle-subdir")?),
         model_revision: value(&args, "--model-revision")?,
         output_dir: PathBuf::from(value(&args, "--output-dir")?),
-        reference_snapshot: optional_value(&args, "--reference-snapshot").map(PathBuf::from),
+        reference_snapshot: optional_value(&args, "--reference-snapshot-root").map(PathBuf::from),
+        reference_bundle_subdir: optional_value(&args, "--reference-bundle-subdir")
+            .map(PathBuf::from),
         reference_model_revision: optional_value(&args, "--reference-model-revision"),
         reference_output: optional_value(&args, "--reference-output").map(PathBuf::from),
         reference_receipt: optional_value(&args, "--reference-receipt").map(PathBuf::from),
