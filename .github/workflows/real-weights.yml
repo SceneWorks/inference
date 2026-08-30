@@ -1590,32 +1590,32 @@ jobs:
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
       - name: Materialize and verify exact native snapshots
         env:
-          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal-mlx
         run: |
           set -o pipefail
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT"
           PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT"
-          mkdir -p "$STARVECTOR_TERMINAL_DIR"
-          python3.12 scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/starvector-1b-inventory.json"
-          python3.12 scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json"
-          shasum -a 256 "$STARVECTOR_TERMINAL_DIR/starvector-1b-inventory.json" "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json" | tee "$STARVECTOR_TERMINAL_DIR/inventory-sha256.txt"
+          mkdir -p "$STARVECTOR_TERMINAL_DIR/inventory" "$STARVECTOR_TERMINAL_DIR/hooks"
+          python3.12 scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/inventory/starvector-1b-inventory.json"
+          python3.12 scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/inventory/starvector-8b-inventory.json"
+          shasum -a 256 "$STARVECTOR_TERMINAL_DIR/inventory/starvector-1b-inventory.json" "$STARVECTOR_TERMINAL_DIR/inventory/starvector-8b-inventory.json" | tee "$STARVECTOR_TERMINAL_DIR/inventory-sha256.txt"
       - name: Run exact native MLX StarVector hooks
         env:
-          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal-mlx
         run: |
           set -o pipefail
-          cargo test --locked -p mlx-llm starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture | tee "$STARVECTOR_TERMINAL_DIR/mlx-starvector-1b.log"
-          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/mlx-starvector-1b.log"
-          cargo test --locked -p mlx-llm starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture | tee "$STARVECTOR_TERMINAL_DIR/mlx-starvector-8b.log"
-          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/mlx-starvector-8b.log"
+          cargo test --locked -p mlx-llm starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture 2>&1 | tee "$STARVECTOR_TERMINAL_DIR/hooks/mlx-starvector-1b.log"
+          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/hooks/mlx-starvector-1b.log"
+          cargo test --locked -p mlx-llm starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture 2>&1 | tee "$STARVECTOR_TERMINAL_DIR/hooks/mlx-starvector-8b.log"
+          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/hooks/mlx-starvector-8b.log"
       - name: Upload MLX terminal provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: starvector-terminal-mlx-${{ github.sha }}
+          name: starvector-terminal-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
           retention-days: 30
-          path: ${{ runner.temp }}/starvector-terminal
+          path: ${{ runner.temp }}/starvector-terminal-mlx
 
   starvector-terminal-candle:
     name: StarVector terminal native-provider preflight (Candle/CUDA)
@@ -1633,13 +1633,21 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: starvector-terminal-mlx-${{ github.sha }}
+          name: starvector-terminal-mlx-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}\\starvector-terminal-mlx
-      - name: Validate transferred MLX provenance
+      - name: Validate and stage transferred MLX provenance
         shell: cmd
         run: |
-          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\starvector-1b-inventory.json" exit /b 1
-          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\starvector-8b-inventory.json" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\inventory\\starvector-1b-inventory.json" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\inventory\\starvector-8b-inventory.json" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\hooks\\mlx-starvector-1b.log" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\hooks\\mlx-starvector-8b.log" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-preflight\\inventory" mkdir "%RUNNER_TEMP%\\starvector-terminal-preflight\\inventory" || exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks" mkdir "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks" || exit /b 1
+          copy /y "%RUNNER_TEMP%\\starvector-terminal-mlx\\inventory\\starvector-1b-inventory.json" "%RUNNER_TEMP%\\starvector-terminal-preflight\\inventory\\starvector-1b-inventory.json" >nul || exit /b 1
+          copy /y "%RUNNER_TEMP%\\starvector-terminal-mlx\\inventory\\starvector-8b-inventory.json" "%RUNNER_TEMP%\\starvector-terminal-preflight\\inventory\\starvector-8b-inventory.json" >nul || exit /b 1
+          copy /y "%RUNNER_TEMP%\\starvector-terminal-mlx\\hooks\\mlx-starvector-1b.log" "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\mlx-starvector-1b.log" >nul || exit /b 1
+          copy /y "%RUNNER_TEMP%\\starvector-terminal-mlx\\hooks\\mlx-starvector-8b.log" "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\mlx-starvector-8b.log" >nul || exit /b 1
           node scripts/release/starvector_terminal_evidence.mjs validate-plan --corpus release/starvector-terminal-corpus-v1.json || exit /b 1
       - name: Install pinned uv
         uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -1661,15 +1669,31 @@ jobs:
           set "PYTHONPATH=%RUNNER_TEMP%\\huggingface-hub"
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" || exit /b 1
-          mkdir "%RUNNER_TEMP%\\starvector-terminal" || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal\\starvector-1b-inventory.json" || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal\\starvector-8b-inventory.json" || exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" mkdir "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-1b-inventory.json" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-8b-inventory.json" || exit /b 1
       - name: Run exact authoritative Candle/CUDA StarVector hooks
         shell: cmd
         run: |
-          call "%VCVARS%"
-          cargo test --locked -p candle-llm --features cuda starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture || exit /b 1
-          cargo test --locked -p candle-llm --features cuda starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture || exit /b 1
+          call "%VCVARS%" || exit /b 1
+          cargo test --locked -p candle-llm --features cuda starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture > "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-1b.log" 2>&1 || (type "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-1b.log" & exit /b 1)
+          type "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-1b.log"
+          findstr /C:"test result: ok. 1 passed" "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-1b.log" >nul || exit /b 1
+          cargo test --locked -p candle-llm --features cuda starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture > "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-8b.log" 2>&1 || (type "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-8b.log" & exit /b 1)
+          type "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-8b.log"
+          findstr /C:"test result: ok. 1 passed" "%RUNNER_TEMP%\\starvector-terminal-preflight\\hooks\\candle-cuda-starvector-8b.log" >nul || exit /b 1
+      - name: Seal exact terminal preflight provenance
+        shell: cmd
+        run: |
+          node scripts/release/starvector_terminal_preflight.mjs assemble --root "%RUNNER_TEMP%\\starvector-terminal-preflight" --head-sha "%GITHUB_SHA%" --workflow-run-id "%GITHUB_RUN_ID%" --workflow-run-attempt "%GITHUB_RUN_ATTEMPT%" || exit /b 1
+          type "%RUNNER_TEMP%\\starvector-terminal-preflight\\starvector-terminal-preflight.json"
+      - name: Upload complete terminal preflight provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: starvector-terminal-preflight-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: ${{ runner.temp }}\\starvector-terminal-preflight
 
   mlx-llm:
     name: MLX LLM real weights
