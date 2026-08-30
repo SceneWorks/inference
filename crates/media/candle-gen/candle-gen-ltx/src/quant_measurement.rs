@@ -27,9 +27,10 @@ use crate::dev_sampler::TransformerVariant;
 use crate::quant_eval::{
     bundle_identity_sha256, inventory_for_snapshot, measurement_case, promotion_copy_sha256,
     selected_bundle_identity_sha256, snapshot_inventory_sha256, Ltx25GpuGeneration,
-    Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt, Ltx25QuantMode, Ltx25QuantQuality,
-    Ltx25QuantRuntimeBindings, Ltx25QuantRuntimeIdentity, LTX25_PUBLIC_REPOSITORY,
-    RUNTIME_BINDING_FILE, RUNTIME_BINDING_SCHEMA, TERMINAL_MEASUREMENT_CASES,
+    Ltx25QuantMeasurementCase, Ltx25QuantMeasurementDraft, Ltx25QuantMeasurementReceipt,
+    Ltx25QuantMode, Ltx25QuantQuality, Ltx25QuantRuntimeBindings, Ltx25QuantRuntimeIdentity,
+    LTX25_PUBLIC_REPOSITORY, RUNTIME_BINDING_FILE, RUNTIME_BINDING_SCHEMA,
+    TERMINAL_MEASUREMENT_CASES,
 };
 
 pub const TERMINAL_ACKNOWLEDGEMENT: &str = "I_ACKNOWLEDGE_SC18777_TERMINAL_MEASUREMENT_ONLY";
@@ -478,6 +479,24 @@ struct HardwareIdentity {
     physical_ordinal: usize,
 }
 
+fn terminal_generation_request(case: &Ltx25QuantMeasurementCase) -> GenerationRequest {
+    GenerationRequest {
+        prompt: PROMPT.to_owned(),
+        width: case.width,
+        height: case.height,
+        count: 1,
+        seed: Some(case.seed),
+        frames: Some(case.frames),
+        fps: Some(case.fps),
+        // Distilled checkpoints expose the fixed-schedule rectified-flow alias. Dev checkpoints
+        // instead have one native 30-step guided Euler trajectory and deliberately advertise no
+        // sampler axis, so an explicit distilled alias must not cross that variant boundary.
+        sampler: (case.transformer_variant == TransformerVariant::Distilled)
+            .then(|| "rectified-flow".to_owned()),
+        ..Default::default()
+    }
+}
+
 /// Execute one case and return the same receipt written to `<output-dir>/receipt.json`.
 pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementReceipt> {
     if config.acknowledgement != TERMINAL_ACKNOWLEDGEMENT {
@@ -645,17 +664,7 @@ pub fn run(config: TerminalMeasurementConfig) -> Result<Ltx25QuantMeasurementRec
     crate::advanced_quant::begin_operator_attestation(case.mode);
     let spec = inspection_spec;
     let generator = crate::load_25_for_terminal_measurement(&spec, case)?;
-    let request = GenerationRequest {
-        prompt: PROMPT.to_owned(),
-        width: case.width,
-        height: case.height,
-        count: 1,
-        seed: Some(case.seed),
-        frames: Some(case.frames),
-        fps: Some(case.fps),
-        sampler: Some("rectified-flow".to_owned()),
-        ..Default::default()
-    };
+    let request = terminal_generation_request(case);
     let mut progress = Vec::new();
     let output = generator.generate(&request, &mut |event: Progress| {
         progress.push(format!("{event:?}"));
@@ -2574,6 +2583,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires an explicit upstream"));
+    }
+
+    #[test]
+    fn terminal_requests_respect_the_loaded_variant_sampler_surface() {
+        let distilled = measurement_case("ltx25-bf16-blackwell-v1").unwrap();
+        let distilled_request = terminal_generation_request(distilled);
+        assert_eq!(distilled_request.sampler.as_deref(), Some("rectified-flow"));
+        crate::descriptor_25_for_variant(TransformerVariant::Distilled)
+            .capabilities
+            .validate_request(crate::MODEL_25_ID, &distilled_request)
+            .expect("distilled terminal request must stay inside its advertised sampler surface");
+
+        let dev = measurement_case("ltx25-bf16-blackwell-dev-v1").unwrap();
+        let dev_request = terminal_generation_request(dev);
+        assert_eq!(dev_request.sampler, None);
+        crate::descriptor_25_for_variant(TransformerVariant::Dev)
+            .capabilities
+            .validate_request(crate::MODEL_25_ID, &dev_request)
+            .expect("dev terminal request must use its native sampler trajectory");
     }
 
     #[test]
