@@ -1,10 +1,15 @@
 //! LTX-2.5 quant selection and terminal measurement evidence (sc-18777).
 //!
-//! Production and measurement are intentionally separate surfaces. Production `Quant::Q8` means
-//! the released INT8-ConvRot transformer/text-encoder pair. The terminal controller can additionally
-//! measure the hosted packed-q8 tier, but that mode has no production selector and cannot enter the
-//! ordinary catalog. Advanced production modes remain fail-closed until a same-run, identity-bound
-//! receipt is deliberately copied into [`ACCEPTED_MEASUREMENT_RECEIPTS`].
+//! Production and measurement are intentionally separate surfaces. Production `Quant::Q8` names the
+//! hosted packed-q8 tier (`<snapshot>/q8`) — the released MLX-affine bundle that also packs the
+//! Gemma 4 text encoder — promoted to a first-class Candle route in sc-18791 once the packed-q8
+//! projection loader landed. It shares the ordinary packed loader with q4 and is admitted
+//! unconditionally, exactly like bf16 and q4.
+//!
+//! The materially different *advanced* operators are unchanged by that promotion. INT8-ConvRot has
+//! no [`LoadSpec`] selector at all (it is reached only by the terminal controller, which names its
+//! mode explicitly), and NVFP4 stays fail-closed until a same-run, identity-bound receipt is
+//! deliberately copied into [`ACCEPTED_MEASUREMENT_RECEIPTS`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,9 +98,10 @@ pub(crate) struct SnapshotInventory {
 
 /// Every numeric source compared by the terminal controller.
 ///
-/// `PackedQ8` is intentionally not constructible from [`LoadSpec`]: the production `Quant::Q8`
-/// contract already names INT8-ConvRot. Keeping a separate terminal-only variant prevents a q8
-/// packed observation from being promoted under the ConvRot label.
+/// `PackedQ8` is the production meaning of `Quant::Q8` (sc-18791): the hosted `q8/` bundle, loaded
+/// by the same MLX-affine packed path as `Q4`. `Int8ConvRot` is the deliberately separate
+/// terminal-only variant — keeping it unconstructible from [`LoadSpec`] prevents a packed-q8
+/// observation from being reported under the ConvRot label, and vice versa.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Ltx25QuantMode {
@@ -111,7 +117,7 @@ impl Ltx25QuantMode {
         match spec.quantize {
             None => Ok(Self::Bf16),
             Some(Quant::Q4) => Ok(Self::Q4),
-            Some(Quant::Q8) => Ok(Self::Int8ConvRot),
+            Some(Quant::Q8) => Ok(Self::PackedQ8),
             Some(Quant::Nvfp4) => Ok(Self::Nvfp4),
         }
     }
@@ -915,9 +921,8 @@ pub fn admit(
     runtime: Option<&Ltx25QuantRuntimeIdentity>,
     accepted: &[Ltx25QuantAcceptedMeasurement],
 ) -> Ltx25QuantAdmission {
-    if mode == Ltx25QuantMode::PackedQ8 {
-        return Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: packed-q8 is a terminal comparison source, not a production selector; production Quant::Q8 means int8-convrot") };
-    }
+    // sc-18791: packed-q8 is an ordinary released tier alongside bf16 and packed-q4 — it falls
+    // through to the unconditional arm below. Only the advanced operators are receipt-gated.
     if mode == Ltx25QuantMode::Nvfp4 && gpu != Ltx25GpuGeneration::ConsumerBlackwellSm120 {
         return Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: nvfp4 requires exact consumer Blackwell sm_120; detected {}. Datacenter Blackwell is not this lane, and fallback to bf16/q4 is forbidden", gpu.id()) };
     }
@@ -1697,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn production_selectors_do_not_alias_packed_q8_to_convrot_evidence() {
+    fn production_selectors_name_packed_tiers_and_never_convrot_evidence() {
         let base = LoadSpec::new(gen_core::WeightsSource::Dir("/weights".into()));
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base).unwrap(),
@@ -1707,18 +1712,51 @@ mod tests {
             Ltx25QuantMode::from_load_spec(&base.clone().with_quant(Quant::Q4)).unwrap(),
             Ltx25QuantMode::Q4
         );
+        // sc-18791: `Quant::Q8` selects the hosted packed q8 bundle, never the ConvRot operator.
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base.clone().with_quant(Quant::Q8)).unwrap(),
-            Ltx25QuantMode::Int8ConvRot
+            Ltx25QuantMode::PackedQ8
         );
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base.with_quant(Quant::Nvfp4)).unwrap(),
             Ltx25QuantMode::Nvfp4
         );
         assert_ne!(Ltx25QuantMode::PackedQ8, Ltx25QuantMode::Int8ConvRot);
-        assert!(
-            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
-        );
+        // The released packed tiers are admitted unconditionally, on every classified generation:
+        // no receipt, no runtime identity, no GPU allowlist.
+        for gpu in [
+            Ltx25GpuGeneration::ConsumerBlackwellSm120,
+            Ltx25GpuGeneration::AdaSm89,
+        ] {
+            for variant in [TransformerVariant::Distilled, TransformerVariant::Dev] {
+                for mode in [
+                    Ltx25QuantMode::Bf16,
+                    Ltx25QuantMode::Q4,
+                    Ltx25QuantMode::PackedQ8,
+                ] {
+                    assert_eq!(
+                        admit(mode, gpu, variant, None, &[]),
+                        Ltx25QuantAdmission::Admitted,
+                        "{} must be a first-class production tier on {}",
+                        mode.id(),
+                        gpu.id()
+                    );
+                }
+            }
+        }
+        // The advanced operators keep their unchanged receipt gate.
+        for mode in [Ltx25QuantMode::Int8ConvRot, Ltx25QuantMode::Nvfp4] {
+            assert!(matches!(
+                admit(
+                    mode,
+                    Ltx25GpuGeneration::ConsumerBlackwellSm120,
+                    TransformerVariant::Distilled,
+                    None,
+                    &[]
+                ),
+                Ltx25QuantAdmission::Refused { .. }
+            ));
+        }
     }
 
     #[test]
