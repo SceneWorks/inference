@@ -46,7 +46,7 @@ def selection(case_ids=None):
     return {
         "policyId": MODULE.POLICY_ID,
         "reviewedBy": "codex-independent-review",
-        "selectedCaseIds": case_ids or ["ltx25-int8-convrot-blackwell-v1"],
+        "selectedCaseIds": case_ids or ["ltx25-packed-q8-blackwell-v1"],
         "minimumReferencePsnr": 20.0,
         "minimumReferenceSsim": 0.8,
         "maximumTemporalBoundaryDrift": 0.1,
@@ -114,7 +114,10 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
             self.assertNotIn("allow_patterns", calls[0])
             self.assertNotIn("local_dir", calls[0])
 
-    def test_campaign_manifest_contains_exact_nine_public_rows(self):
+    def test_campaign_manifest_contains_exact_six_published_rows(self):
+        # sc-18791: the public SceneWorks/ltx-2.5-mlx release ships only dev/{bf16,q4,q8} and
+        # distilled/{bf16,q4,q8} — it has no `bundles/` tree — so the campaign enumerates exactly
+        # those six rows and nothing that would canonicalize to a missing path at run time.
         snapshot = Path("/cache/models--SceneWorks--ltx-2.5-mlx/snapshots") / REVISION
         document = MODULE.campaign_manifest(snapshot, REVISION)
         self.assertEqual(document["schemaVersion"], MODULE.CAMPAIGN_SCHEMA)
@@ -124,40 +127,21 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
                 ("ltx25-bf16-blackwell-v1", "distilled", "distilled/bf16", None),
                 ("ltx25-packed-q4-blackwell-v1", "distilled", "distilled/q4", None),
                 ("ltx25-packed-q8-blackwell-v1", "distilled", "distilled/q8", None),
-                (
-                    "ltx25-int8-convrot-blackwell-v1",
-                    "distilled",
-                    "bundles/distilled/int8-convrot",
-                    "bundles/distilled/int8-convrot/text_encoders/"
-                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-                ),
-                (
-                    "ltx25-nvfp4-blackwell-v1",
-                    "distilled",
-                    "bundles/distilled/nvfp4",
-                    "bundles/distilled/nvfp4/text_encoders/"
-                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-                ),
                 ("ltx25-bf16-blackwell-dev-v1", "dev", "dev/bf16", None),
                 ("ltx25-packed-q4-blackwell-dev-v1", "dev", "dev/q4", None),
                 ("ltx25-packed-q8-blackwell-dev-v1", "dev", "dev/q8", None),
-                (
-                    "ltx25-int8-convrot-blackwell-dev-v1",
-                    "dev",
-                    "bundles/dev/int8-convrot",
-                    "bundles/dev/int8-convrot/text_encoders/"
-                    "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-                ),
             ),
         )
-        self.assertEqual(len(document["cases"]), 9)
-        advanced = [
-            case for case in document["cases"] if "bf16TextEncoderSubpath" in case
-        ]
-        self.assertEqual(len(advanced), 3)
-        self.assertTrue(
-            all("text_encoders/gemma4-12b-with-proj" in case["bf16TextEncoderSubpath"] for case in advanced)
+        self.assertEqual(len(document["cases"]), 6)
+        self.assertEqual(
+            [case for case in document["cases"] if "bf16TextEncoderSubpath" in case],
+            [],
         )
+        for case in document["cases"]:
+            self.assertFalse(
+                case["bundleSubdir"].startswith("bundles/"),
+                f"{case['caseId']} names an unpublished bundle: {case['bundleSubdir']}",
+            )
         self.assertEqual({case["snapshotRoot"] for case in document["cases"]}, {str(snapshot)})
 
     def test_snapshot_inventory_matches_sizes_lfs_hashes_and_canonical_blob_targets(self):
@@ -264,34 +248,32 @@ class PrepareLtx25QuantCampaignTests(unittest.TestCase):
             MODULE._is_unsafe_directory_link(Path("synthetic-directory"), metadata)
         )
 
-    def test_promotion_input_contains_only_explicit_reviewed_winners(self):
+    def test_promotion_is_inert_while_no_advanced_bundle_is_published(self):
+        # sc-18791: promotion only ever moved an INT8-ConvRot/NVFP4 candidate into production, and
+        # those candidates derive from encoder-bearing TERMINAL_CASES rows. With none published,
+        # the promotable set is empty and every promotion input fails closed before any replay.
+        self.assertEqual(MODULE.PROMOTABLE_CASES, {})
         snapshot = Path("/cache/models--SceneWorks--ltx-2.5-mlx/snapshots") / REVISION
-        raw = selection(
-            [
-                "ltx25-nvfp4-blackwell-v1",
-                "ltx25-int8-convrot-blackwell-dev-v1",
-            ]
-        )
-        document = MODULE.promotion_input(
-            snapshot,
-            REVISION,
-            Path("/evidence/public-readback.json"),
-            raw,
-        )
-        self.assertEqual(document["selection"], raw)
-        self.assertEqual(
-            [case["caseId"] for case in document["cases"]],
-            [
-                "ltx25-nvfp4-blackwell-v1",
-                "ltx25-int8-convrot-blackwell-dev-v1",
-            ],
-        )
-        self.assertTrue(all(case["publicModelRevision"] == REVISION for case in document["cases"]))
+        for case_ids in (
+            ["ltx25-nvfp4-blackwell-v1"],
+            ["ltx25-int8-convrot-blackwell-dev-v1"],
+            ["ltx25-packed-q8-blackwell-v1"],
+        ):
+            with self.subTest(case_ids=case_ids):
+                with self.assertRaisesRegex(ValueError, "no terminal case is promotable"):
+                    MODULE.promotion_input(
+                        snapshot,
+                        REVISION,
+                        Path("/evidence/public-readback.json"),
+                        selection(case_ids),
+                    )
 
-    def test_selection_rejects_implicit_or_duplicate_variant_winners(self):
+    def test_selection_rejects_implicit_or_unpromotable_winners(self):
         with self.assertRaisesRegex(ValueError, "exactly the required"):
             MODULE.validate_selection({"selectedCaseIds": []})
-        with self.assertRaisesRegex(ValueError, "at most one winner"):
+        # The per-variant winner check now sits behind the empty-promotable guard, which is the
+        # first and only reachable refusal for a well-formed reviewed selection.
+        with self.assertRaisesRegex(ValueError, "no terminal case is promotable"):
             MODULE.validate_selection(
                 selection(
                     [

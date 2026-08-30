@@ -2477,16 +2477,20 @@ mod tests {
         })
     }
 
-    fn reviewed_promotion_input() -> TerminalPromotionInput {
-        let cases = TERMINAL_MEASUREMENT_CASES
+    /// A well-formed reviewed promotion document over the named case ids. Promotion only ever
+    /// applied to the advanced operators, and sc-18791 removed their unpublished rows, so callers
+    /// pass ids deliberately to prove what the validator does with them.
+    fn reviewed_promotion_input(case_ids: &[&str]) -> TerminalPromotionInput {
+        let cases = case_ids
             .iter()
-            .filter(|case| case.mode == Ltx25QuantMode::Int8ConvRot)
-            .map(|case| TerminalPromotionCase {
-                case_id: case.id.to_owned(),
-                transformer_variant: case.transformer_variant,
+            .map(|id| TerminalPromotionCase {
+                case_id: (*id).to_owned(),
+                transformer_variant: measurement_case(id)
+                    .map(|case| case.transformer_variant)
+                    .unwrap_or(TransformerVariant::Distilled),
                 public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
                 public_model_revision: "b".repeat(40),
-                public_bundle_subdir: PathBuf::from(case.id),
+                public_bundle_subdir: PathBuf::from(*id),
                 bf16_text_encoder_subpath: PathBuf::from("shared/gemma4-bf16.safetensors"),
                 public_readback: PathBuf::from("/public/readback.json"),
             })
@@ -2546,18 +2550,20 @@ mod tests {
     #[test]
     fn campaign_plan_is_exact_and_runs_both_bf16_references_before_candidates() {
         let manifest = campaign_manifest();
-        assert_eq!(validated_campaign_cases(&manifest).unwrap().len(), 9);
+        assert_eq!(validated_campaign_cases(&manifest).unwrap().len(), 6);
+        // sc-18791: the published bundles are all self-contained, so no row binds an external
+        // BF16 Gemma encoder.
         assert_eq!(
             manifest
                 .cases
                 .iter()
                 .filter(|case| case.bf16_text_encoder_subpath.is_some())
                 .count(),
-            3,
-            "all three advanced rows must use an explicit upstream BF16 Gemma encoder"
+            0,
+            "no published row may bind an external BF16 Gemma encoder"
         );
         let order = campaign_order().collect::<Vec<_>>();
-        assert_eq!(order.len(), 9);
+        assert_eq!(order.len(), 6);
         assert!(order[..2]
             .iter()
             .all(|case| case.mode == Ltx25QuantMode::Bf16));
@@ -2572,17 +2578,26 @@ mod tests {
             .to_string()
             .contains("exact terminal case set"));
 
-        let mut missing_encoder = campaign_manifest();
-        missing_encoder
+        // sc-18791: with no advanced row published, the encoder gate is only reachable in the
+        // "must not declare" direction — a packed row that smuggles in an external encoder.
+        let mut smuggled_encoder = campaign_manifest();
+        smuggled_encoder
             .cases
             .iter_mut()
-            .find(|case| case.case_id == "ltx25-nvfp4-blackwell-v1")
+            .find(|case| case.case_id == "ltx25-packed-q8-blackwell-v1")
             .unwrap()
-            .bf16_text_encoder_subpath = None;
-        assert!(validated_campaign_cases(&missing_encoder)
+            .bf16_text_encoder_subpath = Some(PathBuf::from("shared/gemma4-bf16.safetensors"));
+        assert!(validated_campaign_cases(&smuggled_encoder)
             .unwrap_err()
             .to_string()
-            .contains("requires an explicit upstream"));
+            .contains("must not declare"));
+
+        let mut unknown_case = campaign_manifest();
+        unknown_case.cases[0].case_id = "ltx25-int8-convrot-blackwell-v1".to_owned();
+        assert!(validated_campaign_cases(&unknown_case)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown case"));
     }
 
     #[test]
@@ -2605,41 +2620,52 @@ mod tests {
     }
 
     #[test]
-    fn promotion_input_accepts_only_explicit_reviewed_winners() {
-        let input = reviewed_promotion_input();
-        assert_eq!(validated_promotion_cases(&input).unwrap().len(), 2);
+    fn promotion_is_inert_while_no_advanced_bundle_is_published() {
+        // sc-18791: promotion only ever moved an INT8-ConvRot/NVFP4 candidate into production, and
+        // the public release ships neither bundle, so the promotable set is empty by construction.
+        // Every promotion input therefore fails closed before any replay is attempted.
+        assert!(!TERMINAL_MEASUREMENT_CASES.iter().any(|case| matches!(
+            case.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        )));
 
-        let mut packed = input.clone();
-        packed.cases[0].case_id = "ltx25-packed-q8-blackwell-v1".to_owned();
-        assert!(validated_promotion_cases(&packed)
+        let empty = reviewed_promotion_input(&[]);
+        assert!(validated_promotion_cases(&empty)
             .unwrap_err()
             .to_string()
-            .contains("unselected"));
+            .contains("at least one unique selectedCaseId"));
 
-        let mut forced_all_three = input;
-        let nvfp4 = measurement_case("ltx25-nvfp4-blackwell-v1").unwrap();
-        forced_all_three
-            .selection
-            .selected_case_ids
-            .push(nvfp4.id.to_owned());
-        forced_all_three.cases.push(TerminalPromotionCase {
-            case_id: nvfp4.id.to_owned(),
-            transformer_variant: nvfp4.transformer_variant,
-            public_snapshot_root: PathBuf::from("/public/snapshots/immutable"),
-            public_model_revision: "b".repeat(40),
-            public_bundle_subdir: PathBuf::from(nvfp4.id),
-            bf16_text_encoder_subpath: PathBuf::from("shared/gemma4-bf16.safetensors"),
-            public_readback: PathBuf::from("/public/readback.json"),
-        });
-        assert!(validated_promotion_cases(&forced_all_three)
+        // A reviewer naming a retired advanced candidate, or a published packed row that was never
+        // promotable, is refused identically.
+        for id in [
+            "ltx25-int8-convrot-blackwell-v1",
+            "ltx25-nvfp4-blackwell-v1",
+            "ltx25-int8-convrot-blackwell-dev-v1",
+            "ltx25-packed-q8-blackwell-v1",
+        ] {
+            let input = reviewed_promotion_input(&[id]);
+            assert!(
+                validated_promotion_cases(&input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-promotable cases"),
+                "{id} must be refused as non-promotable"
+            );
+        }
+
+        let duplicated = reviewed_promotion_input(&[
+            "ltx25-packed-q8-blackwell-v1",
+            "ltx25-packed-q8-blackwell-v1",
+        ]);
+        assert!(validated_promotion_cases(&duplicated)
             .unwrap_err()
             .to_string()
-            .contains("at most one measured winner per transformer variant"));
+            .contains("at least one unique selectedCaseId"));
     }
 
     #[test]
     fn reviewed_selection_thresholds_fail_closed_before_replay() {
-        let input = reviewed_promotion_input();
+        let input = reviewed_promotion_input(&["ltx25-packed-q8-blackwell-v1"]);
         input.selection.validate().unwrap();
         let poor = Ltx25QuantQuality {
             reference_psnr: 19.9,
@@ -2716,7 +2742,7 @@ mod tests {
     fn public_replay_receipt_seals_output_and_pre_post_inventory_artifacts() {
         let mut replay = PublicReplayReceipt {
             schema_version: PUBLIC_REPLAY_SCHEMA.to_owned(),
-            case_id: "ltx25-int8-convrot-blackwell-v1".to_owned(),
+            case_id: "ltx25-packed-q8-blackwell-v1".to_owned(),
             public_repository: LTX25_PUBLIC_REPOSITORY.to_owned(),
             public_readback_sha256: "1".repeat(64),
             source_receipt_sha256: "2".repeat(64),
@@ -2734,7 +2760,7 @@ mod tests {
                 silent_zero_video_passed: true,
                 silent_zero_audio_passed: true,
             },
-            operator_kind: "int8-convrot-rht-cublaslt-igemm".to_owned(),
+            operator_kind: "mlx-affine-dequant".to_owned(),
             operator_contract_sha256: "7".repeat(64),
             operator_weight_inventory_sha256: "8".repeat(64),
             receipt_sha256: String::new(),
@@ -2979,7 +3005,7 @@ mod tests {
     #[test]
     fn quant_candidate_accepts_a_distinct_explicit_bf16_snapshot_identity_only() {
         let receipt = bf16_receipt();
-        let candidate = measurement_case("ltx25-int8-convrot-blackwell-v1").unwrap();
+        let candidate = measurement_case("ltx25-packed-q8-blackwell-v1").unwrap();
         let hardware = HardwareIdentity {
             gpu_name: receipt.gpu_name.clone(),
             driver_version: receipt.driver_version.clone(),
