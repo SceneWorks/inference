@@ -748,15 +748,21 @@ impl WanTransformer {
     /// payload. The returned cache is intentionally request-scoped: callers create it after the DiT
     /// loads and retain it only for the matching denoise branch.
     pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedWanCrossKv> {
-        let (_, s_kv, _) = context.dims3()?;
-        crate::sc20686_observer::bind_cross_kv_geometry(
-            self.blocks.len() as u32,
-            0,
-            0,
-            0,
-            s_kv as u64,
-            format!("{:?}", context.dtype()),
-        );
+        if let Some((s_kv, dtype)) = crate::sc20686_observer::campaign_evidence(|| {
+            let (_, s_kv, _) = context.dims3()?;
+            Ok::<_, candle_gen::candle_core::Error>((s_kv, format!("{:?}", context.dtype())))
+        })
+        .transpose()?
+        {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                self.blocks.len() as u32,
+                0,
+                0,
+                0,
+                s_kv as u64,
+                dtype,
+            );
+        }
         Ok(PreparedWanCrossKv {
             blocks: self
                 .blocks

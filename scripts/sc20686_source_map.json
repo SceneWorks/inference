@@ -21,12 +21,12 @@
       ],
       "reference_slice": [
         {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "record_flux_kv_created", "line": 367},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 573},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 574}
+        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 579},
+        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 580}
       ],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "attention", "line": 390}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "drop", "line": 903}],
-      "current_kernel": "DoubleAttention dense joint attention over exact to_k/to_v/add_k/add_v projections",
+      "reads": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "attention", "line": 393}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "drop", "line": 921}],
+      "current_kernel": "DoubleAttention dense joint attention over exact to_k/to_v/add_k/add_v projections; full joint duration is non-attributable context",
       "cache_format": "no persistent cross-KV cache",
       "paging": "none",
       "offload": "provider memory-strategy staging; no reference-KV paging",
@@ -82,7 +82,7 @@
     "wan_vace": {
       "family": "wan",
       "route": "wan_vace",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs", "symbol": "sc20686_observer::activate_requested", "line": 459}],
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs", "symbol": "sc20686_observer::activate_requested", "line": 471}],
       "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 339}],
       "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 405}],
       "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
@@ -97,7 +97,7 @@
     "wan2_2_vace_fun_14b": {
       "family": "wan",
       "route": "wan2_2_vace_fun_14b",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs", "symbol": "sc20686_observer::activate_requested", "line": 564}],
+      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs", "symbol": "sc20686_observer::activate_requested", "line": 576}],
       "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 339}],
       "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 405}],
       "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],

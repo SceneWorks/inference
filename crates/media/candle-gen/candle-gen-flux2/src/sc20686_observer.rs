@@ -121,6 +121,8 @@ pub struct CampaignMetrics {
     candidate_read_transient_bytes: u64,
     generation_duration_ms: f64,
     cache_read_duration_ms: f64,
+    joint_attention_context_duration_ms: f64,
+    reference_runtime_attribution_available: bool,
     reused_requests: u64,
     minimum_cache_reads: u64,
 }
@@ -150,7 +152,7 @@ struct Measurements {
     current_read_transient_bytes: u64,
     candidate_persistent_bytes: u64,
     candidate_read_transient_bytes: u64,
-    cache_read_duration_ns: u128,
+    joint_attention_context_duration_ns: u128,
     reused_requests: u64,
     projection_count: u64,
 }
@@ -159,7 +161,7 @@ impl Measurements {
         current_read_transient_bytes: 0,
         candidate_persistent_bytes: 0,
         candidate_read_transient_bytes: 0,
-        cache_read_duration_ns: 0,
+        joint_attention_context_duration_ns: 0,
         reused_requests: 0,
         projection_count: 0,
     };
@@ -409,6 +411,10 @@ impl CacheObserver for JsonlObserver {
                 serde_json::json!(metrics.candidate_read_transient_bytes);
             value["generation_duration_ms"] = serde_json::json!(metrics.generation_duration_ms);
             value["cache_read_duration_ms"] = serde_json::json!(metrics.cache_read_duration_ms);
+            value["joint_attention_context_duration_ms"] =
+                serde_json::json!(metrics.joint_attention_context_duration_ms);
+            value["reference_runtime_attribution_available"] =
+                serde_json::json!(metrics.reference_runtime_attribution_available);
             value["reused_requests"] = serde_json::json!(metrics.reused_requests);
             value["minimum_cache_reads"] = serde_json::json!(metrics.minimum_cache_reads);
         }
@@ -648,7 +654,9 @@ pub(crate) fn begin_flux_kv_read(reference: Option<FluxReferenceKv>) -> Option<F
 
 /// Finish the product attention read. The active allocator high-water is retained as exact
 /// evidence, but the shared joint-attention workspace is not credited as reference-cache savings.
-/// With no packed reader wired, the candidate must materialize the same exact dense reference K/V.
+/// The elapsed duration covers fused text + target + reference attention and is therefore sealed
+/// only as non-attributable context. With no packed reader wired, the candidate must materialize
+/// the same exact dense reference K/V.
 pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
     let Some(measurement) = measurement else {
         return;
@@ -662,8 +670,8 @@ pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
         metrics.candidate_read_transient_bytes = metrics
             .candidate_read_transient_bytes
             .max(measurement.dense_bytes);
-        metrics.cache_read_duration_ns = metrics
-            .cache_read_duration_ns
+        metrics.joint_attention_context_duration_ns = metrics
+            .joint_attention_context_duration_ns
             .saturating_add(measurement.started.elapsed().as_nanos());
         let layers = CONTEXT.with(|slot| {
             slot.borrow()
@@ -678,7 +686,7 @@ pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
     });
     observe_tensor_with_allocator(
         "cross-kv-read",
-        "DoubleAttention::attention(reference-kv-slice)",
+        "DoubleAttention::attention(joint-context-non-attributable)",
         0,
         current_transient,
         1,
@@ -812,14 +820,15 @@ fn observe_tensor_with_allocator(
                     })
                 })
             });
-        if phase == "cross-kv-read" && operation != "DoubleAttention::attention(reference-kv-slice)"
+        if phase == "cross-kv-read"
+            && operation != "DoubleAttention::attention(joint-context-non-attributable)"
         {
             MEASUREMENTS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
                 metrics.current_read_transient_bytes =
                     metrics.current_read_transient_bytes.max(transient_bytes);
-                metrics.cache_read_duration_ns = metrics
-                    .cache_read_duration_ns
+                metrics.joint_attention_context_duration_ns = metrics
+                    .joint_attention_context_duration_ns
                     .saturating_add(measured_duration.unwrap_or_default().as_nanos());
                 metrics.reused_requests = metrics.reused_requests.saturating_add(reused);
             });
@@ -865,7 +874,15 @@ fn observe_tensor_with_allocator(
                             .as_ref()
                             .map_or(0.0, |instant| instant.elapsed().as_secs_f64() * 1_000.0)
                     }),
-                    cache_read_duration_ms: measurement.cache_read_duration_ns as f64 / 1_000_000.0,
+                    // FLUX performs one fused joint attention over text, target image, and
+                    // reference image tokens. Its duration is useful execution context but cannot
+                    // be isolated as reference-K/V runtime, so the attributable duration is zero.
+                    cache_read_duration_ms: 0.0,
+                    joint_attention_context_duration_ms: measurement
+                        .joint_attention_context_duration_ns
+                        as f64
+                        / 1_000_000.0,
+                    reference_runtime_attribution_available: false,
                     reused_requests: measurement.reused_requests,
                     // FLUX owns one logical reference-conditioning payload for the coordinate;
                     // every observed recomputation is a read of that same product-owned payload.

@@ -47,7 +47,9 @@ class CampaignAdapterTests(unittest.TestCase):
             "current_persistent_bytes": 0, "current_read_transient_bytes": dense_reference,
             "candidate_persistent_bytes": 100 * 1024**2,
             "candidate_read_transient_bytes": dense_reference,
-            "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
+            "generation_duration_ms": 1000, "cache_read_duration_ms": 0,
+            "joint_attention_context_duration_ms": 100,
+            "reference_runtime_attribution_available": False,
             "reused_requests": 2, "minimum_cache_reads": 2,
         }
         base = {"sample_kind": "allocator", "peak_bytes": 10 * 1024**3}
@@ -71,10 +73,12 @@ class CampaignAdapterTests(unittest.TestCase):
             {"phase": "cross-kv-created", "operation": "DoubleAttention::to_k/to_v(reference-slice)",
              "persistent_bytes": 0, "transient_bytes": dense_reference, **base},
             {"phase": "cross-kv-read", "transient_bytes": dense_reference,
-             "operation": "DoubleAttention::attention(reference-kv-slice)", "reused": 1,
+             "operation": "DoubleAttention::attention(joint-context-non-attributable)",
+             "reused": 1,
              **allocator, **base},
             {"phase": "cross-kv-read", "transient_bytes": dense_reference,
-             "operation": "DoubleAttention::attention(reference-kv-slice)", "reused": 1,
+             "operation": "DoubleAttention::attention(joint-context-non-attributable)",
+             "reused": 1,
              **allocator, **base},
             {"phase": terminal, **base},
             metrics,
@@ -124,6 +128,33 @@ class CampaignAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "post-release remnant"):
             self.adapter.make_row(
                 self.row_args(), self.config(), "b" * 64, 1, broken_release
+            )
+
+    def test_reserved_high_must_cover_reserved_current_and_used_high(self):
+        for field in ("allocator_reserved_bytes", "allocator_high_bytes"):
+            broken = self.flux_events()
+            read = next(event for event in broken if event["phase"] == "cross-kv-read")
+            if field == "allocator_high_bytes":
+                read["allocator_reserved_bytes"] = read["allocator_after_bytes"]
+            read["peak_bytes"] = read[field] - 1
+            with self.assertRaisesRegex(ValueError, "allocator high-water/remnant ordering"):
+                self.adapter.make_row(
+                    self.row_args(), self.config(), "b" * 64, 1, broken
+                )
+
+    def test_flux_joint_duration_is_context_not_reference_runtime(self):
+        events = self.flux_events()
+        row = self.adapter.make_row(
+            self.row_args(), self.config(), "b" * 64, 1, events
+        )
+        self.assertFalse(row["reference_runtime_attribution_available"])
+        self.assertEqual(row["cache_read_duration_ms"], 0)
+        self.assertEqual(row["joint_attention_context_duration_ms"], 100)
+        metrics = next(event for event in events if event["phase"] == "metrics")
+        metrics["cache_read_duration_ms"] = metrics["joint_attention_context_duration_ms"]
+        with self.assertRaisesRegex(ValueError, "runtime duration|non-attributable"):
+            self.adapter.make_row(
+                self.row_args(), self.config(), "b" * 64, 1, events
             )
 
     def test_raw_receipt_sidecar_hashes_exact_unsigned_artifact(self):
@@ -355,6 +386,8 @@ class CampaignAdapterTests(unittest.TestCase):
              "candidate_persistent_bytes": 200 * 1024**2,
              "candidate_read_transient_bytes": 64 * 1024**2,
              "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
+             "joint_attention_context_duration_ms": 0,
+             "reference_runtime_attribution_available": True,
              "reused_requests": 4, "minimum_cache_reads": 2, **base},
             {"phase": "invalidated", **base},
             {"phase": "released", **measured(1024), **base},
@@ -483,7 +516,7 @@ class CampaignAdapterTests(unittest.TestCase):
                 "phase": "cross-kv-read", "sample_kind": "allocator",
                 "peak_bytes": 10 * 1024**3, "transient_bytes": transient,
                 "operation": (
-                    "DoubleAttention::attention(reference-kv-slice)"
+                    "DoubleAttention::attention(joint-context-non-attributable)"
                     if coordinate.family == "flux2-klein" else "wan-cross-attention"
                 ),
                 **measured,
@@ -557,7 +590,12 @@ class CampaignAdapterTests(unittest.TestCase):
                 "candidate_read_transient_bytes": (
                     exact_dense if coordinate.family == "flux2-klein" else 1
                 ), "generation_duration_ms": 1000,
-                "cache_read_duration_ms": 10, "reused_requests": 2,
+                "cache_read_duration_ms": 0 if coordinate.family == "flux2-klein" else 10,
+                "joint_attention_context_duration_ms": (
+                    10 if coordinate.family == "flux2-klein" else 0
+                ),
+                "reference_runtime_attribution_available": coordinate.family == "wan",
+                "reused_requests": 2,
                 "minimum_cache_reads": 2,
             }
 

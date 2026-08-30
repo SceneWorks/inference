@@ -41,6 +41,7 @@ class AttributionTests(unittest.TestCase):
         )
         exact_dense = self.reducer.dense_reference_kv_bytes(geometry)
         measured = {
+            "peak_bytes": 10 * 1024**3,
             "allocator_before_bytes": 1024,
             "allocator_after_bytes": 1024,
             "allocator_high_bytes": 1024 + (exact_dense if family == "flux2-klein" else 1),
@@ -59,7 +60,7 @@ class AttributionTests(unittest.TestCase):
         read_event = {
             "phase": "cross-kv-read",
             "operation": (
-                "DoubleAttention::attention(reference-kv-slice)"
+                "DoubleAttention::attention(joint-context-non-attributable)"
                 if family == "flux2-klein" else "wan-cross-attention"
             ),
             "transient_bytes": exact_dense if family == "flux2-klein" else 1,
@@ -95,7 +96,10 @@ class AttributionTests(unittest.TestCase):
                 else exact_candidate
             ),
             "candidate_read_transient_bytes": exact_dense if family == "flux2-klein" else 1,
-            "generation_duration_ms": 1000, "cache_read_duration_ms": 10,
+            "generation_duration_ms": 1000,
+            "cache_read_duration_ms": 0 if family == "flux2-klein" else 10,
+            "joint_attention_context_duration_ms": 10 if family == "flux2-klein" else 0,
+            "reference_runtime_attribution_available": family == "wan",
             "reused_requests": 2, "minimum_cache_reads": 2,
         }
         row.update(overrides)
@@ -154,6 +158,73 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(decision["allocator_peak_bytes"], 4 * 1024**3)
         self.assertEqual(decision["process_rss_peak_bytes"], 12 * 1024**3)
         self.assertNotIn("current_whole_process_bytes", decision)
+
+    def test_reserved_high_must_cover_reserved_current_and_used_high(self):
+        for field in ("allocator_reserved_bytes", "allocator_high_bytes"):
+            row = self.complete_rows()[0]
+            read = next(
+                event for event in row["observer_events"]
+                if event.get("phase") == "cross-kv-read"
+            )
+            if field == "allocator_high_bytes":
+                read["allocator_reserved_bytes"] = read["allocator_after_bytes"]
+            read["peak_bytes"] = read[field] - 1
+            with self.assertRaisesRegex(ValueError, "allocator high-water/remnant ordering"):
+                self.reducer.reduce([row])
+
+    def test_memory_qualified_path_does_not_require_attributable_runtime(self):
+        row = next(
+            item for item in self.complete_rows()
+            if item["family"] == "wan" and item["arm"] == "normal"
+        )
+        row.update({
+            "current_persistent_bytes": 700 * 1024**2,
+            "candidate_persistent_bytes": 100 * 1024**2,
+            "cache_read_duration_ms": 0,
+            "joint_attention_context_duration_ms": 0,
+            "reference_runtime_attribution_available": False,
+            "allocator_samples": [{"peak_bytes": 10 * 1024**3}],
+        })
+        decision = self.reducer.coordinate_decision(row)
+        self.assertTrue(decision["memory_qualified"])
+        self.assertFalse(decision["runtime_qualifies"])
+        self.assertEqual(decision["decision"], "go")
+
+    def test_runtime_only_path_requires_available_isolated_duration(self):
+        row = next(
+            item for item in self.complete_rows()
+            if item["family"] == "wan" and item["arm"] == "normal"
+        )
+        row.update({
+            "current_persistent_bytes": 400 * 1024**2,
+            "candidate_persistent_bytes": 0,
+            "current_read_transient_bytes": 1,
+            "candidate_read_transient_bytes": 1,
+            "generation_duration_ms": 1000,
+            "cache_read_duration_ms": 50,
+            "joint_attention_context_duration_ms": 0,
+            "reference_runtime_attribution_available": True,
+            "allocator_samples": [{"peak_bytes": 4 * 1024**3}],
+        })
+        decision = self.reducer.coordinate_decision(row)
+        self.assertFalse(decision["memory_qualified"])
+        self.assertTrue(decision["runtime_only_qualified"])
+        self.assertEqual(decision["decision"], "go")
+        row["reference_runtime_attribution_available"] = False
+        row["cache_read_duration_ms"] = 0
+        row["joint_attention_context_duration_ms"] = 900
+        decision = self.reducer.coordinate_decision(row)
+        self.assertFalse(decision["runtime_qualifies"])
+        self.assertEqual(decision["decision"], "no-go")
+
+    def test_reducer_never_infers_flux_reference_runtime_from_joint_context(self):
+        row = next(
+            item for item in self.complete_rows()
+            if item["family"] == "flux2-klein" and item["arm"] == "normal"
+        )
+        row["cache_read_duration_ms"] = row["joint_attention_context_duration_ms"]
+        with self.assertRaisesRegex(ValueError, "runtime duration|non-attributable"):
+            self.reducer.validate(row, self.source_map_hash)
 
     def test_family_decisions_are_separate_and_variant_scoped(self):
         rows = self.complete_rows()
@@ -263,6 +334,25 @@ class AttributionTests(unittest.TestCase):
         self.assertIn("self.forward_prepared_impl(hidden, &kv, rope, false)", transformer)
         self.assertIn("if !ACTIVE.with(|slot| slot.borrow().is_some())", observer)
         self.assertIn("slot.borrow_mut().remove(&cache_id)", observer)
+
+    def test_wan_observer_evidence_is_lazy_at_every_eager_construction_site(self):
+        root = SCRIPT.parents[1]
+        paths = (
+            "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+            "crates/media/candle-gen/candle-gen-wan/src/vace.rs",
+            "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs",
+            "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
+        )
+        for relative in paths:
+            source = (root / relative).read_text(encoding="utf-8")
+            self.assertIn("sc20686_observer::campaign_evidence(||", source, relative)
+        observer = (
+            root / "crates/media/candle-gen/candle-gen-wan/src/sc20686_observer.rs"
+        ).read_text(encoding="utf-8")
+        guard = observer.index("pub(crate) fn campaign_evidence")
+        inactive = observer.index("if !campaign_active()", guard)
+        build = observer.index("Some(build())", guard)
+        self.assertLess(inactive, build)
 
     def test_flux_source_map_anchors_live_double_attention_kv(self):
         source_map = json.loads(self.reducer.SOURCE_MAP.read_text(encoding="utf-8"))

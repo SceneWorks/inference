@@ -387,6 +387,9 @@ impl DoubleAttention {
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
 
         let campaign_read = crate::sc20686_observer::begin_flux_kv_read(campaign_reference);
+        // This is a fused joint attention over text, target-image, and reference-image tokens.
+        // The observer retains its duration only as non-attributable execution context; it must
+        // never be presented as isolated reference-K/V runtime.
         let o = attention(&q, &k, &v, hd, attention_plan)?; // [B, txt_seq+img_seq, inner]
         crate::sc20686_observer::record_flux_kv_read(campaign_read);
         let txt_out = o.narrow(1, 0, txt_seq)?;

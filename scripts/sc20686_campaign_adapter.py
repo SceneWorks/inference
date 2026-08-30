@@ -206,17 +206,21 @@ def active_allocator_measurement(event, label):
             "allocator_reserved_bytes",
         )
     }
+    reserved_high = event.get("peak_bytes")
     if event.get("allocator_measurement_available") is not True or any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in values.values()
+        for value in (*values.values(), reserved_high)
     ):
         raise ValueError(f"{label} lacks active allocator high-water evidence")
     if (
         values["allocator_high_bytes"] < values["allocator_before_bytes"]
         or values["allocator_high_bytes"] < values["allocator_after_bytes"]
         or values["allocator_reserved_bytes"] < values["allocator_after_bytes"]
+        or reserved_high < values["allocator_reserved_bytes"]
+        or reserved_high < values["allocator_high_bytes"]
     ):
         raise ValueError(f"{label} allocator high-water/remnant ordering is invalid")
+    values["reserved_high_bytes"] = reserved_high
     return values
 
 
@@ -552,8 +556,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     metric_keys = (
         "current_persistent_bytes", "current_read_transient_bytes",
         "candidate_persistent_bytes", "candidate_read_transient_bytes",
-        "generation_duration_ms", "cache_read_duration_ms", "reused_requests",
-        "minimum_cache_reads",
+        "generation_duration_ms", "cache_read_duration_ms",
+        "joint_attention_context_duration_ms", "reused_requests", "minimum_cache_reads",
     )
     if any(
         not isinstance(metrics.get(key), (int, float))
@@ -563,6 +567,18 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         for key in metric_keys
     ):
         raise ValueError("entrypoint metrics are incomplete")
+    runtime_attribution_available = metrics.get("reference_runtime_attribution_available")
+    if not isinstance(runtime_attribution_available, bool):
+        raise ValueError("entrypoint reference runtime attribution availability is missing")
+    if (
+        metrics["cache_read_duration_ms"] > metrics["generation_duration_ms"]
+        or metrics["joint_attention_context_duration_ms"] > metrics["generation_duration_ms"]
+        or (
+            runtime_attribution_available is False
+            and metrics["cache_read_duration_ms"] != 0
+        )
+    ):
+        raise ValueError("entrypoint runtime duration exceeds the generation")
     phases = [event.get("phase") for event in events]
     required = {"generation-start", "cross-kv-created", "cross-kv-read", "invalidated", "released"}
     terminal = "cancelled" if args.cancel_campaign else "generation-end"
@@ -610,6 +626,12 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     release_remnant = events[indices["released"]]
     active_allocator_measurement(release_remnant, "post-release remnant")
     if args.family == "flux2-klein":
+        if (
+            runtime_attribution_available is not False
+            or metrics["cache_read_duration_ms"] != 0
+            or metrics["joint_attention_context_duration_ms"] <= 0
+        ):
+            raise ValueError("FLUX joint attention must remain non-attributable runtime context")
         if metrics["current_persistent_bytes"] != 0 or any(event.get("persistent_bytes") != 0 for event in create_events):
             raise ValueError("FLUX edit must report its non-persistent route honestly")
         if (
@@ -621,7 +643,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
             event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
             for event in create_events
         ) or any(
-            event.get("operation") != "DoubleAttention::attention(reference-kv-slice)"
+            event.get("operation")
+            != "DoubleAttention::attention(joint-context-non-attributable)"
             for event in read_events
         ):
             raise ValueError("FLUX evidence is not anchored at exact DoubleAttention K/V boundaries")
@@ -636,6 +659,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         for event in read_events:
             active_allocator_measurement(event, "FLUX attention read")
     else:
+        if runtime_attribution_available and metrics["joint_attention_context_duration_ms"] != 0:
+            raise ValueError("Wan attributable runtime cannot also claim joint context")
         if metrics["reused_requests"] != observed_reuse:
             raise ValueError("reuse metric differs from product-owned read events")
         if metrics["current_persistent_bytes"] == 0:
@@ -756,6 +781,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         "real_weights": True,
         "full_generation": metadata["full_generation"],
         "attention_kind": "cross",
+        "reference_runtime_attribution_available": runtime_attribution_available,
         **{key: metrics[key] for key in metric_keys},
         "observer_events": events,
     }

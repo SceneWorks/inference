@@ -35,7 +35,8 @@ REQUIRED = (
     "real_weights", "full_generation", "attention_kind", "current_persistent_bytes",
     "current_read_transient_bytes", "candidate_persistent_bytes",
     "candidate_read_transient_bytes", "generation_duration_ms",
-    "cache_read_duration_ms", "reused_requests", "minimum_cache_reads",
+    "cache_read_duration_ms", "joint_attention_context_duration_ms",
+    "reference_runtime_attribution_available", "reused_requests", "minimum_cache_reads",
 )
 
 
@@ -88,17 +89,21 @@ def active_allocator_measurement(event, label):
         "allocator_reserved_bytes",
     )
     values = {field: event.get(field) for field in fields}
+    reserved_high = event.get("peak_bytes")
     if event.get("allocator_measurement_available") is not True or any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in values.values()
+        for value in (*values.values(), reserved_high)
     ):
         fail(f"{label} lacks active allocator high-water evidence")
     if (
         values["allocator_high_bytes"] < values["allocator_before_bytes"]
         or values["allocator_high_bytes"] < values["allocator_after_bytes"]
         or values["allocator_reserved_bytes"] < values["allocator_after_bytes"]
+        or reserved_high < values["allocator_reserved_bytes"]
+        or reserved_high < values["allocator_high_bytes"]
     ):
         fail(f"{label} allocator high-water/remnant ordering is invalid")
+    values["reserved_high_bytes"] = reserved_high
     return values
 
 
@@ -285,7 +290,9 @@ def validate(row, expected_source_map_hash):
         if (
             any(event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
                 or event.get("transient_bytes") != exact_dense for event in created)
-            or any(event.get("operation") != "DoubleAttention::attention(reference-kv-slice)"
+            or any(
+                   event.get("operation")
+                   != "DoubleAttention::attention(joint-context-non-attributable)"
                    or event.get("transient_bytes") != exact_dense for event in reads)
             or row["current_read_transient_bytes"] != exact_dense
             or row["candidate_read_transient_bytes"] != exact_dense
@@ -312,12 +319,34 @@ def validate(row, expected_source_map_hash):
     for field in (
         "model_snapshot_bytes", "current_persistent_bytes", "current_read_transient_bytes",
         "candidate_persistent_bytes", "candidate_read_transient_bytes",
-        "generation_duration_ms", "cache_read_duration_ms", "reused_requests",
-        "minimum_cache_reads",
+        "generation_duration_ms", "cache_read_duration_ms",
+        "joint_attention_context_duration_ms", "reused_requests", "minimum_cache_reads",
     ):
         require_nonnegative(row[field], field)
-    if row["generation_duration_ms"] == 0 or row["cache_read_duration_ms"] > row["generation_duration_ms"]:
+    if not isinstance(row["reference_runtime_attribution_available"], bool):
+        fail("invalid reference runtime attribution availability")
+    if (
+        row["generation_duration_ms"] == 0
+        or row["cache_read_duration_ms"] > row["generation_duration_ms"]
+        or row["joint_attention_context_duration_ms"] > row["generation_duration_ms"]
+        or (
+            row["reference_runtime_attribution_available"] is False
+            and row["cache_read_duration_ms"] != 0
+        )
+    ):
         fail("invalid runtime duration")
+    if row["family"] == "flux2-klein":
+        if (
+            row["reference_runtime_attribution_available"] is not False
+            or row["cache_read_duration_ms"] != 0
+            or row["joint_attention_context_duration_ms"] <= 0
+        ):
+            fail("FLUX joint attention must remain non-attributable runtime context")
+    elif (
+        row["reference_runtime_attribution_available"]
+        and row["joint_attention_context_duration_ms"] != 0
+    ):
+        fail("Wan attributable runtime cannot also claim joint context")
     for sample in row["allocator_samples"] + row["process_samples"]:
         require_nonnegative(sample.get("peak_bytes"), "sample peak_bytes")
         if sample["peak_bytes"] <= 0:
@@ -378,7 +407,11 @@ def coordinate_decision(row):
     current_total = row["current_persistent_bytes"] + row["current_read_transient_bytes"]
     candidate_total = row["candidate_persistent_bytes"] + row["candidate_read_transient_bytes"]
     net_total_saving = current_total - candidate_total
-    runtime_fraction = row["cache_read_duration_ms"] / row["generation_duration_ms"]
+    runtime_available = row["reference_runtime_attribution_available"]
+    runtime_fraction = (
+        row["cache_read_duration_ms"] / row["generation_duration_ms"]
+        if runtime_available else 0.0
+    )
     persistent_opportunity = (
         row["current_persistent_bytes"] >= THRESHOLDS["opportunity_bytes"]
         and row["current_persistent_bytes"] >= allocator_peak * THRESHOLDS["opportunity_peak_pct"]
@@ -387,27 +420,30 @@ def coordinate_decision(row):
         row["current_read_transient_bytes"] >= THRESHOLDS["opportunity_bytes"]
         and row["current_read_transient_bytes"] >= allocator_peak * THRESHOLDS["opportunity_peak_pct"]
     )
-    persistent_reduction = (
-        persistent_opportunity
-        and persistent_saving >= THRESHOLDS["saving_bytes"]
+    persistent_saving_qualifies = (
+        persistent_saving >= THRESHOLDS["saving_bytes"]
         and persistent_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
     )
-    transient_reduction = (
-        transient_opportunity
-        and transient_saving >= THRESHOLDS["saving_bytes"]
+    transient_saving_qualifies = (
+        transient_saving >= THRESHOLDS["saving_bytes"]
         and transient_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
     )
+    persistent_reduction = persistent_opportunity and persistent_saving_qualifies
+    transient_reduction = transient_opportunity and transient_saving_qualifies
     reads_qualify = row["minimum_cache_reads"] >= THRESHOLDS["minimum_reads_per_cache"]
-    runtime_qualifies = runtime_fraction >= THRESHOLDS["runtime_only_pct"]
+    runtime_qualifies = (
+        runtime_available and runtime_fraction >= THRESHOLDS["runtime_only_pct"]
+    )
     net_total_reduction = (
         net_total_saving >= THRESHOLDS["saving_bytes"]
         and net_total_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
     )
-    eligible = (
-        reads_qualify
-        and runtime_qualifies
-        and (persistent_reduction or transient_reduction)
-        and net_total_reduction
+    memory_qualified = persistent_reduction or transient_reduction
+    runtime_only_qualified = runtime_qualifies and (
+        persistent_saving_qualifies or transient_saving_qualifies
+    )
+    eligible = reads_qualify and net_total_reduction and (
+        memory_qualified or runtime_only_qualified
     )
     return {
         "decision": "go" if eligible else "no-go",
@@ -423,6 +459,11 @@ def coordinate_decision(row):
         "net_total_reduction_qualifies": net_total_reduction,
         "persistent_reduction_qualifies": persistent_reduction,
         "read_transient_reduction_qualifies": transient_reduction,
+        "persistent_saving_qualifies": persistent_saving_qualifies,
+        "read_transient_saving_qualifies": transient_saving_qualifies,
+        "memory_qualified": memory_qualified,
+        "runtime_only_qualified": runtime_only_qualified,
+        "reference_runtime_attribution_available": runtime_available,
         "cache_read_runtime_fraction": runtime_fraction,
         "runtime_qualifies": runtime_qualifies,
         "minimum_cache_reads": row["minimum_cache_reads"],

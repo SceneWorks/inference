@@ -178,17 +178,29 @@ impl Pipeline {
         // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [1,3,F,H,W].
         let control_video = self.preprocess_clip(clip.frames, width, height)?;
         let mask = self.preprocess_clip(clip.mask, width, height)?;
-        crate::sc20686_observer::observe_tensor(
-            "prefill-peak",
-            "control-mask-prepared",
-            (control_video.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
-            (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
-            0,
-            format!("{:?};{:?}", control_video.dims(), mask.dims()),
-            format!("{:?}", control_video.dtype()),
-            "control-mask",
-            "applied",
-        );
+        if let Some((persistent, transient, shape, dtype)) =
+            crate::sc20686_observer::campaign_evidence(|| {
+                (
+                    (control_video.elem_count() as u64)
+                        .saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
+                    (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
+                    format!("{:?};{:?}", control_video.dims(), mask.dims()),
+                    format!("{:?}", control_video.dtype()),
+                )
+            })
+        {
+            crate::sc20686_observer::observe_tensor(
+                "prefill-peak",
+                "control-mask-prepared",
+                persistent,
+                transient,
+                0,
+                shape,
+                dtype,
+                "control-mask",
+                "applied",
+            );
+        }
         let mask = ((mask + 1.0)? * 0.5)?; // (m+1)/2 ∈ [0,1]
 
         // Reference images (optional) → [1,3,1,H,W] each.

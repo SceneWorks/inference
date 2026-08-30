@@ -264,18 +264,30 @@ impl Pipeline {
         let mask_latents = prepare_masks(&mask, self.vace_cfg.base.patch.1, num_ref)?;
         let control = build_vace_control(&video_latents, &mask_latents)?;
         let (_, _, t, h, w) = control.dims5()?;
-        crate::sc20686_observer::observe_tensor(
-            "prefill-peak",
-            "vace-control-prepared",
-            (control.elem_count() as u64).saturating_mul(control.dtype().size_in_bytes() as u64),
-            (mask_latents.elem_count() as u64)
-                .saturating_mul(mask_latents.dtype().size_in_bytes() as u64),
-            0,
-            format!("{:?};{:?}", control.dims(), mask_latents.dims()),
-            format!("{:?}", control.dtype()),
-            "control-mask",
-            "applied",
-        );
+        if let Some((persistent, transient, shape, dtype)) =
+            crate::sc20686_observer::campaign_evidence(|| {
+                (
+                    (control.elem_count() as u64)
+                        .saturating_mul(control.dtype().size_in_bytes() as u64),
+                    (mask_latents.elem_count() as u64)
+                        .saturating_mul(mask_latents.dtype().size_in_bytes() as u64),
+                    format!("{:?};{:?}", control.dims(), mask_latents.dims()),
+                    format!("{:?}", control.dtype()),
+                )
+            })
+        {
+            crate::sc20686_observer::observe_tensor(
+                "prefill-peak",
+                "vace-control-prepared",
+                persistent,
+                transient,
+                0,
+                shape,
+                dtype,
+                "control-mask",
+                "applied",
+            );
+        }
         let (pt, ph, pw) = self.vace_cfg.base.patch;
         let (cos, sin) =
             WanRope::new(&self.vace_cfg.base).cos_sin(t / pt, h / ph, w / pw, &self.device)?;

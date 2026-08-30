@@ -490,6 +490,8 @@ impl CacheObserver for JsonlObserver {
                 .with(|slot| *slot.borrow())
                 .max(read_ms as f64)
                 .max(0.001));
+            value["joint_attention_context_duration_ms"] = serde_json::json!(0.0);
+            value["reference_runtime_attribution_available"] = serde_json::json!(true);
             value["reused_requests"] = serde_json::json!(reused);
             value["minimum_cache_reads"] = serde_json::json!(minimum_cache_reads);
             value["real_weights"] = serde_json::json!(event
@@ -1130,6 +1132,16 @@ pub fn observe_tensor(
         }
     });
 }
+
+/// Construct campaign-only evidence lazily. The closure is never evaluated when no campaign
+/// observer is installed, so product execution does not pay for geometry walks, byte accounting,
+/// or string formatting on the disabled path.
+pub(crate) fn campaign_evidence<T>(build: impl FnOnce() -> T) -> Option<T> {
+    if !campaign_active() {
+        return None;
+    }
+    Some(build())
+}
 pub fn observe_cancelled() {
     // A deliberate cancellation arm is only meaningful after a product-owned live K/V read.
     // This prevents preflight/request validation failures from masquerading as cancellation runs.
@@ -1468,6 +1480,14 @@ mod tests {
             CountInto(conversions.clone()),
         );
         assert_eq!(conversions.get(), 0);
+        let evidence_builds = std::rc::Rc::new(Cell::new(0));
+        let counter = evidence_builds.clone();
+        assert!(campaign_evidence(|| {
+            counter.set(counter.get() + 1);
+            "evidence"
+        })
+        .is_none());
+        assert_eq!(evidence_builds.get(), 0);
         assert_eq!(LIVE_PERSISTENT.with(|slot| *slot.borrow()), 0);
         assert_eq!(CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow()), 0);
     }
