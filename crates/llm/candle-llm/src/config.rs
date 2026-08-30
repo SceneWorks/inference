@@ -769,8 +769,9 @@ impl ModelConfig {
     pub fn from_json(top: &Value) -> Result<Self> {
         let architecture = Architecture::from_config(top)?;
         // Qwen3-VL and Gemma 4 nest the decoder fields under `text_config` (the VLM wrapper); read
-        // decoder numerics / RoPE from there, but `tie_word_embeddings` and the `quantization` block
-        // stay at the top level. All other architectures read everything from the top.
+        // decoder numerics / RoPE from there. `tie_word_embeddings` stays at the top level. A
+        // quantization block may be top-level for prepared dense snapshots or nested beside the
+        // decoder fields for an MLX affine packed text encoder.
         let v = if architecture.nests_text_config() {
             top.get("text_config").unwrap_or(top)
         } else {
@@ -832,9 +833,15 @@ impl ModelConfig {
         // prepared Q4/Q8 snapshot yields a genuinely quantized model.
         let quantization = top
             .get("quantization")
-            .and_then(|q| q.get("bits"))
-            .and_then(|b| b.as_u64())
-            .and_then(|bits| QuantSpec::from_bits(bits as u32));
+            .or_else(|| v.get("quantization"))
+            .and_then(|q| {
+                let bits = q.get("bits")?.as_u64()? as u32;
+                let group_size = q
+                    .get("group_size")
+                    .and_then(|group| group.as_u64())
+                    .unwrap_or(64) as usize;
+                QuantSpec::from_bits_and_group_size(bits, group_size)
+            });
 
         // Mixture-of-Experts FFN params: present iff a routed-expert count is configured
         // (`num_experts` for Qwen2-MoE, `n_routed_experts` for DeepSeek-V2).
@@ -1452,6 +1459,23 @@ mod tests {
             "num_attention_heads": 2, "vocab_size": 32, "quantization": { "bits": 5 }
         });
         assert_eq!(ModelConfig::from_json(&bogus).unwrap().quantization, None);
+
+        let nested = json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "model_type": "gemma4_unified_text", "hidden_size": 8,
+                "intermediate_size": 16, "num_hidden_layers": 2,
+                "num_attention_heads": 2, "vocab_size": 32,
+                "quantization": { "bits": 8, "group_size": 32 }
+            }
+        });
+        let nested = ModelConfig::from_json(&nested)
+            .unwrap()
+            .quantization
+            .unwrap();
+        assert_eq!(nested.bits(), 8);
+        assert_eq!(nested.group_size(), 32);
     }
 
     #[test]
