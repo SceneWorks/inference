@@ -221,6 +221,11 @@ static EVIDENCE_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
+thread_local! {
+    static RETAINED_BYTE_ACCOUNTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 static CROSS_KV_PREPARATION_PAIRS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -315,12 +320,15 @@ impl Attention {
         };
         let key = to_heads(&k)?;
         let value = to_heads(&v)?;
-        let retained_bytes = [&key, &value].iter().fold(0u64, |bytes, tensor| {
-            bytes.saturating_add(
-                (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size_in_bytes() as u64),
-            )
-        });
         let cache_id = if observe_cross_attention {
+            #[cfg(test)]
+            RETAINED_BYTE_ACCOUNTINGS.with(|count| count.set(count.get() + 1));
+            let retained_bytes = [&key, &value].iter().fold(0u64, |bytes, tensor| {
+                bytes.saturating_add(
+                    (tensor.elem_count() as u64)
+                        .saturating_mul(tensor.dtype().size_in_bytes() as u64),
+                )
+            });
             let candidate_bytes = crate::sc20686_observer::checked_packed_group_affine_kv_bytes(
                 b as u64,
                 self.num_heads as u64,
@@ -1155,6 +1163,23 @@ mod tests {
         put("scale_shift_table", &[1, 2, d]);
         let vb = VarBuilder::from_tensors(m, DType::F32, dev);
         WanTransformer::new(cfg, vb).unwrap()
+    }
+
+    #[test]
+    fn observer_off_skips_retained_kv_byte_accounting() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let context = Tensor::zeros((1, 3, cfg.dim), DType::F32, &dev).unwrap();
+        RETAINED_BYTE_ACCOUNTINGS.with(|count| count.set(0));
+
+        let _prepared = dit.blocks[0].prepare_cross_kv(&context).unwrap();
+
+        assert_eq!(
+            RETAINED_BYTE_ACCOUNTINGS.with(std::cell::Cell::get),
+            0,
+            "inactive campaign must not compute retained K/V evidence bytes"
+        );
     }
 
     /// Max-abs bound for a **chunked-vs-un-chunked SDPA** comparison (SC-15943). Query-row chunking is

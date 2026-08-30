@@ -346,6 +346,14 @@ class AttributionTests(unittest.TestCase):
         for relative in paths:
             source = (root / relative).read_text(encoding="utf-8")
             self.assertIn("sc20686_observer::campaign_evidence(||", source, relative)
+        transformer = (root / paths[0]).read_text(encoding="utf-8")
+        prepare = transformer.index("fn prepare_kv_impl(")
+        guard = transformer.index("let cache_id = if observe_cross_attention {", prepare)
+        retained = transformer.index("let retained_bytes =", prepare)
+        register = transformer.index("sc20686_observer::register_cache(", prepare)
+        self.assertNotIn("let retained_bytes =", transformer[prepare:guard])
+        self.assertLess(guard, retained)
+        self.assertLess(retained, register)
         observer = (
             root / "crates/media/candle-gen/candle-gen-wan/src/sc20686_observer.rs"
         ).read_text(encoding="utf-8")
