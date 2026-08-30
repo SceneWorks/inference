@@ -106,7 +106,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -119,7 +119,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
         )
     }
@@ -165,7 +165,12 @@ mod tests {
         assert!(snapshot.generator_ids.is_empty());
         assert_eq!(
             snapshot.text_llm_ids,
-            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
         );
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
@@ -275,7 +280,7 @@ mod tests {
             super::PLATFORM,
             super::BACKEND,
             super::media_registry(),
-            super::llm::text_registry(),
+            super::llm::cuda_text_registry(),
             super::llm::snapshot_preparer_registry(),
             runtime_catalog::AudioLane {
                 backend: super::AUDIO_BACKEND,
