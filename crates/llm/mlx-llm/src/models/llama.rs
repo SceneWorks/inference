@@ -61,7 +61,9 @@ use crate::primitives::nn::{
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::quant::QuantizedLinear;
 use crate::primitives::rope::{apply_rope, Rope};
-use crate::primitives::{ContiguousKvCache, PagedKvCache, Weights};
+use crate::primitives::{
+    select_decoder_cache, ContiguousKvCache, PackedCacheRequest, PagedKvCache, Weights,
+};
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;
@@ -922,7 +924,10 @@ impl CausalLm {
 
 impl crate::decode::Decode for CausalLm {
     fn make_cache(&self) -> Box<dyn KvCache> {
-        Box::new(self.new_cache())
+        // Every decoder now crosses the experimental cache factory before its first mutation.
+        // The explicit override remains off by default, so this returns the identical established
+        // contiguous cache while preserving a single, testable future selection seam.
+        select_decoder_cache(PackedCacheRequest::disabled(self.cfg.num_layers)).into_cache()
     }
 
     fn step(&self, input_ids: &Array, cache: &mut dyn KvCache, offset: i32) -> Result<Array> {
