@@ -332,13 +332,14 @@ impl VaeRemapBackend {
         (k, is_conv_weight)
     }
 
-    /// Permute a tier conv weight `[O,kt,kh,kw,I]` → crate `[O,I,kt,kh,kw]`.
+    /// Permute a tier channels-last conv weight back to Candle's channels-first layout.
     fn permute_conv(w: Tensor) -> candle_gen::candle_core::Result<Tensor> {
-        if w.rank() == 5 {
-            w.permute((0, 4, 1, 2, 3))?.contiguous()
-        } else {
-            // A 1-D conv (rare) or already-torch-layout weight: leave as-is.
-            Ok(w)
+        match w.rank() {
+            // Conv3d `[O,kt,kh,kw,I]` → `[O,I,kt,kh,kw]`.
+            5 => w.permute((0, 4, 1, 2, 3))?.contiguous(),
+            // Conv2d `[O,kh,kw,I]` → `[O,I,kh,kw]`.
+            4 => w.permute((0, 3, 1, 2))?.contiguous(),
+            _ => Ok(w),
         }
     }
 }
@@ -438,6 +439,247 @@ impl candle_gen::candle_nn::var_builder::SimpleBackend for VaeEncoderRemapBacken
         let (k, _) = Self::remap(name);
         self.inner.contains_tensor(&k)
     }
+}
+
+/// Inverse of `mlx-gen-ltx::convert::sanitize_audio_vae`: the converted component drops the
+/// `audio_vae.decoder.` wrapper, renames the two statistics with a leading underscore, and stores
+/// Conv2d kernels channels-last. The Candle decoder deliberately keeps the released-checkpoint
+/// namespace, so the bridge belongs at the component boundary rather than inside the decoder.
+struct AudioVaeRemapBackend {
+    inner: VarBuilder<'static>,
+}
+
+impl AudioVaeRemapBackend {
+    fn remap(key: &str) -> (String, bool) {
+        let k = key
+            .strip_prefix("audio_vae.decoder.")
+            .or_else(|| key.strip_prefix("audio_vae."))
+            .unwrap_or(key)
+            .replace(
+                "per_channel_statistics.mean-of-means",
+                "per_channel_statistics._mean_of_means",
+            )
+            .replace(
+                "per_channel_statistics.std-of-means",
+                "per_channel_statistics._std_of_means",
+            );
+        let is_conv = k.ends_with(".conv.weight");
+        (k, is_conv)
+    }
+
+    fn load(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let (key, is_conv) = Self::remap(name);
+        let tensor = self
+            .inner
+            .get_unchecked_dtype(&key, dtype)?
+            .to_device(dev)?;
+        if is_conv {
+            VaeRemapBackend::permute_conv(tensor)
+        } else {
+            Ok(tensor)
+        }
+    }
+}
+
+impl candle_gen::candle_nn::var_builder::SimpleBackend for AudioVaeRemapBackend {
+    fn get(
+        &self,
+        shape: candle_gen::candle_core::Shape,
+        name: &str,
+        _hints: candle_gen::candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let tensor = self.load(name, dtype, dev)?;
+        if tensor.shape() != &shape {
+            candle_gen::candle_core::bail!(
+                "shape mismatch for {name}: expected {:?}, got {:?}",
+                shape.dims(),
+                tensor.dims()
+            )
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        self.load(name, dtype, dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        let (key, _) = Self::remap(name);
+        self.inner.contains_tensor(&key)
+    }
+}
+
+/// Inverse of `mlx-gen-ltx::convert::sanitize_vocoder`: every `vocoder.` segment was removed and
+/// every rank-3 convolution was stored channels-last. Transposed-convolution `ups.*.weight` uses a
+/// different inverse permutation from ordinary Conv1d weights.
+struct VocoderRemapBackend {
+    inner: VarBuilder<'static>,
+}
+
+impl VocoderRemapBackend {
+    fn remap(key: &str) -> (String, bool, bool) {
+        let converted = key.replace("vocoder.", "");
+        let rank3_weight = converted.contains("weight");
+        let transposed = converted.contains("ups");
+        (converted, rank3_weight, transposed)
+    }
+
+    fn permute_weight(tensor: Tensor, transposed: bool) -> candle_gen::candle_core::Result<Tensor> {
+        if transposed {
+            // Converted ConvTranspose1d `[O,K,I]` → released/Candle `[I,O,K]`.
+            tensor.permute((2, 0, 1))?.contiguous()
+        } else {
+            // Converted Conv1d `[O,K,I]` → released/Candle `[O,I,K]`.
+            tensor.permute((0, 2, 1))?.contiguous()
+        }
+    }
+
+    fn load(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let (key, rank3_weight, transposed) = Self::remap(name);
+        let tensor = self
+            .inner
+            .get_unchecked_dtype(&key, dtype)?
+            .to_device(dev)?;
+        if !rank3_weight || tensor.rank() != 3 {
+            return Ok(tensor);
+        }
+        Self::permute_weight(tensor, transposed)
+    }
+}
+
+impl candle_gen::candle_nn::var_builder::SimpleBackend for VocoderRemapBackend {
+    fn get(
+        &self,
+        shape: candle_gen::candle_core::Shape,
+        name: &str,
+        _hints: candle_gen::candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        let tensor = self.load(name, dtype, dev)?;
+        if tensor.shape() != &shape {
+            candle_gen::candle_core::bail!(
+                "shape mismatch for {name}: expected {:?}, got {:?}",
+                shape.dims(),
+                tensor.dims()
+            )
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        self.load(name, dtype, dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        let (key, _, _) = Self::remap(name);
+        self.inner.contains_tensor(&key)
+    }
+}
+
+/// Builders for SceneWorks-converted LTX-2.5 components. They are path-based so the resolved
+/// `LoadSpec` remains authoritative; the tier manifest validates the directory, while explicit
+/// component selection still chooses the exact file that is mapped.
+pub(crate) fn ltx25_transformer_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(rename_vb(inner, dtype, device, remap_transformer_key))
+}
+
+pub(crate) fn ltx25_connector_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(rename_vb(inner, dtype, device, strip_diffusion_prefix))
+}
+
+pub(crate) fn ltx25_vae_decoder_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(VarBuilder::from_backend(
+        Box::new(VaeRemapBackend { inner }),
+        dtype,
+        device.clone(),
+    ))
+}
+
+pub(crate) fn ltx25_vae_encoder_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(VarBuilder::from_backend(
+        Box::new(VaeEncoderRemapBackend { inner }),
+        dtype,
+        device.clone(),
+    ))
+}
+
+pub(crate) fn ltx25_diff_vae_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<(VarBuilder<'static>, VarBuilder<'static>)> {
+    let body = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    let stats = rename_vb(body.clone(), dtype, device, remap_diff_vae_stat_key);
+    Ok((body, stats))
+}
+
+pub(crate) fn ltx25_audio_vae_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(VarBuilder::from_backend(
+        Box::new(AudioVaeRemapBackend { inner }),
+        dtype,
+        device.clone(),
+    ))
+}
+
+pub(crate) fn ltx25_vocoder_vb(
+    path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> CResult<VarBuilder<'static>> {
+    let inner = candle_gen::mmap_var_builder(&[path.to_path_buf()], dtype, device)?;
+    Ok(VarBuilder::from_backend(
+        Box::new(VocoderRemapBackend { inner }),
+        dtype,
+        device.clone(),
+    ))
 }
 
 // =================================================================================================
@@ -1581,6 +1823,14 @@ fn json_bool(source: &Path, value: &serde_json::Value, key: &str) -> CResult<boo
 mod tests {
     use super::*;
 
+    fn write_f32(path: &Path, key: &str, shape: Vec<usize>) {
+        let data = vec![0_u8; shape.iter().product::<usize>() * std::mem::size_of::<f32>()];
+        let view = safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, &data)
+            .expect("valid fixture view");
+        safetensors::serialize_to_file(vec![(key, view)], None, path)
+            .expect("write fixture safetensors");
+    }
+
     /// The transformer remap turns every crate DiT key into the audited tier spelling (sc-9545) — the
     /// exact `to_out.0`/`ff.net.*`/`linear_*` → `to_out`/`proj_in`/`proj_out`/`linear1/2` rewrites the
     /// hf-header audit of `SceneWorks/ltx-2.3-mlx` q4 found, plus the `model.diffusion_model.` strip.
@@ -1634,6 +1884,10 @@ mod tests {
         assert_eq!(
             remap_transformer_key("model.diffusion_model.patchify_proj.weight"),
             "patchify_proj.weight"
+        );
+        assert_eq!(
+            remap_transformer_key("model.diffusion_model.keyframes_abs_pos_embedding"),
+            "keyframes_abs_pos_embedding"
         );
         assert_eq!(
             remap_transformer_key("model.diffusion_model.transformer_blocks.0.attn1.to_q.scales"),
@@ -1699,6 +1953,39 @@ mod tests {
         assert_eq!(k, "per_channel_statistics._std_of_means");
     }
 
+    #[test]
+    fn audio_vae_remap_matches_converted_component_layout() {
+        let (key, conv) =
+            AudioVaeRemapBackend::remap("audio_vae.decoder.up.2.block.0.conv1.conv.weight");
+        assert_eq!(key, "up.2.block.0.conv1.conv.weight");
+        assert!(conv);
+        let (key, conv) = AudioVaeRemapBackend::remap("audio_vae.decoder.conv_out.conv.bias");
+        assert_eq!(key, "conv_out.conv.bias");
+        assert!(!conv);
+        let (key, _) =
+            AudioVaeRemapBackend::remap("audio_vae.per_channel_statistics.mean-of-means");
+        assert_eq!(key, "per_channel_statistics._mean_of_means");
+        let (key, _) = AudioVaeRemapBackend::remap("audio_vae.per_channel_statistics.std-of-means");
+        assert_eq!(key, "per_channel_statistics._std_of_means");
+    }
+
+    #[test]
+    fn vocoder_remap_matches_converted_component_layout() {
+        let (key, weight, transposed) =
+            VocoderRemapBackend::remap("vocoder.vocoder.conv_pre.weight");
+        assert_eq!(key, "conv_pre.weight");
+        assert!(weight);
+        assert!(!transposed);
+        let (key, weight, transposed) =
+            VocoderRemapBackend::remap("vocoder.bwe_generator.ups.0.weight");
+        assert_eq!(key, "bwe_generator.ups.0.weight");
+        assert!(weight);
+        assert!(transposed);
+        let (key, weight, _) = VocoderRemapBackend::remap("vocoder.mel_stft.mel_basis");
+        assert_eq!(key, "mel_stft.mel_basis");
+        assert!(!weight);
+    }
+
     /// The permute turns a tier channels-last conv `[O,kt,kh,kw,I]` into the crate `[O,I,kt,kh,kw]`.
     #[test]
     fn conv_permute_channels_last_to_torch() -> candle_gen::candle_core::Result<()> {
@@ -1728,6 +2015,66 @@ mod tests {
                 }
             }
         }
+        // The same converter also stores Conv2d `[O,kh,kw,I]`; audio/video bridges share this
+        // inverse and must recover `[O,I,kh,kw]`.
+        let w2 = Tensor::zeros((2, 3, 5, 4), DType::F32, &Device::Cpu)?;
+        let p2 = VaeRemapBackend::permute_conv(w2)?;
+        assert_eq!(p2.dims(), &[2, 4, 3, 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn vocoder_permute_restores_conv_and_transposed_conv_layouts(
+    ) -> candle_gen::candle_core::Result<()> {
+        use candle_gen::candle_core::Device;
+
+        let conv = Tensor::zeros((8, 3, 4), DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            VocoderRemapBackend::permute_weight(conv, false)?.dims(),
+            &[8, 4, 3]
+        );
+
+        let transposed = Tensor::zeros((6, 5, 7), DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            VocoderRemapBackend::permute_weight(transposed, true)?.dims(),
+            &[7, 6, 5]
+        );
+        Ok(())
+    }
+
+    /// Regression for the terminal Blackwell failure: production builders must apply the inverse
+    /// converter namespace/layout, not ask a rootless component for released prefixed keys.
+    #[test]
+    fn converted_component_builders_reach_rootless_tensors() -> CResult<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = Device::Cpu;
+
+        let transformer = dir.path().join("transformer.safetensors");
+        write_f32(&transformer, "keyframes_abs_pos_embedding", vec![1, 4]);
+        let dit =
+            ltx25_transformer_vb(&transformer, DType::F32, &device)?.pp("model.diffusion_model");
+        assert_eq!(
+            dit.get_unchecked("keyframes_abs_pos_embedding")?.dims(),
+            &[1, 4]
+        );
+
+        let audio = dir.path().join("audio_vae.safetensors");
+        write_f32(&audio, "conv_in.conv.weight", vec![2, 3, 5, 4]);
+        let audio = ltx25_audio_vae_vb(&audio, DType::F32, &device)?.pp("audio_vae");
+        assert_eq!(
+            audio.get_unchecked("decoder.conv_in.conv.weight")?.dims(),
+            &[2, 4, 3, 5]
+        );
+
+        let vocoder = dir.path().join("vocoder.safetensors");
+        write_f32(&vocoder, "conv_pre.weight", vec![8, 3, 4]);
+        let vocoder = ltx25_vocoder_vb(&vocoder, DType::F32, &device)?;
+        assert_eq!(
+            vocoder
+                .get_unchecked("vocoder.vocoder.conv_pre.weight")?
+                .dims(),
+            &[8, 4, 3]
+        );
         Ok(())
     }
 }
