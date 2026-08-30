@@ -1568,11 +1568,11 @@ jobs:
   starvector-terminal-mlx:
     name: StarVector terminal native-provider preflight (MLX)
     if: github.event_name == 'workflow_dispatch' && inputs.profile == 'starvector-terminal'
-    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    runs-on: [self-hosted, macOS, ARM64, real-weights]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: ${{ vars.STARVECTOR_1B_SNAPSHOT }}
-      STARVECTOR_8B_SNAPSHOT: ${{ vars.STARVECTOR_8B_SNAPSHOT }}
+      STARVECTOR_1B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b
+      STARVECTOR_8B_SNAPSHOT: /Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate immutable terminal corpus and receipt contract
@@ -1624,8 +1624,8 @@ jobs:
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 180
     env:
-      STARVECTOR_1B_SNAPSHOT: ${{ vars.STARVECTOR_1B_SNAPSHOT }}
-      STARVECTOR_8B_SNAPSHOT: ${{ vars.STARVECTOR_8B_SNAPSHOT }}
+      STARVECTOR_1B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-1b
+      STARVECTOR_8B_SNAPSHOT: D:\\sceneworks-terminal\\weights\\models\\starvector-8b
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
       VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"

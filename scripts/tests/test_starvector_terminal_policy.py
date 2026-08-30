@@ -30,6 +30,14 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     mlx = workflow[start:end]
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
+    if "runs-on: [self-hosted, macOS, ARM64, real-weights]" not in mlx:
+        errors.append("MLX terminal lane does not target the provisioned real-weights host")
+    for snapshot in (
+        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b",
+        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b",
+    ):
+        if snapshot not in mlx:
+            errors.append(f"MLX terminal snapshot path missing {snapshot}")
     for name in (
         "starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
@@ -57,6 +65,12 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
         errors.append("Candle lane no longer serializes after MLX")
     if "runs-on: [self-hosted, windows, cuda, real-weights]" not in candle:
         errors.append("Candle lane no longer uses authoritative CUDA")
+    for snapshot in (
+        r"D:\\sceneworks-terminal\\weights\\models\\starvector-1b",
+        r"D:\\sceneworks-terminal\\weights\\models\\starvector-8b",
+    ):
+        if snapshot not in candle:
+            errors.append(f"Candle terminal snapshot path missing {snapshot}")
     for name in (
         "starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
