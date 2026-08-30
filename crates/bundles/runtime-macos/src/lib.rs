@@ -205,7 +205,12 @@ mod tests {
         assert!(snapshot.generator_ids.is_empty());
         assert_eq!(
             snapshot.text_llm_ids,
-            ["mlx-llama", "mlx-joycaption", "mlx-starvector-1b"]
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
         );
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the

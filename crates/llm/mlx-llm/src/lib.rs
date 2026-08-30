@@ -99,11 +99,6 @@ pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
 }
 
 /// Add only providers admitted to a shipped runtime catalog.
-///
-/// StarVector-8B is intentionally absent until terminal sc-22261 records its one real-weight
-/// quality/admission receipt. It remains available through [`text_registry`] for explicit local
-/// loading and the shared conformance harness; this keeps discovery and catalog eligibility from
-/// being conflated.
 pub fn register_catalog_text_providers(
     registry: core_llm::TextLlmRegistryBuilder,
 ) -> core_llm::TextLlmRegistryBuilder {
@@ -111,6 +106,7 @@ pub fn register_catalog_text_providers(
         .register(provider::REGISTRATION)
         .register(joycaption::REGISTRATION)
         .register(starvector_1b::REGISTRATION)
+        .register(starvector_8b::REGISTRATION)
 }
 
 /// Build the explicit MLX LLM catalog whose providers have admission evidence.
@@ -159,7 +155,7 @@ pub fn prepare_snapshot(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_l
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_registry_keeps_8b_available_but_catalog_admission_fail_closed() {
+    fn explicit_registry_and_catalog_include_admitted_starvector_8b() {
         let explicit: Vec<String> = super::text_registry()
             .unwrap()
             .registrations()
@@ -182,8 +178,12 @@ mod explicit_registry_tests {
             .collect();
         assert_eq!(
             admitted,
-            ["mlx-llama", "mlx-joycaption", "mlx-starvector-1b"],
-            "StarVector-8B must stay out of runtime catalogs until sc-22261 admission evidence"
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
         );
 
         let preparers = super::snapshot_preparer_registry().unwrap();
