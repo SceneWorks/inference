@@ -1583,6 +1583,11 @@ jobs:
         run: >-
           python3.12 scripts/release/resolve_snapshot_paths.py
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
       - name: Materialize and verify exact native snapshots
         env:
           STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
