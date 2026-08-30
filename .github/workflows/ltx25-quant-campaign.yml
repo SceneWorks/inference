@@ -83,9 +83,17 @@ jobs:
           "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           "%REVIEWED_PYTHON%" scripts/release/prepare_ltx25_quant_campaign.py campaign --revision "%PUBLIC_REVISION%" --cache-root "%LTX25_HF_CACHE_ROOT%" --manifest-out "%CAMPAIGN_MANIFEST%" --readback-out "%CAMPAIGN_READBACK%" || exit /b 1
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
-        with:
-          toolchain: 1.96.0
+      - name: Install exact Rust 1.96.0 with runner-native rustup
+        shell: powershell
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set 1.96.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $rustc = (rustc --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $rustc -notmatch '^rustc 1\.96\.0 ') {
+            throw "expected exact rustc 1.96.0; got '$rustc'"
+          }
       - name: Build terminal producer once
         shell: cmd
         run: |
