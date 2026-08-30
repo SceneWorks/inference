@@ -276,18 +276,28 @@ impl BigCodeBlock {
         Ok((&residual + linear(&mlp, &self.projw, Some(&self.projb))?)?)
     }
 }
+
+fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
+    let wte = tensor(w, prefix, "wte.weight")?;
+    // GPTBigCode ties the output projection to the token embedding. The published
+    // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
+    let head = wte.clone();
+    Ok((wte, head))
+}
+
 impl StarVectorDecoder {
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let p = "model.svg_transformer.transformer.transformer";
+        let (wte, head) = tied_token_embedding(w, p)?;
         Ok(Self {
-            wte: tensor(w, p, "wte.weight")?,
+            wte,
             wpe: tensor(w, p, "wpe.weight")?,
             layers: (0..24)
                 .map(|i| BigCodeBlock::load(w, &format!("{p}.h.{i}")))
                 .collect::<Result<Vec<_>>>()?,
             lnw: tensor(w, p, "ln_f.weight")?,
             lnb: tensor(w, p, "ln_f.bias")?,
-            head: tensor(w, "model.svg_transformer.transformer", "lm_head.weight")?,
+            head,
         })
     }
     pub fn reset(&mut self) {
@@ -314,6 +324,46 @@ impl StarVectorDecoder {
         }
         let out = layer_norm(&out, &self.lnw, &self.lnb, 1e-5)?;
         linear(&out.narrow(1, s - 1, 1)?.squeeze(1)?, &self.head, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+    use std::collections::HashMap;
+
+    #[test]
+    fn tied_token_embedding_projects_without_a_separate_lm_head() {
+        let device = Device::Cpu;
+        let values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let wte = Tensor::from_vec(values.clone(), (3, 2), &device).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.svg_transformer.transformer.transformer.wte.weight".into(),
+            wte,
+        );
+        let weights = Weights::from_map(tensors, device.clone());
+
+        let (wte, head) =
+            tied_token_embedding(&weights, "model.svg_transformer.transformer.transformer")
+                .unwrap();
+        assert_eq!(
+            head.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            values
+        );
+        assert_eq!(
+            wte.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            head.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let hidden = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
+        assert_eq!(
+            linear(&hidden, &head, None)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![1.0, 3.0, 5.0]]
+        );
     }
 }
 
