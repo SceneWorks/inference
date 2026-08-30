@@ -253,7 +253,7 @@ pub(crate) fn generate_cached_with_observer(
         let values = logits_f32.as_slice::<f32>().to_vec();
         observer.logits("prefill", &values);
         observer.phase("prefill-peak");
-        observe_cache_events(&mut cache, &mut observed_cache_events, observer);
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
     }
 
     let out = decode_loop(
@@ -272,7 +272,7 @@ pub(crate) fn generate_cached_with_observer(
 
     if let Some(observer) = observer.as_deref_mut() {
         observer.phase("decode-steady");
-        observe_cache_events(&mut cache, &mut observed_cache_events, observer);
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
         if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
             observer.phase("cancellation-cleanup");
         }
@@ -288,6 +288,10 @@ pub(crate) fn generate_cached_with_observer(
     full.extend_from_slice(&out.tokens);
     full.truncate(cache.offset() as usize);
     prefix_cache.store(full, &cache);
+    cache.reset()?;
+    if let Some(observer) = observer.as_deref_mut() {
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+    }
 
     Ok(out)
 }
@@ -296,21 +300,29 @@ fn observe_cache_events(
     cache: &mut dyn KvCache,
     seen: &mut usize,
     observer: &mut dyn crate::campaign::Observer,
-) {
+) -> Result<()> {
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
-        return;
+        return Ok(());
     };
     let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
             latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
         } else {
             observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
         }
     }
     *seen = cache.events().len();
     if !latest_by_layer.is_empty() {
-        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let bytes = latest_by_layer
+            .values()
+            .try_fold(0_u64, |total, (bytes, _)| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
+                })
+            })?;
         let tokens = latest_by_layer
             .values()
             .map(|(_, tokens)| *tokens)
@@ -318,6 +330,7 @@ fn observe_cache_events(
             .unwrap_or_default();
         observer.cache_snapshot(bytes, tokens);
     }
+    Ok(())
 }
 
 /// The sequence length (axis [`SEQ_AXIS`]) the stored per-layer KV actually holds — layer 0 speaks

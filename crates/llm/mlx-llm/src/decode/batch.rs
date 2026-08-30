@@ -161,7 +161,7 @@ pub(crate) fn generate_batch_with_observer(
         let values = logits_f32.as_slice::<f32>().to_vec();
         observer.logits("prefill", &values);
         observer.phase("prefill-peak");
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
     }
 
     // Sample the first token per sequence; keep the lanes that did not immediately retire.
@@ -270,10 +270,14 @@ pub(crate) fn generate_batch_with_observer(
 
     if let Some(observer) = observer.as_deref_mut() {
         observer.phase("decode-steady");
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer);
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
         if cancel.is_cancelled() {
             observer.phase("cancellation-cleanup");
         }
+    }
+    cache.reset()?;
+    if let Some(observer) = observer.as_deref_mut() {
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
     }
 
     // ---- Assemble per-request outputs in request order. ----
@@ -295,21 +299,29 @@ fn observe_cache_events(
     cache: &mut dyn crate::primitives::kv_cache::KvCache,
     seen: &mut usize,
     observer: &mut dyn crate::campaign::Observer,
-) {
+) -> Result<()> {
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
-        return;
+        return Ok(());
     };
     let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
             latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
         } else {
             observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
         }
     }
     *seen = cache.events().len();
     if !latest_by_layer.is_empty() {
-        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let bytes = latest_by_layer
+            .values()
+            .try_fold(0_u64, |total, (bytes, _)| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
+                })
+            })?;
         let tokens = latest_by_layer
             .values()
             .map(|(_, tokens)| *tokens)
@@ -317,6 +329,7 @@ fn observe_cache_events(
             .unwrap_or_default();
         observer.cache_snapshot(bytes, tokens);
     }
+    Ok(())
 }
 
 /// Build the left-padded prefill inputs: token ids, per-row RoPE positions, and the additive

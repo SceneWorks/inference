@@ -1128,8 +1128,9 @@ impl KvCache for Qwen35Cache {
             .unwrap_or(0)
     }
 
-    fn reset(&mut self) {
-        Qwen35Cache::reset(self)
+    fn reset(&mut self) -> Result<()> {
+        Qwen35Cache::reset(self);
+        Ok(())
     }
 
     // The hybrid cache is driven natively by `Qwen35Model` (which downcasts via `as_any_mut`); the

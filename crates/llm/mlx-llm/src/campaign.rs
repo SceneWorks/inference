@@ -865,7 +865,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     for event in &receipt.memory.allocation_events {
         if event.bytes == 0
             || !["cache", "attention-workspace", "weights", "output"].contains(&event.role.as_str())
-            || !["persistent", "transient"].contains(&event.lifetime.as_str())
+            || !["persistent", "transient", "released"].contains(&event.lifetime.as_str())
             || event.phase.is_empty()
             || event.kind.is_empty()
             || !REQUIRED_PHASES.contains(&event.phase.as_str())
@@ -873,34 +873,56 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         {
             return Err("allocation event is malformed".into());
         }
+        if event.lifetime == "released"
+            && (event.role != "cache" || event.kind != "product-cache_release")
+        {
+            return Err("release lifecycle event is malformed".into());
+        }
     }
     let max_role = |role: &str, lifetime: &str| {
-        let mut phases = std::collections::BTreeMap::<&str, u64>::new();
-        for event in receipt
+        receipt
             .memory
             .allocation_events
             .iter()
             .filter(|e| e.role == role && e.lifetime == lifetime)
-        {
-            *phases.entry(event.phase.as_str()).or_default() += event.bytes;
-        }
-        phases.values().copied().max().unwrap_or(0)
+            .map(|event| event.bytes)
+            .max()
+            .unwrap_or(0)
     };
-    let max_transient = {
-        let mut phases = std::collections::BTreeMap::<&str, u64>::new();
-        for event in receipt.memory.allocation_events.iter().filter(|e| {
+    let max_transient = receipt
+        .memory
+        .allocation_events
+        .iter()
+        .filter(|e| {
             e.lifetime == "transient"
                 && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
-        }) {
-            *phases.entry(event.phase.as_str()).or_default() += event.bytes;
-        }
-        phases.values().copied().max().unwrap_or(0)
-    };
+        })
+        .map(|event| event.bytes)
+        .max()
+        .unwrap_or(0);
     if max_role("weights", "persistent") != receipt.memory.model_weights_bytes
         || max_role("cache", "persistent") != receipt.memory.persistent_kv_bytes
         || max_transient != receipt.memory.transient_workspace_bytes
     {
         return Err("allocation totals do not reconcile".into());
+    }
+    let mut live_cache = None;
+    let mut releases = 0_u64;
+    for event in &receipt.memory.allocation_events {
+        if event.role == "cache" && event.lifetime == "persistent" {
+            live_cache = Some(event.bytes);
+        } else if event.lifetime == "released" {
+            if live_cache != Some(event.bytes) {
+                return Err("cache release bytes do not match retained KV ownership".into());
+            }
+            live_cache = None;
+            releases = releases
+                .checked_add(1)
+                .ok_or("cache release event count overflow")?;
+        }
+    }
+    if releases == 0 || live_cache.is_some() {
+        return Err("persistent KV ownership was not explicitly released".into());
     }
     let dense = dense_kv_bytes(
         receipt.geometry.batch,
@@ -939,23 +961,21 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("fit-boundary cache occupancy is below the frozen admission ratio".into());
     }
-    let mut transient_by_phase = std::collections::BTreeMap::<&str, u128>::new();
-    for event in receipt.memory.allocation_events.iter().filter(|e| {
-        e.lifetime == "transient"
-            && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
-    }) {
-        let total = transient_by_phase.entry(event.phase.as_str()).or_default();
-        *total = total
-            .checked_add(u128::from(event.bytes))
-            .ok_or("transient allocation total overflow")?;
-    }
+    let transient_high_water = receipt
+        .memory
+        .allocation_events
+        .iter()
+        .filter(|e| {
+            e.lifetime == "transient"
+                && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
+        })
+        .map(|event| event.bytes)
+        .max()
+        .unwrap_or(0);
     if receipt.mode == "compressed"
-        && transient_by_phase
-            .values()
-            .copied()
-            .any(|bytes| bytes.saturating_mul(10) >= u128::from(dense).saturating_mul(9))
+        && u128::from(transient_high_water) * 10 >= u128::from(dense) * 9
     {
-        return Err("aggregate full-cache temporary detected".into());
+        return Err("full-cache transient high-water detected".into());
     }
     let weights = receipt.memory.model_weights_bytes;
     let kv = receipt.memory.persistent_kv_bytes;
@@ -973,12 +993,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("weights-loaded MLX active bytes do not contain weights".into());
     }
     let prefill = sample_for("prefill-peak")?;
-    let prefill_total = weights.saturating_add(kv).saturating_add(workspace);
+    let prefill_total = weights
+        .checked_add(kv)
+        .and_then(|bytes| bytes.checked_add(workspace))
+        .ok_or("prefill attributed memory overflows u64")?;
     if prefill.mlx.active_bytes < prefill_total || prefill.mlx.peak_bytes < prefill_total {
         return Err("prefill MLX samples do not contain attributed allocations".into());
     }
     let decode = sample_for("decode-steady")?;
-    if decode.mlx.active_bytes < weights.saturating_add(kv) {
+    let decode_total = weights
+        .checked_add(kv)
+        .ok_or("decode attributed memory overflows u64")?;
+    if decode.mlx.active_bytes < decode_total {
         return Err("decode MLX active bytes do not contain weights and KV".into());
     }
     if receipt.mode == "dense"
@@ -1272,8 +1298,16 @@ fn assemble_artifacts_with_fixtures_named(
     let semantic = canonical_json_bytes(&semantic).map_err(|e| e.to_string())?;
     receipt.receipt_sha256 = seal_bytes(&semantic);
     let bytes = receipt.bytes().map_err(|e| e.to_string())?;
+    let released_cache_bytes = receipt
+        .memory
+        .allocation_events
+        .iter()
+        .filter(|event| event.role == "cache" && event.lifetime == "released")
+        .map(|event| event.bytes)
+        .max()
+        .unwrap_or(0);
     let human = format!(
-        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Receipt hash: {}\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -1281,6 +1315,7 @@ fn assemble_artifacts_with_fixtures_named(
         },
         receipt.run_id,
         receipt.mode,
+        released_cache_bytes,
         receipt.receipt_sha256
     )
     .into_bytes();
@@ -2729,6 +2764,9 @@ pub trait Observer {
     ) {
         self.allocation(role, lifetime, bytes);
     }
+    /// Observe a cache-ownership release. This is deliberately separate from allocation_event:
+    /// released bytes are lifecycle evidence, never positive workspace or retained allocation.
+    fn release_event(&mut self, _kind: &'static str, _role: &'static str, _bytes: u64) {}
     /// Wall-clock duration of the real snapshot inventory plus provider/model load that created
     /// the bound campaign session.
     fn load_duration(&mut self, _milliseconds: f64) {}
@@ -2840,6 +2878,27 @@ impl ProductObserver {
         }
         if self.cache_capacity_tokens == 0 {
             return Err("product observer did not capture a cumulative cache snapshot".into());
+        }
+        let mut live_cache = None;
+        let mut releases = 0_u64;
+        for event in &self.allocations {
+            if event.role == "cache" && event.lifetime == "persistent" {
+                live_cache = Some(event.bytes);
+            } else if event.lifetime == "released" {
+                if event.kind != "product-cache_release"
+                    || event.role != "cache"
+                    || live_cache != Some(event.bytes)
+                {
+                    return Err("product observer received an invalid cache release".into());
+                }
+                live_cache = None;
+                releases = releases
+                    .checked_add(1)
+                    .ok_or("product cache release event count overflow")?;
+            }
+        }
+        if releases == 0 || live_cache.is_some() {
+            return Err("product observer finalized before releasing cache ownership".into());
         }
         Ok(ProductObservations {
             snapshot: self.snapshot.expect("checked above"),
@@ -2967,6 +3026,24 @@ impl Observer for ProductObserver {
             kind: format!("product-{kind}"),
             role: role.into(),
             lifetime: lifetime.into(),
+            phase: phase.into(),
+            timestamp: timestamp_now(),
+            bytes,
+        });
+    }
+
+    fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
+        let Some(phase) = self.phase else {
+            self.error = Some("release observed before a product phase".into());
+            return;
+        };
+        if bytes == 0 {
+            return;
+        }
+        self.allocations.push(ReceiptAllocation {
+            kind: format!("product-{kind}"),
+            role: role.into(),
+            lifetime: "released".into(),
             phase: phase.into(),
             timestamp: timestamp_now(),
             bytes,
@@ -3344,9 +3421,8 @@ pub fn run_dense_lifecycle_request_on_session(
         // A successful prefix reuse is the product-owned cache proof for this exact provider
         // load.  The version is monotonically scoped to `CampaignSession`, not this PID.
         observer.cache_state(session.advance_cache_state());
-        provider.campaign_cancel_after_first_token(request)?;
         observer.phase("prompt-cache-reuse");
-        observer.phase("cancellation-cleanup");
+        provider.campaign_cancel_after_first_token(request, observer)?;
         output
     };
     observer.phase("post-run-release");
@@ -3592,8 +3668,7 @@ fn run_coordinate_operation_on_session(
     provider.campaign_prefix_reuse(prefix_prompt)?;
     observer.cache_state(session.advance_cache_state());
     observer.phase("prompt-cache-reuse");
-    provider.campaign_cancel_after_first_token(request)?;
-    observer.phase("cancellation-cleanup");
+    provider.campaign_cancel_after_first_token(request, &mut observer)?;
     observer.phase("post-run-release");
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(CoordinateOperationEvidence {
@@ -4246,14 +4321,16 @@ fn product_receipt(
         .map(|e| e.bytes)
         .max()
         .ok_or("coordinate produced no persistent cache snapshot")?;
-    let mut transient_by_phase = std::collections::BTreeMap::<&str, u64>::new();
-    for event in observation.allocations.iter().filter(|e| {
-        e.lifetime == "transient"
-            && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
-    }) {
-        *transient_by_phase.entry(event.phase.as_str()).or_default() += event.bytes;
-    }
-    let workspace = transient_by_phase.values().copied().max().unwrap_or(0);
+    let workspace = observation
+        .allocations
+        .iter()
+        .filter(|e| {
+            e.lifetime == "transient"
+                && (e.role == "cache" || e.role == "attention-workspace" || e.role == "output")
+        })
+        .map(|event| event.bytes)
+        .max()
+        .unwrap_or(0);
     let release = observation.phases.last().ok_or("release phase")?;
     let start = observation.phases.first().ok_or("start phase")?;
     let mut fixture_evidence = std::collections::BTreeMap::new();
@@ -4752,6 +4829,14 @@ mod tests {
                 timestamp: "2026-01-01T00:00:02.200Z".into(),
                 bytes: 1,
             },
+            ReceiptAllocation {
+                kind: "product-cache_release".into(),
+                role: "cache".into(),
+                lifetime: "released".into(),
+                phase: "decode-steady".into(),
+                timestamp: "2026-01-01T00:00:04.300Z".into(),
+                bytes: 4,
+            },
         ];
         let timings = (0..5)
             .map(|_| RawTiming {
@@ -4835,6 +4920,59 @@ mod tests {
                 bytes: 4,
             });
         assert!(validate_receipt_semantics(&threshold_tampered).is_err());
+        let mut sequential = receipt.clone();
+        let release = sequential
+            .memory
+            .allocation_events
+            .pop()
+            .expect("release event");
+        sequential.memory.allocation_events.extend([
+            ReceiptAllocation {
+                kind: "product-dense_concat_coexistence".into(),
+                role: "output".into(),
+                lifetime: "transient".into(),
+                phase: "prefill-peak".into(),
+                timestamp: "2026-01-01T00:00:02.300Z".into(),
+                bytes: 3,
+            },
+            ReceiptAllocation {
+                kind: "product-dense_concat_coexistence".into(),
+                role: "output".into(),
+                lifetime: "transient".into(),
+                phase: "prefill-peak".into(),
+                timestamp: "2026-01-01T00:00:02.400Z".into(),
+                bytes: 2,
+            },
+            ReceiptAllocation {
+                kind: "product-dense_concat_coexistence".into(),
+                role: "output".into(),
+                lifetime: "transient".into(),
+                phase: "decode-steady".into(),
+                timestamp: "2026-01-01T00:00:04.200Z".into(),
+                bytes: 2,
+            },
+            release,
+        ]);
+        sequential.memory.transient_workspace_bytes = 3;
+        assert!(validate_receipt_semantics(&sequential).is_ok());
+        sequential.memory.transient_workspace_bytes = 2;
+        assert!(validate_receipt_semantics(&sequential).is_err());
+        let mut missing_release = receipt.clone();
+        missing_release
+            .memory
+            .allocation_events
+            .retain(|event| event.lifetime != "released");
+        assert!(validate_receipt_semantics(&missing_release).is_err());
+        let mut mismatched_release = receipt.clone();
+        mismatched_release
+            .memory
+            .allocation_events
+            .iter_mut()
+            .find(|event| event.lifetime == "released")
+            .unwrap()
+            .bytes = 3;
+        assert!(validate_receipt_semantics(&mismatched_release).is_err());
+        assert!(dense_kv_bytes(u64::MAX, 2, 2, 2, 2, 2).is_err());
         let mut zero_context = receipt.clone();
         zero_context.geometry.context_window_tokens = 0;
         zero_context.geometry.context_target_tokens = 0;
@@ -4876,6 +5014,9 @@ mod tests {
         assert!(std::str::from_utf8(&bundle.human)
             .unwrap()
             .contains("\n- Receipt hash: "));
+        assert!(std::str::from_utf8(&bundle.human)
+            .unwrap()
+            .contains("\n- Released cache ownership bytes: 4\n"));
         assert!(!std::str::from_utf8(&bundle.human).unwrap().contains("\\n"));
         assert!(
             validate_artifact_bundle(&bundle).is_err(),

@@ -43,6 +43,67 @@ use mlx_rs::Array;
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
 
+enum CapturedCacheLifecycle {
+    Allocation(&'static str, &'static str, &'static str, u64),
+    Snapshot(u64, u64),
+    Release(&'static str, &'static str, u64),
+}
+
+#[derive(Default)]
+struct CacheLifecycleCapture {
+    events: Vec<CapturedCacheLifecycle>,
+}
+
+impl CacheLifecycleCapture {
+    fn replay(self, observer: &mut dyn crate::campaign::Observer) {
+        for event in self.events {
+            match event {
+                CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
+                    observer.allocation_event(kind, role, lifetime, bytes);
+                }
+                CapturedCacheLifecycle::Snapshot(bytes, tokens) => {
+                    observer.cache_snapshot(bytes, tokens);
+                }
+                CapturedCacheLifecycle::Release(kind, role, bytes) => {
+                    observer.release_event(kind, role, bytes);
+                }
+            }
+        }
+    }
+}
+
+impl crate::campaign::Observer for CacheLifecycleCapture {
+    fn phase(&mut self, _name: &'static str) {}
+
+    fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            role, role, lifetime, bytes,
+        ));
+    }
+
+    fn allocation_event(
+        &mut self,
+        kind: &'static str,
+        role: &'static str,
+        lifetime: &'static str,
+        bytes: u64,
+    ) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            kind, role, lifetime, bytes,
+        ));
+    }
+
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::Snapshot(bytes, tokens));
+    }
+
+    fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::Release(kind, role, bytes));
+    }
+}
+
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
@@ -729,6 +790,7 @@ impl LlamaProvider {
     pub(crate) fn campaign_cancel_after_first_token(
         &self,
         mut request: TextLlmRequest,
+        observer: &mut dyn crate::campaign::Observer,
     ) -> CoreResult<()> {
         let cancel = crate::decode::CancelFlag::new();
         request.cancel = cancel.clone();
@@ -737,12 +799,15 @@ impl LlamaProvider {
                 cancel.cancel();
             }
         };
-        let output = self.generate_inner(&request, &mut sink, None)?;
+        let mut captured = CacheLifecycleCapture::default();
+        let output = self.generate_inner(&request, &mut sink, Some(&mut captured))?;
         if output.finish_reason != Some(CoreFinish::Cancelled) {
             return Err(CoreError::Load(
                 "campaign cancellation did not finish as cancelled".into(),
             ));
         }
+        observer.phase("cancellation-cleanup");
+        captured.replay(observer);
         Ok(())
     }
 
@@ -2032,6 +2097,33 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(Default)]
+    struct RecordingLifecycleObserver(Vec<(&'static str, u64)>);
+
+    impl crate::campaign::Observer for RecordingLifecycleObserver {
+        fn phase(&mut self, _name: &'static str) {}
+
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+
+        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64) {
+            self.0.push(("persistent", bytes));
+        }
+
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.0.push(("released", bytes));
+        }
+    }
+
+    #[test]
+    fn cancellation_capture_replays_persistent_then_release_without_allocation_aliasing() {
+        let mut capture = CacheLifecycleCapture::default();
+        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8);
+        crate::campaign::Observer::release_event(&mut capture, "cache_release", "cache", 64);
+        let mut observer = RecordingLifecycleObserver::default();
+        capture.replay(&mut observer);
+        assert_eq!(observer.0, vec![("persistent", 64), ("released", 64)]);
+    }
 
     fn qwen36_wrapper() -> serde_json::Value {
         json!({

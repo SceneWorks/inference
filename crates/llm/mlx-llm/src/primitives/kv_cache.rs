@@ -70,7 +70,7 @@ pub trait KvCache {
     fn truncate(&mut self, len: i32) -> Result<()>;
 
     /// Drop all cached state, returning the cache to its freshly-constructed (empty) condition.
-    fn reset(&mut self);
+    fn reset(&mut self) -> Result<()>;
 
     /// Downcast hook so a decoder can recover its concrete cache from a `&mut dyn KvCache` — the
     /// hybrid Qwen3.6 cache (recurrent linear-attention state + KV) is driven natively rather than
@@ -89,6 +89,19 @@ pub struct CacheEvent {
     pub lifetime: &'static str,
     pub bytes: u64,
     pub tokens: u64,
+}
+
+fn array_bytes(array: &Array) -> Result<u64> {
+    u64::try_from(array.size())
+        .ok()
+        .and_then(|elements| elements.checked_mul(u64::try_from(array.item_size()).ok()?))
+        .ok_or_else(|| crate::error::Error::Msg("KV shape overflows byte accounting".into()))
+}
+
+fn checked_concat_overhead(prior_bytes: u64, incoming_bytes: u64) -> Result<u64> {
+    prior_bytes.checked_add(incoming_bytes).ok_or_else(|| {
+        crate::error::Error::Msg("dense concat transient overhead overflows u64".into())
+    })
 }
 
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
@@ -148,14 +161,6 @@ impl ContiguousKvCache {
 
 impl KvCache for ContiguousKvCache {
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
-        let array_bytes = |array: &Array| -> Result<u64> {
-            u64::try_from(array.size())
-                .ok()
-                .and_then(|elements| elements.checked_mul(u64::try_from(array.item_size()).ok()?))
-                .ok_or_else(|| {
-                    crate::error::Error::Msg("KV shape overflows byte accounting".into())
-                })
-        };
         let prior = self.layers[layer].as_ref();
         let prior_bytes = prior
             .as_ref()
@@ -181,12 +186,10 @@ impl KvCache for ContiguousKvCache {
             .checked_add(array_bytes(&merged.1)?)
             .ok_or_else(|| crate::error::Error::Msg("merged KV bytes overflow u64".into()))?;
         if let Some(prior_bytes) = prior_bytes {
-            let coexistence_bytes = prior_bytes
-                .checked_add(appended_bytes)
-                .and_then(|bytes| bytes.checked_add(merged_bytes))
-                .ok_or_else(|| {
-                    crate::error::Error::Msg("dense concat coexistence bytes overflow u64".into())
-                })?;
+            // The merged arrays are the retained successor and are accounted once by the
+            // persistent event below.  This snapshot is only the additional high-water
+            // overhead while immutable concat keeps the prior and incoming arrays alive.
+            let coexistence_bytes = checked_concat_overhead(prior_bytes, appended_bytes)?;
             self.events.push(CacheEvent {
                 layer,
                 operation: "dense_concat_coexistence",
@@ -260,27 +263,27 @@ impl KvCache for ContiguousKvCache {
         Ok(())
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
         let bytes = self
             .layers
             .iter()
             .flatten()
-            .map(|(k, _)| {
-                k.shape()
-                    .iter()
-                    .try_fold(1_u64, |n, v| n.checked_mul(u64::try_from(*v).ok()?))
-                    .and_then(|n| n.checked_mul(4))
-            })
-            .flatten()
-            .sum();
+            .try_fold(0_u64, |total, (k, v)| {
+                let pair = array_bytes(k)?
+                    .checked_add(array_bytes(v)?)
+                    .ok_or_else(|| {
+                        crate::error::Error::Msg("released KV pair bytes overflow u64".into())
+                    })?;
+                total.checked_add(pair).ok_or_else(|| {
+                    crate::error::Error::Msg("released KV cache bytes overflow u64".into())
+                })
+            })?;
         if bytes > 0 {
             self.events.push(CacheEvent {
                 layer: usize::MAX,
-                operation: "reset",
-                // Release is represented as a classified transient cache event so the
-                // campaign observer can retain exact bytes without violating the receipt schema.
+                operation: "cache_release",
                 role: "cache",
-                lifetime: "transient",
+                lifetime: "released",
                 bytes,
                 tokens: 0,
             });
@@ -288,6 +291,7 @@ impl KvCache for ContiguousKvCache {
         for slot in &mut self.layers {
             *slot = None;
         }
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -338,7 +342,7 @@ mod tests {
             .expect("the immutable concat must publish its real coexistence bytes");
         assert_eq!(event.role, "output");
         assert_eq!(event.lifetime, "transient");
-        assert_eq!(event.bytes, 512);
+        assert_eq!(event.bytes, 256);
     }
 
     #[test]
@@ -432,8 +436,17 @@ mod tests {
         let mut cache = ContiguousKvCache::new(2);
         let k = arange4(1, 2, 3, 4);
         cache.update(0, &k, &k).unwrap();
-        cache.reset();
+        cache.reset().unwrap();
         assert_eq!(cache.offset(), 0);
         assert!(cache.peek(0).is_none());
+        let release = cache.events().last().unwrap();
+        assert_eq!(release.operation, "cache_release");
+        assert_eq!(release.lifetime, "released");
+        assert_eq!(release.bytes, 192);
+    }
+
+    #[test]
+    fn concat_overhead_fails_closed_on_overflow() {
+        assert!(checked_concat_overhead(u64::MAX, 1).is_err());
     }
 }

@@ -194,7 +194,7 @@ pub(crate) fn generate_with_observer(
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("prefill-peak");
         }
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
         let output = {
             let mut saw_first_token = false;
             let mut observed_events = |event| {
@@ -223,14 +223,16 @@ pub(crate) fn generate_with_observer(
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("decode-steady");
         }
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer);
-        output
-    }; // Drop the cache before a cancellation-cleanup observation.
-    if matches!(output.finish_reason, FinishReason::Cancelled) {
-        if let Some(observer) = observer.as_deref_mut() {
-            observer.phase("cancellation-cleanup");
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        if matches!(output.finish_reason, FinishReason::Cancelled) {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("cancellation-cleanup");
+            }
         }
-    }
+        cache.reset()?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        output
+    };
     Ok(output)
 }
 
@@ -241,24 +243,32 @@ fn observe_cache_events(
     cache: &mut dyn KvCache,
     seen: &mut usize,
     observer: &mut Option<&mut dyn crate::campaign::Observer>,
-) {
+) -> Result<()> {
     let Some(observer) = observer.as_deref_mut() else {
-        return;
+        return Ok(());
     };
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
-        return;
+        return Ok(());
     };
     let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
             latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
         } else {
             observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
         }
     }
     *seen = cache.events().len();
     if !latest_by_layer.is_empty() {
-        let bytes = latest_by_layer.values().map(|(bytes, _)| bytes).sum();
+        let bytes = latest_by_layer
+            .values()
+            .try_fold(0_u64, |total, (bytes, _)| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
+                })
+            })?;
         let tokens = latest_by_layer
             .values()
             .map(|(_, tokens)| *tokens)
@@ -266,6 +276,7 @@ fn observe_cache_events(
             .unwrap_or_default();
         observer.cache_snapshot(bytes, tokens);
     }
+    Ok(())
 }
 
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
