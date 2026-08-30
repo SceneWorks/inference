@@ -327,6 +327,29 @@ impl StarVectorDecoder {
     }
 }
 
+/// Loaded native tensor stack.  The provider owns this behind a mutex because decoder KV state is
+/// request-local; [`reset`](Self::reset) is called on every terminal path.
+pub struct StarVectorModel {
+    pub vision: StarVectorClip,
+    pub adapter: StarVectorAdapter,
+    pub decoder: StarVectorDecoder,
+}
+impl StarVectorModel {
+    pub fn from_weights(weights: &Weights) -> Result<Self> {
+        Ok(Self {
+            vision: StarVectorClip::from_weights(weights)?,
+            adapter: StarVectorAdapter::from_weights(weights)?,
+            decoder: StarVectorDecoder::from_weights(weights)?,
+        })
+    }
+    pub fn image_embeddings(&self, pixels: &Tensor) -> Result<Tensor> {
+        self.adapter.forward(&self.vision.forward(pixels)?)
+    }
+    pub fn reset(&mut self) {
+        self.decoder.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,28 +387,5 @@ mod tests {
                 .unwrap(),
             vec![vec![1.0, 3.0, 5.0]]
         );
-    }
-}
-
-/// Loaded native tensor stack.  The provider owns this behind a mutex because decoder KV state is
-/// request-local; [`reset`](Self::reset) is called on every terminal path.
-pub struct StarVectorModel {
-    pub vision: StarVectorClip,
-    pub adapter: StarVectorAdapter,
-    pub decoder: StarVectorDecoder,
-}
-impl StarVectorModel {
-    pub fn from_weights(weights: &Weights) -> Result<Self> {
-        Ok(Self {
-            vision: StarVectorClip::from_weights(weights)?,
-            adapter: StarVectorAdapter::from_weights(weights)?,
-            decoder: StarVectorDecoder::from_weights(weights)?,
-        })
-    }
-    pub fn image_embeddings(&self, pixels: &Tensor) -> Result<Tensor> {
-        self.adapter.forward(&self.vision.forward(pixels)?)
-    }
-    pub fn reset(&mut self) {
-        self.decoder.reset();
     }
 }
