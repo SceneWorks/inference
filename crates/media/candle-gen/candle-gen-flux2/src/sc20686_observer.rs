@@ -34,6 +34,11 @@ pub struct CacheEvent {
     pub context: Option<CampaignContext>,
     pub sample_kind: &'static str,
     pub metrics: Option<CampaignMetrics>,
+    pub allocator_before_bytes: u64,
+    pub allocator_after_bytes: u64,
+    pub allocator_high_bytes: u64,
+    pub allocator_reserved_bytes: u64,
+    pub allocator_measurement_available: bool,
 }
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
@@ -376,7 +381,7 @@ pub(crate) fn bind_edit_geometry(
 pub struct JsonlObserver(Box<dyn Write>);
 impl CacheObserver for JsonlObserver {
     fn record(&mut self, event: CacheEvent) {
-        let mut value = serde_json::json!({"phase": event.phase, "attention": event.attention, "operation": event.operation, "tensor_shape": event.tensor_shape, "dtype": event.dtype, "mask": event.mask, "rope": event.rope, "persistent_bytes": event.persistent_bytes, "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes, "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns, "sample_kind": event.sample_kind});
+        let mut value = serde_json::json!({"phase": event.phase, "attention": event.attention, "operation": event.operation, "tensor_shape": event.tensor_shape, "dtype": event.dtype, "mask": event.mask, "rope": event.rope, "persistent_bytes": event.persistent_bytes, "transient_bytes": event.transient_bytes, "peak_bytes": event.peak_bytes, "reused": event.reused, "elapsed_ms": event.elapsed_ms, "at_ns": event.at_ns, "sample_kind": event.sample_kind, "allocator_before_bytes": event.allocator_before_bytes, "allocator_after_bytes": event.allocator_after_bytes, "allocator_high_bytes": event.allocator_high_bytes, "allocator_reserved_bytes": event.allocator_reserved_bytes, "allocator_measurement_available": event.allocator_measurement_available});
         if let Some(context) = &event.context {
             if event.phase == "metadata" {
                 value["source_ref"] = serde_json::json!(context.source_ref);
@@ -425,13 +430,86 @@ fn backend_peak_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(feature = "cuda")]
-fn backend_reserved_bytes() -> Option<u64> {
-    candle_gen::cuda_mempool::MemPool::device_default(0)?.reserved()
+#[derive(Clone, Copy, Debug)]
+struct ActiveAllocatorWindow {
+    used_before: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ActiveAllocatorMeasurement {
+    used_before: u64,
+    used_after: u64,
+    used_high: u64,
+    reserved_after: u64,
+    available: bool,
+}
+
+#[cfg(feature = "cuda")]
+fn begin_active_allocator_window() -> Option<ActiveAllocatorWindow> {
+    let pool = candle_gen::cuda_mempool::MemPool::device_default(0)?;
+    let used_before = pool.used()?;
+    if !pool.reset_used_high_water() || pool.used_high()? < used_before {
+        return None;
+    }
+    Some(ActiveAllocatorWindow { used_before })
+}
+
 #[cfg(not(feature = "cuda"))]
-fn backend_reserved_bytes() -> Option<u64> {
+fn begin_active_allocator_window() -> Option<ActiveAllocatorWindow> {
     None
+}
+
+#[cfg(feature = "cuda")]
+fn finish_active_allocator_window(
+    window: Option<ActiveAllocatorWindow>,
+) -> ActiveAllocatorMeasurement {
+    let Some(window) = window else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let Some(pool) = candle_gen::cuda_mempool::MemPool::device_default(0) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let (Some(used_after), Some(used_high), Some(reserved_after)) =
+        (pool.used(), pool.used_high(), pool.reserved())
+    else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    ActiveAllocatorMeasurement {
+        used_before: window.used_before,
+        used_after,
+        used_high,
+        reserved_after,
+        available: used_high >= window.used_before && reserved_after >= used_after,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn finish_active_allocator_window(
+    _window: Option<ActiveAllocatorWindow>,
+) -> ActiveAllocatorMeasurement {
+    ActiveAllocatorMeasurement::default()
+}
+
+#[cfg(feature = "cuda")]
+fn allocator_remnant() -> ActiveAllocatorMeasurement {
+    let Some(pool) = candle_gen::cuda_mempool::MemPool::device_default(0) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let (Some(used), Some(reserved)) = (pool.used(), pool.reserved()) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    ActiveAllocatorMeasurement {
+        used_before: used,
+        used_after: used,
+        used_high: used,
+        reserved_after: reserved,
+        available: reserved >= used,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn allocator_remnant() -> ActiveAllocatorMeasurement {
+    ActiveAllocatorMeasurement::default()
 }
 
 pub struct Scope;
@@ -452,41 +530,30 @@ fn install_inner(observer: Box<dyn CacheObserver>, context: Option<CampaignConte
     Scope
 }
 
-pub(crate) struct FluxKvProjection {
-    started: Instant,
-    allocator_before: Option<u64>,
-}
-
-pub(crate) struct FluxKvRead {
-    started: Instant,
-    allocator_after_projection: Option<u64>,
-    projection_transient: u64,
+pub(crate) struct FluxReferenceKv {
+    dense_bytes: u64,
     shape: String,
     dtype: String,
 }
 
-/// Start at the actual `DoubleAttention` K/V projection boundary. Observer-off execution returns
-/// before allocator access or any campaign geometry/accounting work.
-pub(crate) fn begin_flux_kv_projection() -> Option<FluxKvProjection> {
+pub(crate) struct FluxKvRead {
+    started: Instant,
+    dense_bytes: u64,
+    shape: String,
+    dtype: String,
+    allocator_window: Option<ActiveAllocatorWindow>,
+}
+
+/// Narrow the actual image `to_k`/`to_v` outputs at the frozen target/reference token boundary.
+/// Q and text K/V projections are not arguments and therefore cannot enter the byte attribution.
+pub(crate) fn record_flux_kv_created(
+    image_k: &Tensor,
+    image_v: &Tensor,
+) -> Option<FluxReferenceKv> {
     if !ACTIVE.with(|slot| slot.borrow().is_some()) {
         return None;
     }
-    Some(FluxKvProjection {
-        started: Instant::now(),
-        allocator_before: backend_reserved_bytes(),
-    })
-}
-
-/// Bind exact `to_k`/`to_v` image K/V and the colocated `add_k`/`add_v` text projections. Only the
-/// live reference slice of image K/V contributes to candidate cache capacity.
-pub(crate) fn record_flux_kv_created(
-    measurement: Option<FluxKvProjection>,
-    image_k: &Tensor,
-    image_v: &Tensor,
-    text_k: &Tensor,
-    text_v: &Tensor,
-) -> Option<FluxKvRead> {
-    let measurement = measurement?;
+    let started = Instant::now();
     let (batch, heads, image_tokens, width) = image_k.dims4().ok()?;
     if image_v.dims4().ok()? != (batch, heads, image_tokens, width) {
         return None;
@@ -503,6 +570,22 @@ pub(crate) fn record_flux_kv_created(
     if image_tokens != target_tokens.checked_add(reference_tokens)? || layers == 0 {
         return None;
     }
+    let reference_k = image_k.narrow(2, target_tokens, reference_tokens).ok()?;
+    let reference_v = image_v.narrow(2, target_tokens, reference_tokens).ok()?;
+    let exact_shape = (batch, heads, reference_tokens, width);
+    if reference_k.dims4().ok()? != exact_shape
+        || reference_v.dims4().ok()? != exact_shape
+        || reference_k.dtype() != reference_v.dtype()
+    {
+        return None;
+    }
+    let dense_bytes = [&reference_k, &reference_v]
+        .iter()
+        .try_fold(0u64, |total, tensor| {
+            total.checked_add(
+                (tensor.elem_count() as u64).checked_mul(tensor.dtype().size_in_bytes() as u64)?,
+            )
+        })?;
     let candidate_total = checked_packed_group_affine_kv_bytes(
         batch as u64,
         heads as u64,
@@ -521,61 +604,64 @@ pub(crate) fn record_flux_kv_created(
     if !START_EMITTED.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), true)) {
         observe("generation-start", 0, 0, 0);
     }
-    let allocator_after_projection = backend_reserved_bytes();
-    let projection_transient = measurement
-        .allocator_before
-        .zip(allocator_after_projection)
-        .map_or(0, |(before, after)| after.saturating_sub(before));
     MEASUREMENTS.with(|metrics| {
         let mut metrics = metrics.borrow_mut();
         metrics.candidate_persistent_bytes = candidate_total;
         metrics.projection_count = metrics.projection_count.saturating_add(1);
     });
     let shape = format!(
-        "reference=[{batch},{heads},{reference_tokens},{width}];image_k={:?};image_v={:?};text_k={:?};text_v={:?}",
-        image_k.dims(), image_v.dims(), text_k.dims(), text_v.dims()
+        "reference_k={:?};reference_v={:?}",
+        reference_k.dims(),
+        reference_v.dims()
     );
-    let dtype = format!("{:?}", image_k.dtype());
+    let dtype = format!("{:?}", reference_k.dtype());
     observe_tensor(
         "cross-kv-created",
-        "DoubleAttention::to_k/to_v/add_k/add_v",
+        "DoubleAttention::to_k/to_v(reference-slice)",
         0,
-        projection_transient,
+        dense_bytes,
         0,
         shape.clone(),
         dtype.clone(),
         "joint-unmasked",
         "flux2-4-axis",
-        Some(measurement.started),
+        Some(started),
     );
-    Some(FluxKvRead {
-        started: measurement.started,
-        allocator_after_projection,
-        projection_transient,
+    Some(FluxReferenceKv {
+        dense_bytes,
         shape,
         dtype,
     })
 }
 
-/// Finish after attention consumes the exact projections. Projection allocation and attention
-/// workspace stay distinct; only the former is replaced by a compatible packed cache.
+/// Begin the exact product attention read after all unrelated Q/text projection and RoPE work.
+pub(crate) fn begin_flux_kv_read(reference: Option<FluxReferenceKv>) -> Option<FluxKvRead> {
+    let reference = reference?;
+    Some(FluxKvRead {
+        started: Instant::now(),
+        dense_bytes: reference.dense_bytes,
+        shape: reference.shape,
+        dtype: reference.dtype,
+        allocator_window: begin_active_allocator_window(),
+    })
+}
+
+/// Finish the product attention read. The active allocator high-water is retained as exact
+/// evidence, but the shared joint-attention workspace is not credited as reference-cache savings.
+/// With no packed reader wired, the candidate must materialize the same exact dense reference K/V.
 pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
     let Some(measurement) = measurement else {
         return;
     };
-    let allocator_after_attention = backend_reserved_bytes();
-    let workspace_transient = measurement
-        .allocator_after_projection
-        .zip(allocator_after_attention)
-        .map_or(0, |(before, after)| after.saturating_sub(before));
-    let current_transient = measurement.projection_transient.max(workspace_transient);
+    let allocator = finish_active_allocator_window(measurement.allocator_window);
+    let current_transient = measurement.dense_bytes;
     MEASUREMENTS.with(|metrics| {
         let mut metrics = metrics.borrow_mut();
         metrics.current_read_transient_bytes =
             metrics.current_read_transient_bytes.max(current_transient);
         metrics.candidate_read_transient_bytes = metrics
             .candidate_read_transient_bytes
-            .max(workspace_transient);
+            .max(measurement.dense_bytes);
         metrics.cache_read_duration_ns = metrics
             .cache_read_duration_ns
             .saturating_add(measurement.started.elapsed().as_nanos());
@@ -590,9 +676,9 @@ pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
             metrics.projection_count / layers
         };
     });
-    observe_tensor(
+    observe_tensor_with_allocator(
         "cross-kv-read",
-        "DoubleAttention::attention(reference-kv)",
+        "DoubleAttention::attention(reference-kv-slice)",
         0,
         current_transient,
         1,
@@ -601,6 +687,7 @@ pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
         "joint-unmasked",
         "flux2-4-axis",
         Some(measurement.started),
+        allocator,
     );
     let armed = CONTEXT.with(|slot| {
         slot.borrow()
@@ -663,6 +750,38 @@ pub fn observe_tensor(
     rope: impl Into<String>,
     measured: Option<Instant>,
 ) {
+    observe_tensor_with_allocator(
+        phase,
+        operation,
+        persistent_bytes,
+        transient_bytes,
+        reused,
+        tensor_shape,
+        dtype,
+        mask,
+        rope,
+        measured,
+        ActiveAllocatorMeasurement::default(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_tensor_with_allocator(
+    phase: &'static str,
+    operation: &'static str,
+    persistent_bytes: u64,
+    transient_bytes: u64,
+    reused: u64,
+    tensor_shape: impl Into<String>,
+    dtype: impl Into<String>,
+    mask: impl Into<String>,
+    rope: impl Into<String>,
+    measured: Option<Instant>,
+    allocator: ActiveAllocatorMeasurement,
+) {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     ACTIVE.with(|slot| {
         let Some(observer) = slot.borrow_mut().as_mut() else {
             return;
@@ -693,7 +812,8 @@ pub fn observe_tensor(
                     })
                 })
             });
-        if phase == "cross-kv-read" && operation != "DoubleAttention::attention(reference-kv)" {
+        if phase == "cross-kv-read" && operation != "DoubleAttention::attention(reference-kv-slice)"
+        {
             MEASUREMENTS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
                 metrics.current_read_transient_bytes =
@@ -724,6 +844,11 @@ pub fn observe_tensor(
             context,
             sample_kind: "allocator",
             metrics: None,
+            allocator_before_bytes: allocator.used_before,
+            allocator_after_bytes: allocator.used_after,
+            allocator_high_bytes: allocator.used_high,
+            allocator_reserved_bytes: allocator.reserved_after,
+            allocator_measurement_available: allocator.available,
         };
         observer.record(event.clone());
         if phase == "generation-end" || phase == "cancelled" {
@@ -756,13 +881,29 @@ pub fn observe_tensor(
         }
     });
 }
+
+fn observe_release_remnant() {
+    observe_tensor_with_allocator(
+        "released",
+        "release-remnant",
+        0,
+        0,
+        0,
+        "",
+        "",
+        "",
+        "",
+        None,
+        allocator_remnant(),
+    );
+}
 pub fn observe_cancelled() {
     observe("cancelled", 0, 0, 0);
 }
 impl Drop for Scope {
     fn drop(&mut self) {
         observe("invalidated", 0, 0, 0);
-        observe("released", 0, 0, 0);
+        observe_release_remnant();
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         STARTED.with(|slot| *slot.borrow_mut() = None);
@@ -801,11 +942,72 @@ mod tests {
 
     #[test]
     fn observer_off_projection_is_inert_and_group32_projection_is_exact() {
-        assert!(begin_flux_kv_projection().is_none());
+        assert!(begin_flux_kv_read(None).is_none());
         assert_eq!(MEASUREMENTS.with(|slot| slot.borrow().projection_count), 0);
         assert_eq!(
             checked_packed_group_affine_kv_bytes(1, 2, 65, 64),
             Some(6_704)
+        );
+    }
+
+    #[test]
+    fn reference_slice_excludes_target_and_unrelated_projections() {
+        let out = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let context = CampaignContext {
+            source_ref: "a".repeat(40),
+            snapshot_sha256: "b".repeat(64),
+            snapshot_bytes: 1,
+            variant: PRODUCT_ROUTE_ID.into(),
+            cancellation_armed: false,
+            real_weights: false,
+            geometry: CampaignGeometry {
+                batch: 1,
+                frames: 1,
+                width: 32,
+                height: 32,
+                latent_frames: 1,
+                latent_height: 1,
+                latent_width: 1,
+                prompt_sha256: "c".repeat(64),
+                guidance: "1".into(),
+                reference_count: 1,
+                layers: 2,
+                heads: 2,
+                head_dimension: 4,
+                sq: 5,
+                skv: 3,
+                dtype: "F32".into(),
+                mask: "joint-unmasked".into(),
+                rope: "flux2-4-axis".into(),
+            },
+        };
+        let _scope = install_with_context(Box::new(Sink(out.clone())), context);
+        let image_k = Tensor::zeros(
+            (1, 2, 8, 4),
+            candle_gen::candle_core::DType::F32,
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let image_v = Tensor::zeros(
+            (1, 2, 8, 4),
+            candle_gen::candle_core::DType::F32,
+            &candle_gen::candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let reference = record_flux_kv_created(&image_k, &image_v).expect("reference slice");
+        assert_eq!(reference.dense_bytes, 2 * 1 * 2 * 3 * 4 * 4);
+        let created = out
+            .borrow()
+            .iter()
+            .find(|event| event.phase == "cross-kv-created")
+            .cloned()
+            .unwrap();
+        assert_eq!(created.transient_bytes, reference.dense_bytes);
+        assert!(created.tensor_shape.contains("[1, 2, 3, 4]"));
+        assert!(!created.tensor_shape.contains("[1, 2, 8, 4]"));
+        assert_eq!(
+            created.operation,
+            "DoubleAttention::to_k/to_v(reference-slice)"
         );
     }
 }

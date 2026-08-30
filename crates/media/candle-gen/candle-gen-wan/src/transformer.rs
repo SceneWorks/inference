@@ -168,13 +168,16 @@ struct Attention {
 /// Request-scoped K/V heads for one block's cross-attention.  These depend only on the projected
 /// text context, never on the noisy latent or timestep, so the denoise loop must reuse them.
 pub(crate) struct PreparedBlockCrossKv {
-    key: Tensor,
-    value: Tensor,
+    key: Option<Tensor>,
+    value: Option<Tensor>,
     cache_id: u64,
 }
 
 impl Drop for PreparedBlockCrossKv {
     fn drop(&mut self) {
+        // Drop the actual cache tensors before sampling the post-release allocator remnant.
+        drop(self.key.take());
+        drop(self.value.take());
         crate::sc20686_observer::release_cache(self.cache_id);
     }
 }
@@ -187,12 +190,20 @@ pub(crate) struct PreparedWanCrossKv {
 impl PreparedWanCrossKv {
     /// Bytes and shape metadata are derived from the live projected tensors, never from a request
     /// claim. The campaign observer uses this to account for the request-scoped cross-KV payload.
-    pub(crate) fn evidence(&self) -> (u64, String, String) {
+    pub(crate) fn evidence(&self) -> Option<(u64, String, String)> {
+        if !crate::sc20686_observer::campaign_active() {
+            return None;
+        }
+        #[cfg(test)]
+        EVIDENCE_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut bytes = 0u64;
         let mut shapes = Vec::new();
         let mut dtypes = Vec::new();
         for block in &self.blocks {
-            for tensor in [&block.key, &block.value] {
+            for tensor in [block.key.as_ref(), block.value.as_ref()]
+                .into_iter()
+                .flatten()
+            {
                 bytes = bytes.saturating_add(
                     (tensor.elem_count() as u64)
                         .saturating_mul(tensor.dtype().size_in_bytes() as u64),
@@ -201,9 +212,13 @@ impl PreparedWanCrossKv {
                 dtypes.push(format!("{:?}", tensor.dtype()));
             }
         }
-        (bytes, shapes.join(";"), dtypes.join(";"))
+        Some((bytes, shapes.join(";"), dtypes.join(";")))
     }
 }
+
+#[cfg(test)]
+static EVIDENCE_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 static CROSS_KV_PREPARATION_PAIRS: std::sync::atomic::AtomicUsize =
@@ -330,8 +345,8 @@ impl Attention {
             0
         };
         Ok(PreparedBlockCrossKv {
-            key,
-            value,
+            key: Some(key),
+            value: Some(value),
             cache_id,
         })
     }
@@ -370,28 +385,26 @@ impl Attention {
                 .contiguous()
         };
         let mut q = to_heads(&q)?; // [B,H,S,d]
-        let mut k = kv.key.clone();
+        let mut k = kv.key.as_ref().expect("live prepared key").clone();
         if let Some((cos, sin)) = rope {
             q = apply_rope(&q, cos, sin)?;
             k = apply_rope(&k, cos, sin)?;
         }
         let scale = (self.head_dim as f64).powf(-0.5);
-        let allocator_before = observe_cross_attention
-            .then(crate::sc20686_observer::backend_reserved_bytes)
+        let allocator_window = observe_cross_attention
+            .then(crate::sc20686_observer::begin_active_allocator_window)
             .flatten();
-        let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
-        let allocator_after = observe_cross_attention
-            .then(crate::sc20686_observer::backend_reserved_bytes)
-            .flatten();
-        let physical_read_transient = allocator_before
-            .zip(allocator_after)
-            .map_or(0, |(before, after)| after.saturating_sub(before));
+        let out = sdpa(
+            &q,
+            &k,
+            kv.value.as_ref().expect("live prepared value"),
+            scale,
+        )?; // [B,H,S,d]
+        let allocator = crate::sc20686_observer::finish_active_allocator_window(allocator_window);
         if observe_cross_attention {
             crate::sc20686_observer::record_cache_read(
                 kv.cache_id,
-                physical_read_transient,
-                allocator_before.unwrap_or(0),
-                allocator_after.unwrap_or(0),
+                allocator,
                 measured.expect("observed read has a start time"),
             );
         }
@@ -1050,6 +1063,17 @@ mod tests {
     use super::*;
     use crate::rope::{apply_source_id, WanRope};
     use std::collections::HashMap;
+
+    #[test]
+    fn observer_off_skips_prepared_evidence_construction() {
+        EVIDENCE_CONSTRUCTIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let prepared = PreparedWanCrossKv { blocks: Vec::new() };
+        assert!(prepared.evidence().is_none());
+        assert_eq!(
+            EVIDENCE_CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
 
     /// A tiny dense config the CPU synthetic weights below fill (dim 16 = 2 heads × head_dim 8, z16
     /// in/out, patch (1,2,2)). Keeps the packed-forward geometry (`ppf·pph·ppw` tokens, 3-axis RoPE) but

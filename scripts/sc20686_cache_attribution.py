@@ -82,6 +82,36 @@ def packed_group32_kv_bytes(batch, heads, tokens, width):
     return key_codes + key_metadata + key_pending + value_codes + value_metadata
 
 
+def active_allocator_measurement(event, label):
+    fields = (
+        "allocator_before_bytes", "allocator_after_bytes", "allocator_high_bytes",
+        "allocator_reserved_bytes",
+    )
+    values = {field: event.get(field) for field in fields}
+    if event.get("allocator_measurement_available") is not True or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values.values()
+    ):
+        fail(f"{label} lacks active allocator high-water evidence")
+    if (
+        values["allocator_high_bytes"] < values["allocator_before_bytes"]
+        or values["allocator_high_bytes"] < values["allocator_after_bytes"]
+        or values["allocator_reserved_bytes"] < values["allocator_after_bytes"]
+    ):
+        fail(f"{label} allocator high-water/remnant ordering is invalid")
+    return values
+
+
+def dense_reference_kv_bytes(geometry):
+    dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4}.get(geometry["dtype"].upper())
+    if dtype_bytes is None:
+        fail("FLUX reference slice has unsupported live dtype")
+    return (
+        2 * geometry["batch"] * geometry["heads"] * geometry["skv"]
+        * geometry["head_dimension"] * dtype_bytes
+    )
+
+
 def read_checked_json(path, expected_schema):
     try:
         raw = path.read_bytes()
@@ -119,7 +149,10 @@ def checked_contracts():
             or entry.get("self_attention_excluded") is not True
         ):
             fail(f"source map route is malformed: {variant}")
-        for field in ("activation", "creation", "reads", "release"):
+        anchor_fields = ["activation", "creation", "reads", "release"]
+        if entry["family"] == "flux2-klein":
+            anchor_fields.append("reference_slice")
+        for field in anchor_fields:
             anchors = entry.get(field)
             if not isinstance(anchors, list) or not anchors:
                 fail(f"source map lacks {field} anchors: {variant}")
@@ -228,6 +261,38 @@ def validate(row, expected_source_map_hash):
             fail("Wan candidate bytes differ from exact SC-20675 group32 projection")
     elif row["candidate_persistent_bytes"] != expected_candidate * row["geometry"]["layers"]:
         fail("FLUX candidate bytes differ from exact per-layer SC-20675 group32 projection")
+    reads = [
+        event for event in row["observer_events"]
+        if isinstance(event, dict) and event.get("phase") == "cross-kv-read"
+    ]
+    releases = [
+        event for event in row["observer_events"]
+        if isinstance(event, dict) and event.get("phase") in ("cross-kv-released", "released")
+    ]
+    if not reads or not any(event.get("phase") == "released" for event in releases):
+        fail("allocator read/release evidence is incomplete")
+    for event in releases:
+        active_allocator_measurement(event, "release remnant")
+    if row["family"] == "wan":
+        for event in reads:
+            allocator = active_allocator_measurement(event, "Wan cache read")
+            if event.get("transient_bytes") != (
+                allocator["allocator_high_bytes"] - allocator["allocator_before_bytes"]
+            ):
+                fail("Wan read transient differs from active allocator high-water")
+    else:
+        exact_dense = dense_reference_kv_bytes(row["geometry"])
+        if (
+            any(event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
+                or event.get("transient_bytes") != exact_dense for event in created)
+            or any(event.get("operation") != "DoubleAttention::attention(reference-kv-slice)"
+                   or event.get("transient_bytes") != exact_dense for event in reads)
+            or row["current_read_transient_bytes"] != exact_dense
+            or row["candidate_read_transient_bytes"] != exact_dense
+        ):
+            fail("FLUX reference K/V slice differs from exact live geometry/dtype")
+        for event in reads:
+            active_allocator_measurement(event, "FLUX attention read")
     expected_coordinate_id = sha256(
         (json.dumps(row["geometry"], sort_keys=True, separators=(",", ":")) + "\n").encode()
     )[:16]
@@ -310,6 +375,9 @@ def coordinate_decision(row):
     process_peak = max(sample["peak_bytes"] for sample in row["process_samples"])
     persistent_saving = row["current_persistent_bytes"] - row["candidate_persistent_bytes"]
     transient_saving = row["current_read_transient_bytes"] - row["candidate_read_transient_bytes"]
+    current_total = row["current_persistent_bytes"] + row["current_read_transient_bytes"]
+    candidate_total = row["candidate_persistent_bytes"] + row["candidate_read_transient_bytes"]
+    net_total_saving = current_total - candidate_total
     runtime_fraction = row["cache_read_duration_ms"] / row["generation_duration_ms"]
     persistent_opportunity = (
         row["current_persistent_bytes"] >= THRESHOLDS["opportunity_bytes"]
@@ -331,10 +399,15 @@ def coordinate_decision(row):
     )
     reads_qualify = row["minimum_cache_reads"] >= THRESHOLDS["minimum_reads_per_cache"]
     runtime_qualifies = runtime_fraction >= THRESHOLDS["runtime_only_pct"]
+    net_total_reduction = (
+        net_total_saving >= THRESHOLDS["saving_bytes"]
+        and net_total_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
+    )
     eligible = (
         reads_qualify
         and runtime_qualifies
         and (persistent_reduction or transient_reduction)
+        and net_total_reduction
     )
     return {
         "decision": "go" if eligible else "no-go",
@@ -344,6 +417,10 @@ def coordinate_decision(row):
         "read_transient_opportunity": transient_opportunity,
         "persistent_saving_bytes": persistent_saving,
         "read_transient_saving_bytes": transient_saving,
+        "current_total_bytes": current_total,
+        "candidate_total_bytes": candidate_total,
+        "net_total_saving_bytes": net_total_saving,
+        "net_total_reduction_qualifies": net_total_reduction,
         "persistent_reduction_qualifies": persistent_reduction,
         "read_transient_reduction_qualifies": transient_reduction,
         "cache_read_runtime_fraction": runtime_fraction,

@@ -193,6 +193,43 @@ def verify_coordinate_inputs(spec):
         raise ValueError(f"route executable or manifest changed after resolution: {spec.variant}/{spec.name}")
 
 
+def verify_snapshot_identity(spec, expected):
+    if snapshot_identity(spec.snapshot) != expected:
+        raise ValueError(f"model snapshot changed during campaign arm: {spec.variant}/{spec.name}")
+
+
+def active_allocator_measurement(event, label):
+    values = {
+        key: event.get(key)
+        for key in (
+            "allocator_before_bytes", "allocator_after_bytes", "allocator_high_bytes",
+            "allocator_reserved_bytes",
+        )
+    }
+    if event.get("allocator_measurement_available") is not True or any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values.values()
+    ):
+        raise ValueError(f"{label} lacks active allocator high-water evidence")
+    if (
+        values["allocator_high_bytes"] < values["allocator_before_bytes"]
+        or values["allocator_high_bytes"] < values["allocator_after_bytes"]
+        or values["allocator_reserved_bytes"] < values["allocator_after_bytes"]
+    ):
+        raise ValueError(f"{label} allocator high-water/remnant ordering is invalid")
+    return values
+
+
+def dense_reference_kv_bytes(geometry):
+    dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4}.get(geometry["dtype"].upper())
+    if dtype_bytes is None:
+        raise ValueError("FLUX reference slice has unsupported live dtype")
+    return (
+        2 * geometry["batch"] * geometry["heads"] * geometry["skv"]
+        * geometry["head_dimension"] * dtype_bytes
+    )
+
+
 def load_coverage():
     document = json.loads(COVERAGE.read_text(encoding="utf-8"))
     if document.get("schema") != "sc-20686-supported-coverage-v2":
@@ -569,6 +606,9 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if metrics["candidate_read_transient_bytes"] > observed_transient:
         raise ValueError("candidate read workspace exceeds the measured dense read")
     create_events = [event for event in events if event.get("phase") == "cross-kv-created"]
+    geometry = geometry_from(events)
+    release_remnant = events[indices["released"]]
+    active_allocator_measurement(release_remnant, "post-release remnant")
     if args.family == "flux2-klein":
         if metrics["current_persistent_bytes"] != 0 or any(event.get("persistent_bytes") != 0 for event in create_events):
             raise ValueError("FLUX edit must report its non-persistent route honestly")
@@ -578,13 +618,23 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         ):
             raise ValueError("FLUX logical payload reuse differs from product-owned recomputations")
         if any(
-            event.get("operation") != "DoubleAttention::to_k/to_v/add_k/add_v"
+            event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
             for event in create_events
         ) or any(
-            event.get("operation") != "DoubleAttention::attention(reference-kv)"
+            event.get("operation") != "DoubleAttention::attention(reference-kv-slice)"
             for event in read_events
         ):
             raise ValueError("FLUX evidence is not anchored at exact DoubleAttention K/V boundaries")
+        exact_dense = dense_reference_kv_bytes(geometry)
+        if (
+            any(event.get("transient_bytes") != exact_dense for event in create_events)
+            or any(event.get("transient_bytes") != exact_dense for event in read_events)
+            or metrics["current_read_transient_bytes"] != exact_dense
+            or metrics["candidate_read_transient_bytes"] != exact_dense
+        ):
+            raise ValueError("FLUX reference K/V slice bytes differ from exact live geometry/dtype")
+        for event in read_events:
+            active_allocator_measurement(event, "FLUX attention read")
     else:
         if metrics["reused_requests"] != observed_reuse:
             raise ValueError("reuse metric differs from product-owned read events")
@@ -657,15 +707,13 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         ):
             raise ValueError("Wan persistent metric differs from exact simultaneous residency")
         for event in read_events:
-            before = event.get("allocator_before_bytes")
-            after = event.get("allocator_after_bytes")
-            if (
-                not isinstance(before, int) or isinstance(before, bool) or before <= 0
-                or not isinstance(after, int) or isinstance(after, bool) or after <= 0
-                or event.get("transient_bytes") != max(0, after - before)
+            allocator = active_allocator_measurement(event, "Wan cache read")
+            if event.get("transient_bytes") != (
+                allocator["allocator_high_bytes"] - allocator["allocator_before_bytes"]
             ):
-                raise ValueError("Wan read transient lacks exact allocator before/after evidence")
-    geometry = geometry_from(events)
+                raise ValueError("Wan read transient differs from active allocator high-water")
+        for event in release_events:
+            active_allocator_measurement(event, "Wan cache release remnant")
     if args.family == "flux2-klein" and geometry["reference_count"] < 1:
         raise ValueError("FLUX edit campaign requires a live reference image")
     coordinate_id = digest(canonical(geometry))[:16]
@@ -743,7 +791,10 @@ def render_markdown(keys, decision, source_map):
             f"- Offload: {entry['offload']}", f"- Recompute: {entry['recompute']}",
             f"- Compatibility: {entry['compatibility']}",
         ])
-        for kind in ("activation", "creation", "reads", "release"):
+        anchor_kinds = ["activation", "creation", "reads", "release"]
+        if "reference_slice" in entry:
+            anchor_kinds.insert(2, "reference_slice")
+        for kind in anchor_kinds:
             anchors = ", ".join(f"`{item['path']}:{item['line']}#{item['symbol']}`" for item in entry[kind])
             lines.append(f"- {kind.title()} anchors: {anchors}")
         lines.append("")
@@ -891,9 +942,12 @@ def main():
             }
 
             def runner(spec, arm):
+                expected_snapshot = snapshot_identities[str(spec.snapshot)]
                 verify_coordinate_inputs(spec)
+                verify_snapshot_identity(spec, expected_snapshot)
                 run = run_entrypoint(spec.entrypoint, spec.snapshot, spec.variant, arm, spec.args, args.run_timeout_seconds)
                 verify_coordinate_inputs(spec)
+                verify_snapshot_identity(spec, expected_snapshot)
                 return run
 
             def build_row(spec, arm, events, evidence_hashes):
@@ -933,8 +987,10 @@ def main():
 
         def runner(single_spec, arm):
             verify_coordinate_inputs(single_spec)
+            verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
             run = run_entrypoint(single_spec.entrypoint, single_spec.snapshot, single_spec.variant, arm, single_spec.args, args.run_timeout_seconds)
             verify_coordinate_inputs(single_spec)
+            verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
             return run
 
         def build_row(single_spec, arm, events, evidence_hashes):

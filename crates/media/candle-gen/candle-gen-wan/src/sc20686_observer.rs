@@ -30,6 +30,9 @@ pub struct CacheEvent {
     pub candidate_persistent_bytes: u64,
     pub allocator_before_bytes: u64,
     pub allocator_after_bytes: u64,
+    pub allocator_high_bytes: u64,
+    pub allocator_reserved_bytes: u64,
+    pub allocator_measurement_available: bool,
 }
 pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
@@ -420,6 +423,9 @@ impl CacheObserver for JsonlObserver {
             "candidate_persistent_bytes": event.candidate_persistent_bytes,
             "allocator_before_bytes": event.allocator_before_bytes,
             "allocator_after_bytes": event.allocator_after_bytes,
+            "allocator_high_bytes": event.allocator_high_bytes,
+            "allocator_reserved_bytes": event.allocator_reserved_bytes,
+            "allocator_measurement_available": event.allocator_measurement_available,
         });
         if let Some(ctx) = &event.context {
             if event.phase == "metadata" {
@@ -572,16 +578,94 @@ fn backend_peak_bytes() -> Option<u64> {
     None
 }
 
-/// Product-owned allocator sample used to bound one live read. The campaign remains CUDA-only;
-/// non-CUDA builds return `None` and therefore cannot manufacture transient evidence.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActiveAllocatorWindow {
+    used_before: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ActiveAllocatorMeasurement {
+    pub(crate) used_before: u64,
+    pub(crate) used_after: u64,
+    pub(crate) used_high: u64,
+    pub(crate) reserved_after: u64,
+    pub(crate) available: bool,
+}
+
+impl ActiveAllocatorMeasurement {
+    pub(crate) fn transient_bytes(self) -> u64 {
+        self.used_high.saturating_sub(self.used_before)
+    }
+}
+
+/// Reset only the active-byte high-water for one serialized product operation. The whole-run
+/// RESERVED high-water remains untouched and continues to supply the admission-domain peak.
 #[cfg(feature = "cuda")]
-pub(crate) fn backend_reserved_bytes() -> Option<u64> {
-    candle_gen::cuda_mempool::MemPool::device_default(0)?.reserved()
+pub(crate) fn begin_active_allocator_window() -> Option<ActiveAllocatorWindow> {
+    let pool = candle_gen::cuda_mempool::MemPool::device_default(0)?;
+    let used_before = pool.used()?;
+    if !pool.reset_used_high_water() || pool.used_high()? < used_before {
+        return None;
+    }
+    Some(ActiveAllocatorWindow { used_before })
 }
 
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn backend_reserved_bytes() -> Option<u64> {
+pub(crate) fn begin_active_allocator_window() -> Option<ActiveAllocatorWindow> {
     None
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn finish_active_allocator_window(
+    window: Option<ActiveAllocatorWindow>,
+) -> ActiveAllocatorMeasurement {
+    let Some(window) = window else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let Some(pool) = candle_gen::cuda_mempool::MemPool::device_default(0) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let (Some(used_after), Some(used_high), Some(reserved_after)) =
+        (pool.used(), pool.used_high(), pool.reserved())
+    else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    ActiveAllocatorMeasurement {
+        used_before: window.used_before,
+        used_after,
+        used_high,
+        reserved_after,
+        available: used_high >= window.used_before && reserved_after >= used_after,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(crate) fn finish_active_allocator_window(
+    _window: Option<ActiveAllocatorWindow>,
+) -> ActiveAllocatorMeasurement {
+    ActiveAllocatorMeasurement::default()
+}
+
+#[cfg(feature = "cuda")]
+fn allocator_remnant() -> ActiveAllocatorMeasurement {
+    let Some(pool) = candle_gen::cuda_mempool::MemPool::device_default(0) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    let (Some(used), Some(reserved)) = (pool.used(), pool.reserved()) else {
+        return ActiveAllocatorMeasurement::default();
+    };
+    ActiveAllocatorMeasurement {
+        used_before: used,
+        used_after: used,
+        used_high: used,
+        reserved_after: reserved,
+        available: reserved >= used,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn allocator_remnant() -> ActiveAllocatorMeasurement {
+    ActiveAllocatorMeasurement::default()
 }
 pub struct Scope {
     started: Instant,
@@ -648,6 +732,9 @@ pub fn observe_timed(
         0,
         0,
         0,
+        0,
+        0,
+        false,
     );
 }
 
@@ -662,6 +749,9 @@ fn observe_timed_for_cache(
     candidate_persistent_bytes: u64,
     allocator_before_bytes: u64,
     allocator_after_bytes: u64,
+    allocator_high_bytes: u64,
+    allocator_reserved_bytes: u64,
+    allocator_measurement_available: bool,
 ) {
     // Outside an explicitly installed campaign, this must be inert before touching any of the
     // accounting thread-locals or allocating event strings/maps.
@@ -823,6 +913,9 @@ fn observe_timed_for_cache(
                 candidate_persistent_bytes,
                 allocator_before_bytes,
                 allocator_after_bytes,
+                allocator_high_bytes,
+                allocator_reserved_bytes,
+                allocator_measurement_available,
             };
             observer.record(event.clone());
             if phase == "generation-end" {
@@ -871,6 +964,9 @@ pub(crate) fn register_cache(dense_bytes: u64, candidate_bytes: u64, measured: I
         candidate_bytes,
         0,
         0,
+        0,
+        0,
+        false,
     );
     cache_id
 }
@@ -879,9 +975,7 @@ pub(crate) fn register_cache(dense_bytes: u64, candidate_bytes: u64, measured: I
 /// allocator delta, never a tensor element-count surrogate.
 pub(crate) fn record_cache_read(
     cache_id: u64,
-    transient_bytes: u64,
-    allocator_before_bytes: u64,
-    allocator_after_bytes: u64,
+    allocator: ActiveAllocatorMeasurement,
     measured: Instant,
 ) {
     if cache_id == 0 || !ACTIVE.with(|slot| slot.borrow().is_some()) {
@@ -890,13 +984,16 @@ pub(crate) fn record_cache_read(
     observe_timed_for_cache(
         "cross-kv-read",
         0,
-        transient_bytes,
+        allocator.transient_bytes(),
         1,
         Some(measured),
         cache_id,
         0,
-        allocator_before_bytes,
-        allocator_after_bytes,
+        allocator.used_before,
+        allocator.used_after,
+        allocator.used_high,
+        allocator.reserved_after,
+        allocator.available,
     );
 }
 
@@ -906,6 +1003,7 @@ pub(crate) fn release_cache(cache_id: u64) {
     }
     let state = CACHE_STATES.with(|slot| slot.borrow_mut().remove(&cache_id));
     if let Some(state) = state {
+        let allocator = allocator_remnant();
         COMPLETED_CACHE_READS.with(|slot| slot.borrow_mut().push(state.reads));
         observe_timed_for_cache(
             "cross-kv-released",
@@ -915,10 +1013,31 @@ pub(crate) fn release_cache(cache_id: u64) {
             None,
             cache_id,
             state.candidate_bytes,
-            0,
-            0,
+            allocator.used_before,
+            allocator.used_after,
+            allocator.used_high,
+            allocator.reserved_after,
+            allocator.available,
         );
     }
+}
+
+fn observe_release_remnant() {
+    let allocator = allocator_remnant();
+    observe_timed_for_cache(
+        "released",
+        0,
+        0,
+        0,
+        None,
+        0,
+        0,
+        allocator.used_before,
+        allocator.used_after,
+        allocator.used_high,
+        allocator.reserved_after,
+        allocator.available,
+    );
 }
 
 fn elapsed_ms_for(measured: Option<Instant>) -> u64 {
@@ -958,6 +1077,9 @@ pub fn observe_tensor(
     mask: impl Into<String>,
     rope: impl Into<String>,
 ) {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     let shape = tensor_shape.into();
     let dtype = dtype.into();
     let mask = mask.into();
@@ -1001,6 +1123,9 @@ pub fn observe_tensor(
                 candidate_persistent_bytes: 0,
                 allocator_before_bytes: 0,
                 allocator_after_bytes: 0,
+                allocator_high_bytes: 0,
+                allocator_reserved_bytes: 0,
+                allocator_measurement_available: false,
             });
         }
     });
@@ -1106,7 +1231,7 @@ impl Drop for Scope {
             observe("generation-end", 0, 0, 0);
         }
         observe("invalidated", 0, 0, 0);
-        observe("released", 0, 0, 0);
+        observe_release_remnant();
         ACTIVE.with(|slot| *slot.borrow_mut() = None);
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         STARTED.with(|slot| *slot.borrow_mut() = None);
@@ -1281,14 +1406,21 @@ mod tests {
         let _scope = install(Box::new(Sink(out.clone())));
         let first = register_cache(100, 50, Instant::now());
         let second = register_cache(200, 80, Instant::now());
-        record_cache_read(first, 32, 1000, 1032, Instant::now());
-        record_cache_read(first, 32, 1032, 1064, Instant::now());
-        record_cache_read(second, 64, 1064, 1128, Instant::now());
+        let sample = |before, after, high| ActiveAllocatorMeasurement {
+            used_before: before,
+            used_after: after,
+            used_high: high,
+            reserved_after: high,
+            available: true,
+        };
+        record_cache_read(first, sample(1000, 1016, 1032), Instant::now());
+        record_cache_read(first, sample(1032, 1048, 1064), Instant::now());
+        record_cache_read(second, sample(1064, 1100, 1128), Instant::now());
         assert_eq!(
             CACHE_STATES.with(|slot| slot.borrow().values().map(|state| state.reads).min()),
             Some(1)
         );
-        record_cache_read(second, 64, 1128, 1192, Instant::now());
+        record_cache_read(second, sample(1128, 1160, 1192), Instant::now());
         assert_eq!(
             CACHE_STATES.with(|slot| slot.borrow().values().map(|state| state.reads).min()),
             Some(2)
@@ -1308,8 +1440,36 @@ mod tests {
         assert!(rows.iter().any(|event| {
             event.cache_id == second
                 && event.allocator_before_bytes == 1_128
-                && event.allocator_after_bytes == 1_192
+                && event.allocator_after_bytes == 1_160
+                && event.allocator_high_bytes == 1_192
+                && event.allocator_measurement_available
         }));
+    }
+
+    #[test]
+    fn observer_off_skips_string_conversion_and_accounting() {
+        struct CountInto(std::rc::Rc<Cell<u32>>);
+        impl From<CountInto> for String {
+            fn from(value: CountInto) -> Self {
+                value.0.set(value.0.get() + 1);
+                "constructed".into()
+            }
+        }
+        let conversions = std::rc::Rc::new(Cell::new(0));
+        observe_tensor(
+            "disabled",
+            "disabled",
+            1,
+            2,
+            3,
+            CountInto(conversions.clone()),
+            CountInto(conversions.clone()),
+            CountInto(conversions.clone()),
+            CountInto(conversions.clone()),
+        );
+        assert_eq!(conversions.get(), 0);
+        assert_eq!(LIVE_PERSISTENT.with(|slot| *slot.borrow()), 0);
+        assert_eq!(CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow()), 0);
     }
 
     #[test]

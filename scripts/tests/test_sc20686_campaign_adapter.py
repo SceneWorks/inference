@@ -41,27 +41,45 @@ class CampaignAdapterTests(unittest.TestCase):
         if cancel:
             metadata["cancellation_arm_id"] = "a:flux2_klein_9b_edit"
         terminal = "cancelled" if cancel else "generation-end"
+        dense_reference = self.adapter.dense_reference_kv_bytes(geometry)
         metrics = {
             "phase": "metrics", "sample_kind": "allocator", "peak_bytes": 10 * 1024**3,
-            "current_persistent_bytes": 0, "current_read_transient_bytes": 700 * 1024**2,
+            "current_persistent_bytes": 0, "current_read_transient_bytes": dense_reference,
             "candidate_persistent_bytes": 100 * 1024**2,
-            "candidate_read_transient_bytes": 700 * 1024**2,
+            "candidate_read_transient_bytes": dense_reference,
             "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
             "reused_requests": 2, "minimum_cache_reads": 2,
         }
         base = {"sample_kind": "allocator", "peak_bytes": 10 * 1024**3}
+        allocator = {
+            "allocator_before_bytes": 1024**3,
+            "allocator_after_bytes": 1024**3,
+            "allocator_high_bytes": 1024**3 + dense_reference,
+            "allocator_reserved_bytes": 10 * 1024**3,
+            "allocator_measurement_available": True,
+        }
+        remnant = {
+            "allocator_before_bytes": 512 * 1024**2,
+            "allocator_after_bytes": 512 * 1024**2,
+            "allocator_high_bytes": 512 * 1024**2,
+            "allocator_reserved_bytes": 2 * 1024**3,
+            "allocator_measurement_available": True,
+        }
         return [
             metadata,
             {"phase": "generation-start", **base},
-            {"phase": "cross-kv-created", "operation": "DoubleAttention::to_k/to_v/add_k/add_v", "persistent_bytes": 0, **base},
-            {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
-             "operation": "DoubleAttention::attention(reference-kv)", "reused": 1, **base},
-            {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
-             "operation": "DoubleAttention::attention(reference-kv)", "reused": 1, **base},
+            {"phase": "cross-kv-created", "operation": "DoubleAttention::to_k/to_v(reference-slice)",
+             "persistent_bytes": 0, "transient_bytes": dense_reference, **base},
+            {"phase": "cross-kv-read", "transient_bytes": dense_reference,
+             "operation": "DoubleAttention::attention(reference-kv-slice)", "reused": 1,
+             **allocator, **base},
+            {"phase": "cross-kv-read", "transient_bytes": dense_reference,
+             "operation": "DoubleAttention::attention(reference-kv-slice)", "reused": 1,
+             **allocator, **base},
             {"phase": terminal, **base},
             metrics,
             {"phase": "invalidated", **base},
-            {"phase": "released", **base},
+            {"phase": "released", **remnant, **base},
             {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 10 * 1024**3},
         ]
 
@@ -88,6 +106,24 @@ class CampaignAdapterTests(unittest.TestCase):
             self.adapter.make_row(
                 self.row_args(), self.config(), "b" * 64, 1,
                 self.flux_events(variant="flux2_klein_9b"),
+            )
+
+    def test_active_high_water_and_post_release_remnant_are_required(self):
+        broken_read = self.flux_events()
+        next(event for event in broken_read if event["phase"] == "cross-kv-read")[
+            "allocator_measurement_available"
+        ] = False
+        with self.assertRaisesRegex(ValueError, "active allocator high-water"):
+            self.adapter.make_row(
+                self.row_args(), self.config(), "b" * 64, 1, broken_read
+            )
+        broken_release = self.flux_events()
+        next(event for event in broken_release if event["phase"] == "released")[
+            "allocator_measurement_available"
+        ] = False
+        with self.assertRaisesRegex(ValueError, "post-release remnant"):
+            self.adapter.make_row(
+                self.row_args(), self.config(), "b" * 64, 1, broken_release
             )
 
     def test_raw_receipt_sidecar_hashes_exact_unsigned_artifact(self):
@@ -231,6 +267,20 @@ class CampaignAdapterTests(unittest.TestCase):
             after, _ = self.adapter.hash_file_arguments(arguments)
             self.assertNotEqual(before, after)
 
+    def test_model_snapshot_mutation_after_arm_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            config = snapshot / "config.json"
+            config.write_text("{}", encoding="utf-8")
+            expected = self.adapter.snapshot_identity(snapshot)
+            spec = argparse.Namespace(variant="route", name="coordinate", snapshot=snapshot)
+            self.adapter.verify_snapshot_identity(spec, expected)
+            config.write_text('{"changed":true}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "model snapshot changed during campaign arm"):
+                self.adapter.verify_snapshot_identity(spec, expected)
+
     def test_cancel_arm_requires_product_identity_and_metrics(self):
         row = self.adapter.make_row(
             self.row_args(cancel=True), self.config(), "b" * 64, 1,
@@ -256,6 +306,14 @@ class CampaignAdapterTests(unittest.TestCase):
             "rope": "none",
         }
         base = {"sample_kind": "allocator", "peak_bytes": 10 * 1024**3}
+        def measured(before, transient=0):
+            return {
+                "allocator_before_bytes": before,
+                "allocator_after_bytes": before,
+                "allocator_high_bytes": before + transient,
+                "allocator_reserved_bytes": 10 * 1024**3,
+                "allocator_measurement_available": True,
+            }
         events = [
             {"phase": "metadata", "source_ref": "a" * 40,
              "snapshot_sha256": "b" * 64, "snapshot_bytes": 1,
@@ -271,26 +329,26 @@ class CampaignAdapterTests(unittest.TestCase):
              "candidate_persistent_bytes": 100 * 1024**2, **base},
             {"phase": "cross-kv-read", "cache_id": 1,
              "transient_bytes": 64 * 1024**2, "reused": 1,
-             "allocator_before_bytes": 1024, "allocator_after_bytes": 1024 + 64 * 1024**2,
+             **measured(1024, 64 * 1024**2),
              **base},
             {"phase": "cross-kv-read", "cache_id": 2,
              "transient_bytes": 64 * 1024**2, "reused": 1,
-             "allocator_before_bytes": 2048, "allocator_after_bytes": 2048 + 64 * 1024**2,
+             **measured(2048, 64 * 1024**2),
              **base},
             {"phase": "cross-kv-read", "cache_id": 1,
              "transient_bytes": 64 * 1024**2, "reused": 1,
-             "allocator_before_bytes": 3072, "allocator_after_bytes": 3072 + 64 * 1024**2,
+             **measured(3072, 64 * 1024**2),
              **base},
             {"phase": "cross-kv-read", "cache_id": 2,
              "transient_bytes": 64 * 1024**2, "reused": 1,
-             "allocator_before_bytes": 4096, "allocator_after_bytes": 4096 + 64 * 1024**2,
+             **measured(4096, 64 * 1024**2),
              **base},
             {"phase": "cross-kv-released", "cache_id": 1,
              "persistent_bytes": 400 * 1024**2,
-             "candidate_persistent_bytes": 100 * 1024**2, **base},
+             "candidate_persistent_bytes": 100 * 1024**2, **measured(4096), **base},
             {"phase": "cross-kv-released", "cache_id": 2,
              "persistent_bytes": 400 * 1024**2,
-             "candidate_persistent_bytes": 100 * 1024**2, **base},
+             "candidate_persistent_bytes": 100 * 1024**2, **measured(2048), **base},
             {"phase": "generation-end", **base},
             {"phase": "metrics", "current_persistent_bytes": 800 * 1024**2,
              "current_read_transient_bytes": 64 * 1024**2,
@@ -299,7 +357,7 @@ class CampaignAdapterTests(unittest.TestCase):
              "generation_duration_ms": 1000, "cache_read_duration_ms": 100,
              "reused_requests": 4, "minimum_cache_reads": 2, **base},
             {"phase": "invalidated", **base},
-            {"phase": "released", **base},
+            {"phase": "released", **measured(1024), **base},
             {"phase": "process-sample", "sample_kind": "process",
              "peak_bytes": 10 * 1024**3},
         ]
@@ -315,10 +373,10 @@ class CampaignAdapterTests(unittest.TestCase):
             self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
         metrics["candidate_persistent_bytes"] += 1
         first_read = next(event for event in events if event["phase"] == "cross-kv-read")
-        first_read["allocator_after_bytes"] += 1
-        with self.assertRaisesRegex(ValueError, "allocator before/after"):
+        first_read["allocator_high_bytes"] += 1
+        with self.assertRaisesRegex(ValueError, "active allocator high-water"):
             self.adapter.make_row(args, self.config(), "b" * 64, 1, events)
-        first_read["allocator_after_bytes"] -= 1
+        first_read["allocator_high_bytes"] -= 1
         next(event for event in events if event["phase"] == "metrics")[
             "minimum_cache_reads"
         ] = 4
@@ -385,6 +443,23 @@ class CampaignAdapterTests(unittest.TestCase):
         }
 
         def runner(coordinate, arm):
+            expected = self.coverage["families"][coordinate.family][coordinate.variant][
+                "coordinates"
+            ][coordinate.name]
+            geometry = {
+                **expected, "layers": 2, "heads": 2, "head_dimension": 64,
+                "sq": 1024, "skv": 128, "dtype": "BF16", "mask": "none",
+                "rope": "none",
+            }
+            exact_dense = self.reducer.dense_reference_kv_bytes(geometry)
+            transient = exact_dense if coordinate.family == "flux2-klein" else 1
+            measured = {
+                "allocator_before_bytes": 1024,
+                "allocator_after_bytes": 1024,
+                "allocator_high_bytes": 1024 + transient,
+                "allocator_reserved_bytes": 10 * 1024**3,
+                "allocator_measurement_available": True,
+            }
             metadata = {
                 "phase": "metadata", "sample_kind": "allocator",
                 "peak_bytes": 10 * 1024**3,
@@ -399,6 +474,31 @@ class CampaignAdapterTests(unittest.TestCase):
                 "peak_bytes": 10 * 1024**3,
                 "candidate_persistent_bytes": exact_candidate,
             }
+            if coordinate.family == "flux2-klein":
+                created.update({
+                    "operation": "DoubleAttention::to_k/to_v(reference-slice)",
+                    "transient_bytes": exact_dense,
+                })
+            read = {
+                "phase": "cross-kv-read", "sample_kind": "allocator",
+                "peak_bytes": 10 * 1024**3, "transient_bytes": transient,
+                "operation": (
+                    "DoubleAttention::attention(reference-kv-slice)"
+                    if coordinate.family == "flux2-klein" else "wan-cross-attention"
+                ),
+                **measured,
+            }
+            release_events = []
+            if coordinate.family == "wan":
+                release_events.append({
+                    "phase": "cross-kv-released", "sample_kind": "allocator",
+                    "peak_bytes": 10 * 1024**3, **measured,
+                })
+            release_events.append({
+                "phase": "released", "sample_kind": "allocator",
+                "peak_bytes": 10 * 1024**3, **measured,
+            })
+            observer_events = [metadata, created, read, dict(read), *release_events]
             argv = [
                 "product-entrypoint", "--sc20686-campaign", "--sc20686-events", "-",
                 "--snapshot", "/snapshot", "--variant", coordinate.variant,
@@ -406,8 +506,8 @@ class CampaignAdapterTests(unittest.TestCase):
             if arm == "cancel":
                 argv.append("--sc20686-cancel")
             return self.adapter.CampaignRun(
-                [metadata, created, process],
-                self.adapter.canonical(metadata) + self.adapter.canonical(created), b"",
+                [*observer_events, process],
+                b"".join(self.adapter.canonical(event) for event in observer_events), b"",
                 tuple(argv), (process,),
             )
 
@@ -424,6 +524,7 @@ class CampaignAdapterTests(unittest.TestCase):
                 geometry["batch"], geometry["heads"], geometry["skv"],
                 geometry["head_dimension"],
             )
+            exact_dense = self.reducer.dense_reference_kv_bytes(geometry)
             return {
                 "producer": self.adapter.PRODUCER, "family": coordinate.family,
                 "variant": coordinate.variant, "coordinate_name": coordinate.name,
@@ -447,11 +548,15 @@ class CampaignAdapterTests(unittest.TestCase):
                 "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
                 "real_weights": True, "full_generation": arm == "normal",
                 "attention_kind": "cross", "current_persistent_bytes": 1,
-                "current_read_transient_bytes": 1, "candidate_persistent_bytes": (
+                "current_read_transient_bytes": (
+                    exact_dense if coordinate.family == "flux2-klein" else 1
+                ), "candidate_persistent_bytes": (
                     exact_candidate * geometry["layers"]
                     if coordinate.family == "flux2-klein" else exact_candidate
                 ),
-                "candidate_read_transient_bytes": 1, "generation_duration_ms": 1000,
+                "candidate_read_transient_bytes": (
+                    exact_dense if coordinate.family == "flux2-klein" else 1
+                ), "generation_duration_ms": 1000,
                 "cache_read_duration_ms": 10, "reused_requests": 2,
                 "minimum_cache_reads": 2,
             }

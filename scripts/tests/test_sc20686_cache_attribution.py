@@ -39,6 +39,37 @@ class AttributionTests(unittest.TestCase):
             geometry["batch"], geometry["heads"], geometry["skv"],
             geometry["head_dimension"],
         )
+        exact_dense = self.reducer.dense_reference_kv_bytes(geometry)
+        measured = {
+            "allocator_before_bytes": 1024,
+            "allocator_after_bytes": 1024,
+            "allocator_high_bytes": 1024 + (exact_dense if family == "flux2-klein" else 1),
+            "allocator_reserved_bytes": 10 * 1024**3,
+            "allocator_measurement_available": True,
+        }
+        created_event = {
+            "phase": "cross-kv-created",
+            "candidate_persistent_bytes": exact_candidate,
+        }
+        if family == "flux2-klein":
+            created_event.update({
+                "operation": "DoubleAttention::to_k/to_v(reference-slice)",
+                "transient_bytes": exact_dense,
+            })
+        read_event = {
+            "phase": "cross-kv-read",
+            "operation": (
+                "DoubleAttention::attention(reference-kv-slice)"
+                if family == "flux2-klein" else "wan-cross-attention"
+            ),
+            "transient_bytes": exact_dense if family == "flux2-klein" else 1,
+            **measured,
+        }
+        release_event = {"phase": "released", **measured}
+        observer_events = [created_event, read_event, dict(read_event)]
+        if family == "wan":
+            observer_events.append({"phase": "cross-kv-released", **measured})
+        observer_events.append(release_event)
         row = {
             "producer": "sc20686-campaign-adapter-v2", "family": family,
             "variant": variant, "coordinate_name": coordinate,
@@ -52,20 +83,18 @@ class AttributionTests(unittest.TestCase):
             "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
             "allocator_samples": [{"peak_bytes": 10 * 1024**3}],
             "process_samples": [{"peak_bytes": 10 * 1024**3}],
-            "observer_events": [{
-                "phase": "cross-kv-created",
-                "candidate_persistent_bytes": exact_candidate,
-            }],
+            "observer_events": observer_events,
             "raw_receipt_sha256": "c" * 64,
             "raw_receipt_sidecar_sha256": "f" * 64,
             "real_weights": True, "full_generation": arm == "normal",
             "attention_kind": "cross",
-            "current_persistent_bytes": 1, "current_read_transient_bytes": 1,
+            "current_persistent_bytes": 1,
+            "current_read_transient_bytes": exact_dense if family == "flux2-klein" else 1,
             "candidate_persistent_bytes": (
                 exact_candidate * geometry["layers"] if family == "flux2-klein"
                 else exact_candidate
             ),
-            "candidate_read_transient_bytes": 1,
+            "candidate_read_transient_bytes": exact_dense if family == "flux2-klein" else 1,
             "generation_duration_ms": 1000, "cache_read_duration_ms": 10,
             "reused_requests": 2, "minimum_cache_reads": 2,
         }
@@ -128,16 +157,21 @@ class AttributionTests(unittest.TestCase):
 
     def test_family_decisions_are_separate_and_variant_scoped(self):
         rows = self.complete_rows()
+        target_variant = next(iter(self.coverage["families"]["wan"]))
         for row in rows:
-            if row["family"] == "flux2-klein" and row["arm"] == "normal":
+            if (
+                row["family"] == "wan"
+                and row["variant"] == target_variant
+                and row["arm"] == "normal"
+            ):
                 row.update({
-                    "current_read_transient_bytes": 700 * 1024**2,
-                    "candidate_read_transient_bytes": 100 * 1024**2,
+                    "current_persistent_bytes": 700 * 1024**2,
+                    "candidate_persistent_bytes": 100 * 1024**2,
                     "cache_read_duration_ms": 100,
                 })
         result = self.reducer.reduce(rows)
-        self.assertEqual(result["decisions"]["flux2-klein"]["decision"], "go")
-        self.assertEqual(result["decisions"]["wan"]["decision"], "no-go")
+        self.assertEqual(result["decisions"]["flux2-klein"]["decision"], "no-go")
+        self.assertEqual(result["decisions"]["wan"]["decision"], "go")
 
     def test_component_reductions_are_evaluated_independently(self):
         rows = self.complete_rows()
@@ -156,6 +190,22 @@ class AttributionTests(unittest.TestCase):
         self.assertFalse(decision["read_transient_reduction_qualifies"])
         self.assertEqual(decision["decision"], "go")
 
+    def test_candidate_component_shift_must_still_reduce_net_total(self):
+        row = self.complete_rows()[0]
+        row.update({
+            "current_persistent_bytes": 0,
+            "current_read_transient_bytes": 700 * 1024**2,
+            "candidate_persistent_bytes": 10 * 1024**3,
+            "candidate_read_transient_bytes": 100 * 1024**2,
+            "cache_read_duration_ms": 100,
+            "allocator_samples": [{"peak_bytes": 10 * 1024**3}],
+        })
+        decision = self.reducer.coordinate_decision(row)
+        self.assertTrue(decision["read_transient_reduction_qualifies"])
+        self.assertFalse(decision["net_total_reduction_qualifies"])
+        self.assertEqual(decision["decision"], "no-go")
+        self.assertLess(decision["net_total_saving_bytes"], 0)
+
     def test_complete_frozen_coordinates_and_matching_arms_are_required(self):
         rows = self.complete_rows()
         missing = rows[:-1]
@@ -173,6 +223,13 @@ class AttributionTests(unittest.TestCase):
             if cancel["family"] == "flux2-klein" else expected_candidate
         )
         cancel["observer_events"][0]["candidate_persistent_bytes"] = expected_candidate
+        if cancel["family"] == "flux2-klein":
+            exact_dense = self.reducer.dense_reference_kv_bytes(cancel["geometry"])
+            cancel["current_read_transient_bytes"] = exact_dense
+            cancel["candidate_read_transient_bytes"] = exact_dense
+            for event in cancel["observer_events"]:
+                if event.get("phase") in ("cross-kv-created", "cross-kv-read"):
+                    event["transient_bytes"] = exact_dense
         cancel["coordinate_id"] = self.reducer.sha256(
             (json.dumps(cancel["geometry"], sort_keys=True, separators=(",", ":")) + "\n").encode()
         )[:16]
@@ -215,7 +272,23 @@ class AttributionTests(unittest.TestCase):
             {"to_k.forward", "to_v.forward", "add_k.forward", "add_v.forward"},
         )
         self.assertTrue(all(anchor["path"].endswith("flux2/src/transformer.rs") for anchor in entry["creation"]))
+        self.assertEqual(
+            [anchor["symbol"] for anchor in entry["reference_slice"]],
+            ["record_flux_kv_created", "narrow", "narrow"],
+        )
         self.assertEqual(entry["reads"][0]["symbol"], "attention")
+
+        root = SCRIPT.parents[1]
+        transformer = (root / "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs").read_text(
+            encoding="utf-8"
+        )
+        observer = (root / "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("record_flux_kv_created(&ik, &iv)", transformer)
+        self.assertNotIn("record_flux_kv_created(\n            &ik,\n            &iv,\n            &tk", transformer)
+        self.assertIn("image_k.narrow(2, target_tokens, reference_tokens)", observer)
+        self.assertIn("image_v.narrow(2, target_tokens, reference_tokens)", observer)
 
     def test_standalone_reducer_rejects_unsealed_json_list(self):
         with tempfile.TemporaryDirectory() as directory:

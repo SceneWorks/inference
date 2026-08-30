@@ -570,23 +570,24 @@ impl Pipeline {
         check_cancel(cancel)?;
         crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = dit.prepare_cross_kv(ctx_pos)?;
-        let (pos_bytes, pos_shape, pos_dtype) = pos_kv.evidence();
-        crate::sc20686_observer::observe_tensor(
-            "cross-kv-prepared",
-            "prepare",
-            pos_bytes,
-            0,
-            0,
-            pos_shape,
-            pos_dtype,
-            "none",
-            "applied",
-        );
+        if let Some((pos_bytes, pos_shape, pos_dtype)) = pos_kv.evidence() {
+            crate::sc20686_observer::observe_tensor(
+                "cross-kv-prepared",
+                "prepare",
+                pos_bytes,
+                0,
+                0,
+                pos_shape,
+                pos_dtype,
+                "none",
+                "applied",
+            );
+            crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
+        }
         let neg_kv = ctx_neg
             .map(|context| dit.prepare_cross_kv(context))
             .transpose()?;
-        if let Some(neg_kv) = &neg_kv {
-            let (bytes, shape, dtype) = neg_kv.evidence();
+        if let Some((bytes, shape, dtype)) = neg_kv.as_ref().and_then(|kv| kv.evidence()) {
             crate::sc20686_observer::observe_tensor(
                 "cross-kv-prepared",
                 "prepare-negative",
@@ -599,7 +600,6 @@ impl Pipeline {
                 "applied",
             );
         }
-        crate::sc20686_observer::observe("cross-kv-reuse", pos_bytes, 0, 1);
         const FOLDIN: &[&str] = &["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
         let latents = if let Some(name) = sampler_name.filter(|n| FOLDIN.contains(n)) {
             if ti2v.is_some() {
