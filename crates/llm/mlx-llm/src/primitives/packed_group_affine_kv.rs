@@ -75,6 +75,18 @@ pub struct DenseFallbackEvent {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PackedDispatchTelemetry {
+    /// Reader calls which passed cache preflight and began packed argument staging. This and the
+    /// failure/JIT fields are physical-attempt evidence and remain monotonic across rollback.
+    pub dispatch_attempts: u64,
+    pub failed_dispatches: u64,
+    pub compile_jit_attempts: u64,
+    /// True once a reader output has evaluated successfully. Logical model-step rollback cannot
+    /// un-warm the retained pipeline, so this state is deliberately not transactional.
+    pub kernel_warmed: bool,
+    /// Total wall time spent in physical reader attempts, including failed attempts.
+    pub attempted_elapsed_ms: f64,
+    /// Accepted reader calls classified by the physical pipeline state at attempt start. These
+    /// counters are transactional at the decoder whole-step boundary.
     pub cold_dispatches: u64,
     pub steady_dispatches: u64,
     /// End-to-end first successful packed dispatch latency, including packed argument sync,
@@ -84,10 +96,12 @@ pub struct PackedDispatchTelemetry {
     pub cold_elapsed_ms: f64,
     /// Sum of the same end-to-end latency for successful dispatches after the first.
     pub steady_elapsed_ms: f64,
-    /// Cumulative packed payload copied from host into MLX arrays. This includes newly appended
-    /// persistent chunks, retained-prefix rebuilds after trim/restore, and transient padded key
-    /// tails. Packed-domain device-to-device concatenation is not host upload traffic.
+    /// Cumulative packed payload staged from host for physical attempts, including attempts whose
+    /// reader later fails. Packed-domain device-to-device concatenation is not host upload traffic.
     pub uploaded_packed_bytes: u64,
+    /// Subset of `uploaded_packed_bytes` belonging to accepted calls in committed model steps.
+    /// Whole-step rollback restores this counter while leaving physical upload evidence intact.
+    pub accepted_uploaded_packed_bytes: u64,
     /// Logical payload currently retained by the cache-owned device arrays. Backend allocator
     /// overhead and shared pools remain process-level receipt measurements.
     pub retained_device_packed_logical_bytes: u64,
@@ -285,11 +299,23 @@ impl DecoderCacheSelection {
 /// Decoder-facing owner for the experimental storage and retained fused reader. It publishes a
 /// packed result only after the whole call succeeds; unsupported semantics transition the exact
 /// evaluated history to dense before the caller performs its ordinary update.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AcceptedDispatchSnapshot {
+    direct_dispatches: usize,
+    cold_dispatches: u64,
+    steady_dispatches: u64,
+    cold_elapsed_ms: f64,
+    steady_elapsed_ms: f64,
+    accepted_uploaded_packed_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
 struct PendingPackedStep {
     original_len: usize,
     next_layer: usize,
     step: usize,
+    device_layers: Vec<Option<DevicePackedLayer>>,
+    accepted_dispatch: AcceptedDispatchSnapshot,
 }
 
 #[derive(Debug)]
@@ -311,6 +337,14 @@ impl DenseFallbackPackedDecoderCache {
         self.staged.fallback_events()
     }
 
+    fn pending_device_snapshot_overhead(&self) -> u64 {
+        self.pending_step.as_ref().map_or(0, |pending| {
+            self.staged
+                .device_layers_logical_bytes(&pending.device_layers[..pending.next_layer])
+                as u64
+        })
+    }
+
     /// Immutable receipt evidence at the same public object used by `CausalLm`.
     pub fn model_evidence(&self) -> PackedCacheEvidence {
         let telemetry = self.staged.dispatch_telemetry();
@@ -322,12 +356,20 @@ impl DenseFallbackPackedDecoderCache {
             quantization_group_size: representation.group_size,
             accepted_direct_calls: self.staged.direct_dispatches(),
             full_cache_dequantizations: self.staged.full_cache_dequantizations(),
+            dispatch_attempts: telemetry.dispatch_attempts,
+            failed_dispatches: telemetry.failed_dispatches,
+            compile_jit_attempts: telemetry.compile_jit_attempts,
+            kernel_warmed: telemetry.kernel_warmed,
+            attempted_elapsed_ms: telemetry.attempted_elapsed_ms,
             cold_dispatches: telemetry.cold_dispatches,
             steady_dispatches: telemetry.steady_dispatches,
             cold_elapsed_ms: telemetry.cold_elapsed_ms,
             steady_elapsed_ms: telemetry.steady_elapsed_ms,
             uploaded_packed_bytes: telemetry.uploaded_packed_bytes,
-            retained_device_packed_logical_bytes: telemetry.retained_device_packed_logical_bytes,
+            accepted_uploaded_packed_bytes: telemetry.accepted_uploaded_packed_bytes,
+            retained_device_packed_logical_bytes: telemetry
+                .retained_device_packed_logical_bytes
+                .saturating_add(self.pending_device_snapshot_overhead()),
             peak_packed_argument_logical_bytes: telemetry.peak_packed_argument_logical_bytes,
             peak_packed_transient_logical_bytes: telemetry.peak_packed_transient_logical_bytes,
             dense_active: self.dense_active,
@@ -345,14 +387,28 @@ impl DenseFallbackPackedDecoderCache {
         self.staged.bind_compiled_handle(handle)
     }
 
-    fn rollback_pending(&mut self, operation: &str, reason: impl Into<String>) -> Result<()> {
-        let Some(pending) = self.pending_step else {
-            return Ok(());
+    fn restore_pending(&mut self) -> Result<bool> {
+        let Some(pending) = self.pending_step.take() else {
+            return Ok(false);
         };
-        self.staged.trim(pending.original_len)?;
-        self.pending_step = None;
+        if let Err(error) = self.staged.trim(pending.original_len) {
+            self.pending_step = Some(pending);
+            return Err(error);
+        }
+        self.staged.device_layers = pending.device_layers;
+        self.staged.telemetry.retained_device_packed_logical_bytes =
+            self.staged.retained_device_packed_logical_bytes() as u64;
+        self.staged
+            .restore_accepted_dispatch(pending.accepted_dispatch);
         if pending.original_len == 0 {
             self.packed_layer_dtypes.fill(None);
+        }
+        Ok(true)
+    }
+
+    fn rollback_pending(&mut self, operation: &str, reason: impl Into<String>) -> Result<()> {
+        if !self.restore_pending()? {
+            return Ok(());
         }
         self.staged.dense_read_fallback(operation, reason);
         Ok(())
@@ -646,6 +702,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                     original_len,
                     next_layer: 0,
                     step,
+                    device_layers: self.staged.device_layers.clone(),
+                    accepted_dispatch: self.staged.accepted_dispatch_snapshot(),
                 });
             }
             self.staged.append(
@@ -654,8 +712,15 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 values.as_slice::<f32>(),
                 step,
             )?;
-            let output = match self.staged.dispatch_packed(layer, query, packed_mask) {
+            let snapshot_overhead = self.pending_device_snapshot_overhead();
+            let output = match self.staged.dispatch_packed_with_transient_overhead(
+                layer,
+                query,
+                packed_mask,
+                snapshot_overhead,
+            ) {
                 Ok(output) => output,
+                Err(Error::Canceled) => return Err(Error::Canceled),
                 Err(error) if layer == 0 && original_len == 0 => {
                     // Before any packed output is published, a device/JIT fault can still select
                     // the ordinary dense path result-equivalently for this complete model step.
@@ -684,6 +749,10 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         })();
 
         match outcome {
+            Err(Error::Canceled) if self.pending_step.is_some() => {
+                self.restore_pending()?;
+                Err(Error::Canceled)
+            }
             Err(error) if self.pending_step.is_some() => {
                 self.rollback_pending("packed-transaction", error.to_string())?;
                 Err(error)
@@ -738,11 +807,12 @@ impl KvCache for DenseFallbackPackedDecoderCache {
     }
 
     fn reset(&mut self) {
-        if let Some(pending) = self.pending_step {
+        if let Some(pending) = self.pending_step.take() {
             self.staged
                 .trim(pending.original_len)
                 .expect("pending packed rollback remains in bounds");
-            self.pending_step = None;
+            self.staged
+                .restore_accepted_dispatch(pending.accepted_dispatch);
             self.staged
                 .dense_read_fallback("reset", "discarded pending packed step");
         }
@@ -1199,6 +1269,19 @@ struct DevicePackedLayer {
     value_zeros: Option<Array>,
 }
 
+struct StagedPackedArguments {
+    device_layer: DevicePackedLayer,
+    key_codes: Array,
+    key_scales: Array,
+    key_zeros: Array,
+    value_codes: Array,
+    value_scales: Array,
+    value_zeros: Array,
+    uploaded_bytes: u64,
+    argument_bytes: u64,
+    transient_bytes: u64,
+}
+
 impl DevicePackedLayer {
     fn empty() -> Self {
         Self {
@@ -1620,7 +1703,10 @@ impl PackedGroupAffineKvCache {
         Ok(())
     }
 
-    fn sync_device_layer(&mut self, layer: usize) -> Result<u64> {
+    /// Build and evaluate a complete six-array successor without publishing it. The caller owns
+    /// the transaction boundary and may publish only after every downstream fallible operation
+    /// which depends on these arrays has succeeded.
+    fn stage_device_layer(&self, layer: usize) -> Result<(DevicePackedLayer, u64, u64)> {
         let storage = self
             .layers
             .get(layer)
@@ -1765,14 +1851,10 @@ impl PackedGroupAffineKvCache {
             next.value_tokens = value_tokens;
         }
         let next_bytes = self.device_layer_logical_bytes(&next);
-        self.telemetry.peak_packed_transient_logical_bytes =
-            self.telemetry.peak_packed_transient_logical_bytes.max(
-                current_bytes
-                    .saturating_add(uploaded_bytes)
-                    .saturating_add(next_bytes) as u64,
-            );
-        self.device_layers[layer] = Some(next);
-        Ok(uploaded_bytes as u64)
+        let transient_bytes = current_bytes
+            .saturating_add(uploaded_bytes)
+            .saturating_add(next_bytes) as u64;
+        Ok((next, uploaded_bytes as u64, transient_bytes))
     }
 
     fn device_layer_logical_bytes(&self, device: &DevicePackedLayer) -> usize {
@@ -1799,7 +1881,11 @@ impl PackedGroupAffineKvCache {
     }
 
     pub fn retained_device_packed_logical_bytes(&self) -> usize {
-        self.device_layers
+        self.device_layers_logical_bytes(&self.device_layers)
+    }
+
+    fn device_layers_logical_bytes(&self, layers: &[Option<DevicePackedLayer>]) -> usize {
+        layers
             .iter()
             .flatten()
             .map(|device| self.device_layer_logical_bytes(device))
@@ -1894,30 +1980,17 @@ impl PackedGroupAffineKvCache {
         Ok(Some((codes, scales, zeros, uploaded_bytes)))
     }
 
-    /// Return evaluated packed MLX buffers for a resident layer. Codes remain 2-bit packed and
-    /// scales/zeros remain f16. Monotonic prefix extension uploads only the new host chunk, then
-    /// performs an MLX packed-domain concatenate; an incomplete key group contributes one padded
-    /// packed tail whose upload is included in telemetry.
-    pub fn packed_mlx_arguments(
-        &mut self,
-        layer: usize,
-    ) -> Result<(Array, Array, Array, Array, Array, Array)> {
-        let persistent_uploaded_bytes = self.sync_device_layer(layer)?;
-        self.telemetry.retained_device_packed_logical_bytes =
-            self.retained_device_packed_logical_bytes() as u64;
+    /// Construct every evaluated packed argument and its six-array resident successor without
+    /// publishing either device state or telemetry. This keeps padding/concatenation/evaluation
+    /// failures observationally pure.
+    fn stage_packed_mlx_arguments(&self, layer: usize) -> Result<StagedPackedArguments> {
+        let (device, persistent_uploaded_bytes, sync_transient_bytes) =
+            self.stage_device_layer(layer)?;
         let storage = self.layers[layer]
             .as_ref()
             .ok_or_else(|| Error::Config("packed layer is not resident".into()))?;
         let pending = self.padded_pending_key_arrays(storage)?;
         let pending_uploaded_bytes = pending.as_ref().map_or(0, |item| item.3);
-        self.telemetry.uploaded_packed_bytes = self
-            .telemetry
-            .uploaded_packed_bytes
-            .saturating_add(persistent_uploaded_bytes)
-            .saturating_add(pending_uploaded_bytes);
-        let device = self.device_layers[layer]
-            .as_ref()
-            .ok_or_else(|| Error::Config("packed device layer is not resident".into()))?;
         let combine_key = |prefix: &Option<Array>, tail: Option<&Array>| -> Result<Array> {
             let result = match (prefix, tail) {
                 (Some(prefix), Some(tail)) => concatenate_axis(&[prefix, tail], 2)?,
@@ -1967,35 +2040,96 @@ impl PackedGroupAffineKvCache {
                             ),
                     ),
             );
+        let current_layer_bytes = self.device_layers[layer]
+            .as_ref()
+            .map_or(0, |layer| self.device_layer_logical_bytes(layer));
+        let successor_retained_bytes =
+            self.retained_device_packed_logical_bytes()
+                .saturating_sub(current_layer_bytes)
+                .saturating_add(self.device_layer_logical_bytes(&device)) as u64;
+        Ok(StagedPackedArguments {
+            device_layer: device,
+            key_codes,
+            key_scales: key_scale,
+            key_zeros: key_zero,
+            value_codes,
+            value_scales: value_scale,
+            value_zeros: value_zero,
+            uploaded_bytes: persistent_uploaded_bytes.saturating_add(pending_uploaded_bytes),
+            argument_bytes: argument_bytes as u64,
+            transient_bytes: sync_transient_bytes.max(
+                successor_retained_bytes
+                    .saturating_add(pending_uploaded_bytes)
+                    .saturating_add(argument_bytes as u64),
+            ),
+        })
+    }
+
+    fn record_staged_physical_evidence(
+        &mut self,
+        staged: &StagedPackedArguments,
+        additional_transient_bytes: u64,
+    ) {
+        self.telemetry.uploaded_packed_bytes = self
+            .telemetry
+            .uploaded_packed_bytes
+            .saturating_add(staged.uploaded_bytes);
         self.telemetry.peak_packed_argument_logical_bytes = self
             .telemetry
             .peak_packed_argument_logical_bytes
-            .max(argument_bytes as u64);
+            .max(staged.argument_bytes);
         self.telemetry.peak_packed_transient_logical_bytes =
             self.telemetry.peak_packed_transient_logical_bytes.max(
-                self.telemetry
-                    .retained_device_packed_logical_bytes
-                    .saturating_add(pending_uploaded_bytes)
-                    .saturating_add(argument_bytes as u64),
+                staged
+                    .transient_bytes
+                    .saturating_add(additional_transient_bytes),
             );
+    }
+
+    fn publish_staged_device_layer(&mut self, layer: usize, device_layer: DevicePackedLayer) {
+        self.device_layers[layer] = Some(device_layer);
+        self.telemetry.retained_device_packed_logical_bytes =
+            self.retained_device_packed_logical_bytes() as u64;
+    }
+
+    /// Internal source-test seam: publish only after every packed argument has evaluated. Live
+    /// dispatch stages privately until the reader output also evaluates successfully.
+    #[cfg(test)]
+    fn packed_mlx_arguments(
+        &mut self,
+        layer: usize,
+    ) -> Result<(Array, Array, Array, Array, Array, Array)> {
+        let staged = self.stage_packed_mlx_arguments(layer)?;
+        self.record_staged_physical_evidence(&staged, 0);
+        self.publish_staged_device_layer(layer, staged.device_layer);
         Ok((
-            key_codes,
-            key_scale,
-            key_zero,
-            value_codes,
-            value_scale,
-            value_zero,
+            staged.key_codes,
+            staged.key_scales,
+            staged.key_zeros,
+            staged.value_codes,
+            staged.value_scales,
+            staged.value_zeros,
         ))
     }
 
-    /// Run the retained reader against the cache's actual packed layer buffers. Selection happens
-    /// before append; this mutable call synchronizes incremental packed arguments and publishes
-    /// counters only after MLX returns an evaluated output.
+    /// Run the retained reader against privately staged packed buffers. Physical attempt evidence
+    /// is monotonic, while the six-array successor and accepted counters publish only after the
+    /// output evaluates successfully.
     pub fn dispatch_packed(
         &mut self,
         layer: usize,
         query: &Array,
         mask: crate::primitives::packed_metal::PackedMask,
+    ) -> Result<Array> {
+        self.dispatch_packed_with_transient_overhead(layer, query, mask, 0)
+    }
+
+    fn dispatch_packed_with_transient_overhead(
+        &mut self,
+        layer: usize,
+        query: &Array,
+        mask: crate::primitives::packed_metal::PackedMask,
+        additional_transient_bytes: u64,
     ) -> Result<Array> {
         if self.handle.is_none() {
             return Err(Error::Unsupported("no retained packed reader".into()));
@@ -2010,46 +2144,67 @@ impl PackedGroupAffineKvCache {
                 "cannot dispatch an empty packed cache".into(),
             ));
         }
-        // `packed_mlx_arguments` constructs immutable MLX successors and updates upload/peak
-        // telemetry before the retained reader runs. Keep both snapshots private until the
-        // reader has evaluated successfully: a JIT/device fault must not leave a successor
-        // device layer or its byte counters visible to a retry.
-        let prior_device_layer = self.device_layers[layer].clone();
-        let prior_telemetry = self.telemetry;
-        let cold = self.telemetry.cold_dispatches == 0;
         let dense_dequantizations_before = self.full_cache_dequantizations;
         let started = std::time::Instant::now();
-        let result = (|| -> Result<Array> {
-            let (kc, ks, kz, vc, vs, vz) = self.packed_mlx_arguments(layer)?;
-            let output = self
-                .handle
-                .as_ref()
-                .expect("checked above")
-                .inner
-                .dispatch(query, &kc, &ks, &kz, &vc, &vs, &vz, mask)?;
-            output.eval()?;
-            Ok(output)
-        })();
-        let output = match result {
-            Ok(output) => output,
+        self.telemetry.dispatch_attempts += 1;
+        let staged = match self.stage_packed_mlx_arguments(layer) {
+            Ok(staged) => staged,
             Err(error) => {
-                self.device_layers[layer] = prior_device_layer;
-                self.telemetry = prior_telemetry;
+                self.telemetry.failed_dispatches += 1;
+                self.telemetry.attempted_elapsed_ms += started.elapsed().as_secs_f64() * 1000.0;
                 return Err(error);
             }
         };
+        self.record_staged_physical_evidence(&staged, additional_transient_bytes);
+        let was_warmed = self.telemetry.kernel_warmed;
+        if !was_warmed {
+            self.telemetry.compile_jit_attempts += 1;
+        }
+        let result = self
+            .handle
+            .as_ref()
+            .expect("checked above")
+            .inner
+            .dispatch(
+                query,
+                &staged.key_codes,
+                &staged.key_scales,
+                &staged.key_zeros,
+                &staged.value_codes,
+                &staged.value_scales,
+                &staged.value_zeros,
+                mask,
+            )
+            .and_then(|output| {
+                output.eval()?;
+                Ok(output)
+            });
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.telemetry.attempted_elapsed_ms += elapsed_ms;
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.telemetry.failed_dispatches += 1;
+                return Err(error);
+            }
+        };
+        self.telemetry.kernel_warmed = true;
+        self.publish_staged_device_layer(layer, staged.device_layer);
         debug_assert_eq!(
             self.full_cache_dequantizations, dense_dequantizations_before,
             "accepted fused packed dispatch must not reconstruct the full cache"
         );
         self.direct_dispatches += 1;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        if cold {
-            self.telemetry.cold_dispatches += 1;
-            self.telemetry.cold_elapsed_ms = elapsed_ms;
-        } else {
+        self.telemetry.accepted_uploaded_packed_bytes = self
+            .telemetry
+            .accepted_uploaded_packed_bytes
+            .saturating_add(staged.uploaded_bytes);
+        if was_warmed {
             self.telemetry.steady_dispatches += 1;
             self.telemetry.steady_elapsed_ms += elapsed_ms;
+        } else {
+            self.telemetry.cold_dispatches += 1;
+            self.telemetry.cold_elapsed_ms = elapsed_ms;
         }
         Ok(output)
     }
@@ -2065,6 +2220,24 @@ impl PackedGroupAffineKvCache {
     }
     pub fn dispatch_telemetry(&self) -> PackedDispatchTelemetry {
         self.telemetry
+    }
+    fn accepted_dispatch_snapshot(&self) -> AcceptedDispatchSnapshot {
+        AcceptedDispatchSnapshot {
+            direct_dispatches: self.direct_dispatches,
+            cold_dispatches: self.telemetry.cold_dispatches,
+            steady_dispatches: self.telemetry.steady_dispatches,
+            cold_elapsed_ms: self.telemetry.cold_elapsed_ms,
+            steady_elapsed_ms: self.telemetry.steady_elapsed_ms,
+            accepted_uploaded_packed_bytes: self.telemetry.accepted_uploaded_packed_bytes,
+        }
+    }
+    fn restore_accepted_dispatch(&mut self, snapshot: AcceptedDispatchSnapshot) {
+        self.direct_dispatches = snapshot.direct_dispatches;
+        self.telemetry.cold_dispatches = snapshot.cold_dispatches;
+        self.telemetry.steady_dispatches = snapshot.steady_dispatches;
+        self.telemetry.cold_elapsed_ms = snapshot.cold_elapsed_ms;
+        self.telemetry.steady_elapsed_ms = snapshot.steady_elapsed_ms;
+        self.telemetry.accepted_uploaded_packed_bytes = snapshot.accepted_uploaded_packed_bytes;
     }
     pub fn preflight(
         &mut self,
@@ -2374,6 +2547,7 @@ mod tests {
     struct TestPackedKernel {
         calls: AtomicUsize,
         fail_on: Option<usize>,
+        cancel_on_failure: bool,
     }
 
     impl RetainedPackedKernel for TestPackedKernel {
@@ -2400,6 +2574,9 @@ mod tests {
         ) -> Result<Array> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             if self.fail_on == Some(call) {
+                if self.cancel_on_failure {
+                    return Err(Error::Canceled);
+                }
                 return Err(Error::Msg("injected packed dispatch fault".into()));
             }
             Ok(query.clone())
@@ -2416,6 +2593,7 @@ mod tests {
         let kernel = Arc::new(TestPackedKernel {
             calls: AtomicUsize::new(0),
             fail_on,
+            cancel_on_failure: false,
         });
         let selection = select_decoder_cache_with_reader(
             PackedCacheRequest {
@@ -2508,6 +2686,38 @@ mod tests {
                     right.read_row(0, token, row).unwrap()
                 );
             }
+        }
+    }
+
+    fn assert_same_device_layer(
+        actual: &Option<DevicePackedLayer>,
+        expected: &Option<DevicePackedLayer>,
+    ) {
+        let (Some(actual), Some(expected)) = (actual, expected) else {
+            assert_eq!(actual.is_some(), expected.is_some());
+            return;
+        };
+        assert_eq!(actual.key_groups, expected.key_groups);
+        assert_eq!(actual.value_tokens, expected.value_tokens);
+        for (actual, expected) in [
+            (&actual.key_codes, &expected.key_codes),
+            (&actual.value_codes, &expected.value_codes),
+        ] {
+            assert_eq!(
+                actual.as_ref().map(|array| array.as_slice::<u8>()),
+                expected.as_ref().map(|array| array.as_slice::<u8>())
+            );
+        }
+        for (actual, expected) in [
+            (&actual.key_scales, &expected.key_scales),
+            (&actual.key_zeros, &expected.key_zeros),
+            (&actual.value_scales, &expected.value_scales),
+            (&actual.value_zeros, &expected.value_zeros),
+        ] {
+            assert_eq!(
+                actual.as_ref().map(|array| array.as_slice::<f16>()),
+                expected.as_ref().map(|array| array.as_slice::<f16>())
+            );
         }
     }
     #[test]
@@ -2880,6 +3090,7 @@ mod tests {
         let handle = CompiledKernelHandle::new(Arc::new(TestPackedKernel {
             calls: AtomicUsize::new(0),
             fail_on: None,
+            cancel_on_failure: false,
         }));
         let selection = select_decoder_cache_with_reader(
             PackedCacheRequest {
@@ -2961,18 +3172,228 @@ mod tests {
     }
 
     #[test]
-    fn retained_dispatch_fault_restores_device_snapshot_and_byte_telemetry() {
+    fn later_layer_fault_restores_existing_device_residency_and_accepted_receipt_then_retries() {
+        let (mut cache, kernel) = hook_cache_geometry(2, 1, 1, 64, Some(4));
+        let packed = cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        let query = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let values = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        for layer in 0..2 {
+            assert!(packed
+                .try_packed_attention(
+                    layer,
+                    &query,
+                    &values,
+                    &values,
+                    PackedAttentionMask::Causal,
+                    0.125,
+                    false,
+                )
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(packed.offset(), 1);
+        let prior_devices = packed.staged.device_layers.clone();
+        let prior_accepted = packed.staged.accepted_dispatch_snapshot();
+        let prior_physical = packed.staged.dispatch_telemetry();
+
+        assert!(packed
+            .try_packed_attention(
+                0,
+                &query,
+                &values,
+                &values,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .unwrap()
+            .is_some());
+        assert!(
+            packed
+                .packed_evidence()
+                .unwrap()
+                .retained_device_packed_logical_bytes
+                > packed
+                    .staged
+                    .dispatch_telemetry()
+                    .retained_device_packed_logical_bytes,
+            "the public receipt includes the replaced pre-step arrays held for rollback"
+        );
+        assert!(packed
+            .try_packed_attention(
+                1,
+                &query,
+                &values,
+                &values,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .is_err());
+        assert_eq!(packed.offset(), 1);
+        assert!(packed.pending_step.is_none());
+        for (actual, expected) in packed.staged.device_layers.iter().zip(prior_devices.iter()) {
+            assert_same_device_layer(actual, expected);
+        }
+        assert_eq!(packed.staged.accepted_dispatch_snapshot(), prior_accepted);
+        let failed = packed.staged.dispatch_telemetry();
+        assert_eq!(
+            failed.dispatch_attempts,
+            prior_physical.dispatch_attempts + 2
+        );
+        assert_eq!(
+            failed.failed_dispatches,
+            prior_physical.failed_dispatches + 1
+        );
+        assert!(failed.kernel_warmed);
+        assert!(failed.uploaded_packed_bytes > prior_physical.uploaded_packed_bytes);
+        assert!(
+            failed.peak_packed_transient_logical_bytes
+                >= prior_physical.peak_packed_transient_logical_bytes
+        );
+        assert_eq!(
+            failed.accepted_uploaded_packed_bytes,
+            prior_physical.accepted_uploaded_packed_bytes
+        );
+
+        for layer in 0..2 {
+            assert!(packed
+                .try_packed_attention(
+                    layer,
+                    &query,
+                    &values,
+                    &values,
+                    PackedAttentionMask::Causal,
+                    0.125,
+                    false,
+                )
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(kernel.calls.load(Ordering::Relaxed), 6);
+        assert_eq!(packed.offset(), 2);
+        assert_eq!(packed.staged.direct_dispatches(), 4);
+        let retried = packed.staged.dispatch_telemetry();
+        assert_eq!(
+            retried.dispatch_attempts,
+            prior_physical.dispatch_attempts + 4
+        );
+        assert_eq!(
+            retried.failed_dispatches,
+            prior_physical.failed_dispatches + 1
+        );
+        assert_eq!(retried.cold_dispatches, prior_physical.cold_dispatches);
+        assert_eq!(
+            retried.steady_dispatches,
+            prior_physical.steady_dispatches + 2
+        );
+        assert!(
+            retried.accepted_uploaded_packed_bytes > prior_physical.accepted_uploaded_packed_bytes
+        );
+        let evidence = packed.packed_evidence().unwrap();
+        assert_eq!(evidence.dispatch_attempts, retried.dispatch_attempts);
+        assert_eq!(evidence.failed_dispatches, 1);
+        assert_eq!(evidence.accepted_direct_calls, 4);
+        assert_eq!(
+            evidence.accepted_uploaded_packed_bytes,
+            retried.accepted_uploaded_packed_bytes
+        );
+    }
+
+    #[test]
+    fn typed_first_dispatch_cancellation_rolls_back_and_propagates_then_retry_succeeds() {
         let kernel = Arc::new(TestPackedKernel {
             calls: AtomicUsize::new(0),
             fail_on: Some(1),
+            cancel_on_failure: true,
+        });
+        let mut selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "test-packed".into(),
+                layers: 1,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                query_length: 1,
+                has_mask: false,
+            },
+            CompiledKernelHandle::new(kernel.clone()),
+        );
+        let packed = selection
+            .cache
+            .as_any_mut()
+            .downcast_mut::<DenseFallbackPackedDecoderCache>()
+            .unwrap();
+        let query = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
+        let values = Array::from_slice(&vec![2.0f32; 64], &[1, 1, 1, 64]);
+        let error = packed
+            .try_packed_attention(
+                0,
+                &query,
+                &values,
+                &values,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::Canceled));
+        assert_eq!(packed.offset(), 0);
+        assert!(packed.pending_step.is_none());
+        assert!(packed.staged.device_layers[0].is_none());
+        assert!(packed.staged.compiled_handle().is_some());
+        assert!(packed.fallback_events().is_empty());
+        let cancelled = packed.staged.dispatch_telemetry();
+        assert_eq!(cancelled.dispatch_attempts, 1);
+        assert_eq!(cancelled.failed_dispatches, 1);
+        assert_eq!(cancelled.cold_dispatches, 0);
+        assert_eq!(packed.staged.direct_dispatches(), 0);
+        assert!(cancelled.uploaded_packed_bytes > 0);
+        assert_eq!(cancelled.accepted_uploaded_packed_bytes, 0);
+
+        assert!(packed
+            .try_packed_attention(
+                0,
+                &query,
+                &values,
+                &values,
+                PackedAttentionMask::Causal,
+                0.125,
+                false,
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(kernel.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(packed.offset(), 1);
+        assert_eq!(packed.staged.direct_dispatches(), 1);
+        let retried = packed.staged.dispatch_telemetry();
+        assert_eq!(retried.dispatch_attempts, 2);
+        assert_eq!(retried.failed_dispatches, 1);
+        assert_eq!(retried.cold_dispatches, 1);
+        assert!(retried.kernel_warmed);
+        assert!(retried.uploaded_packed_bytes > retried.accepted_uploaded_packed_bytes);
+        assert!(retried.accepted_uploaded_packed_bytes > 0);
+    }
+
+    #[test]
+    fn retained_dispatch_fault_keeps_host_append_private_device_and_truthful_retry_evidence() {
+        let kernel = Arc::new(TestPackedKernel {
+            calls: AtomicUsize::new(0),
+            fail_on: Some(1),
+            cancel_on_failure: false,
         });
         let mut cache = PackedGroupAffineKvCache::new("test-packed", 1, 1, 1, 64, 32).unwrap();
         cache
-            .bind_compiled_handle(CompiledKernelHandle::new(kernel))
+            .bind_compiled_handle(CompiledKernelHandle::new(kernel.clone()))
             .unwrap();
         let values = vec![2.0f32; 64];
         cache.append(0, &values, &values, 1).unwrap();
-        let prior_telemetry = cache.dispatch_telemetry();
         let query = Array::from_slice(&vec![1.0f32; 64], &[1, 1, 1, 64]);
         assert!(cache
             .dispatch_packed(
@@ -2982,12 +3403,62 @@ mod tests {
             )
             .is_err());
         assert!(cache.device_layers[0].is_none());
+        assert_eq!(cache.logical_len(), 1, "host append remains caller-owned");
+        assert!(cache.layers[0].is_some());
+        assert_eq!(cache.direct_dispatches(), 0);
+        let failed = cache.dispatch_telemetry();
+        assert_eq!(failed.dispatch_attempts, 1);
+        assert_eq!(failed.failed_dispatches, 1);
+        assert_eq!(failed.compile_jit_attempts, 1);
+        assert!(!failed.kernel_warmed);
+        assert!(failed.uploaded_packed_bytes > 0);
+        assert_eq!(failed.accepted_uploaded_packed_bytes, 0);
+        assert_eq!(failed.retained_device_packed_logical_bytes, 0);
+
+        cache
+            .dispatch_packed(
+                0,
+                &query,
+                crate::primitives::packed_metal::PackedMask::Causal,
+            )
+            .unwrap();
+        assert_eq!(kernel.calls.load(Ordering::Relaxed), 2);
+        assert!(cache.device_layers[0].is_some());
+        assert_eq!(cache.logical_len(), 1);
+        assert_eq!(cache.direct_dispatches(), 1);
+        let retried = cache.dispatch_telemetry();
+        assert_eq!(retried.dispatch_attempts, 2);
+        assert_eq!(retried.failed_dispatches, 1);
+        assert_eq!(retried.compile_jit_attempts, 2);
+        assert!(retried.kernel_warmed);
+        assert!(retried.uploaded_packed_bytes > retried.accepted_uploaded_packed_bytes);
+        assert!(retried.accepted_uploaded_packed_bytes > 0);
+        assert!(retried.retained_device_packed_logical_bytes > 0);
+    }
+
+    #[test]
+    fn packed_argument_staging_is_observationally_pure_until_explicit_publication() {
+        let mut cache = PackedGroupAffineKvCache::new(
+            "staging-purity",
+            1,
+            2,
+            2,
+            64,
+            PACKED_METAL_QUANT_GROUP_SIZE,
+        )
+        .unwrap();
+        let values = bhst_data(2, 2, 3, 64, -1.5);
+        cache.append(0, &values, &values, 3).unwrap();
+        let prior_telemetry = cache.dispatch_telemetry();
+        assert!(cache.device_layers[0].is_none());
+
+        let staged = cache.stage_packed_mlx_arguments(0).unwrap();
+        assert!(cache.device_layers[0].is_none());
         assert_eq!(cache.dispatch_telemetry(), prior_telemetry);
-        assert_eq!(cache.logical_len(), 0);
-        assert!(
-            cache.layers[0].is_some(),
-            "host append remains caller-owned"
-        );
+        assert_eq!(staged.device_layer.value_tokens, 3);
+        assert!(staged.uploaded_bytes > 0);
+        assert!(staged.argument_bytes > 0);
+        assert!(staged.transient_bytes >= staged.argument_bytes);
     }
 
     #[test]
@@ -3200,6 +3671,7 @@ mod tests {
         let shared = Arc::new(TestPackedKernel {
             calls: AtomicUsize::new(0),
             fail_on: None,
+            cancel_on_failure: false,
         });
         let make_cache = || {
             select_decoder_cache_with_reader(
