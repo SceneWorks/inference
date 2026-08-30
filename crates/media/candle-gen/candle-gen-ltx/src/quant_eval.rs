@@ -263,8 +263,15 @@ const fn terminal_dev_case(
 }
 
 /// The active physical campaign pool is consumer Blackwell `sm_120`. Unsupported generations stay
-/// classified above so selecting them still fails closed, but they are not measurement rows. The
-/// upstream NVFP4 artifact is distilled-only, so no dev/NVFP4 row is representable.
+/// classified above so selecting them still fails closed, but they are not measurement rows.
+///
+/// sc-18791: every row must name a bundle the public `SceneWorks/ltx-2.5-mlx` release actually
+/// ships. That release publishes only `distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` — it has no
+/// `bundles/` tree at all — so the INT8-ConvRot and NVFP4 candidates have no measurable case and
+/// are not rows here. `Ltx25QuantMode::Int8ConvRot` and `::Nvfp4` remain classified selectors:
+/// `admit` refuses them because no terminal case covers them, which is the same fail-closed
+/// outcome the empty receipt allowlist already produced. Publishing those bundles is what makes
+/// the rows representable again.
 pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
     terminal_case(
         "ltx25-bf16-blackwell-v1",
@@ -281,16 +288,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
         Ltx25QuantMode::PackedQ8,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
-    terminal_case(
-        "ltx25-int8-convrot-blackwell-v1",
-        Ltx25QuantMode::Int8ConvRot,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
-    terminal_case(
-        "ltx25-nvfp4-blackwell-v1",
-        Ltx25QuantMode::Nvfp4,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
     terminal_dev_case(
         "ltx25-bf16-blackwell-dev-v1",
         Ltx25QuantMode::Bf16,
@@ -304,11 +301,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
     terminal_dev_case(
         "ltx25-packed-q8-blackwell-dev-v1",
         Ltx25QuantMode::PackedQ8,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
-    terminal_dev_case(
-        "ltx25-int8-convrot-blackwell-dev-v1",
-        Ltx25QuantMode::Int8ConvRot,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
 ];
@@ -1774,7 +1766,9 @@ mod tests {
         write_minimal_safetensors(&transformer);
         write_minimal_safetensors(&encoder);
 
-        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        // sc-18791: public-snapshot staging/binding reads only the runtime identity, never the
+        // case table, so this exercises it through a published case.
+        let measured = receipt("ltx25-packed-q8-blackwell-v1");
         let mut promotion = runtime(&measured);
         promotion.model_revision = revision;
         promotion.bundle_subdir = "bundles/distilled/int8".to_owned();
@@ -1904,9 +1898,24 @@ mod tests {
         assert!(ACCEPTED_MEASUREMENT_RECEIPTS.is_empty());
         assert!(!catalog_advertised(Ltx25QuantMode::Int8ConvRot));
         assert!(!catalog_advertised(Ltx25QuantMode::Nvfp4));
-        assert!(
-            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, ACCEPTED_MEASUREMENT_RECEIPTS.as_slice()), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
-        );
+        // sc-18791: the public release ships no advanced bundle, so no terminal case covers these
+        // modes on any generation or variant. The refusal now names the missing case instead of
+        // the empty allowlist; the outcome — never admitted — is unchanged.
+        for mode in [Ltx25QuantMode::Int8ConvRot, Ltx25QuantMode::Nvfp4] {
+            for variant in [TransformerVariant::Distilled, TransformerVariant::Dev] {
+                let result = admit(
+                    mode,
+                    Ltx25GpuGeneration::ConsumerBlackwellSm120,
+                    variant,
+                    None,
+                    ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
+                );
+                assert!(
+                    matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("no supported terminal measurement case")),
+                    "{mode:?}/{variant:?}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1935,7 +1944,7 @@ mod tests {
 
     #[test]
     fn receipt_cannot_omit_peak_wall_quality_or_identity() {
-        let mut row = receipt("ltx25-int8-convrot-blackwell-v1");
+        let mut row = receipt("ltx25-packed-q8-blackwell-v1");
         row.peak_vram_bytes = 0;
         row.wall_clock_ms = 0;
         row.quality.temporal_boundary_drift = f64::NAN;
@@ -1958,7 +1967,7 @@ mod tests {
 
     #[test]
     fn sealed_receipt_cannot_be_replayed_across_code_model_gpu_or_case_identity() {
-        let original = receipt("ltx25-int8-convrot-blackwell-v1");
+        let original = receipt("ltx25-packed-q8-blackwell-v1");
         assert!(original.validation_errors().is_empty());
         let mut mutations = Vec::new();
         let mut code = original.clone();
@@ -1974,7 +1983,7 @@ mod tests {
         gpu.gpu_name = "different GPU".to_owned();
         mutations.push(gpu);
         let mut case = original.clone();
-        case.case_id = "ltx25-int8-convrot-blackwell-dev-v1".to_owned();
+        case.case_id = "ltx25-packed-q8-blackwell-dev-v1".to_owned();
         mutations.push(case);
         let mut variant = original.clone();
         variant.transformer_variant = TransformerVariant::Dev;
@@ -1987,22 +1996,12 @@ mod tests {
 
     #[test]
     fn production_admission_compares_every_replay_sensitive_runtime_field() {
-        let accepted = receipt("ltx25-int8-convrot-blackwell-v1");
+        // sc-18791: `admit`'s receipt arm is only reachable for a mode that owns a terminal case,
+        // and the public release ships no advanced bundle, so the gate is exercised through the
+        // predicate `admit` delegates to. Every field below is still proven replay-sensitive.
+        let accepted = receipt("ltx25-packed-q8-blackwell-v1");
         let identity = runtime(&accepted);
-        let accepted_record = Ltx25QuantAcceptedMeasurement {
-            receipt: accepted.clone(),
-            runtime: identity.clone(),
-        };
-        assert_eq!(
-            admit(
-                accepted.mode,
-                accepted.gpu_generation,
-                accepted.transformer_variant,
-                Some(&identity),
-                std::slice::from_ref(&accepted_record),
-            ),
-            Ltx25QuantAdmission::Admitted
-        );
+        assert!(receipt_matches_runtime(&accepted, &identity));
         let mutations: Vec<fn(&mut Ltx25QuantRuntimeIdentity)> = vec![
             |value| value.inference_revision = "0".repeat(40),
             |value| value.executable_contract_sha256 = "0".repeat(64),
@@ -2036,26 +2035,20 @@ mod tests {
             |value| value.operator_contract_sha256 = "0".repeat(64),
             |value| value.operator_weight_inventory_sha256 = "0".repeat(64),
         ];
-        for mutate in mutations {
+        for (index, mutate) in mutations.into_iter().enumerate() {
             let mut replay = identity.clone();
             mutate(&mut replay);
-            let result = admit(
-                accepted.mode,
-                accepted.gpu_generation,
-                accepted.transformer_variant,
-                Some(&replay),
-                std::slice::from_ref(&accepted_record),
-            );
+            assert_ne!(replay, identity, "mutation {index} changed nothing");
             assert!(
-                matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("replay")),
-                "{result:?}"
+                !receipt_matches_runtime(&accepted, &replay),
+                "mutation {index} was not replay-sensitive"
             );
         }
     }
 
     #[test]
     fn promotion_copy_proof_cannot_be_replayed_across_public_identity_or_selected_bytes() {
-        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        let measured = receipt("ltx25-packed-q8-blackwell-v1");
         let original = runtime(&measured);
         assert!(receipt_matches_runtime(&measured, &original));
 
@@ -2074,8 +2067,10 @@ mod tests {
     }
 
     #[test]
-    fn current_pool_matrix_is_sm120_only_and_nvfp4_is_distilled_only() {
-        assert_eq!(TERMINAL_MEASUREMENT_CASES.len(), 9);
+    fn current_pool_matrix_is_sm120_only_and_covers_exactly_the_published_bundles() {
+        // sc-18791: the public SceneWorks/ltx-2.5-mlx release ships `distilled/{bf16,q4,q8}` and
+        // `dev/{bf16,q4,q8}` and nothing else, so the matrix is exactly those six rows.
+        assert_eq!(TERMINAL_MEASUREMENT_CASES.len(), 6);
         assert!(TERMINAL_MEASUREMENT_CASES
             .iter()
             .all(|case| case.gpu == Ltx25GpuGeneration::ConsumerBlackwellSm120));
@@ -2084,21 +2079,17 @@ mod tests {
                 Ltx25QuantMode::Bf16,
                 Ltx25QuantMode::Q4,
                 Ltx25QuantMode::PackedQ8,
-                Ltx25QuantMode::Int8ConvRot,
             ] {
                 assert!(TERMINAL_MEASUREMENT_CASES
                     .iter()
                     .any(|case| case.mode == mode && case.transformer_variant == variant));
             }
         }
-        assert!(TERMINAL_MEASUREMENT_CASES
-            .iter()
-            .any(|case| case.mode == Ltx25QuantMode::Nvfp4
-                && case.gpu == Ltx25GpuGeneration::ConsumerBlackwellSm120));
-        assert!(!TERMINAL_MEASUREMENT_CASES
-            .iter()
-            .any(|case| case.mode == Ltx25QuantMode::Nvfp4
-                && case.transformer_variant == TransformerVariant::Dev));
+        // No row may name an unpublished advanced bundle on any variant or generation.
+        assert!(!TERMINAL_MEASUREMENT_CASES.iter().any(|case| matches!(
+            case.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        )));
         assert!(matches!(
             admit(
                 Ltx25QuantMode::Int8ConvRot,

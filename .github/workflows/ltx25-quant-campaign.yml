@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       public_revision:
-        description: Exact public SceneWorks/ltx-2.5-mlx revision containing all nine campaign bundles
+        description: Exact public SceneWorks/ltx-2.5-mlx revision containing all six campaign bundles
         type: string
         required: true
       physical_gpu:
