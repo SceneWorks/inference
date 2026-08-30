@@ -125,7 +125,7 @@ on:
         default: all
         # `audio` still runs every audio family. The `audio-*` entries are the per-family split
         # (sc-16981) — dispatch one provider family without taking the Metal runner for the rest.
-        options: [all, llm, llm-joycaption, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
+        options: [all, llm, llm-joycaption, starvector-terminal, media, mage-memory-ladder, chroma-auxiliary, chroma-memory-ladder, decode-quality-kolors, decode-quality-sdxl, decode-quality-chroma, qwen-image, qwen-image-pid, qwen-image-producers, request-memory-scope, memory-evidence-v1, sana-drift-ceiling, krea-realtime, krea-kv-cache, krea-alternate-decoder, krea-s18-sweep, minimax-h3, scail2, audio, audio-kokoro, audio-moss-sfx, audio-acestep, audio-voice, audio-chatterbox, audio-asr, audio-moss-tts, audio-moss-tts-realtime, same-l, same-chunked, sa3-small-music, sa3-small-sfx, sa3-medium, sa3-base-identity, sa3-small-base]
       sceneworks_revision:
         description: Exact lowercase SceneWorks commit paired with memory-evidence-v1
         type: string
@@ -1558,6 +1558,118 @@ jobs:
             ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-staged.rgb
             ${{ runner.temp }}/memory-evidence-v1/z_image_turbo-resident-tiled.rgb
             ${{ runner.temp }}/memory-evidence-v1/verifier-result.txt
+
+  # SC-22261's native-provider preflight within the one permanent-pin StarVector campaign. This is
+  # deliberately NOT acceptance evidence by itself: SceneWorks owns the paired 120/200/20/60
+  # renderer, sanitizer, publication, and metric receipt after the permanent inference pin. These
+  # jobs bind the exact native snapshot inventories and four provider hooks that that receipt
+  # consumes. They are dispatch-only and serialize Candle after MLX, so shared physical runners
+  # cannot overlap an 8B Metal load with authoritative CUDA evidence.
+  starvector-terminal-mlx:
+    name: StarVector terminal native-provider preflight (MLX)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'starvector-terminal'
+    runs-on: [self-hosted, macOS, ARM64, rw-llm]
+    timeout-minutes: 180
+    env:
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.STARVECTOR_1B_SNAPSHOT }}
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.STARVECTOR_8B_SNAPSHOT }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Validate immutable terminal corpus and receipt contract
+        run: >-
+          node scripts/release/starvector_terminal_evidence.mjs validate-plan
+          --corpus release/starvector-terminal-corpus-v1.json
+      - name: Resolve runner-local snapshot paths
+        run: >-
+          python3.12 scripts/release/resolve_snapshot_paths.py
+          STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
+      - name: Report runner disk headroom
+        continue-on-error: true
+        run: >-
+          scripts/ci/report_runner_disk_headroom.sh
+          STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
+      - name: Materialize and verify exact native snapshots
+        env:
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
+        run: |
+          set -o pipefail
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT"
+          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT"
+          mkdir -p "$STARVECTOR_TERMINAL_DIR"
+          python3.12 scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/starvector-1b-inventory.json"
+          python3.12 scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json"
+          shasum -a 256 "$STARVECTOR_TERMINAL_DIR/starvector-1b-inventory.json" "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json" | tee "$STARVECTOR_TERMINAL_DIR/inventory-sha256.txt"
+      - name: Run exact native MLX StarVector hooks
+        env:
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
+        run: |
+          set -o pipefail
+          cargo test --locked -p mlx-llm starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture | tee "$STARVECTOR_TERMINAL_DIR/mlx-starvector-1b.log"
+          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/mlx-starvector-1b.log"
+          cargo test --locked -p mlx-llm starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture | tee "$STARVECTOR_TERMINAL_DIR/mlx-starvector-8b.log"
+          grep -qE "test result: ok\\. 1 passed" "$STARVECTOR_TERMINAL_DIR/mlx-starvector-8b.log"
+      - name: Upload MLX terminal provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: starvector-terminal-mlx-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: ${{ runner.temp }}/starvector-terminal
+
+  starvector-terminal-candle:
+    name: StarVector terminal native-provider preflight (Candle/CUDA)
+    if: github.event_name == 'workflow_dispatch' && inputs.profile == 'starvector-terminal'
+    needs: starvector-terminal-mlx
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 180
+    env:
+      STARVECTOR_1B_SNAPSHOT: ${{ vars.STARVECTOR_1B_SNAPSHOT }}
+      STARVECTOR_8B_SNAPSHOT: ${{ vars.STARVECTOR_8B_SNAPSHOT }}
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: starvector-terminal-mlx-${{ github.sha }}
+          path: ${{ runner.temp }}\\starvector-terminal-mlx
+      - name: Validate transferred MLX provenance
+        shell: cmd
+        run: |
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\starvector-1b-inventory.json" exit /b 1
+          if not exist "%RUNNER_TEMP%\\starvector-terminal-mlx\\starvector-8b-inventory.json" exit /b 1
+          node scripts/release/starvector_terminal_evidence.mjs validate-plan --corpus release/starvector-terminal-corpus-v1.json || exit /b 1
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Materialize and verify exact native snapshots
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" || exit /b 1
+          mkdir "%RUNNER_TEMP%\\starvector-terminal" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal\\starvector-1b-inventory.json" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal\\starvector-8b-inventory.json" || exit /b 1
+      - name: Run exact authoritative Candle/CUDA StarVector hooks
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked -p candle-llm --features cuda starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture || exit /b 1
+          cargo test --locked -p candle-llm --features cuda starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture || exit /b 1
 
   mlx-llm:
     name: MLX LLM real weights

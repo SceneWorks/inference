@@ -288,6 +288,9 @@ impl TextLlm for CandleStarVector8bProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
     }
+    fn as_starvector_provider(&self) -> Option<&dyn StarVectorProvider> {
+        Some(self)
+    }
     fn validate(&self, request: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
