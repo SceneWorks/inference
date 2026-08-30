@@ -33,6 +33,8 @@ pub mod models;
 pub mod prepare;
 pub mod primitives;
 pub mod provider;
+pub mod starvector;
+pub mod starvector_8b;
 
 // Re-export the contract crate so consumers can reach it as `candle_llm::core_llm::…`.
 pub use core_llm;
@@ -49,18 +51,35 @@ pub use llava::{LlavaConfig, LlavaModel, LlavaProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 
-/// Add every Candle LLM provider to an explicit registry builder.
+/// Add only providers admitted to shipped Candle runtime catalogs.
 pub fn register_text_providers(
     registry: core_llm::TextLlmRegistryBuilder,
 ) -> core_llm::TextLlmRegistryBuilder {
     registry
         .register(provider::REGISTRATION)
         .register(llava::REGISTRATION)
+        .register(starvector::REGISTRATION)
+}
+
+/// Add every locally loadable Candle LLM provider to an explicit registry builder.
+///
+/// StarVector-8B is intentionally present here but absent from [`register_text_providers`]: the
+/// native implementation can be structurally exercised against an explicit local snapshot, while
+/// shipped catalog admission waits for SC-22261's one terminal quality receipt.
+pub fn register_local_text_providers(
+    registry: core_llm::TextLlmRegistryBuilder,
+) -> core_llm::TextLlmRegistryBuilder {
+    register_text_providers(registry).register(starvector_8b::REGISTRATION)
 }
 
 /// Build the complete, explicit Candle LLM provider catalog.
 pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
     register_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
+}
+
+/// Build the explicit local registry, including capabilities still fail-closed from shipping.
+pub fn local_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    register_local_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
 }
 
 /// Add the Candle snapshot preparer to an explicit registry builder.
@@ -110,7 +129,25 @@ mod explicit_registry_tests {
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(explicit, ["candle-llama", "candle-llava"]);
+        assert_eq!(
+            explicit,
+            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
+
+        let local: Vec<String> = super::local_text_registry()
+            .unwrap()
+            .registrations()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(
+            local,
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
+        );
 
         let preparers = super::snapshot_preparer_registry().unwrap();
         assert_eq!(
