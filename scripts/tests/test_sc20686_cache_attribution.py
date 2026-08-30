@@ -35,6 +35,10 @@ class AttributionTests(unittest.TestCase):
         coordinate_id = self.reducer.sha256(
             (json.dumps(geometry, sort_keys=True, separators=(",", ":")) + "\n").encode()
         )[:16]
+        exact_candidate = self.reducer.packed_group32_kv_bytes(
+            geometry["batch"], geometry["heads"], geometry["skv"],
+            geometry["head_dimension"],
+        )
         row = {
             "producer": "sc20686-campaign-adapter-v2", "family": family,
             "variant": variant, "coordinate_name": coordinate,
@@ -48,13 +52,20 @@ class AttributionTests(unittest.TestCase):
             "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
             "allocator_samples": [{"peak_bytes": 10 * 1024**3}],
             "process_samples": [{"peak_bytes": 10 * 1024**3}],
-            "observer_events": [{"phase": "sealed-test-event"}],
+            "observer_events": [{
+                "phase": "cross-kv-created",
+                "candidate_persistent_bytes": exact_candidate,
+            }],
             "raw_receipt_sha256": "c" * 64,
             "raw_receipt_sidecar_sha256": "f" * 64,
             "real_weights": True, "full_generation": arm == "normal",
             "attention_kind": "cross",
             "current_persistent_bytes": 1, "current_read_transient_bytes": 1,
-            "candidate_persistent_bytes": 0, "candidate_read_transient_bytes": 1,
+            "candidate_persistent_bytes": (
+                exact_candidate * geometry["layers"] if family == "flux2-klein"
+                else exact_candidate
+            ),
+            "candidate_read_transient_bytes": 1,
             "generation_duration_ms": 1000, "cache_read_duration_ms": 10,
             "reused_requests": 2, "minimum_cache_reads": 2,
         }
@@ -94,22 +105,26 @@ class AttributionTests(unittest.TestCase):
                 "current_persistent_bytes": 700 * 1024**2,
                 "candidate_persistent_bytes": 100 * 1024**2,
                 "minimum_cache_reads": 2,
+                "cache_read_duration_ms": 100,
             })
         result = self.reducer.reduce(rows)
         self.assertEqual(result["decisions"]["wan"]["decision"], "go")
         self.assertEqual(result["decisions"]["wan"]["qualifying_variants"], [large["variant"]])
 
-    def test_whole_process_bytes_sum_persistent_and_transient(self):
+    def test_allocator_and_process_domains_are_sealed_but_never_summed(self):
         row = self.complete_rows()[0]
         row.update({
             "current_persistent_bytes": 400 * 1024**2,
             "current_read_transient_bytes": 200 * 1024**2,
             "candidate_persistent_bytes": 100 * 1024**2,
             "candidate_read_transient_bytes": 200 * 1024**2,
+            "allocator_samples": [{"peak_bytes": 4 * 1024**3}],
+            "process_samples": [{"peak_bytes": 12 * 1024**3}],
         })
         decision = self.reducer.coordinate_decision(row)
-        self.assertEqual(decision["current_whole_process_bytes"], 600 * 1024**2)
-        self.assertEqual(decision["candidate_whole_process_bytes"], 300 * 1024**2)
+        self.assertEqual(decision["allocator_peak_bytes"], 4 * 1024**3)
+        self.assertEqual(decision["process_rss_peak_bytes"], 12 * 1024**3)
+        self.assertNotIn("current_whole_process_bytes", decision)
 
     def test_family_decisions_are_separate_and_variant_scoped(self):
         rows = self.complete_rows()
@@ -118,12 +133,13 @@ class AttributionTests(unittest.TestCase):
                 row.update({
                     "current_read_transient_bytes": 700 * 1024**2,
                     "candidate_read_transient_bytes": 100 * 1024**2,
+                    "cache_read_duration_ms": 100,
                 })
         result = self.reducer.reduce(rows)
         self.assertEqual(result["decisions"]["flux2-klein"]["decision"], "go")
         self.assertEqual(result["decisions"]["wan"]["decision"], "no-go")
 
-    def test_candidate_with_greater_transient_is_never_eligible(self):
+    def test_component_reductions_are_evaluated_independently(self):
         rows = self.complete_rows()
         row = next(item for item in rows if item["family"] == "wan" and item["arm"] == "normal")
         row.update({
@@ -131,11 +147,14 @@ class AttributionTests(unittest.TestCase):
             "current_read_transient_bytes": 100 * 1024**2,
             "candidate_persistent_bytes": 100 * 1024**2,
             "candidate_read_transient_bytes": 200 * 1024**2,
+            "cache_read_duration_ms": 100,
         })
         result = self.reducer.reduce(rows)
         coordinate = f"{row['variant']}/{row['coordinate_name']}"
-        self.assertFalse(result["decisions"]["wan"]["coordinates"][coordinate]["transient_compatible"])
-        self.assertEqual(result["decisions"]["wan"]["coordinates"][coordinate]["decision"], "no-go")
+        decision = result["decisions"]["wan"]["coordinates"][coordinate]
+        self.assertTrue(decision["persistent_reduction_qualifies"])
+        self.assertFalse(decision["read_transient_reduction_qualifies"])
+        self.assertEqual(decision["decision"], "go")
 
     def test_complete_frozen_coordinates_and_matching_arms_are_required(self):
         rows = self.complete_rows()
@@ -144,7 +163,16 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(result["decisions"]["wan"]["decision"], "blocked")
         pair = self.complete_rows()
         cancel = next(row for row in pair if row["arm"] == "cancel")
-        cancel["geometry"] = {**cancel["geometry"], "sq": cancel["geometry"]["sq"] + 1}
+        cancel["geometry"] = {**cancel["geometry"], "batch": cancel["geometry"]["batch"] + 1}
+        expected_candidate = self.reducer.packed_group32_kv_bytes(
+            cancel["geometry"]["batch"], cancel["geometry"]["heads"],
+            cancel["geometry"]["skv"], cancel["geometry"]["head_dimension"],
+        )
+        cancel["candidate_persistent_bytes"] = (
+            expected_candidate * cancel["geometry"]["layers"]
+            if cancel["family"] == "flux2-klein" else expected_candidate
+        )
+        cancel["observer_events"][0]["candidate_persistent_bytes"] = expected_candidate
         cancel["coordinate_id"] = self.reducer.sha256(
             (json.dumps(cancel["geometry"], sort_keys=True, separators=(",", ":")) + "\n").encode()
         )[:16]
@@ -166,6 +194,29 @@ class AttributionTests(unittest.TestCase):
             },
         )
 
+    def test_source_instrumentation_excludes_wan_self_attention_and_releases_ids(self):
+        root = SCRIPT.parents[1]
+        transformer = (root / "crates/media/candle-gen/candle-gen-wan/src/transformer.rs").read_text(
+            encoding="utf-8"
+        )
+        observer = (root / "crates/media/candle-gen/candle-gen-wan/src/sc20686_observer.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("self.prepare_kv_impl(context, false)?", transformer)
+        self.assertIn("self.forward_prepared_impl(hidden, &kv, rope, false)", transformer)
+        self.assertIn("if !ACTIVE.with(|slot| slot.borrow().is_some())", observer)
+        self.assertIn("slot.borrow_mut().remove(&cache_id)", observer)
+
+    def test_flux_source_map_anchors_live_double_attention_kv(self):
+        source_map = json.loads(self.reducer.SOURCE_MAP.read_text(encoding="utf-8"))
+        entry = source_map["variants"]["flux2_klein_9b_edit"]
+        self.assertEqual(
+            {anchor["symbol"] for anchor in entry["creation"]},
+            {"to_k.forward", "to_v.forward", "add_k.forward", "add_v.forward"},
+        )
+        self.assertTrue(all(anchor["path"].endswith("flux2/src/transformer.rs") for anchor in entry["creation"]))
+        self.assertEqual(entry["reads"][0]["symbol"], "attention")
+
     def test_standalone_reducer_rejects_unsealed_json_list(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "rows.json"
@@ -176,10 +227,10 @@ class AttributionTests(unittest.TestCase):
                 check=False, capture_output=True, text=True,
             )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("exact raw receipt sidecar or sealed bundle", completed.stderr)
+            self.assertIn("standalone raw-row reduction is forbidden", completed.stderr)
             self.assertFalse(output.exists())
 
-    def test_exact_raw_row_and_sidecar_are_accepted_but_incomplete_family_blocks(self):
+    def test_exact_raw_row_and_self_sidecar_are_still_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             raw_path = Path(directory) / "row.json"
             output = Path(directory) / "out.json"
@@ -192,9 +243,9 @@ class AttributionTests(unittest.TestCase):
                 [sys.executable, str(SCRIPT), str(raw_path), str(output), "--sidecar", str(sidecar_path)],
                 check=False, capture_output=True, text=True,
             )
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            result = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(result["decisions"]["flux2-klein"]["decision"], "blocked")
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("standalone raw-row reduction is forbidden", completed.stderr)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

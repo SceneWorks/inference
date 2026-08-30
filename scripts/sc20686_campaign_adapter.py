@@ -23,7 +23,7 @@ COVERAGE = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
 PRODUCER = "sc20686-campaign-adapter-v2"
 GEOMETRY = (
-    "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
+    "batch", "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
     "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope",
 )
 WAN_ROUTES = (
@@ -160,17 +160,22 @@ def normalize_file_arguments(arguments):
     return tuple(normalized)
 
 
-def route_manifest_identity(route, coordinate, entrypoint, snapshot, arguments, inventory):
-    document = {
+def route_manifest_document(route, coordinate, entrypoint, entrypoint_sha256, snapshot, arguments, inventory):
+    return {
         "route": route,
         "coordinate": coordinate,
         "entrypoint": str(Path(entrypoint).resolve()),
-        "entrypoint_sha256": file_identity(entrypoint),
+        "entrypoint_sha256": entrypoint_sha256,
         "snapshot": str(Path(snapshot).resolve()),
         "args": list(map(str, arguments)),
         "input_files": list(inventory),
     }
-    return digest(canonical(document))
+
+
+def route_manifest_identity(route, coordinate, entrypoint, snapshot, arguments, inventory):
+    return digest(canonical(route_manifest_document(
+        route, coordinate, entrypoint, file_identity(entrypoint), snapshot, arguments, inventory,
+    )))
 
 
 def verify_coordinate_inputs(spec):
@@ -227,6 +232,7 @@ def validate_coordinate_arguments(route, name, arguments, expected):
         if arguments.count("--control-dir") != 1 or arguments.count("--mask-dir") != 1:
             raise ValueError(f"VACE coordinate lacks control/mask inputs: {route}/{name}")
     actual = {
+        "batch": 1,
         "resolution": f"{width}x{height}",
         "frames": frames,
         "reference_count": reference_count,
@@ -330,7 +336,7 @@ def flux_coordinates(entrypoint, snapshot, reference, reference2):
         prompt = argument_value(arguments, "--prompt")
         expected = expected_coordinates[name]
         actual = {
-            "resolution": f"{width}x{height}", "frames": 1,
+            "batch": 1, "resolution": f"{width}x{height}", "frames": 1,
             "reference_count": arguments.count("--reference") + arguments.count("--reference2"),
             "prompt": digest(prompt.encode("utf-8")),
             "guidance": float(argument_value(arguments, "--guidance")),
@@ -373,7 +379,7 @@ def geometry_from(events):
         r"[1-9][0-9]*x[1-9][0-9]*", geometry["resolution"]
     ):
         raise ValueError("producer resolution must be positive WxH")
-    for key in ("reference_count", "frames", "layers", "heads", "head_dimension", "sq", "skv"):
+    for key in ("batch", "reference_count", "frames", "layers", "heads", "head_dimension", "sq", "skv"):
         minimum = 0 if key == "reference_count" else 1
         value = geometry[key]
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
@@ -560,17 +566,28 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     observed_reuse = sum(event.get("reused", 0) for event in read_events)
     if metrics["current_read_transient_bytes"] != observed_transient:
         raise ValueError("read transient metric differs from product-owned read events")
-    if metrics["candidate_read_transient_bytes"] != observed_transient:
-        raise ValueError("candidate read workspace must conservatively retain the measured dense read")
-    if metrics["reused_requests"] != observed_reuse:
-        raise ValueError("reuse metric differs from product-owned read events")
+    if metrics["candidate_read_transient_bytes"] > observed_transient:
+        raise ValueError("candidate read workspace exceeds the measured dense read")
     create_events = [event for event in events if event.get("phase") == "cross-kv-created"]
     if args.family == "flux2-klein":
         if metrics["current_persistent_bytes"] != 0 or any(event.get("persistent_bytes") != 0 for event in create_events):
             raise ValueError("FLUX edit must report its non-persistent route honestly")
-        if metrics["minimum_cache_reads"] != observed_reuse:
+        if (
+            metrics["minimum_cache_reads"] != metrics["reused_requests"]
+            or metrics["minimum_cache_reads"] > observed_reuse
+        ):
             raise ValueError("FLUX logical payload reuse differs from product-owned recomputations")
+        if any(
+            event.get("operation") != "DoubleAttention::to_k/to_v/add_k/add_v"
+            for event in create_events
+        ) or any(
+            event.get("operation") != "DoubleAttention::attention(reference-kv)"
+            for event in read_events
+        ):
+            raise ValueError("FLUX evidence is not anchored at exact DoubleAttention K/V boundaries")
     else:
+        if metrics["reused_requests"] != observed_reuse:
+            raise ValueError("reuse metric differs from product-owned read events")
         if metrics["current_persistent_bytes"] == 0:
             raise ValueError("Wan persistent-cache route cannot claim zero persistence")
         created_ids = [event.get("cache_id") for event in create_events]
@@ -768,6 +785,8 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
         raise ValueError("campaign destination or staging path already exists")
     reducer = _load_reducer()
     input_artifacts = dict(input_artifacts or {})
+    if "campaign-inputs.resolved.json" not in input_artifacts:
+        raise ValueError("campaign publication requires sealed resolved inputs")
     input_artifacts.update(run_artifacts)
     input_artifacts["sc20686_coverage_manifest.json"] = COVERAGE.read_bytes()
     input_artifacts["sc20686_source_map.json"] = SOURCE_MAP.read_bytes()
@@ -931,7 +950,23 @@ def main():
             }, snapshot_hash, snapshot_bytes, events)
 
         # A single invocation still captures both lifecycle arms into one atomic, sealed bundle.
-        publish_campaign([spec], runner, build_row, args.output)
+        resolved = {
+            "schema": "sc-20686-resolved-inputs-v2",
+            "coordinates": [{
+                "family": spec.family, "variant": spec.variant, "name": spec.name,
+                "entrypoint": str(spec.entrypoint),
+                "entrypoint_sha256": file_identity(spec.entrypoint),
+                "snapshot": str(spec.snapshot), "snapshot_sha256": snapshot_hash,
+                "snapshot_bytes": snapshot_bytes, "args": list(spec.args),
+                "route_manifest_sha256": spec.route_manifest_sha256,
+                "input_files": list(spec.input_file_inventory),
+            }],
+        }
+        publish_campaign([spec], runner, build_row, args.output, {
+            "campaign-inputs.resolved.json": (
+                json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8"),
+        })
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"SC-20686 adapter refused: {exc}", file=sys.stderr)

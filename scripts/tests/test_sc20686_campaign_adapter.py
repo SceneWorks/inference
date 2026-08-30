@@ -27,7 +27,7 @@ class CampaignAdapterTests(unittest.TestCase):
 
     def flux_events(self, *, variant="flux2_klein_9b_edit", cancel=False):
         geometry = {
-            "resolution": "512x512", "reference_count": 1, "frames": 1,
+            "batch": 1, "resolution": "512x512", "reference_count": 1, "frames": 1,
             "prompt": "6c8d6812785e96e6241dc0e9b6d7d8d1542c6606fb70e3872156f82130f27238",
             "guidance": "1", "layers": 24, "heads": 24, "head_dimension": 128,
             "sq": 4096, "skv": 1024, "dtype": "BF16", "mask": "none", "rope": "4-axis",
@@ -53,11 +53,11 @@ class CampaignAdapterTests(unittest.TestCase):
         return [
             metadata,
             {"phase": "generation-start", **base},
-            {"phase": "cross-kv-created", "persistent_bytes": 0, **base},
+            {"phase": "cross-kv-created", "operation": "DoubleAttention::to_k/to_v/add_k/add_v", "persistent_bytes": 0, **base},
             {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
-             "reused": 1, **base},
+             "operation": "DoubleAttention::attention(reference-kv)", "reused": 1, **base},
             {"phase": "cross-kv-read", "transient_bytes": 700 * 1024**2,
-             "reused": 1, **base},
+             "operation": "DoubleAttention::attention(reference-kv)", "reused": 1, **base},
             {"phase": terminal, **base},
             metrics,
             {"phase": "invalidated", **base},
@@ -362,6 +362,27 @@ class CampaignAdapterTests(unittest.TestCase):
                     coordinates.append(argparse.Namespace(
                         family=family, variant=variant, name=name,
                     ))
+        resolved_coordinates = []
+        route_hashes = {}
+        for coordinate in coordinates:
+            document = {
+                "route": coordinate.variant, "coordinate": coordinate.name,
+                "entrypoint": "product-entrypoint", "entrypoint_sha256": "d" * 64,
+                "snapshot": "/snapshot", "args": [], "input_files": [],
+            }
+            route_hash = self.adapter.digest(self.adapter.canonical(document))
+            route_hashes[(coordinate.family, coordinate.variant, coordinate.name)] = route_hash
+            resolved_coordinates.append({
+                "family": coordinate.family, "variant": coordinate.variant,
+                "name": coordinate.name, "entrypoint": "product-entrypoint",
+                "entrypoint_sha256": "d" * 64, "snapshot": "/snapshot",
+                "snapshot_sha256": "c" * 64, "snapshot_bytes": 1, "args": [],
+                "route_manifest_sha256": route_hash, "input_files": [],
+            })
+        resolved = {
+            "schema": "sc-20686-resolved-inputs-v2",
+            "coordinates": resolved_coordinates,
+        }
 
         def runner(coordinate, arm):
             metadata = {
@@ -372,6 +393,12 @@ class CampaignAdapterTests(unittest.TestCase):
                 "phase": "process-sample", "sample_kind": "process",
                 "peak_bytes": 10 * 1024**3, "at_ns": 1,
             }
+            exact_candidate = self.reducer.packed_group32_kv_bytes(1, 2, 128, 64)
+            created = {
+                "phase": "cross-kv-created", "sample_kind": "allocator",
+                "peak_bytes": 10 * 1024**3,
+                "candidate_persistent_bytes": exact_candidate,
+            }
             argv = [
                 "product-entrypoint", "--sc20686-campaign", "--sc20686-events", "-",
                 "--snapshot", "/snapshot", "--variant", coordinate.variant,
@@ -379,7 +406,8 @@ class CampaignAdapterTests(unittest.TestCase):
             if arm == "cancel":
                 argv.append("--sc20686-cancel")
             return self.adapter.CampaignRun(
-                [metadata, process], self.adapter.canonical(metadata), b"",
+                [metadata, created, process],
+                self.adapter.canonical(metadata) + self.adapter.canonical(created), b"",
                 tuple(argv), (process,),
             )
 
@@ -392,25 +420,37 @@ class CampaignAdapterTests(unittest.TestCase):
                 "sq": 1024, "skv": 128, "dtype": "BF16", "mask": "none",
                 "rope": "none",
             }
+            exact_candidate = self.reducer.packed_group32_kv_bytes(
+                geometry["batch"], geometry["heads"], geometry["skv"],
+                geometry["head_dimension"],
+            )
             return {
                 "producer": self.adapter.PRODUCER, "family": coordinate.family,
                 "variant": coordinate.variant, "coordinate_name": coordinate.name,
                 "coordinate_id": self.adapter.digest(self.adapter.canonical(geometry))[:16],
                 "arm": arm, "source_ref": "a" * 40,
-                "route_manifest_sha256": "b" * 64,
+                "route_manifest_sha256": route_hashes[
+                    (coordinate.family, coordinate.variant, coordinate.name)
+                ],
                 "source_map_sha256": self.source_map_hash,
                 "model_snapshot_sha256": "c" * 64, "model_snapshot_bytes": 1,
                 "input_file_sha256": {},
                 "evidence_artifact_sha256": evidence_hashes,
                 "geometry": geometry,
                 "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
-                "allocator_samples": [{"phase": "metadata", "peak_bytes": 10 * 1024**3}],
+                "allocator_samples": [
+                    {"phase": event["phase"], "peak_bytes": event["peak_bytes"]}
+                    for event in events if event.get("sample_kind") == "allocator"
+                ],
                 "process_samples": [{"phase": "process-sample", "peak_bytes": 10 * 1024**3}],
                 "observer_events": events,
                 "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
                 "real_weights": True, "full_generation": arm == "normal",
                 "attention_kind": "cross", "current_persistent_bytes": 1,
-                "current_read_transient_bytes": 1, "candidate_persistent_bytes": 0,
+                "current_read_transient_bytes": 1, "candidate_persistent_bytes": (
+                    exact_candidate * geometry["layers"]
+                    if coordinate.family == "flux2-klein" else exact_candidate
+                ),
                 "candidate_read_transient_bytes": 1, "generation_duration_ms": 1000,
                 "cache_read_duration_ms": 10, "reused_requests": 2,
                 "minimum_cache_reads": 2,
@@ -419,15 +459,50 @@ class CampaignAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "campaign"
             self.adapter.publish_campaign(
-                coordinates, runner, row_builder, destination
+                coordinates, runner, row_builder, destination, {
+                    "campaign-inputs.resolved.json": (
+                        json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+                    ).encode("utf-8"),
+                }
             )
             result = self.reducer.verify_campaign_bundle(destination)
             self.assertEqual(set(result["decisions"]), {"flux2-klein", "wan"})
             markdown = (destination / "campaign.md").read_text(encoding="utf-8")
             self.assertIn("## Sealed source map", markdown)
-            self.assertIn("- Group size: `64`", markdown)
+            self.assertIn("- Group size: `32`", markdown)
             self.assertIn("- Pending key tail: dense f32", markdown)
             self.assertIn("packed-group-affine", json.dumps(result["source_map"]))
+            resolved_path = destination / "campaign-inputs.resolved.json"
+            resolved_sidecar = destination / "campaign-inputs.resolved.json.sha256"
+            campaign_path = destination / "campaign.json"
+            campaign_sidecar = destination / "campaign.json.sha256"
+            originals = {
+                path: path.read_bytes()
+                for path in (resolved_path, resolved_sidecar, campaign_path, campaign_sidecar)
+            }
+            malicious = json.loads(resolved_path.read_text(encoding="utf-8"))
+            malicious["coordinates"][0]["entrypoint_sha256"] = "e" * 64
+            malicious_raw = (
+                json.dumps(malicious, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            malicious_hash = self.adapter.digest(malicious_raw)
+            resolved_path.write_bytes(malicious_raw)
+            resolved_sidecar.write_text(
+                f"{malicious_hash}  campaign-inputs.resolved.json\n", encoding="utf-8"
+            )
+            campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+            campaign["artifact_sha256"]["campaign-inputs.resolved.json"] = malicious_hash
+            campaign_raw = (
+                json.dumps(campaign, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            campaign_path.write_bytes(campaign_raw)
+            campaign_sidecar.write_text(
+                f"{self.adapter.digest(campaign_raw)}  campaign.json\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "cannot be recomputed"):
+                self.reducer.verify_campaign_bundle(destination)
+            for path, payload in originals.items():
+                path.write_bytes(payload)
             transcript = destination / "run-00-normal.stdout"
             transcript.write_bytes(transcript.read_bytes() + b"tamper")
             with self.assertRaisesRegex(ValueError, "checksum mismatch"):

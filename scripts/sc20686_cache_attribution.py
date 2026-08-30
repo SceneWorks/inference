@@ -23,7 +23,7 @@ THRESHOLDS = {
     "runtime_only_pct": 0.05,
 }
 GEOMETRY = (
-    "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
+    "batch", "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
     "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope",
 )
 REQUIRED = (
@@ -66,6 +66,22 @@ def require_nonnegative(value, name):
         fail(f"invalid {name}")
 
 
+def packed_group32_kv_bytes(batch, heads, tokens, width):
+    if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in (
+        batch, heads, tokens, width,
+    )):
+        fail("invalid packed K/V geometry")
+    complete, pending = divmod(tokens, 32)
+    rows = batch * heads
+    key_codes = rows * complete * ((32 * width + 3) // 4)
+    key_metadata = rows * complete * width * 4
+    key_pending = rows * pending * width * 4
+    value_rows = rows * tokens
+    value_codes = value_rows * ((width + 3) // 4)
+    value_metadata = value_rows * ((width + 31) // 32) * 4
+    return key_codes + key_metadata + key_pending + value_codes + value_metadata
+
+
 def read_checked_json(path, expected_schema):
     try:
         raw = path.read_bytes()
@@ -84,7 +100,7 @@ def checked_contracts():
         "story": "SC-20675",
         "format": "packed-group-affine-v2",
         "bits": 2,
-        "group_size": 64,
+        "group_size": 32,
         "metadata": "f16 scale and zero per completed group",
         "pending_key_tail": "dense f32",
     }:
@@ -141,7 +157,7 @@ def validate_geometry(geometry):
         r"[1-9][0-9]*x[1-9][0-9]*", geometry["resolution"]
     ):
         fail("invalid resolution")
-    for key in ("reference_count", "frames", "layers", "heads", "head_dimension", "sq", "skv"):
+    for key in ("batch", "reference_count", "frames", "layers", "heads", "head_dimension", "sq", "skv"):
         value = geometry[key]
         minimum = 0 if key == "reference_count" else 1
         if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
@@ -197,6 +213,21 @@ def validate(row, expected_source_map_hash):
     if (row["arm"] == "normal") != (row["full_generation"] is True):
         fail("arm/full-generation lifecycle mismatch")
     validate_geometry(row["geometry"])
+    expected_candidate = packed_group32_kv_bytes(
+        row["geometry"]["batch"], row["geometry"]["heads"], row["geometry"]["skv"],
+        row["geometry"]["head_dimension"],
+    )
+    created = [
+        event for event in row["observer_events"]
+        if isinstance(event, dict) and event.get("phase") == "cross-kv-created"
+    ]
+    if row["family"] == "wan":
+        if not created or any(
+            event.get("candidate_persistent_bytes") != expected_candidate for event in created
+        ):
+            fail("Wan candidate bytes differ from exact SC-20675 group32 projection")
+    elif row["candidate_persistent_bytes"] != expected_candidate * row["geometry"]["layers"]:
+        fail("FLUX candidate bytes differ from exact per-layer SC-20675 group32 projection")
     expected_coordinate_id = sha256(
         (json.dumps(row["geometry"], sort_keys=True, separators=(",", ":")) + "\n").encode()
     )[:16]
@@ -275,39 +306,50 @@ def geometry_matches_expected(actual, expected):
 
 
 def coordinate_decision(row):
-    peak = max(sample["peak_bytes"] for sample in row["process_samples"])
-    # The frozen threshold is whole-process occupancy: retained cache bytes and the peak live
-    # cache-read workspace coexist at the read boundary, so neither may hide behind `max()`.
-    current = row["current_persistent_bytes"] + row["current_read_transient_bytes"]
-    candidate = row["candidate_persistent_bytes"] + row["candidate_read_transient_bytes"]
-    saving = current - candidate
-    saving_pct = saving / peak if peak else 0.0
+    allocator_peak = max(sample["peak_bytes"] for sample in row["allocator_samples"])
+    process_peak = max(sample["peak_bytes"] for sample in row["process_samples"])
+    persistent_saving = row["current_persistent_bytes"] - row["candidate_persistent_bytes"]
+    transient_saving = row["current_read_transient_bytes"] - row["candidate_read_transient_bytes"]
     runtime_fraction = row["cache_read_duration_ms"] / row["generation_duration_ms"]
-    opportunity = (
-        current >= THRESHOLDS["opportunity_bytes"]
-        and current >= peak * THRESHOLDS["opportunity_peak_pct"]
-        and row["minimum_cache_reads"] >= THRESHOLDS["minimum_reads_per_cache"]
+    persistent_opportunity = (
+        row["current_persistent_bytes"] >= THRESHOLDS["opportunity_bytes"]
+        and row["current_persistent_bytes"] >= allocator_peak * THRESHOLDS["opportunity_peak_pct"]
     )
-    transient_compatible = (
-        row["candidate_read_transient_bytes"] <= row["current_read_transient_bytes"]
+    transient_opportunity = (
+        row["current_read_transient_bytes"] >= THRESHOLDS["opportunity_bytes"]
+        and row["current_read_transient_bytes"] >= allocator_peak * THRESHOLDS["opportunity_peak_pct"]
     )
+    persistent_reduction = (
+        persistent_opportunity
+        and persistent_saving >= THRESHOLDS["saving_bytes"]
+        and persistent_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
+    )
+    transient_reduction = (
+        transient_opportunity
+        and transient_saving >= THRESHOLDS["saving_bytes"]
+        and transient_saving >= allocator_peak * THRESHOLDS["saving_peak_pct"]
+    )
+    reads_qualify = row["minimum_cache_reads"] >= THRESHOLDS["minimum_reads_per_cache"]
+    runtime_qualifies = runtime_fraction >= THRESHOLDS["runtime_only_pct"]
     eligible = (
-        opportunity
-        and transient_compatible
-        and saving >= THRESHOLDS["saving_bytes"]
-        and saving_pct >= THRESHOLDS["saving_peak_pct"]
+        reads_qualify
+        and runtime_qualifies
+        and (persistent_reduction or transient_reduction)
     )
     return {
         "decision": "go" if eligible else "no-go",
-        "opportunity": opportunity,
-        "current_whole_process_bytes": current,
-        "candidate_whole_process_bytes": candidate,
-        "net_saving_bytes": saving,
-        "net_saving_peak_pct": saving_pct,
+        "allocator_peak_bytes": allocator_peak,
+        "process_rss_peak_bytes": process_peak,
+        "persistent_opportunity": persistent_opportunity,
+        "read_transient_opportunity": transient_opportunity,
+        "persistent_saving_bytes": persistent_saving,
+        "read_transient_saving_bytes": transient_saving,
+        "persistent_reduction_qualifies": persistent_reduction,
+        "read_transient_reduction_qualifies": transient_reduction,
         "cache_read_runtime_fraction": runtime_fraction,
-        "runtime_only_opportunity": runtime_fraction >= THRESHOLDS["runtime_only_pct"],
+        "runtime_qualifies": runtime_qualifies,
         "minimum_cache_reads": row["minimum_cache_reads"],
-        "transient_compatible": transient_compatible,
+        "reads_qualify": reads_qualify,
     }
 
 
@@ -417,6 +459,12 @@ def verify_campaign_bundle(bundle):
         fail("invalid campaign bundle schema")
     artifacts = campaign.get("artifact_sha256")
     validate_hash_map(artifacts, "campaign artifact identity")
+    expected_files = {"campaign.json", "campaign.json.sha256"}
+    for name in artifacts:
+        expected_files.update((name, f"{name}.sha256"))
+    observed_files = {path.name for path in bundle.iterdir() if path.is_file()}
+    if observed_files != expected_files:
+        fail("campaign bundle file inventory is not exact")
     payloads = {
         name: verify_named_artifact(bundle, name, item_hash)
         for name, item_hash in artifacts.items()
@@ -425,6 +473,52 @@ def verify_campaign_bundle(bundle):
     row_files = campaign.get("row_files")
     if not isinstance(sealed_rows, list) or not isinstance(row_files, list) or len(sealed_rows) != len(row_files):
         fail("campaign row inventory is malformed")
+    resolved_raw = payloads.get("campaign-inputs.resolved.json")
+    if resolved_raw is None:
+        fail("campaign lacks sealed resolved inputs")
+    try:
+        resolved = json.loads(resolved_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"campaign resolved inputs are malformed: {exc}")
+    if resolved.get("schema") != "sc-20686-resolved-inputs-v2" or not isinstance(
+        resolved.get("coordinates"), list
+    ):
+        fail("campaign resolved inputs schema is invalid")
+    resolved_by_key = {}
+    for entry in resolved["coordinates"]:
+        if not isinstance(entry, dict):
+            fail("campaign resolved coordinate is malformed")
+        key = (entry.get("family"), entry.get("variant"), entry.get("name"))
+        if key in resolved_by_key:
+            fail("campaign resolved inputs contain duplicate coordinates")
+        for field in ("entrypoint_sha256", "snapshot_sha256", "route_manifest_sha256"):
+            require_digest(entry.get(field), f"resolved {field}")
+        if (
+            not isinstance(entry.get("entrypoint"), str)
+            or not isinstance(entry.get("snapshot"), str)
+            or not isinstance(entry.get("args"), list)
+            or any(not isinstance(item, str) for item in entry["args"])
+            or not isinstance(entry.get("input_files"), list)
+        ):
+            fail("campaign resolved coordinate paths/arguments are malformed")
+        manifest_document = {
+            "route": entry["variant"],
+            "coordinate": entry["name"],
+            "entrypoint": entry["entrypoint"],
+            "entrypoint_sha256": entry["entrypoint_sha256"],
+            "snapshot": entry["snapshot"],
+            "args": entry["args"],
+            "input_files": entry["input_files"],
+        }
+        if sha256((json.dumps(manifest_document, sort_keys=True, separators=(",", ":")) + "\n").encode()) != entry["route_manifest_sha256"]:
+            fail("route manifest identity cannot be recomputed from sealed resolved inputs")
+        resolved_by_key[key] = entry
+    row_coordinate_keys = {
+        (row.get("family"), row.get("variant"), row.get("coordinate_name"))
+        for row in sealed_rows
+    }
+    if set(resolved_by_key) != row_coordinate_keys:
+        fail("resolved input coordinate closure differs from sealed rows")
     for row, name in zip(sealed_rows, row_files):
         raw = payloads.get(name)
         if raw is None:
@@ -474,17 +568,37 @@ def verify_campaign_bundle(bundle):
         argv = command.get("argv") if isinstance(command, dict) else None
         if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
             fail("campaign command transcript is malformed")
-        try:
-            variant = argv[argv.index("--variant") + 1]
-        except (ValueError, IndexError):
-            fail("campaign command lacks exact route identity")
-        cancel = "--sc20686-cancel" in argv
+        resolved_entry = resolved_by_key[
+            (row["family"], row["variant"], row["coordinate_name"])
+        ]
+        expected_argv = [
+            resolved_entry["entrypoint"], "--sc20686-campaign", "--sc20686-events", "-",
+            "--snapshot", resolved_entry["snapshot"], "--variant", row["variant"],
+            *resolved_entry["args"],
+        ]
+        if row["arm"] == "cancel":
+            expected_argv.append("--sc20686-cancel")
+        if argv != expected_argv:
+            fail("campaign command conflicts with sealed resolved inputs")
         if (
-            "--sc20686-campaign" not in argv
-            or variant != row["variant"]
-            or cancel != (row["arm"] == "cancel")
+            row["route_manifest_sha256"] != resolved_entry["route_manifest_sha256"]
+            or row["model_snapshot_sha256"] != resolved_entry["snapshot_sha256"]
+            or row["model_snapshot_bytes"] != resolved_entry["snapshot_bytes"]
         ):
-            fail("campaign command conflicts with the sealed row identity")
+            fail("sealed row identity differs from sealed resolved inputs")
+        resolved_input_hashes = {}
+        for item in resolved_entry["input_files"]:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("flag"), str)
+                or not isinstance(item.get("argument_index"), int)
+            ):
+                fail("resolved input file inventory is malformed")
+            require_digest(item.get("sha256"), "resolved input file hash")
+            key = f"{item['flag'][2:]}-{item['argument_index'] - 1:02d}"
+            resolved_input_hashes[key] = item["sha256"]
+        if row["input_file_sha256"] != resolved_input_hashes:
+            fail("sealed row file identities differ from sealed resolved inputs")
     expected_input_hashes = {
         f"{row['family']}/{row['variant']}/{row['coordinate_name']}/{row['arm']}":
             row["input_file_sha256"]
@@ -521,7 +635,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--sidecar", type=Path)
+    parser.add_argument("--sidecar", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
         if args.input.is_dir():
@@ -529,20 +643,7 @@ def main():
                 fail("bundle input does not accept --sidecar")
             result = verify_campaign_bundle(args.input)
         else:
-            if args.sidecar is None:
-                fail("standalone reduction requires an exact raw receipt sidecar or sealed bundle")
-            raw = args.input.read_bytes()
-            unsigned = json.loads(raw.decode("utf-8"))
-            if not isinstance(unsigned, dict):
-                fail("raw receipt input must contain one unsigned row")
-            if unsigned.get("raw_receipt_sha256") != "" or unsigned.get("raw_receipt_sidecar_sha256") != "":
-                fail("raw receipt must be unsigned")
-            sidecar = args.sidecar.read_bytes()
-            sealed = dict(unsigned)
-            sealed["raw_receipt_sha256"] = sha256(raw)
-            sealed["raw_receipt_sidecar_sha256"] = sha256(sidecar)
-            verify_seal_artifact(sealed, raw, sidecar, args.input.name)
-            result = reduce([sealed])
+            fail("standalone raw-row reduction is forbidden; provide a fully verified campaign bundle")
         payload = (json.dumps(result, indent=2, sort_keys=True) + "\n").encode("utf-8")
         atomic_write(args.output, payload)
         print(json.dumps({"sha256": sha256(payload), "output": str(args.output)}))

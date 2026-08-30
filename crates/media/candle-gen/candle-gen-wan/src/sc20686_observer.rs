@@ -77,24 +77,6 @@ pub fn campaign_plan() -> [CampaignCoordinate; 10] {
     plan
 }
 
-/// Checked projection for the campaign's explicit block-quant contract. The producer supplies the
-/// measured dense element count; no caller-provided byte estimate is accepted.
-pub fn checked_compressed_bytes(
-    elements: u64,
-    bits_per_element: u8,
-    block_bytes: u64,
-) -> Option<u64> {
-    if elements == 0 || bits_per_element == 0 || bits_per_element > 32 || block_bytes == 0 {
-        return None;
-    }
-    let bits = elements.checked_mul(u64::from(bits_per_element))?;
-    let payload = bits.checked_add(7)?.checked_div(8)?;
-    let blocks = payload
-        .checked_add(block_bytes - 1)?
-        .checked_div(block_bytes)?;
-    blocks.checked_mul(block_bytes)
-}
-
 /// Exact SC-20675 v2 payload projection for one live `[B,H,Skv,D]` K/V cache.
 /// Keys group on the token axis and retain an f32 dense pending tail; values group on the
 /// channel axis. Every completed group carries f16 scale and zero metadata.
@@ -481,13 +463,15 @@ impl CacheObserver for JsonlObserver {
             let generation_ms = GENERATION_DURATION_MS.with(|slot| *slot.borrow());
             let read_ms = CACHE_READ_DURATION_MS.with(|slot| *slot.borrow());
             let candidate = PEAK_CANDIDATE.with(|slot| *slot.borrow());
-            let minimum_cache_reads = CACHE_STATES.with(|slot| {
-                slot.borrow()
-                    .values()
-                    .map(|state| state.reads)
-                    .min()
-                    .unwrap_or(0)
-            });
+            let active_min =
+                CACHE_STATES.with(|slot| slot.borrow().values().map(|state| state.reads).min());
+            let completed_min =
+                COMPLETED_CACHE_READS.with(|slot| slot.borrow().iter().copied().min());
+            let minimum_cache_reads = active_min
+                .into_iter()
+                .chain(completed_min)
+                .min()
+                .unwrap_or(0);
             value["current_persistent_bytes"] = serde_json::json!(current);
             value["current_read_transient_bytes"] = serde_json::json!(transient);
             value["candidate_persistent_bytes"] = serde_json::json!(candidate);
@@ -554,6 +538,7 @@ thread_local! { static LIVE_CANDIDATE: RefCell<u64> = const { RefCell::new(0) };
 thread_local! { static PEAK_CANDIDATE: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static NEXT_CACHE_ID: Cell<u64> = const { Cell::new(1) }; }
 thread_local! { static CACHE_STATES: RefCell<BTreeMap<u64, CacheAccounting>> = const { RefCell::new(BTreeMap::new()) }; }
+thread_local! { static COMPLETED_CACHE_READS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) }; }
 thread_local! { static CURRENT_READ_TRANSIENT: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static REUSED_REQUESTS: RefCell<u64> = const { RefCell::new(0) }; }
 thread_local! { static GENERATION_DURATION_MS: RefCell<u64> = const { RefCell::new(0) }; }
@@ -562,6 +547,11 @@ thread_local! { static GENERATION_DURATION_PRECISE_MS: RefCell<f64> = const { Re
 thread_local! { static CACHE_READ_DURATION_PRECISE_MS: RefCell<f64> = const { RefCell::new(0.0) }; }
 thread_local! { static CANCEL_TRIGGERED: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static TERMINAL_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+
+/// The single observer-presence probe used by product code to make the entire campaign path inert.
+pub(crate) fn campaign_active() -> bool {
+    ACTIVE.with(|slot| slot.borrow().is_some())
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CacheAccounting {
@@ -623,6 +613,7 @@ fn install_with_context_inner(
     PEAK_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
     NEXT_CACHE_ID.with(|slot| slot.set(1));
     CACHE_STATES.with(|slot| slot.borrow_mut().clear());
+    COMPLETED_CACHE_READS.with(|slot| slot.borrow_mut().clear());
     CURRENT_READ_TRANSIENT.with(|slot| *slot.borrow_mut() = 0);
     REUSED_REQUESTS.with(|slot| *slot.borrow_mut() = 0);
     GENERATION_DURATION_MS.with(|slot| *slot.borrow_mut() = 0);
@@ -672,6 +663,11 @@ fn observe_timed_for_cache(
     allocator_before_bytes: u64,
     allocator_after_bytes: u64,
 ) {
+    // Outside an explicitly installed campaign, this must be inert before touching any of the
+    // accounting thread-locals or allocating event strings/maps.
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     if phase == "generation-start" {
         if START_EVENT_EMITTED.with(|slot| *slot.borrow()) {
             return;
@@ -857,6 +853,9 @@ fn observe_timed_for_cache(
 
 /// Register one product-owned prepared cache and return its run-local identity.
 pub(crate) fn register_cache(dense_bytes: u64, candidate_bytes: u64, measured: Instant) -> u64 {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return 0;
+    }
     let cache_id = NEXT_CACHE_ID.with(|slot| {
         let value = slot.get();
         slot.set(value.saturating_add(1));
@@ -885,6 +884,9 @@ pub(crate) fn record_cache_read(
     allocator_after_bytes: u64,
     measured: Instant,
 ) {
+    if cache_id == 0 || !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     observe_timed_for_cache(
         "cross-kv-read",
         0,
@@ -899,8 +901,12 @@ pub(crate) fn record_cache_read(
 }
 
 pub(crate) fn release_cache(cache_id: u64) {
-    let state = CACHE_STATES.with(|slot| slot.borrow().get(&cache_id).copied());
+    if cache_id == 0 || !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
+    let state = CACHE_STATES.with(|slot| slot.borrow_mut().remove(&cache_id));
     if let Some(state) = state {
+        COMPLETED_CACHE_READS.with(|slot| slot.borrow_mut().push(state.reads));
         observe_timed_for_cache(
             "cross-kv-released",
             state.dense_bytes,
@@ -1026,6 +1032,9 @@ pub(crate) fn bind_cross_kv_geometry(
     skv: u64,
     dtype: impl Into<String>,
 ) {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     let bound = CONTEXT.with(|slot| {
         if let Some(context) = slot.borrow_mut().as_mut() {
             if layers != 0 {
@@ -1061,6 +1070,9 @@ pub(crate) fn bind_cross_kv_geometry(
 /// insufficient: it happens before projection and cannot prove that a snapshot-backed model loaded
 /// successfully. Tests deliberately remain non-promotable even when their synthetic tensors project.
 pub(crate) fn confirm_real_weight_projection() {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     let bound = CONTEXT.with(|slot| {
         if let Some(context) = slot.borrow_mut().as_mut() {
             context.real_weights = !cfg!(test);
@@ -1108,6 +1120,8 @@ impl Drop for Scope {
         TERMINAL_EMITTED.with(|slot| *slot.borrow_mut() = false);
         GENERATION_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
         CACHE_READ_DURATION_PRECISE_MS.with(|slot| *slot.borrow_mut() = 0.0);
+        CACHE_STATES.with(|slot| slot.borrow_mut().clear());
+        COMPLETED_CACHE_READS.with(|slot| slot.borrow_mut().clear());
         LIVE_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
         PEAK_PERSISTENT.with(|slot| *slot.borrow_mut() = 0);
         LIVE_CANDIDATE.with(|slot| *slot.borrow_mut() = 0);
@@ -1247,23 +1261,16 @@ mod tests {
     }
 
     #[test]
-    fn compressed_projection_is_checked_and_block_aligned() {
-        assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(512));
-        assert_eq!(checked_compressed_bytes(0, 4, 64), None);
-        assert_eq!(checked_compressed_bytes(u64::MAX, 32, 64), None);
-    }
-
-    #[test]
     fn packed_projection_includes_metadata_and_dense_pending_key_tail() {
         // B=1,H=2,Skv=65,D=64: keys have one complete group and one dense f32
         // pending token; values have 130 channel-grouped rows.
         assert_eq!(
-            checked_packed_group_affine_kv_bytes(1, 2, 65, 64, 64),
-            Some(5_672)
+            checked_packed_group_affine_kv_bytes(1, 2, 65, 64, 32),
+            Some(6_704)
         );
-        assert_eq!(checked_packed_group_affine_kv_bytes(1, 2, 0, 64, 64), None);
+        assert_eq!(checked_packed_group_affine_kv_bytes(1, 2, 0, 64, 32), None);
         assert_eq!(
-            checked_packed_group_affine_kv_bytes(u64::MAX, 2, 65, 64, 64),
+            checked_packed_group_affine_kv_bytes(u64::MAX, 2, 65, 64, 32),
             None
         );
     }
@@ -1289,6 +1296,11 @@ mod tests {
         assert_eq!(PEAK_PERSISTENT.with(|slot| *slot.borrow()), 300);
         assert_eq!(PEAK_CANDIDATE.with(|slot| *slot.borrow()), 130);
         release_cache(first);
+        assert!(!CACHE_STATES.with(|slot| slot.borrow().contains_key(&first)));
+        assert_eq!(
+            COMPLETED_CACHE_READS.with(|slot| slot.borrow().clone()),
+            vec![2]
+        );
         assert_eq!(LIVE_PERSISTENT.with(|slot| *slot.borrow()), 200);
         assert_eq!(LIVE_CANDIDATE.with(|slot| *slot.borrow()), 80);
         let rows = out.borrow();

@@ -272,17 +272,25 @@ impl Attention {
 
     /// Project a step-invariant cross-attention source into K/V heads once per request conditioning
     /// payload.  The resulting tensors remain owned by the caller's request scope.
-    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
-        let measured = std::time::Instant::now();
+    fn prepare_kv_impl(
+        &self,
+        context: &Tensor,
+        observe_cross_attention: bool,
+    ) -> Result<PreparedBlockCrossKv> {
+        let observe_cross_attention =
+            observe_cross_attention && crate::sc20686_observer::campaign_active();
+        let measured = observe_cross_attention.then(std::time::Instant::now);
         let (b, s_kv, _) = context.dims3()?;
-        crate::sc20686_observer::bind_cross_kv_geometry(
-            0,
-            self.num_heads as u32,
-            self.head_dim as u32,
-            0,
-            s_kv as u64,
-            format!("{:?}", context.dtype()),
-        );
+        if observe_cross_attention {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                0,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                0,
+                s_kv as u64,
+                format!("{:?}", context.dtype()),
+            );
+        }
         let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
         let v = self.to_v.forward(context)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
@@ -297,24 +305,30 @@ impl Attention {
                 (tensor.elem_count() as u64).saturating_mul(tensor.dtype().size_in_bytes() as u64),
             )
         });
-        let candidate_bytes = crate::sc20686_observer::checked_packed_group_affine_kv_bytes(
-            b as u64,
-            self.num_heads as u64,
-            s_kv as u64,
-            self.head_dim as u64,
-            64,
-        )
-        .ok_or_else(|| {
-            candle_gen::candle_core::Error::Msg(
-                "SC-20686 packed group-affine projection overflow".into(),
+        let cache_id = if observe_cross_attention {
+            let candidate_bytes = crate::sc20686_observer::checked_packed_group_affine_kv_bytes(
+                b as u64,
+                self.num_heads as u64,
+                s_kv as u64,
+                self.head_dim as u64,
+                32,
             )
-        })?;
-        // Only a successfully materialized projection can prove that the product-owned loaded
-        // weights are real. Emit metadata/start before the first created event once query geometry
-        // has also been bound by the denoise caller.
-        crate::sc20686_observer::confirm_real_weight_projection();
-        let cache_id =
-            crate::sc20686_observer::register_cache(retained_bytes, candidate_bytes, measured);
+            .ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(
+                    "SC-20686 packed group-affine projection overflow".into(),
+                )
+            })?;
+            // Only the product cross-attention projection can prove real-weight evidence. The
+            // compatibility/self-attention path below is deliberately observer-inert.
+            crate::sc20686_observer::confirm_real_weight_projection();
+            crate::sc20686_observer::register_cache(
+                retained_bytes,
+                candidate_bytes,
+                measured.expect("observed projection has a start time"),
+            )
+        } else {
+            0
+        };
         Ok(PreparedBlockCrossKv {
             key,
             value,
@@ -322,24 +336,33 @@ impl Attention {
         })
     }
 
+    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        self.prepare_kv_impl(context, true)
+    }
+
     /// `hidden`: `[B, S, dim]`; `kv`: preprojected K/V heads. RoPE is applied only when
     /// `cos`/`sin` are given (self-attention).
-    fn forward_prepared(
+    fn forward_prepared_impl(
         &self,
         hidden: &Tensor,
         kv: &PreparedBlockCrossKv,
         rope: Option<(&Tensor, &Tensor)>,
+        observe_cross_attention: bool,
     ) -> Result<Tensor> {
-        let measured = std::time::Instant::now();
+        let observe_cross_attention =
+            observe_cross_attention && crate::sc20686_observer::campaign_active();
+        let measured = observe_cross_attention.then(std::time::Instant::now);
         let (b, s, _) = hidden.dims3()?;
-        crate::sc20686_observer::bind_cross_kv_geometry(
-            0,
-            self.num_heads as u32,
-            self.head_dim as u32,
-            s as u64,
-            0,
-            format!("{:?}", hidden.dtype()),
-        );
+        if observe_cross_attention {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                0,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                s as u64,
+                0,
+                format!("{:?}", hidden.dtype()),
+            );
+        }
         let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
             t.reshape((b, s, self.num_heads, self.head_dim))?
@@ -353,23 +376,38 @@ impl Attention {
             k = apply_rope(&k, cos, sin)?;
         }
         let scale = (self.head_dim as f64).powf(-0.5);
-        let allocator_before = crate::sc20686_observer::backend_reserved_bytes();
+        let allocator_before = observe_cross_attention
+            .then(crate::sc20686_observer::backend_reserved_bytes)
+            .flatten();
         let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
-        let allocator_after = crate::sc20686_observer::backend_reserved_bytes();
+        let allocator_after = observe_cross_attention
+            .then(crate::sc20686_observer::backend_reserved_bytes)
+            .flatten();
         let physical_read_transient = allocator_before
             .zip(allocator_after)
             .map_or(0, |(before, after)| after.saturating_sub(before));
-        crate::sc20686_observer::record_cache_read(
-            kv.cache_id,
-            physical_read_transient,
-            allocator_before.unwrap_or(0),
-            allocator_after.unwrap_or(0),
-            measured,
-        );
+        if observe_cross_attention {
+            crate::sc20686_observer::record_cache_read(
+                kv.cache_id,
+                physical_read_transient,
+                allocator_before.unwrap_or(0),
+                allocator_after.unwrap_or(0),
+                measured.expect("observed read has a start time"),
+            );
+        }
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;
         self.to_out.forward(&out)
+    }
+
+    fn forward_prepared(
+        &self,
+        hidden: &Tensor,
+        kv: &PreparedBlockCrossKv,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
+        self.forward_prepared_impl(hidden, kv, rope, true)
     }
 
     /// Compatibility path for self-attention and one-off callers. Request render paths use
@@ -380,7 +418,8 @@ impl Attention {
         context: &Tensor,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        self.forward_prepared(hidden, &self.prepare_kv(context)?, rope)
+        let kv = self.prepare_kv_impl(context, false)?;
+        self.forward_prepared_impl(hidden, &kv, rope, false)
     }
 }
 

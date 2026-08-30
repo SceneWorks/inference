@@ -359,6 +359,7 @@ impl DoubleAttention {
     ) -> GenResult<(Tensor, Tensor)> {
         let (h, hd) = (self.heads, self.head_dim);
         let txt_seq = norm_txt.dim(1)?;
+        let campaign_projection = crate::sc20686_observer::begin_flux_kv_projection();
 
         // img stream q/k/v
         let iq = to_heads(&self.to_q.forward(norm_img)?, h, hd, Some(&self.norm_q))?;
@@ -378,6 +379,13 @@ impl DoubleAttention {
             Some(&self.norm_added_k),
         )?;
         let tv = to_heads(&self.add_v.forward(norm_txt)?, h, hd, None)?;
+        let campaign_read = crate::sc20686_observer::record_flux_kv_created(
+            campaign_projection,
+            &ik,
+            &iv,
+            &tk,
+            &tv,
+        );
 
         // Concat [txt, img] along the sequence axis, apply RoPE to the full q/k.
         let q = Tensor::cat(&[&tq, &iq], 2)?;
@@ -387,6 +395,7 @@ impl DoubleAttention {
         let k = Flux2PosEmbed::apply(&k, cos, sin)?;
 
         let o = attention(&q, &k, &v, hd, attention_plan)?; // [B, txt_seq+img_seq, inner]
+        crate::sc20686_observer::record_flux_kv_read(campaign_read);
         let txt_out = o.narrow(1, 0, txt_seq)?;
         let img_out = o.narrow(1, txt_seq, o.dim(1)? - txt_seq)?;
         let txt_out = self.to_add_out.forward(&txt_out.contiguous()?)?;

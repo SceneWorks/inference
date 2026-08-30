@@ -2,6 +2,8 @@
 //!
 //! The observer records only facts produced by the FLUX.2 edit route.  Edit re-concatenates
 //! reference tokens at every denoise step, so it has no persistent cross-request K/V cache.
+use candle_gen::candle_core::Tensor;
+use candle_gen::gen_core::runtime::CancelFlag;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -37,23 +39,42 @@ pub trait CacheObserver {
     fn record(&mut self, event: CacheEvent);
 }
 
-/// Checked block-aligned candidate projection; never an observation about this dense route.
-pub fn checked_compressed_bytes(
-    elements: u64,
-    bits_per_element: u8,
-    block_bytes: u64,
+/// Exact SC-20675 v2 projection for one `[B,H,Skv,D]` K/V payload: 2-bit codes,
+/// group-32 f16 scale/zero metadata, and a dense f32 pending key tail.
+pub fn checked_packed_group_affine_kv_bytes(
+    batch: u64,
+    heads: u64,
+    tokens: u64,
+    width: u64,
 ) -> Option<u64> {
-    if elements == 0 || bits_per_element == 0 || bits_per_element > 32 || block_bytes == 0 {
+    const GROUP: u64 = 32;
+    if batch == 0 || heads == 0 || tokens == 0 || width == 0 {
         return None;
     }
-    let payload = elements
-        .checked_mul(u64::from(bits_per_element))?
-        .checked_add(7)?
-        .checked_div(8)?;
-    payload
-        .checked_add(block_bytes - 1)?
-        .checked_div(block_bytes)?
-        .checked_mul(block_bytes)
+    let rows = batch.checked_mul(heads)?;
+    let complete_groups = tokens.checked_div(GROUP)?;
+    let pending_tokens = tokens.checked_rem(GROUP)?;
+    let key_codes = rows
+        .checked_mul(complete_groups)?
+        .checked_mul(GROUP.checked_mul(width)?.checked_add(3)?.checked_div(4)?)?;
+    let key_metadata = rows
+        .checked_mul(complete_groups)?
+        .checked_mul(width)?
+        .checked_mul(4)?;
+    let key_pending = rows
+        .checked_mul(pending_tokens)?
+        .checked_mul(width)?
+        .checked_mul(4)?;
+    let value_rows = rows.checked_mul(tokens)?;
+    let value_codes = value_rows.checked_mul(width.checked_add(3)?.checked_div(4)?)?;
+    let value_metadata = value_rows
+        .checked_mul(width.checked_add(GROUP - 1)?.checked_div(GROUP)?)?
+        .checked_mul(4)?;
+    key_codes
+        .checked_add(key_metadata)?
+        .checked_add(key_pending)?
+        .checked_add(value_codes)?
+        .checked_add(value_metadata)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -116,19 +137,26 @@ thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = const { RefCe
 thread_local! { static STARTED: RefCell<Option<Instant>> = const { RefCell::new(None) }; }
 thread_local! { static MEASUREMENTS: RefCell<Measurements> = const { RefCell::new(Measurements::EMPTY) }; }
 thread_local! { static CANCELLATION_TRIGGERED: RefCell<bool> = const { RefCell::new(false) }; }
-#[derive(Clone, Copy, Default)]
+thread_local! { static CAMPAIGN_HANDLE: RefCell<Option<CancelFlag>> = const { RefCell::new(None) }; }
+thread_local! { static METADATA_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+thread_local! { static START_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
+#[derive(Clone, Default)]
 struct Measurements {
     current_read_transient_bytes: u64,
     candidate_persistent_bytes: u64,
+    candidate_read_transient_bytes: u64,
     cache_read_duration_ns: u128,
     reused_requests: u64,
+    projection_count: u64,
 }
 impl Measurements {
     const EMPTY: Self = Self {
         current_read_transient_bytes: 0,
         candidate_persistent_bytes: 0,
+        candidate_read_transient_bytes: 0,
         cache_read_duration_ns: 0,
         reused_requests: 0,
+        projection_count: 0,
     };
 }
 
@@ -242,6 +270,7 @@ fn source_revision(root: &Path) -> io::Result<String> {
 /// Activates only after the real edit route starts. Metadata is delayed until live tensors bind it.
 pub(crate) fn activate_requested(
     root: &Path,
+    cancel: &CancelFlag,
     variant: &str,
     width: u32,
     height: u32,
@@ -293,6 +322,7 @@ pub(crate) fn activate_requested(
         Box::new(File::create(path)?)
     };
     let scope = install_with_context(Box::new(JsonlObserver(writer)), context);
+    CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = Some(cancel.clone()));
     if cancellation {
         observe("campaign-cancellation-armed", 0, 0, 1);
     }
@@ -302,15 +332,18 @@ pub(crate) fn activate_requested(
 /// Binds the exact tensors and transformer contract used by the edit call; callers cannot forge it.
 pub(crate) fn bind_edit_geometry(
     layers: u32,
+    batch: u32,
     heads: u32,
     head_dimension: u32,
-    sq: u64,
-    skv: u64,
+    target_sq: u64,
+    reference_skv: u64,
     latent_height: u32,
     latent_width: u32,
     dtype: impl Into<String>,
-    reference_elements: u64,
 ) {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
     let bound = CONTEXT.with(|slot| {
         let Some(context) = slot.borrow_mut().as_mut() else {
             return false;
@@ -318,33 +351,26 @@ pub(crate) fn bind_edit_geometry(
         if layers == 0
             || heads == 0
             || head_dimension == 0
-            || sq == 0
-            || skv == 0
+            || batch == 0
+            || target_sq == 0
+            || reference_skv == 0
             || latent_height == 0
             || latent_width == 0
         {
             return false;
         }
         context.geometry.layers = layers;
+        context.geometry.batch = batch;
         context.geometry.heads = heads;
         context.geometry.head_dimension = head_dimension;
-        context.geometry.sq = sq;
-        context.geometry.skv = skv;
+        context.geometry.sq = target_sq;
+        context.geometry.skv = reference_skv;
         context.geometry.latent_height = latent_height;
         context.geometry.latent_width = latent_width;
         context.geometry.dtype = dtype.into();
-        // This hook runs only after the product edit route has materialized live reference tokens
-        // from its loaded snapshot. Synthetic unit-test tensors remain explicitly non-promotable.
-        context.real_weights = !cfg!(test);
-        MEASUREMENTS.with(|metrics| {
-            metrics.borrow_mut().candidate_persistent_bytes =
-                checked_compressed_bytes(reference_elements, 4, 64).unwrap_or(0)
-        });
         true
     });
-    if bound {
-        observe("metadata", 0, 0, 0);
-    }
+    let _ = bound;
 }
 
 pub struct JsonlObserver(Box<dyn Write>);
@@ -357,7 +383,7 @@ impl CacheObserver for JsonlObserver {
                 value["snapshot_sha256"] = serde_json::json!(context.snapshot_sha256);
                 value["snapshot_bytes"] = serde_json::json!(context.snapshot_bytes);
                 value["variant"] = serde_json::json!(context.variant);
-                value["geometry"] = serde_json::json!({"resolution": format!("{}x{}", context.geometry.width, context.geometry.height), "reference_count": context.geometry.reference_count, "frames": context.geometry.frames, "prompt": context.geometry.prompt_sha256, "guidance": context.geometry.guidance, "layers": context.geometry.layers, "heads": context.geometry.heads, "head_dimension": context.geometry.head_dimension, "sq": context.geometry.sq, "skv": context.geometry.skv, "dtype": context.geometry.dtype, "mask": context.geometry.mask, "rope": context.geometry.rope});
+                value["geometry"] = serde_json::json!({"batch": context.geometry.batch, "resolution": format!("{}x{}", context.geometry.width, context.geometry.height), "reference_count": context.geometry.reference_count, "frames": context.geometry.frames, "prompt": context.geometry.prompt_sha256, "guidance": context.geometry.guidance, "layers": context.geometry.layers, "heads": context.geometry.heads, "head_dimension": context.geometry.head_dimension, "sq": context.geometry.sq, "skv": context.geometry.skv, "dtype": context.geometry.dtype, "mask": context.geometry.mask, "rope": context.geometry.rope});
                 value["cancellation_armed"] = serde_json::json!(context.cancellation_armed);
                 if context.cancellation_armed {
                     value["cancellation_arm_id"] =
@@ -399,6 +425,15 @@ fn backend_peak_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(feature = "cuda")]
+fn backend_reserved_bytes() -> Option<u64> {
+    candle_gen::cuda_mempool::MemPool::device_default(0)?.reserved()
+}
+#[cfg(not(feature = "cuda"))]
+fn backend_reserved_bytes() -> Option<u64> {
+    None
+}
+
 pub struct Scope;
 pub fn install(observer: Box<dyn CacheObserver>) -> Scope {
     install_inner(observer, None)
@@ -412,28 +447,175 @@ fn install_inner(observer: Box<dyn CacheObserver>, context: Option<CampaignConte
     STARTED.with(|slot| *slot.borrow_mut() = Some(Instant::now()));
     MEASUREMENTS.with(|slot| *slot.borrow_mut() = Measurements::EMPTY);
     CANCELLATION_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
+    METADATA_EMITTED.with(|slot| *slot.borrow_mut() = false);
+    START_EMITTED.with(|slot| *slot.borrow_mut() = false);
     Scope
 }
 
-/// Consume the campaign's deliberate cancellation request at the first live cache-read boundary.
-/// Ordinary product cancellation continues to use the request's `CancelFlag`; this hook exists only
-/// while an explicitly armed receipt observer owns the current edit call.
-pub(crate) fn take_requested_cancellation() -> bool {
+pub(crate) struct FluxKvProjection {
+    started: Instant,
+    allocator_before: Option<u64>,
+}
+
+pub(crate) struct FluxKvRead {
+    started: Instant,
+    allocator_after_projection: Option<u64>,
+    projection_transient: u64,
+    shape: String,
+    dtype: String,
+}
+
+/// Start at the actual `DoubleAttention` K/V projection boundary. Observer-off execution returns
+/// before allocator access or any campaign geometry/accounting work.
+pub(crate) fn begin_flux_kv_projection() -> Option<FluxKvProjection> {
+    if !ACTIVE.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    Some(FluxKvProjection {
+        started: Instant::now(),
+        allocator_before: backend_reserved_bytes(),
+    })
+}
+
+/// Bind exact `to_k`/`to_v` image K/V and the colocated `add_k`/`add_v` text projections. Only the
+/// live reference slice of image K/V contributes to candidate cache capacity.
+pub(crate) fn record_flux_kv_created(
+    measurement: Option<FluxKvProjection>,
+    image_k: &Tensor,
+    image_v: &Tensor,
+    text_k: &Tensor,
+    text_v: &Tensor,
+) -> Option<FluxKvRead> {
+    let measurement = measurement?;
+    let (batch, heads, image_tokens, width) = image_k.dims4().ok()?;
+    if image_v.dims4().ok()? != (batch, heads, image_tokens, width) {
+        return None;
+    }
+    let (target_tokens, reference_tokens, layers) = CONTEXT.with(|slot| {
+        let context = slot.borrow();
+        let geometry = &context.as_ref()?.geometry;
+        Some((
+            geometry.sq as usize,
+            geometry.skv as usize,
+            u64::from(geometry.layers),
+        ))
+    })?;
+    if image_tokens != target_tokens.checked_add(reference_tokens)? || layers == 0 {
+        return None;
+    }
+    let candidate_total = checked_packed_group_affine_kv_bytes(
+        batch as u64,
+        heads as u64,
+        reference_tokens as u64,
+        width as u64,
+    )?
+    .checked_mul(layers)?;
+    CONTEXT.with(|slot| {
+        if let Some(context) = slot.borrow_mut().as_mut() {
+            context.real_weights = !cfg!(test);
+        }
+    });
+    if !METADATA_EMITTED.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), true)) {
+        observe("metadata", 0, 0, 0);
+    }
+    if !START_EMITTED.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), true)) {
+        observe("generation-start", 0, 0, 0);
+    }
+    let allocator_after_projection = backend_reserved_bytes();
+    let projection_transient = measurement
+        .allocator_before
+        .zip(allocator_after_projection)
+        .map_or(0, |(before, after)| after.saturating_sub(before));
+    MEASUREMENTS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        metrics.candidate_persistent_bytes = candidate_total;
+        metrics.projection_count = metrics.projection_count.saturating_add(1);
+    });
+    let shape = format!(
+        "reference=[{batch},{heads},{reference_tokens},{width}];image_k={:?};image_v={:?};text_k={:?};text_v={:?}",
+        image_k.dims(), image_v.dims(), text_k.dims(), text_v.dims()
+    );
+    let dtype = format!("{:?}", image_k.dtype());
+    observe_tensor(
+        "cross-kv-created",
+        "DoubleAttention::to_k/to_v/add_k/add_v",
+        0,
+        projection_transient,
+        0,
+        shape.clone(),
+        dtype.clone(),
+        "joint-unmasked",
+        "flux2-4-axis",
+        Some(measurement.started),
+    );
+    Some(FluxKvRead {
+        started: measurement.started,
+        allocator_after_projection,
+        projection_transient,
+        shape,
+        dtype,
+    })
+}
+
+/// Finish after attention consumes the exact projections. Projection allocation and attention
+/// workspace stay distinct; only the former is replaced by a compatible packed cache.
+pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
+    let Some(measurement) = measurement else {
+        return;
+    };
+    let allocator_after_attention = backend_reserved_bytes();
+    let workspace_transient = measurement
+        .allocator_after_projection
+        .zip(allocator_after_attention)
+        .map_or(0, |(before, after)| after.saturating_sub(before));
+    let current_transient = measurement.projection_transient.max(workspace_transient);
+    MEASUREMENTS.with(|metrics| {
+        let mut metrics = metrics.borrow_mut();
+        metrics.current_read_transient_bytes =
+            metrics.current_read_transient_bytes.max(current_transient);
+        metrics.candidate_read_transient_bytes = metrics
+            .candidate_read_transient_bytes
+            .max(workspace_transient);
+        metrics.cache_read_duration_ns = metrics
+            .cache_read_duration_ns
+            .saturating_add(measurement.started.elapsed().as_nanos());
+        let layers = CONTEXT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map_or(0, |context| u64::from(context.geometry.layers))
+        });
+        metrics.reused_requests = if layers == 0 {
+            0
+        } else {
+            metrics.projection_count / layers
+        };
+    });
+    observe_tensor(
+        "cross-kv-read",
+        "DoubleAttention::attention(reference-kv)",
+        0,
+        current_transient,
+        1,
+        measurement.shape,
+        measurement.dtype,
+        "joint-unmasked",
+        "flux2-4-axis",
+        Some(measurement.started),
+    );
     let armed = CONTEXT.with(|slot| {
         slot.borrow()
             .as_ref()
             .is_some_and(|context| context.cancellation_armed)
     });
-    armed
-        && CANCELLATION_TRIGGERED.with(|slot| {
-            let mut triggered = slot.borrow_mut();
-            if *triggered {
-                false
-            } else {
-                *triggered = true;
-                true
+    if armed
+        && !CANCELLATION_TRIGGERED.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), true))
+    {
+        CAMPAIGN_HANDLE.with(|slot| {
+            if let Some(cancel) = slot.borrow().as_ref() {
+                cancel.cancel();
             }
-        })
+        });
+    }
 }
 pub fn observe(phase: &'static str, persistent_bytes: u64, transient_bytes: u64, reused: u64) {
     observe_tensor(
@@ -511,7 +693,7 @@ pub fn observe_tensor(
                     })
                 })
             });
-        if phase == "cross-kv-read" {
+        if phase == "cross-kv-read" && operation != "DoubleAttention::attention(reference-kv)" {
             MEASUREMENTS.with(|metrics| {
                 let mut metrics = metrics.borrow_mut();
                 metrics.current_read_transient_bytes =
@@ -546,14 +728,12 @@ pub fn observe_tensor(
         observer.record(event.clone());
         if phase == "generation-end" || phase == "cancelled" {
             let metrics = MEASUREMENTS.with(|measurement| {
-                let measurement = *measurement.borrow();
+                let measurement = measurement.borrow().clone();
                 CampaignMetrics {
                     current_persistent_bytes: 0,
                     current_read_transient_bytes: measurement.current_read_transient_bytes,
                     candidate_persistent_bytes: measurement.candidate_persistent_bytes,
-                    // No compressed FLUX read kernel exists in this attribution story. Preserve the
-                    // measured dense read transient conservatively instead of claiming it vanishes.
-                    candidate_read_transient_bytes: measurement.current_read_transient_bytes,
+                    candidate_read_transient_bytes: measurement.candidate_read_transient_bytes,
                     generation_duration_ms: STARTED.with(|started| {
                         started
                             .borrow()
@@ -587,6 +767,9 @@ impl Drop for Scope {
         CONTEXT.with(|slot| *slot.borrow_mut() = None);
         STARTED.with(|slot| *slot.borrow_mut() = None);
         CANCELLATION_TRIGGERED.with(|slot| *slot.borrow_mut() = false);
+        CAMPAIGN_HANDLE.with(|slot| *slot.borrow_mut() = None);
+        METADATA_EMITTED.with(|slot| *slot.borrow_mut() = false);
+        START_EMITTED.with(|slot| *slot.borrow_mut() = false);
     }
 }
 
@@ -598,12 +781,6 @@ mod tests {
         fn record(&mut self, event: CacheEvent) {
             self.0.borrow_mut().push(event);
         }
-    }
-    #[test]
-    fn nonpersistent_route_reports_zero_current_cache_and_checked_candidate() {
-        assert_eq!(checked_compressed_bytes(1024, 4, 64), Some(512));
-        assert_eq!(checked_compressed_bytes(0, 4, 64), None);
-        assert_eq!(checked_compressed_bytes(u64::MAX, 32, 64), None);
     }
     #[test]
     fn observer_is_optional_and_records_real_route_hooks() {
@@ -623,38 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn deliberate_cancellation_is_consumed_once_only_when_armed() {
-        let out = std::rc::Rc::new(RefCell::new(Vec::new()));
-        let context = CampaignContext {
-            source_ref: "a".repeat(40),
-            snapshot_sha256: "b".repeat(64),
-            snapshot_bytes: 1,
-            variant: "flux2_klein_9b_edit".into(),
-            cancellation_armed: true,
-            real_weights: false,
-            geometry: CampaignGeometry {
-                batch: 1,
-                frames: 1,
-                width: 1024,
-                height: 1024,
-                latent_frames: 1,
-                latent_height: 128,
-                latent_width: 128,
-                prompt_sha256: "c".repeat(64),
-                guidance: "1".into(),
-                reference_count: 1,
-                layers: 1,
-                heads: 1,
-                head_dimension: 1,
-                sq: 1,
-                skv: 1,
-                dtype: "F32".into(),
-                mask: "joint-unmasked".into(),
-                rope: "flux2-4-axis".into(),
-            },
-        };
-        let _scope = install_with_context(Box::new(Sink(out)), context);
-        assert!(take_requested_cancellation());
-        assert!(!take_requested_cancellation());
+    fn observer_off_projection_is_inert_and_group32_projection_is_exact() {
+        assert!(begin_flux_kv_projection().is_none());
+        assert_eq!(MEASUREMENTS.with(|slot| slot.borrow().projection_count), 0);
+        assert_eq!(
+            checked_packed_group_affine_kv_bytes(1, 2, 65, 64),
+            Some(6_704)
+        );
     }
 }

@@ -523,6 +523,7 @@ impl Flux2Edit {
         // variant and request facts all come from the loaded provider, not campaign arguments.
         let _campaign = crate::sc20686_observer::activate_requested(
             &self.campaign_snapshot_root,
+            &req.cancel,
             crate::sc20686_observer::PRODUCT_ROUTE_ID,
             req.width,
             req.height,
@@ -659,50 +660,28 @@ impl Flux2Edit {
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
-        let (_, prompt_skv, _) = prompt_embeds.dims3()?;
         let (_, reference_sq, _) = ref_tokens.dims3()?;
         let (latent_height, latent_width) = pipeline::latent_dims(req.width, req.height);
-        let layer_count = cfg
-            .num_double_layers
-            .checked_add(cfg.num_single_layers)
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or_else(|| {
-                CandleError::Msg("flux2 edit: transformer layer count overflow".into())
-            })?;
-        let joint_sq = target_seq
-            .checked_add(reference_sq)
-            .ok_or_else(|| CandleError::Msg("flux2 edit: joint image sequence overflow".into()))?;
+        let layer_count = u32::try_from(cfg.num_double_layers).ok_or_else(|| {
+            CandleError::Msg("flux2 edit: transformer layer count overflow".into())
+        })?;
         crate::sc20686_observer::bind_edit_geometry(
             layer_count,
+            u32::try_from(ref_tokens.dim(0)?)
+                .map_err(|_| CandleError::Msg("flux2 edit: batch overflow".into()))?,
             u32::try_from(cfg.num_heads)
                 .map_err(|_| CandleError::Msg("flux2 edit: head count overflow".into()))?,
             u32::try_from(cfg.head_dim)
                 .map_err(|_| CandleError::Msg("flux2 edit: head dimension overflow".into()))?,
-            u64::try_from(joint_sq)
-                .map_err(|_| CandleError::Msg("flux2 edit: joint sequence overflow".into()))?,
-            u64::try_from(prompt_skv)
-                .map_err(|_| CandleError::Msg("flux2 edit: prompt sequence overflow".into()))?,
+            u64::try_from(target_seq)
+                .map_err(|_| CandleError::Msg("flux2 edit: target sequence overflow".into()))?,
+            u64::try_from(reference_sq)
+                .map_err(|_| CandleError::Msg("flux2 edit: reference sequence overflow".into()))?,
             u32::try_from(latent_height)
                 .map_err(|_| CandleError::Msg("flux2 edit: latent height overflow".into()))?,
             u32::try_from(latent_width)
                 .map_err(|_| CandleError::Msg("flux2 edit: latent width overflow".into()))?,
             format!("{:?}", ref_tokens.dtype()),
-            u64::try_from(ref_tokens.elem_count()).map_err(|_| {
-                CandleError::Msg("flux2 edit: reference element count overflow".into())
-            })?,
-        );
-        crate::sc20686_observer::observe("generation-start", 0, 0, 0);
-        crate::sc20686_observer::observe_tensor(
-            "cross-kv-created",
-            "reference-token-route",
-            0,
-            0,
-            0,
-            format!("{:?}", ref_tokens.dims()),
-            format!("{:?}", ref_tokens.dtype()),
-            "joint-unmasked",
-            "flux2-4-axis",
-            None,
         );
         // Per-step latent preview (epic 16948, sc-16955), bound to the same `(lat_h, lat_w)` the decode
         // tail below unpacks against. The sampler's running latent is the TARGET token grid alone —
@@ -746,23 +725,7 @@ impl Flux2Edit {
             |latents, sigma| -> Result<Tensor> {
                 let ts = sigma * 1000.0;
                 // Joint image stream [target, refs] — references re-concatenated with the current target.
-                let recompute_started = std::time::Instant::now();
                 let hidden = Tensor::cat(&[latents, &ref_tokens], 1)?;
-                crate::sc20686_observer::observe_tensor(
-                    "cross-kv-read",
-                    "joint-reconcat",
-                    0,
-                    (hidden.elem_count() as u64).saturating_mul(hidden.dtype().size() as u64),
-                    1,
-                    format!("{:?}", hidden.dims()),
-                    format!("{:?}", hidden.dtype()),
-                    "joint-unmasked",
-                    "flux2-4-axis",
-                    Some(recompute_started),
-                );
-                if crate::sc20686_observer::take_requested_cancellation() {
-                    return Err(CandleError::Canceled);
-                }
                 if embedded_guidance {
                     // dev: a single forward feeding the embedded guidance scalar to the DiT.
                     return self.velocity(
