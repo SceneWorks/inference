@@ -1573,7 +1573,6 @@ jobs:
     env:
       STARVECTOR_1B_SNAPSHOT: ${{ vars.STARVECTOR_1B_SNAPSHOT }}
       STARVECTOR_8B_SNAPSHOT: ${{ vars.STARVECTOR_8B_SNAPSHOT }}
-      STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate immutable terminal corpus and receipt contract
@@ -1585,6 +1584,8 @@ jobs:
           python3.12 scripts/release/resolve_snapshot_paths.py
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
       - name: Materialize and verify exact native snapshots
+        env:
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
         run: |
           set -o pipefail
           python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
@@ -1595,6 +1596,8 @@ jobs:
           python3.12 scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json"
           shasum -a 256 "$STARVECTOR_TERMINAL_DIR/starvector-1b-inventory.json" "$STARVECTOR_TERMINAL_DIR/starvector-8b-inventory.json" | tee "$STARVECTOR_TERMINAL_DIR/inventory-sha256.txt"
       - name: Run exact native MLX StarVector hooks
+        env:
+          STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal
         run: |
           set -o pipefail
           cargo test --locked -p mlx-llm starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance -- --exact --ignored --nocapture | tee "$STARVECTOR_TERMINAL_DIR/mlx-starvector-1b.log"

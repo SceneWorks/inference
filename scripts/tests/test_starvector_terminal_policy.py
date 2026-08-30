@@ -59,7 +59,10 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
 
 class StarVectorTerminalPolicyTests(unittest.TestCase):
     def test_exact_native_model_rows_are_wired_to_terminal_profile(self) -> None:
-        models = {model["key"]: model for model in tomllib.loads(MODELS.read_text())["models"]}
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODELS.read_text(encoding="utf-8"))["models"]
+        }
         expected = {
             "starvector-1b-im2svg": (
                 "starvector/starvector-1b-im2svg",
@@ -146,6 +149,7 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             result = subprocess.run(
                 ["node", str(HARNESS), "validate-plan", "--corpus", str(path)],
                 text=True,
+                encoding="utf-8",
                 capture_output=True,
                 check=False,
             )
