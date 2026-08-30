@@ -30,8 +30,8 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     mlx = workflow[start:end]
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
-    if "runs-on: [self-hosted, macOS, ARM64, real-weights]" not in mlx:
-        errors.append("MLX terminal lane does not target the provisioned real-weights host")
+    if "runs-on: [self-hosted, macOS, ARM64, rw-starvector]" not in mlx:
+        errors.append("MLX terminal lane does not target the provisioned StarVector weight set")
     for snapshot in (
         "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b",
         "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b",
@@ -75,6 +75,8 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
         "starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector-terminal-mlx-${{ github.sha }}",
+        "Compare MLX and Candle snapshot inventories",
+        "compare_model_snapshot_inventories.py",
     ):
         if name not in candle:
             errors.append(f"Candle terminal command missing {name}")
