@@ -1905,6 +1905,13 @@ fn descriptor_25_for_variant(transformer_variant: TransformerVariant) -> ModelDe
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds = 2;
     out.capabilities.supports_diffusion_decoder = true;
+    // sc-18791: LTX-2.5 ships BOTH hosted packed tiers on Candle. The 2.3 descriptor this inherits
+    // from advertises q4 alone because 2.3 has no released q8 route; 2.5 converts `q4/` and `q8/`
+    // side by side, the q8 bundle additionally packing the Gemma 4 text encoder, and both load
+    // through the same MLX-affine packed path. Stated on the shared section rather than per variant:
+    // the numeric tier is a property of the converted bundle, not of distilled-vs-dev, and both
+    // variants have a published q8 conversion.
+    out.capabilities.supported_quants = &[Quant::Q4, Quant::Q8];
     match transformer_variant {
         TransformerVariant::Distilled => {
             out.capabilities.supported_steps = StepSupport::Exact(vec![NATIVE_STEPS]);
@@ -2743,9 +2750,34 @@ mod tests {
         assert!(generator.descriptor.capabilities.supports_diffusion_decoder);
         assert_eq!(
             generator.descriptor.capabilities.supported_quants,
-            &[Quant::Q4],
-            "unmeasured int8-convrot/nvfp4 must stay out of the catalog surface"
+            &[Quant::Q4, Quant::Q8],
+            "both released packed tiers are catalog surface; unmeasured nvfp4 stays out"
         );
+    }
+
+    #[test]
+    fn ltx25_descriptor_advertises_both_released_packed_tiers() {
+        // sc-18791: the 2.5 route ships `q4/` and `q8/` side by side, so it overrides the LTX-2.3
+        // descriptor it is derived from (which has no released q8 route) on BOTH variants — the
+        // numeric tier belongs to the converted bundle, not to distilled-vs-dev.
+        assert_eq!(descriptor().capabilities.supported_quants, &[Quant::Q4]);
+        for descriptor in [
+            descriptor_25(),
+            descriptor_25_for_variant(TransformerVariant::Distilled),
+            descriptor_25_for_variant(TransformerVariant::Dev),
+        ] {
+            assert_eq!(
+                descriptor.capabilities.supported_quants,
+                &[Quant::Q4, Quant::Q8],
+                "LTX-2.5 advertises no tier exclusion on candle"
+            );
+            // NVFP4 is a materially different operator that is still fail-closed; advertising it
+            // here would be a declaration the loader refuses.
+            assert!(!descriptor
+                .capabilities
+                .supported_quants
+                .contains(&Quant::Nvfp4));
+        }
     }
 
     #[test]
@@ -2787,22 +2819,42 @@ mod tests {
     #[test]
     fn ltx25_catalog_route_reaches_the_quant_policy_before_bundle_loading() {
         // This is intentionally an ordinary registry load, not a selector helper. The nonexistent
-        // root proves that Q8 is parsed as the LTX ConvRot option at the provider boundary before
-        // file discovery could accidentally select a different precision.
-        let spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx25".into())).with_quant(Quant::Q8);
-        let result = crate::provider_registry()
-            .expect("provider registry")
-            .load(MODEL_25_ID, &spec);
-        let error = match result {
-            Ok(_) => panic!("unmeasured ConvRot must fail closed"),
+        // root proves the advanced-quant policy is reached at the provider boundary before file
+        // discovery could accidentally select a different precision. NVFP4 carries that witness now
+        // that q8 is a released tier (sc-18791); it is the remaining LoadSpec-selectable advanced
+        // operator and stays fail-closed.
+        let load = |quant| {
+            crate::provider_registry().expect("provider registry").load(
+                MODEL_25_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx25".into())).with_quant(quant),
+            )
+        };
+        let error = match load(Quant::Nvfp4) {
+            Ok(_) => panic!("unmeasured NVFP4 must fail closed"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("int8-convrot"), "got: {error}");
+        assert!(error.contains("nvfp4"), "got: {error}");
         assert!(
-            error.contains("terminal measurement case") || error.contains("not catalog-adopted"),
+            error.contains("terminal measurement case")
+                || error.contains("not catalog-adopted")
+                || error.contains("requires exact consumer Blackwell"),
             "quant policy must run before missing-bundle discovery, got: {error}"
         );
+
+        // The promoted packed tiers clear that same policy and only then meet file discovery, so
+        // the advertised q8 route is reachable rather than merely declared.
+        for quant in [Quant::Q4, Quant::Q8] {
+            let error = match load(quant) {
+                Ok(_) => panic!("a nonexistent bundle cannot load"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("not catalog-adopted")
+                    && !error.contains("terminal measurement case")
+                    && !error.contains("terminal comparison source"),
+                "{quant:?} must pass the quant policy and fail on discovery, got: {error}"
+            );
+        }
     }
 
     #[test]
