@@ -467,6 +467,7 @@ impl Pipeline {
         if let Some(tier) = &converted_tier {
             tier.validate()?;
         }
+        let diff_vae_quant = converted_tier.as_ref().and_then(tier::Ltx25Tier::quant);
         let video_component = ltx25_video_component(self.use_diffusion_decoder);
         let video = bundle
             .require(video_component)
@@ -651,7 +652,12 @@ impl Pipeline {
                 )?;
                 (diff_vb.pp("decoder"), diff_vb)
             };
-            Some(Arc::new(NaDiffusionDecoder::load(body_vb, stats_vb, &cfg)?))
+            Some(Arc::new(NaDiffusionDecoder::load_quantized(
+                body_vb,
+                stats_vb,
+                &cfg,
+                diff_vae_quant,
+            )?))
         } else {
             None
         };
@@ -2870,6 +2876,10 @@ mod tests {
         assert!(loader.contains("tier::ltx25_vocoder_vb("));
         assert!(loader.contains("LtxVideoVae::new_encoder_only("));
         assert!(loader.contains("LtxVideoVae::new_statistics_only("));
+        assert!(loader.contains(".and_then(tier::Ltx25Tier::quant)"));
+        assert!(loader.contains("NaDiffusionDecoder::load_quantized("));
+        assert!(loader.contains("diff_vae_quant,"));
+        assert!(!loader.contains("NaDiffusionDecoder::load(body_vb, stats_vb, &cfg)"));
         assert!(
             !loader.contains(".require(LtxComponent::ConvVideoVae)"),
             "an explicit DiffVAE selection must not require an unrelated conv decoder"
