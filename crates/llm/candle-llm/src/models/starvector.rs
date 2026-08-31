@@ -223,15 +223,15 @@ impl BigCodeBlock {
         Ok(Self {
             ln1w: tensor(w, p, "ln_1.weight")?,
             ln1b: tensor(w, p, "ln_1.bias")?,
-            qkvw: tensor(w, p, "attn.c_attn.weight")?.transpose(0, 1)?,
+            qkvw: decoder_projection(w, p, "attn.c_attn.weight")?,
             qkvb: tensor(w, p, "attn.c_attn.bias")?,
-            outw: tensor(w, p, "attn.c_proj.weight")?.transpose(0, 1)?,
+            outw: decoder_projection(w, p, "attn.c_proj.weight")?,
             outb: tensor(w, p, "attn.c_proj.bias")?,
             ln2w: tensor(w, p, "ln_2.weight")?,
             ln2b: tensor(w, p, "ln_2.bias")?,
-            fcw: tensor(w, p, "mlp.c_fc.weight")?.transpose(0, 1)?,
+            fcw: decoder_projection(w, p, "mlp.c_fc.weight")?,
             fcb: tensor(w, p, "mlp.c_fc.bias")?,
-            projw: tensor(w, p, "mlp.c_proj.weight")?.transpose(0, 1)?,
+            projw: decoder_projection(w, p, "mlp.c_proj.weight")?,
             projb: tensor(w, p, "mlp.c_proj.bias")?,
             cache: None,
         })
@@ -275,6 +275,13 @@ impl BigCodeBlock {
         )?)?;
         Ok((&residual + linear(&mlp, &self.projw, Some(&self.projb))?)?)
     }
+}
+
+/// The published StarVector GPTBigCode tensors are already `[out, in]`, exactly as Candle's
+/// shared `linear` leaf expects. Keeping this boundary explicit prevents accidentally applying
+/// the older Transformers `Conv1D` `[in, out]` convention to these safetensors.
+fn decoder_projection(w: &Weights, prefix: &str, suffix: &str) -> Result<Tensor> {
+    tensor(w, prefix, suffix)
 }
 
 fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
@@ -355,6 +362,27 @@ mod tests {
     use super::*;
     use candle_core::Device;
     use std::collections::HashMap;
+
+    #[test]
+    fn decoder_projection_preserves_published_out_in_layout() {
+        let device = Device::Cpu;
+        let projection =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), &device).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("fixture.attn.c_attn.weight".into(), projection);
+        let weights = Weights::from_map(tensors, device.clone());
+
+        let projection = decoder_projection(&weights, "fixture", "attn.c_attn.weight").unwrap();
+        assert_eq!(projection.dims(), &[3, 2]);
+        let input = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
+        assert_eq!(
+            linear(&input, &projection, None)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![1.0, 3.0, 5.0]]
+        );
+    }
 
     #[test]
     fn tied_token_embedding_projects_without_a_separate_lm_head() {

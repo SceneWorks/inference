@@ -4,7 +4,7 @@
 //! absolute positions and multi-query attention, and treating it as a Llama alias would load the
 //! checkpoint while producing numerically unrelated SVG source.
 
-use mlx_rs::ops::{add, matmul, split_sections};
+use mlx_rs::ops::{add, split_sections};
 use mlx_rs::Array;
 
 use crate::decode::Decode;
@@ -187,10 +187,11 @@ impl GptBigCodeLayer {
             Some(&self.ln_2_bias),
             1e-5,
         )?;
-        // GPTBigCode uses HF Conv1D weights `[in, out]`, unlike the `[out, in]` linear helper.
-        let mlp = add(&matmul(&normed, &self.fc_weight)?, &self.fc_bias)?;
+        // The published StarVector safetensors store every GPTBigCode projection in ordinary
+        // `[out, in]` layout, matching the shared linear helper.
+        let mlp = linear(&normed, &self.fc_weight, Some(&self.fc_bias))?;
         let mlp = gelu_tanh(&mlp)?;
-        let mlp = add(&matmul(&mlp, &self.proj_weight)?, &self.proj_bias)?;
+        let mlp = linear(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
         Ok(add(&hidden, &mlp)?)
     }
 }
@@ -217,7 +218,7 @@ impl GptBigCodeAttention {
     fn forward(&self, hidden: &Array, cache: &mut dyn KvCache, index: usize) -> Result<Array> {
         let shape = hidden.shape();
         let (batch, sequence) = (shape[0], shape[1]);
-        let qkv = add(&matmul(hidden, &self.qkv_weight)?, &self.qkv_bias)?;
+        let qkv = linear(hidden, &self.qkv_weight, Some(&self.qkv_bias))?;
         let head_dim = self.cfg.head_dim();
         // StarCoderBase-1B is `multi_query=true`: one K and one V head.
         let parts = split_sections(
@@ -238,7 +239,7 @@ impl GptBigCodeAttention {
         let attended = sdpa_causal(&query, &keys, &values, 1.0 / (head_dim as f32).sqrt())?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, sequence, self.cfg.hidden_size])?;
-        Ok(add(&matmul(&attended, &self.out_weight)?, &self.out_bias)?)
+        linear(&attended, &self.out_weight, Some(&self.out_bias))
     }
 }
 
@@ -294,12 +295,13 @@ mod tests {
         ] {
             put(&mut map, key, &[0.0; 4], &[4]);
         }
-        // Q is 4 wide and K/V are one 2-wide MQA head each: 8 total output columns.
+        // Q is 4 wide and K/V are one 2-wide MQA head each: 8 total output rows in the
+        // checkpoint's published `[out, in]` projection layout.
         put(
             &mut map,
             "fixture.transformer.h.0.attn.c_attn.weight",
             &[0.0; 32],
-            &[4, 8],
+            &[8, 4],
         );
         put(
             &mut map,
@@ -323,7 +325,7 @@ mod tests {
             &mut map,
             "fixture.transformer.h.0.mlp.c_fc.weight",
             &[0.0; 32],
-            &[4, 8],
+            &[8, 4],
         );
         put(
             &mut map,
@@ -335,7 +337,7 @@ mod tests {
             &mut map,
             "fixture.transformer.h.0.mlp.c_proj.weight",
             &[0.0; 32],
-            &[8, 4],
+            &[4, 8],
         );
         put(
             &mut map,
