@@ -168,13 +168,61 @@ struct Attention {
 /// Request-scoped K/V heads for one block's cross-attention.  These depend only on the projected
 /// text context, never on the noisy latent or timestep, so the denoise loop must reuse them.
 pub(crate) struct PreparedBlockCrossKv {
-    key: Tensor,
-    value: Tensor,
+    key: Option<Tensor>,
+    value: Option<Tensor>,
+    cache_id: u64,
+}
+
+impl Drop for PreparedBlockCrossKv {
+    fn drop(&mut self) {
+        // Drop the actual cache tensors before sampling the post-release allocator remnant.
+        drop(self.key.take());
+        drop(self.value.take());
+        crate::sc20686_observer::release_cache(self.cache_id);
+    }
 }
 
 /// Request-scoped cross-attention K/V heads for every base Wan block.
 pub(crate) struct PreparedWanCrossKv {
     blocks: Vec<PreparedBlockCrossKv>,
+}
+
+impl PreparedWanCrossKv {
+    /// Bytes and shape metadata are derived from the live projected tensors, never from a request
+    /// claim. The campaign observer uses this to account for the request-scoped cross-KV payload.
+    pub(crate) fn evidence(&self) -> Option<(u64, String, String)> {
+        if !crate::sc20686_observer::campaign_active() {
+            return None;
+        }
+        #[cfg(test)]
+        EVIDENCE_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut bytes = 0u64;
+        let mut shapes = Vec::new();
+        let mut dtypes = Vec::new();
+        for block in &self.blocks {
+            for tensor in [block.key.as_ref(), block.value.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                bytes = bytes.saturating_add(
+                    (tensor.elem_count() as u64)
+                        .saturating_mul(tensor.dtype().size_in_bytes() as u64),
+                );
+                shapes.push(format!("{:?}", tensor.dims()));
+                dtypes.push(format!("{:?}", tensor.dtype()));
+            }
+        }
+        Some((bytes, shapes.join(";"), dtypes.join(";")))
+    }
+}
+
+#[cfg(test)]
+static EVIDENCE_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_BYTE_ACCOUNTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -244,8 +292,25 @@ impl Attention {
 
     /// Project a step-invariant cross-attention source into K/V heads once per request conditioning
     /// payload.  The resulting tensors remain owned by the caller's request scope.
-    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+    fn prepare_kv_impl(
+        &self,
+        context: &Tensor,
+        observe_cross_attention: bool,
+    ) -> Result<PreparedBlockCrossKv> {
+        let observe_cross_attention =
+            observe_cross_attention && crate::sc20686_observer::campaign_active();
+        let measured = observe_cross_attention.then(std::time::Instant::now);
         let (b, s_kv, _) = context.dims3()?;
+        if observe_cross_attention {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                0,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                0,
+                s_kv as u64,
+                format!("{:?}", context.dtype()),
+            );
+        }
         let k = rms(&self.to_k.forward(context)?, &self.norm_k, self.eps)?;
         let v = self.to_v.forward(context)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
@@ -253,21 +318,74 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()
         };
+        let key = to_heads(&k)?;
+        let value = to_heads(&v)?;
+        let cache_id = if observe_cross_attention {
+            #[cfg(test)]
+            RETAINED_BYTE_ACCOUNTINGS.with(|count| count.set(count.get() + 1));
+            let retained_bytes = [&key, &value].iter().fold(0u64, |bytes, tensor| {
+                bytes.saturating_add(
+                    (tensor.elem_count() as u64)
+                        .saturating_mul(tensor.dtype().size_in_bytes() as u64),
+                )
+            });
+            let candidate_bytes = crate::sc20686_observer::checked_packed_group_affine_kv_bytes(
+                b as u64,
+                self.num_heads as u64,
+                s_kv as u64,
+                self.head_dim as u64,
+                32,
+            )
+            .ok_or_else(|| {
+                candle_gen::candle_core::Error::Msg(
+                    "SC-20686 packed group-affine projection overflow".into(),
+                )
+            })?;
+            // Only the product cross-attention projection can prove real-weight evidence. The
+            // compatibility/self-attention path below is deliberately observer-inert.
+            crate::sc20686_observer::confirm_real_weight_projection();
+            crate::sc20686_observer::register_cache(
+                retained_bytes,
+                candidate_bytes,
+                measured.expect("observed projection has a start time"),
+            )
+        } else {
+            0
+        };
         Ok(PreparedBlockCrossKv {
-            key: to_heads(&k)?,
-            value: to_heads(&v)?,
+            key: Some(key),
+            value: Some(value),
+            cache_id,
         })
+    }
+
+    fn prepare_kv(&self, context: &Tensor) -> Result<PreparedBlockCrossKv> {
+        self.prepare_kv_impl(context, true)
     }
 
     /// `hidden`: `[B, S, dim]`; `kv`: preprojected K/V heads. RoPE is applied only when
     /// `cos`/`sin` are given (self-attention).
-    fn forward_prepared(
+    fn forward_prepared_impl(
         &self,
         hidden: &Tensor,
         kv: &PreparedBlockCrossKv,
         rope: Option<(&Tensor, &Tensor)>,
+        observe_cross_attention: bool,
     ) -> Result<Tensor> {
+        let observe_cross_attention =
+            observe_cross_attention && crate::sc20686_observer::campaign_active();
+        let measured = observe_cross_attention.then(std::time::Instant::now);
         let (b, s, _) = hidden.dims3()?;
+        if observe_cross_attention {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                0,
+                self.num_heads as u32,
+                self.head_dim as u32,
+                s as u64,
+                0,
+                format!("{:?}", hidden.dtype()),
+            );
+        }
         let q = rms(&self.to_q.forward(hidden)?, &self.norm_q, self.eps)?;
         let to_heads = |t: &Tensor| -> Result<Tensor> {
             t.reshape((b, s, self.num_heads, self.head_dim))?
@@ -275,17 +393,42 @@ impl Attention {
                 .contiguous()
         };
         let mut q = to_heads(&q)?; // [B,H,S,d]
-        let mut k = kv.key.clone();
+        let mut k = kv.key.as_ref().expect("live prepared key").clone();
         if let Some((cos, sin)) = rope {
             q = apply_rope(&q, cos, sin)?;
             k = apply_rope(&k, cos, sin)?;
         }
         let scale = (self.head_dim as f64).powf(-0.5);
-        let out = sdpa(&q, &k, &kv.value, scale)?; // [B,H,S,d]
+        let allocator_window = observe_cross_attention
+            .then(crate::sc20686_observer::begin_active_allocator_window)
+            .flatten();
+        let out = sdpa(
+            &q,
+            &k,
+            kv.value.as_ref().expect("live prepared value"),
+            scale,
+        )?; // [B,H,S,d]
+        let allocator = crate::sc20686_observer::finish_active_allocator_window(allocator_window);
+        if observe_cross_attention {
+            crate::sc20686_observer::record_cache_read(
+                kv.cache_id,
+                allocator,
+                measured.expect("observed read has a start time"),
+            );
+        }
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;
         self.to_out.forward(&out)
+    }
+
+    fn forward_prepared(
+        &self,
+        hidden: &Tensor,
+        kv: &PreparedBlockCrossKv,
+        rope: Option<(&Tensor, &Tensor)>,
+    ) -> Result<Tensor> {
+        self.forward_prepared_impl(hidden, kv, rope, true)
     }
 
     /// Compatibility path for self-attention and one-off callers. Request render paths use
@@ -296,7 +439,8 @@ impl Attention {
         context: &Tensor,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        self.forward_prepared(hidden, &self.prepare_kv(context)?, rope)
+        let kv = self.prepare_kv_impl(context, false)?;
+        self.forward_prepared_impl(hidden, &kv, rope, false)
     }
 }
 
@@ -612,6 +756,21 @@ impl WanTransformer {
     /// payload. The returned cache is intentionally request-scoped: callers create it after the DiT
     /// loads and retain it only for the matching denoise branch.
     pub(crate) fn prepare_cross_kv(&self, context: &Tensor) -> Result<PreparedWanCrossKv> {
+        if let Some((s_kv, dtype)) = crate::sc20686_observer::campaign_evidence(|| {
+            let (_, s_kv, _) = context.dims3()?;
+            Ok::<_, candle_gen::candle_core::Error>((s_kv, format!("{:?}", context.dtype())))
+        })
+        .transpose()?
+        {
+            crate::sc20686_observer::bind_cross_kv_geometry(
+                self.blocks.len() as u32,
+                0,
+                0,
+                0,
+                s_kv as u64,
+                dtype,
+            );
+        }
         Ok(PreparedWanCrossKv {
             blocks: self
                 .blocks
@@ -919,6 +1078,17 @@ mod tests {
     use crate::rope::{apply_source_id, WanRope};
     use std::collections::HashMap;
 
+    #[test]
+    fn observer_off_skips_prepared_evidence_construction() {
+        EVIDENCE_CONSTRUCTIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let prepared = PreparedWanCrossKv { blocks: Vec::new() };
+        assert!(prepared.evidence().is_none());
+        assert_eq!(
+            EVIDENCE_CONSTRUCTIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
     /// A tiny dense config the CPU synthetic weights below fill (dim 16 = 2 heads × head_dim 8, z16
     /// in/out, patch (1,2,2)). Keeps the packed-forward geometry (`ppf·pph·ppw` tokens, 3-axis RoPE) but
     /// small enough to run on CPU without weights.
@@ -993,6 +1163,23 @@ mod tests {
         put("scale_shift_table", &[1, 2, d]);
         let vb = VarBuilder::from_tensors(m, DType::F32, dev);
         WanTransformer::new(cfg, vb).unwrap()
+    }
+
+    #[test]
+    fn observer_off_skips_retained_kv_byte_accounting() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let context = Tensor::zeros((1, 3, cfg.dim), DType::F32, &dev).unwrap();
+        RETAINED_BYTE_ACCOUNTINGS.with(|count| count.set(0));
+
+        let _prepared = dit.blocks[0].prepare_cross_kv(&context).unwrap();
+
+        assert_eq!(
+            RETAINED_BYTE_ACCOUNTINGS.with(std::cell::Cell::get),
+            0,
+            "inactive campaign must not compute retained K/V evidence bytes"
+        );
     }
 
     /// Max-abs bound for a **chunked-vs-un-chunked SDPA** comparison (SC-15943). Query-row chunking is

@@ -32,6 +32,21 @@ fn main() -> Result<()> {
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("WAN_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set WAN_SNAPSHOT)")?;
+    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+        let event_path = arg(&args, "--sc20686-events")
+            .filter(|path| path != "-")
+            .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
+        let request = candle_gen_wan::sc20686_observer::request_output(
+            event_path,
+        );
+        Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| {
         "a fluffy cat walking across a sunny garden, gentle camera pan, cinematic, highly detailed"
             .into()
@@ -94,7 +109,17 @@ fn main() -> Result<()> {
         Progress::Loading(phase) => println!("\n[smoke] loading {phase:?}"),
     };
     let t0 = std::time::Instant::now();
-    let output = gen.generate(&req, &mut on_progress)?;
+    let output = match gen.generate(&req, &mut on_progress) {
+        Ok(output) => output,
+        Err(_error)
+            if args.iter().any(|arg| arg == "--sc20686-cancel")
+                && candle_gen_wan::sc20686_observer::campaign_cancelled() =>
+        {
+            println!("[smoke] expected SC-20686 campaign cancellation");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let secs = t0.elapsed().as_secs_f32();
     let (frames, fps) = match output {
         GenerationOutput::Video { frames, fps, .. } => (frames, fps),

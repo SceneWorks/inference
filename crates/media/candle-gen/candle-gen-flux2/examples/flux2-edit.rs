@@ -187,6 +187,22 @@ struct Common {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let cancel_campaign = args.iter().any(|arg| arg == "--sc20686-cancel");
+    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+        let event_path = arg(&args, "--sc20686-events")
+            .filter(|path| path != "-")
+            .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
+        let request = candle_gen_flux2::sc20686_observer::request_output(
+            event_path,
+        );
+        Some(if cancel_campaign {
+            request.arm_cancellation()
+        } else {
+            request.arm()
+        })
+    } else {
+        None
+    };
     let dev_variant = matches!(arg(&args, "--variant").as_deref(), Some("dev"));
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("FLUX2_SNAPSHOT").ok())
@@ -396,12 +412,16 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
 /// klein (sc-5487): distilled reference edit (dense). Self-contained — txt2img-generates the reference
 /// and the no-reference baseline when `--reference` is absent.
 fn run_klein(args: &[String], c: &Common) -> Result<()> {
+    let campaign = args.iter().any(|value| value == "--sc20686-campaign");
     let reference = match arg(args, "--reference") {
         Some(path) => {
             println!("[edit] reference={path}");
             load_image(&path)?
         }
         None => {
+            if campaign {
+                return Err("SC-20686 FLUX edit campaign requires --reference <png>".into());
+            }
             let base_prompt =
                 "a photorealistic studio portrait of a young woman with long red hair, \
                                neutral background, soft lighting";
@@ -422,26 +442,40 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
             base
         }
     };
+    let reference2 = match arg(args, "--reference2") {
+        Some(path) => Some(load_image(&path)?),
+        None => None,
+    };
+    let mut references = vec![reference];
+    if let Some(reference2) = reference2 {
+        references.push(reference2);
+    }
     println!(
         "[edit] {}x{} steps={} guidance={} seed={}\n[edit] prompt={:?}",
         c.width, c.height, c.steps, c.guidance, c.seed, c.prompt
     );
 
-    // Ablation baseline FIRST, while no edit model is resident (two 9B models do not co-reside).
-    let noref = txt2img(
-        "flux2_klein_9b",
-        &c.snapshot,
-        None,
-        &c.prompt,
-        c.width,
-        c.height,
-        c.steps,
-        c.seed,
-    )?;
-    save(
-        &noref,
-        &PathBuf::from(format!("{}_noref.png", c.out.display())),
-    )?;
+    // The ordinary smoke keeps its no-reference ablation. A campaign coordinate owns exactly one
+    // observed edit generation and must not include an unobserved txt2img load/render.
+    let noref = if campaign {
+        None
+    } else {
+        let image = txt2img(
+            "flux2_klein_9b",
+            &c.snapshot,
+            None,
+            &c.prompt,
+            c.width,
+            c.height,
+            c.steps,
+            c.seed,
+        )?;
+        save(
+            &image,
+            &PathBuf::from(format!("{}_noref.png", c.out.display())),
+        )?;
+        Some(image)
+    };
 
     let model = Flux2Edit::load(&Flux2EditPaths {
         root: PathBuf::from(&c.snapshot),
@@ -468,15 +502,29 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
     };
     let mut prog = step_progress("edit");
     let t0 = std::time::Instant::now();
-    let edited = model.generate(&req, std::slice::from_ref(&reference), &mut prog)?;
+    let result = model.generate(&req, &references, &mut prog);
+    if campaign && args.iter().any(|value| value == "--sc20686-cancel") {
+        return match result {
+            Err(candle_gen::CandleError::Canceled) => Ok(()),
+            Ok(_) => Err("SC-20686 cancellation arm completed instead of cancelling".into()),
+            Err(error) => Err(error.into()),
+        };
+    }
+    let edited = result?;
+    if campaign {
+        return Ok(());
+    }
     println!("\n[edit] edit done in {:.1}s", t0.elapsed().as_secs_f32());
     save(&edited, &c.out)?;
     println!("[edit] wrote {}", c.out.display());
 
-    let diff = mean_abs_diff(&edited, &noref);
+    let diff = mean_abs_diff(
+        &edited,
+        noref.as_ref().expect("ordinary smoke has ablation"),
+    );
     println!("[edit] ablation: mean|edit − noref| = {diff:.2} (decisive when >> 0)");
 
-    cancel_contract("edit", &model, &req, std::slice::from_ref(&reference));
+    cancel_contract("edit", &model, &req, &references);
     Ok(())
 }
 
