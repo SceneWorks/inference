@@ -281,7 +281,6 @@ dependencies = [
  "rand",
  "rand_distr",
  "sceneworks-gen-core-testkit",
- "serde",
  "serde_json",
  "tempfile",
  "zip 7.2.0",
