@@ -31,6 +31,10 @@ pub const QUALITY_CONTRACT_HASH: &str =
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
 pub const FIT_BOUNDARY_MIN_CONTEXT_BPS: u64 = 9_000;
+/// Fixed allowance for process-resident Metal/JIT runtime pages after MLX live tensors and its
+/// allocator cache have returned exactly to the loaded-model boundary. This is deliberately not a
+/// tensor or cache tolerance: both MLX release tolerances remain zero.
+pub const POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES: u64 = 512 * 1024 * 1024;
 pub const SCENEWORKS_REPOSITORY: &str = "github.com/SceneWorks/SceneWorks";
 pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
@@ -1238,14 +1242,28 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.memory.reconciliation.tolerance_bytes,
         ));
     }
+    if receipt.memory.release.phys_footprint_tolerance_bytes
+        != POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES
+        || receipt.memory.release.mlx_active_tolerance_bytes != 0
+        || receipt.memory.release.mlx_cache_tolerance_bytes != 0
+    {
+        return Err("release tolerances differ from the frozen platform contract".into());
+    }
     let end = receipt.memory.phase_samples.last().unwrap();
     if end.phys_footprint_bytes
-        > weights_loaded.phys_footprint_bytes
-            + receipt.memory.release.phys_footprint_tolerance_bytes
+        > weights_loaded
+            .phys_footprint_bytes
+            .saturating_add(receipt.memory.release.phys_footprint_tolerance_bytes)
         || end.mlx.active_bytes
-            > weights_loaded.mlx.active_bytes + receipt.memory.release.mlx_active_tolerance_bytes
+            > weights_loaded
+                .mlx
+                .active_bytes
+                .saturating_add(receipt.memory.release.mlx_active_tolerance_bytes)
         || end.mlx.cache_bytes
-            > weights_loaded.mlx.cache_bytes + receipt.memory.release.mlx_cache_tolerance_bytes
+            > weights_loaded
+                .mlx
+                .cache_bytes
+                .saturating_add(receipt.memory.release.mlx_cache_tolerance_bytes)
     {
         return Err(format!(
             "release did not return within tolerance: endPhys={}, weightsLoadedPhys={}, physTolerance={}, endMlxActive={}, weightsLoadedMlxActive={}, activeTolerance={}, endMlxCache={}, weightsLoadedMlxCache={}, cacheTolerance={}",
@@ -4909,7 +4927,7 @@ fn product_receipt(
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
     ReceiptBuilder {
@@ -5418,7 +5436,8 @@ mod tests {
                 },
                 release: ReceiptRelease {
                     verified: true,
-                    phys_footprint_tolerance_bytes: 0,
+                    phys_footprint_tolerance_bytes:
+                        POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
                     mlx_active_tolerance_bytes: 0,
                     mlx_cache_tolerance_bytes: 0,
                 },
@@ -5592,6 +5611,15 @@ mod tests {
         .expect("builder must produce a complete v3 receipt");
         assert_eq!(receipt.provenance.model_file_bytes, 100);
         assert_eq!(receipt.memory.model_weights_bytes, 1);
+        let mut loosened_release = receipt.clone();
+        loosened_release
+            .memory
+            .release
+            .phys_footprint_tolerance_bytes += 1;
+        assert_eq!(
+            validate_receipt_semantics(&loosened_release).unwrap_err(),
+            "release tolerances differ from the frozen platform contract"
+        );
         let mut unreleased_active = receipt.clone();
         unreleased_active
             .memory
