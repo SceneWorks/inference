@@ -1325,7 +1325,24 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .decode_tokens_per_second_coefficient_of_variation
             > 0.05
     {
-        return Err("timing policy failed".into());
+        return Err(format!(
+            "timing policy failed: decodeSamples={:?}, coefficientOfVariation={}, maximum=0.05, summaryMean={}, summaryP95={}, summaryVariance={}, confidenceLow={}, confidenceHigh={}",
+            receipt
+                .timings
+                .samples
+                .iter()
+                .map(|sample| sample.decode_tokens_per_second)
+                .collect::<Vec<_>>(),
+            receipt
+                .timings
+                .summary
+                .decode_tokens_per_second_coefficient_of_variation,
+            receipt.timings.summary.decode_tokens_per_second_mean,
+            receipt.timings.summary.decode_tokens_per_second_p95,
+            receipt.timings.summary.decode_tokens_per_second_variance,
+            receipt.timings.summary.confidence_interval_low,
+            receipt.timings.summary.confidence_interval_high,
+        ));
     }
     let decode_mean = receipt
         .timings
@@ -5760,6 +5777,14 @@ mod tests {
         let mut timing_tampered = receipt.clone();
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());
+        let mut unstable_timing = receipt.clone();
+        unstable_timing
+            .timings
+            .summary
+            .decode_tokens_per_second_coefficient_of_variation = 0.1;
+        assert!(validate_receipt_semantics(&unstable_timing)
+            .unwrap_err()
+            .contains("coefficientOfVariation=0.1, maximum=0.05"));
         let mut quality_tampered = receipt.clone();
         quality_tampered.mode = "compressed".into();
         quality_tampered.provenance.command = "run --mode compressed".into();
