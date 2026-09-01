@@ -40,7 +40,9 @@ use mlx_gen_wan::{normalize_wan_key, CausalPackedAttention, WanTransformer};
 use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
-use crate::compressed_kv::{CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle, TILE_ROWS};
+use crate::compressed_kv::{
+    CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle, TILE_ROWS,
+};
 use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
 #[cfg(test)]

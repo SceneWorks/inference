@@ -192,9 +192,7 @@ fn main() -> Result<()> {
         let event_path = arg(&args, "--sc20686-events")
             .filter(|path| path != "-")
             .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
-        let request = candle_gen_flux2::sc20686_observer::request_output(
-            event_path,
-        );
+        let request = candle_gen_flux2::sc20686_observer::request_output(event_path);
         Some(if cancel_campaign {
             request.arm_cancellation()
         } else {
