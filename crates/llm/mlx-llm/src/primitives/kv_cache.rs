@@ -29,6 +29,43 @@ pub enum CacheRoute {
     ExperimentalPacked,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackedAttentionMask {
+    None,
+    Causal,
+    SlidingWindow(usize),
+    Additive,
+}
+
+/// Immutable evidence exported by an experimental packed cache at the same trait-object boundary
+/// used by the decoder.  A sealed harness must not need private-field access or a storage-only test
+/// path to prove that model calls stayed compressed-domain.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PackedCacheEvidence {
+    pub representation_identity: String,
+    pub representation_version: u32,
+    pub bits: u8,
+    pub quantization_group_size: usize,
+    pub accepted_direct_calls: usize,
+    pub full_cache_dequantizations: usize,
+    pub dispatch_attempts: u64,
+    pub failed_dispatches: u64,
+    pub compile_jit_attempts: u64,
+    pub kernel_warmed: bool,
+    pub attempted_elapsed_ms: f64,
+    pub cold_dispatches: u64,
+    pub steady_dispatches: u64,
+    pub cold_elapsed_ms: f64,
+    pub steady_elapsed_ms: f64,
+    pub uploaded_packed_bytes: u64,
+    pub accepted_uploaded_packed_bytes: u64,
+    pub retained_device_packed_logical_bytes: u64,
+    pub peak_packed_argument_logical_bytes: u64,
+    pub peak_packed_transient_logical_bytes: u64,
+    pub dense_active: bool,
+    pub fallback_reasons: Vec<(String, String)>,
+}
+
 /// The decoder-facing cache contract.
 ///
 /// A decoder, for each layer, hands the cache this step's keys/values and gets back the full
@@ -42,6 +79,33 @@ pub trait KvCache {
         CacheRoute::DenseFallback {
             reason: "experimental packed representation disabled".into(),
         }
+    }
+    /// Optional pre-update packed attention path. Returning `Some` means the cache appended the
+    /// current K/V and produced attention output directly; callers must not call `update` or
+    /// dense SDPA for that layer. The default preserves all existing cache implementations.
+    #[allow(clippy::too_many_arguments)]
+    fn try_packed_attention(
+        &mut self,
+        _layer: usize,
+        _query: &Array,
+        _keys: &Array,
+        _values: &Array,
+        _mask: PackedAttentionMask,
+        _scale: f32,
+        _retained_for_sharing: bool,
+    ) -> Result<Option<Array>> {
+        Ok(None)
+    }
+
+    /// Force an explicitly-reasoned dense transition before the caller performs its ordinary
+    /// update. Dense and paged caches are already dense, so their default is a no-op.
+    fn prepare_dense_fallback(&mut self, _operation: &str, _reason: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Model-boundary evidence for sealed packed-cache receipts.
+    fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
+        None
     }
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return
     /// the full cached `(keys, values)` to attend over, same layout with the sequence axis grown.
