@@ -262,7 +262,10 @@ fn observe_cache_events(
             .map(|(_, tokens)| *tokens)
             .max()
             .unwrap_or_default();
-        observer.cache_snapshot(bytes, tokens);
+        let element_bytes = cache.element_bytes()?.ok_or_else(|| {
+            crate::error::Error::Msg("persistent KV snapshot has no retained arrays".into())
+        })?;
+        observer.cache_snapshot(bytes, tokens, element_bytes);
     }
     Ok(())
 }

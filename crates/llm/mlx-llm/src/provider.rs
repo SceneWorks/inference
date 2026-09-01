@@ -45,7 +45,7 @@ pub const PROVIDER_ID: &str = "mlx-llama";
 
 enum CapturedCacheLifecycle {
     Allocation(&'static str, &'static str, &'static str, u64),
-    Snapshot(u64, u64),
+    Snapshot(u64, u64, u64),
     Release(&'static str, &'static str, u64),
 }
 
@@ -61,8 +61,8 @@ impl CacheLifecycleCapture {
                 CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
                     observer.allocation_event(kind, role, lifetime, bytes);
                 }
-                CapturedCacheLifecycle::Snapshot(bytes, tokens) => {
-                    observer.cache_snapshot(bytes, tokens);
+                CapturedCacheLifecycle::Snapshot(bytes, tokens, element_bytes) => {
+                    observer.cache_snapshot(bytes, tokens, element_bytes);
                 }
                 CapturedCacheLifecycle::Release(kind, role, bytes) => {
                     observer.release_event(kind, role, bytes);
@@ -93,9 +93,12 @@ impl crate::campaign::Observer for CacheLifecycleCapture {
         ));
     }
 
-    fn cache_snapshot(&mut self, bytes: u64, tokens: u64) {
-        self.events
-            .push(CapturedCacheLifecycle::Snapshot(bytes, tokens));
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64, element_bytes: u64) {
+        self.events.push(CapturedCacheLifecycle::Snapshot(
+            bytes,
+            tokens,
+            element_bytes,
+        ));
     }
 
     fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
@@ -571,8 +574,8 @@ impl LlamaProvider {
             kv_heads: kv_heads.max(0) as u64,
             head_dimension: head_dimension.max(0) as u64,
             layers: layers as u64,
-            // The dense MLX decode cache is bf16 on this provider path.
-            element_bytes: 2,
+            // The product observer fills this from the first retained MLX key/value arrays.
+            element_bytes: 0,
         }
     }
 
@@ -2157,7 +2160,7 @@ mod tests {
 
         fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
 
-        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64) {
+        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _element_bytes: u64) {
             self.0.push(("persistent", bytes));
         }
 
@@ -2169,8 +2172,12 @@ mod tests {
     #[test]
     fn cancellation_capture_replays_persistent_then_release_without_allocation_aliasing() {
         let mut capture = CacheLifecycleCapture::default();
-        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8);
+        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8, 4);
         crate::campaign::Observer::release_event(&mut capture, "cache_release", "cache", 64);
+        assert!(matches!(
+            capture.events.first(),
+            Some(CapturedCacheLifecycle::Snapshot(64, 8, 4))
+        ));
         let mut observer = RecordingLifecycleObserver::default();
         capture.replay(&mut observer);
         assert_eq!(observer.0, vec![("persistent", 64), ("released", 64)]);

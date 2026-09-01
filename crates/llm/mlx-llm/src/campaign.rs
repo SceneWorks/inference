@@ -3156,9 +3156,10 @@ pub trait Observer {
     /// observer replays these as the first two receipt phases so later reference allocations cannot
     /// be mistaken for candidate weights.
     fn load_boundary(&mut self, _process_start: &MemorySample, _weights_loaded: &MemorySample) {}
-    /// Current cumulative cache ownership at a decoder boundary. The product cache supplies both
-    /// bytes and sequence capacity so repeated append events are not summed as independent memory.
-    fn cache_snapshot(&mut self, bytes: u64, _tokens: u64) {
+    /// Current cumulative cache ownership at a decoder boundary. The product cache supplies bytes,
+    /// sequence capacity, and the actual MLX array scalar width so repeated append events are not
+    /// summed and the receipt cannot confuse model-weight dtype with cache dtype.
+    fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _element_bytes: u64) {
         self.allocation("cache", "persistent", bytes);
     }
     /// Bind a product-owned provider-load identity before the first phase.  The default preserves
@@ -3351,9 +3352,21 @@ impl Observer for ProductObserver {
         }
     }
 
-    fn cache_snapshot(&mut self, bytes: u64, tokens: u64) {
-        if bytes == 0 || tokens == 0 {
-            self.error = Some("product cache snapshot must have positive bytes and tokens".into());
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64, element_bytes: u64) {
+        if bytes == 0 || tokens == 0 || element_bytes == 0 {
+            self.error = Some(
+                "product cache snapshot must have positive bytes, tokens, and element width".into(),
+            );
+            return;
+        }
+        let Some(geometry) = self.geometry.as_mut() else {
+            self.error = Some("product cache snapshot arrived before loaded geometry".into());
+            return;
+        };
+        if geometry.element_bytes == 0 {
+            geometry.element_bytes = element_bytes;
+        } else if geometry.element_bytes != element_bytes {
+            self.error = Some("product cache element width changed within one coordinate".into());
             return;
         }
         self.cache_capacity_tokens = self.cache_capacity_tokens.max(tokens);
@@ -5107,6 +5120,47 @@ mod tests {
     fn product_observer_refuses_caller_supplied_partial_evidence() {
         let observer = ProductObserver::new();
         assert!(observer.finish().is_err());
+    }
+
+    #[test]
+    fn product_observer_sources_element_width_from_retained_cache_arrays() {
+        let mut observer = ProductObserver::new();
+        Observer::geometry(
+            &mut observer,
+            ProductGeometry {
+                query_heads: 8,
+                kv_heads: 2,
+                head_dimension: 64,
+                layers: 4,
+                element_bytes: 0,
+            },
+        );
+        observer.phase = Some("prefill-peak");
+        Observer::cache_snapshot(&mut observer, 4096, 2, 4);
+        assert_eq!(observer.geometry.unwrap().element_bytes, 4);
+        assert!(observer.error.is_none());
+    }
+
+    #[test]
+    fn product_observer_rejects_cache_element_width_changes() {
+        let mut observer = ProductObserver::new();
+        Observer::geometry(
+            &mut observer,
+            ProductGeometry {
+                query_heads: 8,
+                kv_heads: 2,
+                head_dimension: 64,
+                layers: 4,
+                element_bytes: 0,
+            },
+        );
+        observer.phase = Some("prefill-peak");
+        Observer::cache_snapshot(&mut observer, 4096, 2, 4);
+        Observer::cache_snapshot(&mut observer, 8192, 4, 2);
+        assert_eq!(
+            observer.error.as_deref(),
+            Some("product cache element width changed within one coordinate")
+        );
     }
 
     #[test]

@@ -208,6 +208,35 @@ impl ContiguousKvCache {
         &self.events
     }
 
+    /// Actual scalar width of the retained key/value arrays. A dense-cache campaign must source
+    /// this from MLX-owned arrays rather than assume that a model's weight dtype is also the
+    /// attention-cache dtype.
+    pub fn element_bytes(&self) -> Result<Option<u64>> {
+        let mut observed = None;
+        for (keys, values) in self.layers.iter().flatten() {
+            for array in [keys, values] {
+                let bytes = u64::try_from(array.item_size()).map_err(|_| {
+                    crate::error::Error::Msg("KV element width overflows u64".into())
+                })?;
+                if bytes == 0 {
+                    return Err(crate::error::Error::Msg(
+                        "KV element width must be positive".into(),
+                    ));
+                }
+                match observed {
+                    Some(expected) if expected != bytes => {
+                        return Err(crate::error::Error::Msg(
+                            "dense KV cache contains mixed element widths".into(),
+                        ));
+                    }
+                    None => observed = Some(bytes),
+                    _ => {}
+                }
+            }
+        }
+        Ok(observed)
+    }
+
     /// Snapshot every layer's cached `(keys, values)` as clones (MLX arrays are refcounted, so this
     /// shares buffers rather than copying), or `None` if any layer is still empty. The prefix cache
     /// stores this after a generation so a later shared-prefix request can be [`seeded`] from it.
@@ -380,6 +409,7 @@ mod tests {
         let mut cache = ContiguousKvCache::new(2);
         assert_eq!(cache.offset(), 0);
         assert_eq!(cache.batch_size(), 0);
+        assert_eq!(cache.element_bytes().unwrap(), None);
 
         let k = arange4(1, 2, 3, 4);
         let v = arange4(1, 2, 3, 4);
@@ -388,6 +418,7 @@ mod tests {
         assert_eq!(va.shape(), &[1, 2, 3, 4]);
         assert_eq!(cache.offset(), 3);
         assert_eq!(cache.num_layers(), 2);
+        assert_eq!(cache.element_bytes().unwrap(), Some(4));
     }
 
     #[test]
