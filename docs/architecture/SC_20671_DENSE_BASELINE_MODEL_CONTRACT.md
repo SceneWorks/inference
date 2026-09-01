@@ -8,13 +8,13 @@ architecture, exact native context, and candidate/reference precision role. The 
 
 | family | role | immutable Hugging Face repository and revision | native context |
 | --- | --- | --- | --- |
-| Llama | 4-bit candidate | `mlx-community/Llama-3.2-1B-Instruct-4bit@08231374eeacb049a0eade7922910865b8fce912` | 131,072 |
-| Llama | bf16 reference | `mlx-community/Llama-3.2-1B-Instruct-bf16@863c846a9ac6fad4e49e1743d52984dff262e953` | 131,072 |
+| Llama | 4-bit candidate | `mlx-community/Llama-3.2-3B-Instruct-4bit@7f0dc925e0d0afb0322d96f9255cfddf2ba5636e` | 131,072 |
+| Llama | bf16 reference | `mlx-community/Llama-3.2-3B-Instruct-bf16@6d88ba43024fef71b10e52e101c7cd4598322601` | 131,072 |
 | Qwen | 4-bit candidate | `mlx-community/Qwen3-1.7B-4bit@3b1b1768f8f8cf8351c712464f906e86c2b8269e` | 40,960 |
 | Qwen | bf16 reference | `mlx-community/Qwen3-1.7B-bf16@9cd6692855d3e06772228e9a962b2606359b2d24` | 40,960 |
 
-The required inventory includes the complete single-file weights payload, `config.json`, and the
-published model/index and tokenizer configuration files. The contract records every required file's
+The required inventory includes every published weights shard, `config.json`, and the published
+model/index and tokenizer configuration files. The contract records every required file's
 SHA-256 and byte length in source; a mismatch fails the parent before it starts workers and fails
 the worker again before product loading. The fixed 64-coordinate schedule remains source-owned by
 `required_schedule`; no CLI flag supplies families, model IDs, revisions, coordinates, or receipt

@@ -39,6 +39,14 @@ pub fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> 
 
 /// RMSNorm via MLX's fused kernel: `x / rms(x) * weight`.
 pub fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let x_width = x_shape.last().copied().unwrap_or_default();
+    if weight_shape.len() != 1 || weight_shape[0] != x_width {
+        return Err(crate::error::Error::Msg(format!(
+            "rms_norm width mismatch: activation shape {x_shape:?}, weight shape {weight_shape:?}"
+        )));
+    }
     Ok(mlx_rs::fast::rms_norm(x, weight, eps)?)
 }
 
@@ -163,6 +171,14 @@ mod tests {
         let b = Array::from_slice(&[10.0f32, 20.0], &[2]);
         let y = linear(&x, &w, Some(&b)).unwrap();
         assert_eq!(y.as_slice::<f32>().to_vec(), vec![11.0, 21.0]);
+    }
+
+    #[test]
+    fn rms_norm_rejects_width_mismatch_before_backend_dispatch() {
+        let x = Array::zeros::<f32>(&[1, 2, 3]).unwrap();
+        let weight = Array::ones::<f32>(&[4]).unwrap();
+        let error = rms_norm(&x, &weight, 1e-5).unwrap_err().to_string();
+        assert!(error.contains("activation shape [1, 2, 3], weight shape [4]"));
     }
 
     #[test]

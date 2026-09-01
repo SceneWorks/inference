@@ -59,7 +59,7 @@ use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
 };
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
-use crate::primitives::quant::QuantizedLinear;
+use crate::primitives::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{
     select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
@@ -87,13 +87,41 @@ enum Stack {
     Sequential(Box<crate::residency::SequentialStack>),
 }
 
+/// Token embeddings may arrive dense (the engine-native snapshot invariant) or already packed by
+/// an MLX community checkpoint. Packed rows stay packed at rest and are dequantized only after the
+/// requested token ids have been gathered.
+#[derive(Debug)]
+enum TokenEmbedding {
+    Dense(Array),
+    Quantized(QuantizedEmbedding),
+}
+
+impl TokenEmbedding {
+    fn forward(&self, input_ids: &Array) -> Result<Array> {
+        match self {
+            Self::Dense(weight) => embed(weight, input_ids),
+            Self::Quantized(weight) => weight.forward(input_ids),
+        }
+    }
+
+    fn tied_projection(&self) -> Projection {
+        match self {
+            Self::Dense(weight) => Projection::Dense {
+                weight: weight.clone(),
+                bias: None,
+            },
+            Self::Quantized(weight) => Projection::Quantized(weight.tied_linear()),
+        }
+    }
+}
+
 /// A loaded causal decoder.
 #[derive(Debug)]
 pub struct CausalLm {
-    embed_tokens: Array,
+    embed_tokens: TokenEmbedding,
     stack: Stack,
     norm: Array,
-    lm_head: Array,
+    lm_head: Projection,
     /// The model-level RoPE for a uniform architecture; Gemma 4's `sliding_attention` schedule.
     rope: Rope,
     /// Gemma 4's `full_attention` schedule — a different head dim *and* a different frequency
@@ -283,12 +311,53 @@ impl CausalLm {
             }
         };
 
-        let embed_tokens = req_bf16(p("embed_tokens.weight"))?;
+        let embed_key = p("embed_tokens.weight");
+        let embed_base = embed_key
+            .strip_suffix(".weight")
+            .expect("embedding weight key has the required suffix");
+        let embed_scales_key = format!("{embed_base}.scales");
+        let embed_tokens = if w.contains(&embed_scales_key) {
+            let spec = cfg.quantization.ok_or_else(|| {
+                Error::Config(format!(
+                    "snapshot stores quantized tensor `{embed_scales_key}` but config.json has no `quantization` block"
+                ))
+            })?;
+            TokenEmbedding::Quantized(QuantizedEmbedding::from_quantized(
+                w.require(&embed_key)?.clone(),
+                w.require(&embed_scales_key)?.clone(),
+                w.require(&format!("{embed_base}.biases"))?.clone(),
+                spec.group_size,
+                spec.bits,
+            )?)
+        } else {
+            TokenEmbedding::Dense(req_bf16(embed_key)?)
+        };
         let norm = norm_w(p("norm.weight"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            embed_tokens.clone()
+            embed_tokens.tied_projection()
         } else {
-            req_bf16(head_key)?
+            let head_base = head_key
+                .strip_suffix(".weight")
+                .expect("LM head key has the required suffix");
+            let head_scales_key = format!("{head_base}.scales");
+            if w.contains(&head_scales_key) {
+                let spec = cfg.quantization.ok_or_else(|| {
+                    Error::Config(format!(
+                        "snapshot stores quantized tensor `{head_scales_key}` but config.json has no `quantization` block"
+                    ))
+                })?;
+                Projection::from_quantized(
+                    w.require(&head_key)?.clone(),
+                    w.require(&head_scales_key)?.clone(),
+                    w.require(&format!("{head_base}.biases"))?.clone(),
+                    spec,
+                )
+            } else {
+                Projection::Dense {
+                    weight: req_bf16(head_key)?,
+                    bias: None,
+                }
+            }
         };
 
         let plan = LayerPlan::new(&cfg, decoder_root.clone());
@@ -468,7 +537,10 @@ impl CausalLm {
 
     /// Embed token ids `[batch, seq]` → `[batch, seq, hidden]` (bf16). Gemma scales by √hidden.
     pub fn embed(&self, input_ids: &Array) -> Result<Array> {
-        let e = embed(&self.embed_tokens, input_ids)?;
+        let e = self
+            .embed_tokens
+            .forward(input_ids)?
+            .as_dtype(COMPUTE_DTYPE)?;
         match self.embed_scale {
             Some(s) => Ok(multiply(&e, &Array::from_f32(s).as_dtype(e.dtype())?)?),
             None => Ok(e),
@@ -915,7 +987,7 @@ impl CausalLm {
     /// Final RMSNorm + `lm_head` (+ Gemma-2 logit soft-cap) over hidden states `[batch, n, hidden]`.
     fn project_logits(&self, h: &Array) -> Result<Array> {
         let normed = rms_norm(h, &self.norm, self.cfg.rms_norm_eps)?;
-        let logits = linear(&normed, &self.lm_head, None)?;
+        let logits = self.lm_head.forward(&normed)?;
         match self.final_softcap {
             // Soft-cap in f32 for precision (the cap denominator matters near the extremes).
             Some(c) => soft_cap(&logits.as_dtype(Dtype::Float32)?, c),

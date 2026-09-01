@@ -37,9 +37,8 @@ pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs
 pub const SC20671_MIN_NATIVE_CONTEXT_TOKENS: u64 = 32 * 1024;
 
 /// One file which must be present, byte-for-byte, in a SC-20671 benchmark snapshot.
-/// The MLX repositories publish one safetensors payload, so binding that payload and the parsed
-/// config is sufficient to reject a caller-provided model substitution without inventing a cache
-/// path convention.
+/// Binding every published safetensors payload and the parsed config is sufficient to reject a
+/// caller-provided model substitution without inventing a cache path convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PinnedSnapshotFile {
     pub path: &'static str,
@@ -66,18 +65,18 @@ pub struct BenchmarkModelSpec {
 const LLAMA_4BIT_FILES: &[PinnedSnapshotFile] = &[
     PinnedSnapshotFile {
         path: "config.json",
-        bytes: 1121,
-        sha256: "73bfb89e5a43c76ada2d7a9609862139578a71cfbb43e30bf5d4571026dd3741",
+        bytes: 1122,
+        sha256: "c546925585e48f43890d9dc5150df4fec73dd3780d92961c5ace451934cc4cd6",
     },
     PinnedSnapshotFile {
         path: "model.safetensors",
-        bytes: 695_283_921,
-        sha256: "35e396644bca888eec399f9c0f843ec7fa78b8f8c5e06841661be62b4edf96dd",
+        bytes: 1_807_496_278,
+        sha256: "d75e1ee0ea653cc5b76191ec934c7c0d568e94d4e47846619f1f4bc715b7b265",
     },
     PinnedSnapshotFile {
         path: "model.safetensors.index.json",
-        bytes: 26_159,
-        sha256: "437f66af94c5f921f4fbe465341bdee4dc6a37ab8f29bbb12fd7caad577dedd7",
+        bytes: 45_720,
+        sha256: "2ef31fa0b9dcda01f87835851d5e1d5a39ab6258ae618af6ea864c3747e556e4",
     },
     PinnedSnapshotFile {
         path: "tokenizer_config.json",
@@ -88,18 +87,23 @@ const LLAMA_4BIT_FILES: &[PinnedSnapshotFile] = &[
 const LLAMA_BF16_FILES: &[PinnedSnapshotFile] = &[
     PinnedSnapshotFile {
         path: "config.json",
-        bytes: 968,
-        sha256: "8d40f9098d80a1510565233591a58ccf4dadba6a94934c1a514bf95201621efa",
+        bytes: 969,
+        sha256: "7e4149635018dd8d82f9b0873d800459faca261b1ac969d458c93f51133643a8",
     },
     PinnedSnapshotFile {
-        path: "model.safetensors",
-        bytes: 2_471_645_521,
-        sha256: "f5dc593b89368a9a44a8fc3b2dacd7a3d65e43acb4ffbd98a1a40fac9c2bd6da",
+        path: "model-00001-of-00002.safetensors",
+        bytes: 5_368_478_882,
+        sha256: "b475af8535933afaf9393b30c6bcb4bfede59586b16ecdd010e7da8a83dfc95b",
+    },
+    PinnedSnapshotFile {
+        path: "model-00002-of-00002.safetensors",
+        bytes: 1_057_050_089,
+        sha256: "9b2903fa2b3728423f6442c0dc667db645906fb113c9d0cd794faeb820cc82d3",
     },
     PinnedSnapshotFile {
         path: "model.safetensors.index.json",
-        bytes: 10_408,
-        sha256: "21d0047096a570c0602ab22be6dad6838e291c5e8494de3fe973bfbe4cce36d9",
+        bytes: 21_946,
+        sha256: "de5995e586fc98a942b576a6752034a6d0a741d2dece5f61e697d99c8bb99b3d",
     },
     PinnedSnapshotFile {
         path: "tokenizer_config.json",
@@ -155,8 +159,8 @@ const QWEN_BF16_FILES: &[PinnedSnapshotFile] = &[
 pub const LLAMA_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
     family: "llama",
     role: "candidate",
-    repository: "mlx-community/Llama-3.2-1B-Instruct-4bit",
-    revision: "08231374eeacb049a0eade7922910865b8fce912",
+    repository: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    revision: "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e",
     architecture: "LlamaForCausalLM",
     model_type: "llama",
     native_context_tokens: 131_072,
@@ -166,8 +170,8 @@ pub const LLAMA_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
 pub const LLAMA_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
     family: "llama",
     role: "bf16-reference",
-    repository: "mlx-community/Llama-3.2-1B-Instruct-bf16",
-    revision: "863c846a9ac6fad4e49e1743d52984dff262e953",
+    repository: "mlx-community/Llama-3.2-3B-Instruct-bf16",
+    revision: "6d88ba43024fef71b10e52e101c7cd4598322601",
     architecture: "LlamaForCausalLM",
     model_type: "llama",
     native_context_tokens: 131_072,
@@ -4006,8 +4010,11 @@ pub fn quality_from_product_fixtures(
         &cache_candidate.quality_observation.token_probabilities,
         &cache_reference.quality_observation.token_probabilities,
     );
-    let tool_ok = !tool_candidate.output.tool_calls.is_empty()
-        && tool_candidate.output.tool_calls == tool_reference.output.tool_calls;
+    let tool_ok = tool_candidate.output.tool_calls == tool_reference.output.tool_calls
+        && matches!(tool_candidate.output.tool_calls.as_slice(), [call]
+            if call.name == "record_baseline_fact"
+                && call.arguments.get("fact").and_then(serde_json::Value::as_str)
+                    == Some("SC20671 structured fixture"));
     let needle_ok = needle_candidate.output.text.contains(expected_needle)
         && needle_reference.output.text.contains(expected_needle);
     if !tool_ok {
@@ -4713,14 +4720,23 @@ mod tests {
         let llama_reference = benchmark_model("llama", true).unwrap();
         let qwen = benchmark_model("qwen", false).unwrap();
         let qwen_reference = benchmark_model("qwen", true).unwrap();
-        assert_eq!(llama.repository, "mlx-community/Llama-3.2-1B-Instruct-4bit");
-        assert_eq!(llama.revision, "08231374eeacb049a0eade7922910865b8fce912");
+        assert_eq!(llama.repository, "mlx-community/Llama-3.2-3B-Instruct-4bit");
+        assert_eq!(llama.revision, "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e");
         assert_eq!(
             llama_reference.repository,
-            "mlx-community/Llama-3.2-1B-Instruct-bf16"
+            "mlx-community/Llama-3.2-3B-Instruct-bf16"
+        );
+        assert_eq!(
+            llama_reference.revision,
+            "6d88ba43024fef71b10e52e101c7cd4598322601"
         );
         assert_eq!(qwen.repository, "mlx-community/Qwen3-1.7B-4bit");
+        assert_eq!(qwen.revision, "3b1b1768f8f8cf8351c712464f906e86c2b8269e");
         assert_eq!(qwen_reference.repository, "mlx-community/Qwen3-1.7B-bf16");
+        assert_eq!(
+            qwen_reference.revision,
+            "9cd6692855d3e06772228e9a962b2606359b2d24"
+        );
         assert!(llama.native_context_tokens >= SC20671_MIN_NATIVE_CONTEXT_TOKENS);
         assert!(qwen.native_context_tokens >= SC20671_MIN_NATIVE_CONTEXT_TOKENS);
         assert_ne!(llama.revision, llama_reference.revision);

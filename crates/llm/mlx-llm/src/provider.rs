@@ -18,7 +18,7 @@ use core_llm::{
     JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
     Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -108,8 +108,8 @@ impl crate::campaign::Observer for CacheLifecycleCapture {
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
 enum Decoder {
-    Causal(CausalLm),
-    Qwen35(Qwen35Model),
+    Causal(Box<CausalLm>),
+    Qwen35(Box<Qwen35Model>),
 }
 
 impl Decode for Decoder {
@@ -147,8 +147,8 @@ impl Decoder {
     /// decoder type.
     fn as_vlm(&self) -> &dyn VlmDecode {
         match self {
-            Decoder::Causal(m) => m,
-            Decoder::Qwen35(m) => m,
+            Decoder::Causal(m) => m.as_ref(),
+            Decoder::Qwen35(m) => m.as_ref(),
         }
     }
 }
@@ -464,6 +464,7 @@ pub struct LlamaProvider {
     model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
+    tool_call_format: Option<ToolCallFormat>,
     stop_tokens: Vec<i32>,
     /// Cached per-vocab decode table for constrained decoding — built once (it decodes the whole
     /// vocabulary) on the first JSON-constrained request, then reused.
@@ -845,12 +846,12 @@ impl LlamaProvider {
             // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
             let m = Qwen35Model::from_weights_with(&weights, "model.language_model", qcfg, quant)
                 .map_err(to_core)?;
-            (Decoder::Qwen35(m), descriptor)
+            (Decoder::Qwen35(Box::new(m)), descriptor)
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
-            (Decoder::Causal(m), descriptor)
+            (Decoder::Causal(Box::new(m)), descriptor)
         };
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
@@ -913,9 +914,9 @@ impl LlamaProvider {
 
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let stop_tokens = eos_token_ids(dir);
-        let (template, supports_thinking, supports_tools) = load_chat_template(dir);
+        let (template, supports_thinking, tool_call_format) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
-        descriptor.capabilities.supports_tools = supports_tools;
+        descriptor.capabilities.supports_tools = tool_call_format.is_some();
         Ok(Self {
             descriptor,
             architecture: arch,
@@ -923,6 +924,7 @@ impl LlamaProvider {
             model,
             tokenizer,
             template,
+            tool_call_format,
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision,
@@ -949,9 +951,10 @@ impl LlamaProvider {
             descriptor: provider_descriptor(),
             architecture,
             campaign_family,
-            model: Decoder::Causal(model),
+            model: Decoder::Causal(Box::new(model)),
             tokenizer,
             template: Box::new(Llama3Template),
+            tool_call_format: None,
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision: None,
@@ -1259,23 +1262,40 @@ impl ConstraintMask for JsonMask<'_> {
 /// present; otherwise fall back to the typed Llama-3 template. Also reports two template-gated
 /// capabilities, detected from the source (not the family, matching the transformers convention):
 /// - **thinking** — the template gates an `enable_thinking` kwarg (sc-7585).
-/// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
-///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
-///   the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool) {
+/// - **tools** — the template renders either tagged tool-call blocks or the bare JSON format shipped
+///   by Llama 3.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolCallFormat {
+    Tagged,
+    BareJson,
+}
+
+fn tool_call_format(source: &str) -> Option<ToolCallFormat> {
+    if source.contains("<tool_call>") {
+        Some(ToolCallFormat::Tagged)
+    } else if source.contains("tool_call")
+        && source.contains("respond with JSON for a function call")
+    {
+        Some(ToolCallFormat::BareJson)
+    } else {
+        None
+    }
+}
+
+fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, Option<ToolCallFormat>) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
-        let supports_tools = t.source().contains("tool_call");
-        return (Box::new(t), supports_thinking, supports_tools);
+        let tool_call_format = tool_call_format(t.source());
+        return (Box::new(t), supports_thinking, tool_call_format);
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
         Ok(t) => {
             let supports_thinking = t.source().contains("enable_thinking");
-            let supports_tools = t.source().contains("tool_call");
-            (Box::new(t), supports_thinking, supports_tools)
+            let tool_call_format = tool_call_format(t.source());
+            (Box::new(t), supports_thinking, tool_call_format)
         }
-        Err(_) => (Box::new(Llama3Template), false, false),
+        Err(_) => (Box::new(Llama3Template), false, None),
     }
 }
 
@@ -1326,6 +1346,22 @@ fn tool_pieces(seg: &mut Option<ToolCallSegmenter>, text: &str) -> Vec<String> {
     match seg {
         Some(ts) => ts.push(text),
         None => vec![text.to_string()],
+    }
+}
+
+/// Parse the complete bare JSON tool-call form emitted by Llama 3.2. This is deliberately an
+/// end-of-generation operation: unlike tagged formats, raw JSON has no streaming boundary that can
+/// distinguish a tool call from ordinary answer text until the document is complete.
+fn bare_json_tool_calls(text: &str, tools: &[core_llm::ToolSpec]) -> Vec<ToolCall> {
+    let mut parser = ToolCallSegmenter::new(tools);
+    let wrapped = format!("<tool_call>{text}</tool_call>");
+    let mut remainder = parser.push(&wrapped).concat();
+    remainder.push_str(&parser.flush().concat());
+    let calls = parser.take_calls();
+    if remainder.trim().is_empty() {
+        calls
+    } else {
+        Vec::new()
     }
 }
 
@@ -1536,8 +1572,9 @@ impl LlamaProvider {
         // it lifts `<tool_call>` blocks out of the answer channel (markup excluded from the streamed
         // text) and parses them into structured calls (sc-7636). `None` otherwise, so a no-tools
         // request flows straight through `tool_pieces` unchanged.
-        let tools_active = self.descriptor.capabilities.supports_tools && !req.tools.is_empty();
-        let mut tool_seg = tools_active.then(|| ToolCallSegmenter::new(&req.tools));
+        let tools_active = self.tool_call_format.is_some() && !req.tools.is_empty();
+        let mut tool_seg = matches!(self.tool_call_format, Some(ToolCallFormat::Tagged))
+            .then(|| ToolCallSegmenter::new(&req.tools));
 
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
@@ -1778,14 +1815,21 @@ impl LlamaProvider {
         // `streamed` accumulates only `IncrementalDetok`-released deltas, so it carries no
         // transient U+FFFD placeholders; a character truncated by end-of-generation is dropped
         // rather than surfaced as U+FFFD (sc-12452).
-        let text = if stop_active || thinking_active || tools_active {
+        let mut text = if stop_active || thinking_active || tools_active {
             streamed
         } else {
             let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
             tokenizer.decode(&gen_u32, true)?
         };
         let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
-        let tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
+        let mut tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
+        if matches!(self.tool_call_format, Some(ToolCallFormat::BareJson)) && tools_active {
+            let parsed = bare_json_tool_calls(&text, &req.tools);
+            if !parsed.is_empty() {
+                tool_calls = parsed;
+                text.clear();
+            }
+        }
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -2158,6 +2202,42 @@ mod tests {
         assert!(can_load_value(
             &json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })
         ));
+    }
+
+    #[test]
+    fn tool_format_distinguishes_tagged_and_llama_bare_json() {
+        assert_eq!(
+            tool_call_format("emit <tool_call>...</tool_call>"),
+            Some(ToolCallFormat::Tagged)
+        );
+        assert_eq!(
+            tool_call_format(
+                "message.tool_calls; please respond with JSON for a function call exactly"
+            ),
+            Some(ToolCallFormat::BareJson)
+        );
+        assert_eq!(tool_call_format("message.tool_calls only"), None);
+
+        let tools = [core_llm::ToolSpec::new(
+            "record_baseline_fact",
+            "Record a fact",
+            json!({
+                "type": "object",
+                "properties": {"fact": {"type": "string"}},
+                "required": ["fact"]
+            }),
+        )];
+        let calls = bare_json_tool_calls(
+            r#"{"name":"record_baseline_fact","parameters":{"fact":"SC20671 structured fixture"}}"#,
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "record_baseline_fact");
+        assert_eq!(
+            calls[0].arguments.get("fact"),
+            Some(&json!("SC20671 structured fixture"))
+        );
+        assert!(bare_json_tool_calls("ordinary answer", &tools).is_empty());
     }
 
     #[test]

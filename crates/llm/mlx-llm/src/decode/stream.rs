@@ -195,31 +195,19 @@ pub(crate) fn generate_with_observer(
             observer.phase("prefill-peak");
         }
         observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
-        let output = {
-            let mut saw_first_token = false;
-            let mut observed_events = |event| {
-                if !saw_first_token && matches!(event, StreamEvent::Token { .. }) {
-                    saw_first_token = true;
-                    if let Some(observer) = observer.as_deref_mut() {
-                        observer.phase("first-token");
-                    }
-                }
-                on_event(event);
-            };
-            decode_loop(
-                decoder,
-                cache.as_mut(),
-                logits,
-                rng,
-                prompt_ids.to_vec(),
-                config,
-                cancel,
-                &mut observed_events,
-                constraint,
-                should_stop,
-                &mut None,
-            )?
-        };
+        let output = decode_loop(
+            decoder,
+            cache.as_mut(),
+            logits,
+            rng,
+            prompt_ids.to_vec(),
+            config,
+            cancel,
+            on_event,
+            constraint,
+            should_stop,
+            &mut observer,
+        )?;
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("decode-steady");
         }
@@ -496,3 +484,79 @@ pub(crate) fn default_seed() -> u64 {
 }
 
 pub use super::cancel::CancelFlag;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixedDecoder;
+
+    impl Decode for FixedDecoder {
+        fn make_cache(&self) -> Box<dyn KvCache> {
+            Box::new(ContiguousKvCache::new(0))
+        }
+
+        fn step(
+            &self,
+            _input_ids: &Array,
+            _cache: &mut dyn KvCache,
+            _offset: i32,
+        ) -> Result<Array> {
+            Ok(Array::from_slice(&[0.0_f32, 1.0, -1.0], &[1, 3]))
+        }
+    }
+
+    #[derive(Default)]
+    struct DecodeObserver {
+        phases: Vec<&'static str>,
+        logits: usize,
+        probabilities: Vec<(i32, f64)>,
+    }
+
+    impl crate::campaign::Observer for DecodeObserver {
+        fn phase(&mut self, name: &'static str) {
+            self.phases.push(name);
+        }
+
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+
+        fn logits(&mut self, stage: &'static str, values: &[f32]) {
+            assert_eq!(stage, "prefill");
+            assert_eq!(values.len(), 3);
+            self.logits += 1;
+        }
+
+        fn token_probability(&mut self, stage: &'static str, token: i32, probability: f64) {
+            assert_eq!(stage, "decode");
+            self.probabilities.push((token, probability));
+        }
+    }
+
+    #[test]
+    fn observed_generation_forwards_decode_probability_and_first_token_phase() {
+        let mut observer = DecodeObserver::default();
+        let output = generate_with_observer(
+            &FixedDecoder,
+            &[7],
+            &GenerationConfig {
+                max_new_tokens: 1,
+                seed: Some(0),
+                ..Default::default()
+            },
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            Some(&mut observer),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 1);
+        assert_eq!(observer.logits, 1);
+        assert_eq!(observer.probabilities.len(), 1);
+        assert!(observer.probabilities[0].1.is_finite());
+        assert_eq!(
+            observer.phases,
+            vec!["prefill-peak", "first-token", "decode-steady"]
+        );
+    }
+}
