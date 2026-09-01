@@ -4468,8 +4468,25 @@ fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
     {
         return Err("pmset thermal probe reports throttling or a contradictory state".into());
     }
+    let lines = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let nominal_no_history = [
+        "note: no thermal warning level has been recorded",
+        "note: no performance warning level has been recorded",
+        "note: no cpu power status has been recorded",
+    ];
+    if lines.len() == nominal_no_history.len()
+        && nominal_no_history
+            .iter()
+            .all(|expected| lines.contains(expected))
+    {
+        return Ok("nominal".into());
+    }
     let mut saw_zero = false;
-    for line in normalized.lines().map(str::trim) {
+    for line in lines {
         let Some((name, raw_value)) = line.split_once(':') else {
             continue;
         };
@@ -5411,9 +5428,18 @@ mod tests {
     }
 
     #[test]
-    fn thermal_probe_requires_an_explicit_zero_pressure_record() {
+    fn thermal_probe_requires_an_explicit_nominal_record() {
         assert_eq!(
             normalize_pmset_thermal("Thermal Pressure: 0\n").unwrap(),
+            "nominal"
+        );
+        assert_eq!(
+            normalize_pmset_thermal(
+                "Note: No thermal warning level has been recorded\n\
+                 Note: No performance warning level has been recorded\n\
+                 Note: No CPU power status has been recorded\n"
+            )
+            .unwrap(),
             "nominal"
         );
         for invalid in [
@@ -5421,6 +5447,7 @@ mod tests {
             "Thermal Level: 0\nnot nominal\n",
             "nominal\n",
             "Thermal Pressure: 0\nthrottling active\n",
+            "Note: No thermal warning level has been recorded\n",
         ] {
             assert!(
                 normalize_pmset_thermal(invalid).is_err(),
