@@ -1,6 +1,6 @@
 # SC-20684: Krea Realtime compressed-KV source map
 
-**Status:** experimental source POC, off by default; no Metal, model, performance, memory, or quality receipt has been produced.
+**Status:** experimental source POC, off by default; no Metal, model, performance, memory, or quality receipt has been produced. The opt-in launcher and its product-owned observer are present, but remain unrun until the coordinator owns the Metal lane.
 
 The sealed companion is [`sc-20684-krea-realtime-compressed-kv-contract.json`](sc-20684-krea-realtime-compressed-kv-contract.json). It binds the POC to the checked-out Krea seams and requires an evidence receipt before any product claim.
 
@@ -35,6 +35,19 @@ Absolute RoPE remains the Wan/Krea producer's responsibility: keys passed to app
 A future same-run device receipt must name the model/snapshot, exact B/H/Sq/Skv/D and mask, representation/version, compiled-handle identity, packed persistent bytes, retained-handle bytes, bounded scratch bytes, zero/nonzero dense-window and score-matrix bytes, timing label, fallback reason, parity, quality, and cancellation outcome. Q4 cannot be promoted using Q8 evidence. Dense full-cache dequantize-then-SDPA remains a non-goal for compressed-domain execution.
 
 The source tests cover Q8 tiled/tail/block-mask/outlier parity against an independent dense oracle, arbitrary append boundaries, packed trim, disabled pre-mutation fallback, and cancellation scratch cleanup. The focused Rust suite and strict package clippy pass locally; the Python checker rejects missing source mappings, fallback axes, receipt axes, checksum drift, or dense-window/score-route needles.
+
+## Real-weight campaign handoff
+
+The parent command is `scripts/sc20684_krea_realtime_campaign.py`. It launches the ignored `generate_smoke::sc20684_packed_campaign_observer` test once for each T2V/I2V/V2V × Q8/Q4 cell, passing only a run nonce, selected arm, and pinned snapshot path. The test, not the parent, reads the checked-out source hashes, snapshot metadata, toolchain/hardware identity, live cache receipt, actual packed-vs-dense latent parity, decoded media quality, fallback counters, and pre-cancelled route result; it emits one `SC20684_KREA_PROVIDER_OBSERVATION` JSON line after those values are terminal.
+
+The reducer rejects any missing/duplicate cell, identity disagreement, failed parity or quality arm, uncompiled handle, dense window/score bytes, partial cancellation, or Q8/Q4 substitution. It writes a checksumed receipt directory outside the repository only by an atomic final rename. Q4 is selected only when the launcher's explicit `KREA_SC20684_Q4_QUALITY_ARM=acknowledged` selector is present; this acknowledges the distinct arm but cannot turn a failed measured quality row into a passing one.
+
+```sh
+python3 scripts/sc20684_krea_realtime_campaign.py \
+  --snapshot /Volumes/Data/krea-realtime/q4 \
+  --output /Volumes/Data/receipts/sc-20684-$(date +%Y%m%dT%H%M%S) \
+  --product-command 'cargo test -p mlx-gen-krea-realtime --test integration generate_smoke::sc20684_packed_campaign_observer -- --ignored --nocapture'
+```
 
 ## Source-only validation
 

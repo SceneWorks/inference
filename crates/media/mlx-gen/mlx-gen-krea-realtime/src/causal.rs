@@ -40,7 +40,7 @@ use mlx_gen_wan::{normalize_wan_key, CausalPackedAttention, WanTransformer};
 use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
-use crate::compressed_kv::{CompressedTier, KreaPackedMetalKernel};
+use crate::compressed_kv::{CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle, TILE_ROWS};
 use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
 #[cfg(test)]
@@ -472,6 +472,22 @@ pub struct CausalKvCache {
     evict_to_next_read: bool,
 }
 
+/// Provider-owned measurement snapshot for an opt-in packed-Metal cache.  This is deliberately
+/// populated from the cache which actually participated in a forward, rather than from a caller's
+/// requested tier.  It is the narrow runtime seam consumed by the SC-20684 real-weight observer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedMetalRouteReceipt {
+    pub compiled_handle_identity: String,
+    pub retained_handle_bytes: usize,
+    pub persistent_bytes: usize,
+    pub bounded_scratch_bytes: usize,
+    pub dense_window_bytes: usize,
+    pub score_matrix_bytes: usize,
+    pub accepted_forwards: usize,
+    pub dense_fallbacks: usize,
+    pub last_fallback_reason: Option<String>,
+}
+
 impl CausalKvCache {
     /// An empty cache for `num_layers` transformer blocks with the given read-window geometry (in
     /// tokens) and storage tier. See
@@ -529,6 +545,24 @@ impl CausalKvCache {
             self.packed_metal_dense_fallbacks,
             self.last_packed_metal_fallback.as_deref(),
         )
+    }
+
+    /// Return a receipt only for the retained experimental kernel that this cache owns.  The
+    /// fixed scratch/zero-dense values are properties of the product's tiled Metal kernel, while
+    /// persistent bytes and route counters are read from this live cache after dispatch.
+    pub fn packed_metal_route_receipt(&self) -> Option<PackedMetalRouteReceipt> {
+        let kernel = self.packed_metal_kernel.as_ref()?;
+        Some(PackedMetalRouteReceipt {
+            compiled_handle_identity: kernel.identity().to_owned(),
+            retained_handle_bytes: kernel.retained_bytes(),
+            persistent_bytes: self.retained_bytes(),
+            bounded_scratch_bytes: TILE_ROWS * 128 * std::mem::size_of::<f32>(),
+            dense_window_bytes: 0,
+            score_matrix_bytes: 0,
+            accepted_forwards: self.packed_metal_accepted_forwards,
+            dense_fallbacks: self.packed_metal_dense_fallbacks,
+            last_fallback_reason: self.last_packed_metal_fallback.clone(),
+        })
     }
 
     pub fn peak_append_coexistence_bytes(&self) -> usize {

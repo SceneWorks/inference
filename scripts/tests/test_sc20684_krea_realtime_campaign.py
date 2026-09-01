@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "sc20684_krea_realtime_campaign.py"
+ROOT = SCRIPT.parents[1]
 SPEC = importlib.util.spec_from_file_location("sc20684_campaign", SCRIPT)
 assert SPEC and SPEC.loader
 campaign = importlib.util.module_from_spec(SPEC)
@@ -104,6 +105,22 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--product-command", result.stdout)
         self.assertIn("SC20684_KREA_PROVIDER_OBSERVATION", result.stdout)
+
+    def test_launcher_and_provider_seam_have_one_owned_protocol(self) -> None:
+        provider = (
+            ROOT / "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs"
+        ).read_text(encoding="utf-8")
+        cache = (
+            ROOT / "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs"
+        ).read_text(encoding="utf-8")
+        launcher = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("fn sc20684_packed_campaign_observer()", provider)
+        self.assertIn("SC20684_KREA_PROVIDER_OBSERVATION", provider)
+        self.assertIn("generate_latents_conditioned_into", provider)
+        self.assertIn("packed_metal_route_receipt", cache)
+        self.assertIn("KREA_SC20684_Q4_QUALITY_ARM", launcher)
+        self.assertNotIn('add_argument("--parity"', launcher)
+        self.assertNotIn('add_argument("--quality"', launcher)
 
     def test_complete_matrix_closes_only_after_all_modes_and_tiers(self) -> None:
         rows = self.complete_rows()

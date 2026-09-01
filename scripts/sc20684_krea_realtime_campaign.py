@@ -47,6 +47,8 @@ SOURCE_FILES = (
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/t2v.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/pipeline.rs",
+    "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs",
+    "scripts/sc20684_krea_realtime_campaign.py",
 )
 
 
@@ -271,6 +273,10 @@ def run_matrix(command: str, snapshot: Path, source: dict[str, Any], model: dict
             "KREA_SC20684_MODEL_REPOSITORY": MODEL_REPOSITORY,
             "KREA_SC20684_MODEL_REVISION": MODEL_REVISION,
         })
+        if tier == "q4":
+            # The Q4 arm is a separately named experiment.  This is a selector only; measured
+            # quality still has to arrive from the provider-owned observer and pass reduction.
+            env["KREA_SC20684_Q4_QUALITY_ARM"] = "acknowledged"
         started = time.monotonic_ns()
         try:
             result = subprocess.run(argv, cwd=ROOT, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, check=False)

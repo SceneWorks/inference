@@ -147,6 +147,7 @@ pub fn conservative_video_decode_memory_profile(
 
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
+    PackedMetalRouteReceipt,
 };
 pub use compressed_kv::{
     AttentionGeometry, CancellationProbe, CompiledKernelBinding, CompressedInstrumentation,

@@ -61,5 +61,7 @@
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn prepare_packed_window"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub trait CausalPackedAttention"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk_with_packed_attention"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn packed_metal_route_receipt"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "needle": "fn sc20684_packed_campaign_observer()"}
   ]
 }

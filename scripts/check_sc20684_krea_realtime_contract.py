@@ -34,6 +34,8 @@ REQUIRED_MAPPINGS = {
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "fn prepare_packed_window"),
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub trait CausalPackedAttention"),
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub fn forward_causal_chunk_with_packed_attention"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "pub fn packed_metal_route_receipt"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "fn sc20684_packed_campaign_observer()"),
 }
 REQUIRED_FALLBACKS = {"disabled", "q4-quality", "handle", "geometry", "mask", "cancellation", "receipt"}
 REQUIRED_RECEIPT_FIELDS = {
