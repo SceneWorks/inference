@@ -4091,6 +4091,14 @@ fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
     }
 }
 
+fn needle_fixture_prompt(prompt: &str, band_payload: &str, needle: &str) -> String {
+    format!(
+        "{prompt}\nRemember this harmless passphrase exactly: {needle}\n\
+         BEGIN LONG CONTEXT\n{band_payload}\nEND LONG CONTEXT\n\
+         What harmless passphrase were you instructed to remember? Reply with only the passphrase."
+    )
+}
+
 pub fn run_product_fixture_suite(
     candidate_snapshot: &Path,
     reference_snapshot: &Path,
@@ -4136,9 +4144,7 @@ pub fn run_product_fixture_suite_on_sessions(
     let tool_prompt = format!(
         "{prompt}\n{band_payload}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."
     );
-    let needle_prompt = format!(
-        "{prompt}\nThe marker to retain is {needle}.\n{band_payload}\nReturn the exact marker stated before the context payload."
-    );
+    let needle_prompt = needle_fixture_prompt(prompt, &band_payload, &needle);
     let cache_prompt = format!("{prompt}\n{band_payload}\nRepeat the stable baseline fact.");
     for fixture_prompt in [&kernel_prompt, &tool_prompt, &needle_prompt, &cache_prompt] {
         let candidate_tokens = candidate_session
@@ -4693,6 +4699,17 @@ pub fn verify_coordinate_product_controls(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn needle_prompt_places_one_passphrase_before_the_long_context() {
+        let prompt = needle_fixture_prompt("baseline", "DISTRACTOR", "SC20671-NEEDLE");
+        assert_eq!(prompt.matches("SC20671-NEEDLE").count(), 1);
+        assert!(prompt.find("SC20671-NEEDLE").unwrap() < prompt.find("DISTRACTOR").unwrap());
+        assert!(prompt.contains("BEGIN LONG CONTEXT\nDISTRACTOR\nEND LONG CONTEXT"));
+        assert!(prompt.ends_with(
+            "What harmless passphrase were you instructed to remember? Reply with only the passphrase."
+        ));
+    }
 
     #[test]
     fn formula_includes_batch_and_key_value_pair() {
