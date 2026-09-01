@@ -42,8 +42,11 @@ fn main() -> Result<()> {
     // becoming evidence and ensures the scope covers generation and release.
     let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
         {
+            let event_path = arg(&args, "--sc20686-events")
+                .filter(|path| path != "-")
+                .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
             let request = candle_gen_wan::sc20686_observer::request_output(
-                arg(&args, "--sc20686-events").unwrap_or_else(|| "-".into()),
+                event_path,
             );
             Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
                 request.arm_cancellation()

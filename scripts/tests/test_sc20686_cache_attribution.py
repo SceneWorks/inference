@@ -362,6 +362,31 @@ class AttributionTests(unittest.TestCase):
         build = observer.index("Some(build())", guard)
         self.assertLess(inactive, build)
 
+    def test_campaign_entrypoints_require_a_dedicated_event_file(self):
+        root = SCRIPT.parents[1]
+        paths = (
+            "crates/media/candle-gen/candle-gen-flux2/examples/flux2-edit.rs",
+            "crates/media/candle-gen/candle-gen-wan/examples/wan-txt2video.rs",
+            "crates/media/candle-gen/candle-gen-wan/examples/wan14b-txt2video.rs",
+            "crates/media/candle-gen/candle-gen-wan/examples/wan14b-img2video.rs",
+            "crates/media/candle-gen/candle-gen-wan/examples/vace_smoke.rs",
+        )
+        for relative in paths:
+            source = (root / relative).read_text(encoding="utf-8")
+            self.assertIn('arg(&args, "--sc20686-events")', source, relative)
+            self.assertIn('.filter(|path| path != "-")', source, relative)
+            self.assertIn("dedicated --sc20686-events <file>", source, relative)
+
+    def test_campaign_transport_doc_describes_wired_wan_and_flux_no_go_boundary(self):
+        root = SCRIPT.parents[1]
+        document = (root / "docs/architecture/SC_20686_PERSISTENT_KV_CAMPAIGN.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("all five registered Wan", document)
+        self.assertIn("product-owned observer", document)
+        self.assertIn("no persistent reference K/V boundary", document)
+        self.assertIn("no-go", document)
+
     def test_flux_source_map_anchors_live_double_attention_kv(self):
         source_map = json.loads(self.reducer.SOURCE_MAP.read_text(encoding="utf-8"))
         entry = source_map["variants"]["flux2_klein_9b_edit"]

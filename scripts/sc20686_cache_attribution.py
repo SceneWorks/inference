@@ -649,17 +649,17 @@ def verify_campaign_bundle(bundle):
         evidence_names = set(row["evidence_artifact_sha256"])
         by_suffix = {
             suffix: [item for item in evidence_names if item.endswith(suffix)]
-            for suffix in (".stdout", ".stderr", ".command.json", ".process.json")
+            for suffix in (".events.jsonl", ".stdout", ".stderr", ".command.json", ".process.json")
         }
-        if any(len(names) != 1 for names in by_suffix.values()) or len(evidence_names) != 4:
+        if any(len(names) != 1 for names in by_suffix.values()) or len(evidence_names) != 5:
             fail("row evidence artifact inventory is not the exact run transcript set")
-        stdout = payloads[by_suffix[".stdout"][0]]
+        event_transcript = payloads[by_suffix[".events.jsonl"][0]]
         try:
-            observed = [
-                json.loads(line)
-                for line in stdout.decode("utf-8").splitlines()
-                if line.lstrip().startswith("{")
-            ]
+            if not event_transcript or b"\r" in event_transcript or not event_transcript.endswith(b"\n"):
+                fail("campaign observer event transcript is malformed")
+            observed = [json.loads(line) for line in event_transcript.decode("utf-8").splitlines()]
+            if not observed or any(not isinstance(event, dict) for event in observed):
+                fail("campaign observer event transcript is malformed")
             process = json.loads(payloads[by_suffix[".process.json"][0]].decode("utf-8"))
             command = json.loads(payloads[by_suffix[".command.json"][0]].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -667,7 +667,7 @@ def verify_campaign_bundle(bundle):
         if not isinstance(process, dict) or not isinstance(process.get("samples"), list):
             fail("campaign process sample transcript is malformed")
         if observed + process["samples"] != row["observer_events"]:
-            fail("sealed row events differ from the exact stdout/process transcripts")
+            fail("sealed row events differ from the exact event/process transcripts")
         expected_allocator = [
             {"phase": event["phase"], "peak_bytes": event["peak_bytes"]}
             for event in observed
@@ -690,13 +690,20 @@ def verify_campaign_bundle(bundle):
             (row["family"], row["variant"], row["coordinate_name"])
         ]
         expected_argv = [
-            resolved_entry["entrypoint"], "--sc20686-campaign", "--sc20686-events", "-",
+            resolved_entry["entrypoint"], "--sc20686-campaign", "--sc20686-events",
             "--snapshot", resolved_entry["snapshot"], "--variant", row["variant"],
             *resolved_entry["args"],
         ]
         if row["arm"] == "cancel":
             expected_argv.append("--sc20686-cancel")
-        if argv != expected_argv:
+        if (
+            argv[:3] != expected_argv[:3]
+            or len(argv) < 4
+            or argv[3] == "-"
+            or not Path(argv[3]).is_absolute()
+            or Path(argv[3]).name != "events.jsonl"
+            or argv[4:] != expected_argv[3:]
+        ):
             fail("campaign command conflicts with sealed resolved inputs")
         if (
             row["route_manifest_sha256"] != resolved_entry["route_manifest_sha256"]

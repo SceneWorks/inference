@@ -13,6 +13,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ class CampaignRun:
     stderr: bytes
     command: tuple
     process_samples: tuple
+    event_transcript: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -477,63 +479,83 @@ def _sample_rss(pid):
         return None
 
 
-def run_entrypoint(entrypoint, snapshot, variant, arm, extra_args=(), timeout_seconds=21600):
-    command = [
-        str(Path(entrypoint).resolve()), "--sc20686-campaign", "--sc20686-events", "-",
-        "--snapshot", str(Path(snapshot).resolve()), "--variant", variant, *map(str, extra_args),
-    ]
-    if arm == "cancel":
-        command.append("--sc20686-cancel")
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout_chunks, stderr_chunks = [], []
-    stdout_thread = threading.Thread(target=_drain, args=(child.stdout, stdout_chunks), daemon=True)
-    stderr_thread = threading.Thread(target=_drain, args=(child.stderr, stderr_chunks), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-    process_samples = []
-    deadline = time.monotonic() + timeout_seconds
-    timed_out = False
-    while child.poll() is None:
-        rss = _sample_rss(child.pid)
-        if rss:
-            process_samples.append({
-                "phase": "process-sample", "sample_kind": "process", "peak_bytes": rss,
-                "at_ns": time.time_ns(),
-            })
-        if time.monotonic() >= deadline:
-            timed_out = True
-            child.terminate()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-            break
-        time.sleep(0.05)
-    child.wait()
-    stdout_thread.join(timeout=10)
-    stderr_thread.join(timeout=10)
-    if stdout_thread.is_alive() or stderr_thread.is_alive():
-        child.kill()
-        raise ValueError(f"{variant}/{arm} transcript drain did not terminate")
-    stdout = b"".join(stdout_chunks)
-    stderr = b"".join(stderr_chunks)
-    if timed_out:
-        raise ValueError(f"{variant}/{arm} entrypoint timed out after {timeout_seconds}s")
-    if child.returncode:
-        message = stderr.decode("utf-8", errors="replace")[-4096:].strip()
-        raise ValueError(f"{variant}/{arm} entrypoint failed: {message}")
+def parse_event_transcript(payload, variant, arm):
+    """Accept only complete JSONL from the adapter-owned observer channel."""
+    if not payload or b"\r" in payload or not payload.endswith(b"\n"):
+        raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript")
     try:
-        events = [
-            json.loads(line)
-            for line in stdout.decode("utf-8").splitlines()
-            if line.lstrip().startswith("{")
+        lines = payload.decode("utf-8").splitlines()
+        if not lines:
+            raise ValueError("event transcript is empty")
+        events = [json.loads(line) for line in lines]
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript") from exc
+    if any(not isinstance(event, dict) for event in events):
+        raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript")
+    return events
+
+
+def run_entrypoint(entrypoint, snapshot, variant, arm, extra_args=(), timeout_seconds=21600):
+    # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
+    # owns this private file and accepts observer events only from it, never by filtering stdout.
+    with tempfile.TemporaryDirectory(prefix="sc20686-events-") as directory:
+        event_path = Path(directory) / "events.jsonl"
+        command = [
+            str(Path(entrypoint).resolve()), "--sc20686-campaign", "--sc20686-events",
+            str(event_path), "--snapshot", str(Path(snapshot).resolve()), "--variant", variant,
+            *map(str, extra_args),
         ]
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{variant}/{arm} emitted an invalid observer transcript") from exc
+        if arm == "cancel":
+            command.append("--sc20686-cancel")
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout_chunks, stderr_chunks = [], []
+        stdout_thread = threading.Thread(target=_drain, args=(child.stdout, stdout_chunks), daemon=True)
+        stderr_thread = threading.Thread(target=_drain, args=(child.stderr, stderr_chunks), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        process_samples = []
+        deadline = time.monotonic() + timeout_seconds
+        timed_out = False
+        while child.poll() is None:
+            rss = _sample_rss(child.pid)
+            if rss:
+                process_samples.append({
+                    "phase": "process-sample", "sample_kind": "process", "peak_bytes": rss,
+                    "at_ns": time.time_ns(),
+                })
+            if time.monotonic() >= deadline:
+                timed_out = True
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                break
+            time.sleep(0.05)
+        child.wait()
+        stdout_thread.join(timeout=10)
+        stderr_thread.join(timeout=10)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            child.kill()
+            raise ValueError(f"{variant}/{arm} transcript drain did not terminate")
+        stdout = b"".join(stdout_chunks)
+        stderr = b"".join(stderr_chunks)
+        if timed_out:
+            raise ValueError(f"{variant}/{arm} entrypoint timed out after {timeout_seconds}s")
+        if child.returncode:
+            message = stderr.decode("utf-8", errors="replace")[-4096:].strip()
+            raise ValueError(f"{variant}/{arm} entrypoint failed: {message}")
+        try:
+            event_transcript = event_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript") from exc
+    events = parse_event_transcript(event_transcript, variant, arm)
     events.extend(process_samples)
     if not events or not process_samples:
         raise ValueError(f"{variant}/{arm} lacks observer or process evidence")
-    return CampaignRun(events, stdout, stderr, tuple(command), tuple(process_samples))
+    return CampaignRun(
+        events, stdout, stderr, tuple(command), tuple(process_samples), event_transcript,
+    )
 
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
@@ -839,6 +861,7 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
             command_payload = canonical({"argv": list(run.command)})
             process_payload = canonical({"samples": list(run.process_samples)})
             artifacts = {
+                f"{stem}.events.jsonl": run.event_transcript,
                 f"{stem}.stdout": run.stdout,
                 f"{stem}.stderr": run.stderr,
                 f"{stem}.command.json": command_payload,

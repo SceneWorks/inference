@@ -163,14 +163,19 @@ class CampaignAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.reducer.verify_seal_artifact(sealed, raw + b" ", sidecar, "row.json")
 
-    def test_streaming_runner_drains_more_than_pipe_capacity(self):
+    def test_streaming_runner_keeps_carriage_return_progress_out_of_events(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             executable = root / "producer"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json,time\n"
-                "for i in range(10000): print(json.dumps({'phase':'noise','payload':'x'*256}))\n"
+                "import json,sys,time\n"
+                "event_path = sys.argv[sys.argv.index('--sc20686-events') + 1]\n"
+                "with open(event_path, 'w', encoding='utf-8') as events:\n"
+                "    for i in range(10000):\n"
+                "        events.write(json.dumps({'phase':'noise','payload':'x'*256}) + '\\n')\n"
+                "print('\\rprovider progress 100%', end='', flush=True)\n"
+                "print('diagnostic'*10000, flush=True)\n"
                 "time.sleep(.2)\n",
                 encoding="utf-8",
             )
@@ -183,7 +188,30 @@ class CampaignAdapterTests(unittest.TestCase):
             )
             self.assertEqual(len(run.events) - len(run.process_samples), 10000)
             self.assertGreater(len(run.stdout), 64 * 1024)
+            self.assertIn(b"\rprovider progress", run.stdout)
+            self.assertNotIn(b"\r", run.event_transcript)
             self.assertTrue(run.process_samples)
+
+    def test_streaming_runner_fails_closed_on_missing_or_malformed_event_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            executable = root / "producer"
+            for payload, expected in ((None, "missing or malformed"), ("{not-json}\\n", "missing or malformed")):
+                body = "#!/usr/bin/env python3\nimport sys\n"
+                if payload is not None:
+                    body += (
+                        "event_path = sys.argv[sys.argv.index('--sc20686-events') + 1]\n"
+                        f"open(event_path, 'w', encoding='utf-8').write({payload!r})\n"
+                    )
+                executable.write_text(body, encoding="utf-8")
+                executable.chmod(0o755)
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.adapter.run_entrypoint(
+                        executable, snapshot, "route", "normal", timeout_seconds=5
+                    )
 
     def test_streaming_runner_enforces_timeout_and_terminates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +305,18 @@ class CampaignAdapterTests(unittest.TestCase):
             ]
             manifest.write_text(json.dumps(entries), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "frozen coverage"):
+                self.adapter.load_wan_manifest(manifest)
+
+    def test_manifest_cannot_override_adapter_owned_event_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = self._manifest_fixture(root)
+            route = self.adapter.WAN_ROUTES[0]
+            coordinate = next(iter(entries[route]["coordinates"]))
+            entries[route]["coordinates"][coordinate].extend(("--sc20686-events", "-"))
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "overrides campaign identity"):
                 self.adapter.load_wan_manifest(manifest)
 
     def test_every_file_bearing_route_argument_is_content_hashed(self):
@@ -533,7 +573,8 @@ class CampaignAdapterTests(unittest.TestCase):
             })
             observer_events = [metadata, created, read, dict(read), *release_events]
             argv = [
-                "product-entrypoint", "--sc20686-campaign", "--sc20686-events", "-",
+                "product-entrypoint", "--sc20686-campaign", "--sc20686-events",
+                "/adapter-owned/events.jsonl",
                 "--snapshot", "/snapshot", "--variant", coordinate.variant,
             ]
             if arm == "cancel":
@@ -541,7 +582,7 @@ class CampaignAdapterTests(unittest.TestCase):
             return self.adapter.CampaignRun(
                 [*observer_events, process],
                 b"".join(self.adapter.canonical(event) for event in observer_events), b"",
-                tuple(argv), (process,),
+                tuple(argv), (process,), b"".join(self.adapter.canonical(event) for event in observer_events),
             )
 
         def row_builder(coordinate, arm, events, evidence_hashes):
