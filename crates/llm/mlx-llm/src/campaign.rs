@@ -3092,7 +3092,7 @@ fn product_fixture_artifact(
                 "coordinateEvidenceSha256": coordinate_operation_digest(candidate),
                 "operationGeneratedTokens": candidate.coordinate_generated_tokens,
                 "operationPromptTokens": candidate.coordinate_prompt_tokens,
-                "qualityTranscriptSha256": seal_bytes(candidate.output.text.as_bytes()),
+                "qualityTranscriptSha256": product_output_digest(&candidate.output),
                 "secondaryOperation": candidate.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
                     "operation": secondary.operation.as_str(),
                     "outputSha256": secondary.output_sha256.as_str(),
@@ -3114,7 +3114,7 @@ fn product_fixture_artifact(
                 "coordinateEvidenceSha256": coordinate_operation_digest(reference),
                 "operationGeneratedTokens": reference.coordinate_generated_tokens,
                 "operationPromptTokens": reference.coordinate_prompt_tokens,
-                "qualityTranscriptSha256": seal_bytes(reference.output.text.as_bytes()),
+                "qualityTranscriptSha256": product_output_digest(&reference.output),
                 "secondaryOperation": reference.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
                     "operation": secondary.operation.as_str(),
                     "outputSha256": secondary.output_sha256.as_str(),
@@ -3849,9 +3849,9 @@ pub fn run_dense_coordinate(
             },
             observer,
         )?;
-        if !saw_token {
+        if !output_has_observed_generation(&output, saw_token) {
             return Err(core_llm::Error::InvalidRequest(
-                "dense campaign produced no first-token observation".into(),
+                "dense campaign produced neither a streamed token nor a parsed tool call".into(),
             ));
         }
         output
@@ -3938,9 +3938,9 @@ pub fn run_dense_lifecycle_request_on_session(
             &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
             observer,
         )?;
-        if !saw_token {
+        if !output_has_observed_generation(&output, saw_token) {
             return Err(core_llm::Error::InvalidRequest(
-                "dense campaign produced no first-token observation".into(),
+                "dense campaign produced neither a streamed token nor a parsed tool call".into(),
             ));
         }
         observer.operation("single-shot-generation");
@@ -3986,6 +3986,43 @@ pub struct CoordinateOperationEvidence {
     pub generated_tokens: u64,
     pub prompt_tokens: u64,
     pub output_sha256: String,
+}
+
+fn output_has_observed_generation(output: &TextLlmOutput, saw_streamed_token: bool) -> bool {
+    output.usage.generated_tokens > 0 && (saw_streamed_token || !output.tool_calls.is_empty())
+}
+
+/// Bind every externally meaningful output channel. Tool-only responses deliberately have empty
+/// `text`, so hashing text alone would make distinct structured calls indistinguishable.
+fn product_output_digest(output: &TextLlmOutput) -> String {
+    let tool_calls = output
+        .tool_calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "name": call.name,
+                "arguments": call.arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    let finish_reason = match output.finish_reason {
+        Some(core_llm::FinishReason::Stop) => "stop",
+        Some(core_llm::FinishReason::Length) => "length",
+        Some(core_llm::FinishReason::Cancelled) => "cancelled",
+        Some(core_llm::FinishReason::ContentFilter) => "content-filter",
+        None => "none",
+    };
+    let (bytes, _) = sealed_json(&serde_json::json!({
+        "text": output.text,
+        "thinking": output.thinking,
+        "toolCalls": tool_calls,
+        "usage": {
+            "promptTokens": output.usage.prompt_tokens,
+            "generatedTokens": output.usage.generated_tokens,
+        },
+        "finishReason": finish_reason,
+    }));
+    seal_bytes(&bytes)
 }
 
 fn operation_evidence_digest(evidence: &CoordinateOperationEvidence) -> String {
@@ -4130,70 +4167,71 @@ fn run_coordinate_operation_on_session(
     observer.phase("weights-loaded");
     observer.allocation("weights", "persistent", session.model_weights_bytes());
 
-    let (operation, generated_tokens, prompt_tokens, output_sha256) =
-        if operation == "supported-batch" {
-            let (outputs, prompt_tokens) =
-                provider.campaign_supported_batch_observed(prefix_prompt, 2, &mut observer)?;
-            let mut bytes = Vec::new();
-            let generated = outputs
-                .iter()
-                .map(|output| output.tokens.len() as u64)
-                .sum();
-            for output in outputs {
-                for token in output.tokens {
-                    bytes.extend_from_slice(&token.to_le_bytes());
-                }
-            }
-            observer.operation("supported-batch");
-            (
-                "supported-batch".to_string(),
-                generated,
-                prompt_tokens,
-                seal_bytes(&bytes),
-            )
-        } else if operation == "chunked-prefix-reuse" {
-            let (output, hits, prompt_tokens) =
-                provider.campaign_prefix_reuse_observed(prefix_prompt, &mut observer)?;
-            if hits == 0 {
-                return Err(core_llm::Error::InvalidRequest(
-                    "observed prefix coordinate has no cache hit".into(),
-                ));
-            }
-            let mut bytes = Vec::new();
-            for token in &output.tokens {
+    let (operation, generated_tokens, prompt_tokens, output_sha256) = if operation
+        == "supported-batch"
+    {
+        let (outputs, prompt_tokens) =
+            provider.campaign_supported_batch_observed(prefix_prompt, 2, &mut observer)?;
+        let mut bytes = Vec::new();
+        let generated = outputs
+            .iter()
+            .map(|output| output.tokens.len() as u64)
+            .sum();
+        for output in outputs {
+            for token in output.tokens {
                 bytes.extend_from_slice(&token.to_le_bytes());
             }
-            observer.operation("chunked-prefix-reuse");
-            (
-                "chunked-prefix-reuse".to_string(),
-                output.tokens.len() as u64,
-                prompt_tokens,
-                seal_bytes(&bytes),
-            )
-        } else if operation == "single-shot-generation" {
-            let mut saw_token = false;
-            let output = provider.generate_observed(
-                &request,
-                &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
-                &mut observer,
-            )?;
-            if !saw_token {
-                return Err(core_llm::Error::InvalidRequest(
-                    "single coordinate produced no first-token observation".into(),
-                ));
-            }
-            observer.operation("single-shot-generation");
-            (
-                "single-shot-generation".to_string(),
-                output.usage.generated_tokens as u64,
-                output.usage.prompt_tokens as u64,
-                seal_bytes(output.text.as_bytes()),
-            )
-        } else {
+        }
+        observer.operation("supported-batch");
+        (
+            "supported-batch".to_string(),
+            generated,
+            prompt_tokens,
+            seal_bytes(&bytes),
+        )
+    } else if operation == "chunked-prefix-reuse" {
+        let (output, hits, prompt_tokens) =
+            provider.campaign_prefix_reuse_observed(prefix_prompt, &mut observer)?;
+        if hits == 0 {
             return Err(core_llm::Error::InvalidRequest(
-                "unknown campaign coordinate operation".into(),
+                "observed prefix coordinate has no cache hit".into(),
             ));
-        };
+        }
+        let mut bytes = Vec::new();
+        for token in &output.tokens {
+            bytes.extend_from_slice(&token.to_le_bytes());
+        }
+        observer.operation("chunked-prefix-reuse");
+        (
+            "chunked-prefix-reuse".to_string(),
+            output.tokens.len() as u64,
+            prompt_tokens,
+            seal_bytes(&bytes),
+        )
+    } else if operation == "single-shot-generation" {
+        let mut saw_token = false;
+        let output = provider.generate_observed(
+            &request,
+            &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
+            &mut observer,
+        )?;
+        if !output_has_observed_generation(&output, saw_token) {
+            return Err(core_llm::Error::InvalidRequest(
+                "single coordinate produced neither a streamed token nor a parsed tool call".into(),
+            ));
+        }
+        observer.operation("single-shot-generation");
+        (
+            "single-shot-generation".to_string(),
+            output.usage.generated_tokens as u64,
+            output.usage.prompt_tokens as u64,
+            product_output_digest(&output),
+        )
+    } else {
+        return Err(core_llm::Error::InvalidRequest(
+            "unknown campaign coordinate operation".into(),
+        ));
+    };
 
     // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
     // replace the coordinate operation measured above.
@@ -5096,6 +5134,43 @@ mod tests {
         assert_eq!(request.thinking, ThinkingMode::Disabled);
         assert_eq!(request.max_new_tokens, 64);
         assert_eq!(request.tools.len(), 1);
+    }
+
+    #[test]
+    fn tool_only_generation_is_observed_and_bound_by_structured_output() {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "fact".into(),
+            serde_json::json!("SC20671 structured fixture"),
+        );
+        let output = TextLlmOutput {
+            tool_calls: vec![core_llm::ToolCall::new("record_baseline_fact", arguments)],
+            usage: core_llm::Usage {
+                prompt_tokens: 10,
+                generated_tokens: 5,
+            },
+            finish_reason: Some(core_llm::FinishReason::Stop),
+            ..Default::default()
+        };
+        assert!(output_has_observed_generation(&output, false));
+        let mut changed = output.clone();
+        changed.tool_calls[0]
+            .arguments
+            .insert("fact".into(), serde_json::json!("different"));
+        assert_ne!(
+            product_output_digest(&output),
+            product_output_digest(&changed)
+        );
+
+        let no_stream_or_tool = TextLlmOutput {
+            usage: output.usage,
+            ..Default::default()
+        };
+        assert!(!output_has_observed_generation(&no_stream_or_tool, false));
+        assert!(!output_has_observed_generation(
+            &TextLlmOutput::default(),
+            true
+        ));
     }
 
     #[test]
