@@ -13,7 +13,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use core_llm::{Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest, ToolSpec};
+use core_llm::{
+    Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest, ThinkingMode, ToolSpec,
+};
 
 pub const REQUIRED_PHASES: [&str; 8] = [
     "process-start",
@@ -4409,6 +4411,11 @@ fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
     TextLlmRequest {
         messages: vec![Message::text(Role::User, prompt)],
         tools,
+        // The frozen fixture measures bounded answer/tool behavior, not unbounded reasoning.
+        // Qwen3 defaults to thinking and can consume the entire 64-token fixture budget before it
+        // reaches the answer or tool-call block; disabling it keeps candidate and reference on the
+        // same deterministic product path. Providers without thinking support ignore Disabled.
+        thinking: ThinkingMode::Disabled,
         sampling: Sampling {
             temperature: 0.0,
             top_p: 1.0,
@@ -5081,6 +5088,14 @@ mod tests {
         assert!(prompt.ends_with(
             "What harmless passphrase were you instructed to remember? Reply with only the passphrase."
         ));
+    }
+
+    #[test]
+    fn frozen_fixture_disables_thinking_before_bounded_generation() {
+        let request = fixture_request("fixture".into(), vec![structured_fixture_tool()]);
+        assert_eq!(request.thinking, ThinkingMode::Disabled);
+        assert_eq!(request.max_new_tokens, 64);
+        assert_eq!(request.tools.len(), 1);
     }
 
     #[test]
