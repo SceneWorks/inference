@@ -34,6 +34,183 @@ pub const FIT_BOUNDARY_MIN_CONTEXT_BPS: u64 = 9_000;
 pub const SCENEWORKS_REPOSITORY: &str = "github.com/SceneWorks/SceneWorks";
 pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
+pub const SC20671_MIN_NATIVE_CONTEXT_TOKENS: u64 = 32 * 1024;
+
+/// One file which must be present, byte-for-byte, in a SC-20671 benchmark snapshot.
+/// The MLX repositories publish one safetensors payload, so binding that payload and the parsed
+/// config is sufficient to reject a caller-provided model substitution without inventing a cache
+/// path convention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedSnapshotFile {
+    pub path: &'static str,
+    pub bytes: u64,
+    pub sha256: &'static str,
+}
+
+/// Source-owned identity for one of the four dense-baseline snapshots.  These are commit IDs, not
+/// mutable Hugging Face branches or aliases.  Snapshot directories intentionally remain CLI
+/// inputs: the operator controls storage, while this contract controls what may be loaded from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BenchmarkModelSpec {
+    pub family: &'static str,
+    pub role: &'static str,
+    pub repository: &'static str,
+    pub revision: &'static str,
+    pub architecture: &'static str,
+    pub model_type: &'static str,
+    pub native_context_tokens: u64,
+    pub quantized: bool,
+    pub required_files: &'static [PinnedSnapshotFile],
+}
+
+const LLAMA_4BIT_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 1121,
+        sha256: "73bfb89e5a43c76ada2d7a9609862139578a71cfbb43e30bf5d4571026dd3741",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 695_283_921,
+        sha256: "35e396644bca888eec399f9c0f843ec7fa78b8f8c5e06841661be62b4edf96dd",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 26_159,
+        sha256: "437f66af94c5f921f4fbe465341bdee4dc6a37ab8f29bbb12fd7caad577dedd7",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 54_558,
+        sha256: "022d5ae3df4737998ab97d8f31ac2bcb4c06dd8ebe5a8aba2b4aceef1e5ea7d3",
+    },
+];
+const LLAMA_BF16_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 968,
+        sha256: "8d40f9098d80a1510565233591a58ccf4dadba6a94934c1a514bf95201621efa",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 2_471_645_521,
+        sha256: "f5dc593b89368a9a44a8fc3b2dacd7a3d65e43acb4ffbd98a1a40fac9c2bd6da",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 10_408,
+        sha256: "21d0047096a570c0602ab22be6dad6838e291c5e8494de3fe973bfbe4cce36d9",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 54_528,
+        sha256: "9823dcfdc1121869029da45192238e85cf44f0b232a6d9dc20e4fe6f4242a14e",
+    },
+];
+const QWEN_4BIT_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 937,
+        sha256: "507a6701220524eb8b283425bf0856a9ae4f21f4052e563896ddd668994b1dc7",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 968_080_210,
+        sha256: "0e86d9677e519323849eac1bc272caae88567a481ff188c431f70be543d9995f",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 49_731,
+        sha256: "1e3058d4ba4b04e4de35b74467725cbef90ff022198404218e48f21adc9cfa15",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 9_706,
+        sha256: "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0",
+    },
+];
+const QWEN_BF16_FILES: &[PinnedSnapshotFile] = &[
+    PinnedSnapshotFile {
+        path: "config.json",
+        bytes: 784,
+        sha256: "fa2aca3f3437d838672845487b8dd013b6a1f022daafb457bc9cb08564663ee4",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors",
+        bytes: 3_441_185_437,
+        sha256: "790a82e1fcbac0fa316e4c21cd025c0c39aa03e882e33e2b1dc39407c9629e4e",
+    },
+    PinnedSnapshotFile {
+        path: "model.safetensors.index.json",
+        bytes: 22_148,
+        sha256: "d6a4b92a4ede4c18d5bbc8e5814e7a4b899a514262e74b92cedba90f0c3e836d",
+    },
+    PinnedSnapshotFile {
+        path: "tokenizer_config.json",
+        bytes: 9_706,
+        sha256: "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0",
+    },
+];
+
+pub const LLAMA_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "llama",
+    role: "candidate",
+    repository: "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    revision: "08231374eeacb049a0eade7922910865b8fce912",
+    architecture: "LlamaForCausalLM",
+    model_type: "llama",
+    native_context_tokens: 131_072,
+    quantized: true,
+    required_files: LLAMA_4BIT_FILES,
+};
+pub const LLAMA_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "llama",
+    role: "bf16-reference",
+    repository: "mlx-community/Llama-3.2-1B-Instruct-bf16",
+    revision: "863c846a9ac6fad4e49e1743d52984dff262e953",
+    architecture: "LlamaForCausalLM",
+    model_type: "llama",
+    native_context_tokens: 131_072,
+    quantized: false,
+    required_files: LLAMA_BF16_FILES,
+};
+pub const QWEN_CANDIDATE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "qwen",
+    role: "candidate",
+    repository: "mlx-community/Qwen3-1.7B-4bit",
+    revision: "3b1b1768f8f8cf8351c712464f906e86c2b8269e",
+    architecture: "Qwen3ForCausalLM",
+    model_type: "qwen3",
+    native_context_tokens: 40_960,
+    quantized: true,
+    required_files: QWEN_4BIT_FILES,
+};
+pub const QWEN_REFERENCE: BenchmarkModelSpec = BenchmarkModelSpec {
+    family: "qwen",
+    role: "bf16-reference",
+    repository: "mlx-community/Qwen3-1.7B-bf16",
+    revision: "9cd6692855d3e06772228e9a962b2606359b2d24",
+    architecture: "Qwen3ForCausalLM",
+    model_type: "qwen3",
+    native_context_tokens: 40_960,
+    quantized: false,
+    required_files: QWEN_BF16_FILES,
+};
+
+pub fn benchmark_model(
+    family: &str,
+    reference: bool,
+) -> Result<&'static BenchmarkModelSpec, String> {
+    match (family, reference) {
+        ("llama", false) => Ok(&LLAMA_CANDIDATE),
+        ("llama", true) => Ok(&LLAMA_REFERENCE),
+        ("qwen", false) => Ok(&QWEN_CANDIDATE),
+        ("qwen", true) => Ok(&QWEN_REFERENCE),
+        _ => Err(format!(
+            "SC-20671 has no immutable benchmark model for family {family:?}"
+        )),
+    }
+}
 
 pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u64, String> {
     if context_window < 1_024 {
@@ -1965,6 +2142,12 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             ));
         }
     }
+    // Validate every role before a single worker is spawned.  The worker repeats the family-local
+    // check before loading, so neither command boundary can smuggle in an arbitrary snapshot.
+    validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?;
+    validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?;
+    validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?;
+    validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?;
     let parent = launch
         .destination
         .parent()
@@ -2077,6 +2260,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             if prompt.trim().is_empty() {
                 return Err("campaign prompt must not be empty".into());
             }
+            validate_coordinate_model_contract(&row.coordinate, &snapshot, &reference_snapshot)?;
             let candidate_session = CampaignSession::load(&snapshot)
                 .map_err(|e| format!("load candidate campaign session: {e}"))?;
             let reference_session = CampaignSession::load(&reference_snapshot)
@@ -2429,6 +2613,82 @@ pub fn inventory_snapshot(root: impl AsRef<Path>) -> std::io::Result<SnapshotInv
         sha256: hex(&digest.finalize()),
         files,
     })
+}
+
+/// Validate a materialized snapshot against its source-owned model contract before the product
+/// loader sees it.  A filesystem path is a storage location only: it cannot select a repository,
+/// revision, family, architecture, context window, precision arm, or weight payload.
+pub fn validate_benchmark_snapshot(
+    root: impl AsRef<Path>,
+    spec: &BenchmarkModelSpec,
+) -> Result<SnapshotInventory, String> {
+    if spec.native_context_tokens < SC20671_MIN_NATIVE_CONTEXT_TOKENS {
+        return Err(format!(
+            "{} {} is below SC-20671's 32k native-context minimum",
+            spec.repository, spec.revision
+        ));
+    }
+    let inventory = inventory_snapshot(root).map_err(|error| error.to_string())?;
+    for expected in spec.required_files {
+        let actual = inventory
+            .files
+            .iter()
+            .find(|file| file.path == expected.path)
+            .ok_or_else(|| {
+                format!(
+                    "{}@{} lacks required {}",
+                    spec.repository, spec.revision, expected.path
+                )
+            })?;
+        if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+            return Err(format!(
+                "{}@{} has an unexpected {} inventory entry",
+                spec.repository, spec.revision, expected.path
+            ));
+        }
+    }
+    let config_bytes = fs::read(inventory.root.join("config.json"))
+        .map_err(|error| format!("read {} config: {error}", spec.repository))?;
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes)
+        .map_err(|error| format!("parse {} config: {error}", spec.repository))?;
+    let architecture = config
+        .get("architectures")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|architectures| architectures.first())
+        .and_then(serde_json::Value::as_str);
+    let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
+    let context = config
+        .get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64);
+    let quantized = config
+        .get("quantization_config")
+        .is_some_and(|value| !value.is_null());
+    if architecture != Some(spec.architecture)
+        || model_type != Some(spec.model_type)
+        || context != Some(spec.native_context_tokens)
+        || quantized != spec.quantized
+    {
+        return Err(format!(
+            "{}@{} configuration does not match its frozen {} {} contract",
+            spec.repository, spec.revision, spec.family, spec.role
+        ));
+    }
+    Ok(inventory)
+}
+
+fn validate_coordinate_model_contract(
+    coordinate: &Coordinate,
+    snapshot: &Path,
+    reference_snapshot: &Path,
+) -> Result<(), String> {
+    let candidate = benchmark_model(coordinate.family, false)?;
+    let reference = benchmark_model(coordinate.family, true)?;
+    if snapshot == reference_snapshot {
+        return Err("candidate and higher-precision reference paths must be distinct".into());
+    }
+    validate_benchmark_snapshot(snapshot, candidate)?;
+    validate_benchmark_snapshot(reference_snapshot, reference)?;
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -4270,6 +4530,8 @@ fn product_receipt(
     }
     let reference = &suite.kernel_reference.observation.snapshot;
     let model = &observation.snapshot;
+    let candidate_contract = benchmark_model(coordinate.family, false)?;
+    let reference_contract = benchmark_model(coordinate.family, true)?;
     let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
@@ -4357,7 +4619,7 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{};architecture={};inventory={}", model.root.display(), coordinate.family, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{};architecture={};inventory={}", reference.root.display(), coordinate.family, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
@@ -4416,6 +4678,86 @@ mod tests {
         let second = inventory_snapshot(dir.path()).unwrap();
         assert_eq!(first.sha256, second.sha256);
         assert_eq!(first.files[0].path, "a.safetensors");
+    }
+
+    #[test]
+    fn benchmark_model_selection_is_the_four_exact_public_pins() {
+        let llama = benchmark_model("llama", false).unwrap();
+        let llama_reference = benchmark_model("llama", true).unwrap();
+        let qwen = benchmark_model("qwen", false).unwrap();
+        let qwen_reference = benchmark_model("qwen", true).unwrap();
+        assert_eq!(llama.repository, "mlx-community/Llama-3.2-1B-Instruct-4bit");
+        assert_eq!(llama.revision, "08231374eeacb049a0eade7922910865b8fce912");
+        assert_eq!(
+            llama_reference.repository,
+            "mlx-community/Llama-3.2-1B-Instruct-bf16"
+        );
+        assert_eq!(qwen.repository, "mlx-community/Qwen3-1.7B-4bit");
+        assert_eq!(qwen_reference.repository, "mlx-community/Qwen3-1.7B-bf16");
+        assert!(llama.native_context_tokens >= SC20671_MIN_NATIVE_CONTEXT_TOKENS);
+        assert!(qwen.native_context_tokens >= SC20671_MIN_NATIVE_CONTEXT_TOKENS);
+        assert_ne!(llama.revision, llama_reference.revision);
+        assert_ne!(qwen.revision, qwen_reference.revision);
+        assert!(
+            benchmark_model("mistral", false).is_err(),
+            "wrong family must fail closed"
+        );
+    }
+
+    #[test]
+    fn benchmark_snapshot_rejects_substitution_family_and_reference_mismatch() {
+        const FILES: &[PinnedSnapshotFile] = &[
+            PinnedSnapshotFile {
+                path: "config.json",
+                bytes: 124,
+                sha256: "f165c79f5f1092f615d77da1b2eb8b436e399683be472e9d90af462ccdb10b34",
+            },
+            PinnedSnapshotFile {
+                path: "model.safetensors",
+                bytes: 7,
+                sha256: "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c",
+            },
+        ];
+        let candidate = BenchmarkModelSpec {
+            family: "llama",
+            role: "candidate",
+            repository: "example/candidate",
+            revision: "a",
+            architecture: "LlamaForCausalLM",
+            model_type: "llama",
+            native_context_tokens: 32_768,
+            quantized: true,
+            required_files: FILES,
+        };
+        let reference = BenchmarkModelSpec {
+            role: "fp32-reference",
+            quantized: false,
+            ..candidate
+        };
+        let wrong_family = BenchmarkModelSpec {
+            family: "qwen",
+            architecture: "Qwen3ForCausalLM",
+            model_type: "qwen3",
+            ..candidate
+        };
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama","max_position_embeddings":32768,"quantization_config":{"bits":4}}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"tokenizer").unwrap();
+        assert!(validate_benchmark_snapshot(dir.path(), &candidate).is_ok());
+        // The source-owned config and precision arm catch a caller swapping candidate/reference
+        // or family paths even when the snapshot directory itself is valid.
+        assert!(validate_benchmark_snapshot(dir.path(), &reference).is_err());
+        assert!(validate_benchmark_snapshot(dir.path(), &wrong_family).is_err());
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        assert!(
+            validate_benchmark_snapshot(dir.path(), &candidate).is_err(),
+            "config hash must reject caller edits"
+        );
     }
 
     #[test]
