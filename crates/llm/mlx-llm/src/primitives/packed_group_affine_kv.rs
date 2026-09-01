@@ -26,6 +26,47 @@ pub const PACKED_CODES_PER_BYTE: usize = 4;
 /// channels, but both use this same quantization group width.
 pub const PACKED_METAL_QUANT_GROUP_SIZE: usize = 32;
 
+/// MLX exposes array extents as signed `i32`s, while packed-cache storage uses `usize`.
+/// Keep that conversion at the array boundary so a large host-side cache can never wrap into an
+/// invalid MLX shape.
+fn mlx_shape(shape: [usize; 4]) -> Result<[i32; 4]> {
+    shape
+        .map(|dimension| {
+            i32::try_from(dimension)
+                .map_err(|_| Error::Config("packed KV dimension exceeds MLX i32 range".into()))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .and_then(|dimensions| {
+            dimensions
+                .try_into()
+                .map_err(|_| Error::Msg("internal packed KV MLX shape conversion failed".into()))
+        })
+}
+
+/// Input tensors are owned by MLX and therefore arrive with signed extents. Reject malformed
+/// extents before comparing them with cache-owned `usize` geometry.
+fn packed_input_shape(shape: &[i32], tensor: &str) -> Result<[usize; 4]> {
+    let [batch, heads, tokens, width] = shape else {
+        return Err(Error::Unsupported(format!(
+            "{tensor} tensor must have rank four"
+        )));
+    };
+    [*batch, *heads, *tokens, *width]
+        .map(|dimension| {
+            usize::try_from(dimension).map_err(|_| {
+                Error::Unsupported(format!("{tensor} tensor has a negative MLX dimension"))
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .and_then(|dimensions| {
+            dimensions
+                .try_into()
+                .map_err(|_| Error::Msg("internal packed KV input shape conversion failed".into()))
+        })
+}
+
 pub(crate) fn packed_metal_head_dimension_supported(head_dimension: usize) -> bool {
     matches!(head_dimension, 64 | 128 | 256)
 }
@@ -423,7 +464,6 @@ impl DenseFallbackPackedDecoderCache {
             return Ok(());
         }
         let mut dense = ContiguousKvCache::new(self.staged.layers());
-        let shape_prefix = [self.staged.batch as i32, self.staged.kv_heads as i32];
         let width = self.staged.head_dimension;
         let mut reconstructed = false;
         for (layer_index, layer) in self.staged.layers.iter().enumerate() {
@@ -449,12 +489,7 @@ impl DenseFallbackPackedDecoderCache {
             let (evaluated_tokens, keys, values) =
                 self.staged.evaluated_dense_layer(layer_index)?;
             debug_assert_eq!(evaluated_tokens, tokens);
-            let shape = [
-                shape_prefix[0],
-                shape_prefix[1],
-                tokens as i32,
-                width as i32,
-            ];
+            let shape = mlx_shape([self.staged.batch, self.staged.kv_heads, tokens, width])?;
             let keys = Array::from_slice(&keys, &shape).as_dtype(key_dtype)?;
             let values = Array::from_slice(&values, &shape).as_dtype(value_dtype)?;
             keys.eval()?;
@@ -534,7 +569,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         if self.dense_active {
             self.dense.offset()
         } else {
-            self.staged.logical_len() as i32
+            i32::try_from(self.staged.logical_len())
+                .expect("packed cache length is bounded to the MLX i32 range")
         }
     }
 
@@ -542,7 +578,8 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         if self.dense_active {
             self.dense.batch_size()
         } else {
-            self.staged.batch_size() as i32
+            i32::try_from(self.staged.batch_size())
+                .expect("packed cache batch is validated for the MLX i32 range")
         }
     }
 
@@ -591,7 +628,23 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 Some("query, key, and value tensors must all have rank four")
             } else if layer >= self.staged.layers() {
                 Some("layer index is out of range")
-            } else if q_shape[0] != self.staged.batch
+            } else if q_shape
+                .iter()
+                .chain(k_shape.iter())
+                .chain(v_shape.iter())
+                .any(|&dimension| dimension < 0)
+            {
+                Some("query, key, and value tensors must not have negative MLX dimensions")
+            } else {
+                None
+            };
+            if let Some(reason) = shape_reason {
+                return self.decline_before_packed_mutation("geometry/dtype", reason);
+            }
+            let q_shape = packed_input_shape(q_shape, "query")?;
+            let k_shape = packed_input_shape(k_shape, "key")?;
+            let v_shape = packed_input_shape(v_shape, "value")?;
+            let shape_reason = if q_shape[0] != self.staged.batch
                 || k_shape[0] != self.staged.batch
                 || v_shape[0] != self.staged.batch
             {
@@ -799,7 +852,10 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         if self.pending_step.is_some() {
             self.rollback_pending("truncate", "discarded pending packed step")?;
         }
-        self.staged.trim(len as usize)?;
+        let len = usize::try_from(len).map_err(|_| {
+            Error::Config("packed cache truncate length must not be negative".into())
+        })?;
+        self.staged.trim(len)?;
         if len == 0 {
             self.packed_layer_dtypes.fill(None);
         }
@@ -1361,6 +1417,7 @@ impl PackedGroupAffineKvCache {
         if group_size == 0 || head_dimension == 0 || batch == 0 || kv_heads == 0 || layers == 0 {
             return Err(Error::Config("invalid packed KV shape".into()));
         }
+        let _ = mlx_shape([batch, kv_heads, 1, head_dimension])?;
         Ok(Self {
             identity: identity.into(),
             group_size,
@@ -1444,7 +1501,13 @@ impl PackedGroupAffineKvCache {
         if layer >= self.layers.len() {
             return Err(Error::Config("layer out of range".into()));
         }
-        self.grow(self.logical_len + step);
+        let next_logical_len = self
+            .logical_len
+            .checked_add(step)
+            .ok_or_else(|| Error::Config("packed cache length overflow".into()))?;
+        i32::try_from(next_logical_len)
+            .map_err(|_| Error::Config("packed cache length exceeds MLX i32 range".into()))?;
+        self.grow(next_logical_len);
         let rows = self.rows();
         let width = self.row_width();
         let group = self.group_size;
@@ -1473,9 +1536,9 @@ impl PackedGroupAffineKvCache {
                 .layers
                 .iter()
                 .flatten()
-                .all(|l| l.keys.logical_tokens() == self.logical_len + step)
+                .all(|l| l.keys.logical_tokens() == next_logical_len)
         {
-            self.logical_len += step;
+            self.logical_len = next_logical_len;
         }
         Ok(())
     }
@@ -1735,9 +1798,9 @@ impl PackedGroupAffineKvCache {
             let code_range = old_key_groups * rows * key_bytes..complete_groups * rows * key_bytes;
             let metadata_range = old_key_groups * rows * self.head_dimension
                 ..complete_groups * rows * self.head_dimension;
-            let shape_codes = [self.batch, self.kv_heads, groups, key_bytes].map(|v| v as i32);
+            let shape_codes = mlx_shape([self.batch, self.kv_heads, groups, key_bytes])?;
             let shape_metadata =
-                [self.batch, self.kv_heads, groups, self.head_dimension].map(|v| v as i32);
+                mlx_shape([self.batch, self.kv_heads, groups, self.head_dimension])?;
             Some((
                 Array::from_slice(
                     &row_major_outer_rows(
@@ -1776,9 +1839,8 @@ impl PackedGroupAffineKvCache {
                 old_value_tokens * rows * value_bytes..value_tokens * rows * value_bytes;
             let metadata_range =
                 old_value_tokens * rows * value_groups..value_tokens * rows * value_groups;
-            let shape_codes = [self.batch, self.kv_heads, tokens, value_bytes].map(|v| v as i32);
-            let shape_metadata =
-                [self.batch, self.kv_heads, tokens, value_groups].map(|v| v as i32);
+            let shape_codes = mlx_shape([self.batch, self.kv_heads, tokens, value_bytes])?;
+            let shape_metadata = mlx_shape([self.batch, self.kv_heads, tokens, value_groups])?;
             Some((
                 Array::from_slice(
                     &row_major_outer_rows(
@@ -1966,8 +2028,8 @@ impl PackedGroupAffineKvCache {
         let rows = self.rows();
         let width = self.head_dimension;
         let key_bytes = tail.code_bytes_per_group();
-        let code_shape = [self.batch, self.kv_heads, 1, key_bytes].map(|value| value as i32);
-        let metadata_shape = [self.batch, self.kv_heads, 1, width].map(|value| value as i32);
+        let code_shape = mlx_shape([self.batch, self.kv_heads, 1, key_bytes])?;
+        let metadata_shape = mlx_shape([self.batch, self.kv_heads, 1, width])?;
         let codes = Array::from_slice(&tail.codes, &code_shape);
         let scales = Array::from_slice(&tail.scales, &metadata_shape);
         let zeros = Array::from_slice(&tail.zeros, &metadata_shape);
@@ -2543,6 +2605,13 @@ mod tests {
     use crate::primitives::kv_cache::PackedAttentionMask;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn rejects_mlx_dimension_overflow_before_storage_allocation() {
+        let oversized = usize::try_from(i32::MAX).unwrap() + 1;
+        let error = PackedGroupAffineKvCache::new("overflow", 1, oversized, 1, 64, 32).unwrap_err();
+        assert!(error.to_string().contains("exceeds MLX i32 range"));
+    }
+
     #[derive(Debug)]
     struct TestPackedKernel {
         calls: AtomicUsize,
@@ -2903,8 +2972,9 @@ mod tests {
 
     #[test]
     fn atomic_layers_and_preflight_are_reachable() {
-        let mut c = PackedGroupAffineKvCache::new("m", 2, 1, 1, 5, 4).unwrap();
-        let x = data(2, 1, 5, 0.0);
+        let mut c =
+            PackedGroupAffineKvCache::new("m", 2, 1, 1, 64, PACKED_METAL_QUANT_GROUP_SIZE).unwrap();
+        let x = data(2, 1, 64, 0.0);
         let updates = [(&x[..], &x[..]), (&x[..x.len() - 1], &x[..x.len() - 1])];
         assert!(c.append_all_layers(&updates, 2).is_err());
         assert_eq!(c.logical_len(), 0);
@@ -3640,7 +3710,7 @@ mod tests {
         actual_values.eval().unwrap();
         assert_eq!(
             actual_keys.shape(),
-            &[keep.len(), KV_HEADS, STEP + 1, WIDTH]
+            &mlx_shape([keep.len(), KV_HEADS, STEP + 1, WIDTH]).unwrap()
         );
         for (actual, expected) in [
             (
@@ -4028,6 +4098,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn assert_real_metal_dense_sdpa_case(
         dtype: mlx_rs::Dtype,
         head_dimension: usize,

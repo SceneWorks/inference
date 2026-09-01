@@ -11,6 +11,37 @@ use crate::primitives::packed_group_affine_kv::{
 use mlx_rs::fast::{MetalKernel, OutputArg};
 use mlx_rs::{Array, Dtype};
 
+fn checked_shape(shape: &[i32], tensor: &str) -> Result<[usize; 4]> {
+    let [batch, heads, tokens, width] = shape else {
+        return Err(Error::Unsupported(format!("SC-20676 {tensor} buffer rank")));
+    };
+    [*batch, *heads, *tokens, *width]
+        .map(|dimension| {
+            usize::try_from(dimension).map_err(|_| {
+                Error::Unsupported(format!("SC-20676 {tensor} buffer has a negative dimension"))
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .and_then(|dimensions| {
+            dimensions
+                .try_into()
+                .map_err(|_| Error::Msg("internal SC-20676 shape conversion failed".into()))
+        })
+}
+
+fn checked_div_ceil(value: usize, divisor: usize, name: &str) -> Result<usize> {
+    if divisor == 0 {
+        return Err(Error::Msg(format!("SC-20676 {name} divisor is zero")));
+    }
+    Ok(value / divisor + usize::from(!value.is_multiple_of(divisor)))
+}
+
+fn checked_msl_i32(value: usize, name: &str) -> Result<i32> {
+    i32::try_from(value)
+        .map_err(|_| Error::Unsupported(format!("SC-20676 {name} exceeds MSL i32 range")))
+}
+
 /// Mask forms the retained reader can prove without allocating a score matrix.  Arbitrary
 /// additive masks deliberately select the observable dense fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +88,9 @@ impl PackedMetalGpuFamily {
 
 const HEADER: &str = r#"#include <metal_stdlib>
 using namespace metal;
+
+template <typename T> struct sc20676_device_element;
+template <typename T> struct sc20676_device_element<device T*> { using type = T; };
 "#;
 
 const MSL: &str = r#"
@@ -130,7 +164,8 @@ const MSL: &str = r#"
     for (uint owned = 0; owned < VALUES_PER_THREAD; ++owned) {
         const uint d = tid + owned * THREADS;
         if (d < q_shape[3]) {
-            out[((b*q_shape[1]+qh)*q_shape[2]+qi)*q_shape[3]+d] = outv[owned] / shared_norm;
+            using OutputT = typename sc20676_device_element<decltype(out)>::type;
+            out[((b*q_shape[1]+qh)*q_shape[2]+qi)*q_shape[3]+d] = static_cast<OutputT>(outv[owned] / shared_norm);
         }
     }
 "#;
@@ -233,45 +268,70 @@ impl PackedMetalKernel {
         v_zero: &Array,
         mask: PackedMask,
     ) -> Result<Array> {
-        let shape = q.shape();
-        if k_codes.ndim() != 4 || v_codes.ndim() != 4 {
-            return Err(Error::Unsupported("SC-20676 packed buffer rank".into()));
-        }
-        let q_shape = shape;
+        let q_shape = q.shape();
         let kc_shape = k_codes.shape();
         let ks_shape = k_scale.shape();
         let kz_shape = k_zero.shape();
         let vc_shape = v_codes.shape();
         let vs_shape = v_scale.shape();
         let vz_shape = v_zero.shape();
-        if q_shape.len() != 4
-            || kc_shape.len() != 4
-            || ks_shape.len() != 4
-            || kz_shape.len() != 4
-            || vc_shape.len() != 4
-            || vs_shape.len() != 4
-            || vz_shape.len() != 4
-            || kc_shape[0] != q_shape[0]
-            || kc_shape[1] == 0
-            || q_shape[1] % kc_shape[1] != 0
-            || ks_shape != [kc_shape[0], kc_shape[1], kc_shape[2], q_shape[3]]
-            || kz_shape != ks_shape
-            || vc_shape[0] != q_shape[0]
-            || vc_shape[1] != kc_shape[1]
-            || vc_shape[2] == 0
-            || q_shape[2] > vc_shape[2]
-            || kc_shape[2] != vc_shape[2].div_ceil(PACKED_METAL_QUANT_GROUP_SIZE)
-            || vs_shape
+        let q_dimensions = checked_shape(q_shape, "query")?;
+        let kc_dimensions = checked_shape(kc_shape, "key codes")?;
+        let ks_dimensions = checked_shape(ks_shape, "key scales")?;
+        let kz_dimensions = checked_shape(kz_shape, "key zeros")?;
+        let vc_dimensions = checked_shape(vc_shape, "value codes")?;
+        let vs_dimensions = checked_shape(vs_shape, "value scales")?;
+        let vz_dimensions = checked_shape(vz_shape, "value zeros")?;
+        let [batch, query_heads, query_tokens, head_dimension] = q_dimensions;
+        let key_words = checked_div_ceil(
+            PACKED_METAL_QUANT_GROUP_SIZE
+                .checked_mul(head_dimension)
+                .ok_or_else(|| Error::Unsupported("SC-20676 key word size overflow".into()))?,
+            PACKED_CODES_PER_BYTE,
+            "key word size",
+        )?;
+        let value_words =
+            checked_div_ceil(head_dimension, PACKED_CODES_PER_BYTE, "value word size")?;
+        let key_groups = checked_div_ceil(
+            vc_dimensions[2],
+            PACKED_METAL_QUANT_GROUP_SIZE,
+            "key group count",
+        )?;
+        let value_groups = checked_div_ceil(
+            head_dimension,
+            PACKED_METAL_QUANT_GROUP_SIZE,
+            "value group count",
+        )?;
+        if batch == 0
+            || query_heads == 0
+            || query_tokens == 0
+            || !packed_metal_head_dimension_supported(head_dimension)
+            || kc_dimensions[0] != batch
+            || kc_dimensions[1] == 0
+            || query_heads % kc_dimensions[1] != 0
+            || ks_dimensions
                 != [
-                    vc_shape[0],
-                    vc_shape[1],
-                    vc_shape[2],
-                    q_shape[3].div_ceil(PACKED_METAL_QUANT_GROUP_SIZE),
+                    kc_dimensions[0],
+                    kc_dimensions[1],
+                    kc_dimensions[2],
+                    head_dimension,
                 ]
-            || vz_shape != vs_shape
-            || kc_shape[3]
-                != (PACKED_METAL_QUANT_GROUP_SIZE * q_shape[3]).div_ceil(PACKED_CODES_PER_BYTE)
-            || vc_shape[3] != q_shape[3].div_ceil(PACKED_CODES_PER_BYTE)
+            || kz_dimensions != ks_dimensions
+            || vc_dimensions[0] != batch
+            || vc_dimensions[1] != kc_dimensions[1]
+            || vc_dimensions[2] == 0
+            || query_tokens > vc_dimensions[2]
+            || kc_dimensions[2] != key_groups
+            || vs_dimensions
+                != [
+                    vc_dimensions[0],
+                    vc_dimensions[1],
+                    vc_dimensions[2],
+                    value_groups,
+                ]
+            || vz_dimensions != vs_dimensions
+            || kc_dimensions[3] != key_words
+            || vc_dimensions[3] != value_words
             || k_codes.dtype() != Dtype::Uint8
             || v_codes.dtype() != Dtype::Uint8
             || k_scale.dtype() != Dtype::Float16
@@ -301,18 +361,22 @@ impl PackedMetalKernel {
                 ))
             }
         };
-        if shape[0] == 0
-            || shape[1] == 0
-            || shape[2] == 0
-            || !packed_metal_head_dimension_supported(shape[3])
-        {
-            return Err(Error::Unsupported("SC-20676 packed Metal geometry".into()));
-        }
-        let tuning = self.gpu_family.tuning(shape[3]).ok_or_else(|| {
+        let tuning = self.gpu_family.tuning(head_dimension).ok_or_else(|| {
             Error::Unsupported(
                 "SC-20676 has no conservative tuning for this device/geometry".into(),
             )
         })?;
+        let threads = checked_msl_i32(tuning.threads, "thread-group width")?;
+        let grid_x = q_shape[1]
+            .checked_mul(q_shape[2])
+            .and_then(|value| value.checked_mul(threads))
+            .ok_or_else(|| Error::Unsupported("SC-20676 Metal grid dimension overflow".into()))?;
+        let group = checked_msl_i32(PACKED_METAL_QUANT_GROUP_SIZE, "quantization group")?;
+        let codes_per_byte = checked_msl_i32(PACKED_CODES_PER_BYTE, "codes per byte")?;
+        let key_words = checked_msl_i32(key_words, "key words")?;
+        let value_words = checked_msl_i32(value_words, "value words")?;
+        let simd_groups = checked_msl_i32(tuning.simd_groups, "SIMD-group count")?;
+        let values_per_thread = checked_msl_i32(tuning.values_per_thread, "values per thread")?;
         let out = self
             .kernel
             .apply()
@@ -324,21 +388,18 @@ impl PackedMetalKernel {
             .input(v_scale)
             .input(v_zero)
             .output(OutputArg {
-                shape: shape.to_vec(),
+                shape: q_shape.to_vec(),
                 dtype: q.dtype(),
             })
-            .grid(shape[1] * shape[2] * tuning.threads, shape[0], 1)
-            .thread_group(tuning.threads, 1, 1)
-            .template_arg("GROUP", PACKED_METAL_QUANT_GROUP_SIZE)
-            .template_arg("CODES_PER_BYTE", PACKED_CODES_PER_BYTE)
-            .template_arg(
-                "K_WORDS",
-                (PACKED_METAL_QUANT_GROUP_SIZE * shape[3]).div_ceil(PACKED_CODES_PER_BYTE),
-            )
-            .template_arg("V_WORDS", shape[3].div_ceil(PACKED_CODES_PER_BYTE))
-            .template_arg("THREADS", tuning.threads)
-            .template_arg("SIMD_GROUPS", tuning.simd_groups)
-            .template_arg("VALUES_PER_THREAD", tuning.values_per_thread)
+            .grid(grid_x, q_shape[0], 1)
+            .thread_group(threads, 1, 1)
+            .template_arg("GROUP", group)
+            .template_arg("CODES_PER_BYTE", codes_per_byte)
+            .template_arg("K_WORDS", key_words)
+            .template_arg("V_WORDS", value_words)
+            .template_arg("THREADS", threads)
+            .template_arg("SIMD_GROUPS", simd_groups)
+            .template_arg("VALUES_PER_THREAD", values_per_thread)
             .template_arg("MASK_MODE", mask_mode)
             .template_arg("WINDOW", window)
             .run()?
