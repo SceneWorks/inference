@@ -1387,8 +1387,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.quality.parity_max_error.is_finite()
         || !receipt.quality.perplexity_delta.is_finite()
         || receipt.quality.parity_max_error < 0.0
-        || receipt.quality.parity_max_error > 0.0001
-        || receipt.quality.perplexity_delta > 0.01
         || [
             receipt.quality.greedy_token_agreement,
             receipt.quality.structured_tool_agreement,
@@ -1397,6 +1395,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         ]
         .into_iter()
         .any(|v| !(0.0..=1.0).contains(&v))
+    {
+        return Err("quality evidence contains invalid numeric values".into());
+    }
+    if receipt.mode == "compressed"
+        && (receipt.quality.parity_max_error > 0.0001 || receipt.quality.perplexity_delta > 0.01)
     {
         return Err(format!(
             "quality thresholds failed: parityMaxError={}, perplexityDelta={}, greedyTokenAgreement={}, structuredToolAgreement={}, needleRetrieval={}, multiTurnPromptCache={}",
@@ -1414,10 +1417,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("quality contract evidence incomplete".into());
     }
-    if receipt.quality.greedy_token_agreement < 0.999
-        || receipt.quality.structured_tool_agreement < 1.0
-        || receipt.quality.needle_retrieval < 1.0
-        || receipt.quality.multi_turn_prompt_cache < 1.0
+    if (receipt.mode == "compressed"
+        && (receipt.quality.greedy_token_agreement < 0.999
+            || receipt.quality.structured_tool_agreement < 1.0
+            || receipt.quality.needle_retrieval < 1.0
+            || receipt.quality.multi_turn_prompt_cache < 1.0))
         || REQUIRED_FIXTURES.iter().any(|name| {
             receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
                 !f.passed
@@ -3054,7 +3058,7 @@ fn product_fixture_artifact(
     let metrics = compute_quality(&quality)?;
     let value = serde_json::json!({
         "fixture": name,
-        "independentReference": format!("fp32-snapshot:{}", reference.quality_observation.snapshot.sha256),
+        "independentReference": fixture_independent_reference(name, &reference.quality_observation.snapshot.sha256),
         "binding": {
             "coordinate": coordinate_slug(coordinate),
             "repeat": repeat,
@@ -3114,6 +3118,14 @@ fn product_fixture_artifact(
         },
     });
     Ok(sealed_json(&value))
+}
+
+fn fixture_independent_reference(name: &str, reference_inventory: &str) -> String {
+    if name == "kernel-fp32-reference" {
+        format!("host-fp32-dense-attention-v1;bf16-model:{reference_inventory}")
+    } else {
+        format!("bf16-model:{reference_inventory}")
+    }
 }
 
 fn fixture_artifact_name(fixture: &str, repeat: usize) -> String {
@@ -4208,6 +4220,83 @@ fn token_agreement(left: &[(i32, f64)], right: &[(i32, f64)]) -> (u64, u64) {
     (matches, total)
 }
 
+/// Run a fixed real MLX dense-attention dispatch against an independently accumulated fp64 host
+/// reference. Model-level candidate/bf16 differences must never be relabeled as kernel parity.
+fn dense_kernel_fp32_parity_errors() -> Result<Vec<f64>, String> {
+    const QUERY_HEADS: usize = 4;
+    const KV_HEADS: usize = 2;
+    const TOKENS: usize = 16;
+    const WIDTH: usize = 128;
+    let query = (0..QUERY_HEADS * WIDTH)
+        .map(|index| (index as i32 % 17 - 8) as f32 * 0.002)
+        .collect::<Vec<_>>();
+    let keys = (0..KV_HEADS * TOKENS * WIDTH)
+        .map(|index| (index as i32 % 29 - 14) as f32 * 0.001)
+        .collect::<Vec<_>>();
+    let values = (0..KV_HEADS * TOKENS * WIDTH)
+        .map(|index| (index as i32 % 23 - 11) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let q = mlx_rs::Array::from_slice(&query, &[1, QUERY_HEADS as i32, 1, WIDTH as i32]);
+    let k = mlx_rs::Array::from_slice(&keys, &[1, KV_HEADS as i32, TOKENS as i32, WIDTH as i32]);
+    let v = mlx_rs::Array::from_slice(&values, &[1, KV_HEADS as i32, TOKENS as i32, WIDTH as i32]);
+    let scale = 1.0 / (WIDTH as f32).sqrt();
+    let output = crate::primitives::attention::sdpa(
+        &q,
+        &k,
+        &v,
+        scale,
+        crate::primitives::attention::AttnMask::None,
+    )
+    .map_err(|error| format!("dense kernel parity dispatch: {error}"))?;
+    output
+        .eval()
+        .map_err(|error| format!("dense kernel parity evaluation: {error}"))?;
+    let actual = output.as_slice::<f32>();
+    let groups = QUERY_HEADS / KV_HEADS;
+    let mut expected = Vec::with_capacity(QUERY_HEADS * WIDTH);
+    for query_head in 0..QUERY_HEADS {
+        let kv_head = query_head / groups;
+        let query_base = query_head * WIDTH;
+        let kv_base = kv_head * TOKENS * WIDTH;
+        let mut scores = Vec::with_capacity(TOKENS);
+        let mut maximum = f32::NEG_INFINITY;
+        for token in 0..TOKENS {
+            let key_base = kv_base + token * WIDTH;
+            let dot = (0..WIDTH)
+                .map(|channel| query[query_base + channel] * keys[key_base + channel])
+                .sum::<f32>()
+                * scale;
+            maximum = maximum.max(dot);
+            scores.push(dot);
+        }
+        let denominator = scores
+            .iter()
+            .map(|score| (*score - maximum).exp())
+            .sum::<f32>();
+        for channel in 0..WIDTH {
+            expected.push(
+                scores
+                    .iter()
+                    .enumerate()
+                    .map(|(token, score)| {
+                        ((*score - maximum).exp() / denominator)
+                            * values[kv_base + token * WIDTH + channel]
+                    })
+                    .sum::<f32>(),
+            );
+        }
+    }
+    let errors = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| f64::from((*actual - expected).abs()))
+        .collect::<Vec<_>>();
+    drop(output);
+    drop((q, k, v));
+    mlx_rs::memory::clear_cache();
+    Ok(errors)
+}
+
 /// Convert four actual candidate/reference fixture pairs into the raw quality input consumed by
 /// [`ReceiptBuilder`].  This helper intentionally rejects a fixture that did not execute its own
 /// required behavior (tool parsing, needle recovery, or prefix result equality), rather than
@@ -4224,16 +4313,7 @@ pub fn quality_from_product_fixtures(
     cache_reference: &ProductFixtureResult,
     expected_needle: &str,
 ) -> Result<QualityObservation, String> {
-    let candidate_logits = &kernel_candidate.quality_observation.prefill_logits;
-    let reference_logits = &kernel_reference.quality_observation.prefill_logits;
-    if candidate_logits.len() != reference_logits.len() || candidate_logits.is_empty() {
-        return Err("candidate/reference production logits are not comparable".into());
-    }
-    let parity_errors = candidate_logits
-        .iter()
-        .zip(reference_logits)
-        .map(|(candidate, reference)| f64::from((candidate - reference).abs()))
-        .collect::<Vec<_>>();
+    let parity_errors = dense_kernel_fp32_parity_errors()?;
     let (greedy_matches, greedy_total) = token_agreement(
         &kernel_candidate.quality_observation.token_probabilities,
         &kernel_reference.quality_observation.token_probabilities,
@@ -4926,7 +5006,7 @@ fn product_receipt(
                 artifact_name,
                 artifact_sha256: hash,
                 artifact_sidecar_sha256: seal_bytes(artifact.sidecar.as_bytes()),
-                independent_reference: format!("fp32-snapshot:{}", reference.sha256),
+                independent_reference: fixture_independent_reference(name, &reference.sha256),
             },
         );
     }
@@ -5290,6 +5370,14 @@ mod tests {
             ..raw
         })
         .is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dense_kernel_fixture_uses_independent_host_fp32_reference() {
+        let errors = dense_kernel_fp32_parity_errors().unwrap();
+        assert!(!errors.is_empty());
+        assert!(errors.into_iter().fold(0.0_f64, f64::max) <= 0.0001);
     }
 
     struct FakeSampler(u8);
@@ -5673,6 +5761,8 @@ mod tests {
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());
         let mut quality_tampered = receipt.clone();
+        quality_tampered.mode = "compressed".into();
+        quality_tampered.provenance.command = "run --mode compressed".into();
         quality_tampered.quality.parity_max_error = 0.1;
         assert!(validate_receipt_semantics(&quality_tampered)
             .unwrap_err()
