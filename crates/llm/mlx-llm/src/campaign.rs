@@ -1231,7 +1231,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         && receipt.memory.persistent_kv_bytes.abs_diff(dense)
             > receipt.memory.reconciliation.tolerance_bytes
     {
-        return Err("dense KV exceeds tolerance".into());
+        return Err(format!(
+            "dense KV exceeds tolerance: observed={}, theoretical={}, tolerance={}",
+            receipt.memory.persistent_kv_bytes,
+            dense,
+            receipt.memory.reconciliation.tolerance_bytes,
+        ));
     }
     let end = receipt.memory.phase_samples.last().unwrap();
     if end.phys_footprint_bytes
