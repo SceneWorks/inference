@@ -328,7 +328,7 @@ fn chunked_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize
 /// One real prefill of an `S`-token prompt: a fresh contiguous cache, `decode_logits(ids[1,S], …, 0)`,
 /// evaluated. This is the shipping (chunked) path end-to-end.
 fn prefill_step(model: &CausalLm, cache: &mut ContiguousKvCache, ids: &Array) {
-    cache.reset();
+    cache.reset().unwrap();
     let logits = model.decode_logits(ids, cache, 0).unwrap();
     eval(std::iter::once(&logits)).unwrap();
 }
@@ -384,7 +384,7 @@ fn prefill_breakdown(name: &str, model: &CausalLm) {
         // Model-level real prefill (shipping/chunked path).
         let ids = Array::from_slice(&vec![1i32; s], &[1, si]);
         let t_after = timed_prefill(|| prefill_step(model, &mut cache, &ids));
-        cache.reset();
+        cache.reset().unwrap();
 
         // SDPA-isolated before vs after at the real prefill attention shape, summed over all layers.
         let q = synth(&[1, h, si, hd]);

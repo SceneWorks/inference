@@ -269,9 +269,9 @@ impl KvCache for DenseFallbackPackedDecoderCache {
         self.dense.truncate(len)
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
         self.dense_before_mutation("reset");
-        self.dense.reset();
+        self.dense.reset()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

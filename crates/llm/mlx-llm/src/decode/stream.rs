@@ -11,10 +11,11 @@
 //! *mid-stream* stops promptly and returns the partial output marked
 //! [`FinishReason::Cancelled`].
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
+use crate::primitives::kv_cache::ContiguousKvCache;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
@@ -141,7 +142,34 @@ pub fn generate_with(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
+    generate_with_observer(
+        decoder,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        None,
+    )
+}
+
+/// Internal campaign-only variant.  `None` preserves the ordinary zero-overhead path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_observer(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("cancellation-cleanup");
+        }
         return Err(Error::Canceled); // typed pre-inference cancel
     }
     if prompt_ids.is_empty() {
@@ -149,24 +177,106 @@ pub fn generate_with(
     }
 
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = decoder.make_cache();
+    let output = {
+        let mut cache = decoder.make_cache();
+        let mut observed_cache_events = 0;
+        // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
+        // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
+        let prompt = input_ids(prompt_ids);
+        let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+        if let Some(observer) = observer.as_deref_mut() {
+            // This host read is campaign-only.  Normal generation does not materialize logits or
+            // pay this synchronization cost; the receipt producer needs actual product logits for
+            // its independent fp32/reference-quality calculation.
+            let values = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+            observer.logits("prefill", &values);
+        }
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("prefill-peak");
+        }
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        let output = {
+            let mut saw_first_token = false;
+            let mut observed_events = |event| {
+                if !saw_first_token && matches!(event, StreamEvent::Token { .. }) {
+                    saw_first_token = true;
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer.phase("first-token");
+                    }
+                }
+                on_event(event);
+            };
+            decode_loop(
+                decoder,
+                cache.as_mut(),
+                logits,
+                rng,
+                prompt_ids.to_vec(),
+                config,
+                cancel,
+                &mut observed_events,
+                constraint,
+                should_stop,
+                None,
+            )?
+        };
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.phase("decode-steady");
+        }
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        if matches!(output.finish_reason, FinishReason::Cancelled) {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("cancellation-cleanup");
+            }
+        }
+        cache.reset()?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        output
+    };
+    Ok(output)
+}
 
-    // Prefill the whole prompt at offset 0; logits are for the last prompt position.
-    let prompt = input_ids(prompt_ids);
-    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
-
-    decode_loop(
-        decoder,
-        cache.as_mut(),
-        logits,
-        rng,
-        prompt_ids.to_vec(),
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-    )
+/// Export only cache-owned byte observations.  Unsupported cache implementations produce no
+/// synthetic events; the receipt producer must then record an explicit fallback rather than
+/// inventing an allocation total.
+fn observe_cache_events(
+    cache: &mut dyn KvCache,
+    seen: &mut usize,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> Result<()> {
+    let Some(observer) = observer.as_deref_mut() else {
+        return Ok(());
+    };
+    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
+        return Ok(());
+    };
+    let mut latest_by_layer = std::collections::BTreeMap::new();
+    for event in cache.events().iter().skip(*seen) {
+        if event.role == "cache" && event.lifetime == "persistent" {
+            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
+        } else {
+            observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
+        }
+    }
+    *seen = cache.events().len();
+    if !latest_by_layer.is_empty() {
+        let bytes = latest_by_layer
+            .values()
+            .try_fold(0_u64, |total, (bytes, _)| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
+                })
+            })?;
+        let tokens = latest_by_layer
+            .values()
+            .map(|(_, tokens)| *tokens)
+            .max()
+            .unwrap_or_default();
+        observer.cache_snapshot(bytes, tokens);
+    }
+    Ok(())
 }
 
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
@@ -214,6 +324,7 @@ pub fn generate_with_cache(
         on_event,
         None,
         None,
+        None,
     )
 }
 
@@ -253,6 +364,7 @@ pub fn generate_from_prefill(
         on_event,
         constraint,
         should_stop,
+        None,
     )
 }
 
@@ -276,6 +388,7 @@ pub(crate) fn decode_loop(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
@@ -295,6 +408,10 @@ pub(crate) fn decode_loop(
             sample(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.token_probability("decode", next, selected_token_probability(&logits, next)?);
+        }
+
         if config.stop_tokens.contains(&next) {
             finish = FinishReason::StopToken;
             break;
@@ -305,6 +422,11 @@ pub(crate) fn decode_loop(
         }
 
         on_event(StreamEvent::Token { id: next, step });
+        if step == 0 {
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.phase("first-token");
+            }
+        }
         generated.push(next);
         history.push(next);
 
@@ -333,6 +455,35 @@ pub(crate) fn decode_loop(
         tokens: generated,
         finish_reason: finish,
     })
+}
+
+/// Product-owned selected-token probability.  This runs only while an evidence observer is
+/// attached, after the exact production logits have been produced and before sampling mutates the
+/// decode state.  The max-shifted reduction is deliberately finite/checked so malformed logits
+/// cannot be turned into a plausible campaign quality value.
+fn selected_token_probability(logits: &Array, token: i32) -> Result<f64> {
+    if token < 0 {
+        return Err(Error::Msg("negative sampled token id".into()));
+    }
+    let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+    let values = logits_f32.as_slice::<f32>();
+    let token = token as usize;
+    if token >= values.len() || values.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Msg(
+            "invalid product logits for campaign observation".into(),
+        ));
+    }
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denominator = values
+        .iter()
+        .map(|value| f64::from((*value - maximum).exp()))
+        .sum::<f64>();
+    let numerator = f64::from((values[token] - maximum).exp());
+    let probability = numerator / denominator;
+    if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+        return Err(Error::Msg("invalid selected-token probability".into()));
+    }
+    Ok(probability)
 }
 
 /// A non-reproducible seed for `GenerationConfig::seed == None`.

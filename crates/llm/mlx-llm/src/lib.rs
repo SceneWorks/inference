@@ -40,6 +40,7 @@
 //! MLX's default Metal device is single-threaded; engine instances hold MLX `Array`s and are
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
 
+pub mod campaign;
 pub mod config;
 pub mod decode;
 pub mod error;

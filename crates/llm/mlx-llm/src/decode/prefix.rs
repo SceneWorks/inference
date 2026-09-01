@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use core_llm::prefix::{PrefixId, PrefixIndex};
 
@@ -58,6 +58,13 @@ pub struct PrefixCache {
     /// Full-sequence per-layer `(keys, values)` for each live entry, keyed by the index's handle.
     kv: HashMap<PrefixId, Vec<(Array, Array)>>,
     stats: PrefixStats,
+    reuse_events: Vec<PrefixReuseEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixReuseEvent {
+    pub matched_tokens: usize,
+    pub stored_sequences: usize,
 }
 
 impl PrefixCache {
@@ -67,12 +74,18 @@ impl PrefixCache {
             index: PrefixIndex::new(capacity),
             kv: HashMap::new(),
             stats: PrefixStats::default(),
+            reuse_events: Vec::new(),
         }
     }
 
     /// Cumulative reuse accounting since construction.
     pub fn stats(&self) -> PrefixStats {
         self.stats
+    }
+
+    /// Producer-only evidence of actual prefix reuse (not a caller-supplied boolean).
+    pub fn reuse_events(&self) -> &[PrefixReuseEvent] {
+        &self.reuse_events
     }
 
     /// Number of stored sequences currently held.
@@ -111,6 +124,10 @@ impl PrefixCache {
                 self.stats.hits += 1;
                 self.stats.reused_prefix_tokens += len;
                 self.stats.computed_prefill_tokens += prompt_len - len;
+                self.reuse_events.push(PrefixReuseEvent {
+                    matched_tokens: len,
+                    stored_sequences: self.kv.len(),
+                });
                 Ok(Some((ContiguousKvCache::seeded(layers), len)))
             }
             None => {
@@ -157,13 +174,14 @@ pub fn generate_cached(
     on_event: &mut dyn FnMut(StreamEvent),
     prefix_cache: &mut PrefixCache,
 ) -> Result<GenerationOutput> {
-    generate_cached_with(
+    generate_cached_with_observer(
         model,
         prompt_ids,
         config,
         cancel,
         on_event,
         prefix_cache,
+        None,
         None,
         None,
     )
@@ -184,6 +202,33 @@ pub fn generate_cached_with(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
+    generate_cached_with_observer(
+        model,
+        prompt_ids,
+        config,
+        cancel,
+        on_event,
+        prefix_cache,
+        constraint,
+        should_stop,
+        None,
+    )
+}
+
+/// Campaign-only observer variant of [`generate_cached_with`].  The observer is attached to the
+/// cache-hit prefill and decode that actually execute, rather than to a later single-shot control.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_cached_with_observer(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    prefix_cache: &mut PrefixCache,
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    mut observer: Option<&mut dyn crate::campaign::Observer>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
     }
@@ -200,8 +245,16 @@ pub fn generate_cached_with(
         Some((cache, len)) => (cache, len),
         None => (model.new_cache(), 0),
     };
+    let mut observed_cache_events = 0;
     let suffix = input_ids(&prompt_ids[matched_len..]);
     let logits = model.decode_logits(&suffix, &mut cache, matched_len as i32)?;
+    if let Some(observer) = observer.as_deref_mut() {
+        let logits_f32 = logits.as_dtype(Dtype::Float32)?;
+        let values = logits_f32.as_slice::<f32>().to_vec();
+        observer.logits("prefill", &values);
+        observer.phase("prefill-peak");
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+    }
 
     let out = decode_loop(
         model,
@@ -214,7 +267,16 @@ pub fn generate_cached_with(
         on_event,
         constraint,
         should_stop,
+        observer.as_deref_mut(),
     )?;
+
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.phase("decode-steady");
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+        if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
+            observer.phase("cancellation-cleanup");
+        }
+    }
 
     // Store the sequence whose KV the cache actually holds, so the next shared-prefix request
     // reuses it. On a budget (`MaxTokens`) finish — and on a host-stop (`Stopped`) finish —
@@ -226,8 +288,49 @@ pub fn generate_cached_with(
     full.extend_from_slice(&out.tokens);
     full.truncate(cache.offset() as usize);
     prefix_cache.store(full, &cache);
+    cache.reset()?;
+    if let Some(observer) = observer.as_deref_mut() {
+        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+    }
 
     Ok(out)
+}
+
+fn observe_cache_events(
+    cache: &mut dyn KvCache,
+    seen: &mut usize,
+    observer: &mut dyn crate::campaign::Observer,
+) -> Result<()> {
+    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
+        return Ok(());
+    };
+    let mut latest_by_layer = std::collections::BTreeMap::new();
+    for event in cache.events().iter().skip(*seen) {
+        if event.role == "cache" && event.lifetime == "persistent" {
+            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+        } else if event.lifetime == "released" {
+            observer.release_event(event.operation, event.role, event.bytes);
+        } else {
+            observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
+        }
+    }
+    *seen = cache.events().len();
+    if !latest_by_layer.is_empty() {
+        let bytes = latest_by_layer
+            .values()
+            .try_fold(0_u64, |total, (bytes, _)| {
+                total.checked_add(*bytes).ok_or_else(|| {
+                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
+                })
+            })?;
+        let tokens = latest_by_layer
+            .values()
+            .map(|(_, tokens)| *tokens)
+            .max()
+            .unwrap_or_default();
+        observer.cache_snapshot(bytes, tokens);
+    }
+    Ok(())
 }
 
 /// The sequence length (axis [`SEQ_AXIS`]) the stored per-layer KV actually holds — layer 0 speaks

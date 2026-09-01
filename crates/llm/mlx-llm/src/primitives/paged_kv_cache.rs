@@ -427,7 +427,7 @@ impl KvCache for PagedKvCache {
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
         // Single-sequence: the only valid non-empty keep is `[0]` (a no-op); an empty keep drops it.
         match keep {
-            [] => self.reset(),
+            [] => self.reset()?,
             [0] => {}
             other => {
                 return Err(Error::Msg(format!(
@@ -516,7 +516,7 @@ impl KvCache for PagedKvCache {
         Ok(())
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
         {
             let mut pool = self.pool.borrow_mut();
             for &id in &self.block_ids {
@@ -529,6 +529,7 @@ impl KvCache for PagedKvCache {
         self.tail_len = 0;
         self.frozen_k = vec![None; self.num_layers];
         self.frozen_v = vec![None; self.num_layers];
+        Ok(())
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -862,7 +863,7 @@ mod tests {
         let k = seq(1, 4, 1, 0.0);
         c.update(0, &k, &k).unwrap();
         assert_eq!(pool.borrow().live_blocks(), 2);
-        c.reset();
+        c.reset().unwrap();
         assert_eq!(pool.borrow().live_blocks(), 0);
         assert_eq!(c.offset(), 0);
     }

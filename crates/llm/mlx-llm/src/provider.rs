@@ -9,7 +9,7 @@
 //! `core_llm::JinjaChatTemplate`, story 7164), falling back to the typed [`Llama3Template`] when a
 //! snapshot ships no `tokenizer_config.json`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::path::Path;
 
 use core_llm::{
@@ -22,9 +22,10 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
+use crate::decode::generate_with_observer;
 use crate::decode::{
-    generate_from_prefill, generate_with, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_batch, generate_from_prefill, generate_with, BatchRequest, CancelFlag, ConstraintMask,
+    Decode, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -41,6 +42,67 @@ use mlx_rs::Array;
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
+
+enum CapturedCacheLifecycle {
+    Allocation(&'static str, &'static str, &'static str, u64),
+    Snapshot(u64, u64),
+    Release(&'static str, &'static str, u64),
+}
+
+#[derive(Default)]
+struct CacheLifecycleCapture {
+    events: Vec<CapturedCacheLifecycle>,
+}
+
+impl CacheLifecycleCapture {
+    fn replay(self, observer: &mut dyn crate::campaign::Observer) {
+        for event in self.events {
+            match event {
+                CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
+                    observer.allocation_event(kind, role, lifetime, bytes);
+                }
+                CapturedCacheLifecycle::Snapshot(bytes, tokens) => {
+                    observer.cache_snapshot(bytes, tokens);
+                }
+                CapturedCacheLifecycle::Release(kind, role, bytes) => {
+                    observer.release_event(kind, role, bytes);
+                }
+            }
+        }
+    }
+}
+
+impl crate::campaign::Observer for CacheLifecycleCapture {
+    fn phase(&mut self, _name: &'static str) {}
+
+    fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            role, role, lifetime, bytes,
+        ));
+    }
+
+    fn allocation_event(
+        &mut self,
+        kind: &'static str,
+        role: &'static str,
+        lifetime: &'static str,
+        bytes: u64,
+    ) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            kind, role, lifetime, bytes,
+        ));
+    }
+
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::Snapshot(bytes, tokens));
+    }
+
+    fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::Release(kind, role, bytes));
+    }
+}
 
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
@@ -395,6 +457,10 @@ fn substitute_vision_placeholders(
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
+    /// Architecture parsed from the loaded snapshot. Campaign receipts use this product-owned
+    /// identity instead of trusting the matrix row's caller-authored family label.
+    architecture: Architecture,
+    campaign_family: Option<&'static str>,
     model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
@@ -409,9 +475,342 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// Campaign-only prefix cache; ordinary serving never consults this state.
+    campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
 }
 
 impl LlamaProvider {
+    /// Frozen SC-20671 family identity for architectures that implement the campaign's contiguous
+    /// cache controls. Other architectures fail closed instead of being mislabeled as Llama/Qwen.
+    pub(crate) fn campaign_family(&self) -> CoreResult<&'static str> {
+        self.campaign_family.ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "SC-20671 does not support loaded architecture {:?} as Llama or Qwen",
+                self.architecture
+            ))
+        })
+    }
+
+    pub(crate) fn campaign_context_window(&self) -> CoreResult<u64> {
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "SC-20671 requires a causal decoder context window".into(),
+            ));
+        };
+        u64::try_from(model.config().max_position_embeddings)
+            .ok()
+            .filter(|tokens| *tokens >= 1_024)
+            .ok_or_else(|| {
+                CoreError::Load(
+                    "SC-20671 requires max_position_embeddings >= 1024 in loaded config".into(),
+                )
+            })
+    }
+
+    pub(crate) fn campaign_prompt_tokens(&self, prompt: &str) -> CoreResult<u64> {
+        u64::try_from(self.tokenizer.encode(prompt, false)?.len())
+            .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
+    }
+
+    /// Build a tokenizer-measured payload for one frozen context band. A binary search chooses the
+    /// largest deterministic filler that stays below the band target, avoiding assumptions that a
+    /// repeated source word maps to exactly one token for both supported families.
+    pub(crate) fn campaign_context_payload(&self, context_band: &str) -> CoreResult<String> {
+        Ok(self.campaign_context_band_measurement(context_band)?.0)
+    }
+
+    pub(crate) fn campaign_context_band_measurement(
+        &self,
+        context_band: &str,
+    ) -> CoreResult<(String, u64, u64)> {
+        let context_window = self.campaign_context_window()?;
+        let target = crate::campaign::context_band_target(context_window, context_band)
+            .map_err(CoreError::Load)?;
+        let header = format!("SC20671-CONTEXT-BAND-{context_band}");
+        let mut lower = 0usize;
+        let mut upper = usize::try_from(target)
+            .map_err(|_| CoreError::Load("campaign context target overflows usize".into()))?;
+        while lower < upper {
+            let midpoint = lower + (upper - lower).div_ceil(2);
+            let candidate = format!("{header}{}", " context".repeat(midpoint));
+            if self.campaign_prompt_tokens(&candidate)? <= target {
+                lower = midpoint;
+            } else {
+                upper = midpoint - 1;
+            }
+        }
+        let payload = format!("{header}{}", " context".repeat(lower));
+        let observed_tokens = self.campaign_prompt_tokens(&payload)?;
+        if observed_tokens < target / 2 || observed_tokens > target {
+            return Err(CoreError::Load(format!(
+                "context band {context_band} produced {observed_tokens} tokens for target {target}"
+            )));
+        }
+        Ok((payload, target, observed_tokens))
+    }
+
+    /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign
+    /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
+    pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
+        let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
+            Decoder::Causal(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+            Decoder::Qwen35(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+        };
+        crate::campaign::ProductGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dimension: head_dimension.max(0) as u64,
+            layers: layers as u64,
+            // The dense MLX decode cache is bf16 on this provider path.
+            element_bytes: 2,
+        }
+    }
+
+    /// Exercise real contiguous-cache prefix reuse on the loaded causal decoder.  Hybrid Qwen3.6
+    /// has a distinct cache contract and is rejected here rather than being mislabeled as a
+    /// successful contiguous-cache observation.
+    pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<u64> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        if cache.stats().hits == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce a cache hit".into(),
+            ));
+        }
+        u64::try_from(cache.stats().hits)
+            .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))
+    }
+
+    /// Execute the cache-hit half of the real prefix-reuse path with campaign observation attached.
+    /// The first call seeds the provider-owned cache; the second call is the measured operation and
+    /// must prove a new hit before its output can be used as coordinate evidence.
+    pub(crate) fn campaign_prefix_reuse_observed(
+        &self,
+        prompt: &str,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<(GenerationOutput, u64, u64)> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let before_hits = cache.stats().hits;
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        let mut emitted = 0usize;
+        let output = crate::decode::prefix::generate_cached_with_observer(
+            model,
+            &ids,
+            &config,
+            &cancel,
+            &mut |event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            cache,
+            None,
+            None,
+            Some(observer),
+        )
+        .map_err(to_core)?;
+        let hits = cache.stats().hits;
+        if hits <= before_hits || emitted == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce an observed cache hit and token".into(),
+            ));
+        }
+        Ok((
+            output,
+            u64::try_from(hits)
+                .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))?,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign prefix token count overflow".into()))?,
+        ))
+    }
+
+    /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
+    /// This is not emulated by serial `TextLlm` requests.
+    pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = generate_batch(model, &requests, &cancel, &mut |_, event| {
+            emitted += usize::from(matches!(event, StreamEvent::Token { .. }));
+        })
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no product tokens".into(),
+            ));
+        }
+        Ok(outputs.len() as u64)
+    }
+
+    /// Run the actual batched decoder while the receipt observer is attached to its prefill and
+    /// decode path.  Ordinary scheduling continues to call [`Self::campaign_supported_batch`].
+    pub(crate) fn campaign_supported_batch_observed(
+        &self,
+        prompt: &str,
+        batch: usize,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<(Vec<GenerationOutput>, u64)> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = crate::decode::batch::generate_batch_with_observer(
+            model,
+            &requests,
+            &cancel,
+            &mut |_, event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            Some(observer),
+        )
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no observed product tokens".into(),
+            ));
+        }
+        Ok((
+            outputs,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign batch token count overflow".into()))?,
+        ))
+    }
+
+    /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative
+    /// cleanup path rather than recording a pre-cancelled no-op request.
+    pub(crate) fn campaign_cancel_after_first_token(
+        &self,
+        mut request: TextLlmRequest,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<()> {
+        let cancel = crate::decode::CancelFlag::new();
+        request.cancel = cancel.clone();
+        let mut sink = |event: CoreEvent| {
+            if matches!(event, CoreEvent::Token { .. }) {
+                cancel.cancel();
+            }
+        };
+        let mut captured = CacheLifecycleCapture::default();
+        let output = self.generate_inner(&request, &mut sink, Some(&mut captured))?;
+        if output.finish_reason != Some(CoreFinish::Cancelled) {
+            return Err(CoreError::Load(
+                "campaign cancellation did not finish as cancelled".into(),
+            ));
+        }
+        observer.phase("cancellation-cleanup");
+        captured.replay(observer);
+        Ok(())
+    }
+
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.
@@ -425,6 +824,26 @@ impl LlamaProvider {
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
+        let text_config = cfg_value.get("text_config").unwrap_or(&cfg_value);
+        let architecture_name = text_config
+            .get("architectures")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let model_type = text_config
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let campaign_family = match arch {
+            Architecture::Qwen3 => Some("qwen"),
+            Architecture::Llama if architecture_name.contains("llama") || model_type == "llama" => {
+                Some("llama")
+            }
+            _ => None,
+        };
         let weights = Weights::from_dir(dir).map_err(to_core)?;
 
         let (model, mut descriptor) = if arch == Architecture::Qwen35 {
@@ -506,6 +925,8 @@ impl LlamaProvider {
         descriptor.capabilities.supports_tools = supports_tools;
         Ok(Self {
             descriptor,
+            architecture: arch,
+            campaign_family,
             model,
             tokenizer,
             template,
@@ -513,6 +934,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision,
             gemma4,
+            campaign_prefix_cache: RefCell::new(None),
         })
     }
 
@@ -524,8 +946,16 @@ impl LlamaProvider {
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+        let architecture = model.config().architecture;
+        let campaign_family = match architecture {
+            Architecture::Llama => Some("llama"),
+            Architecture::Qwen3 => Some("qwen"),
+            _ => None,
+        };
         Self {
             descriptor: provider_descriptor(),
+            architecture,
+            campaign_family,
             model: Decoder::Causal(model),
             tokenizer,
             template: Box::new(Llama3Template),
@@ -533,6 +963,7 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
         }
     }
 
@@ -953,6 +1384,27 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, None)
+    }
+}
+
+impl LlamaProvider {
+    /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
+    pub(crate) fn generate_observed(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, Some(observer))
+    }
+
+    fn generate_inner(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        mut observer: Option<&mut dyn crate::campaign::Observer>,
+    ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -1235,16 +1687,29 @@ impl TextLlm for LlamaProvider {
                         )
                         .map_err(to_core)?
                     }
-                    None => generate_with(
-                        &self.model,
-                        &prompt_ids,
-                        &config,
-                        &req.cancel,
-                        &mut sink,
-                        constraint,
-                        should_stop_opt,
-                    )
-                    .map_err(to_core)?,
+                    None => match observer.as_deref_mut() {
+                        Some(observer) => generate_with_observer(
+                            &self.model,
+                            &prompt_ids,
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            Some(observer),
+                        )
+                        .map_err(to_core)?,
+                        None => generate_with(
+                            &self.model,
+                            &prompt_ids,
+                            &config,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                        )
+                        .map_err(to_core)?,
+                    },
                 },
             }
         };
@@ -1632,6 +2097,33 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[derive(Default)]
+    struct RecordingLifecycleObserver(Vec<(&'static str, u64)>);
+
+    impl crate::campaign::Observer for RecordingLifecycleObserver {
+        fn phase(&mut self, _name: &'static str) {}
+
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+
+        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64) {
+            self.0.push(("persistent", bytes));
+        }
+
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.0.push(("released", bytes));
+        }
+    }
+
+    #[test]
+    fn cancellation_capture_replays_persistent_then_release_without_allocation_aliasing() {
+        let mut capture = CacheLifecycleCapture::default();
+        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8);
+        crate::campaign::Observer::release_event(&mut capture, "cache_release", "cache", 64);
+        let mut observer = RecordingLifecycleObserver::default();
+        capture.replay(&mut observer);
+        assert_eq!(observer.0, vec![("persistent", 64), ("released", 64)]);
+    }
 
     fn qwen36_wrapper() -> serde_json::Value {
         json!({
