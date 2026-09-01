@@ -1398,7 +1398,15 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .into_iter()
         .any(|v| !(0.0..=1.0).contains(&v))
     {
-        return Err("quality thresholds failed".into());
+        return Err(format!(
+            "quality thresholds failed: parityMaxError={}, perplexityDelta={}, greedyTokenAgreement={}, structuredToolAgreement={}, needleRetrieval={}, multiTurnPromptCache={}",
+            receipt.quality.parity_max_error,
+            receipt.quality.perplexity_delta,
+            receipt.quality.greedy_token_agreement,
+            receipt.quality.structured_tool_agreement,
+            receipt.quality.needle_retrieval,
+            receipt.quality.multi_turn_prompt_cache,
+        ));
     }
     if receipt.quality.fixture_evidence.len() != 4
         || receipt.quality.statistics.repeats != 5
@@ -5664,6 +5672,11 @@ mod tests {
         let mut timing_tampered = receipt.clone();
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());
+        let mut quality_tampered = receipt.clone();
+        quality_tampered.quality.parity_max_error = 0.1;
+        assert!(validate_receipt_semantics(&quality_tampered)
+            .unwrap_err()
+            .contains("parityMaxError=0.1"));
         let mut lifecycle_tampered = receipt.clone();
         lifecycle_tampered.lifecycle.append = false;
         assert!(validate_receipt_semantics(&lifecycle_tampered).is_err());
