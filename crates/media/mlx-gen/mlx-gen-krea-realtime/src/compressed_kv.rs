@@ -1,10 +1,10 @@
 //! Experimental compressed-domain attention for Krea Realtime's persistent KV cache.
 //!
 //! This module owns both a source-level CPU oracle and an off-by-default MLX custom-Metal
-//! dispatch. It packs the same D-axis affine rows as [`crate::causal::PackedKv`], streams
-//! those rows through tiled online softmax, and gives device code an exact fail-closed
-//! selection boundary. The public API remains disabled until a caller explicitly retains
-//! a Metal handle and produces the SC-20684 device receipt.
+//! dispatch. [`CompressedKvCache`] packs D-axis affine rows compatible with the existing
+//! `crate::causal::PackedKv` layout, streams those rows through tiled online softmax, and gives
+//! device code an exact fail-closed selection boundary. The public API remains disabled until a
+//! caller explicitly retains a Metal handle and produces the SC-20684 device receipt.
 //!
 //! No cached K/V row is expanded into a dense window and no score matrix is allocated.
 //! The only dynamic result allocation is the required output tensor; the device analogue
