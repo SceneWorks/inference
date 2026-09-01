@@ -3951,7 +3951,7 @@ pub fn run_dense_lifecycle_request_on_session(
         // load.  The version is monotonically scoped to `CampaignSession`, not this PID.
         observer.cache_state(session.advance_cache_state());
         observer.phase("prompt-cache-reuse");
-        provider.campaign_cancel_after_first_token(request, observer)?;
+        provider.campaign_cancel_after_first_token(observer)?;
         output
     };
     provider.campaign_release_cache_state();
@@ -4200,7 +4200,7 @@ fn run_coordinate_operation_on_session(
     provider.campaign_prefix_reuse(prefix_prompt)?;
     observer.cache_state(session.advance_cache_state());
     observer.phase("prompt-cache-reuse");
-    provider.campaign_cancel_after_first_token(request, &mut observer)?;
+    provider.campaign_cancel_after_first_token(&mut observer)?;
     provider.campaign_release_cache_state();
     mlx_rs::memory::clear_cache();
     observer.phase("post-run-release");

@@ -16,9 +16,9 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LoadSpec, Message, Quantize, RenderOptions,
-    Result as CoreResult, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter,
-    Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
+    Result as CoreResult, Role, Sampling, StopMatcher, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
+    ThinkingSegmenter, Tokenizer, ToolCall, ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -790,12 +790,14 @@ impl LlamaProvider {
     }
 
     /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative
-    /// cleanup path rather than recording a pre-cancelled no-op request.
+    /// cleanup path rather than recording a pre-cancelled no-op request. This uses a dedicated
+    /// no-tools prompt: a valid tool-only response is intentionally lifted out of the content
+    /// stream, so reusing a structured-output fixture would never trigger a content-token cancel.
     pub(crate) fn campaign_cancel_after_first_token(
         &self,
-        mut request: TextLlmRequest,
         observer: &mut dyn crate::campaign::Observer,
     ) -> CoreResult<()> {
+        let mut request = campaign_cancellation_probe_request();
         let cancel = crate::decode::CancelFlag::new();
         request.cancel = cancel.clone();
         let mut sink = |event: CoreEvent| {
@@ -1267,6 +1269,20 @@ impl LlamaProvider {
             visual_pos_mask,
             deepstack,
         })
+    }
+}
+
+fn campaign_cancellation_probe_request() -> TextLlmRequest {
+    TextLlmRequest {
+        messages: vec![Message::text(
+            Role::User,
+            "Reply with exactly these words: alpha beta gamma delta epsilon zeta eta theta.",
+        )],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 16,
+        seed: Some(0),
+        thinking: ThinkingMode::Disabled,
+        ..Default::default()
     }
 }
 
@@ -2188,6 +2204,18 @@ mod tests {
         let mut observer = RecordingLifecycleObserver::default();
         capture.replay(&mut observer);
         assert_eq!(observer.0, vec![("persistent", 64), ("released", 64)]);
+    }
+
+    #[test]
+    fn campaign_cancellation_probe_is_bounded_content_without_tools_or_thinking() {
+        let request = campaign_cancellation_probe_request();
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.tools.is_empty());
+        assert!(request.stop.is_empty());
+        assert!(request.constraint.is_none());
+        assert_eq!(request.thinking, ThinkingMode::Disabled);
+        assert_eq!(request.max_new_tokens, 16);
+        assert!(request.sampling.is_greedy());
     }
 
     fn qwen36_wrapper() -> serde_json::Value {
