@@ -1247,7 +1247,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || end.mlx.cache_bytes
             > weights_loaded.mlx.cache_bytes + receipt.memory.release.mlx_cache_tolerance_bytes
     {
-        return Err("release did not return within tolerance".into());
+        return Err(format!(
+            "release did not return within tolerance: endPhys={}, weightsLoadedPhys={}, physTolerance={}, endMlxActive={}, weightsLoadedMlxActive={}, activeTolerance={}, endMlxCache={}, weightsLoadedMlxCache={}, cacheTolerance={}",
+            end.phys_footprint_bytes,
+            weights_loaded.phys_footprint_bytes,
+            receipt.memory.release.phys_footprint_tolerance_bytes,
+            end.mlx.active_bytes,
+            weights_loaded.mlx.active_bytes,
+            receipt.memory.release.mlx_active_tolerance_bytes,
+            end.mlx.cache_bytes,
+            weights_loaded.mlx.cache_bytes,
+            receipt.memory.release.mlx_cache_tolerance_bytes,
+        ));
     }
     if receipt.timings.samples.len() != 5
         || !receipt
@@ -5577,6 +5588,18 @@ mod tests {
         .expect("builder must produce a complete v3 receipt");
         assert_eq!(receipt.provenance.model_file_bytes, 100);
         assert_eq!(receipt.memory.model_weights_bytes, 1);
+        let mut unreleased_active = receipt.clone();
+        unreleased_active
+            .memory
+            .phase_samples
+            .last_mut()
+            .unwrap()
+            .mlx
+            .active_bytes = 4;
+        let release_error = validate_receipt_semantics(&unreleased_active).unwrap_err();
+        assert!(
+            release_error.contains("endMlxActive=4, weightsLoadedMlxActive=3, activeTolerance=0")
+        );
         let mut reference_only_memory = receipt.clone();
         reference_only_memory.memory.phase_samples[0]
             .mlx
