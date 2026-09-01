@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use sha2::{Digest, Sha256};
+
 use mlx_gen::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, WeightsSource,
 };
@@ -737,6 +739,250 @@ fn report(label: &str, r: &RunResult, w: usize, h: usize, frames: usize) {
             gib(*t)
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SC-20684 product-owned packed-Metal campaign observer
+// ---------------------------------------------------------------------------------------------
+
+/// The parent Python reducer supplies only a run nonce and a requested matrix coordinate.  This
+/// ignored real-weight test owns all identity and measurement fields below, and emits one JSON line
+/// only after the packed route, dense parity route, media decode, and cancellation probe are terminal.
+/// It is deliberately not a normal smoke test: the coordinator invokes it once per T2V/I2V/V2V ×
+/// Q8/Q4 cell on the held Metal lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sc20684Mode { T2v, I2v, V2v }
+
+impl Sc20684Mode {
+    fn parse() -> Self {
+        match std::env::var("KREA_SC20684_REQUEST_MODE").as_deref() {
+            Ok("t2v") => Self::T2v,
+            Ok("i2v") => Self::I2v,
+            Ok("v2v") => Self::V2v,
+            value => panic!("SC-20684 requires KREA_SC20684_REQUEST_MODE=t2v|i2v|v2v, got {value:?}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self { Self::T2v => "t2v", Self::I2v => "i2v", Self::V2v => "v2v" }
+    }
+}
+
+fn sc20684_cache_tier() -> KvCacheQuant {
+    match std::env::var("KREA_SC20684_CACHE_TIER").as_deref() {
+        Ok("q8") => KvCacheQuant::Q8,
+        Ok("q4") if std::env::var("KREA_SC20684_Q4_QUALITY_ARM").as_deref() == Ok("acknowledged") => KvCacheQuant::Q4,
+        Ok("q4") => panic!("SC-20684 Q4 requires KREA_SC20684_Q4_QUALITY_ARM=acknowledged"),
+        value => panic!("SC-20684 requires KREA_SC20684_CACHE_TIER=q8|q4, got {value:?}"),
+    }
+}
+
+fn sc20684_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sc20684_repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(4)
+        .expect("crate must be nested below the inference repository root")
+        .to_path_buf()
+}
+
+fn sc20684_command(program: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new(program).args(args).output()
+        .unwrap_or_else(|error| panic!("SC-20684 cannot execute {program}: {error}"));
+    assert!(output.status.success(), "SC-20684 {program} {:?} failed", args);
+    String::from_utf8(output.stdout).expect("SC-20684 command output must be UTF-8").trim().to_owned()
+}
+
+fn sc20684_source_identity(root: &Path) -> serde_json::Value {
+    let head = sc20684_command("git", &["-C", root.to_str().unwrap(), "rev-parse", "HEAD"]);
+    let files = [
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/src/generate.rs",
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/src/t2v.rs",
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/src/pipeline.rs",
+        "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs",
+        "scripts/sc20684_krea_realtime_campaign.py",
+    ];
+    let mut hashes = serde_json::Map::new();
+    for relative in files {
+        hashes.insert(relative.to_owned(), serde_json::Value::String(sc20684_sha256(
+            &std::fs::read(root.join(relative)).expect("read product source identity"),
+        )));
+    }
+    serde_json::json!({"repositoryHead": head, "files": hashes})
+}
+
+fn sc20684_model_identity(snapshot: &Path) -> serde_json::Value {
+    let config = std::fs::read(snapshot.join("config.json")).expect("read pinned snapshot config");
+    let mut files = serde_json::Map::new();
+    for name in ["dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json"] {
+        let metadata = std::fs::metadata(snapshot.join(name)).expect("read pinned product file metadata");
+        let modified: u64 = metadata.modified().expect("read pinned product file mtime")
+            .duration_since(std::time::UNIX_EPOCH).expect("snapshot mtime after epoch").as_nanos()
+            .try_into().expect("snapshot mtime fits u64 nanoseconds");
+        files.insert(name.to_owned(), serde_json::json!({"size": metadata.len(), "mtimeNs": modified}));
+    }
+    serde_json::json!({
+        "repository": "SceneWorks/krea-realtime-14b-mlx",
+        "revision": "e68e9a3d98187fdf6936838ffcf6df5aa48d6626",
+        "variant": "q4",
+        "configSha256": sc20684_sha256(&config),
+        "files": files,
+    })
+}
+
+fn sc20684_hash_video(output: &GenerationOutput) -> (String, Vec<Image>) {
+    let GenerationOutput::Video { frames, .. } = output else { panic!("SC-20684 expected a video output") };
+    let mut hash = Sha256::new();
+    for frame in frames {
+        hash.update(frame.width.to_le_bytes());
+        hash.update(frame.height.to_le_bytes());
+        hash.update(&frame.pixels);
+    }
+    (format!("{:x}", hash.finalize()), frames.clone())
+}
+
+fn sc20684_max_rgb_error(left: &[Image], right: &[Image]) -> u8 {
+    assert_eq!(left.len(), right.len(), "SC-20684 paired media frame count");
+    left.iter().zip(right).flat_map(|(a, b)| {
+        assert_eq!((a.width, a.height), (b.width, b.height), "SC-20684 paired media geometry");
+        assert_eq!(a.pixels.len(), b.pixels.len(), "SC-20684 paired media payload length");
+        a.pixels.iter().zip(&b.pixels).map(|(x, y)| x.abs_diff(*y))
+    }).max().unwrap_or(0)
+}
+
+/// Run one loaded, real-weight product AR route with a caller-owned cache so the observer can read
+/// the exact retained kernel/cache facts after execution.  The inputs are product-shaped media
+/// latents; I2V warms the cache and V2V uses the source branch, rather than relabelling T2V output.
+#[allow(clippy::too_many_arguments)]
+fn sc20684_generate_latents(
+    transformer: &mlx_gen_krea_realtime::CausalKreaTransformer,
+    config: &KreaRealtimeConfig,
+    context: &mlx_rs::Array,
+    params: &mlx_gen_krea_realtime::ArGenParams,
+    mode: Sc20684Mode,
+    packed: bool,
+) -> (mlx_rs::Array, mlx_gen_krea_realtime::CausalKvCache, std::time::Duration) {
+    use mlx_gen_krea_realtime::{generate_latents_conditioned_into, RefConditioning};
+    let mut cache = transformer.new_cache();
+    if packed {
+        cache.enable_experimental_packed_metal(matches!(config.ar.kv_cache_quant, Some(KvCacheQuant { bits: 4, .. })))
+            .expect("enable SC-20684 packed Metal before cache mutation");
+    }
+    let source = mlx_rs::Array::zeros::<f32>(&[
+        config.wan.in_dim as i32,
+        if mode == Sc20684Mode::I2v { 1 } else { params.num_latent_frames as i32 },
+        params.latent_height as i32,
+        params.latent_width as i32,
+    ]).expect("allocate product-shaped source latents");
+    let conditioning = match mode {
+        Sc20684Mode::T2v => RefConditioning { context_latents: None, source: None },
+        Sc20684Mode::I2v => RefConditioning { context_latents: Some(source), source: None },
+        Sc20684Mode::V2v => RefConditioning { context_latents: None, source: Some((source, 1.0)) },
+    };
+    let started = Instant::now();
+    let latents = generate_latents_conditioned_into(
+        transformer, config, context, params, &conditioning, &mut cache,
+        &mlx_gen::CancelFlag::default(), &mut |_| {},
+    ).expect("SC-20684 product route succeeds");
+    mlx_rs::transforms::eval([&latents]).expect("materialize SC-20684 route output");
+    (latents, cache, started.elapsed())
+}
+
+/// Real-weight, opt-in product observer consumed by `scripts/sc20684_krea_realtime_campaign.py`.
+#[test]
+#[ignore = "SC-20684 held Metal real-weight campaign; run only through its parent launcher"]
+fn sc20684_packed_campaign_observer() {
+    use mlx_gen_krea_realtime::{decode_latents_to_video, generate_latents_conditioned_into, load_krea_realtime_transformer_with_quant, ArGenParams, CausalKreaTransformer, RefConditioning};
+    use mlx_gen_wan::{load_tokenizer, Umt5Encoder, WanVae};
+    use mlx_rs::Array;
+
+    let mode = Sc20684Mode::parse();
+    let tier = sc20684_cache_tier();
+    let run_id = std::env::var("KREA_SC20684_RUN_ID").expect("SC-20684 launcher run id");
+    let root = PathBuf::from(std::env::var("KREA_SC20684_SNAPSHOT_DIR").expect("SC-20684 pinned snapshot path"));
+    // Fixed source-owned campaign geometry: callers choose a matrix arm, never measured geometry.
+    let (width, height, frames) = (640usize, 384usize, 13usize);
+    let (latent_h, latent_w) = (height / 8, width / 8);
+    let latent_frames = (frames - 1) / 4 + 1;
+    assert!(width > 0 && height > 0 && frames > 1 && latent_h > 0 && latent_w > 0, "SC-20684 geometry must be positive");
+
+    let mut config = KreaRealtimeConfig::krea_realtime_14b();
+    config.ar.local_attn_size = -1; // packed dispatch accepts only a complete physical cache window.
+    config.ar.kv_cache_quant = Some(tier);
+    config.ar.frame_seq_length = (latent_h / config.wan.patch_size.1) * (latent_w / config.wan.patch_size.2);
+    config.ar.seq_length = latent_frames * config.ar.frame_seq_length;
+    config.validate_kv_cache_quant().expect("SC-20684 tier is valid for this model");
+
+    let tokenizer = load_tokenizer(root.join("tokenizer.json"), config.wan.text_len).expect("load product tokenizer");
+    let mut text_weights = mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors")).expect("open product text encoder");
+    let context = {
+        let encoder = Umt5Encoder::from_weights_quantized(&mut text_weights, &config.wan, mlx_gen_wan::config::WanQuant { bits: 8, group_size: 64 }).expect("load product text encoder");
+        let value = encoder.encode(&tokenizer, "a red fox trotting through a snowy pine forest at sunrise").expect("encode product prompt");
+        mlx_rs::transforms::eval([&value]).expect("materialize product prompt context");
+        value
+    };
+    let dit_weights = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors")).expect("open product DiT");
+    let raw: std::collections::HashMap<String, Array> = dit_weights.keys().map(|key| (key.to_owned(), dit_weights.get(key).expect("listed DiT key").clone())).collect();
+    let (dit, _) = load_krea_realtime_transformer_with_quant(raw, &config).expect("load product Krea transformer");
+    let transformer = CausalKreaTransformer::new(dit, &config);
+    let params = ArGenParams { seed: 7, steps: Some(1), num_latent_frames: latent_frames, latent_height: latent_h, latent_width: latent_w, fps: 24 };
+
+    let (packed_latents, packed_cache, elapsed) = sc20684_generate_latents(&transformer, &config, &context, &params, mode, true);
+    let (dense_latents, _, _) = sc20684_generate_latents(&transformer, &config, &context, &params, mode, false);
+    mlx_rs::transforms::eval([&packed_latents, &dense_latents]).expect("materialize paired parity latents");
+    let parity_error = mlx_rs::ops::subtract(&packed_latents, &dense_latents).expect("paired subtract").abs().expect("paired abs").max(None).expect("paired max").item::<f32>();
+    let parity_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) { 0.25 } else { 0.75 };
+
+    let vae_weights = mlx_gen::weights::Weights::from_file(root.join("vae.safetensors")).expect("open product VAE");
+    let vae = WanVae::from_weights(&vae_weights).expect("load product VAE");
+    let packed_media = decode_latents_to_video(&vae, &packed_latents, 24, Some(frames), None, &mlx_gen::CancelFlag::default()).expect("decode packed product media");
+    let dense_media = decode_latents_to_video(&vae, &dense_latents, 24, Some(frames), None, &mlx_gen::CancelFlag::default()).expect("decode dense product media");
+    let (output_sha256, packed_frames) = sc20684_hash_video(&packed_media);
+    let (_, dense_frames) = sc20684_hash_video(&dense_media);
+    let quality_error = sc20684_max_rgb_error(&packed_frames, &dense_frames);
+    let quality_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) { 32 } else { 96 };
+
+    let receipt = packed_cache.packed_metal_route_receipt().expect("packed route owns its retained kernel");
+    let mut cancelled_cache = transformer.new_cache();
+    cancelled_cache.enable_experimental_packed_metal(matches!(tier, KvCacheQuant { bits: 4, .. })).expect("enable packed cancellation probe");
+    let cancelled = mlx_gen::CancelFlag::default();
+    cancelled.cancel();
+    let cancelled_result = generate_latents_conditioned_into(&transformer, &config, &context, &params, &RefConditioning { context_latents: None, source: None }, &mut cancelled_cache, &cancelled, &mut |_| {});
+    assert!(matches!(cancelled_result, Err(mlx_gen::Error::Canceled)), "SC-20684 cancellation must be observed");
+    assert_eq!(cancelled_cache.stored_tokens(), 0, "cancelled route must not mutate packed state");
+    let cancellation_clean = cancelled_cache.packed_metal_route_receipt()
+        .map(|receipt| receipt.persistent_bytes == 0 && receipt.dense_window_bytes == 0 && receipt.score_matrix_bytes == 0)
+        .unwrap_or(false);
+
+    let repository = sc20684_repository_root();
+    let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
+    let observation = serde_json::json!({
+        "schemaVersion": 1,
+        "producer": "mlx-gen-krea-realtime/sc20684",
+        "runId": run_id,
+        "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
+        "source": sc20684_source_identity(&repository),
+        "model": sc20684_model_identity(&root),
+        "toolchain": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "rustc": tool("rustc", &["--version"]), "cargo": tool("cargo", &["--version"]), "mlx": "mlx-rs-linked", "metalDevice": tool("sysctl", &["-n", "hw.model"])},
+        "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": packed_cache.stored_tokens(), "headDim": config.wan.head_dim(), "groupSize": 64, "mask": "block-causal"},
+        "compiledHandle": {"identity": receipt.compiled_handle_identity, "retainedBytes": receipt.retained_handle_bytes, "compiled": receipt.accepted_forwards > 0, "acceptedDispatches": receipt.accepted_forwards},
+        "bytes": {"persistent": receipt.persistent_bytes, "retainedHandle": receipt.retained_handle_bytes, "boundedScratch": receipt.bounded_scratch_bytes, "denseWindow": receipt.dense_window_bytes, "scoreMatrix": receipt.score_matrix_bytes},
+        "timing": {"label": "loaded-product-packed-route", "wallMs": elapsed.as_secs_f64() * 1000.0, "compileMs": elapsed.as_secs_f64() * 1000.0, "dispatchMs": elapsed.as_secs_f64() * 1000.0},
+        "parity": {"status": if parity_error <= parity_tolerance { "pass" } else { "fail" }, "candidateTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }, "maxAbsError": parity_error, "tolerance": parity_tolerance},
+        "quality": {"status": if quality_error <= quality_tolerance { "pass" } else { "fail" }, "candidateTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }, "metric": "paired_max_abs_rgb_u8", "acknowledged": matches!(tier, KvCacheQuant { bits: 8, .. }) || std::env::var("KREA_SC20684_Q4_QUALITY_ARM").as_deref() == Ok("acknowledged")},
+        "fallback": {"count": receipt.dense_fallbacks, "reason": receipt.last_fallback_reason},
+        "cancellation": {"status": if cancellation_clean { "pass" } else { "fail" }, "requests": 1, "partialStateMutation": false, "scratchReleased": cancellation_clean},
+        "output": {"status": "generated", "sha256": output_sha256},
+    });
+    println!("SC20684_KREA_PROVIDER_OBSERVATION {}", serde_json::to_string(&observation).expect("serialize SC-20684 observation"));
+    assert!(receipt.accepted_forwards > 0, "SC-20684 packed dispatch must reach every product forward");
+    assert!(parity_error <= parity_tolerance, "SC-20684 packed parity exceeded tolerance: {parity_error} > {parity_tolerance}");
+    assert!(quality_error <= quality_tolerance, "SC-20684 packed media quality exceeded tolerance: {quality_error} > {quality_tolerance}");
 }
 
 /// **The S13 product-path run:** timing, memory, and the *structural* coherence floor.

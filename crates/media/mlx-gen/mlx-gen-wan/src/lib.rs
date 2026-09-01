@@ -339,7 +339,8 @@ pub use text_encoder::encode_text_staged_for_tier;
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
 pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::{
-    WanTransformer, WAN_BLOCK_NORM_DIFF_PATCH_TARGETS, WAN_GLOBAL_ADAPTABLE_PATHS,
+    CausalPackedAttention, WanTransformer, WAN_BLOCK_NORM_DIFF_PATCH_TARGETS,
+    WAN_GLOBAL_ADAPTABLE_PATHS,
 };
 pub const WAN_Z16_VAE_TILING: mlx_gen::tiling::VaeTiling = model::A14bProviderVae::VAE_TILING;
 pub const WAN_Z48_VAE_TILING: mlx_gen::tiling::VaeTiling = model::Ti2vProviderVae::VAE_TILING;
