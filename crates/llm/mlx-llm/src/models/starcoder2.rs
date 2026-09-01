@@ -30,8 +30,13 @@ pub struct StarCoder2Config {
 
 impl StarCoder2Config {
     /// The StarCoder2-7B decoder embedded in the published StarVector-8B snapshot.
+    ///
+    /// The snapshot's `config.json` records the 49,152-token base vocabulary, while its tokenizer
+    /// adds five StarVector tokens and the tied embedding/head is correspondingly resized to
+    /// 49,157 rows. Runtime logits must follow the checkpoint tensor, not the base-vocabulary
+    /// provenance field.
     pub const STARVECTOR_8B: Self = Self {
-        vocab_size: 49_152,
+        vocab_size: 49_157,
         hidden_size: 4_608,
         intermediate_size: 18_432,
         layers: 32,
@@ -63,6 +68,14 @@ impl StarCoder2 {
     /// accepting an unrelated optional head.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: StarCoder2Config) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
+        let embed_tokens = w.require(&key("model.embed_tokens.weight"))?.clone();
+        let expected_embedding_shape = [cfg.vocab_size, cfg.hidden_size];
+        if embed_tokens.shape() != expected_embedding_shape {
+            return Err(crate::error::Error::Config(format!(
+                "StarCoder2 tied embedding/head must be {expected_embedding_shape:?}, got {:?}",
+                embed_tokens.shape()
+            )));
+        }
         let mut layers = Vec::with_capacity(cfg.layers);
         for index in 0..cfg.layers {
             layers.push(StarCoder2Layer::from_weights(
@@ -72,7 +85,7 @@ impl StarCoder2 {
             )?);
         }
         Ok(Self {
-            embed_tokens: w.require(&key("model.embed_tokens.weight"))?.clone(),
+            embed_tokens,
             layers,
             final_norm_weight: w.require(&key("model.norm.weight"))?.clone(),
             final_norm_bias: w.require(&key("model.norm.bias"))?.clone(),
@@ -385,5 +398,40 @@ mod tests {
         assert_eq!(first.tokens, second.tokens);
         assert_eq!(first_events, second_events);
         assert_eq!(first.tokens.len(), 3);
+    }
+
+    #[test]
+    fn starvector_8b_runtime_vocab_includes_checkpoint_added_tokens() {
+        assert_eq!(StarCoder2Config::STARVECTOR_8B.vocab_size, 49_157);
+    }
+
+    #[test]
+    fn rejects_tied_embedding_shape_that_disagrees_with_runtime_vocab() {
+        let cfg = StarCoder2Config {
+            vocab_size: 3,
+            hidden_size: 4,
+            intermediate_size: 8,
+            layers: 1,
+            heads: 2,
+            kv_heads: 1,
+            rope_theta: 10_000.0,
+            layer_norm_eps: 1e-5,
+        };
+        let mut map = HashMap::new();
+        put(
+            &mut map,
+            "fixture.model.embed_tokens.weight",
+            &[0.0; 16],
+            &[4, 4],
+        );
+        let error = match StarCoder2::from_weights(&Weights::from_map(map), "fixture", cfg) {
+            Ok(_) => panic!("mismatched tied embedding/head shape must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            crate::error::Error::Config(message)
+                if message.contains("must be [3, 4]") && message.contains("got [4, 4]")
+        ));
     }
 }
