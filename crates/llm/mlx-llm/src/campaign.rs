@@ -3897,6 +3897,8 @@ pub fn run_dense_lifecycle_request_on_session(
         provider.campaign_cancel_after_first_token(request, observer)?;
         output
     };
+    provider.campaign_release_cache_state();
+    mlx_rs::memory::clear_cache();
     observer.phase("post-run-release");
     Ok(output)
 }
@@ -4142,6 +4144,8 @@ fn run_coordinate_operation_on_session(
     observer.cache_state(session.advance_cache_state());
     observer.phase("prompt-cache-reuse");
     provider.campaign_cancel_after_first_token(request, &mut observer)?;
+    provider.campaign_release_cache_state();
+    mlx_rs::memory::clear_cache();
     observer.phase("post-run-release");
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(CoordinateOperationEvidence {

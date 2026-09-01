@@ -685,6 +685,13 @@ impl LlamaProvider {
         ))
     }
 
+    /// Drop campaign-only shared-prefix ownership before a post-request release sample. Ordinary
+    /// serving has no access to this cache; campaign workers must not let it retain MLX arrays and
+    /// then claim that request-scoped cache memory was released.
+    pub(crate) fn campaign_release_cache_state(&self) {
+        self.campaign_prefix_cache.borrow_mut().take();
+    }
+
     /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
     /// This is not emulated by serial `TextLlm` requests.
     pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
