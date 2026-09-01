@@ -275,6 +275,7 @@ fn source_revision(root: &Path) -> io::Result<String> {
 }
 
 /// Activates only after the real edit route starts. Metadata is delayed until live tensors bind it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn activate_requested(
     root: &Path,
     cancel: &CancelFlag,
@@ -337,6 +338,7 @@ pub(crate) fn activate_requested(
 }
 
 /// Binds the exact tensors and transformer contract used by the edit call; callers cannot forge it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_edit_geometry(
     layers: u32,
     batch: u32,
@@ -352,7 +354,8 @@ pub(crate) fn bind_edit_geometry(
         return;
     }
     let bound = CONTEXT.with(|slot| {
-        let Some(context) = slot.borrow_mut().as_mut() else {
+        let mut context_slot = slot.borrow_mut();
+        let Some(context) = context_slot.as_mut() else {
             return false;
         };
         if layers == 0
@@ -438,6 +441,7 @@ fn backend_peak_bytes() -> Option<u64> {
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveAllocatorWindow {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     used_before: u64,
 }
 
@@ -678,11 +682,7 @@ pub(crate) fn record_flux_kv_read(measurement: Option<FluxKvRead>) {
                 .as_ref()
                 .map_or(0, |context| u64::from(context.geometry.layers))
         });
-        metrics.reused_requests = if layers == 0 {
-            0
-        } else {
-            metrics.projection_count / layers
-        };
+        metrics.reused_requests = metrics.projection_count.checked_div(layers).unwrap_or(0);
     });
     observe_tensor_with_allocator(
         "cross-kv-read",
@@ -746,6 +746,7 @@ pub fn observe_timed(
         Some(measured),
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub fn observe_tensor(
     phase: &'static str,
     operation: &'static str,
@@ -791,7 +792,8 @@ fn observe_tensor_with_allocator(
         return;
     }
     ACTIVE.with(|slot| {
-        let Some(observer) = slot.borrow_mut().as_mut() else {
+        let mut observer_slot = slot.borrow_mut();
+        let Some(observer) = observer_slot.as_mut() else {
             return;
         };
         let context = CONTEXT.with(|ctx| ctx.borrow().clone());
@@ -1012,7 +1014,7 @@ mod tests {
         )
         .unwrap();
         let reference = record_flux_kv_created(&image_k, &image_v).expect("reference slice");
-        assert_eq!(reference.dense_bytes, 2 * 1 * 2 * 3 * 4 * 4);
+        assert_eq!(reference.dense_bytes, 2 * 2 * 3 * 4 * 4);
         let created = out
             .borrow()
             .iter()

@@ -267,7 +267,7 @@ pub(crate) fn generate_cached_with_observer(
         on_event,
         constraint,
         should_stop,
-        observer.as_deref_mut(),
+        &mut observer,
     )?;
 
     if let Some(observer) = observer.as_deref_mut() {
@@ -289,7 +289,7 @@ pub(crate) fn generate_cached_with_observer(
     full.truncate(cache.offset() as usize);
     prefix_cache.store(full, &cache);
     cache.reset()?;
-    if let Some(observer) = observer.as_deref_mut() {
+    if let Some(observer) = observer {
         observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
     }
 

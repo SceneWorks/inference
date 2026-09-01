@@ -515,9 +515,8 @@ pub struct ReceiptQualityStatistics {
     pub confidence_interval: String,
     pub outlier_policy: String,
     pub variance_policy: String,
-    #[allow(non_snake_case)]
     #[serde(rename = "maxCoefficientOfVariation")]
-    pub max_coefficient_of_VARIATION: f64,
+    pub max_coefficient_of_variation: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -678,7 +677,11 @@ impl ReceiptBuilder {
             || self.template.geometry.context_window_tokens == 0
             || self.template.geometry.context_target_tokens == 0
             || self.template.geometry.context_payload_tokens == 0
-            || self.template.geometry.query_heads % self.template.geometry.kv_heads != 0
+            || !self
+                .template
+                .geometry
+                .query_heads
+                .is_multiple_of(self.template.geometry.kv_heads)
             || self.template.geometry.capacity < self.template.geometry.kv_length
         {
             return Err("invalid geometry".into());
@@ -992,7 +995,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || !["single", "supported-batch"].contains(&receipt.matrix.request_mode.as_str())
         || !["chunked", "single-shot"].contains(&receipt.matrix.prefill_mode.as_str())
         || !["cold", "warm"].contains(&receipt.matrix.process_temperature.as_str())
-        || g.query_heads % g.kv_heads != 0
+        || !g.query_heads.is_multiple_of(g.kv_heads)
         || g.capacity < g.kv_length
         || (receipt.matrix.request_mode == "single" && g.batch != 1)
         || (receipt.matrix.request_mode == "supported-batch" && g.batch <= 1)
@@ -1341,7 +1344,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
                     || !f
                         .artifact_sha256
                         .bytes()
-                        .all(|b| b.is_ascii_digit() || (b >= b'a' && b <= b'f'))
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                     || f.independent_reference.is_empty()
                     || f.artifact_sidecar_sha256.len() != 64
                     || !f
@@ -1418,7 +1421,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if !receipt.lifecycle.post_run_release {
         return Err("postRunRelease is required".into());
     }
-    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_VARIATION != 0.05 { return Err("frozen quality statistics mismatch".into()); }
+    if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
     Ok(())
 }
 
@@ -1633,17 +1636,17 @@ pub fn validate_artifact_bundle_named(
         .ok_or("memory is not an object")?;
     if memory["phaseSamples"]
         .as_array()
-        .map_or(true, |v| v.len() != 8)
+        .is_none_or(|v| v.len() != 8)
         || memory["allocationEvents"]
             .as_array()
-            .map_or(true, |v| v.is_empty())
+            .is_none_or(|v| v.is_empty())
     {
         return Err("receipt memory evidence is incomplete".into());
     }
     let timings = object["timings"]
         .as_object()
         .ok_or("timings is not an object")?;
-    if timings["samples"].as_array().map_or(true, |v| v.len() != 5) {
+    if timings["samples"].as_array().is_none_or(|v| v.len() != 5) {
         return Err("receipt timing samples are incomplete".into());
     }
     let quality = object["quality"]
@@ -1651,7 +1654,7 @@ pub fn validate_artifact_bundle_named(
         .ok_or("quality is not an object")?;
     if quality["fixtureEvidence"]
         .as_object()
-        .map_or(true, |v| v.len() != 4)
+        .is_none_or(|v| v.len() != 4)
     {
         return Err("receipt fixture evidence is incomplete".into());
     }
@@ -1753,9 +1756,12 @@ fn validate_fixture_binding(
         .get("reference")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| format!("fixture {name} reference binding"))?;
-    let field = |object: &serde_json::Map<String, serde_json::Value>, key: &str| {
+    fn field<'a>(
+        object: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
-    };
+    }
     let reference_inventory = receipt.provenance.reference_model_sha256.as_str();
     let reference_session = field(reference, "coordinateSessionId")
         .filter(|session| {
@@ -2484,6 +2490,7 @@ pub fn validate_schedule_outcomes(
 
 /// The only scheduling seam.  Production supplies a child-process launcher; tests may use a fake
 /// worker, but it receives the immutable schedule rather than inventing rows or temperatures.
+#[cfg(test)]
 pub(crate) fn execute_required_schedule<F>(
     mut worker: F,
 ) -> Result<Vec<(Coordinate, ProcessDiscipline, u32)>, String>
@@ -3969,6 +3976,7 @@ fn token_agreement(left: &[(i32, f64)], right: &[(i32, f64)]) -> (u64, u64) {
 /// [`ReceiptBuilder`].  This helper intentionally rejects a fixture that did not execute its own
 /// required behavior (tool parsing, needle recovery, or prefix result equality), rather than
 /// converting a missing capability into a green ratio.
+#[allow(clippy::too_many_arguments)]
 pub fn quality_from_product_fixtures(
     kernel_candidate: &ProductFixtureResult,
     kernel_reference: &ProductFixtureResult,
@@ -4104,7 +4112,7 @@ pub fn run_product_fixture_suite_on_sessions(
     }
     let (band_payload, context_target_tokens, context_payload_tokens) = candidate_session
         .provider
-        .campaign_context_band_measurement(&coordinate.context_band)?;
+        .campaign_context_band_measurement(coordinate.context_band)?;
     if candidate_session
         .provider
         .campaign_prompt_tokens(&band_payload)?
@@ -4624,7 +4632,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variATION:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -5079,7 +5087,7 @@ mod tests {
                     confidence_interval: "95% bootstrap".into(),
                     outlier_policy: "report all samples; no silent deletion".into(),
                     variance_policy: "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),
-                    max_coefficient_of_VARIATION: 0.05,
+                    max_coefficient_of_variation: 0.05,
                 },
                 fixture_evidence: std::collections::BTreeMap::new(),
             },
@@ -5341,7 +5349,6 @@ mod tests {
         let mut split_prefill = receipt.clone();
         split_prefill.memory.phase_samples[2].mlx.active_bytes = 3;
         split_prefill.memory.phase_samples[2].mlx.peak_bytes = 4;
-        assert!(3 + 4 > 1 + 4 + 1);
         assert!(validate_receipt_semantics(&split_prefill).is_err());
         let mut fixture_tampered = receipt.clone();
         fixture_tampered

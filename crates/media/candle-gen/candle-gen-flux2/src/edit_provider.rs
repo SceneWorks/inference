@@ -662,9 +662,8 @@ impl Flux2Edit {
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
         let (_, reference_sq, _) = ref_tokens.dims3()?;
         let (latent_height, latent_width) = pipeline::latent_dims(req.width, req.height);
-        let layer_count = u32::try_from(cfg.num_double_layers).ok_or_else(|| {
-            CandleError::Msg("flux2 edit: transformer layer count overflow".into())
-        })?;
+        let layer_count = u32::try_from(cfg.num_double_layers)
+            .map_err(|_| CandleError::Msg("flux2 edit: transformer layer count overflow".into()))?;
         crate::sc20686_observer::bind_edit_geometry(
             layer_count,
             u32::try_from(ref_tokens.dim(0)?)

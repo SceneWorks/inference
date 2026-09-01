@@ -217,7 +217,7 @@ pub(crate) fn generate_with_observer(
                 &mut observed_events,
                 constraint,
                 should_stop,
-                None,
+                &mut None,
             )?
         };
         if let Some(observer) = observer.as_deref_mut() {
@@ -324,7 +324,7 @@ pub fn generate_with_cache(
         on_event,
         None,
         None,
-        None,
+        &mut None,
     )
 }
 
@@ -364,7 +364,7 @@ pub fn generate_from_prefill(
         on_event,
         constraint,
         should_stop,
-        None,
+        &mut None,
     )
 }
 
@@ -388,7 +388,7 @@ pub(crate) fn decode_loop(
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
-    mut observer: Option<&mut dyn crate::campaign::Observer>,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;

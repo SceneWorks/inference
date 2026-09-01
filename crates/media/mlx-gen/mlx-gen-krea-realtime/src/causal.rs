@@ -1220,12 +1220,11 @@ impl CausalKreaTransformer {
                         Err(Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")));
                 }
             }
+            let dispatched_layers = backend.dispatched_outputs.len();
+            drop(backend);
             match packed_result {
                 Ok(result)
-                    if packed_dispatch_complete(
-                        backend.dispatched_outputs.len(),
-                        self.inner.num_blocks(),
-                    ) =>
+                    if packed_dispatch_complete(dispatched_layers, self.inner.num_blocks()) =>
                 {
                     cache.packed_metal_accepted_forwards += 1;
                     result
@@ -1234,7 +1233,7 @@ impl CausalKreaTransformer {
                     cache.packed_metal_dense_fallbacks += 1;
                     cache.last_packed_metal_fallback = Some(format!(
                         "{PACKED_DISPATCH_ERROR_PREFIX}packed dispatch reached {}/{} layers",
-                        backend.dispatched_outputs.len(),
+                        dispatched_layers,
                         self.inner.num_blocks()
                     ));
                     let (prev_kv, _) = cache.window_prev(s_new)?;

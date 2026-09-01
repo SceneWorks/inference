@@ -276,7 +276,7 @@ pub(crate) fn generate_batch_with_observer(
         }
     }
     cache.reset()?;
-    if let Some(observer) = observer.as_deref_mut() {
+    if let Some(observer) = observer {
         observe_cache_events(cache.as_mut(), &mut observed_cache_events, observer)?;
     }
 

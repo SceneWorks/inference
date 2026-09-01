@@ -3237,7 +3237,7 @@ mod tests {
             .try_packed_attention(1, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .is_err());
         assert_eq!(packed.offset(), 0);
-        packed.reset();
+        packed.reset().unwrap();
         assert_eq!(packed.offset(), 0);
         assert!(packed.retain_sequences(&[0]).is_ok());
     }
@@ -3583,7 +3583,7 @@ mod tests {
         packed
             .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
             .unwrap();
-        packed.reset();
+        packed.reset().unwrap();
         assert_eq!(packed.offset(), 0);
         assert!(packed
             .staged

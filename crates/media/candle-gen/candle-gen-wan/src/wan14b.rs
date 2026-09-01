@@ -49,9 +49,8 @@ use crate::text_encoder::Umt5Encoder;
 use crate::transformer::WanTransformer;
 
 fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
-    product_check_cancel(cancel).map_err(|error| {
+    product_check_cancel(cancel).inspect_err(|_| {
         crate::sc20686_observer::observe_cancelled();
-        error
     })
 }
 
@@ -557,9 +556,7 @@ impl Pipeline {
         crate::sc20686_observer::observe("generation-start", 0, 0, 0);
         // One cache per projected conditioning payload for this expert's request-scoped denoise range.
         // A staged high/low render builds it after loading each expert, so no K/V survives an expert drop.
-        if let Err(error) = check_cancel(cancel) {
-            return Err(error);
-        }
+        check_cancel(cancel)?;
         crate::sc20686_observer::bind_cross_kv_geometry(0, 0, 0, cos.dim(0)? as u64, 0, "");
         let pos_kv = expert.prepare_cross_kv(ctx_pos)?;
         if let Some((pos_bytes, pos_shape, pos_dtype)) = pos_kv.evidence() {
@@ -593,9 +590,7 @@ impl Pipeline {
             );
         }
         for i in range {
-            if let Err(error) = check_cancel(cancel) {
-                return Err(error);
-            }
+            check_cancel(cancel)?;
             let t = sched.timestep(i);
             // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
             let x = match y {

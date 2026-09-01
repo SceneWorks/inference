@@ -512,13 +512,6 @@ impl LlamaProvider {
             .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
     }
 
-    /// Build a tokenizer-measured payload for one frozen context band. A binary search chooses the
-    /// largest deterministic filler that stays below the band target, avoiding assumptions that a
-    /// repeated source word maps to exactly one token for both supported families.
-    pub(crate) fn campaign_context_payload(&self, context_band: &str) -> CoreResult<String> {
-        Ok(self.campaign_context_band_measurement(context_band)?.0)
-    }
-
     pub(crate) fn campaign_context_band_measurement(
         &self,
         context_band: &str,
@@ -1403,7 +1396,7 @@ impl LlamaProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
-        mut observer: Option<&mut dyn crate::campaign::Observer>,
+        observer: Option<&mut dyn crate::campaign::Observer>,
     ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
@@ -1687,7 +1680,7 @@ impl LlamaProvider {
                         )
                         .map_err(to_core)?
                     }
-                    None => match observer.as_deref_mut() {
+                    None => match observer {
                         Some(observer) => generate_with_observer(
                             &self.model,
                             &prompt_ids,

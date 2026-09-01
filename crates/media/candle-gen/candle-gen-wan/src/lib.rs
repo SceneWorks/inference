@@ -175,9 +175,8 @@ use text_encoder::Umt5Encoder;
 use transformer::WanTransformer;
 
 fn check_cancel(cancel: &CancelFlag) -> CResult<()> {
-    product_check_cancel(cancel).map_err(|error| {
+    product_check_cancel(cancel).inspect_err(|_| {
         sc20686_observer::observe_cancelled();
-        error
     })
 }
 

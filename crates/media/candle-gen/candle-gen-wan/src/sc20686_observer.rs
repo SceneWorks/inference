@@ -179,8 +179,8 @@ pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
     }
 }
 
-thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = RefCell::new(None); }
-thread_local! { static PENDING_CANCELLATION: RefCell<bool> = RefCell::new(false); }
+thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = const { RefCell::new(None) }; }
+thread_local! { static PENDING_CANCELLATION: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static LAST_CAMPAIGN_CANCELLATION: Cell<bool> = const { Cell::new(false) }; }
 
 impl CampaignOutputRequest {
@@ -301,6 +301,7 @@ fn source_revision(root: &Path) -> io::Result<String> {
     Ok(candidate)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn activate_requested(
     root: &Path,
     cancel: &CancelFlag,
@@ -532,8 +533,8 @@ pub fn install_jsonl_with_context(
     Ok(scope)
 }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = RefCell::new(None); }
-thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = RefCell::new(None); }
-thread_local! { static STARTED: RefCell<Option<Instant>> = RefCell::new(None); }
+thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = const { RefCell::new(None) }; }
+thread_local! { static STARTED: RefCell<Option<Instant>> = const { RefCell::new(None) }; }
 thread_local! { static METADATA_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static START_EVENT_EMITTED: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static PENDING_START: RefCell<bool> = const { RefCell::new(false) }; }
@@ -582,6 +583,7 @@ fn backend_peak_bytes() -> Option<u64> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ActiveAllocatorWindow {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     used_before: u64,
 }
 
@@ -1068,6 +1070,7 @@ fn elapsed_precise_ms_for(measured: Option<Instant>) -> f64 {
         |t| (t.elapsed().as_secs_f64() * 1000.0).max(0.001),
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub fn observe_tensor(
     phase: &'static str,
     operation: &'static str,

@@ -954,64 +954,6 @@ fn outstanding_scratch() -> usize {
     OUTSTANDING_SCRATCH.load(Ordering::SeqCst)
 }
 
-fn concat_packed(previous: Option<&PackedAffineRows>, next: PackedAffineRows) -> PackedAffineRows {
-    let Some(old) = previous else {
-        return next;
-    };
-    // Rows are token-major, then B/H. Keep the token-axis physical order exact.
-    let mut words = Vec::with_capacity(old.words.len() + next.words.len());
-    let mut scales_bf16 = Vec::with_capacity(old.scales_bf16.len() + next.scales_bf16.len());
-    let mut biases_bf16 = Vec::with_capacity(old.biases_bf16.len() + next.biases_bf16.len());
-    for s in 0..old.tokens {
-        for b in 0..old.batch {
-            for h in 0..old.heads {
-                append_packed_row(old, b, h, s, &mut words, &mut scales_bf16, &mut biases_bf16);
-            }
-        }
-    }
-    for s in 0..next.tokens {
-        for b in 0..next.batch {
-            for h in 0..next.heads {
-                append_packed_row(
-                    &next,
-                    b,
-                    h,
-                    s,
-                    &mut words,
-                    &mut scales_bf16,
-                    &mut biases_bf16,
-                );
-            }
-        }
-    }
-    PackedAffineRows {
-        tokens: old.tokens + next.tokens,
-        words,
-        scales_bf16,
-        biases_bf16,
-        ..next
-    }
-}
-
-fn append_packed_row(
-    rows: &PackedAffineRows,
-    b: usize,
-    h: usize,
-    s: usize,
-    words: &mut Vec<u32>,
-    scales_bf16: &mut Vec<u16>,
-    biases_bf16: &mut Vec<u16>,
-) {
-    let row = rows.row_index(b, h, s);
-    let word_start = row * rows.words_per_row();
-    words.extend_from_slice(&rows.words[word_start..word_start + rows.words_per_row()]);
-    let meta_start = row * rows.groups_per_row();
-    scales_bf16
-        .extend_from_slice(&rows.scales_bf16[meta_start..meta_start + rows.groups_per_row()]);
-    biases_bf16
-        .extend_from_slice(&rows.biases_bf16[meta_start..meta_start + rows.groups_per_row()]);
-}
-
 fn slice_packed(
     rows: &PackedAffineRows,
     start: usize,
