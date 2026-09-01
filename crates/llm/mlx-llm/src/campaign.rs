@@ -4682,6 +4682,8 @@ mod tests {
         fs::write(dir.path().join("b.safetensors"), b"b").unwrap();
         let mut file = fs::File::create(dir.path().join("a.safetensors")).unwrap();
         file.write_all(b"a").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
         let first = inventory_snapshot(dir.path()).unwrap();
         let second = inventory_snapshot(dir.path()).unwrap();
         assert_eq!(first.sha256, second.sha256);
