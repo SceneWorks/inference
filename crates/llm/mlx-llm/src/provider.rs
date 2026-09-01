@@ -809,6 +809,17 @@ impl LlamaProvider {
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
+        Self::load_inner(spec, false)
+    }
+
+    /// Campaign-only load which evaluates every tensor consumed by the product model constructor.
+    /// Ordinary serving keeps MLX's lazy-load behavior; the sealed memory campaign needs an exact
+    /// parameter-only materialization boundary before it samples `weights-loaded`.
+    pub(crate) fn load_for_campaign(spec: &LoadSpec) -> CoreResult<Self> {
+        Self::load_inner(spec, true)
+    }
+
+    fn load_inner(spec: &LoadSpec, materialize_campaign_weights: bool) -> CoreResult<Self> {
         let dir = Path::new(&spec.source);
         let quant = spec.quantize.map(|q| match q {
             Quantize::Q4 => QuantSpec::q4(),
@@ -917,6 +928,9 @@ impl LlamaProvider {
         let (template, supports_thinking, tool_call_format) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
         descriptor.capabilities.supports_tools = tool_call_format.is_some();
+        if materialize_campaign_weights {
+            weights.materialize_accessed().map_err(to_core)?;
+        }
         Ok(Self {
             descriptor,
             architecture: arch,

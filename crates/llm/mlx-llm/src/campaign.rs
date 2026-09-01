@@ -334,6 +334,9 @@ pub struct CampaignSession {
     inventory: SnapshotInventory,
     family: &'static str,
     load_elapsed_ms: f64,
+    load_start_sample: MemorySample,
+    weights_loaded_sample: MemorySample,
+    model_weights_bytes: u64,
     session_id: String,
     cache_state_version: Cell<u64>,
 }
@@ -342,12 +345,21 @@ impl CampaignSession {
     pub fn load(snapshot: impl AsRef<Path>) -> core_llm::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+        mlx_rs::memory::clear_cache();
+        mlx_rs::memory::reset_peak_memory();
+        let load_start_sample = sample_memory(std::process::id())
+            .map_err(|e| core_llm::Error::Load(format!("campaign load-start sample: {e}")))?;
         let load_started = std::time::Instant::now();
         let inventory = inventory_snapshot(snapshot.as_ref())
             .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
-        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
-            snapshot.as_ref().to_string_lossy().to_string(),
-        ))?;
+        let provider = crate::provider::LlamaProvider::load_for_campaign(
+            &core_llm::LoadSpec::dense(snapshot.as_ref().to_string_lossy().to_string()),
+        )?;
+        let weights_loaded_sample = sample_memory(std::process::id())
+            .map_err(|e| core_llm::Error::Load(format!("campaign weights-loaded sample: {e}")))?;
+        let model_weights_bytes =
+            measured_model_weight_bytes(&load_start_sample, &weights_loaded_sample)
+                .map_err(core_llm::Error::Load)?;
         let family = provider.campaign_family()?;
         let load_elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
         if !load_elapsed_ms.is_finite() || load_elapsed_ms <= 0.0 {
@@ -371,6 +383,9 @@ impl CampaignSession {
             inventory,
             family,
             load_elapsed_ms,
+            load_start_sample,
+            weights_loaded_sample,
+            model_weights_bytes,
             session_id,
             cache_state_version: Cell::new(0),
         })
@@ -381,6 +396,9 @@ impl CampaignSession {
     }
     pub fn inventory(&self) -> &SnapshotInventory {
         &self.inventory
+    }
+    fn model_weights_bytes(&self) -> u64 {
+        self.model_weights_bytes
     }
     fn validate_coordinate_family(&self, coordinate: &Coordinate) -> core_llm::Result<()> {
         if self.family != coordinate.family {
@@ -1172,8 +1190,21 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .find(|sample| sample.phase == phase)
             .ok_or_else(|| format!("missing containment phase {phase}"))
     };
+    let process_start = sample_for("process-start")?;
+    let active_delta = |sample: &ReceiptPhase| {
+        sample
+            .mlx
+            .active_bytes
+            .checked_sub(process_start.mlx.active_bytes)
+            .ok_or_else(|| {
+                format!(
+                    "{} MLX active bytes fell below process baseline",
+                    sample.phase
+                )
+            })
+    };
     let weights_loaded = sample_for("weights-loaded")?;
-    if weights_loaded.mlx.active_bytes < weights {
+    if active_delta(weights_loaded)? < weights {
         return Err("weights-loaded MLX active bytes do not contain weights".into());
     }
     let prefill = sample_for("prefill-peak")?;
@@ -1181,14 +1212,19 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .checked_add(kv)
         .and_then(|bytes| bytes.checked_add(workspace))
         .ok_or("prefill attributed memory overflows u64")?;
-    if prefill.mlx.active_bytes < prefill_total || prefill.mlx.peak_bytes < prefill_total {
+    let prefill_peak_total = process_start
+        .mlx
+        .active_bytes
+        .checked_add(prefill_total)
+        .ok_or("prefill peak containment overflows u64")?;
+    if active_delta(prefill)? < prefill_total || prefill.mlx.peak_bytes < prefill_peak_total {
         return Err("prefill MLX samples do not contain attributed allocations".into());
     }
     let decode = sample_for("decode-steady")?;
     let decode_total = weights
         .checked_add(kv)
         .ok_or("decode attributed memory overflows u64")?;
-    if decode.mlx.active_bytes < decode_total {
+    if active_delta(decode)? < decode_total {
         return Err("decode MLX active bytes do not contain weights and KV".into());
     }
     if receipt.mode == "dense"
@@ -1197,14 +1233,14 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("dense KV exceeds tolerance".into());
     }
-    let start = &receipt.memory.phase_samples[0];
     let end = receipt.memory.phase_samples.last().unwrap();
     if end.phys_footprint_bytes
-        > start.phys_footprint_bytes + receipt.memory.release.phys_footprint_tolerance_bytes
+        > weights_loaded.phys_footprint_bytes
+            + receipt.memory.release.phys_footprint_tolerance_bytes
         || end.mlx.active_bytes
-            > start.mlx.active_bytes + receipt.memory.release.mlx_active_tolerance_bytes
+            > weights_loaded.mlx.active_bytes + receipt.memory.release.mlx_active_tolerance_bytes
         || end.mlx.cache_bytes
-            > start.mlx.cache_bytes + receipt.memory.release.mlx_cache_tolerance_bytes
+            > weights_loaded.mlx.cache_bytes + receipt.memory.release.mlx_cache_tolerance_bytes
     {
         return Err("release did not return within tolerance".into());
     }
@@ -2273,17 +2309,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             validate_coordinate_model_contract(&row.coordinate, &snapshot, &reference_snapshot)?;
             let candidate_session = CampaignSession::load(&snapshot)
                 .map_err(|e| format!("load candidate campaign session: {e}"))?;
-            let reference_session = CampaignSession::load(&reference_snapshot)
-                .map_err(|e| format!("load reference campaign session: {e}"))?;
-            // Warm rows execute the frozen two warmup suites before collection. Both actual
-            // operation records are sealed, and their measured prefill intervals provide the
-            // first-dispatch/steady compilation probe used below.
-            let mut warmup_suites = Vec::new();
+            let candidate_baseline = candidate_session.load_start_sample.mlx_active_bytes;
+            // Candidate lifecycle evidence is collected before the reference model exists in the
+            // process. This keeps every global MLX phase sample attributable to the candidate.
+            let mut candidate_warmups = Vec::new();
             if row.coordinate.process_temperature == "warm" {
                 for warmup_index in 0..2 {
-                    let suite = run_product_fixture_suite_on_sessions(
+                    let half = run_product_fixture_half_on_session(
                         &candidate_session,
-                        &reference_session,
                         &prompt,
                         &row.coordinate,
                     )
@@ -2293,19 +2326,13 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                             coordinate_slug(&row.coordinate)
                         )
                     })?;
-                    suite.quality().map_err(|e| {
-                        format!(
-                            "product warmup {warmup_index} quality for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?;
-                    warmup_suites.push(suite);
+                    candidate_warmups.push(half);
                 }
             }
-            let warmup = (!warmup_suites.is_empty()).then(|| {
-                let operations = warmup_suites
+            let warmup = (!candidate_warmups.is_empty()).then(|| {
+                let operations = candidate_warmups
                     .iter()
-                    .map(|suite| primary_operation_evidence_digest(&suite.kernel_candidate))
+                    .map(|half| primary_operation_evidence_digest(&half.kernel))
                     .collect::<Vec<_>>()
                     .join(":");
                 (
@@ -2320,11 +2347,10 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     candidate_session.cache_state_version(),
                 )
             });
-            let mut suites = Vec::with_capacity(5);
+            let mut candidate_repeats = Vec::with_capacity(5);
             for repeat in 0..5 {
-                let suite = run_product_fixture_suite_on_sessions(
+                let half = run_product_fixture_half_on_session(
                     &candidate_session,
-                    &reference_session,
                     &prompt,
                     &row.coordinate,
                 )
@@ -2334,11 +2360,91 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                         coordinate_slug(&row.coordinate)
                     )
                 })?;
-                // Every raw fixture is independently quality-validated before any timing or
-                // aggregate publication decision.  There is no successful partial-repeat path.
-                suite.quality()?;
-                suites.push(suite);
+                candidate_repeats.push(half);
             }
+            drop(candidate_session);
+            quiesce_campaign_active_memory(candidate_baseline).map_err(|e| {
+                format!(
+                    "candidate session release for {}: {e}",
+                    coordinate_slug(&row.coordinate)
+                )
+            })?;
+
+            let reference_session = CampaignSession::load(&reference_snapshot)
+                .map_err(|e| format!("load reference campaign session: {e}"))?;
+            let reference_baseline = reference_session.load_start_sample.mlx_active_bytes;
+            let mut reference_warmups = Vec::with_capacity(candidate_warmups.len());
+            for warmup_index in 0..candidate_warmups.len() {
+                reference_warmups.push(
+                    run_product_fixture_half_on_session(
+                        &reference_session,
+                        &prompt,
+                        &row.coordinate,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "reference warmup {warmup_index} for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        )
+                    })?,
+                );
+            }
+            let mut reference_repeats = Vec::with_capacity(5);
+            for repeat in 0..5 {
+                reference_repeats.push(
+                    run_product_fixture_half_on_session(
+                        &reference_session,
+                        &prompt,
+                        &row.coordinate,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "reference fixture repeat {repeat} for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        )
+                    })?,
+                );
+            }
+            drop(reference_session);
+            quiesce_campaign_active_memory(reference_baseline).map_err(|e| {
+                format!(
+                    "reference session release for {}: {e}",
+                    coordinate_slug(&row.coordinate)
+                )
+            })?;
+
+            let warmup_suites = candidate_warmups
+                .into_iter()
+                .zip(reference_warmups)
+                .enumerate()
+                .map(|(warmup_index, (candidate, reference))| {
+                    let suite = pair_product_fixture_halves(candidate, reference)?;
+                    suite.quality().map_err(|e| {
+                        core_llm::Error::InvalidRequest(format!(
+                            "product warmup {warmup_index} quality for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        ))
+                    })?;
+                    Ok(suite)
+                })
+                .collect::<core_llm::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            let suites = candidate_repeats
+                .into_iter()
+                .zip(reference_repeats)
+                .enumerate()
+                .map(|(repeat, (candidate, reference))| {
+                    let suite = pair_product_fixture_halves(candidate, reference)?;
+                    suite.quality().map_err(|e| {
+                        core_llm::Error::InvalidRequest(format!(
+                            "product fixture repeat {repeat} quality for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        ))
+                    })?;
+                    Ok(suite)
+                })
+                .collect::<core_llm::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
             let kernel_runs = suites
                 .iter()
                 .map(|suite| &suite.kernel_candidate)
@@ -3041,6 +3147,10 @@ pub trait Observer {
     /// Wall-clock duration of the real snapshot inventory plus provider/model load that created
     /// the bound campaign session.
     fn load_duration(&mut self, _milliseconds: f64) {}
+    /// Candidate-only samples bracketing explicit model-parameter materialization.  The campaign
+    /// observer replays these as the first two receipt phases so later reference allocations cannot
+    /// be mistaken for candidate weights.
+    fn load_boundary(&mut self, _process_start: &MemorySample, _weights_loaded: &MemorySample) {}
     /// Current cumulative cache ownership at a decoder boundary. The product cache supplies both
     /// bytes and sequence capacity so repeated append events are not summed as independent memory.
     fn cache_snapshot(&mut self, bytes: u64, _tokens: u64) {
@@ -3084,6 +3194,7 @@ pub struct ProductObserver {
     cache_state_version: Option<u64>,
     operations: Vec<String>,
     load_elapsed_ms: Option<f64>,
+    load_boundary: Option<(MemorySample, MemorySample)>,
     cache_capacity_tokens: u64,
 }
 
@@ -3105,6 +3216,7 @@ impl ProductObserver {
             cache_state_version: None,
             operations: Vec::new(),
             load_elapsed_ms: None,
+            load_boundary: None,
             cache_capacity_tokens: 0,
         }
     }
@@ -3224,6 +3336,16 @@ impl Observer for ProductObserver {
         }
     }
 
+    fn load_boundary(&mut self, process_start: &MemorySample, weights_loaded: &MemorySample) {
+        if self.load_boundary.is_some()
+            || measured_model_weight_bytes(process_start, weights_loaded).is_err()
+        {
+            self.error = Some("invalid or duplicate product load boundary".into());
+        } else {
+            self.load_boundary = Some((process_start.clone(), weights_loaded.clone()));
+        }
+    }
+
     fn cache_snapshot(&mut self, bytes: u64, tokens: u64) {
         if bytes == 0 || tokens == 0 {
             self.error = Some("product cache snapshot must have positive bytes and tokens".into());
@@ -3251,7 +3373,20 @@ impl Observer for ProductObserver {
             self.error = Some(format!("duplicate or out-of-order product phase {name}"));
             return;
         }
-        match sample_memory(self.pid) {
+        let sampled = match name {
+            "process-start" => self
+                .load_boundary
+                .as_ref()
+                .map(|(sample, _)| sample.clone())
+                .ok_or_else(|| std::io::Error::other("missing product load-start sample")),
+            "weights-loaded" => self
+                .load_boundary
+                .as_ref()
+                .map(|(_, sample)| sample.clone())
+                .ok_or_else(|| std::io::Error::other("missing product weights-loaded sample")),
+            _ => sample_memory(self.pid),
+        };
+        match sampled {
             Ok(sample) => {
                 self.phases.push(ReceiptPhase {
                     phase: name.into(),
@@ -3362,6 +3497,43 @@ pub struct MemorySample {
     pub mlx_active_bytes: u64,
     pub mlx_cache_bytes: u64,
     pub mlx_peak_bytes: u64,
+}
+
+/// Derive live candidate parameter residency from the exact MLX active-memory boundary around
+/// explicit weight evaluation. Snapshot file bytes remain provenance only: tokenizer/config bytes,
+/// safetensors headers, and allocator cache reservation are deliberately excluded.
+fn measured_model_weight_bytes(
+    process_start: &MemorySample,
+    weights_loaded: &MemorySample,
+) -> Result<u64, String> {
+    if process_start.pid == 0
+        || process_start.pid != weights_loaded.pid
+        || process_start.captured_at >= weights_loaded.captured_at
+    {
+        return Err("campaign weight samples do not form one ordered process boundary".into());
+    }
+    if weights_loaded.mlx_active_bytes > weights_loaded.current_bytes {
+        return Err("campaign weight sample exceeds Darwin physical footprint".into());
+    }
+    weights_loaded
+        .mlx_active_bytes
+        .checked_sub(process_start.mlx_active_bytes)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            "campaign model materialization produced no positive MLX active delta".into()
+        })
+}
+
+fn quiesce_campaign_active_memory(expected_active_bytes: u64) -> core_llm::Result<()> {
+    mlx_rs::memory::clear_cache();
+    let active = mlx_rs::memory::get_active_memory() as u64;
+    let cache = mlx_rs::memory::get_cache_memory() as u64;
+    if active != expected_active_bytes || cache != 0 {
+        return Err(core_llm::Error::Load(format!(
+            "campaign session did not quiesce before the next model load: active={active}, expected={expected_active_bytes}, cache={cache}"
+        )));
+    }
+    Ok(())
 }
 
 fn timestamp_now() -> String {
@@ -3559,20 +3731,17 @@ pub fn run_dense_coordinate(
     max_new_tokens: u32,
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
+    let session = CampaignSession::load(snapshot)?;
+    observer.bind_session(session.session_id());
+    observer.load_duration(session.load_elapsed_ms);
+    observer.load_boundary(&session.load_start_sample, &session.weights_loaded_sample);
     observer.phase("process-start");
-    let inventory = inventory_snapshot(snapshot.as_ref())
-        .map_err(|e| core_llm::Error::Load(format!("snapshot inventory: {e}")))?;
-    if inventory.bytes == 0 || inventory.files.is_empty() {
-        return Err(core_llm::Error::Load("snapshot inventory is empty".into()));
-    }
     let output = {
-        let provider = crate::provider::LlamaProvider::load(&core_llm::LoadSpec::dense(
-            snapshot.as_ref().to_string_lossy().to_string(),
-        ))?;
-        observer.snapshot_inventory(&inventory);
+        let provider = &session.provider;
+        observer.snapshot_inventory(session.inventory());
         observer.geometry(provider.campaign_geometry());
         observer.phase("weights-loaded");
-        observer.allocation("weights", "persistent", inventory.bytes);
+        observer.allocation("weights", "persistent", session.model_weights_bytes());
         let request = TextLlmRequest {
             messages: vec![Message::text(Role::User, prompt)],
             sampling: Sampling {
@@ -3600,7 +3769,9 @@ pub fn run_dense_coordinate(
             ));
         }
         output
-    }; // Provider/model ownership is released before the final sample.
+    };
+    drop(session); // Provider/model ownership is released before the final sample.
+    mlx_rs::memory::clear_cache();
     observer.phase("post-run-release");
     Ok(output)
 }
@@ -3656,6 +3827,7 @@ pub fn run_dense_lifecycle_request_on_session(
     }
     observer.bind_session(session.session_id());
     observer.load_duration(session.load_elapsed_ms);
+    observer.load_boundary(&session.load_start_sample, &session.weights_loaded_sample);
     observer.phase("process-start");
     let inventory = session.inventory();
     let provider = &session.provider;
@@ -3663,7 +3835,7 @@ pub fn run_dense_lifecycle_request_on_session(
         observer.snapshot_inventory(inventory);
         observer.geometry(provider.campaign_geometry());
         observer.phase("weights-loaded");
-        observer.allocation("weights", "persistent", inventory.bytes);
+        observer.allocation("weights", "persistent", session.model_weights_bytes());
         if let Some(coordinate) = coordinate {
             if coordinate.request_mode == "supported-batch" {
                 provider.campaign_supported_batch(prefix_prompt, 2)?;
@@ -3863,11 +4035,12 @@ fn run_coordinate_operation_on_session(
     let mut observer = ProductObserver::new();
     observer.bind_session(session.session_id());
     observer.load_duration(session.load_elapsed_ms);
+    observer.load_boundary(&session.load_start_sample, &session.weights_loaded_sample);
     observer.phase("process-start");
     observer.snapshot_inventory(session.inventory());
     observer.geometry(provider.campaign_geometry());
     observer.phase("weights-loaded");
-    observer.allocation("weights", "persistent", session.inventory().bytes);
+    observer.allocation("weights", "persistent", session.model_weights_bytes());
 
     let (operation, generated_tokens, prompt_tokens, output_sha256) =
         if operation == "supported-batch" {
@@ -4106,39 +4279,42 @@ pub fn run_product_fixture_suite(
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureSuite> {
     let candidate = CampaignSession::load(candidate_snapshot)?;
+    let candidate_baseline = candidate.load_start_sample.mlx_active_bytes;
+    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate)?;
+    drop(candidate);
+    quiesce_campaign_active_memory(candidate_baseline)?;
+
     let reference = CampaignSession::load(reference_snapshot)?;
-    run_product_fixture_suite_on_sessions(&candidate, &reference, prompt, coordinate)
+    let reference_baseline = reference.load_start_sample.mlx_active_bytes;
+    let reference_half = run_product_fixture_half_on_session(&reference, prompt, coordinate)?;
+    drop(reference);
+    quiesce_campaign_active_memory(reference_baseline)?;
+    pair_product_fixture_halves(candidate_half, reference_half)
 }
 
-pub fn run_product_fixture_suite_on_sessions(
-    candidate_session: &CampaignSession,
-    reference_session: &CampaignSession,
+struct ProductFixtureHalf {
+    kernel: ProductFixtureResult,
+    tool: ProductFixtureResult,
+    needle_result: ProductFixtureResult,
+    cache: ProductFixtureResult,
+    needle: String,
+    context_window_tokens: u64,
+    context_target_tokens: u64,
+    context_payload_tokens: u64,
+    context_payload_sha256: String,
+    fixture_prompt_tokens: [u64; 4],
+}
+
+fn run_product_fixture_half_on_session(
+    session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
-) -> core_llm::Result<ProductFixtureSuite> {
-    candidate_session.validate_coordinate_family(coordinate)?;
-    reference_session.validate_coordinate_family(coordinate)?;
-    let candidate_window = candidate_session.provider.campaign_context_window()?;
-    let reference_window = reference_session.provider.campaign_context_window()?;
-    if candidate_window != reference_window {
-        return Err(core_llm::Error::InvalidRequest(format!(
-            "candidate/reference context windows differ: {candidate_window} != {reference_window}"
-        )));
-    }
-    let (band_payload, context_target_tokens, context_payload_tokens) = candidate_session
+) -> core_llm::Result<ProductFixtureHalf> {
+    session.validate_coordinate_family(coordinate)?;
+    let context_window_tokens = session.provider.campaign_context_window()?;
+    let (band_payload, context_target_tokens, context_payload_tokens) = session
         .provider
         .campaign_context_band_measurement(coordinate.context_band)?;
-    if candidate_session
-        .provider
-        .campaign_prompt_tokens(&band_payload)?
-        != reference_session
-            .provider
-            .campaign_prompt_tokens(&band_payload)?
-    {
-        return Err(core_llm::Error::InvalidRequest(
-            "candidate/reference tokenizers disagree on the context-band payload".into(),
-        ));
-    }
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
     let kernel_prompt = format!("{prompt}\n{band_payload}\nReturn a concise deterministic answer.");
     let tool_prompt = format!(
@@ -4146,56 +4322,85 @@ pub fn run_product_fixture_suite_on_sessions(
     );
     let needle_prompt = needle_fixture_prompt(prompt, &band_payload, &needle);
     let cache_prompt = format!("{prompt}\n{band_payload}\nRepeat the stable baseline fact.");
-    for fixture_prompt in [&kernel_prompt, &tool_prompt, &needle_prompt, &cache_prompt] {
-        let candidate_tokens = candidate_session
-            .provider
-            .campaign_prompt_tokens(fixture_prompt)?;
-        let reference_tokens = reference_session
-            .provider
-            .campaign_prompt_tokens(fixture_prompt)?;
-        if candidate_tokens != reference_tokens
-            || candidate_tokens > candidate_window.saturating_sub(256)
-        {
+    let fixture_prompt_tokens = [
+        session.provider.campaign_prompt_tokens(&kernel_prompt)?,
+        session.provider.campaign_prompt_tokens(&tool_prompt)?,
+        session.provider.campaign_prompt_tokens(&needle_prompt)?,
+        session.provider.campaign_prompt_tokens(&cache_prompt)?,
+    ];
+    for tokens in fixture_prompt_tokens {
+        if tokens > context_window_tokens.saturating_sub(256) {
             return Err(core_llm::Error::InvalidRequest(format!(
-                "fixture prompt tokenization is not comparable or exceeds the loaded context: {candidate_tokens}/{reference_tokens}/{candidate_window}"
+                "fixture prompt tokenization exceeds the loaded context: {tokens}/{context_window_tokens}"
             )));
         }
     }
-    let run_pair = |prefix: &str, request: TextLlmRequest| -> core_llm::Result<_> {
-        Ok((
-            run_product_fixture_on_session(candidate_session, prefix, request.clone(), coordinate)?,
-            run_product_fixture_on_session(reference_session, prefix, request, coordinate)?,
-        ))
-    };
-    let (kernel_candidate, kernel_reference) = run_pair(
+    let kernel = run_product_fixture_on_session(
+        session,
         &kernel_prompt,
         fixture_request(kernel_prompt.clone(), Vec::new()),
+        coordinate,
     )?;
-    let (tool_candidate, tool_reference) = run_pair(
+    let tool = run_product_fixture_on_session(
+        session,
         &tool_prompt,
         fixture_request(tool_prompt.clone(), vec![structured_fixture_tool()]),
+        coordinate,
     )?;
-    let (needle_candidate, needle_reference) = run_pair(
+    let needle_result = run_product_fixture_on_session(
+        session,
         &needle_prompt,
         fixture_request(needle_prompt.clone(), Vec::new()),
+        coordinate,
     )?;
-    let (cache_candidate, cache_reference) = run_pair(
+    let cache = run_product_fixture_on_session(
+        session,
         &cache_prompt,
         fixture_request(cache_prompt.clone(), Vec::new()),
+        coordinate,
     )?;
-    Ok(ProductFixtureSuite {
-        kernel_candidate,
-        kernel_reference,
-        tool_candidate,
-        tool_reference,
-        needle_candidate,
-        needle_reference,
-        cache_candidate,
-        cache_reference,
+    Ok(ProductFixtureHalf {
+        kernel,
+        tool,
+        needle_result,
+        cache,
         needle,
-        context_window_tokens: candidate_window,
+        context_window_tokens,
         context_target_tokens,
         context_payload_tokens,
+        context_payload_sha256: seal_bytes(band_payload.as_bytes()),
+        fixture_prompt_tokens,
+    })
+}
+
+fn pair_product_fixture_halves(
+    candidate: ProductFixtureHalf,
+    reference: ProductFixtureHalf,
+) -> core_llm::Result<ProductFixtureSuite> {
+    if candidate.needle != reference.needle
+        || candidate.context_window_tokens != reference.context_window_tokens
+        || candidate.context_target_tokens != reference.context_target_tokens
+        || candidate.context_payload_tokens != reference.context_payload_tokens
+        || candidate.context_payload_sha256 != reference.context_payload_sha256
+        || candidate.fixture_prompt_tokens != reference.fixture_prompt_tokens
+    {
+        return Err(core_llm::Error::InvalidRequest(
+            "candidate/reference context or tokenizer evidence differs".into(),
+        ));
+    }
+    Ok(ProductFixtureSuite {
+        kernel_candidate: candidate.kernel,
+        kernel_reference: reference.kernel,
+        tool_candidate: candidate.tool,
+        tool_reference: reference.tool,
+        needle_candidate: candidate.needle_result,
+        needle_reference: reference.needle_result,
+        cache_candidate: candidate.cache,
+        cache_reference: reference.cache,
+        needle: candidate.needle,
+        context_window_tokens: candidate.context_window_tokens,
+        context_target_tokens: candidate.context_target_tokens,
+        context_payload_tokens: candidate.context_payload_tokens,
     })
 }
 
@@ -4621,6 +4826,13 @@ fn product_receipt(
         .map(|e| e.bytes)
         .max()
         .ok_or("coordinate produced no persistent cache snapshot")?;
+    let model_weights_bytes = observation
+        .allocations
+        .iter()
+        .filter(|event| event.role == "weights" && event.lifetime == "persistent")
+        .map(|event| event.bytes)
+        .max()
+        .ok_or("coordinate produced no measured model-weight allocation")?;
     let workspace = observation
         .allocations
         .iter()
@@ -4632,7 +4844,11 @@ fn product_receipt(
         .max()
         .unwrap_or(0);
     let release = observation.phases.last().ok_or("release phase")?;
-    let start = observation.phases.first().ok_or("start phase")?;
+    let weights_loaded = observation
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "weights-loaded")
+        .ok_or("weights-loaded phase")?;
     let mut fixture_evidence = std::collections::BTreeMap::new();
     for name in REQUIRED_FIXTURES {
         let artifact_name = format!("fixtures/{name}.json");
@@ -4660,7 +4876,7 @@ fn product_receipt(
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes: model.bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= start.phys_footprint_bytes && release.mlx.active_bytes <= start.mlx.active_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: 0, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:coordinate.prefill_mode=="chunked",single_shot_prefill:coordinate.prefill_mode=="single-shot",prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
     ReceiptBuilder {
@@ -5013,6 +5229,31 @@ mod tests {
     }
 
     #[test]
+    fn model_weight_residency_is_a_positive_candidate_only_active_delta() {
+        let sample = |timestamp: &str, pid: u32, active: u64, cache: u64| MemorySample {
+            captured_at: timestamp.into(),
+            pid,
+            current_bytes: active + cache + 1_000,
+            peak_bytes: active + cache + 1_000,
+            mlx_active_bytes: active,
+            mlx_cache_bytes: cache,
+            mlx_peak_bytes: active,
+        };
+        let start = sample("2026-01-01T00:00:00.000Z", 7, 500, 900);
+        let loaded = sample("2026-01-01T00:00:01.000Z", 7, 532, 1_900);
+        assert_eq!(measured_model_weight_bytes(&start, &loaded), Ok(32));
+
+        let no_candidate_delta = sample("2026-01-01T00:00:01.000Z", 7, 500, 9_000);
+        assert!(measured_model_weight_bytes(&start, &no_candidate_delta).is_err());
+        let lower_active = sample("2026-01-01T00:00:01.000Z", 7, 499, 0);
+        assert!(measured_model_weight_bytes(&start, &lower_active).is_err());
+        let wrong_pid = sample("2026-01-01T00:00:01.000Z", 8, 532, 0);
+        assert!(measured_model_weight_bytes(&start, &wrong_pid).is_err());
+        let stale = sample("2025-12-31T23:59:59.000Z", 7, 532, 0);
+        assert!(measured_model_weight_bytes(&start, &stale).is_err());
+    }
+
+    #[test]
     fn fixture_evidence_is_fail_closed() {
         let evidence = REQUIRED_FIXTURES
             .iter()
@@ -5056,7 +5297,7 @@ mod tests {
                 hardware: "hardware".into(),
                 model_id: "model".into(),
                 model_file_sha256: "d".repeat(64),
-                model_file_bytes: 1,
+                model_file_bytes: 100,
                 reference_model_id: "reference-model".into(),
                 reference_model_sha256: "9".repeat(64),
                 reference_model_bytes: 1,
@@ -5188,6 +5429,8 @@ mod tests {
                 },
             );
         }
+        let active_bytes = [2, 3, 8, 7, 7, 7, 3, 3];
+        let peak_bytes = [2, 3, 8, 8, 8, 8, 8, 8];
         let phases = REQUIRED_PHASES
             .iter()
             .enumerate()
@@ -5200,9 +5443,9 @@ mod tests {
                 phys_footprint_peak_bytes: 100,
                 mlx: ReceiptMlx {
                     source: "mlx_rs::memory".into(),
-                    active_bytes: 10,
-                    cache_bytes: 1,
-                    peak_bytes: 10,
+                    active_bytes: active_bytes[index],
+                    cache_bytes: 0,
+                    peak_bytes: peak_bytes[index],
                 },
             })
             .collect();
@@ -5273,6 +5516,21 @@ mod tests {
         }
         .finish()
         .expect("builder must produce a complete v3 receipt");
+        assert_eq!(receipt.provenance.model_file_bytes, 100);
+        assert_eq!(receipt.memory.model_weights_bytes, 1);
+        let mut reference_only_memory = receipt.clone();
+        reference_only_memory.memory.phase_samples[0]
+            .mlx
+            .active_bytes = 100;
+        reference_only_memory.memory.phase_samples[0].mlx.peak_bytes = 100;
+        reference_only_memory.memory.phase_samples[1]
+            .mlx
+            .active_bytes = 100;
+        reference_only_memory.memory.phase_samples[1].mlx.peak_bytes = 100;
+        for phase in &mut reference_only_memory.memory.phase_samples[2..] {
+            phase.mlx.peak_bytes = phase.mlx.peak_bytes.max(100);
+        }
+        assert!(validate_receipt_semantics(&reference_only_memory).is_err());
         let mut different_session = receipt.clone();
         different_session.provenance.campaign_session_id = "7".repeat(64);
         assert_eq!(
@@ -5356,6 +5614,10 @@ mod tests {
             release,
         ]);
         sequential.memory.transient_workspace_bytes = 3;
+        sequential.memory.phase_samples[2].mlx.active_bytes = 10;
+        for phase in &mut sequential.memory.phase_samples[2..] {
+            phase.mlx.peak_bytes = 10;
+        }
         assert!(validate_receipt_semantics(&sequential).is_ok());
         sequential.memory.transient_workspace_bytes = 2;
         assert!(validate_receipt_semantics(&sequential).is_err());
