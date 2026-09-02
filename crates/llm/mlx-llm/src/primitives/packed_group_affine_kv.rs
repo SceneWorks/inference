@@ -8,6 +8,7 @@
 use std::any::Any;
 use std::convert::TryInto;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -185,11 +186,15 @@ pub trait RetainedPackedKernel: fmt::Debug {
 #[derive(Clone)]
 pub struct CompiledKernelHandle {
     inner: Arc<dyn RetainedPackedKernel>,
+    warmed: Arc<AtomicBool>,
 }
 
 impl CompiledKernelHandle {
     pub fn new(inner: Arc<dyn RetainedPackedKernel>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            warmed: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn cache_identity(&self) -> &str {
@@ -202,6 +207,14 @@ impl CompiledKernelHandle {
 
     pub fn retained_host_bytes_estimate(&self) -> usize {
         self.inner.retained_host_bytes_estimate()
+    }
+
+    fn is_warmed(&self) -> bool {
+        self.warmed.load(Ordering::Acquire)
+    }
+
+    fn mark_warmed(&self) {
+        self.warmed.store(true, Ordering::Release);
     }
 }
 
@@ -2303,7 +2316,11 @@ impl PackedGroupAffineKvCache {
             }
         };
         self.record_staged_physical_evidence(&staged, additional_transient_bytes);
-        let was_warmed = self.telemetry.kernel_warmed;
+        // Compilation belongs to the retained handle, not to any one cache that borrows it. A new
+        // cache over an already-exercised handle must therefore classify its first dispatch as
+        // steady rather than inventing another cold/JIT event.
+        let was_warmed = self.handle.as_ref().expect("checked above").is_warmed();
+        self.telemetry.kernel_warmed = was_warmed;
         if !was_warmed {
             self.telemetry.compile_jit_attempts += 1;
         }
@@ -2335,6 +2352,7 @@ impl PackedGroupAffineKvCache {
                 return Err(error);
             }
         };
+        self.handle.as_ref().expect("checked above").mark_warmed();
         self.telemetry.kernel_warmed = true;
         self.publish_staged_device_layer(layer, staged.device_layer);
         debug_assert_eq!(
@@ -3301,6 +3319,60 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(packed.offset(), 2);
+    }
+
+    #[test]
+    fn sc20676_cloned_retained_handle_reports_one_real_cold_dispatch_across_caches() {
+        let kernel = Arc::new(TestPackedKernel {
+            calls: AtomicUsize::new(0),
+            fail_on: None,
+            cancel_on_failure: false,
+        });
+        let handle = CompiledKernelHandle::new(kernel);
+        let request = || PackedCacheRequest {
+            enabled: true,
+            backend: "mlx-metal".into(),
+            identity: "test-packed".into(),
+            layers: 1,
+            batch: 1,
+            kv_heads: 1,
+            head_dimension: 64,
+            group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+            query_length: 1,
+            has_mask: false,
+        };
+        let dispatch = |handle: CompiledKernelHandle| {
+            let mut cache = select_decoder_cache_with_reader(request(), handle).into_cache();
+            let packed = cache
+                .as_any_mut()
+                .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                .unwrap();
+            let query = Array::from_slice(&[1.0_f32; 64], &[1, 1, 1, 64]);
+            let kv = Array::from_slice(&[2.0_f32; 64], &[1, 1, 1, 64]);
+            assert!(packed
+                .try_packed_attention(
+                    0,
+                    &query,
+                    &kv,
+                    &kv,
+                    PackedAttentionMask::Causal,
+                    0.125,
+                    false,
+                )
+                .unwrap()
+                .is_some());
+            packed.model_evidence()
+        };
+
+        let cold = dispatch(handle.clone());
+        assert_eq!(cold.compile_jit_attempts, 1);
+        assert_eq!(cold.cold_dispatches, 1);
+        assert_eq!(cold.steady_dispatches, 0);
+        let warm = dispatch(handle);
+        assert_eq!(warm.compile_jit_attempts, 0);
+        assert_eq!(warm.cold_dispatches, 0);
+        assert_eq!(warm.steady_dispatches, 1);
+        assert!(warm.kernel_warmed);
     }
 
     #[test]

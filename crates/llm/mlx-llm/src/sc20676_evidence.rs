@@ -66,8 +66,10 @@ pub struct Sc20676BaselineBinding {
     pub model_repository: String,
     pub model_revision: String,
     pub snapshot_inventory_sha256: String,
+    pub scene_works_revision: String,
     pub inference_revision: String,
     pub campaign_session_id: String,
+    pub campaign_global_identity_sha256: String,
     pub context_band: String,
     pub context_payload_tokens: u64,
 }
@@ -241,14 +243,22 @@ impl Sc20676Receipt {
         self.schema_version = SC20676_SCHEMA_VERSION;
         self.harness_version = SC20676_HARNESS_VERSION.into();
         self.receipt_sha256.clear();
-        validate_sc20676_receipt(&self)?;
+        validate_sc20676_receipt_core(&self)?;
         self.receipt_sha256 = campaign::seal_bytes(&self.bytes().map_err(|e| e.to_string())?);
+        validate_sc20676_receipt(&self)?;
         Ok(self)
     }
 }
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn is_revision(value: &str) -> bool {
+    value.len() == 40
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -335,6 +345,40 @@ fn take_validated_family_arms(
     ))
 }
 
+fn validate_complete_matrix_receipts(
+    receipts: &[Sc20676Receipt],
+) -> std::result::Result<(), String> {
+    for receipt in receipts {
+        validate_sc20676_receipt(receipt)?;
+    }
+    let families = receipts
+        .iter()
+        .map(|receipt| receipt.dense.family.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let baseline_campaigns = receipts
+        .iter()
+        .map(|receipt| {
+            (
+                receipt.baseline.campaign_session_id.as_str(),
+                receipt.baseline.campaign_global_identity_sha256.as_str(),
+                receipt.baseline.scene_works_revision.as_str(),
+                receipt.baseline.inference_revision.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if receipts.len() != 2 || families != std::collections::BTreeSet::from(["llama", "qwen"]) {
+        return Err(
+            "SC-20676 complete matrix requires exactly one Llama and one Qwen receipt".into(),
+        );
+    }
+    if baseline_campaigns.len() != 1 {
+        return Err(
+            "SC-20676 complete matrix must bind one SC-20671 campaign and source closure".into(),
+        );
+    }
+    Ok(())
+}
+
 fn timing_summary(
     samples: &[Sc20676TimingSample],
 ) -> std::result::Result<Sc20676TimingSummary, String> {
@@ -365,10 +409,11 @@ fn timing_summary(
 }
 
 fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), String> {
-    const PHASES: [&str; 5] = [
+    const PHASES: [&str; 6] = [
         "process-start",
         "weights-loaded",
         "prefill-cache-resident",
+        "decode-cache-resident",
         "decode-transient-peak",
         "reset-release",
     ];
@@ -392,7 +437,7 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
         return Err("SC-20676 memory phase evidence is incomplete".into());
     }
     let weights = &memory.phases[1];
-    let release = &memory.phases[4];
+    let release = &memory.phases[5];
     if release.mlx_active_bytes != weights.mlx_active_bytes
         || release.mlx_cache_bytes != weights.mlx_cache_bytes
         || release.phys_footprint_bytes
@@ -403,9 +448,9 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
         return Err("SC-20676 release did not return to the weights-only boundary".into());
     }
     if memory.transient_workspace_bytes
-        != memory.phases[3]
+        != memory.phases[4]
             .mlx_peak_bytes
-            .saturating_sub(memory.phases[2].mlx_active_bytes)
+            .saturating_sub(memory.phases[3].mlx_active_bytes)
     {
         return Err(
             "SC-20676 transient workspace is not the measured peak above resident cache".into(),
@@ -493,7 +538,7 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
                     && (sample.packed_cold_dispatch_ms != 0.0
                         || sample.packed_warm_dispatch_ms != 0.0))
                 || (arm.mode == "packed"
-                    && (!finite_positive(sample.packed_cold_dispatch_ms)
+                    && (sample.packed_cold_dispatch_ms != 0.0
                         || !finite_positive(sample.packed_warm_dispatch_ms)))
         })
     {
@@ -531,6 +576,10 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || packed.full_cache_dequantizations != 0
         || packed.dense_active
         || packed.failed_dispatches != 0
+        || packed.compile_jit_attempts != 1
+        || !packed.kernel_warmed
+        || packed.cold_dispatches != 1
+        || packed.steady_dispatches == 0
         || !finite_positive(packed.cold_elapsed_ms)
         || !finite_positive(packed.steady_elapsed_ms)
         || packed.retained_device_packed_logical_bytes == 0
@@ -547,11 +596,19 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || arm.memory.packed_device_bytes == 0
         || arm.continuation_dispatches == 0
         || !warm.kernel_warmed
+        || warm.accepted_direct_calls == 0
+        || warm.full_cache_dequantizations != 0
+        || warm.dense_active
+        || warm.failed_dispatches != 0
+        || warm.compile_jit_attempts != 0
+        || warm.cold_dispatches != 0
         || warm.steady_dispatches == 0
+        || !finite_positive(warm.steady_elapsed_ms)
+        || !warm.fallback_reasons.is_empty()
     {
         return Err("SC-20676 packed representation contract is not proven".into());
     }
-    let resident = &arm.memory.phases[2];
+    let resident = &arm.memory.phases[3];
     let weights = &arm.memory.phases[1];
     if arm.memory.packed_logical_payload_bytes != packed.retained_device_code_bytes
         || arm.memory.packed_metadata_bytes != packed.retained_device_metadata_bytes
@@ -593,8 +650,8 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// Reject malformed or deceptively dense evidence before a receipt can be sealed or consumed.
-pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result<(), String> {
+/// Reject malformed or deceptively dense evidence while constructing the semantic core.
+fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Result<(), String> {
     if receipt.schema_version != SC20676_SCHEMA_VERSION
         || receipt.harness_version != SC20676_HARNESS_VERSION
         || receipt.thresholds.contract_hash != SC20676_CONTRACT_HASH
@@ -603,9 +660,11 @@ pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result
         || !is_digest(&receipt.baseline.snapshot_inventory_sha256)
         || receipt.baseline.model_id.is_empty()
         || receipt.baseline.model_repository.is_empty()
-        || receipt.baseline.model_revision.len() != 40
-        || receipt.baseline.inference_revision.len() != 40
+        || !is_revision(&receipt.baseline.model_revision)
+        || !is_revision(&receipt.baseline.scene_works_revision)
+        || !is_revision(&receipt.baseline.inference_revision)
         || !is_digest(&receipt.baseline.campaign_session_id)
+        || !is_digest(&receipt.baseline.campaign_global_identity_sha256)
         || receipt.baseline.context_band != campaign::SC20676_BASELINE_CONTEXT_BAND
         || receipt.baseline.context_payload_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
         || receipt.thresholds.max_logit_abs_error != SC20676_MAX_LOGIT_ABS_ERROR
@@ -642,8 +701,25 @@ pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result
     {
         return Err("SC-20676 receipt arm evidence is incomplete".into());
     }
+    let model = campaign::benchmark_model(&receipt.dense.family, false)?;
+    let expected_model_id = format!(
+        "{}@{};architecture={};inventory={}",
+        model.repository,
+        model.revision,
+        model.architecture,
+        receipt.baseline.snapshot_inventory_sha256
+    );
+    if receipt.baseline.model_repository != model.repository
+        || receipt.baseline.model_revision != model.revision
+        || receipt.baseline.model_id != expected_model_id
+    {
+        return Err("SC-20676 baseline model binding does not match the receipt family".into());
+    }
     if receipt.dense.provenance != receipt.packed.provenance
-        || receipt.dense.provenance.inference_revision.len() != 40
+        || !is_revision(&receipt.dense.provenance.inference_revision)
+        || !is_revision(&receipt.dense.provenance.scene_works_revision)
+        || receipt.dense.provenance.inference_revision != receipt.baseline.inference_revision
+        || receipt.dense.provenance.scene_works_revision != receipt.baseline.scene_works_revision
         || !is_digest(&receipt.dense.provenance.dependency_lock_sha256)
         || [
             receipt.dense.provenance.os.as_str(),
@@ -713,16 +789,20 @@ pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result
     {
         return Err("SC-20676 cancellation cleanup is unproven".into());
     }
-    if !receipt.receipt_sha256.is_empty() {
-        if !is_digest(&receipt.receipt_sha256) {
-            return Err("SC-20676 receipt seal is malformed".into());
-        }
-        let mut core = receipt.clone();
-        core.receipt_sha256.clear();
-        if campaign::seal_bytes(&core.bytes().map_err(|e| e.to_string())?) != receipt.receipt_sha256
-        {
-            return Err("SC-20676 receipt seal does not bind its contents".into());
-        }
+    Ok(())
+}
+
+/// Validate a published receipt, including its mandatory semantic-core seal. Construction uses
+/// the private core validator above; every consumer and publication path uses this sealed form.
+pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result<(), String> {
+    validate_sc20676_receipt_core(receipt)?;
+    if !is_digest(&receipt.receipt_sha256) {
+        return Err("SC-20676 receipt seal is missing or malformed".into());
+    }
+    let mut core = receipt.clone();
+    core.receipt_sha256.clear();
+    if campaign::seal_bytes(&core.bytes().map_err(|e| e.to_string())?) != receipt.receipt_sha256 {
+        return Err("SC-20676 receipt seal does not bind its contents".into());
     }
     Ok(())
 }
@@ -737,6 +817,8 @@ pub fn bind_sc20671_baseline(
 ) -> std::result::Result<Sc20676BaselineBinding, String> {
     let baseline = campaign::select_sc20676_baseline_row(campaign_directory.as_ref(), family)?;
     let receipt = baseline.receipt;
+    let campaign_global_identity_sha256 =
+        campaign::seal_bytes(&campaign::campaign_global_identity(&receipt)?);
     let inventory = campaign::validate_sc20676_candidate_snapshot(family, snapshot)?;
     let spec = campaign::benchmark_model(family, false)?;
     let expected_model_id = format!(
@@ -760,8 +842,10 @@ pub fn bind_sc20671_baseline(
         model_repository: spec.repository.into(),
         model_revision: spec.revision.into(),
         snapshot_inventory_sha256: inventory.sha256,
+        scene_works_revision: receipt.provenance.scene_works_revision,
         inference_revision: receipt.provenance.inference_revision,
         campaign_session_id: receipt.provenance.campaign_session_id,
+        campaign_global_identity_sha256,
         context_band: baseline.coordinate.context_band.into(),
         context_payload_tokens: receipt.geometry.context_payload_tokens,
     })
@@ -849,14 +933,20 @@ fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
     })
 }
 
-fn max_abs(a: &[f32], b: &[f32]) -> f64 {
+fn max_abs(a: &[f32], b: &[f32]) -> std::result::Result<f64, String> {
     if a.is_empty() || a.len() != b.len() {
-        return f64::INFINITY;
+        return Err("SC-20676 logit vectors are empty or have different lengths".into());
     }
-    a.iter()
-        .zip(b)
-        .map(|(a, b)| (*a as f64 - *b as f64).abs())
-        .fold(0.0, f64::max)
+    let mut maximum = 0.0_f64;
+    for (dense, packed) in a.iter().zip(b) {
+        let dense = f64::from(*dense);
+        let packed = f64::from(*packed);
+        if !dense.is_finite() || !packed.is_finite() {
+            return Err("SC-20676 logits contain a non-finite value".into());
+        }
+        maximum = maximum.max((dense - packed).abs());
+    }
+    Ok(maximum)
 }
 
 fn agreement(a: &[i32], b: &[i32]) -> f64 {
@@ -1177,10 +1267,16 @@ fn packed_timing_trial(
     let steady_ms = decode_ms - ttft_ms;
     if output.tokens.len() < 2
         || !finite_positive(steady_ms)
-        || evidence.cold_dispatches == 0
+        || evidence.accepted_direct_calls == 0
+        || evidence.full_cache_dequantizations != 0
+        || evidence.dense_active
+        || evidence.failed_dispatches != 0
+        || evidence.compile_jit_attempts != 0
+        || !evidence.kernel_warmed
+        || evidence.cold_dispatches != 0
         || evidence.steady_dispatches == 0
-        || !finite_positive(evidence.cold_elapsed_ms)
         || !finite_positive(evidence.steady_elapsed_ms)
+        || !evidence.fallback_reasons.is_empty()
     {
         return Err("packed timing trial has incomplete dispatch evidence".into());
     }
@@ -1189,7 +1285,9 @@ fn packed_timing_trial(
         ttft_ms,
         first_token_ms: prefill_ms + ttft_ms,
         steady_decode_tokens_per_second: (output.tokens.len() - 1) as f64 / (steady_ms / 1000.0),
-        packed_cold_dispatch_ms: evidence.cold_elapsed_ms,
+        // The retained handle was warmed once by the primary measured arm. These five independent
+        // cache trials are steady-only; the real cold/JIT observation remains in `arm.packed`.
+        packed_cold_dispatch_ms: 0.0,
         packed_warm_dispatch_ms: evidence.steady_elapsed_ms / evidence.steady_dispatches as f64,
     })
 }
@@ -1369,6 +1467,7 @@ pub fn run_sc20676_worker(
                     phase("process-start", &before),
                     phase("weights-loaded", &weights_loaded),
                     phase("prefill-cache-resident", &resident),
+                    phase("decode-cache-resident", &decode_peak),
                     phase("decode-transient-peak", &decode_peak),
                     phase("reset-release", &after),
                 ],
@@ -1377,7 +1476,10 @@ pub fn run_sc20676_worker(
                 packed_logical_payload_bytes: 0,
                 packed_metadata_bytes: 0,
                 packed_device_bytes: 0,
-                transient_workspace_bytes: transient_peak_above_resident(&resident, &decode_peak),
+                transient_workspace_bytes: transient_peak_above_resident(
+                    &decode_peak,
+                    &decode_peak,
+                ),
                 theoretical_dense_reconstruction_bytes: dense_theoretical_kv_bytes,
                 theoretical_score_matrix_bytes,
                 release_verified: after.mlx_active_bytes == weights_loaded.mlx_active_bytes
@@ -1490,7 +1592,7 @@ pub fn run_sc20676_worker(
         .trim()
         .to_owned();
     let quality = Sc20676Quality {
-        max_logit_abs_error: max_abs(&dense_logits.0, &packed_logits),
+        max_logit_abs_error: max_abs(&dense_logits.0, &packed_logits)?,
         greedy_token_agreement: agreement(&dense_tokens, &out.tokens),
         needle_retrieval: needle_output == SC20676_NEEDLE,
     };
@@ -1582,8 +1684,11 @@ pub fn run_sc20676_worker(
     let after = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
     let dense_theoretical_kv_bytes = dense_kv_geometry(&cfg, ids.len())?;
     let theoretical_score_matrix_bytes = score_matrix_geometry(&cfg, ids.len())?;
-    let packed_device_bytes = active_resident_delta(&weights_loaded, &resident);
-    let transient_workspace_bytes = transient_peak_above_resident(&resident, &decode_peak);
+    // The component evidence below is read from this same post-decode cache state. Using the
+    // prefill boundary here would join different sequence lengths and could falsely validate only
+    // because allocator slack hid the mismatch.
+    let packed_device_bytes = active_resident_delta(&weights_loaded, &decode_peak);
+    let transient_workspace_bytes = transient_peak_above_resident(&decode_peak, &decode_peak);
     if packed_device_bytes == 0 || transient_workspace_bytes == 0 {
         return Err("packed allocator evidence has no resident or transient delta".into());
     }
@@ -1625,6 +1730,7 @@ pub fn run_sc20676_worker(
                 phase("process-start", &before),
                 phase("weights-loaded", &weights_loaded),
                 phase("prefill-cache-resident", &resident),
+                phase("decode-cache-resident", &decode_peak),
                 phase("decode-transient-peak", &decode_peak),
                 phase("reset-release", &after),
             ],
@@ -1733,6 +1839,7 @@ fn validate_complete_matrix_directory(
         return Err("SC-20676 complete matrix must contain Llama and Qwen only".into());
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut validated_receipts = Vec::with_capacity(2);
     for row in rows {
         let family = row
             .get("family")
@@ -1762,10 +1869,12 @@ fn validate_complete_matrix_directory(
         {
             return Err("SC-20676 matrix row does not bind its staged receipt".into());
         }
+        validated_receipts.push(receipt);
     }
     if seen.len() != 2 {
         return Err("SC-20676 complete matrix lacks a required family".into());
     }
+    validate_complete_matrix_receipts(&validated_receipts)?;
     Ok(())
 }
 
@@ -1926,18 +2035,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
             .finish()?;
             receipts.push(receipt);
         }
-        if receipts.len() != 2
-            || receipts
-                .iter()
-                .map(|receipt| receipt.dense.family.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != 2
-        {
-            return Err(
-                "SC-20676 complete matrix requires exactly one Llama and one Qwen receipt".into(),
-            );
-        }
+        validate_complete_matrix_receipts(&receipts)?;
         fs::create_dir(&staging).map_err(|e| e.to_string())?;
         let mut receipt_file_sha256 = std::collections::BTreeMap::new();
         for receipt in &receipts {
@@ -2020,7 +2118,7 @@ mod tests {
                 ttft_ms: 1.0,
                 first_token_ms: 2.0,
                 steady_decode_tokens_per_second: 10.0,
-                packed_cold_dispatch_ms: if packed { 1.0 } else { 0.0 },
+                packed_cold_dispatch_ms: 0.0,
                 packed_warm_dispatch_ms: if packed { 1.0 } else { 0.0 }
             };
             5
@@ -2040,6 +2138,7 @@ mod tests {
                 "process-start",
                 "weights-loaded",
                 "prefill-cache-resident",
+                "decode-cache-resident",
                 "decode-transient-peak",
                 "reset-release",
             ]
@@ -2064,6 +2163,8 @@ mod tests {
             bits: 2,
             quantization_group_size: 32,
             accepted_direct_calls: 2,
+            compile_jit_attempts: 1,
+            kernel_warmed: true,
             cold_dispatches: 1,
             steady_dispatches: 1,
             cold_elapsed_ms: 1.0,
@@ -2084,11 +2185,13 @@ mod tests {
         let timings = timing(packed);
         let mut arm_memory = memory();
         if packed {
-            arm_memory.phases[2].mlx_active_bytes = 4;
+            arm_memory.phases[2].mlx_active_bytes = 3;
             arm_memory.phases[2].mlx_peak_bytes = 6;
             arm_memory.phases[3].mlx_active_bytes = 4;
             arm_memory.phases[3].mlx_peak_bytes = 6;
+            arm_memory.phases[4].mlx_active_bytes = 4;
             arm_memory.phases[4].mlx_peak_bytes = 6;
+            arm_memory.phases[5].mlx_peak_bytes = 6;
             arm_memory.packed_device_bytes = 2;
         } else {
             arm_memory.packed_logical_payload_bytes = 0;
@@ -2128,8 +2231,10 @@ mod tests {
             .into(),
             packed: packed.then(packed_evidence),
             warm_packed: packed.then_some(PackedCacheEvidence {
+                accepted_direct_calls: 2,
                 kernel_warmed: true,
                 steady_dispatches: 1,
+                steady_elapsed_ms: 1.0,
                 ..Default::default()
             }),
             continuation_dispatches: u64::from(packed),
@@ -2161,6 +2266,8 @@ mod tests {
         arm.arm_sha256 = arm_semantic_seal(arm).unwrap();
     }
     fn receipt() -> Sc20676Receipt {
+        let model = campaign::benchmark_model("llama", false).unwrap();
+        let inventory_sha256 = digest();
         Sc20676Receipt {
             schema_version: SC20676_SCHEMA_VERSION,
             harness_version: SC20676_HARNESS_VERSION.into(),
@@ -2168,12 +2275,17 @@ mod tests {
             baseline: Sc20676BaselineBinding {
                 receipt_sha256: digest(),
                 model_file_sha256: digest(),
-                model_id: "model".into(),
-                model_repository: "repo".into(),
-                model_revision: "b".repeat(40),
-                snapshot_inventory_sha256: digest(),
+                model_id: format!(
+                    "{}@{};architecture={};inventory={}",
+                    model.repository, model.revision, model.architecture, inventory_sha256
+                ),
+                model_repository: model.repository.into(),
+                model_revision: model.revision.into(),
+                snapshot_inventory_sha256: inventory_sha256,
+                scene_works_revision: "b".repeat(40),
                 inference_revision: "b".repeat(40),
                 campaign_session_id: digest(),
+                campaign_global_identity_sha256: digest(),
                 context_band: campaign::SC20676_BASELINE_CONTEXT_BAND.into(),
                 context_payload_tokens: 1024,
             },
@@ -2295,6 +2407,66 @@ mod tests {
         assert!(validate_sc20676_receipt(&bad).is_err());
     }
     #[test]
+    fn non_finite_logits_never_reduce_to_a_passing_parity_scalar() {
+        assert_eq!(max_abs(&[1.0, -2.0], &[1.5, -1.0]).unwrap(), 1.0);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(max_abs(&[value], &[0.0]).is_err());
+            assert!(max_abs(&[0.0], &[value]).is_err());
+        }
+        assert!(max_abs(&[], &[]).is_err());
+        assert!(max_abs(&[0.0], &[0.0, 1.0]).is_err());
+    }
+    #[test]
+    fn baseline_source_and_complete_campaign_identity_fail_closed() {
+        let mut stale_inference = receipt();
+        stale_inference.baseline.inference_revision = "c".repeat(40);
+        assert!(validate_sc20676_receipt_core(&stale_inference).is_err());
+
+        let mut stale_scene_works = receipt();
+        stale_scene_works.baseline.scene_works_revision = "c".repeat(40);
+        assert!(validate_sc20676_receipt_core(&stale_scene_works).is_err());
+
+        let llama = receipt().finish().unwrap();
+        let mut qwen = receipt();
+        let model = campaign::benchmark_model("qwen", false).unwrap();
+        qwen.baseline.model_repository = model.repository.into();
+        qwen.baseline.model_revision = model.revision.into();
+        qwen.baseline.model_id = format!(
+            "{}@{};architecture={};inventory={}",
+            model.repository,
+            model.revision,
+            model.architecture,
+            qwen.baseline.snapshot_inventory_sha256
+        );
+        qwen.dense.family = "qwen".into();
+        qwen.packed.family = "qwen".into();
+        reseal_arm(&mut qwen.dense);
+        reseal_arm(&mut qwen.packed);
+        let qwen = qwen.finish().unwrap();
+        assert!(validate_complete_matrix_receipts(&[llama.clone(), qwen.clone()]).is_ok());
+
+        let mut mixed_campaign = qwen;
+        mixed_campaign.baseline.campaign_global_identity_sha256 = "c".repeat(64);
+        let mixed_campaign = mixed_campaign.finish().unwrap();
+        assert!(validate_complete_matrix_receipts(&[llama, mixed_campaign]).is_err());
+    }
+    #[test]
+    fn packed_allocator_residency_uses_the_final_decode_cache_boundary() {
+        let valid = receipt();
+        assert_ne!(
+            valid.packed.memory.phases[2].mlx_active_bytes,
+            valid.packed.memory.phases[3].mlx_active_bytes
+        );
+        validate_sc20676_receipt_core(&valid).unwrap();
+
+        let mut prefill_join = valid;
+        prefill_join.packed.memory.packed_device_bytes = prefill_join.packed.memory.phases[2]
+            .mlx_active_bytes
+            .saturating_sub(prefill_join.packed.memory.phases[1].mlx_active_bytes);
+        reseal_arm(&mut prefill_join.packed);
+        assert!(validate_sc20676_receipt_core(&prefill_join).is_err());
+    }
+    #[test]
     fn partial_staging_never_publishes_a_final_matrix() {
         let root = std::env::temp_dir().join(format!("sc20676-atomic-test-{}", std::process::id()));
         let staging = root.join("staging");
@@ -2305,6 +2477,18 @@ mod tests {
         assert!(publish_complete_matrix(&staging, &destination, &digest(), &digest()).is_err());
         assert!(!destination.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn staged_receipt_parser_requires_the_semantic_core_seal() {
+        let unsealed = receipt();
+        let bytes = unsealed.bytes().unwrap();
+        let file_sha256 = campaign::seal_bytes(&bytes);
+        assert!(parse_staged_receipt_bytes(&bytes, &file_sha256).is_err());
+
+        let sealed = receipt().finish().unwrap();
+        let bytes = sealed.bytes().unwrap();
+        let file_sha256 = campaign::seal_bytes(&bytes);
+        assert!(parse_staged_receipt_bytes(&bytes, &file_sha256).is_ok());
     }
     #[test]
     fn output_hash_and_frozen_threshold_tampering_fail_closed() {
