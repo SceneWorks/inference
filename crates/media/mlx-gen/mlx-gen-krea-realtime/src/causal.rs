@@ -43,7 +43,8 @@ use mlx_rs::ops::{concatenate_axis, dequantize, quantize};
 use mlx_rs::{Array, Dtype};
 
 use crate::compressed_kv::{
-    CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle, TILE_ROWS,
+    CompressedTier, KreaPackedMetalKernel, RetainedKernelHandle,
+    PACKED_METAL_THREADGROUP_SCRATCH_BYTES,
 };
 use crate::config::{KreaRealtimeConfig, KvCacheQuant};
 
@@ -464,6 +465,8 @@ pub struct CausalKvCache {
     /// Product-boundary counters for the experimental route. A runtime/JIT dispatch fault is
     /// retried through unchanged dense SDPA and remains visible here for the device receipt.
     packed_metal_accepted_forwards: usize,
+    packed_metal_materialized_scratch_dispatches: usize,
+    packed_metal_bounded_scratch_bytes: usize,
     packed_metal_dense_fallbacks: usize,
     last_packed_metal_fallback: Option<String>,
     packed_metal_dispatch_geometries: Vec<PackedMetalDispatchGeometry>,
@@ -504,6 +507,7 @@ pub struct PackedMetalRouteReceipt {
     pub retained_handle_bytes: usize,
     pub persistent_bytes: usize,
     pub bounded_scratch_bytes: usize,
+    pub materialized_scratch_dispatches: usize,
     pub dense_window_bytes: usize,
     pub score_matrix_bytes: usize,
     pub accepted_forwards: usize,
@@ -542,6 +546,8 @@ impl CausalKvCache {
             quant,
             packed_metal_kernel: None,
             packed_metal_accepted_forwards: 0,
+            packed_metal_materialized_scratch_dispatches: 0,
+            packed_metal_bounded_scratch_bytes: 0,
             packed_metal_dense_fallbacks: 0,
             last_packed_metal_fallback: None,
             packed_metal_dispatch_geometries: Vec::new(),
@@ -582,16 +588,17 @@ impl CausalKvCache {
         )
     }
 
-    /// Return a receipt only for the retained experimental kernel that this cache owns.  The
-    /// fixed scratch/zero-dense values are properties of the product's tiled Metal kernel, while
-    /// persistent bytes and route counters are read from this live cache after dispatch.
+    /// Return a receipt only for the retained experimental kernel that this cache owns. Scratch is
+    /// reported only after a packed output has materialized successfully; before the first accepted
+    /// dispatch it remains zero. Persistent bytes and route counters come from this live cache.
     pub fn packed_metal_route_receipt(&self) -> Option<PackedMetalRouteReceipt> {
         let kernel = self.packed_metal_kernel.as_ref()?;
         Some(PackedMetalRouteReceipt {
             compiled_handle_identity: kernel.identity().to_owned(),
             retained_handle_bytes: kernel.retained_bytes(),
             persistent_bytes: self.retained_bytes(),
-            bounded_scratch_bytes: TILE_ROWS * 128 * std::mem::size_of::<f32>(),
+            bounded_scratch_bytes: self.packed_metal_bounded_scratch_bytes,
+            materialized_scratch_dispatches: self.packed_metal_materialized_scratch_dispatches,
             dense_window_bytes: 0,
             score_matrix_bytes: 0,
             accepted_forwards: self.packed_metal_accepted_forwards,
@@ -612,6 +619,12 @@ impl CausalKvCache {
         query_tokens: usize,
         key_tokens: usize,
     ) {
+        self.packed_metal_materialized_scratch_dispatches = self
+            .packed_metal_materialized_scratch_dispatches
+            .saturating_add(1);
+        self.packed_metal_bounded_scratch_bytes = self
+            .packed_metal_bounded_scratch_bytes
+            .max(PACKED_METAL_THREADGROUP_SCRATCH_BYTES);
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         if self.packed_metal_first_forward_ns.is_none() {
             self.packed_metal_first_forward_ns = Some(elapsed_ns);
@@ -1541,6 +1554,11 @@ mod tests {
         cache.record_packed_append_duration(std::time::Duration::from_nanos(2));
 
         assert_eq!(cache.packed_metal_first_forward_ns, Some(11));
+        assert_eq!(cache.packed_metal_materialized_scratch_dispatches, 3);
+        assert_eq!(
+            cache.packed_metal_bounded_scratch_bytes,
+            PACKED_METAL_THREADGROUP_SCRATCH_BYTES
+        );
         assert_eq!(cache.packed_metal_steady_forward_ns, 12);
         assert_eq!(cache.packed_metal_steady_forward_count, 2);
         assert_eq!(

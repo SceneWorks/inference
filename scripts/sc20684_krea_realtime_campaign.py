@@ -37,8 +37,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 STORY = "SC-20684"
-SCHEMA_VERSION = 4
-RECEIPT_SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+RECEIPT_SCHEMA_VERSION = 5
 MODEL_REPOSITORY = "SceneWorks/krea-realtime-14b-mlx"
 MODEL_REVISION = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
 OBSERVATION_PREFIX = "SC20684_KREA_PROVIDER_OBSERVATION "
@@ -176,6 +176,58 @@ def _sha256_file(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _route_lifecycle_snapshot(value: object, name: str) -> dict[str, Any]:
+    route = _object(
+        value,
+        name,
+        {
+            "compiledHandleIdentity", "retainedHandleBytes", "acceptedForwards",
+            "materializedScratchDispatches", "boundedScratchBytes", "denseWindowBytes",
+            "scoreMatrixBytes", "dispatchGeometries",
+        },
+    )
+    _nonempty(route["compiledHandleIdentity"], f"{name}.compiledHandleIdentity")
+    _integer(route["retainedHandleBytes"], f"{name}.retainedHandleBytes", minimum=1)
+    accepted = _integer(route["acceptedForwards"], f"{name}.acceptedForwards")
+    _integer(route["materializedScratchDispatches"], f"{name}.materializedScratchDispatches")
+    _integer(route["boundedScratchBytes"], f"{name}.boundedScratchBytes")
+    if route["denseWindowBytes"] != 0 or route["scoreMatrixBytes"] != 0:
+        raise CampaignError(f"{name} used a dense window or score matrix")
+    geometries = route["dispatchGeometries"]
+    if not isinstance(geometries, list):
+        raise CampaignError(f"{name}.dispatchGeometries must be a list")
+    coordinates: set[tuple[int, int]] = set()
+    counted = 0
+    for index, value in enumerate(geometries):
+        geometry = _object(
+            value,
+            f"{name}.dispatchGeometries[{index}]",
+            {"queryTokens", "keyTokens", "acceptedForwards"},
+        )
+        query = _integer(geometry["queryTokens"], f"{name}.dispatchGeometries[{index}].queryTokens", minimum=1)
+        key = _integer(geometry["keyTokens"], f"{name}.dispatchGeometries[{index}].keyTokens", minimum=query)
+        forwards = _integer(geometry["acceptedForwards"], f"{name}.dispatchGeometries[{index}].acceptedForwards", minimum=1)
+        if (query, key) in coordinates:
+            raise CampaignError(f"{name}.dispatchGeometries contains a duplicate coordinate")
+        coordinates.add((query, key))
+        counted += forwards
+    if counted != accepted:
+        raise CampaignError(f"{name} dispatch counters disagree with geometry evidence")
+    return route
+
+
+def _cancellation_dispatch_token(run_id: str, route: dict[str, Any]) -> str:
+    dispatches = ";".join(
+        f"{geometry['queryTokens']}:{geometry['keyTokens']}:{geometry['acceptedForwards']}"
+        for geometry in route["dispatchGeometries"]
+    )
+    raw = (
+        f"{run_id}\0{route['compiledHandleIdentity']}\0{route['acceptedForwards']}\0"
+        f"{route['materializedScratchDispatches']}\0{dispatches}"
+    )
+    return _sha256(raw.encode("utf-8"))
 
 
 def _integer(value: object, name: str, *, minimum: int = 0) -> int:
@@ -570,10 +622,10 @@ def _validate_observation(
         "cancellation",
         {
             "status", "requests", "trigger", "progressStepsBeforeCancel",
-            "typedCancellationObserved", "packedDispatchesBeforeCancel",
+            "typedCancellationObserved", "dispatchToken", "routeBefore", "routeAtCancel",
             "expectedContextTokens", "storedTokensAfterCancel",
-            "activeBytesBefore", "activeBytesAtCancel", "activeBytesAfterRelease",
-            "cacheBytesBefore", "cacheBytesAtCancel", "cacheBytesAfterRelease",
+            "activeBytesBefore", "activeBytesAfterRelease",
+            "cacheBytesBefore", "cacheBytesAfterRelease",
             "allocationObserved", "partialStateMutation", "scratchReleased",
         },
     )
@@ -591,11 +643,35 @@ def _validate_observation(
         raise CampaignError("cancellation probe must issue exactly one request")
     if _integer(cancellation["progressStepsBeforeCancel"], "cancellation.progressStepsBeforeCancel", minimum=1) != 1:
         raise CampaignError("cancellation probe must cancel after its first materialized step")
-    packed_dispatches = _integer(
-        cancellation["packedDispatchesBeforeCancel"],
-        "cancellation.packedDispatchesBeforeCancel",
-        minimum=1,
+    route_before = _route_lifecycle_snapshot(cancellation["routeBefore"], "cancellation.routeBefore")
+    route_at_cancel = _route_lifecycle_snapshot(cancellation["routeAtCancel"], "cancellation.routeAtCancel")
+    if (
+        route_before["compiledHandleIdentity"] != route_at_cancel["compiledHandleIdentity"]
+        or route_before["retainedHandleBytes"] != route_at_cancel["retainedHandleBytes"]
+    ):
+        raise CampaignError("cancellation route lifecycle does not identify one retained handle")
+    dispatch_delta = route_at_cancel["acceptedForwards"] - route_before["acceptedForwards"]
+    scratch_dispatch_delta = (
+        route_at_cancel["materializedScratchDispatches"]
+        - route_before["materializedScratchDispatches"]
     )
+    expected_scratch_bytes = (
+        3 * geometry["queryTile"] * geometry["headDim"]
+        + geometry["queryTile"] * geometry["keyTile"]
+        + 3 * geometry["queryTile"]
+    ) * 4
+    route_allocation_observed = (
+        route_before["acceptedForwards"] == 0
+        and route_before["materializedScratchDispatches"] == 0
+        and route_before["boundedScratchBytes"] == 0
+        and route_before["dispatchGeometries"] == []
+        and dispatch_delta == 1
+        and scratch_dispatch_delta == dispatch_delta
+        and route_at_cancel["boundedScratchBytes"] == expected_scratch_bytes
+    )
+    dispatch_token = cancellation["dispatchToken"]
+    if not _is_sha256(dispatch_token) or dispatch_token != _cancellation_dispatch_token(run_id, route_at_cancel):
+        raise CampaignError("cancellation dispatch token does not bind the launched run and route receipt")
     expected_context_tokens = _integer(
         cancellation["expectedContextTokens"], "cancellation.expectedContextTokens", minimum=1
     )
@@ -603,27 +679,24 @@ def _validate_observation(
         cancellation["storedTokensAfterCancel"], "cancellation.storedTokensAfterCancel"
     )
     for key in (
-        "activeBytesBefore", "activeBytesAtCancel", "activeBytesAfterRelease",
-        "cacheBytesBefore", "cacheBytesAtCancel", "cacheBytesAfterRelease",
+        "activeBytesBefore", "activeBytesAfterRelease",
+        "cacheBytesBefore", "cacheBytesAfterRelease",
     ):
         _integer(cancellation[key], f"cancellation.{key}")
-    allocation_observed = (
-        cancellation["activeBytesAtCancel"] > cancellation["activeBytesBefore"]
-        or cancellation["cacheBytesAtCancel"] > cancellation["cacheBytesBefore"]
-    )
     scratch_released = (
         cancellation["activeBytesAfterRelease"] <= cancellation["activeBytesBefore"]
         and cancellation["cacheBytesAfterRelease"] <= cancellation["cacheBytesBefore"]
     )
-    if cancellation["allocationObserved"] != allocation_observed or cancellation["scratchReleased"] != scratch_released:
-        raise CampaignError("cancellation allocation/cleanup claims contradict raw allocator evidence")
+    if cancellation["allocationObserved"] != route_allocation_observed:
+        raise CampaignError("cancellation allocation claim contradicts the packed-route receipt delta")
+    if cancellation["scratchReleased"] != scratch_released:
+        raise CampaignError("cancellation cleanup claim contradicts raw allocator evidence")
     partial_state_mutation = stored_tokens_after != expected_context_tokens
     if cancellation["partialStateMutation"] != partial_state_mutation:
         raise CampaignError("cancellation mutation claim contradicts raw cache-token evidence")
     cancellation_clean = (
         cancellation["typedCancellationObserved"] is True
         and cancellation["allocationObserved"] is True
-        and packed_dispatches > 0
         and cancellation["partialStateMutation"] is False
         and cancellation["scratchReleased"] is True
     )

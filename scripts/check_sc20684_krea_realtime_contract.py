@@ -138,7 +138,8 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
             if needle in production_source:
                 errors.append(f"compressed POC must not allocate a dense K/V window or score route: {needle}")
         required = (
-            "TILE_ROWS", "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision",
+            "TILE_ROWS", "TILE_KEYS", "PACKED_METAL_THREADGROUP_SCRATCH_BYTES",
+            "dense_window_bytes = 0", "score_matrix_bytes = 0", "DispatchDecision",
             "simdgroup_matrix", "simdgroup_load", "simdgroup_multiply_accumulate",
             "KreaPackedMetalKernel", "current_k", "current_v", "acc0 *= old_weight",
             "lane * 4", ".thread_group(256, 1, 1)",
@@ -182,7 +183,9 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
             '"packedCodes": "uint32"',
             '"after-first-materialized-denoise-step"',
             "release_active <= weights_loaded_active",
-            "cancellation_packed_dispatches > 0",
+            "cancellation_route_at_cancel",
+            "materialized_scratch_dispatches",
+            "cancellation_route_allocation_observed",
         )
         for needle in required:
             if needle not in source:

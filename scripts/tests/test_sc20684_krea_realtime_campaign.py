@@ -48,8 +48,31 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
         "i2v": {"kind": "deterministic-gradient-still", "frameCount": 1, "vaeEncoding": "WanVae.encode-mode", "v2vStrength": None},
         "v2v": {"kind": "deterministic-smooth-motion-clip", "frameCount": 25, "vaeEncoding": "WanVae.encode-sample", "v2vStrength": 0.6},
     }
+    handle_identity = f"sc20684/krea-packed-affine-{tier}-d128-g64-v1"
+    route_before = {
+        "compiledHandleIdentity": handle_identity,
+        "retainedHandleBytes": 128,
+        "acceptedForwards": 0,
+        "materializedScratchDispatches": 0,
+        "boundedScratchBytes": 0,
+        "denseWindowBytes": 0,
+        "scoreMatrixBytes": 0,
+        "dispatchGeometries": [],
+    }
+    route_at_cancel = {
+        "compiledHandleIdentity": handle_identity,
+        "retainedHandleBytes": 128,
+        "acceptedForwards": 1,
+        "materializedScratchDispatches": 1,
+        "boundedScratchBytes": (3 * 8 * 128 + 8 * 8 + 3 * 8) * 4,
+        "denseWindowBytes": 0,
+        "scoreMatrixBytes": 0,
+        "dispatchGeometries": [
+            {"queryTokens": 8, "keyTokens": 16, "acceptedForwards": 1},
+        ],
+    }
     return {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
@@ -101,7 +124,7 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
             "generatedLatentFrames": 6 if mode == "i2v" else 7,
         },
         "compiledHandle": {
-            "identity": f"sc20684/krea-packed-affine-{tier}-d128-g64-v1",
+            "identity": handle_identity,
             "retainedBytes": 128,
             "compiled": True,
             "acceptedDispatches": 5,
@@ -199,14 +222,14 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
             "trigger": "after-first-materialized-denoise-step",
             "progressStepsBeforeCancel": 1,
             "typedCancellationObserved": True,
-            "packedDispatchesBeforeCancel": 1,
+            "dispatchToken": campaign._cancellation_dispatch_token(run_id, route_at_cancel),
+            "routeBefore": route_before,
+            "routeAtCancel": route_at_cancel,
             "expectedContextTokens": 2,
             "storedTokensAfterCancel": 2,
             "activeBytesBefore": 6 * GIB,
-            "activeBytesAtCancel": 6 * GIB + 64 * 1024**2,
             "activeBytesAfterRelease": 6 * GIB,
             "cacheBytesBefore": GIB // 2,
-            "cacheBytesAtCancel": GIB // 2,
             "cacheBytesAfterRelease": GIB // 2,
             "allocationObserved": True,
             "partialStateMutation": False,
@@ -226,7 +249,7 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
 
 def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> dict:
     return {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
@@ -556,7 +579,10 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             self.validate_from(row)
 
         row = observation("t2v", "q8", "run")
-        row["cancellation"]["activeBytesAtCancel"] = row["cancellation"]["activeBytesBefore"]
+        row["cancellation"]["routeAtCancel"] = dict(row["cancellation"]["routeBefore"])
+        row["cancellation"]["dispatchToken"] = campaign._cancellation_dispatch_token(
+            "run", row["cancellation"]["routeAtCancel"]
+        )
         row["cancellation"]["allocationObserved"] = False
         row["cancellation"]["status"] = "fail"
         row["memory"]["releaseVerified"] = False
@@ -564,7 +590,27 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         self.assertEqual(validated["cancellation"]["status"], "fail")
 
         row["cancellation"]["allocationObserved"] = True
-        with self.assertRaisesRegex(campaign.CampaignError, "contradict raw allocator evidence"):
+        with self.assertRaisesRegex(campaign.CampaignError, "packed-route receipt delta"):
+            self.validate_from(row)
+
+        row = observation("t2v", "q8", "run")
+        row["cancellation"]["routeAtCancel"]["acceptedForwards"] = 2
+        row["cancellation"]["routeAtCancel"]["materializedScratchDispatches"] = 2
+        row["cancellation"]["routeAtCancel"]["dispatchGeometries"][0]["acceptedForwards"] = 2
+        row["cancellation"]["dispatchToken"] = campaign._cancellation_dispatch_token(
+            "run", row["cancellation"]["routeAtCancel"]
+        )
+        with self.assertRaisesRegex(campaign.CampaignError, "packed-route receipt delta"):
+            self.validate_from(row)
+
+        row = observation("t2v", "q8", "run")
+        row["cancellation"]["dispatchToken"] = "f" * 64
+        with self.assertRaisesRegex(campaign.CampaignError, "does not bind"):
+            self.validate_from(row)
+
+        row = observation("t2v", "q8", "run")
+        row["cancellation"]["injectedAllocationBytes"] = 64 * 1024**2
+        with self.assertRaisesRegex(campaign.CampaignError, "cancellation fields differ"):
             self.validate_from(row)
 
     def test_fallback_quality_and_release_failures_are_sealed_no_go_outcomes(self) -> None:

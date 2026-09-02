@@ -933,6 +933,51 @@ fn sc20684_model_identity(snapshot: &Path) -> serde_json::Value {
     })
 }
 
+fn sc20684_route_lifecycle_snapshot(
+    receipt: &mlx_gen_krea_realtime::PackedMetalRouteReceipt,
+) -> serde_json::Value {
+    serde_json::json!({
+        "compiledHandleIdentity": receipt.compiled_handle_identity,
+        "retainedHandleBytes": receipt.retained_handle_bytes,
+        "acceptedForwards": receipt.accepted_forwards,
+        "materializedScratchDispatches": receipt.materialized_scratch_dispatches,
+        "boundedScratchBytes": receipt.bounded_scratch_bytes,
+        "denseWindowBytes": receipt.dense_window_bytes,
+        "scoreMatrixBytes": receipt.score_matrix_bytes,
+        "dispatchGeometries": receipt.dispatch_geometries.iter().map(|geometry| serde_json::json!({
+            "queryTokens": geometry.query_tokens,
+            "keyTokens": geometry.key_tokens,
+            "acceptedForwards": geometry.accepted_forwards,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn sc20684_cancellation_dispatch_token(
+    run_id: &str,
+    receipt: &mlx_gen_krea_realtime::PackedMetalRouteReceipt,
+) -> String {
+    let dispatches = receipt
+        .dispatch_geometries
+        .iter()
+        .map(|geometry| {
+            format!(
+                "{}:{}:{}",
+                geometry.query_tokens, geometry.key_tokens, geometry.accepted_forwards
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    sc20684_sha256(
+        format!(
+            "{run_id}\0{}\0{}\0{}\0{dispatches}",
+            receipt.compiled_handle_identity,
+            receipt.accepted_forwards,
+            receipt.materialized_scratch_dispatches,
+        )
+        .as_bytes(),
+    )
+}
+
 fn sc20684_hash_video(output: &GenerationOutput) -> (String, Vec<Image>) {
     let GenerationOutput::Video { frames, .. } = output else {
         panic!("SC-20684 expected a video output")
@@ -1458,7 +1503,7 @@ fn sc20684_packed_campaign_observer() {
         let repository = sc20684_repository_root();
         let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
         let observation = serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
             "runId": run_id,
             "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1648,6 +1693,9 @@ fn sc20684_packed_campaign_observer() {
     cancelled_cache
         .enable_experimental_packed_metal(matches!(tier, KvCacheQuant { bits: 4, .. }))
         .expect("enable packed cancellation probe");
+    let cancellation_route_before = cancelled_cache
+        .packed_metal_route_receipt()
+        .expect("cancellation cache owns its packed route before dispatch");
     let cancellation_context_latents = packed_latents
         .take_axis(Array::from_slice(&[0i32], &[1]), 1)
         .expect("select deterministic cancellation context latent");
@@ -1661,9 +1709,6 @@ fn sc20684_packed_campaign_observer() {
     let cancellation_cache_before = mlx_rs::memory::get_cache_memory() as u64;
     let cancelled = mlx_gen::CancelFlag::default();
     let mut cancellation_progress_steps = 0u64;
-    let mut cancellation_active_at_cancel = cancellation_active_before;
-    let mut cancellation_cache_at_cancel = cancellation_cache_before;
-    let mut cancellation_probe_allocation: Option<Array> = None;
     let cancelled_result = generate_latents_conditioned_into(
         &transformer,
         &config,
@@ -1675,13 +1720,6 @@ fn sc20684_packed_campaign_observer() {
         &mut |progress| {
             if matches!(progress, Progress::Step { .. }) && cancellation_progress_steps == 0 {
                 cancellation_progress_steps = 1;
-                let allocation = Array::zeros::<f32>(&[16 * 1024 * 1024])
-                    .expect("allocate deterministic in-flight cancellation probe");
-                mlx_rs::transforms::eval([&allocation])
-                    .expect("materialize deterministic in-flight cancellation probe");
-                cancellation_probe_allocation = Some(allocation);
-                cancellation_active_at_cancel = mlx_rs::memory::get_active_memory() as u64;
-                cancellation_cache_at_cancel = mlx_rs::memory::get_cache_memory() as u64;
                 cancelled.cancel();
             }
         },
@@ -1691,26 +1729,37 @@ fn sc20684_packed_campaign_observer() {
     let cancellation_stored_tokens_after = cancelled_cache.stored_tokens();
     let cancellation_state_unchanged =
         cancellation_stored_tokens_after == cancellation_expected_context_tokens;
-    let cancellation_packed_dispatches = cancelled_cache
+    let cancellation_route_at_cancel = cancelled_cache
         .packed_metal_route_receipt()
-        .map(|receipt| receipt.accepted_forwards)
-        .unwrap_or(0);
-    drop(cancellation_probe_allocation.take());
+        .expect("cancellation cache owns its packed route after dispatch");
+    let cancellation_dispatch_token =
+        sc20684_cancellation_dispatch_token(&run_id, &cancellation_route_at_cancel);
+    let cancellation_route_before_json =
+        sc20684_route_lifecycle_snapshot(&cancellation_route_before);
+    let cancellation_route_at_cancel_json =
+        sc20684_route_lifecycle_snapshot(&cancellation_route_at_cancel);
+    let cancellation_dispatch_delta = cancellation_route_at_cancel
+        .accepted_forwards
+        .saturating_sub(cancellation_route_before.accepted_forwards);
+    let cancellation_scratch_dispatch_delta = cancellation_route_at_cancel
+        .materialized_scratch_dispatches
+        .saturating_sub(cancellation_route_before.materialized_scratch_dispatches);
+    let cancellation_route_allocation_observed = cancellation_dispatch_delta == 1
+        && cancellation_scratch_dispatch_delta == cancellation_dispatch_delta
+        && cancellation_route_before.bounded_scratch_bytes == 0
+        && cancellation_route_at_cancel.bounded_scratch_bytes
+            == mlx_gen_krea_realtime::compressed_kv::PACKED_METAL_THREADGROUP_SCRATCH_BYTES;
     drop(cancelled_cache);
     drop(cancellation_conditioning);
     mlx_rs::memory::clear_cache();
     let cancellation_active_after_release = mlx_rs::memory::get_active_memory() as u64;
     let cancellation_cache_after_release = mlx_rs::memory::get_cache_memory() as u64;
-    let cancellation_allocation_observed = cancellation_active_at_cancel
-        > cancellation_active_before
-        || cancellation_cache_at_cancel > cancellation_cache_before;
     let cancellation_scratch_released = cancellation_active_after_release
         <= cancellation_active_before
         && cancellation_cache_after_release <= cancellation_cache_before;
     let cancellation_clean = cancellation_observed
         && cancellation_progress_steps == 1
-        && cancellation_packed_dispatches > 0
-        && cancellation_allocation_observed
+        && cancellation_route_allocation_observed
         && cancellation_state_unchanged
         && cancellation_scratch_released;
 
@@ -1766,7 +1815,7 @@ fn sc20684_packed_campaign_observer() {
     let repository = sc20684_repository_root();
     let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
     let observation = serde_json::json!({
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1860,16 +1909,16 @@ fn sc20684_packed_campaign_observer() {
             "trigger": "after-first-materialized-denoise-step",
             "progressStepsBeforeCancel": cancellation_progress_steps,
             "typedCancellationObserved": cancellation_observed,
-            "packedDispatchesBeforeCancel": cancellation_packed_dispatches,
+            "dispatchToken": cancellation_dispatch_token,
+            "routeBefore": cancellation_route_before_json,
+            "routeAtCancel": cancellation_route_at_cancel_json,
             "expectedContextTokens": cancellation_expected_context_tokens,
             "storedTokensAfterCancel": cancellation_stored_tokens_after,
             "activeBytesBefore": cancellation_active_before,
-            "activeBytesAtCancel": cancellation_active_at_cancel,
             "activeBytesAfterRelease": cancellation_active_after_release,
             "cacheBytesBefore": cancellation_cache_before,
-            "cacheBytesAtCancel": cancellation_cache_at_cancel,
             "cacheBytesAfterRelease": cancellation_cache_after_release,
-            "allocationObserved": cancellation_allocation_observed,
+            "allocationObserved": cancellation_route_allocation_observed,
             "partialStateMutation": !cancellation_state_unchanged,
             "scratchReleased": cancellation_scratch_released,
         },

@@ -924,6 +924,13 @@ impl CompressedKvCache {
 
 /// The bounded number of query rows a retained threadgroup owns at once.
 pub const TILE_ROWS: usize = 8;
+/// The bounded number of packed-history key rows streamed through a threadgroup at once.
+pub const TILE_KEYS: usize = 8;
+/// Exact threadgroup storage declared by the fixed D=128 Metal source: Q/K/V tiles, the 8x8 score
+/// tile, and three 8-row online-softmax vectors. It is attributable to a receipt only after the
+/// corresponding packed output has materialized successfully.
+pub const PACKED_METAL_THREADGROUP_SCRATCH_BYTES: usize =
+    (3 * TILE_ROWS * 128 + TILE_ROWS * TILE_KEYS + 3 * TILE_ROWS) * std::mem::size_of::<f32>();
 
 pub trait CancellationProbe {
     fn cancelled(&self) -> bool;
