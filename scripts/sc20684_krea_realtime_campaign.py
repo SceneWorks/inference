@@ -37,8 +37,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 STORY = "SC-20684"
-SCHEMA_VERSION = 3
-RECEIPT_SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+RECEIPT_SCHEMA_VERSION = 4
 MODEL_REPOSITORY = "SceneWorks/krea-realtime-14b-mlx"
 MODEL_REVISION = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
 OBSERVATION_PREFIX = "SC20684_KREA_PROVIDER_OBSERVATION "
@@ -48,6 +48,29 @@ MINIMUM_MEMORY_REDUCTION_BYTES = 256 * 1024**2
 MINIMUM_MEMORY_REDUCTION_FRACTION = 0.05
 MINIMUM_THROUGHPUT_RATIO = 0.95
 MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION = 0.05
+PARITY_MAX_ABS_ERROR_BY_TIER = {"q8": 0.25, "q4": 0.75}
+QUALITY_THRESHOLDS_BY_TIER = {
+    "q8": {
+        "maxAbsRgbU8": 32,
+        "meanAbsRgbU8": 1.0,
+        "temporalDeltaDrift": 4.0,
+    },
+    "q4": {
+        "maxAbsRgbU8": 96,
+        "meanAbsRgbU8": 3.0,
+        "temporalDeltaDrift": 12.0,
+    },
+}
+PACKED_GEOMETRY_IDENTITY = {
+    "queryTile": 8,
+    "keyTile": 8,
+    "dtypes": {
+        "packedCodes": "uint32",
+        "packedMetadata": "bfloat16",
+        "queryAndCurrentKv": "bfloat16",
+        "accumulator": "float32",
+    },
+}
 SOURCE_FILES = (
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -66,7 +89,7 @@ class CampaignError(ValueError):
 def decision_policy() -> dict[str, Any]:
     """Return the source-frozen policy captured before any product process runs."""
     return {
-        "identity": "sc20684-krea-packed-affine-decision-v1",
+        "identity": "sc20684-krea-packed-affine-decision-v2",
         "materialMemory": {
             "minimumReductionBytes": MINIMUM_MEMORY_REDUCTION_BYTES,
             "minimumReductionFraction": MINIMUM_MEMORY_REDUCTION_FRACTION,
@@ -76,6 +99,11 @@ def decision_policy() -> dict[str, Any]:
             "minimumMeanOutputFpsRatio": MINIMUM_THROUGHPUT_RATIO,
             "minimumSteadyDenoiseEquivalentFpsRatio": MINIMUM_THROUGHPUT_RATIO,
             "maximumRequestFirstFrameRegressionFraction": MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION,
+        },
+        "accuracy": {
+            "metric": "paired-rgb-and-temporal-delta",
+            "parityMaxAbsErrorByTier": PARITY_MAX_ABS_ERROR_BY_TIER,
+            "qualityByTier": QUALITY_THRESHOLDS_BY_TIER,
         },
         "requiredSafety": {
             "pairedProcessExitCode": 0,
@@ -96,9 +124,10 @@ def decision_policy() -> dict[str, Any]:
             ],
             "exactPerArmAxes": [
                 "batch", "heads", "queryTokens", "keyTokens", "dispatchGeometries",
-                "headDim", "groupSize",
+                "headDim", "groupSize", "queryTile", "keyTile", "dtypes",
                 "mask", "width", "height", "frames", "latentFrames",
                 "generatedLatentFrames", "hardwareModel", "metalDevice",
+                "repositoryHead", "sourceFiles", "toolchain",
             ],
             "fixedProductGeometry": {
                 "batch": 1,
@@ -108,6 +137,7 @@ def decision_policy() -> dict[str, Any]:
                 "width": 832,
                 "height": 480,
                 "frames": 25,
+                **PACKED_GEOMETRY_IDENTITY,
             },
             "eligibilityBoundary": "only exact measured arm geometries are eligible",
             "notSweptByThisSchedule": [
@@ -117,6 +147,8 @@ def decision_policy() -> dict[str, Any]:
                 "alternateTileShapes",
                 "alternateWindowPolicies",
                 "alternateGpuFamilies",
+                "alternateDtypes",
+                "alternateToolchainsOrBuilds",
             ],
         },
         "aggregation": {
@@ -132,6 +164,14 @@ def _canonical_sha256(value: object) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _is_sha256(value: object) -> bool:
@@ -215,9 +255,11 @@ def snapshot_identity(snapshot: Path) -> dict[str, Any]:
     quant = parsed.get("quantization")
     if not isinstance(quant, dict) or quant.get("bits") != 4 or quant.get("group_size") != 64:
         raise CampaignError("snapshot must identify the pinned Q4/group-64 product tier")
-    # Deliberately stat only: the launcher must never read the materialized real weights.
-    required = ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json")
-    files: dict[str, dict[str, int]] = {}
+    if snapshot.name != "q4" or snapshot.parent.name != MODEL_REVISION:
+        raise CampaignError("snapshot path must be the exact pinned revision's q4 directory")
+    required = ("config.json", "dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json")
+    files: dict[str, dict[str, int | str]] = {}
+    inventory = hashlib.sha256()
     for name in required:
         path = snapshot / name
         if not path.is_file():
@@ -225,13 +267,16 @@ def snapshot_identity(snapshot: Path) -> dict[str, Any]:
         stat = path.stat()
         if stat.st_size <= 0:
             raise CampaignError(f"snapshot product file is empty: {name}")
-        files[name] = {"size": stat.st_size, "mtimeNs": stat.st_mtime_ns}
+        digest = _sha256_file(path)
+        files[name] = {"size": stat.st_size, "sha256": digest}
+        inventory.update(f"{name}\0{stat.st_size}\0{digest}\n".encode("utf-8"))
     return {
         "repository": MODEL_REPOSITORY,
         "revision": MODEL_REVISION,
         "variant": "q4",
         "configSha256": _sha256(raw),
         "files": files,
+        "inventorySha256": inventory.hexdigest(),
     }
 
 
@@ -307,10 +352,16 @@ def _validate_observation(
     geometry = _object(
         row["geometry"],
         "geometry",
-        {"batch", "heads", "queryTokens", "keyTokens", "dispatchGeometries", "headDim", "groupSize", "mask", "width", "height", "frames", "latentFrames", "generatedLatentFrames"},
+        {"batch", "heads", "queryTokens", "keyTokens", "dispatchGeometries", "headDim", "groupSize", "queryTile", "keyTile", "dtypes", "mask", "width", "height", "frames", "latentFrames", "generatedLatentFrames"},
     )
     if geometry["batch"] != 1 or geometry["heads"] != 40 or geometry["headDim"] != 128 or geometry["groupSize"] != 64:
         raise CampaignError("provider observation did not use native Krea packed geometry")
+    if {
+        "queryTile": geometry["queryTile"],
+        "keyTile": geometry["keyTile"],
+        "dtypes": geometry["dtypes"],
+    } != PACKED_GEOMETRY_IDENTITY:
+        raise CampaignError("provider observation did not use the frozen packed tile/dtype identity")
     _integer(geometry["queryTokens"], "geometry.queryTokens", minimum=1)
     _integer(geometry["keyTokens"], "geometry.keyTokens", minimum=1)
     if geometry["mask"] not in {"none", "block-causal"}:
@@ -455,19 +506,26 @@ def _validate_observation(
         raise CampaignError("memory sampler coverage has an excessive gap")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("memory.releaseVerified must be a boolean")
-    release_limit = memory["verificationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
+    loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
+    terminal_release_limit = memory["verificationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
     resources_released = not (
-        mlx["releaseActiveBytes"] > mlx["verificationTerminalActiveBytes"]
+        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"]
+        or mlx["releaseActiveBytes"] > mlx["verificationTerminalActiveBytes"]
+        or mlx["releaseCacheBytes"] > mlx["weightsLoadedCacheBytes"]
         or mlx["releaseCacheBytes"] > mlx["verificationTerminalCacheBytes"]
-        or memory["release"]["physFootprintBytes"] > release_limit
+        or memory["release"]["physFootprintBytes"] > loaded_release_limit
+        or memory["release"]["physFootprintBytes"] > terminal_release_limit
     )
 
     parity = _object(row["parity"], "parity", {"status", "candidateTier", "maxAbsError", "tolerance"})
     if parity["status"] not in {"pass", "fail"} or parity["candidateTier"] != expected_tier:
         raise CampaignError("packed parity status is malformed or tier-substituted")
-    if type(parity["maxAbsError"]) not in (int, float) or type(parity["tolerance"]) not in (int, float) or parity["maxAbsError"] < 0 or parity["tolerance"] <= 0:
-        raise CampaignError("packed parity numbers are malformed")
-    if (parity["status"] == "pass") != (parity["maxAbsError"] <= parity["tolerance"]):
+    parity_error = _number(parity["maxAbsError"], "parity.maxAbsError")
+    parity_tolerance = _number(parity["tolerance"], "parity.tolerance", positive=True)
+    frozen_parity_tolerance = PARITY_MAX_ABS_ERROR_BY_TIER[expected_tier]
+    if parity_tolerance != frozen_parity_tolerance:
+        raise CampaignError("packed parity tolerance differs from the frozen decision policy")
+    if (parity["status"] == "pass") != (parity_error <= frozen_parity_tolerance):
         raise CampaignError("packed parity status contradicts its measured values")
 
     quality = _object(
@@ -477,13 +535,22 @@ def _validate_observation(
     )
     if quality["status"] not in {"pass", "fail"} or quality["candidateTier"] != expected_tier:
         raise CampaignError("packed quality status is malformed or tier-substituted")
-    _nonempty(quality["metric"], "quality.metric")
+    if quality["metric"] != decision_policy()["accuracy"]["metric"]:
+        raise CampaignError("packed quality metric differs from the frozen decision policy")
     for key in ("maxAbsRgbU8", "maxAbsRgbU8Tolerance", "meanAbsRgbU8", "meanAbsRgbU8Tolerance", "packedMeanTemporalDelta", "denseMeanTemporalDelta", "temporalDeltaDrift", "temporalDeltaDriftTolerance"):
         _number(quality[key], f"quality.{key}", positive=key in {"maxAbsRgbU8Tolerance", "meanAbsRgbU8Tolerance", "temporalDeltaDriftTolerance"})
+    frozen_quality = QUALITY_THRESHOLDS_BY_TIER[expected_tier]
+    reported_quality = {
+        "maxAbsRgbU8": quality["maxAbsRgbU8Tolerance"],
+        "meanAbsRgbU8": quality["meanAbsRgbU8Tolerance"],
+        "temporalDeltaDrift": quality["temporalDeltaDriftTolerance"],
+    }
+    if reported_quality != frozen_quality:
+        raise CampaignError("packed quality tolerances differ from the frozen decision policy")
     quality_pass = not (
-        quality["maxAbsRgbU8"] > quality["maxAbsRgbU8Tolerance"]
-        or quality["meanAbsRgbU8"] > quality["meanAbsRgbU8Tolerance"]
-        or quality["temporalDeltaDrift"] > quality["temporalDeltaDriftTolerance"]
+        quality["maxAbsRgbU8"] > frozen_quality["maxAbsRgbU8"]
+        or quality["meanAbsRgbU8"] > frozen_quality["meanAbsRgbU8"]
+        or quality["temporalDeltaDrift"] > frozen_quality["temporalDeltaDrift"]
     )
     if (quality["status"] == "pass") != quality_pass:
         raise CampaignError("packed quality status contradicts its measured values")
@@ -498,16 +565,66 @@ def _validate_observation(
         or (isinstance(fallback["reason"], str) and not fallback["reason"].strip())
     ):
         raise CampaignError("fallback count and reason are inconsistent")
-    cancellation = _object(row["cancellation"], "cancellation", {"status", "requests", "partialStateMutation", "scratchReleased"})
+    cancellation = _object(
+        row["cancellation"],
+        "cancellation",
+        {
+            "status", "requests", "trigger", "progressStepsBeforeCancel",
+            "typedCancellationObserved", "packedDispatchesBeforeCancel",
+            "expectedContextTokens", "storedTokensAfterCancel",
+            "activeBytesBefore", "activeBytesAtCancel", "activeBytesAfterRelease",
+            "cacheBytesBefore", "cacheBytesAtCancel", "cacheBytesAfterRelease",
+            "allocationObserved", "partialStateMutation", "scratchReleased",
+        },
+    )
     if (
         cancellation["status"] not in {"pass", "fail"}
         or type(cancellation["partialStateMutation"]) is not bool
         or type(cancellation["scratchReleased"]) is not bool
+        or type(cancellation["allocationObserved"]) is not bool
+        or type(cancellation["typedCancellationObserved"]) is not bool
     ):
         raise CampaignError("cancellation evidence is malformed")
-    _integer(cancellation["requests"], "cancellation.requests", minimum=1)
+    if cancellation["trigger"] != "after-first-materialized-denoise-step":
+        raise CampaignError("cancellation probe was not triggered in-flight after allocation")
+    if _integer(cancellation["requests"], "cancellation.requests", minimum=1) != 1:
+        raise CampaignError("cancellation probe must issue exactly one request")
+    if _integer(cancellation["progressStepsBeforeCancel"], "cancellation.progressStepsBeforeCancel", minimum=1) != 1:
+        raise CampaignError("cancellation probe must cancel after its first materialized step")
+    packed_dispatches = _integer(
+        cancellation["packedDispatchesBeforeCancel"],
+        "cancellation.packedDispatchesBeforeCancel",
+        minimum=1,
+    )
+    expected_context_tokens = _integer(
+        cancellation["expectedContextTokens"], "cancellation.expectedContextTokens", minimum=1
+    )
+    stored_tokens_after = _integer(
+        cancellation["storedTokensAfterCancel"], "cancellation.storedTokensAfterCancel"
+    )
+    for key in (
+        "activeBytesBefore", "activeBytesAtCancel", "activeBytesAfterRelease",
+        "cacheBytesBefore", "cacheBytesAtCancel", "cacheBytesAfterRelease",
+    ):
+        _integer(cancellation[key], f"cancellation.{key}")
+    allocation_observed = (
+        cancellation["activeBytesAtCancel"] > cancellation["activeBytesBefore"]
+        or cancellation["cacheBytesAtCancel"] > cancellation["cacheBytesBefore"]
+    )
+    scratch_released = (
+        cancellation["activeBytesAfterRelease"] <= cancellation["activeBytesBefore"]
+        and cancellation["cacheBytesAfterRelease"] <= cancellation["cacheBytesBefore"]
+    )
+    if cancellation["allocationObserved"] != allocation_observed or cancellation["scratchReleased"] != scratch_released:
+        raise CampaignError("cancellation allocation/cleanup claims contradict raw allocator evidence")
+    partial_state_mutation = stored_tokens_after != expected_context_tokens
+    if cancellation["partialStateMutation"] != partial_state_mutation:
+        raise CampaignError("cancellation mutation claim contradicts raw cache-token evidence")
     cancellation_clean = (
-        cancellation["partialStateMutation"] is False
+        cancellation["typedCancellationObserved"] is True
+        and cancellation["allocationObserved"] is True
+        and packed_dispatches > 0
+        and cancellation["partialStateMutation"] is False
         and cancellation["scratchReleased"] is True
     )
     if (cancellation["status"] == "pass") != cancellation_clean:
@@ -623,11 +740,15 @@ def _validate_baseline_observation(
         raise CampaignError("dense baseline allocator coverage is inconsistent")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("dense baseline memory.releaseVerified must be a boolean")
-    release_limit = memory["generationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
+    loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
+    terminal_release_limit = memory["generationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
     resources_released = not (
-        mlx["releaseActiveBytes"] > mlx["generationTerminalActiveBytes"]
+        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"]
+        or mlx["releaseActiveBytes"] > mlx["generationTerminalActiveBytes"]
+        or mlx["releaseCacheBytes"] > mlx["weightsLoadedCacheBytes"]
         or mlx["releaseCacheBytes"] > mlx["generationTerminalCacheBytes"]
-        or memory["release"]["physFootprintBytes"] > release_limit
+        or memory["release"]["physFootprintBytes"] > loaded_release_limit
+        or memory["release"]["physFootprintBytes"] > terminal_release_limit
     )
     if memory["releaseVerified"] != resources_released:
         raise CampaignError("dense baseline release status contradicts its resource boundaries")
@@ -689,6 +810,11 @@ def _exact_geometry(row: dict[str, Any]) -> dict[str, Any]:
         "mode": row["mode"],
         "cacheTier": row["cacheTier"],
         "geometry": observation["geometry"],
+        "build": {
+            "repositoryHead": observation["source"]["repositoryHead"],
+            "sourceFiles": observation["source"]["files"],
+            "toolchain": toolchain,
+        },
         "hardware": {
             "hardwareModel": toolchain["hardwareModel"],
             "metalDevice": toolchain["metalDevice"],
@@ -1096,6 +1222,8 @@ def main() -> int:
             )
             if source_identity() != source:
                 raise CampaignError("campaign source changed after decision policy was frozen")
+            if snapshot_identity(args.snapshot) != model:
+                raise CampaignError("model snapshot changed during the campaign")
             publish(
                 output,
                 source=source,

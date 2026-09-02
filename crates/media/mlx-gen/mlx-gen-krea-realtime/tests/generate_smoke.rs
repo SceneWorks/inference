@@ -32,6 +32,7 @@
 //! `KREA_SMOKE_STEPS` (default: the config's Self-Forcing schedule), `KREA_SMOKE_SEED`,
 //! `KREA_SMOKE_OUT` (frame dump dir).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -759,6 +760,14 @@ enum Sc20684Mode {
 }
 
 const SC20684_V2V_STRENGTH: f32 = 0.6;
+const SC20684_Q8_PARITY_MAX_ABS_ERROR: f32 = 0.25;
+const SC20684_Q4_PARITY_MAX_ABS_ERROR: f32 = 0.75;
+const SC20684_Q8_MAX_ABS_RGB_U8: u8 = 32;
+const SC20684_Q4_MAX_ABS_RGB_U8: u8 = 96;
+const SC20684_Q8_MEAN_ABS_RGB_U8: f64 = 1.0;
+const SC20684_Q4_MEAN_ABS_RGB_U8: f64 = 3.0;
+const SC20684_Q8_TEMPORAL_DELTA_DRIFT: f64 = 4.0;
+const SC20684_Q4_TEMPORAL_DELTA_DRIFT: f64 = 12.0;
 
 impl Sc20684Mode {
     fn parse() -> Self {
@@ -796,6 +805,25 @@ fn sc20684_cache_tier() -> KvCacheQuant {
 
 fn sc20684_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sc20684_sha256_file(path: &Path) -> (u64, String) {
+    let mut file = std::fs::File::open(path).expect("open pinned model artifact for hashing");
+    let size = file
+        .metadata()
+        .expect("read pinned model artifact metadata")
+        .len();
+    assert!(size > 0, "SC-20684 pinned model artifact must be nonempty");
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).expect("hash pinned model artifact");
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    (size, format!("{:x}", digest.finalize()))
 }
 
 fn sc20684_repository_root() -> PathBuf {
@@ -857,35 +885,51 @@ fn sc20684_source_identity(root: &Path) -> serde_json::Value {
 }
 
 fn sc20684_model_identity(snapshot: &Path) -> serde_json::Value {
-    let config = std::fs::read(snapshot.join("config.json")).expect("read pinned snapshot config");
+    assert_eq!(
+        snapshot.file_name().and_then(|value| value.to_str()),
+        Some("q4"),
+        "SC-20684 snapshot must be the q4 variant"
+    );
+    assert_eq!(
+        snapshot
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str()),
+        Some("e68e9a3d98187fdf6936838ffcf6df5aa48d6626"),
+        "SC-20684 snapshot must be nested below the exact pinned revision"
+    );
     let mut files = serde_json::Map::new();
+    let mut inventory = Sha256::new();
     for name in [
+        "config.json",
         "dit.safetensors",
         "t5_encoder.safetensors",
         "vae.safetensors",
         "tokenizer.json",
     ] {
-        let metadata =
-            std::fs::metadata(snapshot.join(name)).expect("read pinned product file metadata");
-        let modified: u64 = metadata
-            .modified()
-            .expect("read pinned product file mtime")
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("snapshot mtime after epoch")
-            .as_nanos()
-            .try_into()
-            .expect("snapshot mtime fits u64 nanoseconds");
+        let (size, digest) = sc20684_sha256_file(&snapshot.join(name));
+        inventory.update(name.as_bytes());
+        inventory.update([0]);
+        inventory.update(size.to_string().as_bytes());
+        inventory.update([0]);
+        inventory.update(digest.as_bytes());
+        inventory.update(b"\n");
         files.insert(
             name.to_owned(),
-            serde_json::json!({"size": metadata.len(), "mtimeNs": modified}),
+            serde_json::json!({"size": size, "sha256": digest}),
         );
     }
+    let config_sha256 = files["config.json"]["sha256"]
+        .as_str()
+        .expect("config identity sha256")
+        .to_owned();
     serde_json::json!({
         "repository": "SceneWorks/krea-realtime-14b-mlx",
         "revision": "e68e9a3d98187fdf6936838ffcf6df5aa48d6626",
         "variant": "q4",
-        "configSha256": sc20684_sha256(&config),
+        "configSha256": config_sha256,
         "files": files,
+        "inventorySha256": format!("{:x}", inventory.finalize()),
     })
 }
 
@@ -1392,14 +1436,20 @@ fn sc20684_packed_campaign_observer() {
         let release_active = mlx_rs::memory::get_active_memory() as u64;
         let release_cache = mlx_rs::memory::get_cache_memory() as u64;
         let allocator = allocator_probe.finish();
+        let weights_loaded_footprint = weights_loaded["physFootprintBytes"]
+            .as_u64()
+            .expect("SC-20684 dense weights-loaded footprint");
         let terminal_footprint = terminal_process["physFootprintBytes"]
             .as_u64()
             .expect("SC-20684 dense terminal footprint");
         let release_footprint = release_process["physFootprintBytes"]
             .as_u64()
             .expect("SC-20684 dense release footprint");
-        let release_verified = release_active <= terminal_active
+        let release_verified = release_active <= weights_loaded_active
+            && release_active <= terminal_active
+            && release_cache <= weights_loaded_cache
             && release_cache <= terminal_cache
+            && release_footprint <= weights_loaded_footprint.saturating_add(512 * 1024 * 1024)
             && release_footprint <= terminal_footprint.saturating_add(512 * 1024 * 1024);
         let request_first_frame_ms =
             (conditioning_elapsed + generation_elapsed + decode_elapsed).as_secs_f64() * 1000.0;
@@ -1408,7 +1458,7 @@ fn sc20684_packed_campaign_observer() {
         let repository = sc20684_repository_root();
         let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
         let observation = serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
             "runId": run_id,
             "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1422,7 +1472,7 @@ fn sc20684_packed_campaign_observer() {
                 "seed": params.seed,
             },
             "toolchain": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "rustc": tool("rustc", &["--version"]), "cargo": tool("cargo", &["--version"]), "mlx": "mlx-rs-linked", "hardwareModel": tool("sysctl", &["-n", "hw.model"]), "metalDevice": sc20684_metal_device()},
-            "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": [], "headDim": config.wan.head_dim(), "groupSize": 64, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
+            "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": [], "headDim": config.wan.head_dim(), "groupSize": 64, "queryTile": 8, "keyTile": 8, "dtypes": {"packedCodes": "uint32", "packedMetadata": "bfloat16", "queryAndCurrentKv": "bfloat16", "accumulator": "float32"}, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
             "timing": {
                 "label": "fresh-process-full-schedule-dense-read-window-baseline",
                 "processWallMs": campaign_started.elapsed().as_secs_f64() * 1000.0,
@@ -1528,9 +1578,9 @@ fn sc20684_packed_campaign_observer() {
         .expect("paired max")
         .item::<f32>();
     let parity_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) {
-        0.25
+        SC20684_Q8_PARITY_MAX_ABS_ERROR
     } else {
-        0.75
+        SC20684_Q4_PARITY_MAX_ABS_ERROR
     };
 
     let dense_decode_started = Instant::now();
@@ -1551,19 +1601,19 @@ fn sc20684_packed_campaign_observer() {
     let dense_temporal_delta = sc20684_mean_temporal_delta(&dense_frames);
     let temporal_delta_drift = (packed_temporal_delta - dense_temporal_delta).abs();
     let quality_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) {
-        32
+        SC20684_Q8_MAX_ABS_RGB_U8
     } else {
-        96
+        SC20684_Q4_MAX_ABS_RGB_U8
     };
     let quality_mean_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) {
-        1.0
+        SC20684_Q8_MEAN_ABS_RGB_U8
     } else {
-        3.0
+        SC20684_Q4_MEAN_ABS_RGB_U8
     };
     let temporal_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) {
-        4.0
+        SC20684_Q8_TEMPORAL_DELTA_DRIFT
     } else {
-        12.0
+        SC20684_Q4_TEMPORAL_DELTA_DRIFT
     };
     let quality_pass = quality_error <= quality_tolerance
         && quality_mean_error <= quality_mean_tolerance
@@ -1598,33 +1648,71 @@ fn sc20684_packed_campaign_observer() {
     cancelled_cache
         .enable_experimental_packed_metal(matches!(tier, KvCacheQuant { bits: 4, .. }))
         .expect("enable packed cancellation probe");
+    let cancellation_context_latents = packed_latents
+        .take_axis(Array::from_slice(&[0i32], &[1]), 1)
+        .expect("select deterministic cancellation context latent");
+    mlx_rs::transforms::eval([&cancellation_context_latents])
+        .expect("materialize deterministic cancellation context latent");
+    let cancellation_conditioning = RefConditioning {
+        context_latents: Some(cancellation_context_latents),
+        source: None,
+    };
+    let cancellation_active_before = mlx_rs::memory::get_active_memory() as u64;
+    let cancellation_cache_before = mlx_rs::memory::get_cache_memory() as u64;
     let cancelled = mlx_gen::CancelFlag::default();
-    cancelled.cancel();
+    let mut cancellation_progress_steps = 0u64;
+    let mut cancellation_active_at_cancel = cancellation_active_before;
+    let mut cancellation_cache_at_cancel = cancellation_cache_before;
+    let mut cancellation_probe_allocation: Option<Array> = None;
     let cancelled_result = generate_latents_conditioned_into(
         &transformer,
         &config,
         &context,
         &params,
-        &RefConditioning {
-            context_latents: None,
-            source: None,
-        },
+        &cancellation_conditioning,
         &mut cancelled_cache,
         &cancelled,
-        &mut |_| {},
+        &mut |progress| {
+            if matches!(progress, Progress::Step { .. }) && cancellation_progress_steps == 0 {
+                cancellation_progress_steps = 1;
+                let allocation = Array::zeros::<f32>(&[16 * 1024 * 1024])
+                    .expect("allocate deterministic in-flight cancellation probe");
+                mlx_rs::transforms::eval([&allocation])
+                    .expect("materialize deterministic in-flight cancellation probe");
+                cancellation_probe_allocation = Some(allocation);
+                cancellation_active_at_cancel = mlx_rs::memory::get_active_memory() as u64;
+                cancellation_cache_at_cancel = mlx_rs::memory::get_cache_memory() as u64;
+                cancelled.cancel();
+            }
+        },
     );
     let cancellation_observed = matches!(cancelled_result, Err(mlx_gen::Error::Canceled));
-    let cancellation_state_unchanged = cancelled_cache.stored_tokens() == 0;
-    let cancellation_scratch_released = cancelled_cache
+    let cancellation_expected_context_tokens = config.ar.frame_seq_length;
+    let cancellation_stored_tokens_after = cancelled_cache.stored_tokens();
+    let cancellation_state_unchanged =
+        cancellation_stored_tokens_after == cancellation_expected_context_tokens;
+    let cancellation_packed_dispatches = cancelled_cache
         .packed_metal_route_receipt()
-        .map(|receipt| {
-            receipt.persistent_bytes == 0
-                && receipt.dense_window_bytes == 0
-                && receipt.score_matrix_bytes == 0
-        })
-        .unwrap_or(false);
-    let cancellation_clean =
-        cancellation_observed && cancellation_state_unchanged && cancellation_scratch_released;
+        .map(|receipt| receipt.accepted_forwards)
+        .unwrap_or(0);
+    drop(cancellation_probe_allocation.take());
+    drop(cancelled_cache);
+    drop(cancellation_conditioning);
+    mlx_rs::memory::clear_cache();
+    let cancellation_active_after_release = mlx_rs::memory::get_active_memory() as u64;
+    let cancellation_cache_after_release = mlx_rs::memory::get_cache_memory() as u64;
+    let cancellation_allocation_observed = cancellation_active_at_cancel
+        > cancellation_active_before
+        || cancellation_cache_at_cancel > cancellation_cache_before;
+    let cancellation_scratch_released = cancellation_active_after_release
+        <= cancellation_active_before
+        && cancellation_cache_after_release <= cancellation_cache_before;
+    let cancellation_clean = cancellation_observed
+        && cancellation_progress_steps == 1
+        && cancellation_packed_dispatches > 0
+        && cancellation_allocation_observed
+        && cancellation_state_unchanged
+        && cancellation_scratch_released;
 
     let steady_forward_ns = u64::try_from(receipt.steady_evaluated_forward_count)
         .ok()
@@ -1650,7 +1738,6 @@ fn sc20684_packed_campaign_observer() {
     let verification_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let verification_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
     let key_tokens = packed_cache.stored_tokens();
-    drop(cancelled_cache);
     drop(packed_cache);
     drop(packed_latents);
     drop(dense_latents);
@@ -1659,6 +1746,9 @@ fn sc20684_packed_campaign_observer() {
     let release_process = sc20684_process_memory();
     let release_active = mlx_rs::memory::get_active_memory() as u64;
     let release_cache = mlx_rs::memory::get_cache_memory() as u64;
+    let weights_loaded_footprint = weights_loaded["physFootprintBytes"]
+        .as_u64()
+        .expect("SC-20684 weights-loaded footprint");
     let verification_terminal_footprint = verification_terminal["physFootprintBytes"]
         .as_u64()
         .expect("SC-20684 verification-terminal footprint");
@@ -1666,14 +1756,17 @@ fn sc20684_packed_campaign_observer() {
         .as_u64()
         .expect("SC-20684 release footprint");
     let release_verified = cancellation_clean
+        && release_active <= weights_loaded_active
         && release_active <= verification_terminal_active
+        && release_cache <= weights_loaded_cache
         && release_cache <= verification_terminal_cache
+        && release_footprint <= weights_loaded_footprint.saturating_add(512 * 1024 * 1024)
         && release_footprint <= verification_terminal_footprint.saturating_add(512 * 1024 * 1024);
 
     let repository = sc20684_repository_root();
     let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
     let observation = serde_json::json!({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1687,7 +1780,7 @@ fn sc20684_packed_campaign_observer() {
             "seed": params.seed,
         },
         "toolchain": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "rustc": tool("rustc", &["--version"]), "cargo": tool("cargo", &["--version"]), "mlx": "mlx-rs-linked", "hardwareModel": tool("sysctl", &["-n", "hw.model"]), "metalDevice": sc20684_metal_device()},
-        "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": receipt.dispatch_geometries.iter().map(|geometry| serde_json::json!({"queryTokens": geometry.query_tokens, "keyTokens": geometry.key_tokens, "acceptedForwards": geometry.accepted_forwards})).collect::<Vec<_>>(), "headDim": config.wan.head_dim(), "groupSize": 64, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
+        "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": receipt.dispatch_geometries.iter().map(|geometry| serde_json::json!({"queryTokens": geometry.query_tokens, "keyTokens": geometry.key_tokens, "acceptedForwards": geometry.accepted_forwards})).collect::<Vec<_>>(), "headDim": config.wan.head_dim(), "groupSize": 64, "queryTile": 8, "keyTile": 8, "dtypes": {"packedCodes": "uint32", "packedMetadata": "bfloat16", "queryAndCurrentKv": "bfloat16", "accumulator": "float32"}, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
         "compiledHandle": {"identity": receipt.compiled_handle_identity, "retainedBytes": receipt.retained_handle_bytes, "compiled": receipt.accepted_forwards > 0, "acceptedDispatches": receipt.accepted_forwards},
         "bytes": {"persistent": receipt.persistent_bytes, "retainedHandle": receipt.retained_handle_bytes, "boundedScratch": receipt.bounded_scratch_bytes, "denseWindow": receipt.dense_window_bytes, "scoreMatrix": receipt.score_matrix_bytes},
         "timing": {
@@ -1761,7 +1854,25 @@ fn sc20684_packed_campaign_observer() {
             "acknowledged": matches!(tier, KvCacheQuant { bits: 8, .. }) || std::env::var("KREA_SC20684_Q4_QUALITY_ARM").as_deref() == Ok("acknowledged"),
         },
         "fallback": {"count": receipt.dense_fallbacks, "reason": receipt.last_fallback_reason},
-        "cancellation": {"status": if cancellation_clean { "pass" } else { "fail" }, "requests": 1, "partialStateMutation": !cancellation_state_unchanged, "scratchReleased": cancellation_scratch_released},
+        "cancellation": {
+            "status": if cancellation_clean { "pass" } else { "fail" },
+            "requests": 1,
+            "trigger": "after-first-materialized-denoise-step",
+            "progressStepsBeforeCancel": cancellation_progress_steps,
+            "typedCancellationObserved": cancellation_observed,
+            "packedDispatchesBeforeCancel": cancellation_packed_dispatches,
+            "expectedContextTokens": cancellation_expected_context_tokens,
+            "storedTokensAfterCancel": cancellation_stored_tokens_after,
+            "activeBytesBefore": cancellation_active_before,
+            "activeBytesAtCancel": cancellation_active_at_cancel,
+            "activeBytesAfterRelease": cancellation_active_after_release,
+            "cacheBytesBefore": cancellation_cache_before,
+            "cacheBytesAtCancel": cancellation_cache_at_cancel,
+            "cacheBytesAfterRelease": cancellation_cache_after_release,
+            "allocationObserved": cancellation_allocation_observed,
+            "partialStateMutation": !cancellation_state_unchanged,
+            "scratchReleased": cancellation_scratch_released,
+        },
         "output": {"status": "generated", "sha256": output_sha256, "denseSha256": dense_output_sha256, "artifacts": artifacts},
     });
     println!(

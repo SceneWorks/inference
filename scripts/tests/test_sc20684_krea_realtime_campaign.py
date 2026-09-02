@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import tempfile
 import unittest
@@ -21,15 +22,23 @@ SOURCE = {
     "repositoryHead": "a" * 40,
     "files": {path: "b" * 64 for path in campaign.SOURCE_FILES},
 }
+MODEL_FILES = {
+    name: {"size": 1, "sha256": "c" * 64}
+    for name in ("config.json", "dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json")
+}
+MODEL_INVENTORY = hashlib.sha256(
+    "".join(
+        f"{name}\0{identity['size']}\0{identity['sha256']}\n"
+        for name, identity in MODEL_FILES.items()
+    ).encode("utf-8")
+).hexdigest()
 MODEL = {
     "repository": campaign.MODEL_REPOSITORY,
     "revision": campaign.MODEL_REVISION,
     "variant": "q4",
     "configSha256": "c" * 64,
-    "files": {
-        name: {"size": 1, "mtimeNs": 1}
-        for name in ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json")
-    },
+    "files": MODEL_FILES,
+    "inventorySha256": MODEL_INVENTORY,
 }
 
 
@@ -40,7 +49,7 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
         "v2v": {"kind": "deterministic-smooth-motion-clip", "frameCount": 25, "vaeEncoding": "WanVae.encode-sample", "v2vStrength": 0.6},
     }
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
@@ -76,6 +85,14 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
             ],
             "headDim": 128,
             "groupSize": 64,
+            "queryTile": 8,
+            "keyTile": 8,
+            "dtypes": {
+                "packedCodes": "uint32",
+                "packedMetadata": "bfloat16",
+                "queryAndCurrentKv": "bfloat16",
+                "accumulator": "float32",
+            },
             "mask": "block-causal",
             "width": 832,
             "height": 480,
@@ -150,28 +167,51 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
-                "releaseActiveBytes": 6 * GIB,
+                "releaseActiveBytes": 5 * GIB,
                 "releaseCacheBytes": GIB // 2,
             },
             "releaseVerified": True,
         },
-        "parity": {"status": "pass", "candidateTier": tier, "maxAbsError": 0.01, "tolerance": 0.1},
+        "parity": {
+            "status": "pass",
+            "candidateTier": tier,
+            "maxAbsError": 0.01,
+            "tolerance": campaign.PARITY_MAX_ABS_ERROR_BY_TIER[tier],
+        },
         "quality": {
             "status": "pass",
             "candidateTier": tier,
             "metric": "paired-rgb-and-temporal-delta",
             "maxAbsRgbU8": 2,
-            "maxAbsRgbU8Tolerance": 32,
+            "maxAbsRgbU8Tolerance": campaign.QUALITY_THRESHOLDS_BY_TIER[tier]["maxAbsRgbU8"],
             "meanAbsRgbU8": 0.5,
-            "meanAbsRgbU8Tolerance": 1.0,
+            "meanAbsRgbU8Tolerance": campaign.QUALITY_THRESHOLDS_BY_TIER[tier]["meanAbsRgbU8"],
             "packedMeanTemporalDelta": 4.0,
             "denseMeanTemporalDelta": 3.5,
             "temporalDeltaDrift": 0.5,
-            "temporalDeltaDriftTolerance": 4.0,
+            "temporalDeltaDriftTolerance": campaign.QUALITY_THRESHOLDS_BY_TIER[tier]["temporalDeltaDrift"],
             "acknowledged": True,
         },
         "fallback": {"count": 0, "reason": None},
-        "cancellation": {"status": "pass", "requests": 1, "partialStateMutation": False, "scratchReleased": True},
+        "cancellation": {
+            "status": "pass",
+            "requests": 1,
+            "trigger": "after-first-materialized-denoise-step",
+            "progressStepsBeforeCancel": 1,
+            "typedCancellationObserved": True,
+            "packedDispatchesBeforeCancel": 1,
+            "expectedContextTokens": 2,
+            "storedTokensAfterCancel": 2,
+            "activeBytesBefore": 6 * GIB,
+            "activeBytesAtCancel": 6 * GIB + 64 * 1024**2,
+            "activeBytesAfterRelease": 6 * GIB,
+            "cacheBytesBefore": GIB // 2,
+            "cacheBytesAtCancel": GIB // 2,
+            "cacheBytesAfterRelease": GIB // 2,
+            "allocationObserved": True,
+            "partialStateMutation": False,
+            "scratchReleased": True,
+        },
         "output": {
             "status": "generated",
             "sha256": "d" * 64,
@@ -186,7 +226,7 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
 
 def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> dict:
     return {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
@@ -232,7 +272,7 @@ def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> 
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
-                "releaseActiveBytes": 7 * GIB,
+                "releaseActiveBytes": 5 * GIB,
                 "releaseCacheBytes": GIB // 2,
             },
             "releaseVerified": True,
@@ -380,6 +420,34 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         self.assertEqual(decision["decision"], "no-go")
         self.assertIn("zeroDenseWindowBytes", decision["failedCriteria"])
 
+    def test_snapshot_identity_hashes_exact_inventory_and_detects_same_size_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / campaign.MODEL_REVISION / "q4"
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text(
+                json.dumps({"quantization": {"bits": 4, "group_size": 64}}),
+                encoding="utf-8",
+            )
+            for name in ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json"):
+                (snapshot / name).write_bytes(name.encode("utf-8"))
+            first = campaign.snapshot_identity(snapshot)
+            self.assertEqual(first["configSha256"], first["files"]["config.json"]["sha256"])
+            self.assertEqual(set(first["files"]), set(MODEL_FILES))
+            original = (snapshot / "dit.safetensors").read_bytes()
+            (snapshot / "dit.safetensors").write_bytes(b"x" * len(original))
+            second = campaign.snapshot_identity(snapshot)
+            self.assertEqual(
+                first["files"]["dit.safetensors"]["size"],
+                second["files"]["dit.safetensors"]["size"],
+            )
+            self.assertNotEqual(first["inventorySha256"], second["inventorySha256"])
+
+            wrong_revision = Path(temporary) / ("0" * 40) / "q4"
+            wrong_revision.parent.mkdir()
+            snapshot.rename(wrong_revision)
+            with self.assertRaisesRegex(campaign.CampaignError, "exact pinned revision"):
+                campaign.snapshot_identity(wrong_revision)
+
     def test_missing_or_malformed_rows_fail_closed(self) -> None:
         row = observation("i2v", "q4", "run")
         del row["cancellation"]
@@ -444,6 +512,60 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         row["quality"]["candidateTier"] = "q8"
         with self.assertRaisesRegex(campaign.CampaignError, "tier-substituted"):
             self.validate_from(row, mode="v2v", tier="q4")
+
+    def test_provider_cannot_supply_its_own_parity_or_quality_tolerances(self) -> None:
+        row = observation("t2v", "q8", "run")
+        row["parity"]["maxAbsError"] = 1.0
+        row["parity"]["tolerance"] = 2.0
+        with self.assertRaisesRegex(campaign.CampaignError, "frozen decision policy"):
+            self.validate_from(row)
+
+        row = observation("v2v", "q4", "run")
+        row["quality"]["meanAbsRgbU8"] = 4.0
+        row["quality"]["meanAbsRgbU8Tolerance"] = 5.0
+        with self.assertRaisesRegex(campaign.CampaignError, "frozen decision policy"):
+            self.validate_from(row, mode="v2v", tier="q4")
+
+    def test_release_must_return_to_loaded_model_and_terminal_boundaries(self) -> None:
+        row = observation("t2v", "q8", "run")
+        row["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + 1
+        row["memory"]["releaseVerified"] = False
+        validated = self.validate_from(row)
+        self.assertFalse(validated["memory"]["releaseVerified"])
+        row["memory"]["releaseVerified"] = True
+        with self.assertRaisesRegex(campaign.CampaignError, "terminal resource boundaries"):
+            self.validate_from(row)
+
+        candidate = self.validate()
+        baseline = baseline_observation("t2v", "q8", "baseline", candidate)
+        baseline["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + 1
+        baseline["memory"]["releaseVerified"] = True
+        with self.assertRaisesRegex(campaign.CampaignError, "resource boundaries"):
+            campaign._validate_baseline_observation(
+                baseline,
+                expected_mode="t2v",
+                expected_tier="q8",
+                run_id="baseline",
+                candidate=candidate,
+            )
+
+    def test_cancellation_must_be_in_flight_allocated_and_cleaned(self) -> None:
+        row = observation("t2v", "q8", "run")
+        row["cancellation"]["trigger"] = "pre-cancelled"
+        with self.assertRaisesRegex(campaign.CampaignError, "triggered in-flight"):
+            self.validate_from(row)
+
+        row = observation("t2v", "q8", "run")
+        row["cancellation"]["activeBytesAtCancel"] = row["cancellation"]["activeBytesBefore"]
+        row["cancellation"]["allocationObserved"] = False
+        row["cancellation"]["status"] = "fail"
+        row["memory"]["releaseVerified"] = False
+        validated = self.validate_from(row)
+        self.assertEqual(validated["cancellation"]["status"], "fail")
+
+        row["cancellation"]["allocationObserved"] = True
+        with self.assertRaisesRegex(campaign.CampaignError, "contradict raw allocator evidence"):
+            self.validate_from(row)
 
     def test_fallback_quality_and_release_failures_are_sealed_no_go_outcomes(self) -> None:
         matrix_row = self.complete_rows()[0]
@@ -568,11 +690,18 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         self.assertEqual(policy["materialMemory"]["minimumReductionBytes"], 256 * 1024**2)
         self.assertEqual(policy["materialMemory"]["minimumReductionFraction"], 0.05)
         self.assertEqual(policy["throughputNeutral"]["minimumMeanOutputFpsRatio"], 0.95)
+        self.assertEqual(policy["accuracy"]["parityMaxAbsErrorByTier"], {"q8": 0.25, "q4": 0.75})
+        self.assertEqual(policy["coverage"]["fixedProductGeometry"]["queryTile"], 8)
+        self.assertEqual(policy["coverage"]["fixedProductGeometry"]["keyTile"], 8)
         self.assertIn("alternateGpuFamilies", policy["coverage"]["notSweptByThisSchedule"])
         self.assertEqual(
             policy["coverage"]["eligibilityBoundary"],
             "only exact measured arm geometries are eligible",
         )
+        decision = campaign.arm_decision(self.complete_rows()[0], policy)
+        self.assertEqual(decision["eligibleGeometry"]["geometry"]["queryTile"], 8)
+        self.assertEqual(decision["eligibleGeometry"]["build"]["repositoryHead"], SOURCE["repositoryHead"])
+        self.assertEqual(decision["eligibleGeometry"]["build"]["toolchain"]["rustc"], "rustc 1.90")
 
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(

@@ -53,6 +53,8 @@ REQUIRED_RECEIPT_FIELDS = {
     "decisionPolicy", "decisionPolicySha256", "geometryCoverage", "processExitCodes",
     "perArmDecision", "tierDecision", "overallDecision", "eligibleGeometry",
     "dispatchGeometryCoverage",
+    "modelArtifactInventory", "frozenAccuracyThresholds", "inFlightCancellationAllocation",
+    "loadedModelReleaseBaseline", "buildIdentity", "tileAndDtypeIdentity",
 }
 REQUIRED_UPSTREAM_MECHANISMS = {"scalar_fused_decode_attend", "rabitq_prefill_attend"}
 REQUIRED_HEADINGS = (
@@ -152,6 +154,15 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
             "MINIMUM_MEMORY_REDUCTION_FRACTION = 0.05",
             "MINIMUM_THROUGHPUT_RATIO = 0.95",
             "MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION = 0.05",
+            'PARITY_MAX_ABS_ERROR_BY_TIER = {"q8": 0.25, "q4": 0.75}',
+            '"maxAbsRgbU8": 96',
+            '"temporalDeltaDrift": 12.0',
+            '"queryTile": 8',
+            '"keyTile": 8',
+            '"inventorySha256": inventory.hexdigest()',
+            'if snapshot_identity(args.snapshot) != model:',
+            'mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"]',
+            '"after-first-materialized-denoise-step"',
             '"eligibilityBoundary": "only exact measured arm geometries are eligible"',
             '"status": f"terminal-{decision[\'overall\'][\'decision\']}"',
             '"eligibleGeometry": geometry if not failed else None',
@@ -159,6 +170,23 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
         for needle in required:
             if needle not in source:
                 errors.append(f"sealed decision-policy guard missing: {needle}")
+    provider_source = source_root / "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs"
+    if provider_source.is_file():
+        source = provider_source.read_text(encoding="utf-8")
+        required = (
+            "SC20684_Q8_PARITY_MAX_ABS_ERROR",
+            "SC20684_Q4_TEMPORAL_DELTA_DRIFT",
+            "fn sc20684_sha256_file(path: &Path)",
+            '"inventorySha256": format!',
+            '"queryTile": 8',
+            '"packedCodes": "uint32"',
+            '"after-first-materialized-denoise-step"',
+            "release_active <= weights_loaded_active",
+            "cancellation_packed_dispatches > 0",
+        )
+        for needle in required:
+            if needle not in source:
+                errors.append(f"provider evidence guard missing: {needle}")
     return errors
 
 
