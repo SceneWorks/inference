@@ -2802,17 +2802,24 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
                 .output()
                 .map_err(|e| format!("launch worker {index}: {e}"))?;
             if !output.status.success() {
-                failures.push(format!(
+                let failure = format!(
                     "{}: {}",
                     coordinate_slug(&row.coordinate),
                     String::from_utf8_lossy(&output.stderr).trim()
-                ));
+                );
+                eprintln!("coordinate {}/64 failed: {failure}", index + 1);
+                failures.push(failure);
                 continue;
             }
             prepared.push(load_prepared_coordinate_receipt(
                 &child_dir,
                 row.coordinate.clone(),
             )?);
+            eprintln!(
+                "coordinate {}/64 accepted: {}",
+                index + 1,
+                coordinate_slug(&row.coordinate)
+            );
         }
         if !failures.is_empty() {
             return Err(format!(
