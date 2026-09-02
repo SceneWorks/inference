@@ -290,7 +290,7 @@ pub fn svg_descriptor() -> core_llm::StarVectorDescriptor {
             decoder_hidden_size: 2048,
             image_token_count: 257,
         },
-        max_svg_bytes: 1_000_000,
+        max_svg_bytes: 2 * 1024 * 1024,
         max_wall_time: Some(std::time::Duration::from_secs(120)),
     }
 }
@@ -602,6 +602,24 @@ mod tests {
         );
     }
 
+    fn terminal_profile() -> StarVectorProfile {
+        StarVectorProfile {
+            image: Some(core_llm::ImageRef::new(2, 2, vec![0x80; 12]).unwrap()),
+            text: None,
+            max_new_tokens: 4_000,
+            max_svg_bytes: 2 * 1024 * 1024,
+            max_wall_time: std::time::Duration::from_secs(120),
+            seed: 7,
+        }
+    }
+
+    #[test]
+    fn terminal_profile_fits_advertised_svg_limit() {
+        FixtureProvider::new()
+            .validate_svg(&terminal_profile().request())
+            .unwrap();
+    }
+
     /// Terminal real-weight hook. It deliberately opens only the explicit exact snapshot supplied
     /// by SC-22261; ordinary CPU checks neither download weights nor invoke CUDA.
     #[test]
@@ -610,14 +628,7 @@ mod tests {
         let snapshot = std::env::var("STARVECTOR_1B_SNAPSHOT")
             .expect("sc-22261 must set STARVECTOR_1B_SNAPSHOT to the local exact snapshot");
         let spec = core_llm::LoadSpec::dense(snapshot);
-        let profile = StarVectorProfile {
-            image: Some(core_llm::ImageRef::new(2, 2, vec![0x80; 12]).unwrap()),
-            text: None,
-            max_new_tokens: 4_000,
-            max_svg_bytes: 2 * 1024 * 1024,
-            max_wall_time: std::time::Duration::from_secs(120),
-            seed: 7,
-        };
+        let profile = terminal_profile();
         starvector_conformance(
             || Box::new(CandleStarVectorProvider::load(&spec).unwrap()),
             &profile,
