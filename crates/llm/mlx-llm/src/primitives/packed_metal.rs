@@ -69,7 +69,24 @@ struct PackedMetalTuning {
     values_per_thread: usize,
 }
 
+/// Dispatch geometry selected by the retained packed Metal reader. Evidence harnesses expose this
+/// profile alongside the probed device name so performance receipts cannot silently change tuning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedMetalTuningProfile {
+    pub gpu_family: &'static str,
+    pub threads: usize,
+    pub simd_groups: usize,
+    pub values_per_thread: usize,
+}
+
 impl PackedMetalGpuFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConservativeUnknownApple => "conservative-unknown-apple",
+            Self::Apple7OrNewer => "apple7-or-newer",
+        }
+    }
+
     fn tuning(self, head_dimension: usize) -> Option<PackedMetalTuning> {
         if !packed_metal_head_dimension_supported(head_dimension) {
             return None;
@@ -254,6 +271,17 @@ impl PackedMetalKernel {
 
     pub fn gpu_family(&self) -> PackedMetalGpuFamily {
         self.gpu_family
+    }
+
+    pub fn tuning_profile(&self, head_dimension: usize) -> Option<PackedMetalTuningProfile> {
+        self.gpu_family
+            .tuning(head_dimension)
+            .map(|tuning| PackedMetalTuningProfile {
+                gpu_family: self.gpu_family.as_str(),
+                threads: tuning.threads,
+                simd_groups: tuning.simd_groups,
+                values_per_thread: tuning.values_per_thread,
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -441,6 +469,14 @@ mod tests {
         assert!(PackedMetalGpuFamily::ConservativeUnknownApple
             .tuning(96)
             .is_none());
+        assert_eq!(
+            PackedMetalGpuFamily::ConservativeUnknownApple.as_str(),
+            "conservative-unknown-apple"
+        );
+        assert_eq!(
+            PackedMetalGpuFamily::Apple7OrNewer.as_str(),
+            "apple7-or-newer"
+        );
     }
 
     #[test]

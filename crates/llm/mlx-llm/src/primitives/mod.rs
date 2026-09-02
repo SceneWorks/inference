@@ -47,7 +47,9 @@ pub use packed_group_affine_kv::{
     RepresentationMetadata, RetainedPackedKernel, PACKED_CODES_PER_BYTE,
     PACKED_METAL_QUANT_GROUP_SIZE,
 };
-pub use packed_metal::{PackedMask, PackedMetalGpuFamily, PackedMetalKernel};
+pub use packed_metal::{
+    PackedMask, PackedMetalGpuFamily, PackedMetalKernel, PackedMetalTuningProfile,
+};
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;

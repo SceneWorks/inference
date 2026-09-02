@@ -45,7 +45,7 @@ pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
 pub const SC20671_MIN_NATIVE_CONTEXT_TOKENS: u64 = 32 * 1024;
 
-fn valid_utc_timestamp(value: &str) -> bool {
+pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     let fixed = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
     let shape = (bytes.len() == 20
@@ -98,7 +98,7 @@ fn valid_utc_timestamp(value: &str) -> bool {
         && second < 60
 }
 
-fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+pub(crate) fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
     if !valid_utc_timestamp(left) || !valid_utc_timestamp(right) {
         return None;
     }
@@ -129,7 +129,7 @@ fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering>
     Some(std::cmp::Ordering::Equal)
 }
 
-fn utc_timestamp_before(left: &str, right: &str) -> bool {
+pub(crate) fn utc_timestamp_before(left: &str, right: &str) -> bool {
     compare_utc_timestamps(left, right) == Some(std::cmp::Ordering::Less)
 }
 

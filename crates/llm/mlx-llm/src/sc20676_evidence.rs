@@ -29,8 +29,8 @@ use crate::primitives::{
 };
 use crate::{Error, ModelConfig, Result};
 
-pub const SC20676_SCHEMA_VERSION: u32 = 1;
-pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v1";
+pub const SC20676_SCHEMA_VERSION: u32 = 2;
+pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v2";
 /// The SC-20671 frozen contract is the policy identity; SC-20676 only narrows it with the
 /// compressed-domain parity requirements below and never introduces a tunable caller threshold.
 pub const SC20676_CONTRACT_HASH: &str = campaign::QUALITY_CONTRACT_HASH;
@@ -72,6 +72,7 @@ pub struct Sc20676BaselineBinding {
     pub campaign_global_identity_sha256: String,
     pub context_band: String,
     pub context_payload_tokens: u64,
+    pub head_dimension: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +118,7 @@ pub struct Sc20676TimingSummary {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676MemoryPhase {
     pub phase: String,
+    pub captured_at: String,
     pub phys_footprint_bytes: u64,
     pub phys_footprint_peak_bytes: u64,
     pub mlx_active_bytes: u64,
@@ -124,10 +126,20 @@ pub struct Sc20676MemoryPhase {
     pub mlx_peak_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sc20676PeakWindow {
+    pub started_at: String,
+    pub baseline_active_bytes: u64,
+    pub baseline_cache_bytes: u64,
+    pub reset_peak_bytes: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676MemoryEvidence {
     pub phases: Vec<Sc20676MemoryPhase>,
+    pub decode_peak_window: Sc20676PeakWindow,
     pub dense_theoretical_kv_bytes: u64,
     pub observed_dense_kv_bytes: u64,
     pub packed_logical_payload_bytes: u64,
@@ -139,6 +151,18 @@ pub struct Sc20676MemoryEvidence {
     pub theoretical_dense_reconstruction_bytes: u64,
     pub theoretical_score_matrix_bytes: u64,
     pub release_verified: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sc20676KernelProfile {
+    pub metal_device: String,
+    pub gpu_family: String,
+    pub qualification: String,
+    pub head_dimension: u64,
+    pub threads: u64,
+    pub simd_groups: u64,
+    pub values_per_thread: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -212,6 +236,7 @@ pub struct Sc20676Arm {
     pub timing_summary: Sc20676TimingSummary,
     pub memory: Sc20676MemoryEvidence,
     pub route: String,
+    pub kernel_profile: Option<Sc20676KernelProfile>,
     pub packed: Option<PackedCacheEvidence>,
     pub warm_packed: Option<PackedCacheEvidence>,
     pub continuation_dispatches: u64,
@@ -413,19 +438,20 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
         "process-start",
         "weights-loaded",
         "prefill-cache-resident",
-        "decode-cache-resident",
-        "decode-transient-peak",
+        "decode-window-start",
+        "decode-complete",
         "reset-release",
     ];
     if memory.phases.len() != PHASES.len()
         || memory.phases.iter().zip(PHASES).any(|(sample, expected)| {
             sample.phase != expected
+                || !campaign::valid_utc_timestamp(&sample.captured_at)
                 || sample.phys_footprint_peak_bytes < sample.phys_footprint_bytes
-                || sample.mlx_peak_bytes < sample.mlx_active_bytes
         })
         || memory.phases.windows(2).any(|window| {
             window[1].phys_footprint_peak_bytes < window[0].phys_footprint_peak_bytes
-                || window[1].mlx_peak_bytes < window[0].mlx_peak_bytes
+                || campaign::compare_utc_timestamps(&window[0].captured_at, &window[1].captured_at)
+                    == Some(std::cmp::Ordering::Greater)
         })
         || memory.dense_theoretical_kv_bytes == 0
         || memory.observed_dense_kv_bytes == 0
@@ -435,6 +461,23 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
         || !memory.release_verified
     {
         return Err("SC-20676 memory phase evidence is incomplete".into());
+    }
+    let prefill = &memory.phases[2];
+    let window_start = &memory.phases[3];
+    let decode = &memory.phases[4];
+    if !campaign::valid_utc_timestamp(&memory.decode_peak_window.started_at)
+        || memory.decode_peak_window.started_at != window_start.captured_at
+        || !campaign::utc_timestamp_before(&prefill.captured_at, &window_start.captured_at)
+        || !campaign::utc_timestamp_before(&window_start.captured_at, &decode.captured_at)
+        || memory.decode_peak_window.baseline_active_bytes != window_start.mlx_active_bytes
+        || memory.decode_peak_window.baseline_cache_bytes != window_start.mlx_cache_bytes
+        || window_start.mlx_active_bytes != prefill.mlx_active_bytes
+        || window_start.mlx_cache_bytes != prefill.mlx_cache_bytes
+        || memory.decode_peak_window.reset_peak_bytes != 0
+        || window_start.mlx_peak_bytes != memory.decode_peak_window.reset_peak_bytes
+        || window_start.mlx_active_bytes == 0
+    {
+        return Err("SC-20676 decode peak window is not a sealed phase-local reset".into());
     }
     let weights = &memory.phases[1];
     let release = &memory.phases[5];
@@ -448,9 +491,9 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
         return Err("SC-20676 release did not return to the weights-only boundary".into());
     }
     if memory.transient_workspace_bytes
-        != memory.phases[4]
+        != decode
             .mlx_peak_bytes
-            .saturating_sub(memory.phases[3].mlx_active_bytes)
+            .saturating_sub(decode.mlx_active_bytes)
     {
         return Err(
             "SC-20676 transient workspace is not the measured peak above resident cache".into(),
@@ -546,7 +589,8 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
     }
     validate_memory(&arm.memory)?;
     if arm.mode == "dense" {
-        if arm.packed.is_some()
+        if arm.kernel_profile.is_some()
+            || arm.packed.is_some()
             || arm.warm_packed.is_some()
             || arm.continuation_dispatches != 0
             || arm.quality.is_some()
@@ -564,6 +608,21 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         .packed
         .as_ref()
         .ok_or("packed arm lacks primary representation evidence")?;
+    let profile = arm
+        .kernel_profile
+        .as_ref()
+        .ok_or("packed arm lacks device-bound kernel profile evidence")?;
+    let expected_values_per_thread = profile.head_dimension.checked_div(32).unwrap_or(0);
+    if profile.metal_device != arm.provenance.metal_device
+        || profile.gpu_family != "conservative-unknown-apple"
+        || profile.qualification != "conservative-default"
+        || ![64, 128, 256].contains(&profile.head_dimension)
+        || profile.threads != 32
+        || profile.simd_groups != 1
+        || profile.values_per_thread != expected_values_per_thread
+    {
+        return Err("SC-20676 packed kernel profile is not bound to the measured device".into());
+    }
     let warm = arm
         .warm_packed
         .as_ref()
@@ -608,7 +667,7 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
     {
         return Err("SC-20676 packed representation contract is not proven".into());
     }
-    let resident = &arm.memory.phases[3];
+    let resident = &arm.memory.phases[4];
     let weights = &arm.memory.phases[1];
     if arm.memory.packed_logical_payload_bytes != packed.retained_device_code_bytes
         || arm.memory.packed_metadata_bytes != packed.retained_device_metadata_bytes
@@ -667,6 +726,7 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         || !is_digest(&receipt.baseline.campaign_global_identity_sha256)
         || receipt.baseline.context_band != campaign::SC20676_BASELINE_CONTEXT_BAND
         || receipt.baseline.context_payload_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
+        || ![64, 128, 256].contains(&receipt.baseline.head_dimension)
         || receipt.thresholds.max_logit_abs_error != SC20676_MAX_LOGIT_ABS_ERROR
         || receipt.thresholds.min_greedy_token_agreement != SC20676_MIN_GREEDY_TOKEN_AGREEMENT
     {
@@ -679,6 +739,14 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         || receipt.dense.family != receipt.packed.family
     {
         return Err("SC-20676 receipt arms are not a same-family dense/packed pair".into());
+    }
+    if receipt
+        .packed
+        .kernel_profile
+        .as_ref()
+        .is_none_or(|profile| profile.head_dimension != receipt.baseline.head_dimension)
+    {
+        return Err("SC-20676 packed kernel profile does not match baseline model geometry".into());
     }
     if receipt.dense.prompt_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
         || receipt.dense.prompt_tokens != receipt.baseline.context_payload_tokens
@@ -848,6 +916,7 @@ pub fn bind_sc20671_baseline(
         campaign_global_identity_sha256,
         context_band: baseline.coordinate.context_band.into(),
         context_payload_tokens: receipt.geometry.context_payload_tokens,
+        head_dimension: receipt.geometry.head_dimension,
     })
 }
 
@@ -1000,12 +1069,32 @@ fn output_binding(
 fn phase(name: &str, sample: &campaign::MemorySample) -> Sc20676MemoryPhase {
     Sc20676MemoryPhase {
         phase: name.into(),
+        captured_at: sample.captured_at.clone(),
         phys_footprint_bytes: sample.current_bytes,
         phys_footprint_peak_bytes: sample.peak_bytes,
         mlx_active_bytes: sample.mlx_active_bytes,
         mlx_cache_bytes: sample.mlx_cache_bytes,
         mlx_peak_bytes: sample.mlx_peak_bytes,
     }
+}
+
+fn begin_decode_peak_window(
+) -> std::result::Result<(Sc20676PeakWindow, campaign::MemorySample), String> {
+    mlx_rs::memory::reset_peak_memory();
+    let sample = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
+    if sample.mlx_active_bytes == 0 || sample.mlx_peak_bytes != 0 {
+        return Err(
+            "SC-20676 decode peak-window reset did not produce a positive active baseline and zero peak"
+                .into(),
+        );
+    }
+    let window = Sc20676PeakWindow {
+        started_at: sample.captured_at.clone(),
+        baseline_active_bytes: sample.mlx_active_bytes,
+        baseline_cache_bytes: sample.mlx_cache_bytes,
+        reset_peak_bytes: sample.mlx_peak_bytes,
+    };
+    Ok((window, sample))
 }
 
 fn file_sha256(path: &Path) -> std::result::Result<String, String> {
@@ -1168,12 +1257,8 @@ fn active_resident_delta_from_phases(
         .saturating_sub(weights.mlx_active_bytes)
 }
 
-fn transient_peak_above_resident(
-    resident: &campaign::MemorySample,
-    peak: &campaign::MemorySample,
-) -> u64 {
-    peak.mlx_peak_bytes
-        .saturating_sub(resident.mlx_active_bytes)
+fn transient_peak_above_active(peak: &campaign::MemorySample) -> u64 {
+    peak.mlx_peak_bytes.saturating_sub(peak.mlx_active_bytes)
 }
 
 /// Two warmups are deliberately discarded; all five stored samples are independent cache
@@ -1391,6 +1476,7 @@ pub fn run_sc20676_worker(
         let logit_shape = logits.shape().to_vec();
         let logit_dtype = format!("{:?}", logits.dtype());
         let resident = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
+        let (decode_peak_window, decode_window_start) = begin_decode_peak_window()?;
         let out = generate_from_prefill(
             &model,
             cache.as_mut(),
@@ -1447,16 +1533,30 @@ pub fn run_sc20676_worker(
             snapshot_inventory_sha256: final_snapshot_inventory.sha256,
             prompt_tokens: ids.len() as u64,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-            peak_mlx_bytes: [&before, &weights_loaded, &resident, &decode_peak, &after]
-                .into_iter()
-                .map(|sample| sample.mlx_peak_bytes)
-                .max()
-                .unwrap_or(0),
-            peak_phys_footprint_bytes: [&before, &weights_loaded, &resident, &decode_peak, &after]
-                .into_iter()
-                .map(|sample| sample.peak_bytes)
-                .max()
-                .unwrap_or(0),
+            peak_mlx_bytes: [
+                &before,
+                &weights_loaded,
+                &resident,
+                &decode_window_start,
+                &decode_peak,
+                &after,
+            ]
+            .into_iter()
+            .map(|sample| sample.mlx_peak_bytes)
+            .max()
+            .unwrap_or(0),
+            peak_phys_footprint_bytes: [
+                &before,
+                &weights_loaded,
+                &resident,
+                &decode_window_start,
+                &decode_peak,
+                &after,
+            ]
+            .into_iter()
+            .map(|sample| sample.peak_bytes)
+            .max()
+            .unwrap_or(0),
             provenance,
             input: input_binding(&ids),
             output,
@@ -1467,19 +1567,17 @@ pub fn run_sc20676_worker(
                     phase("process-start", &before),
                     phase("weights-loaded", &weights_loaded),
                     phase("prefill-cache-resident", &resident),
-                    phase("decode-cache-resident", &decode_peak),
-                    phase("decode-transient-peak", &decode_peak),
+                    phase("decode-window-start", &decode_window_start),
+                    phase("decode-complete", &decode_peak),
                     phase("reset-release", &after),
                 ],
+                decode_peak_window,
                 dense_theoretical_kv_bytes,
                 observed_dense_kv_bytes,
                 packed_logical_payload_bytes: 0,
                 packed_metadata_bytes: 0,
                 packed_device_bytes: 0,
-                transient_workspace_bytes: transient_peak_above_resident(
-                    &decode_peak,
-                    &decode_peak,
-                ),
+                transient_workspace_bytes: transient_peak_above_active(&decode_peak),
                 theoretical_dense_reconstruction_bytes: dense_theoretical_kv_bytes,
                 theoretical_score_matrix_bytes,
                 release_verified: after.mlx_active_bytes == weights_loaded.mlx_active_bytes
@@ -1490,6 +1588,7 @@ pub fn run_sc20676_worker(
                             .saturating_add(campaign::POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES),
             },
             route: "dense".into(),
+            kernel_profile: None,
             packed: None,
             warm_packed: None,
             continuation_dispatches: 0,
@@ -1541,10 +1640,27 @@ pub fn run_sc20676_worker(
     let weights_loaded = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
     // The cache clone/snapshot contract owns this non-threaded Metal object through its existing
     // `Arc` handle; it is never sent across threads by this single-worker harness.
+    let kernel = PackedMetalKernel::new().map_err(|e| e.to_string())?;
+    let head_dimension =
+        usize::try_from(cfg.head_dim).map_err(|_| "SC-20676 head dimension does not fit usize")?;
+    let tuning = kernel
+        .tuning_profile(head_dimension)
+        .ok_or("SC-20676 packed kernel has no tuning profile for the model head dimension")?;
+    let kernel_profile = Sc20676KernelProfile {
+        metal_device: provenance.metal_device.clone(),
+        gpu_family: tuning.gpu_family.into(),
+        qualification: "conservative-default".into(),
+        head_dimension: u64::try_from(head_dimension)
+            .map_err(|_| "SC-20676 head dimension does not fit u64")?,
+        threads: u64::try_from(tuning.threads)
+            .map_err(|_| "SC-20676 thread count does not fit u64")?,
+        simd_groups: u64::try_from(tuning.simd_groups)
+            .map_err(|_| "SC-20676 SIMD-group count does not fit u64")?,
+        values_per_thread: u64::try_from(tuning.values_per_thread)
+            .map_err(|_| "SC-20676 values-per-thread count does not fit u64")?,
+    };
     #[allow(clippy::arc_with_non_send_sync)]
-    let retained = CompiledKernelHandle::new(Arc::new(
-        PackedMetalKernel::new().map_err(|e| e.to_string())?,
-    ));
+    let retained = CompiledKernelHandle::new(Arc::new(kernel));
     let (route, mut cache) = packed_cache(&model, retained.clone(), ids.len(), false);
     if route != CacheRoute::ExperimentalPacked {
         return Err(format!("packed selection refused real request: {route:?}"));
@@ -1559,6 +1675,7 @@ pub fn run_sc20676_worker(
     let packed_logit_shape = first_logits.shape().to_vec();
     let packed_logit_dtype = format!("{:?}", first_logits.dtype());
     let resident = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
+    let (decode_peak_window, decode_window_start) = begin_decode_peak_window()?;
     let out = generate_from_prefill(
         &model,
         cache.as_mut(),
@@ -1688,7 +1805,7 @@ pub fn run_sc20676_worker(
     // prefill boundary here would join different sequence lengths and could falsely validate only
     // because allocator slack hid the mismatch.
     let packed_device_bytes = active_resident_delta(&weights_loaded, &decode_peak);
-    let transient_workspace_bytes = transient_peak_above_resident(&decode_peak, &decode_peak);
+    let transient_workspace_bytes = transient_peak_above_active(&decode_peak);
     if packed_device_bytes == 0 || transient_workspace_bytes == 0 {
         return Err("packed allocator evidence has no resident or transient delta".into());
     }
@@ -1710,16 +1827,30 @@ pub fn run_sc20676_worker(
         snapshot_inventory_sha256: final_snapshot_inventory.sha256,
         prompt_tokens: ids.len() as u64,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-        peak_mlx_bytes: [&before, &weights_loaded, &resident, &decode_peak, &after]
-            .into_iter()
-            .map(|sample| sample.mlx_peak_bytes)
-            .max()
-            .unwrap_or(0),
-        peak_phys_footprint_bytes: [&before, &weights_loaded, &resident, &decode_peak, &after]
-            .into_iter()
-            .map(|sample| sample.peak_bytes)
-            .max()
-            .unwrap_or(0),
+        peak_mlx_bytes: [
+            &before,
+            &weights_loaded,
+            &resident,
+            &decode_window_start,
+            &decode_peak,
+            &after,
+        ]
+        .into_iter()
+        .map(|sample| sample.mlx_peak_bytes)
+        .max()
+        .unwrap_or(0),
+        peak_phys_footprint_bytes: [
+            &before,
+            &weights_loaded,
+            &resident,
+            &decode_window_start,
+            &decode_peak,
+            &after,
+        ]
+        .into_iter()
+        .map(|sample| sample.peak_bytes)
+        .max()
+        .unwrap_or(0),
         provenance,
         input: input_binding(&ids),
         output,
@@ -1730,10 +1861,11 @@ pub fn run_sc20676_worker(
                 phase("process-start", &before),
                 phase("weights-loaded", &weights_loaded),
                 phase("prefill-cache-resident", &resident),
-                phase("decode-cache-resident", &decode_peak),
-                phase("decode-transient-peak", &decode_peak),
+                phase("decode-window-start", &decode_window_start),
+                phase("decode-complete", &decode_peak),
                 phase("reset-release", &after),
             ],
+            decode_peak_window,
             dense_theoretical_kv_bytes,
             observed_dense_kv_bytes: dense_observed_kv_bytes,
             packed_logical_payload_bytes: packed.retained_device_code_bytes,
@@ -1745,6 +1877,7 @@ pub fn run_sc20676_worker(
             release_verified: physical_release_verified,
         },
         route: route_name(&route),
+        kernel_profile: Some(kernel_profile),
         packed: Some(packed),
         warm_packed: Some(warm_packed),
         continuation_dispatches,
@@ -2125,26 +2258,38 @@ mod tests {
         ]
     }
     fn memory() -> Sc20676MemoryEvidence {
-        let sample = |phase: &str| Sc20676MemoryPhase {
+        let sample = |index: usize, phase: &str| Sc20676MemoryPhase {
             phase: phase.into(),
+            captured_at: format!("2026-01-01T00:00:{index:02}Z"),
             phys_footprint_bytes: 10,
             phys_footprint_peak_bytes: 10,
             mlx_active_bytes: 2,
             mlx_cache_bytes: 3,
-            mlx_peak_bytes: 4,
+            mlx_peak_bytes: if ["weights-loaded", "decode-window-start"].contains(&phase) {
+                0
+            } else {
+                4
+            },
         };
         Sc20676MemoryEvidence {
             phases: [
                 "process-start",
                 "weights-loaded",
                 "prefill-cache-resident",
-                "decode-cache-resident",
-                "decode-transient-peak",
+                "decode-window-start",
+                "decode-complete",
                 "reset-release",
             ]
             .into_iter()
-            .map(sample)
+            .enumerate()
+            .map(|(index, phase)| sample(index, phase))
             .collect(),
+            decode_peak_window: Sc20676PeakWindow {
+                started_at: "2026-01-01T00:00:03Z".into(),
+                baseline_active_bytes: 2,
+                baseline_cache_bytes: 3,
+                reset_peak_bytes: 0,
+            },
             dense_theoretical_kv_bytes: 2,
             observed_dense_kv_bytes: 1,
             packed_logical_payload_bytes: 1,
@@ -2187,11 +2332,12 @@ mod tests {
         if packed {
             arm_memory.phases[2].mlx_active_bytes = 3;
             arm_memory.phases[2].mlx_peak_bytes = 6;
-            arm_memory.phases[3].mlx_active_bytes = 4;
-            arm_memory.phases[3].mlx_peak_bytes = 6;
+            arm_memory.phases[3].mlx_active_bytes = 3;
+            arm_memory.phases[3].mlx_peak_bytes = 0;
             arm_memory.phases[4].mlx_active_bytes = 4;
             arm_memory.phases[4].mlx_peak_bytes = 6;
             arm_memory.phases[5].mlx_peak_bytes = 6;
+            arm_memory.decode_peak_window.baseline_active_bytes = 3;
             arm_memory.packed_device_bytes = 2;
         } else {
             arm_memory.packed_logical_payload_bytes = 0;
@@ -2229,6 +2375,15 @@ mod tests {
                 "dense"
             }
             .into(),
+            kernel_profile: packed.then_some(Sc20676KernelProfile {
+                metal_device: "Apple GPU".into(),
+                gpu_family: "conservative-unknown-apple".into(),
+                qualification: "conservative-default".into(),
+                head_dimension: 64,
+                threads: 32,
+                simd_groups: 1,
+                values_per_thread: 2,
+            }),
             packed: packed.then(packed_evidence),
             warm_packed: packed.then_some(PackedCacheEvidence {
                 accepted_direct_calls: 2,
@@ -2288,6 +2443,7 @@ mod tests {
                 campaign_global_identity_sha256: digest(),
                 context_band: campaign::SC20676_BASELINE_CONTEXT_BAND.into(),
                 context_payload_tokens: 1024,
+                head_dimension: 64,
             },
             thresholds: Sc20676Thresholds::default(),
             dense: arm("dense"),
@@ -2455,7 +2611,7 @@ mod tests {
         let valid = receipt();
         assert_ne!(
             valid.packed.memory.phases[2].mlx_active_bytes,
-            valid.packed.memory.phases[3].mlx_active_bytes
+            valid.packed.memory.phases[4].mlx_active_bytes
         );
         validate_sc20676_receipt_core(&valid).unwrap();
 
@@ -2523,9 +2679,7 @@ mod tests {
         assert!(validate_sc20676_receipt(&bad).is_err());
 
         let mut bad = receipt();
-        bad.packed.memory.phases[2].mlx_active_bytes = 3;
-        bad.packed.memory.phases[3].mlx_active_bytes = 3;
-        bad.packed.memory.phases[3].mlx_peak_bytes = 5;
+        bad.packed.memory.phases[4].mlx_active_bytes = 3;
         bad.packed.memory.phases[4].mlx_peak_bytes = 5;
         bad.packed.memory.packed_device_bytes = 1;
         reseal_arm(&mut bad.packed);
@@ -2567,6 +2721,61 @@ mod tests {
         bad.packed.timings[0].packed_warm_dispatch_ms = 0.0;
         reseal_arm(&mut bad.packed);
         assert!(validate_sc20676_receipt(&bad).is_err());
+    }
+    #[test]
+    fn decode_peak_attribution_requires_a_sealed_reset_after_prefill() {
+        let mut valid = receipt();
+        valid.packed.memory.phases[2].mlx_peak_bytes = 100;
+        valid.packed.peak_mlx_bytes = 100;
+        reseal_arm(&mut valid.packed);
+        validate_sc20676_receipt_core(&valid).unwrap();
+
+        let mut bad = valid.clone();
+        bad.packed.memory.decode_peak_window.reset_peak_bytes = 100;
+        bad.packed.memory.phases[3].mlx_peak_bytes = 100;
+        reseal_arm(&mut bad.packed);
+        assert!(validate_sc20676_receipt_core(&bad).is_err());
+
+        let mut stale_window = valid;
+        stale_window.packed.memory.decode_peak_window.started_at =
+            stale_window.packed.memory.phases[2].captured_at.clone();
+        reseal_arm(&mut stale_window.packed);
+        assert!(validate_sc20676_receipt_core(&stale_window).is_err());
+    }
+    #[test]
+    fn packed_kernel_profile_is_bound_to_device_and_dispatch_geometry() {
+        let valid = receipt();
+        validate_sc20676_receipt_core(&valid).unwrap();
+
+        let mut wrong_device = valid.clone();
+        wrong_device
+            .packed
+            .kernel_profile
+            .as_mut()
+            .unwrap()
+            .metal_device = "another device".into();
+        reseal_arm(&mut wrong_device.packed);
+        assert!(validate_sc20676_receipt_core(&wrong_device).is_err());
+
+        let mut wrong_family = valid.clone();
+        wrong_family
+            .packed
+            .kernel_profile
+            .as_mut()
+            .unwrap()
+            .gpu_family = "apple7-or-newer".into();
+        reseal_arm(&mut wrong_family.packed);
+        assert!(validate_sc20676_receipt_core(&wrong_family).is_err());
+
+        let mut wrong_geometry = valid;
+        wrong_geometry
+            .packed
+            .kernel_profile
+            .as_mut()
+            .unwrap()
+            .threads = 64;
+        reseal_arm(&mut wrong_geometry.packed);
+        assert!(validate_sc20676_receipt_core(&wrong_geometry).is_err());
     }
     #[test]
     fn post_model_snapshot_inventory_must_match_the_initial_validation() {
