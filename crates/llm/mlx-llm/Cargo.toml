@@ -31,6 +31,8 @@ core-llm = { workspace = true }
 thiserror = { workspace = true }
 # config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
 serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
 # half-precision scalar helpers for host-side dtype handling.
 half = "2"
 memmap2 = "0.9"
