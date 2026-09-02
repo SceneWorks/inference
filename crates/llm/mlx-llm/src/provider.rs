@@ -621,9 +621,49 @@ impl LlamaProvider {
             .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))
     }
 
-    /// Execute the cache-hit half of the real prefix-reuse path with campaign observation attached.
-    /// The first call seeds the provider-owned cache; the second call is the measured operation and
-    /// must prove a new hit before its output can be used as coordinate evidence.
+    /// Seed the provider-owned prefix cache before a campaign opens its phase-local MLX peak
+    /// window.  The observed cache-hit dispatch is deliberately separate so seed allocations and
+    /// compile work cannot establish the peak used as measured prefill evidence.
+    pub(crate) fn campaign_seed_prefix_reuse(&self, prompt: &str) -> CoreResult<()> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        if cache_slot.is_some() {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix cache was already seeded".into(),
+            ));
+        }
+        let mut cache = crate::decode::PrefixCache::new(2);
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+            .map_err(to_core)?;
+        *cache_slot = Some(cache);
+        Ok(())
+    }
+
+    /// Execute only the cache-hit half of the real prefix-reuse path with campaign observation
+    /// attached. The caller must seed before resetting the phase-local peak; this method proves a
+    /// new hit and emitted token before its output can be used as coordinate evidence.
     pub(crate) fn campaign_prefix_reuse_observed(
         &self,
         prompt: &str,
@@ -652,11 +692,10 @@ impl LlamaProvider {
         };
         let cancel = crate::decode::CancelFlag::new();
         let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
-        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let cache = cache_slot.as_mut().ok_or_else(|| {
+            CoreError::InvalidRequest("campaign prefix cache was not seeded".into())
+        })?;
         let before_hits = cache.stats().hits;
-        let mut sink = |_| {};
-        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
-            .map_err(to_core)?;
         let mut emitted = 0usize;
         let output = crate::decode::prefix::generate_cached_with_observer(
             model,

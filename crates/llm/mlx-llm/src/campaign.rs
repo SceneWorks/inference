@@ -480,11 +480,20 @@ pub struct ReceiptRelease {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ReceiptPeakWindow {
+    pub started_at: String,
+    pub baseline_active_bytes: u64,
+    pub reset_peak_bytes: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ReceiptMemory {
     pub model_weights_bytes: u64,
     pub persistent_kv_bytes: u64,
     pub transient_workspace_bytes: u64,
     pub dense_theoretical_kv_bytes: u64,
+    pub prefill_peak_window: ReceiptPeakWindow,
     pub phase_samples: Vec<ReceiptPhase>,
     pub allocation_events: Vec<ReceiptAllocation>,
     pub reconciliation: ReceiptReconciliation,
@@ -1091,8 +1100,17 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if receipt.memory.phase_samples.windows(2).any(|w| {
         w[0].timestamp >= w[1].timestamp
             || w[1].phys_footprint_peak_bytes < w[0].phys_footprint_peak_bytes
-            || w[1].mlx.peak_bytes < w[0].mlx.peak_bytes
-    }) {
+    }) || receipt
+        .memory
+        .phase_samples
+        .windows(2)
+        .enumerate()
+        .any(|(index, w)| {
+            // MLX peak memory is deliberately reset to zero at the sealed boundary immediately
+            // before prefill.  Every other adjacent phase remains process-local and monotonic.
+            index != 1 && w[1].mlx.peak_bytes < w[0].mlx.peak_bytes
+        })
+    {
         return Err("phase sequence or peak monotonicity failed".into());
     }
     if receipt.memory.phase_samples.iter().any(|p| {
@@ -1243,17 +1261,31 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if active_delta(weights_loaded)? < weights {
         return Err("weights-loaded MLX active bytes do not contain weights".into());
     }
+    let prefill_peak_window = &receipt.memory.prefill_peak_window;
+    if !rfc3339(&prefill_peak_window.started_at)
+        || prefill_peak_window.started_at <= weights_loaded.timestamp
+        || prefill_peak_window.reset_peak_bytes != 0
+        || prefill_peak_window.baseline_active_bytes < weights_loaded.mlx.active_bytes
+    {
+        return Err("MLX prefill peak window is invalid".into());
+    }
     let prefill = sample_for("prefill-peak")?;
-    let prefill_total = weights
+    if prefill_peak_window.started_at >= prefill.timestamp {
+        return Err("MLX prefill peak window is not ordered before prefill".into());
+    }
+    let prefill_active_floor = prefill_peak_window
+        .baseline_active_bytes
         .checked_add(kv)
-        .and_then(|bytes| bytes.checked_add(workspace))
-        .ok_or("prefill attributed memory overflows u64")?;
-    let prefill_peak_total = process_start
-        .mlx
-        .active_bytes
-        .checked_add(prefill_total)
-        .ok_or("prefill peak containment overflows u64")?;
-    if active_delta(prefill)? < prefill_total || prefill.mlx.peak_bytes < prefill_peak_total {
+        .ok_or("prefill persistent memory floor overflows u64")?;
+    let prefill_peak_floor = prefill_active_floor
+        .checked_add(workspace)
+        .ok_or("prefill attributed peak floor overflows u64")?;
+    // The instantaneous sample must retain the phase-local baseline and KV. Transient workspace may
+    // be released by the time the post-dispatch sample is captured, so the sealed reset window
+    // binds the prefill peak without accepting a session-global load or warmup high-water.
+    if prefill.mlx.active_bytes < prefill_active_floor
+        || prefill.mlx.peak_bytes < prefill_peak_floor
+    {
         return Err("prefill MLX samples do not contain attributed allocations".into());
     }
     let decode = sample_for("decode-steady")?;
@@ -3469,6 +3501,9 @@ pub trait Observer {
     /// observer replays these as the first two receipt phases so later reference allocations cannot
     /// be mistaken for candidate weights.
     fn load_boundary(&mut self, _process_start: &MemorySample, _weights_loaded: &MemorySample) {}
+    /// Reset MLX's process-global high-water immediately before the measured prefill and seal the
+    /// active-memory baseline independently from the historical model-load boundary.
+    fn begin_prefill_memory_window(&mut self) {}
     /// Current cumulative cache ownership at a decoder boundary. The product cache supplies bytes,
     /// sequence capacity, and the actual MLX array scalar width so repeated append events are not
     /// summed and the receipt cannot confuse model-weight dtype with cache dtype.
@@ -3514,6 +3549,7 @@ pub struct ProductObserver {
     operations: Vec<String>,
     load_elapsed_ms: Option<f64>,
     load_boundary: Option<(MemorySample, MemorySample)>,
+    prefill_peak_window: Option<ReceiptPeakWindow>,
     cache_capacity_tokens: u64,
 }
 
@@ -3536,6 +3572,7 @@ impl ProductObserver {
             operations: Vec::new(),
             load_elapsed_ms: None,
             load_boundary: None,
+            prefill_peak_window: None,
             cache_capacity_tokens: 0,
         }
     }
@@ -3578,6 +3615,9 @@ impl ProductObserver {
         if self.phases.len() != REQUIRED_PHASES.len() {
             return Err("product observer did not capture the exact phase set".into());
         }
+        let prefill_peak_window = self
+            .prefill_peak_window
+            .ok_or("product observer did not reset the MLX prefill peak window")?;
         if self.cache_capacity_tokens == 0 {
             return Err("product observer did not capture a cumulative cache snapshot".into());
         }
@@ -3620,6 +3660,7 @@ impl ProductObserver {
             load_elapsed_ms: self
                 .load_elapsed_ms
                 .ok_or("product observer is missing measured snapshot load duration")?,
+            prefill_peak_window,
             cache_capacity_tokens: self.cache_capacity_tokens,
         })
     }
@@ -3643,6 +3684,7 @@ pub struct ProductObservations {
     pub cache_state_version: u64,
     pub operations: Vec<String>,
     pub load_elapsed_ms: f64,
+    pub prefill_peak_window: ReceiptPeakWindow,
     pub cache_capacity_tokens: u64,
 }
 
@@ -3662,6 +3704,37 @@ impl Observer for ProductObserver {
             self.error = Some("invalid or duplicate product load boundary".into());
         } else {
             self.load_boundary = Some((process_start.clone(), weights_loaded.clone()));
+        }
+    }
+
+    fn begin_prefill_memory_window(&mut self) {
+        if self.prefill_peak_window.is_some()
+            || self.phase != Some("process-start")
+            || self.phases.len() != 1
+        {
+            self.error = Some("invalid or duplicate MLX prefill peak-window reset".into());
+            return;
+        }
+        if self.load_boundary.is_none() {
+            self.error = Some("MLX prefill peak-window reset has no load boundary".into());
+            return;
+        }
+        mlx_rs::memory::reset_peak_memory();
+        match sample_memory(self.pid) {
+            Ok(sample) if sample.mlx_active_bytes > 0 && sample.mlx_peak_bytes == 0 => {
+                self.prefill_peak_window = Some(ReceiptPeakWindow {
+                    started_at: sample.captured_at,
+                    baseline_active_bytes: sample.mlx_active_bytes,
+                    reset_peak_bytes: sample.mlx_peak_bytes,
+                });
+            }
+            Ok(_) => {
+                self.error =
+                    Some("MLX prefill peak-window reset did not produce a positive active baseline and zero peak".into())
+            }
+            Err(error) => {
+                self.error = Some(format!("MLX prefill peak-window baseline sample: {error}"))
+            }
         }
     }
 
@@ -4071,6 +4144,7 @@ pub fn run_dense_coordinate(
         let provider = &session.provider;
         observer.snapshot_inventory(session.inventory());
         observer.geometry(provider.campaign_geometry());
+        observer.begin_prefill_memory_window();
         observer.phase("weights-loaded");
         observer.allocation("weights", "persistent", session.model_weights_bytes());
         let request = TextLlmRequest {
@@ -4165,8 +4239,6 @@ pub fn run_dense_lifecycle_request_on_session(
     let output = {
         observer.snapshot_inventory(inventory);
         observer.geometry(provider.campaign_geometry());
-        observer.phase("weights-loaded");
-        observer.allocation("weights", "persistent", session.model_weights_bytes());
         if let Some(coordinate) = coordinate {
             if coordinate.request_mode == "supported-batch" {
                 provider.campaign_supported_batch(prefix_prompt, 2)?;
@@ -4177,6 +4249,9 @@ pub fn run_dense_lifecycle_request_on_session(
                 observer.operation("chunked-prefix-reuse");
             }
         }
+        observer.begin_prefill_memory_window();
+        observer.phase("weights-loaded");
+        observer.allocation("weights", "persistent", session.model_weights_bytes());
         let mut saw_token = false;
         let output = provider.generate_observed(
             &request,
@@ -4409,6 +4484,10 @@ fn run_coordinate_operation_on_session(
     observer.phase("process-start");
     observer.snapshot_inventory(session.inventory());
     observer.geometry(provider.campaign_geometry());
+    if operation == "chunked-prefix-reuse" {
+        provider.campaign_seed_prefix_reuse(prefix_prompt)?;
+    }
+    observer.begin_prefill_memory_window();
     observer.phase("weights-loaded");
     observer.allocation("weights", "persistent", session.model_weights_bytes());
 
@@ -5325,7 +5404,7 @@ fn product_receipt(
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
     ReceiptBuilder {
@@ -5878,6 +5957,11 @@ mod tests {
                 persistent_kv_bytes: 4,
                 transient_workspace_bytes: 1,
                 dense_theoretical_kv_bytes: 4,
+                prefill_peak_window: ReceiptPeakWindow {
+                    started_at: "2026-01-01T00:00:01.500Z".into(),
+                    baseline_active_bytes: 3,
+                    reset_peak_bytes: 0,
+                },
                 phase_samples: vec![],
                 allocation_events: vec![],
                 reconciliation: ReceiptReconciliation {
@@ -6244,6 +6328,60 @@ mod tests {
         split_prefill.memory.phase_samples[2].mlx.active_bytes = 3;
         split_prefill.memory.phase_samples[2].mlx.peak_bytes = 4;
         assert!(validate_receipt_semantics(&split_prefill).is_err());
+        let mut missing_prefill_workspace_peak = receipt.clone();
+        missing_prefill_workspace_peak.memory.phase_samples[2]
+            .mlx
+            .active_bytes = 7;
+        missing_prefill_workspace_peak.memory.phase_samples[2]
+            .mlx
+            .peak_bytes = 7;
+        assert!(validate_receipt_semantics(&missing_prefill_workspace_peak).is_err());
+        let mut missing_prefill_persistent_byte = receipt.clone();
+        missing_prefill_persistent_byte.memory.phase_samples[2]
+            .mlx
+            .active_bytes = 6;
+        missing_prefill_persistent_byte.memory.phase_samples[2]
+            .mlx
+            .peak_bytes = 8;
+        assert!(validate_receipt_semantics(&missing_prefill_persistent_byte).is_err());
+        let mut stale_prefill_window = receipt.clone();
+        stale_prefill_window
+            .memory
+            .prefill_peak_window
+            .reset_peak_bytes = 8;
+        assert!(
+            validate_receipt_semantics(&stale_prefill_window).is_err(),
+            "a session-global load or warmup peak must not masquerade as measured prefill workspace"
+        );
+        let mut late_prefill_window = receipt.clone();
+        late_prefill_window.memory.prefill_peak_window.started_at =
+            "2026-01-01T00:00:02.500Z".into();
+        assert!(validate_receipt_semantics(&late_prefill_window).is_err());
+        let mut missing_prefill_baseline = receipt.clone();
+        missing_prefill_baseline
+            .memory
+            .prefill_peak_window
+            .baseline_active_bytes = 2;
+        assert!(validate_receipt_semantics(&missing_prefill_baseline).is_err());
+        let mut released_prefill_workspace = receipt.clone();
+        released_prefill_workspace.memory.phase_samples[2]
+            .mlx
+            .active_bytes = 7;
+        released_prefill_workspace.memory.phase_samples[2]
+            .mlx
+            .peak_bytes = 8;
+        assert!(
+            validate_receipt_semantics(&released_prefill_workspace).is_ok(),
+            "the post-prefill active sample need only retain weights and KV when peak memory proves the transient workspace"
+        );
+        let mut phase_local_peak_reset = receipt.clone();
+        phase_local_peak_reset.memory.phase_samples[1]
+            .mlx
+            .peak_bytes = 99;
+        assert!(
+            validate_receipt_semantics(&phase_local_peak_reset).is_ok(),
+            "the sealed prefill reset boundary permits the measured peak to fall below the earlier load high-water"
+        );
         let mut fixture_tampered = receipt.clone();
         fixture_tampered
             .quality
