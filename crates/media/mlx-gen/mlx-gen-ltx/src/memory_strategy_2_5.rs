@@ -402,10 +402,19 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     let mut additional_prerequisites = vec![
-        // Inherited from 2.3: LTX stages Gemma before the AvDiT on every render, so a selected
-        // decode rung co-engages rung 1 even though the shared cost-order default does not.
+        // Inherited from 2.3: LTX stages Gemma before the AvDiT on every render, so every selected
+        // optimized rung below co-engages rung 1 even though the shared cost-order default does
+        // not. Keep these edges on the provider: staging is LTX's shipped floor, not a universal
+        // prerequisite for the same shared scratch-bounding rungs on other families.
         (
             MemoryStrategy::BoundedDecode,
+            MemoryStrategyPrerequisite::Rung {
+                rung: MemoryStrategy::StagedResidency,
+                scope: MemoryPrerequisiteScope::EngagedInSameRequest,
+            },
+        ),
+        (
+            MemoryStrategy::BoundedAttention,
             MemoryStrategyPrerequisite::Rung {
                 rung: MemoryStrategy::StagedResidency,
                 scope: MemoryPrerequisiteScope::EngagedInSameRequest,
@@ -1139,6 +1148,52 @@ mod tests {
                 ATTENTION_CHUNK_SIZES,
             );
         }
+    }
+
+    #[test]
+    fn bounded_attention_compositions_layer_on_the_unconditional_staging_floor() {
+        let conv_spec = spec(LoadShape::EagerMaterialization);
+        let conv_contract = weights_free_memory_strategy_contract(&conv_spec).unwrap();
+        let conv_selection =
+            registered_valid_fixtures(&conv_spec, &conv_contract, MemoryStrategy::BoundedAttention)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .context
+                .selection;
+        assert_eq!(
+            conv_contract.engaged_composition_for_selection(&conv_selection),
+            [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+                MemoryStrategy::BoundedAttention,
+            ]
+        );
+
+        let diffvae_spec = spec(LoadShape::EagerMaterialization).with_component(
+            LtxComponent::DiffusionVideoVae.id(),
+            WeightsSource::File("/nonexistent/diffusion-vae.safetensors".into()),
+        );
+        let diffvae_contract = weights_free_memory_strategy_contract(&diffvae_spec).unwrap();
+        let diffvae_selection = registered_valid_fixtures(
+            &diffvae_spec,
+            &diffvae_contract,
+            MemoryStrategy::BoundedAttention,
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+        .context
+        .selection;
+        assert_eq!(
+            diffvae_contract.engaged_composition_for_selection(&diffvae_selection),
+            [
+                MemoryStrategy::Resident,
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedAttention,
+            ]
+        );
     }
 
     /// `DeferredMaterialization` supplies the re-openable source, but it is not itself an

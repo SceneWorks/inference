@@ -270,7 +270,15 @@ class WeightSetLabelTests(unittest.TestCase):
     looks green at a glance, so it is asserted rather than reviewed.
     """
 
-    KNOWN = {"rw-mage", "rw-sa3", "rw-krea", "rw-audio", "rw-llm", "rw-chroma"}
+    KNOWN = {
+        "rw-mage",
+        "rw-sa3",
+        "rw-krea",
+        "rw-audio",
+        "rw-llm",
+        "rw-chroma",
+        "rw-starvector",
+    }
 
     def setUp(self) -> None:
         self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))

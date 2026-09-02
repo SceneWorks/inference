@@ -3,9 +3,15 @@
 
 This helper is deliberately limited to the canonical public repository. It always resolves the
 requested immutable revision anonymously into a canonical Hugging Face cache, captures the raw
-expanded public API response, and writes either the exact nine-row campaign manifest or the
+expanded public API response, and writes either the exact six-row campaign manifest or the
 reviewed promotion input. It never accepts a token, a private source, a local-dir projection, or a
 partial download pattern.
+
+sc-18791: the campaign measures exactly what the public release ships. That release contains only
+`distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` — there is no `bundles/` tree — so the INT8-ConvRot
+and NVFP4 candidate rows were removed. Promotion only ever applied to those advanced candidates,
+so `PROMOTABLE_CASES` is empty and the `promotion` subcommand fails closed until such a bundle is
+published and its row restored here and in `TERMINAL_MEASUREMENT_CASES`.
 """
 
 from __future__ import annotations
@@ -35,30 +41,9 @@ TERMINAL_CASES: tuple[tuple[str, str, str, str | None], ...] = (
     ("ltx25-bf16-blackwell-v1", "distilled", "distilled/bf16", None),
     ("ltx25-packed-q4-blackwell-v1", "distilled", "distilled/q4", None),
     ("ltx25-packed-q8-blackwell-v1", "distilled", "distilled/q8", None),
-    (
-        "ltx25-int8-convrot-blackwell-v1",
-        "distilled",
-        "bundles/distilled/int8-convrot",
-        "bundles/distilled/int8-convrot/text_encoders/"
-        "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-    ),
-    (
-        "ltx25-nvfp4-blackwell-v1",
-        "distilled",
-        "bundles/distilled/nvfp4",
-        "bundles/distilled/nvfp4/text_encoders/"
-        "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-    ),
     ("ltx25-bf16-blackwell-dev-v1", "dev", "dev/bf16", None),
     ("ltx25-packed-q4-blackwell-dev-v1", "dev", "dev/q4", None),
     ("ltx25-packed-q8-blackwell-dev-v1", "dev", "dev/q8", None),
-    (
-        "ltx25-int8-convrot-blackwell-dev-v1",
-        "dev",
-        "bundles/dev/int8-convrot",
-        "bundles/dev/int8-convrot/text_encoders/"
-        "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-    ),
 )
 PROMOTABLE_CASES = {
     case_id: (variant, bundle, encoder)
@@ -311,6 +296,11 @@ def validate_selection(selection: Any) -> dict[str, Any]:
         raise ValueError(f"promotion policyId must equal {POLICY_ID}")
     if not isinstance(selection["reviewedBy"], str) or not selection["reviewedBy"].strip():
         raise ValueError("reviewedBy must be a non-empty reviewer identity")
+    if not PROMOTABLE_CASES:
+        raise ValueError(
+            "no terminal case is promotable: the public release publishes no advanced "
+            "(INT8-ConvRot/NVFP4) bundle, so there is nothing to promote"
+        )
     selected = selection["selectedCaseIds"]
     if (
         not isinstance(selected, list)

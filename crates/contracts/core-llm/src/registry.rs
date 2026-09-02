@@ -389,6 +389,11 @@ mod tests {
     use super::*;
     use crate::capabilities::TextLlmCapabilities;
     use crate::output::{StreamEvent, TextLlmOutput};
+    use crate::{
+        DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorDescriptor,
+        StarVectorFinishReason, StarVectorOutput, StarVectorProvider, StarVectorRequest,
+        StarVectorStreamEvent, StarVectorTier, VisionEncoderArchitecture,
+    };
 
     // --- A throwaway provider whose `load` is never invoked by `select` (resolution only). ---
     struct Dummy;
@@ -441,6 +446,171 @@ mod tests {
             backend: "test".into(),
             capabilities: caps(true, &[]),
         }
+    }
+
+    struct LoadedNonStar {
+        descriptor: TextLlmDescriptor,
+    }
+
+    impl TextLlm for LoadedNonStar {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, _req: &TextLlmRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &TextLlmRequest,
+            _on_event: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TextLlmOutput> {
+            unreachable!("the typed-view test does not generate text")
+        }
+    }
+
+    struct LoadedStarVector {
+        descriptor: TextLlmDescriptor,
+        starvector: StarVectorDescriptor,
+    }
+
+    impl TextLlm for LoadedStarVector {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn as_starvector_provider(&self) -> Option<&dyn StarVectorProvider> {
+            Some(self)
+        }
+
+        fn validate(&self, _req: &TextLlmRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn generate(
+            &self,
+            _req: &TextLlmRequest,
+            _on_event: &mut dyn FnMut(StreamEvent),
+        ) -> Result<TextLlmOutput> {
+            unreachable!("the typed-view test calls generate_svg directly")
+        }
+    }
+
+    impl StarVectorProvider for LoadedStarVector {
+        fn starvector_descriptor(&self) -> &StarVectorDescriptor {
+            &self.starvector
+        }
+
+        fn generate_svg(
+            &self,
+            _request: &StarVectorRequest,
+            on_event: &mut dyn FnMut(StarVectorStreamEvent),
+        ) -> Result<StarVectorOutput> {
+            let output = StarVectorOutput {
+                svg: Some("<svg/>".to_owned()),
+                generated_tokens: 1,
+                generated_bytes: "<svg/>".len(),
+                finish_reason: StarVectorFinishReason::CompleteRoot,
+            };
+            on_event(StarVectorStreamEvent::Done {
+                finish_reason: output.finish_reason,
+                generated_tokens: output.generated_tokens,
+                generated_bytes: output.generated_bytes,
+            });
+            Ok(output)
+        }
+    }
+
+    fn starvector_desc() -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: "starvector-test".into(),
+            family: "starvector".into(),
+            backend: "test".into(),
+            capabilities: caps(true, &[]),
+        }
+    }
+
+    fn loaded_non_star(_spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        Ok(Box::new(LoadedNonStar {
+            descriptor: text_desc(),
+        }))
+    }
+
+    fn loaded_starvector(_spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        Ok(Box::new(LoadedStarVector {
+            descriptor: starvector_desc(),
+            starvector: StarVectorDescriptor {
+                tier: StarVectorTier::OneB,
+                preprocessing: ImagePreprocessing {
+                    image_size: 224,
+                    channels: 3,
+                    preserve_aspect_ratio: true,
+                },
+                projection: ProjectionMetadata {
+                    vision_encoder: VisionEncoderArchitecture::Clip,
+                    decoder: DecoderArchitecture::GptBigCode,
+                    vision_hidden_size: 1024,
+                    decoder_hidden_size: 2048,
+                    image_token_count: 257,
+                },
+                max_svg_bytes: 1024,
+                max_wall_time: None,
+            },
+        }))
+    }
+
+    #[test]
+    fn registry_loaded_textllm_exposes_only_the_typed_starvector_view() {
+        let registry = TextLlmRegistryBuilder::new()
+            .register(TextLlmRegistration {
+                descriptor: text_desc,
+                load: loaded_non_star,
+                can_load: |_| false,
+                weightless_vision: None,
+                weightless_audio: None,
+            })
+            .register(TextLlmRegistration {
+                descriptor: starvector_desc,
+                load: loaded_starvector,
+                can_load: |_| false,
+                weightless_vision: None,
+                weightless_audio: None,
+            })
+            .build()
+            .expect("distinct explicit registrations build");
+        let spec = LoadSpec::dense("synthetic-starvector-snapshot");
+
+        let ordinary = registry
+            .load_textllm("text", &spec)
+            .expect("non-StarVector provider loads through the same registry");
+        assert!(ordinary.as_starvector_provider().is_none());
+
+        let loaded = registry
+            .load_textllm("starvector-test", &spec)
+            .expect("StarVector provider loads through the ordinary registry");
+        assert_eq!(loaded.descriptor().id, "starvector-test");
+        let typed = loaded
+            .as_starvector_provider()
+            .expect("loaded StarVector exposes its typed view");
+        assert_eq!(typed.starvector_descriptor().tier, StarVectorTier::OneB);
+
+        let request = StarVectorRequest::new(
+            TextLlmRequest::new(Vec::new(), 1),
+            16,
+            std::time::Duration::from_secs(1),
+        );
+        let mut done = None;
+        let output = typed
+            .generate_svg(&request, &mut |event| {
+                if let StarVectorStreamEvent::Done { finish_reason, .. } = event {
+                    done = Some(finish_reason);
+                }
+            })
+            .expect("typed view exposes StarVector output");
+        assert_eq!(output.svg.as_deref(), Some("<svg/>"));
+        assert_eq!(output.finish_reason, StarVectorFinishReason::CompleteRoot);
+        assert_eq!(done, Some(StarVectorFinishReason::CompleteRoot));
     }
 
     // --- Qwen3-VL model-first routing fixtures (sc-8077) ---------------------------------------

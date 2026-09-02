@@ -1011,6 +1011,9 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
     let video_path = bundle.require(video_component)?.path().to_path_buf();
     let encoder_path = ltx25_encoder_path(root, video_component, &video_path);
     let audio = bundle.require(LtxComponent::AudioVae)?.path().to_path_buf();
+    // The converted vocoder is an intentionally unclaimed secondary sibling, like the connector.
+    // Resolve it beside the audio VAE that owns the merged upstream audio/vocoder configuration.
+    let vocoder = audio.with_file_name("vocoder.safetensors");
     let connector = bundle
         .require(LtxComponent::Transformer)?
         .path()
@@ -1025,6 +1028,7 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
     }
     let video_w = Weights::from_file(&video_path)?;
     let audio_w = Weights::from_file(&audio)?;
+    let vocoder_w = Weights::from_file(&vocoder)?;
     let vae_cfg = LtxVaeConfig::from_bundle(&bundle, video_component)?;
     let audio_cfg = AudioVaeConfig::from_bundle(&bundle)?;
     let vocoder_cfg = VocoderConfig::from_bundle(&bundle)?;
@@ -1056,7 +1060,7 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
         _ => unreachable!("the staged LTX-2.5 decoder selection and component must agree"),
     };
     let audio_decoder = AudioDecoder::from_weights(&audio_w, &audio_cfg)?;
-    let vocoder = LtxVocoder::from_weights(&audio_w, &vocoder_cfg)?;
+    let vocoder = LtxVocoder::from_weights(&vocoder_w, &vocoder_cfg)?;
     let spatial = bundle.require(LtxComponent::SpatialUpsampler)?.path();
     let upsampler = LatentUpsampler::from_checkpoint(spatial)?;
     let latent_mean = to_dtype(video_w.require("per_channel_statistics.mean")?, stat_dt)?;
@@ -3145,6 +3149,22 @@ mod tests {
             variant,
             enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
         }
+    }
+
+    #[test]
+    fn ltx25_split_audio_pipeline_loads_the_vocoder_component() {
+        let start = MODEL_SRC.find("fn build_ltx25(").expect("LTX-2.5 builder");
+        let end = MODEL_SRC[start..]
+            .find("let spatial =")
+            .map(|offset| start + offset)
+            .expect("end of LTX-2.5 audio construction");
+        let wiring = &MODEL_SRC[start..end];
+
+        assert!(wiring.contains("bundle.require(LtxComponent::AudioVae)"));
+        assert!(wiring.contains("audio.with_file_name(\"vocoder.safetensors\")"));
+        assert!(wiring.contains("AudioDecoder::from_weights(&audio_w"));
+        assert!(wiring.contains("LtxVocoder::from_weights(&vocoder_w"));
+        assert!(!wiring.contains("LtxVocoder::from_weights(&audio_w"));
     }
 
     #[test]
