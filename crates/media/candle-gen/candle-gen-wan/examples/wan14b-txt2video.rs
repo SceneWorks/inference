@@ -20,8 +20,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert, Progress,
-    WeightsSource,
+    AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert,
+    OffloadPolicy, Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -32,6 +32,20 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
+fn campaign_contract(args: &[String]) -> Result<Option<(String, String, OffloadPolicy)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency sequential")?;
+    if residency != "sequential" {
+        return Err("wan2_2_t2v_14b campaign residency must be sequential".into());
+    }
+    Ok(Some((source_ref, residency, OffloadPolicy::Sequential)))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let snapshot = arg(&args, "--snapshot")
@@ -40,12 +54,15 @@ fn main() -> Result<()> {
     // Campaign observation is armed before loading but activated only by the producer after the
     // registry has resolved the real snapshot and request geometry.  This keeps caller flags from
     // becoming evidence and ensures the scope covers generation and release.
-    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+    let campaign_contract = campaign_contract(&args)?;
+    let _campaign_request = if let Some((source_ref, residency, _)) = &campaign_contract {
         {
             let event_path = arg(&args, "--sc20686-events")
                 .filter(|path| path != "-")
                 .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
-            let request = candle_gen_wan::sc20686_observer::request_output(event_path);
+            let request = candle_gen_wan::sc20686_observer::request_output(
+                event_path, source_ref, residency,
+            )?;
             Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
                 request.arm_cancellation()
             } else {
@@ -135,8 +152,13 @@ fn main() -> Result<()> {
             )?
         }
         _ => {
-            let spec =
-                LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
+            let offload = campaign_contract
+                .as_ref()
+                .map(|(_, _, policy)| *policy)
+                .unwrap_or_default();
+            let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)))
+                .with_adapters(adapters)
+                .with_offload_policy(offload);
             candle_gen_wan::provider_registry()?.load("wan2_2_t2v_14b", &spec)?
         }
     };

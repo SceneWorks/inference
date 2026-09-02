@@ -1,5 +1,5 @@
 {
-  "schema": "sc-20686-source-map-v1",
+  "schema": "sc-20686-source-map-v2",
   "compatibility_target": {
     "story": "SC-20675",
     "format": "packed-group-affine-v2",
@@ -21,14 +21,15 @@
       ],
       "reference_slice": [
         {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "record_flux_kv_created", "line": 367},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 583},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 584}
+        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 620},
+        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 621}
       ],
       "reads": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "attention", "line": 393}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "drop", "line": 923}],
+      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "drop", "line": 959}],
       "current_kernel": "DoubleAttention dense joint attention over exact to_k/to_v/add_k/add_v projections; full joint duration is non-attributable context",
       "cache_format": "no persistent cross-KV cache",
       "paging": "none",
+      "product_residency": "sequential",
       "offload": "provider memory-strategy staging; no reference-KV paging",
       "recompute": "reference image K/V is projected in each DoubleAttention layer on every denoise evaluation",
       "compatibility": "reference slice [B,H,Skv,D] projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes; no packed reader is wired",
@@ -44,7 +45,8 @@
       "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
       "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
       "paging": "none",
-      "offload": "resident or request-selected sequential component staging",
+      "product_residency": "sequential",
+      "offload": "product-selected sequential component staging",
       "recompute": "prepared once per conditioning branch and reused across denoise steps",
       "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
       "self_attention_excluded": true
@@ -59,7 +61,8 @@
       "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
       "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
       "paging": "none",
-      "offload": "resident or sequential high/low expert staging",
+      "product_residency": "sequential",
+      "offload": "product-selected sequential high/low expert staging",
       "recompute": "prepared once per expert and conditioning branch",
       "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
       "self_attention_excluded": true
@@ -74,7 +77,8 @@
       "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
       "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
       "paging": "none",
-      "offload": "resident or sequential high/low expert staging",
+      "product_residency": "sequential",
+      "offload": "product-selected sequential high/low expert staging",
       "recompute": "prepared once per expert and conditioning branch",
       "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
       "self_attention_excluded": true
@@ -89,7 +93,8 @@
       "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
       "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
       "paging": "none",
-      "offload": "request-scoped model lifecycle",
+      "product_residency": "resident",
+      "offload": "product-selected resident model lifecycle",
       "recompute": "prepared once per conditioning branch",
       "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
       "self_attention_excluded": true
@@ -104,7 +109,8 @@
       "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
       "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
       "paging": "none",
-      "offload": "resident or sequential high/low expert staging",
+      "product_residency": "sequential",
+      "offload": "product-selected sequential high/low expert staging",
       "recompute": "prepared once per expert and conditioning branch",
       "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
       "self_attention_excluded": true

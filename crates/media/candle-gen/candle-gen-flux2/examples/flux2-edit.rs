@@ -26,8 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{
-    GenerationOutput, GenerationRequest, Image, LoadSpec, PreviewSink, Progress,
-    PromptEnhancementOutcome, PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource,
+    GenerationMemory, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy,
+    PreviewSink, Progress, PromptEnhancementOutcome, PromptEnhancementReport,
+    PromptEnhancementSink, Quant, WeightsSource,
 };
 use candle_gen_flux2::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
 
@@ -37,6 +38,20 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn campaign_contract(args: &[String]) -> Result<Option<(String, String)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency sequential")?;
+    if residency != "sequential" {
+        return Err("flux2_klein_9b_edit campaign residency must be sequential".into());
+    }
+    Ok(Some((source_ref, residency)))
 }
 
 fn save(img: &Image, path: &PathBuf) -> Result<()> {
@@ -187,12 +202,18 @@ struct Common {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let dev_variant = matches!(arg(&args, "--variant").as_deref(), Some("dev"));
+    let campaign_contract = campaign_contract(&args)?;
+    if campaign_contract.is_some() && dev_variant {
+        return Err("SC-20686 campaign supports only flux2_klein_9b_edit".into());
+    }
     let cancel_campaign = args.iter().any(|arg| arg == "--sc20686-cancel");
-    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+    let _campaign_request = if let Some((source_ref, residency)) = &campaign_contract {
         let event_path = arg(&args, "--sc20686-events")
             .filter(|path| path != "-")
             .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
-        let request = candle_gen_flux2::sc20686_observer::request_output(event_path);
+        let request =
+            candle_gen_flux2::sc20686_observer::request_output(event_path, source_ref, residency)?;
         Some(if cancel_campaign {
             request.arm_cancellation()
         } else {
@@ -201,7 +222,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let dev_variant = matches!(arg(&args, "--variant").as_deref(), Some("dev"));
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("FLUX2_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set FLUX2_SNAPSHOT)")?;
@@ -475,10 +495,24 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         Some(image)
     };
 
-    let model = Flux2Edit::load(&Flux2EditPaths {
+    let paths = Flux2EditPaths {
         root: PathBuf::from(&c.snapshot),
         adapters: Vec::new(),
-    })?;
+    };
+    let model = if campaign {
+        let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&c.snapshot)))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        Flux2Edit::load_klein_with_memory_spec(
+            &paths,
+            &spec,
+            GenerationMemory {
+                stage_residency: true,
+                ..GenerationMemory::default()
+            },
+        )?
+    } else {
+        Flux2Edit::load(&paths)?
+    };
     let req = Flux2EditRequest {
         prompt: c.prompt.clone(),
         negative: String::new(),

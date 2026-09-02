@@ -22,8 +22,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress, ReplacementMode,
-    WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress,
+    ReplacementMode, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -32,6 +32,33 @@ fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+fn campaign_contract(
+    args: &[String],
+    route: &str,
+) -> Result<Option<(String, String, OffloadPolicy)>> {
+    if !args.iter().any(|arg| arg == "--sc20686-campaign") {
+        return Ok(None);
+    }
+    let source_ref = arg(args, "--sc20686-source-ref")
+        .ok_or("SC-20686 campaign requires --sc20686-source-ref <inference-commit>")?;
+    let residency = arg(args, "--sc20686-residency")
+        .ok_or("SC-20686 campaign requires --sc20686-residency <resident|sequential>")?;
+    let expected = match route {
+        "wan_vace" => "resident",
+        "wan2_2_vace_fun_14b" => "sequential",
+        other => return Err(format!("unsupported VACE smoke route: {other}").into()),
+    };
+    if residency != expected {
+        return Err(format!("{route} campaign residency must be {expected}").into());
+    }
+    let policy = if residency == "sequential" {
+        OffloadPolicy::Sequential
+    } else {
+        OffloadPolicy::Resident
+    };
+    Ok(Some((source_ref, residency, policy)))
 }
 
 fn load_image(path: &std::path::Path) -> Result<Image> {
@@ -143,11 +170,18 @@ fn main() -> Result<()> {
     let snapshot = arg(&args, "--snapshot")
         .or_else(|| std::env::var("VACE_SNAPSHOT").ok())
         .ok_or("pass --snapshot <dir> (or set VACE_SNAPSHOT)")?;
-    let _campaign_request = if args.iter().any(|arg| arg == "--sc20686-campaign") {
+    let route = arg(&args, "--sc20686-route").unwrap_or_else(|| "wan_vace".into());
+    let route = match route.as_str() {
+        "wan_vace" | "wan2_2_vace_fun_14b" => route,
+        other => return Err(format!("unsupported VACE smoke route: {other}").into()),
+    };
+    let campaign_contract = campaign_contract(&args, &route)?;
+    let _campaign_request = if let Some((source_ref, residency, _)) = &campaign_contract {
         let event_path = arg(&args, "--sc20686-events")
             .filter(|path| path != "-")
             .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
-        let request = candle_gen_wan::sc20686_observer::request_output(event_path);
+        let request =
+            candle_gen_wan::sc20686_observer::request_output(event_path, source_ref, residency)?;
         Some(if args.iter().any(|arg| arg == "--sc20686-cancel") {
             request.arm_cancellation()
         } else {
@@ -227,12 +261,12 @@ fn main() -> Result<()> {
          [smoke] prompt={prompt:?}"
     );
 
-    let route = arg(&args, "--sc20686-route").unwrap_or_else(|| "wan_vace".into());
-    let route = match route.as_str() {
-        "wan_vace" | "wan2_2_vace_fun_14b" => route,
-        other => return Err(format!("unsupported VACE smoke route: {other}").into()),
-    };
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let offload = campaign_contract
+        .as_ref()
+        .map(|(_, _, policy)| *policy)
+        .unwrap_or_default();
+    let spec =
+        LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_offload_policy(offload);
     let gen = candle_gen_wan::provider_registry()?.load(&route, &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",

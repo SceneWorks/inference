@@ -28,7 +28,8 @@ GEOMETRY = (
 )
 REQUIRED = (
     "producer", "family", "variant", "coordinate_name", "coordinate_id", "arm",
-    "source_ref", "route_manifest_sha256", "source_map_sha256",
+    "source_ref", "model_snapshot_revision", "residency_strategy",
+    "route_manifest_sha256", "source_map_sha256",
     "model_snapshot_sha256", "model_snapshot_bytes", "input_file_sha256",
     "evidence_artifact_sha256", "geometry", "lifecycle", "allocator_samples",
     "process_samples", "observer_events", "raw_receipt_sha256", "raw_receipt_sidecar_sha256",
@@ -38,6 +39,14 @@ REQUIRED = (
     "cache_read_duration_ms", "joint_attention_context_duration_ms",
     "reference_runtime_attribution_available", "reused_requests", "minimum_cache_reads",
 )
+PRODUCT_RESIDENCY = {
+    "flux2_klein_9b_edit": "sequential",
+    "wan2_2_ti2v_5b": "sequential",
+    "wan2_2_t2v_14b": "sequential",
+    "wan2_2_i2v_14b": "sequential",
+    "wan_vace": "resident",
+    "wan2_2_vace_fun_14b": "sequential",
+}
 
 
 def fail(message):
@@ -130,7 +139,7 @@ def read_checked_json(path, expected_schema):
 
 def checked_contracts():
     coverage, coverage_raw = read_checked_json(MANIFEST, "sc-20686-supported-coverage-v2")
-    source_map, source_map_raw = read_checked_json(SOURCE_MAP, "sc-20686-source-map-v1")
+    source_map, source_map_raw = read_checked_json(SOURCE_MAP, "sc-20686-source-map-v2")
     if source_map.get("compatibility_target") != {
         "story": "SC-20675",
         "format": "packed-group-affine-v2",
@@ -151,6 +160,7 @@ def checked_contracts():
         if (
             entry.get("route") != variant
             or entry.get("family") != expected[variant]
+            or entry.get("product_residency") != PRODUCT_RESIDENCY[variant]
             or entry.get("self_attention_excluded") is not True
         ):
             fail(f"source map route is malformed: {variant}")
@@ -227,7 +237,7 @@ def validate(row, expected_source_map_hash):
     missing = set(REQUIRED) - row.keys()
     if missing:
         fail(f"missing fields: {sorted(missing)}")
-    if row["producer"] != "sc20686-campaign-adapter-v2":
+    if row["producer"] != "sc20686-campaign-adapter-v3":
         fail("untrusted producer")
     if row["family"] not in FAMILIES or not isinstance(row["variant"], str):
         fail("invalid family/variant")
@@ -237,6 +247,9 @@ def validate(row, expected_source_map_hash):
     if row["arm"] not in ("normal", "cancel"):
         fail("invalid campaign arm")
     require_digest(row["source_ref"], "immutable source ref", 40)
+    require_digest(row["model_snapshot_revision"], "model snapshot revision", 40)
+    if row["residency_strategy"] != PRODUCT_RESIDENCY.get(row["variant"]):
+        fail("receipt residency strategy differs from the frozen product route")
     for field in (
         "route_manifest_sha256", "source_map_sha256", "model_snapshot_sha256",
         "raw_receipt_sha256", "raw_receipt_sidecar_sha256",
@@ -522,7 +535,8 @@ def reduce(rows):
             if not geometry_matches_expected(normal["geometry"], expected_geometry):
                 fail(f"observed geometry violates frozen coordinate: {variant}/{coordinate}")
             for field in (
-                "source_ref", "route_manifest_sha256", "source_map_sha256",
+                "source_ref", "model_snapshot_revision", "residency_strategy",
+                "route_manifest_sha256", "source_map_sha256",
                 "model_snapshot_sha256", "model_snapshot_bytes", "coordinate_id",
                 "input_file_sha256",
             ):
@@ -543,7 +557,7 @@ def reduce(rows):
             "self_attention_excluded": True,
         }
     return {
-        "schema": "sc-20686-cache-attribution-v3",
+        "schema": "sc-20686-cache-attribution-v4",
         "thresholds": THRESHOLDS,
         "coverage_manifest_sha256": coverage_hash,
         "source_map_sha256": source_map_hash,
@@ -573,7 +587,7 @@ def verify_campaign_bundle(bundle):
     if (bundle / "campaign.json.sha256").read_bytes() != expected_sidecar:
         fail("campaign aggregate sidecar mismatch")
     campaign = json.loads(campaign_raw.decode("utf-8"))
-    if campaign.get("schema") != "sc-20686-campaign-bundle-v3":
+    if campaign.get("schema") != "sc-20686-campaign-bundle-v4":
         fail("invalid campaign bundle schema")
     artifacts = campaign.get("artifact_sha256")
     validate_hash_map(artifacts, "campaign artifact identity")
@@ -598,10 +612,11 @@ def verify_campaign_bundle(bundle):
         resolved = json.loads(resolved_raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"campaign resolved inputs are malformed: {exc}")
-    if resolved.get("schema") != "sc-20686-resolved-inputs-v2" or not isinstance(
+    if resolved.get("schema") != "sc-20686-resolved-inputs-v3" or not isinstance(
         resolved.get("coordinates"), list
     ):
         fail("campaign resolved inputs schema is invalid")
+    require_digest(resolved.get("inference_revision"), "resolved inference revision", 40)
     resolved_by_key = {}
     for entry in resolved["coordinates"]:
         if not isinstance(entry, dict):
@@ -611,12 +626,14 @@ def verify_campaign_bundle(bundle):
             fail("campaign resolved inputs contain duplicate coordinates")
         for field in ("entrypoint_sha256", "snapshot_sha256", "route_manifest_sha256"):
             require_digest(entry.get(field), f"resolved {field}")
+        require_digest(entry.get("model_snapshot_revision"), "resolved model snapshot revision", 40)
         if (
             not isinstance(entry.get("entrypoint"), str)
             or not isinstance(entry.get("snapshot"), str)
             or not isinstance(entry.get("args"), list)
             or any(not isinstance(item, str) for item in entry["args"])
             or not isinstance(entry.get("input_files"), list)
+            or entry.get("residency_strategy") != PRODUCT_RESIDENCY.get(entry.get("variant"))
         ):
             fail("campaign resolved coordinate paths/arguments are malformed")
         manifest_document = {
@@ -625,6 +642,8 @@ def verify_campaign_bundle(bundle):
             "entrypoint": entry["entrypoint"],
             "entrypoint_sha256": entry["entrypoint_sha256"],
             "snapshot": entry["snapshot"],
+            "model_snapshot_revision": entry["model_snapshot_revision"],
+            "residency_strategy": entry["residency_strategy"],
             "args": entry["args"],
             "input_files": entry["input_files"],
         }
@@ -689,24 +708,34 @@ def verify_campaign_bundle(bundle):
         resolved_entry = resolved_by_key[
             (row["family"], row["variant"], row["coordinate_name"])
         ]
-        expected_argv = [
-            resolved_entry["entrypoint"], "--sc20686-campaign", "--sc20686-events",
+        expected_after_events = [
+            "--sc20686-source-ref", resolved["inference_revision"],
+            "--sc20686-residency", resolved_entry["residency_strategy"],
             "--snapshot", resolved_entry["snapshot"], "--variant", row["variant"],
             *resolved_entry["args"],
         ]
         if row["arm"] == "cancel":
-            expected_argv.append("--sc20686-cancel")
+            expected_after_events.append("--sc20686-cancel")
+        event_path = Path(argv[3]) if len(argv) > 3 else Path("")
+        output_path = Path(argv[-1]) if argv else Path("")
         if (
-            argv[:3] != expected_argv[:3]
-            or len(argv) < 4
-            or argv[3] == "-"
-            or not Path(argv[3]).is_absolute()
-            or Path(argv[3]).name != "events.jsonl"
-            or argv[4:] != expected_argv[3:]
+            argv[:3] != [resolved_entry["entrypoint"], "--sc20686-campaign", "--sc20686-events"]
+            or len(argv) < 7
+            or not event_path.is_absolute()
+            or event_path.name != "events.jsonl"
+            or argv[4:-2] != expected_after_events
+            or argv[-2] != "--out"
+            or not output_path.is_absolute()
+            or output_path.name != "media"
+            or output_path.parent != event_path.parent
+            or event_path.parent.name != "sealed-run"
         ):
             fail("campaign command conflicts with sealed resolved inputs")
         if (
             row["route_manifest_sha256"] != resolved_entry["route_manifest_sha256"]
+            or row["source_ref"] != resolved["inference_revision"]
+            or row["model_snapshot_revision"] != resolved_entry["model_snapshot_revision"]
+            or row["residency_strategy"] != resolved_entry["residency_strategy"]
             or row["model_snapshot_sha256"] != resolved_entry["snapshot_sha256"]
             or row["model_snapshot_bytes"] != resolved_entry["snapshot_bytes"]
         ):

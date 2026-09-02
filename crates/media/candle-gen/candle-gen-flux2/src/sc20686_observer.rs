@@ -106,6 +106,8 @@ pub struct CampaignGeometry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CampaignContext {
     source_ref: String,
+    model_snapshot_revision: String,
+    residency_strategy: String,
     snapshot_sha256: String,
     snapshot_bytes: u64,
     variant: String,
@@ -128,16 +130,39 @@ pub struct CampaignMetrics {
 }
 pub struct CampaignOutputRequest {
     path: PathBuf,
+    source_ref: String,
+    residency_strategy: String,
     cancellation: bool,
 }
-pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
-    CampaignOutputRequest {
-        path: path.into(),
-        cancellation: false,
+pub fn request_output(
+    path: impl Into<PathBuf>,
+    source_ref: impl Into<String>,
+    residency_strategy: impl Into<String>,
+) -> io::Result<CampaignOutputRequest> {
+    let source_ref = source_ref.into();
+    let residency_strategy = residency_strategy.into();
+    if !is_lowercase_sha(&source_ref) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inference source revision must be lowercase 40-hex",
+        ));
     }
+    if !matches!(residency_strategy.as_str(), "resident" | "sequential") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "residency strategy must be resident or sequential",
+        ));
+    }
+    Ok(CampaignOutputRequest {
+        path: path.into(),
+        source_ref,
+        residency_strategy,
+        cancellation: false,
+    })
 }
 
 thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = const { RefCell::new(None) }; }
+thread_local! { static PENDING_CONTRACT: RefCell<Option<(String, String)>> = const { RefCell::new(None) }; }
 thread_local! { static PENDING_CANCELLATION: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static ACTIVE: RefCell<Option<Box<dyn CacheObserver>>> = const { RefCell::new(None) }; }
 thread_local! { static CONTEXT: RefCell<Option<CampaignContext>> = const { RefCell::new(None) }; }
@@ -170,6 +195,9 @@ impl Measurements {
 impl CampaignOutputRequest {
     pub fn arm(self) -> Self {
         PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = Some(self.path.clone()));
+        PENDING_CONTRACT.with(|slot| {
+            *slot.borrow_mut() = Some((self.source_ref.clone(), self.residency_strategy.clone()))
+        });
         PENDING_CANCELLATION.with(|slot| *slot.borrow_mut() = self.cancellation);
         self
     }
@@ -183,6 +211,7 @@ impl Drop for CampaignOutputRequest {
         PENDING_OUTPUT.with(|slot| {
             if slot.borrow().as_ref() == Some(&self.path) {
                 *slot.borrow_mut() = None;
+                PENDING_CONTRACT.with(|contract| *contract.borrow_mut() = None);
                 PENDING_CANCELLATION.with(|cancel| *cancel.borrow_mut() = false);
             }
         });
@@ -248,30 +277,26 @@ fn is_lowercase_sha(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-fn source_revision(root: &Path) -> io::Result<String> {
-    let value = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| is_lowercase_sha(name))
-        .map(str::to_owned)
-        .or_else(|| {
-            std::fs::read_to_string(root.join(".snapshot-revision"))
-                .ok()
-                .map(|value| value.trim().to_owned())
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot has no immutable revision",
-            )
-        })?;
-    if !is_lowercase_sha(&value) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "snapshot revision must be lowercase 40-hex",
-        ));
+fn model_snapshot_revision(root: &Path) -> io::Result<String> {
+    for candidate_root in root.ancestors().take(3) {
+        if let Some(candidate) = candidate_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|value| is_lowercase_sha(value))
+        {
+            return Ok(candidate.to_owned());
+        }
+        if let Ok(candidate) = std::fs::read_to_string(candidate_root.join(".snapshot-revision")) {
+            let candidate = candidate.trim();
+            if is_lowercase_sha(candidate) {
+                return Ok(candidate.to_owned());
+            }
+        }
     }
-    Ok(value)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "snapshot root or parent has no lowercase 40-hex immutable model revision",
+    ))
 }
 
 /// Activates only after the real edit route starts. Metadata is delayed until live tensors bind it.
@@ -287,8 +312,15 @@ pub(crate) fn activate_requested(
     reference_count: u32,
 ) -> io::Result<Option<Scope>> {
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
+    let contract = PENDING_CONTRACT.with(|slot| slot.borrow_mut().take());
     let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
     let Some(path) = path else { return Ok(None) };
+    let (source_ref, residency_strategy) = contract.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "armed SC-20686 output is missing its source contract",
+        )
+    })?;
     if backend_peak_bytes().is_none() && !cfg!(test) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -297,7 +329,9 @@ pub(crate) fn activate_requested(
     }
     let (snapshot_sha256, snapshot_bytes) = snapshot_identity(root)?;
     let context = CampaignContext {
-        source_ref: source_revision(root)?,
+        source_ref,
+        model_snapshot_revision: model_snapshot_revision(root)?,
+        residency_strategy,
         snapshot_sha256,
         snapshot_bytes,
         variant: variant.into(),
@@ -390,6 +424,9 @@ impl CacheObserver for JsonlObserver {
         if let Some(context) = &event.context {
             if event.phase == "metadata" {
                 value["source_ref"] = serde_json::json!(context.source_ref);
+                value["model_snapshot_revision"] =
+                    serde_json::json!(context.model_snapshot_revision);
+                value["residency_strategy"] = serde_json::json!(context.residency_strategy);
                 value["snapshot_sha256"] = serde_json::json!(context.snapshot_sha256);
                 value["snapshot_bytes"] = serde_json::json!(context.snapshot_bytes);
                 value["variant"] = serde_json::json!(context.variant);
@@ -974,6 +1011,8 @@ mod tests {
         let out = std::rc::Rc::new(RefCell::new(Vec::new()));
         let context = CampaignContext {
             source_ref: "a".repeat(40),
+            model_snapshot_revision: "d".repeat(40),
+            residency_strategy: "sequential".into(),
             snapshot_sha256: "b".repeat(64),
             snapshot_bytes: 1,
             variant: PRODUCT_ROUTE_ID.into(),

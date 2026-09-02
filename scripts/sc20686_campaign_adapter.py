@@ -22,7 +22,8 @@ from pathlib import Path
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
 COVERAGE = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
-PRODUCER = "sc20686-campaign-adapter-v2"
+PRODUCER = "sc20686-campaign-adapter-v3"
+INFERENCE_ROOT = Path(__file__).resolve().parents[1]
 GEOMETRY = (
     "batch", "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
     "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope",
@@ -47,7 +48,16 @@ FILE_ARGUMENT_FLAGS = {
 }
 PROTECTED_FLAGS = {
     "--sc20686-campaign", "--sc20686-events", "--snapshot", "--variant",
-    "--sc20686-route", "--sc20686-cancel",
+    "--sc20686-route", "--sc20686-cancel", "--sc20686-source-ref",
+    "--sc20686-residency", "--out",
+}
+PRODUCT_RESIDENCY = {
+    "flux2_klein_9b_edit": "sequential",
+    "wan2_2_ti2v_5b": "sequential",
+    "wan2_2_t2v_14b": "sequential",
+    "wan2_2_i2v_14b": "sequential",
+    "wan_vace": "resident",
+    "wan2_2_vace_fun_14b": "sequential",
 }
 
 
@@ -68,6 +78,8 @@ class CoordinateSpec:
     name: str
     entrypoint: Path
     snapshot: Path
+    model_snapshot_revision: str
+    residency_strategy: str
     args: tuple
     route_manifest_sha256: str
     input_file_sha256: dict
@@ -108,6 +120,62 @@ def snapshot_identity(root):
         aggregate.update(str(path.relative_to(root)).encode("utf-8"))
         aggregate.update(b"\0" + struct.pack("<Q", size) + b"\0" + file_hash.digest() + b"\n")
     return aggregate.hexdigest(), total
+
+
+def require_revision(value, label):
+    value = str(value)
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError(f"{label} must be lowercase 40-hex")
+    return value
+
+
+def model_snapshot_revision(root):
+    """Resolve the HF revision without confusing a nested tier name with source provenance."""
+    root = Path(root).resolve()
+    for depth, candidate in enumerate((root, *root.parents)):
+        if depth > 2:
+            break
+        if re.fullmatch(r"[0-9a-f]{40}", candidate.name):
+            return candidate.name
+        marker = candidate / ".snapshot-revision"
+        if marker.is_file():
+            return require_revision(marker.read_text(encoding="utf-8").strip(), "model snapshot revision")
+    raise ValueError("model snapshot has no immutable revision within its tier/root closure")
+
+
+def verify_inference_revision(expected):
+    expected = require_revision(expected, "inference repository revision")
+    try:
+        actual = subprocess.check_output(
+            ["git", "-C", str(INFERENCE_ROOT), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("inference repository revision is unavailable") from exc
+    if actual != expected:
+        raise ValueError(
+            f"inference repository revision mismatch: requested {expected}, checkout {actual}"
+        )
+    return actual
+
+
+def validate_snapshot_layout(root, label):
+    """Accept an exact component/tier root or a real Diffusers pipeline root."""
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError(f"{label} snapshot directory is missing")
+    if (root / "config.json").is_file():
+        return
+    component_configs = sorted(
+        path for path in root.glob("*/config.json") if path.is_file()
+    )
+    if (root / "model_index.json").is_file() and component_configs:
+        return
+    raise ValueError(
+        f"{label} snapshot must be an exact component/tier root with config.json or a "
+        "Diffusers root with model_index.json plus component configs"
+    )
 
 
 def path_identity(path):
@@ -162,21 +230,30 @@ def normalize_file_arguments(arguments):
     return tuple(normalized)
 
 
-def route_manifest_document(route, coordinate, entrypoint, entrypoint_sha256, snapshot, arguments, inventory):
+def route_manifest_document(
+    route, coordinate, entrypoint, entrypoint_sha256, snapshot,
+    model_revision, residency_strategy, arguments, inventory,
+):
     return {
         "route": route,
         "coordinate": coordinate,
         "entrypoint": str(Path(entrypoint).resolve()),
         "entrypoint_sha256": entrypoint_sha256,
         "snapshot": str(Path(snapshot).resolve()),
+        "model_snapshot_revision": model_revision,
+        "residency_strategy": residency_strategy,
         "args": list(map(str, arguments)),
         "input_files": list(inventory),
     }
 
 
-def route_manifest_identity(route, coordinate, entrypoint, snapshot, arguments, inventory):
+def route_manifest_identity(
+    route, coordinate, entrypoint, snapshot, model_revision,
+    residency_strategy, arguments, inventory,
+):
     return digest(canonical(route_manifest_document(
-        route, coordinate, entrypoint, file_identity(entrypoint), snapshot, arguments, inventory,
+        route, coordinate, entrypoint, file_identity(entrypoint), snapshot,
+        model_revision, residency_strategy, arguments, inventory,
     )))
 
 
@@ -188,7 +265,8 @@ def verify_coordinate_inputs(spec):
                 f"route input changed after resolution: {spec.variant}/{spec.name}/{item['flag']}"
             )
     current_manifest = route_manifest_identity(
-        spec.variant, spec.name, spec.entrypoint, spec.snapshot, spec.args,
+        spec.variant, spec.name, spec.entrypoint, spec.snapshot,
+        spec.model_snapshot_revision, spec.residency_strategy, spec.args,
         spec.input_file_inventory,
     )
     if current_manifest != spec.route_manifest_sha256:
@@ -307,6 +385,7 @@ def load_wan_manifest(path):
             or entry.get("provider_id") != route
             or not isinstance(entry.get("entrypoint"), str)
             or not isinstance(entry.get("snapshot"), str)
+            or entry.get("residency_strategy") != PRODUCT_RESIDENCY[route]
             or not isinstance(entry.get("coordinates"), dict)
         ):
             raise ValueError(f"Wan manifest entry is malformed: {route}")
@@ -316,8 +395,9 @@ def load_wan_manifest(path):
             raise ValueError(f"Wan manifest entrypoint is not executable: {route}")
         if binary.stem != WAN_ENTRYPOINT_STEMS[route]:
             raise ValueError(f"Wan manifest entrypoint does not match registered route: {route}")
-        if not snapshot.is_dir() or not (snapshot / "config.json").is_file():
-            raise ValueError(f"Wan manifest snapshot is missing config.json: {route}")
+        validate_snapshot_layout(snapshot, f"Wan manifest {route}")
+        revision = model_snapshot_revision(snapshot)
+        residency_strategy = entry["residency_strategy"]
         expected_coordinates = set(coverage[route]["coordinates"])
         if set(entry["coordinates"]) != expected_coordinates:
             raise ValueError(f"Wan manifest coordinates do not match frozen coverage: {route}")
@@ -339,10 +419,13 @@ def load_wan_manifest(path):
                 route, name, arguments, coverage[route]["coordinates"][name]
             )
             file_hashes, inventory = hash_file_arguments(arguments)
-            identity = route_manifest_identity(route, name, binary, snapshot, arguments, inventory)
+            identity = route_manifest_identity(
+                route, name, binary, snapshot, revision, residency_strategy,
+                arguments, inventory,
+            )
             route_specs[name] = CoordinateSpec(
-                "wan", route, name, binary, snapshot, arguments, identity,
-                file_hashes, inventory,
+                "wan", route, name, binary, snapshot, revision,
+                residency_strategy, arguments, identity, file_hashes, inventory,
             )
         result[route] = route_specs
     return result
@@ -355,8 +438,9 @@ def flux_coordinates(entrypoint, snapshot, reference, reference2):
     reference2 = Path(reference2).resolve()
     if not entrypoint.is_file() or not os.access(entrypoint, os.X_OK):
         raise ValueError("FLUX campaign entrypoint is not executable")
-    if not snapshot.is_dir() or not (snapshot / "config.json").is_file():
-        raise ValueError("FLUX campaign snapshot is missing config.json")
+    validate_snapshot_layout(snapshot, "FLUX campaign")
+    revision = model_snapshot_revision(snapshot)
+    residency_strategy = PRODUCT_RESIDENCY[FLUX_ROUTES[0]]
     definitions = {
         "edit-512-ref1-cfg1": (
             "--reference", str(reference), "--single-only", "--width", "512",
@@ -391,8 +475,12 @@ def flux_coordinates(entrypoint, snapshot, reference, reference2):
             raise ValueError(f"FLUX coordinate differs from frozen coverage: {name}")
         file_hashes, inventory = hash_file_arguments(arguments)
         result.append(CoordinateSpec(
-            "flux2-klein", FLUX_ROUTES[0], name, entrypoint, snapshot, arguments,
-            route_manifest_identity(FLUX_ROUTES[0], name, entrypoint, snapshot, arguments, inventory),
+            "flux2-klein", FLUX_ROUTES[0], name, entrypoint, snapshot, revision,
+            residency_strategy, arguments,
+            route_manifest_identity(
+                FLUX_ROUTES[0], name, entrypoint, snapshot, revision,
+                residency_strategy, arguments, inventory,
+            ),
             file_hashes, inventory,
         ))
     return result
@@ -495,19 +583,30 @@ def parse_event_transcript(payload, variant, arm):
     return events
 
 
-def run_entrypoint(entrypoint, snapshot, variant, arm, extra_args=(), timeout_seconds=21600):
+def run_entrypoint(
+    entrypoint, snapshot, variant, arm, inference_revision, residency_strategy,
+    extra_args=(), timeout_seconds=21600,
+):
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
     with tempfile.TemporaryDirectory(prefix="sc20686-events-") as directory:
-        event_path = Path(directory) / "events.jsonl"
+        run_directory = Path(directory) / "sealed-run"
+        run_directory.mkdir()
+        event_path = run_directory / "events.jsonl"
+        media_output = run_directory / "media"
         command = [
             str(Path(entrypoint).resolve()), "--sc20686-campaign", "--sc20686-events",
-            str(event_path), "--snapshot", str(Path(snapshot).resolve()), "--variant", variant,
+            str(event_path), "--sc20686-source-ref", inference_revision,
+            "--sc20686-residency", residency_strategy,
+            "--snapshot", str(Path(snapshot).resolve()), "--variant", variant,
             *map(str, extra_args),
         ]
         if arm == "cancel":
             command.append("--sc20686-cancel")
-        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command.extend(("--out", str(media_output)))
+        child = subprocess.Popen(
+            command, cwd=run_directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
         stdout_chunks, stderr_chunks = [], []
         stdout_thread = threading.Thread(target=_drain, args=(child.stdout, stdout_chunks), daemon=True)
         stderr_thread = threading.Thread(target=_drain, args=(child.stderr, stderr_chunks), daemon=True)
@@ -568,8 +667,16 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     metadata, metrics = metadata_events[0], metrics_events[0]
     if metadata.get("snapshot_sha256") != snapshot_hash or metadata.get("snapshot_bytes") != snapshot_bytes:
         raise ValueError("entrypoint model identity does not match the hashed snapshot")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(metadata.get("source_ref", ""))):
-        raise ValueError("entrypoint must emit an immutable lowercase source ref")
+    if metadata.get("source_ref") != config.get("inference_revision"):
+        raise ValueError("entrypoint inference revision differs from the sealed repository revision")
+    if metadata.get("model_snapshot_revision") != config.get("model_snapshot_revision"):
+        raise ValueError("entrypoint model revision differs from the sealed snapshot revision")
+    if metadata.get("residency_strategy") != config.get("residency_strategy"):
+        raise ValueError("entrypoint residency differs from the sealed product strategy")
+    require_revision(metadata["source_ref"], "entrypoint inference revision")
+    require_revision(metadata["model_snapshot_revision"], "entrypoint model snapshot revision")
+    if metadata["residency_strategy"] != PRODUCT_RESIDENCY.get(args.variant):
+        raise ValueError("entrypoint residency does not match the frozen product route")
     if metadata.get("variant") != args.variant:
         raise ValueError("producer variant does not match the exact product route")
     for field in ("route_manifest_sha256", "source_map_sha256"):
@@ -784,6 +891,8 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         "coordinate_id": coordinate_id,
         "arm": "cancel" if args.cancel_campaign else "normal",
         "source_ref": metadata["source_ref"],
+        "model_snapshot_revision": metadata["model_snapshot_revision"],
+        "residency_strategy": metadata["residency_strategy"],
         "route_manifest_sha256": config["route_manifest_sha256"],
         "source_map_sha256": config["source_map_sha256"],
         "model_snapshot_sha256": snapshot_hash,
@@ -910,7 +1019,7 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                 raise ValueError("campaign input artifact is malformed")
         artifact_hashes = {name: digest(payload) for name, payload in artifact_payloads.items()}
         campaign = {
-            "schema": "sc-20686-campaign-bundle-v3",
+            "schema": "sc-20686-campaign-bundle-v4",
             "decision": decision,
             "artifact_sha256": artifact_hashes,
             "route_input_file_sha256": {
@@ -955,6 +1064,7 @@ def main():
     parser.add_argument("--flux-reference2", type=Path)
     parser.add_argument("--matrix-output", type=Path)
     parser.add_argument("--entrypoint", type=Path)
+    parser.add_argument("--inference-revision")
     parser.add_argument("--cancel-campaign", action="store_true")
     parser.add_argument("--fake", action="store_true")
     parser.add_argument("--run-timeout-seconds", type=float, default=21600)
@@ -964,6 +1074,7 @@ def main():
     if args.fake:
         parser.error("synthetic evidence cannot enter the campaign adapter")
     try:
+        inference_revision = verify_inference_revision(args.inference_revision)
         source_map_hash = digest(SOURCE_MAP.read_bytes())
         if args.matrix:
             if not all((args.wan_manifest, args.flux_entrypoint, args.flux_snapshot, args.flux_reference, args.flux_reference2, args.matrix_output)):
@@ -976,13 +1087,17 @@ def main():
                 for snapshot in sorted({spec.snapshot for spec in coordinates})
             }
             resolved = {
-                "schema": "sc-20686-resolved-inputs-v2",
+                "schema": "sc-20686-resolved-inputs-v3",
+                "inference_revision": inference_revision,
                 "coordinates": [
                     {
                         "family": spec.family, "variant": spec.variant, "name": spec.name,
                         "entrypoint": str(spec.entrypoint), "entrypoint_sha256": file_identity(spec.entrypoint),
                         "snapshot": str(spec.snapshot), "snapshot_sha256": snapshot_identities[str(spec.snapshot)][0],
-                        "snapshot_bytes": snapshot_identities[str(spec.snapshot)][1], "args": list(spec.args),
+                        "snapshot_bytes": snapshot_identities[str(spec.snapshot)][1],
+                        "model_snapshot_revision": spec.model_snapshot_revision,
+                        "residency_strategy": spec.residency_strategy,
+                        "args": list(spec.args),
                         "route_manifest_sha256": spec.route_manifest_sha256,
                         "input_files": list(spec.input_file_inventory),
                     }
@@ -992,11 +1107,17 @@ def main():
 
             def runner(spec, arm):
                 expected_snapshot = snapshot_identities[str(spec.snapshot)]
+                verify_inference_revision(inference_revision)
                 verify_coordinate_inputs(spec)
                 verify_snapshot_identity(spec, expected_snapshot)
-                run = run_entrypoint(spec.entrypoint, spec.snapshot, spec.variant, arm, spec.args, args.run_timeout_seconds)
+                run = run_entrypoint(
+                    spec.entrypoint, spec.snapshot, spec.variant, arm,
+                    inference_revision, spec.residency_strategy, spec.args,
+                    args.run_timeout_seconds,
+                )
                 verify_coordinate_inputs(spec)
                 verify_snapshot_identity(spec, expected_snapshot)
+                verify_inference_revision(inference_revision)
                 return run
 
             def build_row(spec, arm, events, evidence_hashes):
@@ -1008,6 +1129,9 @@ def main():
                 return make_row(row_args, {
                     "route_manifest_sha256": spec.route_manifest_sha256,
                     "source_map_sha256": source_map_hash,
+                    "inference_revision": inference_revision,
+                    "model_snapshot_revision": spec.model_snapshot_revision,
+                    "residency_strategy": spec.residency_strategy,
                     "input_file_sha256": spec.input_file_sha256,
                     "evidence_artifact_sha256": evidence_hashes,
                 }, snapshot_hash, snapshot_bytes, events)
@@ -1026,20 +1150,34 @@ def main():
                 parser.error("single FLUX campaign requires --flux-reference")
             route_args = ("--reference", str(args.flux_reference.resolve()), "--single-only")
         file_hashes, inventory = hash_file_arguments(route_args)
+        if args.variant not in PRODUCT_RESIDENCY:
+            parser.error("single mode variant is not a frozen product route")
+        validate_snapshot_layout(args.snapshot, "single campaign")
+        revision = model_snapshot_revision(args.snapshot)
+        residency_strategy = PRODUCT_RESIDENCY[args.variant]
         spec = CoordinateSpec(
             args.family, args.variant, args.coordinate_name, args.entrypoint.resolve(),
-            args.snapshot.resolve(), route_args,
-            route_manifest_identity(args.variant, args.coordinate_name, args.entrypoint, args.snapshot, route_args, inventory),
+            args.snapshot.resolve(), revision, residency_strategy, route_args,
+            route_manifest_identity(
+                args.variant, args.coordinate_name, args.entrypoint, args.snapshot,
+                revision, residency_strategy, route_args, inventory,
+            ),
             file_hashes, inventory,
         )
         snapshot_hash, snapshot_bytes = snapshot_identity(spec.snapshot)
 
         def runner(single_spec, arm):
+            verify_inference_revision(inference_revision)
             verify_coordinate_inputs(single_spec)
             verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
-            run = run_entrypoint(single_spec.entrypoint, single_spec.snapshot, single_spec.variant, arm, single_spec.args, args.run_timeout_seconds)
+            run = run_entrypoint(
+                single_spec.entrypoint, single_spec.snapshot, single_spec.variant, arm,
+                inference_revision, single_spec.residency_strategy, single_spec.args,
+                args.run_timeout_seconds,
+            )
             verify_coordinate_inputs(single_spec)
             verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
+            verify_inference_revision(inference_revision)
             return run
 
         def build_row(single_spec, arm, events, evidence_hashes):
@@ -1050,19 +1188,26 @@ def main():
             return make_row(row_args, {
                 "route_manifest_sha256": single_spec.route_manifest_sha256,
                 "source_map_sha256": source_map_hash,
+                "inference_revision": inference_revision,
+                "model_snapshot_revision": single_spec.model_snapshot_revision,
+                "residency_strategy": single_spec.residency_strategy,
                 "input_file_sha256": single_spec.input_file_sha256,
                 "evidence_artifact_sha256": evidence_hashes,
             }, snapshot_hash, snapshot_bytes, events)
 
         # A single invocation still captures both lifecycle arms into one atomic, sealed bundle.
         resolved = {
-            "schema": "sc-20686-resolved-inputs-v2",
+            "schema": "sc-20686-resolved-inputs-v3",
+            "inference_revision": inference_revision,
             "coordinates": [{
                 "family": spec.family, "variant": spec.variant, "name": spec.name,
                 "entrypoint": str(spec.entrypoint),
                 "entrypoint_sha256": file_identity(spec.entrypoint),
                 "snapshot": str(spec.snapshot), "snapshot_sha256": snapshot_hash,
-                "snapshot_bytes": snapshot_bytes, "args": list(spec.args),
+                "snapshot_bytes": snapshot_bytes,
+                "model_snapshot_revision": spec.model_snapshot_revision,
+                "residency_strategy": spec.residency_strategy,
+                "args": list(spec.args),
                 "route_manifest_sha256": spec.route_manifest_sha256,
                 "input_files": list(spec.input_file_inventory),
             }],

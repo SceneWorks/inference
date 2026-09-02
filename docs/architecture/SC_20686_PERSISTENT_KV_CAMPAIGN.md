@@ -6,6 +6,44 @@ path to the product entrypoint with `--sc20686-events`, and seals the exact even
 separate bundle artifact. Provider stdout and stderr are retained only as diagnostics: progress
 output, including carriage-return updates, is never parsed as campaign evidence.
 
+Every child process runs inside its own adapter-owned `sealed-run` directory. The adapter passes an
+absolute `--out` below that directory, so images and video frames cannot escape the run closure via
+an entrypoint default. The event transcript and media output therefore share one isolated parent;
+the reducer rejects a command receipt that does not preserve that relationship.
+
+## Sealed provenance and snapshot layouts
+
+Invoke the adapter with `--inference-revision <40-hex-commit>` from the exact inference checkout
+being measured. The adapter verifies that value against `git rev-parse HEAD`, passes it separately
+as `--sc20686-source-ref`, and requires observer metadata to reproduce it. This repository revision
+is never inferred from a model path.
+
+Model identity has two independent fields: `model_snapshot_revision` is the immutable Hugging Face
+revision, while `model_snapshot_sha256` hashes only the selected model/tier root. A selected root may
+be either a component/tier directory with `config.json`, or a Diffusers pipeline root with
+`model_index.json` and at least one component `config.json`. Nested tier roots such as
+`<snapshot-revision>/q4` resolve the revision from the nearest two ancestors while hashing only the
+`q4` contents. This preserves exact tier identity without confusing `q4` with a revision or widening
+the hash to unrelated siblings.
+
+## Product-equivalent residency
+
+Residency is a sealed route axis, is passed to the entrypoint as `--sc20686-residency`, and is
+applied to the real `LoadSpec` (plus request-scoped generation staging for FLUX.2 edit). The frozen
+SceneWorks-equivalent strategies are:
+
+| Product route | Strategy |
+| --- | --- |
+| `flux2_klein_9b_edit` | `sequential` |
+| `wan2_2_ti2v_5b` | `sequential` |
+| `wan2_2_t2v_14b` | `sequential` |
+| `wan2_2_i2v_14b` | `sequential` |
+| `wan_vace` | `resident` |
+| `wan2_2_vace_fun_14b` | `sequential` |
+
+The adapter, entrypoints, observer metadata, resolved-input manifest, row receipts, and reducer all
+reject a different strategy rather than measuring a non-product residency shape.
+
 The Wan entrypoints are wired to the product-owned observer after each real route has bound its
 snapshot-backed geometry. With observation off, the ownership hooks remain inactive and do not
 allocate campaign evidence or retain cache ids. The adapter rejects a missing, non-JSONL, or

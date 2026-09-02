@@ -72,9 +72,11 @@ class AttributionTests(unittest.TestCase):
             observer_events.append({"phase": "cross-kv-released", **measured})
         observer_events.append(release_event)
         row = {
-            "producer": "sc20686-campaign-adapter-v2", "family": family,
+            "producer": "sc20686-campaign-adapter-v3", "family": family,
             "variant": variant, "coordinate_name": coordinate,
             "coordinate_id": coordinate_id, "arm": arm, "source_ref": "d" * 40,
+            "model_snapshot_revision": "a" * 40,
+            "residency_strategy": self.reducer.PRODUCT_RESIDENCY[variant],
             "route_manifest_sha256": "e" * 64,
             "source_map_sha256": self.source_map_hash,
             "model_snapshot_sha256": "a" * 64, "model_snapshot_bytes": 1_000_000_000,
@@ -374,8 +376,21 @@ class AttributionTests(unittest.TestCase):
         for relative in paths:
             source = (root / relative).read_text(encoding="utf-8")
             self.assertIn('arg(&args, "--sc20686-events")', source, relative)
+            self.assertIn('arg(args, "--sc20686-source-ref")', source, relative)
+            self.assertIn('arg(args, "--sc20686-residency")', source, relative)
             self.assertIn('.filter(|path| path != "-")', source, relative)
             self.assertIn("dedicated --sc20686-events <file>", source, relative)
+            self.assertIn("with_offload_policy", source, relative)
+        flux = (root / paths[0]).read_text(encoding="utf-8")
+        self.assertIn("load_klein_with_memory_spec", flux)
+        self.assertIn("stage_residency: true", flux)
+        for relative in (
+            "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
+            "crates/media/candle-gen/candle-gen-wan/src/sc20686_observer.rs",
+        ):
+            observer = (root / relative).read_text(encoding="utf-8")
+            self.assertIn('value["model_snapshot_revision"]', observer, relative)
+            self.assertIn('value["residency_strategy"]', observer, relative)
 
     def test_campaign_transport_doc_describes_wired_wan_and_flux_no_go_boundary(self):
         root = SCRIPT.parents[1]
@@ -386,6 +401,9 @@ class AttributionTests(unittest.TestCase):
         self.assertIn("product-owned observer", document)
         self.assertIn("no persistent reference K/V boundary", document)
         self.assertIn("no-go", document)
+        self.assertIn("--inference-revision", document)
+        self.assertIn("<snapshot-revision>/q4", document)
+        self.assertIn("Product-equivalent residency", document)
 
     def test_flux_source_map_anchors_live_double_attention_kv(self):
         source_map = json.loads(self.reducer.SOURCE_MAP.read_text(encoding="utf-8"))

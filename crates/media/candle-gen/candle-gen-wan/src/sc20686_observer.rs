@@ -126,8 +126,9 @@ pub fn checked_packed_group_affine_kv_bytes(
         .checked_add(value_codes)?
         .checked_add(value_metadata)
 }
-/// Product-owned identity captured after Wan model loading; campaign callers must not populate
-/// evidence fields from CLI claims.
+/// Product-owned identity captured after Wan model loading. The adapter supplies the independently
+/// verified inference revision and frozen product residency; model content and geometry are derived
+/// by the runtime rather than accepted as CLI evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CampaignGeometry {
     pub(crate) batch: u32,
@@ -153,6 +154,8 @@ pub struct CampaignGeometry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CampaignContext {
     source_ref: String,
+    model_snapshot_revision: String,
+    residency_strategy: String,
     snapshot_sha256: String,
     snapshot_bytes: u64,
     variant: String,
@@ -164,6 +167,8 @@ pub struct CampaignContext {
 
 pub struct CampaignOutputRequest {
     path: PathBuf,
+    source_ref: String,
+    residency_strategy: String,
     cancellation: bool,
 }
 /// Whether the most recent armed campaign was cancelled by the product after its first live read.
@@ -172,20 +177,44 @@ pub fn campaign_cancelled() -> bool {
     LAST_CAMPAIGN_CANCELLATION.with(Cell::get)
 }
 
-pub fn request_output(path: impl Into<PathBuf>) -> CampaignOutputRequest {
-    CampaignOutputRequest {
-        path: path.into(),
-        cancellation: false,
+pub fn request_output(
+    path: impl Into<PathBuf>,
+    source_ref: impl Into<String>,
+    residency_strategy: impl Into<String>,
+) -> io::Result<CampaignOutputRequest> {
+    let source_ref = source_ref.into();
+    let residency_strategy = residency_strategy.into();
+    if !is_lowercase_revision(&source_ref) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inference source revision must be lowercase 40-hex",
+        ));
     }
+    if !matches!(residency_strategy.as_str(), "resident" | "sequential") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "residency strategy must be resident or sequential",
+        ));
+    }
+    Ok(CampaignOutputRequest {
+        path: path.into(),
+        source_ref,
+        residency_strategy,
+        cancellation: false,
+    })
 }
 
 thread_local! { static PENDING_OUTPUT: RefCell<Option<PathBuf>> = const { RefCell::new(None) }; }
+thread_local! { static PENDING_CONTRACT: RefCell<Option<(String, String)>> = const { RefCell::new(None) }; }
 thread_local! { static PENDING_CANCELLATION: RefCell<bool> = const { RefCell::new(false) }; }
 thread_local! { static LAST_CAMPAIGN_CANCELLATION: Cell<bool> = const { Cell::new(false) }; }
 
 impl CampaignOutputRequest {
     pub fn arm(self) -> Self {
         PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = Some(self.path.clone()));
+        PENDING_CONTRACT.with(|slot| {
+            *slot.borrow_mut() = Some((self.source_ref.clone(), self.residency_strategy.clone()))
+        });
         PENDING_CANCELLATION.with(|slot| *slot.borrow_mut() = self.cancellation);
         self
     }
@@ -203,6 +232,7 @@ impl Drop for CampaignOutputRequest {
         PENDING_OUTPUT.with(|slot| {
             if slot.borrow().as_ref() == Some(&self.path) {
                 *slot.borrow_mut() = None;
+                PENDING_CONTRACT.with(|contract| *contract.borrow_mut() = None);
                 PENDING_CANCELLATION.with(|cancel| *cancel.borrow_mut() = false);
             }
         });
@@ -264,41 +294,36 @@ fn snapshot_identity(root: &Path) -> io::Result<(String, u64)> {
     Ok((format!("{:x}", aggregate.finalize()), total))
 }
 
-/// The model snapshot digest is not a source revision.  Resolve the immutable revision from the
-/// standard HF snapshot directory name or an explicit marker; never substitute a path/label.
-fn source_revision(root: &Path) -> io::Result<String> {
-    let candidate = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| {
-            name.len() == 40
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        })
-        .map(str::to_owned)
-        .or_else(|| {
-            std::fs::read_to_string(root.join(".snapshot-revision"))
-                .ok()
-                .map(|value| value.trim().to_owned())
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot has no immutable revision",
-            )
-        })?;
-    if candidate.len() != 40
-        || !candidate
+fn is_lowercase_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
             .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "snapshot revision must be lowercase 40-hex",
-        ));
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Resolve the immutable model revision independently from the inference repository revision.
+/// Quantized tiers may be rooted at `<snapshot-revision>/q4`, so inspect the selected root and its
+/// two nearest ancestors without widening the snapshot content identity beyond `root`.
+fn model_snapshot_revision(root: &Path) -> io::Result<String> {
+    for candidate_root in root.ancestors().take(3) {
+        if let Some(candidate) = candidate_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|value| is_lowercase_revision(value))
+        {
+            return Ok(candidate.to_owned());
+        }
+        if let Ok(candidate) = std::fs::read_to_string(candidate_root.join(".snapshot-revision")) {
+            let candidate = candidate.trim();
+            if is_lowercase_revision(candidate) {
+                return Ok(candidate.to_owned());
+            }
+        }
     }
-    Ok(candidate)
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "snapshot root or parent has no lowercase 40-hex immutable model revision",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,8 +343,15 @@ pub(crate) fn activate_requested(
     reference_count: u32,
 ) -> io::Result<Option<Scope>> {
     let path = PENDING_OUTPUT.with(|slot| slot.borrow_mut().take());
+    let contract = PENDING_CONTRACT.with(|slot| slot.borrow_mut().take());
     let cancellation = PENDING_CANCELLATION.with(|slot| *slot.borrow());
     let Some(path) = path else { return Ok(None) };
+    let (source_ref, residency_strategy) = contract.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "armed SC-20686 output is missing its source contract",
+        )
+    })?;
     if !cfg!(test) && backend_peak_bytes().is_none() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -328,7 +360,9 @@ pub(crate) fn activate_requested(
     }
     let (digest, bytes) = snapshot_identity(root)?;
     let context = CampaignContext::from_runtime(
-        source_revision(root)?,
+        source_ref,
+        model_snapshot_revision(root)?,
+        residency_strategy,
         digest,
         bytes,
         variant.into(),
@@ -371,19 +405,20 @@ pub(crate) fn activate_requested(
 }
 
 impl CampaignContext {
-    /// Runtime-only constructor. Public callers can request observation, but cannot provide the
-    /// identity, geometry, or snapshot facts that become receipt evidence.
+    /// Runtime-only constructor. Public callers can request observation with the verified source
+    /// contract, but cannot provide geometry or snapshot-content facts that become receipt evidence.
     pub(crate) fn from_runtime(
         source_ref: String,
+        model_snapshot_revision: String,
+        residency_strategy: String,
         snapshot_sha256: String,
         snapshot_bytes: u64,
         variant: String,
         geometry: CampaignGeometry,
     ) -> Result<Self, String> {
-        if source_ref.len() != 40
-            || !source_ref
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        if !is_lowercase_revision(&source_ref)
+            || !is_lowercase_revision(&model_snapshot_revision)
+            || !matches!(residency_strategy.as_str(), "resident" | "sequential")
             || variant.trim().is_empty()
             || snapshot_bytes == 0
             || snapshot_sha256.len() != 64
@@ -402,6 +437,8 @@ impl CampaignContext {
         }
         Ok(Self {
             source_ref,
+            model_snapshot_revision,
+            residency_strategy,
             snapshot_sha256,
             snapshot_bytes,
             variant,
@@ -431,6 +468,8 @@ impl CacheObserver for JsonlObserver {
         if let Some(ctx) = &event.context {
             if event.phase == "metadata" {
                 value["source_ref"] = serde_json::json!(ctx.source_ref);
+                value["model_snapshot_revision"] = serde_json::json!(ctx.model_snapshot_revision);
+                value["residency_strategy"] = serde_json::json!(ctx.residency_strategy);
                 value["snapshot_sha256"] = serde_json::json!(ctx.snapshot_sha256);
                 value["snapshot_bytes"] = serde_json::json!(ctx.snapshot_bytes);
                 value["variant"] = serde_json::json!(ctx.variant);
@@ -1321,6 +1360,8 @@ mod tests {
         let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let context = CampaignContext::from_runtime(
             "b".repeat(40),
+            "c".repeat(40),
+            "sequential".into(),
             "a".repeat(64),
             4096,
             "t2v".into(),
@@ -1388,6 +1429,8 @@ mod tests {
         };
         assert!(CampaignContext::from_runtime(
             "snapshot".into(),
+            "b".repeat(40),
+            "sequential".into(),
             "A".repeat(64),
             4096,
             "t2v".into(),
@@ -1395,7 +1438,9 @@ mod tests {
         )
         .is_err());
         assert!(CampaignContext::from_runtime(
-            "snapshot".into(),
+            "b".repeat(40),
+            "c".repeat(40),
+            "sequential".into(),
             "a".repeat(64),
             0,
             "t2v".into(),
@@ -1610,11 +1655,15 @@ mod tests {
     #[test]
     fn requested_output_derives_identity_from_snapshot_bytes() {
         let root = tempfile::tempdir().unwrap();
-        let snapshot = root.path().join("0123456789abcdef0123456789abcdef01234567");
+        let model_revision = "0123456789abcdef0123456789abcdef01234567";
+        let snapshot = root.path().join(model_revision).join("q4");
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join("config.json"), b"{\"layers\":1}").unwrap();
         let output = root.path().join("events.jsonl");
-        let _request = request_output(&output).arm();
+        let source_ref = "fedcba9876543210fedcba9876543210fedcba98";
+        let _request = request_output(&output, source_ref, "sequential")
+            .unwrap()
+            .arm();
         let scope = activate_requested(
             &snapshot,
             &CancelFlag::default(),
@@ -1638,6 +1687,9 @@ mod tests {
         drop(scope);
         let lines = std::fs::read_to_string(output).unwrap();
         assert!(lines.contains("wan2_2_t2v_14b"));
+        assert!(lines.contains(&format!("\"source_ref\":\"{source_ref}\"")));
+        assert!(lines.contains(&format!("\"model_snapshot_revision\":\"{model_revision}\"")));
+        assert!(lines.contains("\"residency_strategy\":\"sequential\""));
         assert_eq!(
             lines
                 .lines()

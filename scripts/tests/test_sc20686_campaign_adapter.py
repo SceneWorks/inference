@@ -34,6 +34,8 @@ class CampaignAdapterTests(unittest.TestCase):
         }
         metadata = {
             "phase": "metadata", "source_ref": "a" * 40, "snapshot_sha256": "b" * 64,
+            "model_snapshot_revision": "b" * 40,
+            "residency_strategy": self.adapter.PRODUCT_RESIDENCY.get(variant, "sequential"),
             "snapshot_bytes": 1, "variant": variant, "geometry": geometry,
             "real_weights": True, "full_generation": not cancel, "attention_kind": "cross",
             "cancellation_armed": cancel,
@@ -89,6 +91,9 @@ class CampaignAdapterTests(unittest.TestCase):
 
     def config(self):
         return {
+            "inference_revision": "a" * 40,
+            "model_snapshot_revision": "b" * 40,
+            "residency_strategy": "sequential",
             "route_manifest_sha256": "c" * 64,
             "source_map_sha256": self.source_map_hash,
             "input_file_sha256": {"reference-0": "d" * 64},
@@ -111,6 +116,31 @@ class CampaignAdapterTests(unittest.TestCase):
                 self.row_args(), self.config(), "b" * 64, 1,
                 self.flux_events(variant="flux2_klein_9b"),
             )
+
+    def test_row_binds_repository_model_and_residency_as_separate_axes(self):
+        mutations = (
+            ("source_ref", "c" * 40, "inference revision"),
+            ("model_snapshot_revision", "c" * 40, "model revision"),
+            ("residency_strategy", "resident", "residency"),
+        )
+        for field, value, expected in mutations:
+            with self.subTest(field=field):
+                events = self.flux_events()
+                events[0][field] = value
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.adapter.make_row(
+                        self.row_args(), self.config(), "b" * 64, 1, events
+                    )
+
+    def test_inference_revision_must_match_the_exact_checkout(self):
+        actual = self.adapter.subprocess.check_output(
+            ["git", "-C", str(self.adapter.INFERENCE_ROOT), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        self.assertEqual(self.adapter.verify_inference_revision(actual), actual)
+        wrong = "0" * 40 if actual != "0" * 40 else "1" * 40
+        with self.assertRaisesRegex(ValueError, "revision mismatch"):
+            self.adapter.verify_inference_revision(wrong)
 
     def test_active_high_water_and_post_release_remnant_are_required(self):
         broken_read = self.flux_events()
@@ -169,13 +199,14 @@ class CampaignAdapterTests(unittest.TestCase):
             executable = root / "producer"
             executable.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json,sys,time\n"
+                "import json,os,sys,time\n"
                 "event_path = sys.argv[sys.argv.index('--sc20686-events') + 1]\n"
                 "with open(event_path, 'w', encoding='utf-8') as events:\n"
                 "    for i in range(10000):\n"
                 "        events.write(json.dumps({'phase':'noise','payload':'x'*256}) + '\\n')\n"
                 "print('\\rprovider progress 100%', end='', flush=True)\n"
                 "print('diagnostic'*10000, flush=True)\n"
+                "print(os.getcwd(), flush=True)\n"
                 "time.sleep(.2)\n",
                 encoding="utf-8",
             )
@@ -184,13 +215,25 @@ class CampaignAdapterTests(unittest.TestCase):
             snapshot.mkdir()
             (snapshot / "config.json").write_text("{}", encoding="utf-8")
             run = self.adapter.run_entrypoint(
-                executable, snapshot, "route", "normal", timeout_seconds=5
+                executable, snapshot, "route", "normal", "a" * 40, "sequential",
+                timeout_seconds=5,
             )
             self.assertEqual(len(run.events) - len(run.process_samples), 10000)
             self.assertGreater(len(run.stdout), 64 * 1024)
             self.assertIn(b"\rprovider progress", run.stdout)
             self.assertNotIn(b"\r", run.event_transcript)
             self.assertTrue(run.process_samples)
+            event_path = Path(run.command[run.command.index("--sc20686-events") + 1])
+            output_path = Path(run.command[run.command.index("--out") + 1])
+            self.assertEqual(event_path.parent, output_path.parent)
+            self.assertEqual(event_path.parent.name, "sealed-run")
+            self.assertIn(str(event_path.parent).encode(), run.stdout)
+            self.assertEqual(
+                run.command[run.command.index("--sc20686-source-ref") + 1], "a" * 40
+            )
+            self.assertEqual(
+                run.command[run.command.index("--sc20686-residency") + 1], "sequential"
+            )
 
     def test_streaming_runner_fails_closed_on_missing_or_malformed_event_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -210,7 +253,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 executable.chmod(0o755)
                 with self.assertRaisesRegex(ValueError, expected):
                     self.adapter.run_entrypoint(
-                        executable, snapshot, "route", "normal", timeout_seconds=5
+                        executable, snapshot, "route", "normal", "a" * 40,
+                        "sequential", timeout_seconds=5,
                     )
 
     def test_streaming_runner_enforces_timeout_and_terminates(self):
@@ -226,7 +270,8 @@ class CampaignAdapterTests(unittest.TestCase):
             snapshot.mkdir()
             with self.assertRaisesRegex(ValueError, "timed out"):
                 self.adapter.run_entrypoint(
-                    executable, snapshot, "route", "normal", timeout_seconds=0.1
+                    executable, snapshot, "route", "normal", "a" * 40,
+                    "sequential", timeout_seconds=0.1,
                 )
 
     def _manifest_fixture(self, root):
@@ -251,8 +296,8 @@ class CampaignAdapterTests(unittest.TestCase):
             binary = root / self.adapter.WAN_ENTRYPOINT_STEMS[route]
             binary.write_text("#!/bin/sh\n", encoding="utf-8")
             binary.chmod(0o755)
-            snapshot = root / route
-            snapshot.mkdir()
+            snapshot = root / route / ("1" * 40)
+            snapshot.mkdir(parents=True)
             (snapshot / "config.json").write_text("{}", encoding="utf-8")
             coordinates = {}
             for name, expected in self.coverage["families"]["wan"][route]["coordinates"].items():
@@ -273,7 +318,9 @@ class CampaignAdapterTests(unittest.TestCase):
                 coordinates[name] = values
             entries[route] = {
                 "provider_id": route, "entrypoint": str(binary),
-                "snapshot": str(snapshot), "coordinates": coordinates,
+                "snapshot": str(snapshot),
+                "residency_strategy": self.adapter.PRODUCT_RESIDENCY[route],
+                "coordinates": coordinates,
             }
         return entries
 
@@ -305,6 +352,40 @@ class CampaignAdapterTests(unittest.TestCase):
             ]
             manifest.write_text(json.dumps(entries), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "frozen coverage"):
+                self.adapter.load_wan_manifest(manifest)
+
+    def test_diffusers_layout_and_nested_q4_model_revision_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            revision = "2" * 40
+            diffusers = root / revision
+            (diffusers / "transformer").mkdir(parents=True)
+            (diffusers / "model_index.json").write_text("{}", encoding="utf-8")
+            (diffusers / "transformer" / "config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            self.adapter.validate_snapshot_layout(diffusers, "FLUX campaign")
+            self.assertEqual(self.adapter.model_snapshot_revision(diffusers), revision)
+
+            q4 = diffusers / "q4"
+            q4.mkdir()
+            (q4 / "config.json").write_text("{}", encoding="utf-8")
+            self.adapter.validate_snapshot_layout(q4, "Wan campaign")
+            self.assertEqual(self.adapter.model_snapshot_revision(q4), revision)
+            identity = self.adapter.snapshot_identity(q4)
+            (diffusers / "unselected.safetensors").write_bytes(b"sibling")
+            self.assertEqual(self.adapter.snapshot_identity(q4), identity)
+            (q4 / "weights.safetensors").write_bytes(b"selected")
+            self.assertNotEqual(self.adapter.snapshot_identity(q4), identity)
+
+    def test_manifest_rejects_non_product_residency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = self._manifest_fixture(root)
+            entries["wan_vace"]["residency_strategy"] = "sequential"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "malformed"):
                 self.adapter.load_wan_manifest(manifest)
 
     def test_manifest_cannot_override_adapter_owned_event_transport(self):
@@ -387,6 +468,8 @@ class CampaignAdapterTests(unittest.TestCase):
             }
         events = [
             {"phase": "metadata", "source_ref": "a" * 40,
+             "model_snapshot_revision": "b" * 40,
+             "residency_strategy": "sequential",
              "snapshot_sha256": "b" * 64, "snapshot_bytes": 1,
              "variant": "wan2_2_ti2v_5b", "geometry": geometry,
              "real_weights": True, "full_generation": True,
@@ -499,7 +582,9 @@ class CampaignAdapterTests(unittest.TestCase):
             document = {
                 "route": coordinate.variant, "coordinate": coordinate.name,
                 "entrypoint": "product-entrypoint", "entrypoint_sha256": "d" * 64,
-                "snapshot": "/snapshot", "args": [], "input_files": [],
+                "snapshot": "/snapshot", "model_snapshot_revision": "b" * 40,
+                "residency_strategy": self.adapter.PRODUCT_RESIDENCY[coordinate.variant],
+                "args": [], "input_files": [],
             }
             route_hash = self.adapter.digest(self.adapter.canonical(document))
             route_hashes[(coordinate.family, coordinate.variant, coordinate.name)] = route_hash
@@ -508,10 +593,13 @@ class CampaignAdapterTests(unittest.TestCase):
                 "name": coordinate.name, "entrypoint": "product-entrypoint",
                 "entrypoint_sha256": "d" * 64, "snapshot": "/snapshot",
                 "snapshot_sha256": "c" * 64, "snapshot_bytes": 1, "args": [],
+                "model_snapshot_revision": "b" * 40,
+                "residency_strategy": self.adapter.PRODUCT_RESIDENCY[coordinate.variant],
                 "route_manifest_sha256": route_hash, "input_files": [],
             })
         resolved = {
-            "schema": "sc-20686-resolved-inputs-v2",
+            "schema": "sc-20686-resolved-inputs-v3",
+            "inference_revision": "a" * 40,
             "coordinates": resolved_coordinates,
         }
 
@@ -574,11 +662,15 @@ class CampaignAdapterTests(unittest.TestCase):
             observer_events = [metadata, created, read, dict(read), *release_events]
             argv = [
                 "product-entrypoint", "--sc20686-campaign", "--sc20686-events",
-                "/adapter-owned/events.jsonl",
+                "/adapter-owned/sealed-run/events.jsonl",
+                "--sc20686-source-ref", "a" * 40,
+                "--sc20686-residency",
+                self.adapter.PRODUCT_RESIDENCY[coordinate.variant],
                 "--snapshot", "/snapshot", "--variant", coordinate.variant,
             ]
             if arm == "cancel":
                 argv.append("--sc20686-cancel")
+            argv.extend(("--out", "/adapter-owned/sealed-run/media"))
             return self.adapter.CampaignRun(
                 [*observer_events, process],
                 b"".join(self.adapter.canonical(event) for event in observer_events), b"",
@@ -604,6 +696,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 "variant": coordinate.variant, "coordinate_name": coordinate.name,
                 "coordinate_id": self.adapter.digest(self.adapter.canonical(geometry))[:16],
                 "arm": arm, "source_ref": "a" * 40,
+                "model_snapshot_revision": "b" * 40,
+                "residency_strategy": self.adapter.PRODUCT_RESIDENCY[coordinate.variant],
                 "route_manifest_sha256": route_hashes[
                     (coordinate.family, coordinate.variant, coordinate.name)
                 ],
