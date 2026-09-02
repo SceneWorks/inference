@@ -37,6 +37,7 @@ pub mod block_residency;
 // retained compilation and P3 exact epilogues default ON in production, with the benchmark keeping
 // A/B authority and a truthful opt-out for any path that cannot run one.
 pub mod capability;
+pub mod coherence;
 pub mod error;
 pub mod img2img;
 pub mod logical_weights;

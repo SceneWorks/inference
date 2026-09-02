@@ -55,19 +55,62 @@ impl Weights {
     /// otherwise run the post-read fingerprint check before the file-backed graph had consumed its
     /// payload. Provider loaders call this after their final normalization so both source arrays and
     /// derived casts/dequantizations are materialized while the pin guard is still active.
+    ///
+    /// Materializing is also the load boundary at which the GPU's view of every fresh buffer is
+    /// verified against the CPU's ([`crate::coherence`], sc-22414), before any graph consumes it.
+    ///
+    /// Evaluation is batched at [`Self::MATERIALIZE_BATCH_BYTES`] in sorted-key order so a cold
+    /// multi-gigabyte checkpoint never becomes one submission.
     pub fn materialize(&self) -> Result<()> {
-        mlx_rs::transforms::eval(self.tensors.values())?;
+        let mut named: Vec<(&str, &Array)> = self
+            .tensors
+            .iter()
+            .map(|(key, array)| (key.as_str(), array))
+            .collect();
+        Self::materialize_and_verify(&mut named)
+    }
+
+    /// Upper bound on the bytes one [`Self::materialize`] / [`Self::materialize_accessed`] batch
+    /// evaluates at once.
+    pub const MATERIALIZE_BATCH_BYTES: usize = 512 * 1024 * 1024;
+
+    fn materialize_and_verify(named: &mut [(&str, &Array)]) -> Result<()> {
+        named.sort_unstable_by_key(|(key, _)| *key);
+        let mut start = 0;
+        let mut bytes = 0usize;
+        for end in 0..named.len() {
+            bytes = bytes.saturating_add(named[end].1.nbytes());
+            if bytes >= Self::MATERIALIZE_BATCH_BYTES {
+                Self::materialize_batch(&named[start..=end])?;
+                start = end + 1;
+                bytes = 0;
+            }
+        }
+        if start < named.len() {
+            Self::materialize_batch(&named[start..])?;
+        }
         Ok(())
+    }
+
+    fn materialize_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        mlx_rs::transforms::eval(batch.iter().map(|(_, array)| *array))?;
+        crate::coherence::verify_gpu_view(batch.iter().copied())
     }
 
     /// Evaluate only tensors read through [`Self::get`] / [`Self::require`] since the last drain.
     /// Block-window loaders use this before [`Self::remove_accessed`] so the source bytes for the
     /// current window are consumed under its immutable-file guard without evaluating the rest of the
     /// checkpoint and defeating bounded residency.
+    ///
+    /// Like [`Self::materialize`], this verifies the GPU's view of each window's fresh buffers
+    /// against the CPU's before the window's blocks consume them (sc-22414).
     pub fn materialize_accessed(&self) -> Result<()> {
         let accessed = self.accessed.borrow();
-        mlx_rs::transforms::eval(accessed.iter().filter_map(|key| self.tensors.get(key)))?;
-        Ok(())
+        let mut named: Vec<(&str, &Array)> = accessed
+            .iter()
+            .filter_map(|key| self.tensors.get(key).map(|array| (key.as_str(), array)))
+            .collect();
+        Self::materialize_and_verify(&mut named)
     }
 
     /// Load a safetensors file while decoding `F8_E4M3` payloads to bf16.

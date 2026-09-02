@@ -105,14 +105,16 @@ struct StarVector8bAdapter {
 impl StarVector8bAdapter {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        Ok(Self {
+        let model = Self {
             fc_weight: w.require(&key("c_fc.weight"))?.clone(),
             fc_bias: w.require(&key("c_fc.bias"))?.clone(),
             proj_weight: w.require(&key("c_proj.weight"))?.clone(),
             proj_bias: w.require(&key("c_proj.bias"))?.clone(),
             norm_weight: w.require(&key("norm.weight"))?.clone(),
             norm_bias: w.require(&key("norm.bias"))?.clone(),
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     fn forward(&self, image_features: &Array) -> Result<Array> {
