@@ -83,7 +83,10 @@ class KreaRealtimeContractTests(unittest.TestCase):
         write_sealed_manifest(root, data)
         result = self.run_checker(root)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("receipt contract must remain unproduced and complete", result.stdout)
+        self.assertIn(
+            "receipt producer contract must remain complete and require terminal evidence",
+            result.stdout,
+        )
 
     def test_metal_source_uses_bounded_mma_and_online_rescale(self) -> None:
         source = (

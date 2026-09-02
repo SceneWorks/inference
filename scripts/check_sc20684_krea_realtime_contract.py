@@ -35,6 +35,7 @@ REQUIRED_MAPPINGS = {
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub trait CausalPackedAttention"),
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub fn forward_causal_chunk_with_packed_attention"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "pub fn packed_metal_route_receipt"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "fn record_packed_forward_duration"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "fn sc20684_packed_campaign_observer()"),
 }
 REQUIRED_FALLBACKS = {"disabled", "q4-quality", "handle", "geometry", "mask", "cancellation", "receipt"}
@@ -42,7 +43,10 @@ REQUIRED_RECEIPT_FIELDS = {
     "modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability",
     "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes",
     "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity",
-    "quality", "cancellation", "timingLabel",
+    "quality", "cancellation", "timingLabel", "inputIdentity", "denoisingSchedule",
+    "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts",
+    "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline",
+    "pairedCandidateComparison",
 }
 REQUIRED_UPSTREAM_MECHANISMS = {"scalar_fused_decode_attend", "rabitq_prefill_attend"}
 REQUIRED_HEADINGS = (
@@ -72,7 +76,7 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
     poc = data.get("poc")
     if (
         not isinstance(poc, dict)
-        or poc.get("status") != "implemented-source-only-device-unverified"
+        or poc.get("status") != "implemented-device-kernel-full-generation-evidence-required"
         or poc.get("nonGoal") != "full-cache dequantize-then-SDPA is not compressed-domain execution"
     ):
         errors.append("POC boundary mismatch")
@@ -94,11 +98,11 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
     fields = set(receipt.get("requiredFields", [])) if isinstance(receipt, dict) else set()
     if (
         not isinstance(receipt, dict)
-        or receipt.get("status") != "schema-only-not-produced"
+        or receipt.get("status") != "producer-implemented-terminal-receipt-required"
         or fields != REQUIRED_RECEIPT_FIELDS
         or len(receipt.get("requiredFields", [])) != len(REQUIRED_RECEIPT_FIELDS)
     ):
-        errors.append("receipt contract must remain unproduced and complete")
+        errors.append("receipt producer contract must remain complete and require terminal evidence")
     mappings = data.get("sourceMappings")
     declared = (
         {(item.get("path"), item.get("needle")) for item in mappings if isinstance(item, dict)}

@@ -33,6 +33,8 @@
 //! mask + KV read window + causal RoPE offset — the released reference applies no additive attention
 //! bias / `score_mod` in its sampling path (see the crate-root reconciliation note).
 
+use std::time::Instant;
+
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, DiffPatchPart};
 use mlx_gen::{Error, Result};
 use mlx_gen_wan::patchify::unpatchify;
@@ -464,6 +466,17 @@ pub struct CausalKvCache {
     packed_metal_accepted_forwards: usize,
     packed_metal_dense_fallbacks: usize,
     last_packed_metal_fallback: Option<String>,
+    /// Evaluated packed-forward timing. The first accepted forward includes lazy Metal pipeline
+    /// compilation; later accepted forwards are the steady evaluated distribution. Failed/fallback
+    /// attempts are deliberately excluded from accepted-path timing and remain visible in the
+    /// fallback counters above.
+    packed_metal_first_forward_ns: Option<u64>,
+    packed_metal_steady_forward_ns: u64,
+    packed_metal_steady_forward_count: usize,
+    /// Successful packed append transactions, including quantize/concat and forced evaluation of
+    /// every successor layer before publication.
+    packed_metal_append_ns: u64,
+    packed_metal_append_count: usize,
     /// Largest logical old-plus-successor payload simultaneously alive at an immutable MLX append
     /// barrier. Process receipts still measure allocator high water; this prevents retained-only
     /// accounting from concealing full-history concat residency.
@@ -488,6 +501,11 @@ pub struct PackedMetalRouteReceipt {
     pub accepted_forwards: usize,
     pub dense_fallbacks: usize,
     pub last_fallback_reason: Option<String>,
+    pub first_evaluated_forward_ns: u64,
+    pub steady_evaluated_forward_ns: u64,
+    pub steady_evaluated_forward_count: usize,
+    pub accepted_append_ns: u64,
+    pub accepted_append_count: usize,
 }
 
 impl CausalKvCache {
@@ -517,6 +535,11 @@ impl CausalKvCache {
             packed_metal_accepted_forwards: 0,
             packed_metal_dense_fallbacks: 0,
             last_packed_metal_fallback: None,
+            packed_metal_first_forward_ns: None,
+            packed_metal_steady_forward_ns: 0,
+            packed_metal_steady_forward_count: 0,
+            packed_metal_append_ns: 0,
+            packed_metal_append_count: 0,
             peak_append_coexistence_bytes: 0,
             #[cfg(test)]
             evict_to_next_read: true,
@@ -564,7 +587,32 @@ impl CausalKvCache {
             accepted_forwards: self.packed_metal_accepted_forwards,
             dense_fallbacks: self.packed_metal_dense_fallbacks,
             last_fallback_reason: self.last_packed_metal_fallback.clone(),
+            first_evaluated_forward_ns: self.packed_metal_first_forward_ns.unwrap_or(0),
+            steady_evaluated_forward_ns: self.packed_metal_steady_forward_ns,
+            steady_evaluated_forward_count: self.packed_metal_steady_forward_count,
+            accepted_append_ns: self.packed_metal_append_ns,
+            accepted_append_count: self.packed_metal_append_count,
         })
+    }
+
+    fn record_packed_forward_duration(&mut self, elapsed: std::time::Duration) {
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        if self.packed_metal_first_forward_ns.is_none() {
+            self.packed_metal_first_forward_ns = Some(elapsed_ns);
+        } else {
+            self.packed_metal_steady_forward_ns = self
+                .packed_metal_steady_forward_ns
+                .saturating_add(elapsed_ns);
+            self.packed_metal_steady_forward_count =
+                self.packed_metal_steady_forward_count.saturating_add(1);
+        }
+    }
+
+    fn record_packed_append_duration(&mut self, elapsed: std::time::Duration) {
+        self.packed_metal_append_ns = self
+            .packed_metal_append_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.packed_metal_append_count = self.packed_metal_append_count.saturating_add(1);
     }
 
     pub fn peak_append_coexistence_bytes(&self) -> usize {
@@ -908,6 +956,7 @@ impl CausalKvCache {
     /// grows that tail until the next read supplies its actual length and trims again. `new_kv` must
     /// carry exactly one `(k, v)` per layer.
     pub fn append(&mut self, new_kv: Vec<LayerKv>) -> Result<()> {
+        let packed_append_started = self.packed_metal_kernel.as_ref().map(|_| Instant::now());
         if new_kv.len() != self.layers.len() {
             return Err(Error::Msg(format!(
                 "krea causal: append expected {} layers, got {}",
@@ -1000,6 +1049,9 @@ impl CausalKvCache {
             self.layers = staged_layers;
             self.committed_tokens = committed_after;
             self.tail_base = tail_base_new;
+            if let Some(started) = packed_append_started.as_ref() {
+                self.record_packed_append_duration(started.elapsed());
+            }
             return Ok(());
         }
         // While the sink is still filling, newly appended contiguous tokens become part of it.
@@ -1009,6 +1061,9 @@ impl CausalKvCache {
         self.layers = staged_layers;
         self.committed_tokens = committed_after;
         self.tail_base = tail_base_after;
+        if let Some(started) = packed_append_started.as_ref() {
+            self.record_packed_append_duration(started.elapsed());
+        }
         Ok(())
     }
 }
@@ -1201,6 +1256,7 @@ impl CausalKreaTransformer {
                 block_size: self.block_size,
                 dispatched_outputs: Vec::with_capacity(40),
             };
+            let packed_started = Instant::now();
             let mut packed_result = self.inner.forward_causal_chunk_with_packed_attention(
                 &tokens,
                 t,
@@ -1220,12 +1276,14 @@ impl CausalKreaTransformer {
                         Err(Error::Msg(format!("{PACKED_DISPATCH_ERROR_PREFIX}{error}")));
                 }
             }
+            let packed_elapsed = packed_started.elapsed();
             let dispatched_layers = backend.dispatched_outputs.len();
             drop(backend);
             match packed_result {
                 Ok(result)
                     if packed_dispatch_complete(dispatched_layers, self.inner.num_blocks()) =>
                 {
+                    cache.record_packed_forward_duration(packed_elapsed);
                     cache.packed_metal_accepted_forwards += 1;
                     result
                 }
@@ -1433,6 +1491,22 @@ mod tests {
         assert!(!packed_dispatch_complete(0, 40));
         assert!(!packed_dispatch_complete(0, 0));
         // A zero-layer model cannot produce a meaningful packed receipt.
+    }
+
+    #[test]
+    fn packed_timing_keeps_cold_steady_and_append_phases_distinct() {
+        let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(11));
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(7));
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(5));
+        cache.record_packed_append_duration(std::time::Duration::from_nanos(3));
+        cache.record_packed_append_duration(std::time::Duration::from_nanos(2));
+
+        assert_eq!(cache.packed_metal_first_forward_ns, Some(11));
+        assert_eq!(cache.packed_metal_steady_forward_ns, 12);
+        assert_eq!(cache.packed_metal_steady_forward_count, 2);
+        assert_eq!(cache.packed_metal_append_ns, 5);
+        assert_eq!(cache.packed_metal_append_count, 2);
     }
 
     /// A Wan-2.1-14B-T2V style LoRA (musubi-tuner / diffusion-pipe / ComfyUI), once its

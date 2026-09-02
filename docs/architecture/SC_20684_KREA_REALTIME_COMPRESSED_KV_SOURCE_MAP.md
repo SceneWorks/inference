@@ -1,6 +1,6 @@
 # SC-20684: Krea Realtime compressed-KV source map
 
-**Status:** experimental source POC, off by default; no Metal, model, performance, memory, or quality receipt has been produced. The opt-in launcher and its product-owned observer are present, but remain unrun until the coordinator owns the Metal lane.
+**Status:** experimental retained Metal kernel and terminal receipt producer implemented, off by default. Focused Metal JIT/oracle dispatch was previously verified, but no full real-weight generation, performance, memory, or quality receipt has been produced. The complete launcher remains unrun until the coordinator owns the Metal lane.
 
 The sealed companion is [`sc-20684-krea-realtime-compressed-kv-contract.json`](sc-20684-krea-realtime-compressed-kv-contract.json). It binds the POC to the checked-out Krea seams and requires an evidence receipt before any product claim.
 
@@ -12,7 +12,7 @@ The Krea 14B backbone is normally B=1, H=40, D=128 and uses group 64. `S_q` is r
 
 ## Existing evidence boundary
 
-Existing Q8 storage evidence applies to the **old dequantize-then-SDPA** route only, including its recorded quality cost. Q4 is unmeasured. This POC contains no device output and makes no local performance, resident-memory, image/video-quality, or backend-dispatch claim.
+Existing Q8 storage evidence applies to the **old dequantize-then-SDPA** route only, including its recorded quality cost. Q4 is unmeasured. The POC's focused Metal JIT/oracle test proves only that Q8/Q4 kernels compile, dispatch, retain their handle, and match the packed oracle on its test geometries; it does not establish real-model performance, resident-memory reduction, or image/video quality.
 
 ## Frozen upstream comparison and decision
 
@@ -32,24 +32,26 @@ Absolute RoPE remains the Wan/Krea producer's responsibility: keys passed to app
 
 ## Receipt and migration contract
 
-A future same-run device receipt must name the model/snapshot, exact B/H/Sq/Skv/D and mask, representation/version, compiled-handle identity, packed persistent bytes, retained-handle bytes, bounded scratch bytes, zero/nonzero dense-window and score-matrix bytes, timing label, fallback reason, parity, quality, and cancellation outcome. Q4 cannot be promoted using Q8 evidence. Dense full-cache dequantize-then-SDPA remains a non-goal for compressed-domain execution.
+A same-run device receipt must name the model/snapshot, deterministic request input, complete source-owned five-step schedule, exact B/H/Sq/Skv/D and mask, representation/version, compiled-handle identity, packed persistent bytes, retained-handle bytes, bounded scratch bytes, zero/nonzero dense-window and score-matrix bytes, independent load/conditioning/generation/decode/first-frame/cold-forward/steady-forward/append timings, paired allocator/process-memory samples, fallback reason, latent parity, decoded spatial/temporal quality, generated review artifacts, and cancellation/release outcome. Q4 cannot be promoted using Q8 evidence. Dense full-cache dequantize-then-SDPA remains a non-goal for compressed-domain execution.
 
 The source tests cover Q8 tiled/tail/block-mask/outlier parity against an independent dense oracle, arbitrary append boundaries, packed trim, disabled pre-mutation fallback, and cancellation scratch cleanup. The focused Rust suite and strict package clippy pass locally; the Python checker rejects missing source mappings, fallback axes, receipt axes, checksum drift, or dense-window/score-route needles.
 
 ## Real-weight campaign handoff
 
-The parent command is `scripts/sc20684_krea_realtime_campaign.py`. It launches the ignored `generate_smoke::sc20684_packed_campaign_observer` test once for each T2V/I2V/V2V × Q8/Q4 cell, passing only a run nonce, selected arm, and pinned snapshot path. The test, not the parent, reads the checked-out source hashes, snapshot metadata, toolchain/hardware identity, live cache receipt, actual packed-vs-dense latent parity, decoded media quality, fallback counters, and pre-cancelled route result; it emits one `SC20684_KREA_PROVIDER_OBSERVATION` JSON line after those values are terminal.
+The parent command is `scripts/sc20684_krea_realtime_campaign.py`. For each T2V/I2V/V2V × Q8/Q4 cell it launches the ignored `generate_smoke::sc20684_packed_campaign_observer` test in two fresh processes: a paired packed-plus-dense correctness run and an independent dense-read-window baseline for uncontaminated whole-generation memory/timing comparison. It passes only a run nonce, measurement role, selected arm, pinned snapshot path, and new external artifact directory. T2V uses a fixed prompt; I2V VAE-encodes a deterministic gradient still; V2V VAE-encodes a deterministic 25-frame motion clip with fixed strength and seed. Every arm runs all five source-owned Self-Forcing steps at 832×480×25: T2V/I2V use the configured `[1000, 937, 833, 625, 0]` list, while V2V records and validates the actual strength-0.6 warped schedule `[882.3529052734375, 803.5714111328125, 681.8181762695312, 468.75, 0]`. The geometry distinguishes seven total output latents from generated latents: T2V/V2V generate all seven, while I2V follows the product route exactly by warming one reference latent and generating the remaining six (two full AR chunks and ten denoise progress steps).
 
-The reducer rejects any missing/duplicate cell, identity disagreement, failed parity or quality arm, uncompiled handle, dense window/score bytes, partial cancellation, or Q8/Q4 substitution. It writes a checksumed receipt directory outside the repository only by an atomic final rename. Q4 is selected only when the launcher's explicit `KREA_SC20684_Q4_QUALITY_ARM=acknowledged` selector is present; this acknowledges the distinct arm but cannot turn a failed measured quality row into a passing one.
+The test, not the parent, reads the checked-out source hashes, snapshot metadata, toolchain, Mac hardware model, actual Metal chipset, live cache receipt, actual packed-vs-dense latent parity, decoded RGB/temporal quality, fallback counters, pre-cancelled route result, Darwin physical footprint, MLX allocator samples, phase timings, and generated review-frame identities. Timing reports both whole-generation mean output rate (including the non-streaming VAE decode) and a separately named steady-denoise-equivalent rate derived from the post-warmup full AR chunk; it never labels denoise-only throughput as delivered output FPS. The paired quality gate freezes an additional packed-kernel mean RGB budget of 1.0/255 for Q8 and 3.0/255 for the separately acknowledged Q4 arm; Q8 is intentionally tighter than the previously recorded 1.20–2.79/255 Q8-versus-bf16 cache-tier drift because this POC is compared against the same tier's dequantize-then-attend route. It emits one `SC20684_KREA_PROVIDER_OBSERVATION` JSON line only after those values and the external artifacts are terminal.
+
+The reducer rejects any missing/duplicate cell, identity disagreement, synthetic or mode-substituted input, incomplete schedule, conflated timing, inadequate memory-sampling coverage, failed release/parity/quality arm, uncompiled handle, dense window/score bytes, partial cancellation, missing or hash-drifted review artifact, or Q8/Q4 substitution. It preserves hash-identified raw stdout/stderr and all six verified artifact sets, writes both a receipt checksum and a whole-tree checksum manifest, and publishes the evidence directory outside the repository only by an atomic final rename. Q4 is selected only when the launcher's explicit `KREA_SC20684_Q4_QUALITY_ARM=acknowledged` selector is present; this acknowledges the distinct arm but cannot turn a failed measured quality row into a passing one.
 
 ```sh
 python3 scripts/sc20684_krea_realtime_campaign.py \
-  --snapshot /Volumes/Data/krea-realtime/q4 \
-  --output /Volumes/Data/receipts/sc-20684-$(date +%Y%m%dT%H%M%S) \
+  --snapshot /Volumes/Models/huggingface/hub/models--SceneWorks--krea-realtime-14b-mlx/snapshots/e68e9a3d98187fdf6936838ffcf6df5aa48d6626/q4 \
+  --output /Users/michael/.codex/worktrees/epic20669/evidence/sc20684/campaign-$(date +%Y%m%dT%H%M%S) \
   --product-command 'cargo test -p mlx-gen-krea-realtime --test integration generate_smoke::sc20684_packed_campaign_observer -- --ignored --nocapture'
 ```
 
-## Source-only validation
+## Pre-campaign validation
 
 ```sh
 python3 scripts/check_sc20684_krea_realtime_contract.py

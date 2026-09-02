@@ -20,7 +20,7 @@
   },
   "poc": {
     "candidate": "Krea-owned D-axis affine Q8 packed K/V with tiled online softmax; Q4 is a separately acknowledged quality arm",
-    "status": "implemented-source-only-device-unverified",
+    "status": "implemented-device-kernel-full-generation-evidence-required",
     "nativeGeometry": "B=1, H=40, D=128, group=64, Q8 by default; query tiles of 8 and analytic block-causal masking from O(S) positions",
     "rejectedCurrentFormat": "Krea Q8/Q4 is not RaBitQ and is not VeloxQuant token-axis K grouping; the POC reads Krea's own uint32 plus bf16 scale/bias rows",
     "nonGoal": "full-cache dequantize-then-SDPA is not compressed-domain execution"
@@ -35,8 +35,8 @@
     {"id": "receipt", "reason": "no device-produced parity, quality, resident-byte, transient-byte, or dispatch receipt exists"}
   ],
   "receipt": {
-    "status": "schema-only-not-produced",
-    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel"],
+    "status": "producer-implemented-terminal-receipt-required",
+    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel", "inputIdentity", "denoisingSchedule", "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts", "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline", "pairedCandidateComparison"],
     "forbiddenClaims": ["local performance", "local memory reduction", "local quality parity", "compressed-domain execution"]
   },
   "sourceMappings": [
@@ -62,6 +62,7 @@
     ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub trait CausalPackedAttention"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk_with_packed_attention"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn packed_metal_route_receipt"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn record_packed_forward_duration"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "needle": "fn sc20684_packed_campaign_observer()"}
   ]
 }
