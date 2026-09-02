@@ -1286,7 +1286,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if prefill.mlx.active_bytes < prefill_active_floor
         || prefill.mlx.peak_bytes < prefill_peak_floor
     {
-        return Err("prefill MLX samples do not contain attributed allocations".into());
+        return Err(format!(
+            "prefill MLX samples do not contain attributed allocations: baselineActiveBytes={}, persistentKvBytes={kv}, transientWorkspaceBytes={workspace}, activeBytes={}, activeFloor={prefill_active_floor}, peakBytes={}, peakFloor={prefill_peak_floor}",
+            prefill_peak_window.baseline_active_bytes,
+            prefill.mlx.active_bytes,
+            prefill.mlx.peak_bytes,
+        ));
     }
     let decode = sample_for("decode-steady")?;
     let decode_total = weights
