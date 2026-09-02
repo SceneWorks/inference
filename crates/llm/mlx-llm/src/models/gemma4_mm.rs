@@ -461,7 +461,9 @@ impl Gemma4AudioEmbedder {
                 cfg.samples_per_token
             )));
         }
-        Ok(Self { proj_w, cfg })
+        let model = Self { proj_w, cfg };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// The audio geometry this projector was built for.
@@ -505,7 +507,9 @@ impl Gemma4Mm {
             (Some(ac), true) => Some(Gemma4AudioEmbedder::from_weights(w, layout, ac.clone())?),
             _ => None,
         };
-        Ok(Self { cfg, vision, audio })
+        let model = Self { cfg, vision, audio };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 }
 

@@ -49,6 +49,28 @@ pub enum Error {
         alternative: Option<(u32, u32)>,
     },
 
+    /// A freshly loaded weight buffer whose GPU view never converged on the bytes the CPU holds
+    /// (sc-22414). Typed so a consumer can tell "the host's Metal mapping is lagging" from a
+    /// generic failure; see [`crate::coherence`]. Bridges to [`gen_core::Error::Msg`] with its full
+    /// text — gen-core has no load-coherence variant and the worker only reports it.
+    #[error(
+        "GPU view of `{name}` ({bytes} bytes) never matched the CPU view after {attempts} reads \
+         (cpu checksum {cpu:#x}, gpu checksum {gpu:#x}): the Metal mapping of a freshly loaded \
+         buffer is stale — retry the load once the host's write-back pressure subsides (sc-22414)"
+    )]
+    IncoherentLoad {
+        /// The tensor key.
+        name: String,
+        /// Its byte size.
+        bytes: usize,
+        /// The CPU-stream checksum (the reference).
+        cpu: u64,
+        /// The last GPU-stream checksum observed.
+        gpu: u64,
+        /// GPU reads attempted.
+        attempts: u32,
+    },
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -91,6 +113,9 @@ impl From<Error> for gen_core::Error {
                 requested_height,
                 alternative,
             },
+            incoherent @ Error::IncoherentLoad { .. } => {
+                gen_core::Error::Msg(incoherent.to_string())
+            }
             Error::Msg(s) => gen_core::Error::Msg(s),
         }
     }
@@ -160,6 +185,33 @@ mod tests {
         }
         let back: gen_core::Error = down.into();
         assert!(matches!(back, gen_core::Error::Unsupported(_)));
+    }
+
+    /// sc-22414: the load-coherence refusal crosses to gen-core as a message that still names the
+    /// tensor, both checksums and the story, so the worker's report is actionable.
+    #[test]
+    fn incoherent_load_bridges_with_its_full_text() {
+        let up: gen_core::Error = Error::IncoherentLoad {
+            name: "model.embed_tokens.weight".into(),
+            bytes: 2_013_265_920,
+            cpu: 0xdead_beef,
+            gpu: 0,
+            attempts: 13,
+        }
+        .into();
+        match up {
+            gen_core::Error::Msg(text) => {
+                for needle in [
+                    "model.embed_tokens.weight",
+                    "0xdeadbeef",
+                    "13 reads",
+                    "sc-22414",
+                ] {
+                    assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+                }
+            }
+            other => panic!("expected Msg, got {other:?}"),
+        }
     }
 
     #[test]

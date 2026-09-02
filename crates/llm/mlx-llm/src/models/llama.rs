@@ -312,6 +312,13 @@ impl CausalLm {
             ),
             None => (cfg.build_rope(), None),
         };
+        // Every tensor this constructor read is a freshly loaded buffer whose GPU view can lag the
+        // CPU's (sc-22414): force them resident in bounded batches and hold until the GPU reads the
+        // same bytes, *before* any forward builds a graph over them. Under `Stack::Resident` that is
+        // the whole checkpoint; under `Stack::Sequential` it is the resident set (embeddings, final
+        // norm, LM head) — the streamed layers are verified per pass in
+        // `crate::residency::SequentialStack::run_layer`.
+        w.verify_accessed_gpu_view()?;
         let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,

@@ -67,7 +67,7 @@ impl GptBigCode {
                 cfg,
             )?);
         }
-        Ok(Self {
+        let model = Self {
             token_embedding,
             position_embedding,
             layers,
@@ -75,7 +75,9 @@ impl GptBigCode {
             final_norm_bias: w.require(&key("transformer.ln_f.bias"))?.clone(),
             lm_head,
             cfg,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Token embeddings with learned absolute position rows for a cache offset.

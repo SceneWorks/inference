@@ -203,6 +203,19 @@ fn from_gemma4_decode(e: mlx_llm::Error) -> Error {
         mlx_llm::Error::Canceled => Error::Canceled,
         mlx_llm::Error::MissingTensor(key) => Error::MissingTensor(key),
         mlx_llm::Error::Io(error) => Error::Io(error),
+        mlx_llm::Error::IncoherentLoad {
+            name,
+            bytes,
+            cpu,
+            gpu,
+            attempts,
+        } => Error::IncoherentLoad {
+            name,
+            bytes,
+            cpu,
+            gpu,
+            attempts,
+        },
         other => Error::Msg(format!("ltx_2_5 enhancer decode: {other}")),
     }
 }
