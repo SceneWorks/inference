@@ -797,6 +797,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
     let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
     let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
+    // Resident components cross the GPU-view guard here (sc-22414, `mlx_gen::coherence`).
+    vae_w.materialize()?;
+    audio_vae_w.materialize()?;
+    vocoder_w.materialize()?;
 
     // Loaded through the path constructor, so a stamped checkpoint's declared config is
     // cross-checked against the structure the weights imply instead of the rank silently winning.
@@ -1029,6 +1033,10 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
     let video_w = Weights::from_file(&video_path)?;
     let audio_w = Weights::from_file(&audio)?;
     let vocoder_w = Weights::from_file(&vocoder)?;
+    // Resident components cross the GPU-view guard here (sc-22414, `mlx_gen::coherence`).
+    video_w.materialize()?;
+    audio_w.materialize()?;
+    vocoder_w.materialize()?;
     let vae_cfg = LtxVaeConfig::from_bundle(&bundle, video_component)?;
     let audio_cfg = AudioVaeConfig::from_bundle(&bundle)?;
     let vocoder_cfg = VocoderConfig::from_bundle(&bundle)?;
@@ -1074,6 +1082,7 @@ fn build_ltx25(spec: &LoadSpec, enhancer_cache: Rc<RefCell<PrefixCache>>) -> Res
     let enhancer_template = ltx25_packed_chat_template(&assets)?;
     let enhancer = ltx25_enhancer_dir(spec)?;
     let duration_w = Weights::from_file(bundle.require(LtxComponent::DurationHead)?.path())?;
+    duration_w.materialize()?;
     let duration_head = DurationHead::from_weights(&duration_w)?;
     let temporal_upsampler =
         LatentUpsampler::from_checkpoint(bundle.require(LtxComponent::TemporalUpsampler)?.path())?;
@@ -1152,6 +1161,7 @@ impl Ltx {
                 ..
             } => {
                 let connector_w = Weights::from_file(connector)?;
+                connector_w.materialize()?;
                 Ok(StagedTextEncoder::Gemma4(Box::new(
                     Ltx25TextEncoder::from_bundle_av(
                         bundle,
@@ -1205,6 +1215,10 @@ impl Ltx {
         } else {
             AvDiT::from_weights(&transformer_w, &self.config, self.dit_prec)?
         };
+        // Exactly the tensors the DiT read cross the GPU-view guard (sc-22414): the whole file when
+        // resident, only the non-block set when streamed — the stream guards each window itself in
+        // `LtxBlockStream::materialize`. `materialize()` here would force a streamed DiT resident.
+        transformer_w.materialize_accessed()?;
         if let Some(chunk) = execution.attention_chunk_size {
             transformer.set_attention_budget(
                 mlx_gen::attention::AttentionBudget::from_score_elements(u64::from(chunk), true),
@@ -2056,6 +2070,7 @@ impl Ltx {
         let quant = resolve_gemma_quant(dir)?;
         let model =
             GemmaModel::from_weights_with_prefix(&w, GemmaConfig::gemma_3_12b(), quant, "model.")?;
+        w.materialize_accessed()?;
         let tokenizer = LtxTokenizer::from_dir(dir)?;
         Ok((model, tokenizer))
     }

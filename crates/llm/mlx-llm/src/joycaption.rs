@@ -140,13 +140,15 @@ impl LlavaProjector {
     ) -> Result<Self> {
         let bf16 =
             |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
-        Ok(Self {
+        let model = Self {
             linear1_w: bf16(format!("{prefix}.linear_1.weight"))?,
             linear1_b: bf16(format!("{prefix}.linear_1.bias"))?,
             linear2_w: bf16(format!("{prefix}.linear_2.weight"))?,
             linear2_b: bf16(format!("{prefix}.linear_2.bias"))?,
             activation,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Project SigLIP features `[b, seq, 1152]` to language features `[b, seq, hidden]`. The f32
