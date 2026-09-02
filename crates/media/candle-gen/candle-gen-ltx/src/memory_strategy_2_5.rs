@@ -621,18 +621,6 @@ fn registered_valid_fixtures(
     Ok(vec![fixture.with_load_spec(spec.clone())])
 }
 
-fn surfaces() -> Vec<gen_core::MemoryContractSurfaceSpec> {
-    gen_core::candle_memory_contract_surface_specs()
-        .into_iter()
-        .filter(|surface| {
-            matches!(
-                surface.selector.tier,
-                gen_core::MemoryContractSurfaceTier::Bf16 | gen_core::MemoryContractSurfaceTier::Q4
-            )
-        })
-        .collect()
-}
-
 /// The production Candle LTX-2.5 memory registration.
 pub(crate) const LTX_2_5_DISTILLED_MEMORY_REGISTRATION: gen_core::MemoryRegistration =
     gen_core::MemoryRegistration {
@@ -641,12 +629,14 @@ pub(crate) const LTX_2_5_DISTILLED_MEMORY_REGISTRATION: gen_core::MemoryRegistra
         safety_check: registered_safety_check,
     };
 
-/// Complete weights-free BF16/Q4 load surface for the registered Candle route.
+/// Complete weights-free BF16/Q4/Q8 load surface for the registered Candle route — the shared
+/// Candle surface, unfiltered (sc-18791). LTX-2.5 converts and ships a hosted `q8/` tier beside
+/// `q4/`, so excluding the Q8 rungs would leave the shipped tier's request scope unexercised.
 pub(crate) const LTX_2_5_DISTILLED_MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
     gen_core::MemoryContractFixtureRegistration {
         provider_id: LTX_2_5_DISTILLED_MODEL_ID,
         contract: weights_free_contract,
-        surface_specs: surfaces,
+        surface_specs: gen_core::candle_memory_contract_surface_specs,
     };
 
 /// Executable weights-free request-scope behavior for every implemented optimized rung.
@@ -981,14 +971,43 @@ mod tests {
             crate::MODEL_ID
         );
         let surfaces = (LTX_2_5_DISTILLED_MEMORY_FIXTURE.surface_specs)();
+        let mut tiers: Vec<_> = surfaces
+            .iter()
+            .map(|surface| surface.selector.tier)
+            .collect();
+        tiers.sort();
+        tiers.dedup();
+        assert_eq!(
+            tiers,
+            vec![
+                gen_core::MemoryContractSurfaceTier::Bf16,
+                gen_core::MemoryContractSurfaceTier::Q4,
+                gen_core::MemoryContractSurfaceTier::Q8,
+            ],
+            "every released tier, and only released tiers, carries a weights-free surface"
+        );
         assert_eq!(
             surfaces.len(),
-            8,
-            "BF16/Q4 x resident/sequential x eager/deferred"
+            12,
+            "3 tiers x resident/sequential x eager/deferred"
         );
-        assert!(surfaces
+        // sc-18791: the shipped q8 tier is a first-class Candle route, so its four rungs must be
+        // present rather than filtered out of the weights-free surface.
+        let q8: Vec<_> = surfaces
             .iter()
-            .all(|surface| surface.selector.tier != gen_core::MemoryContractSurfaceTier::Q8));
+            .filter(|surface| surface.selector.tier == gen_core::MemoryContractSurfaceTier::Q8)
+            .collect();
+        assert_eq!(q8.len(), 4, "q8 x resident/sequential x eager/deferred");
+        for surface in &q8 {
+            // Advertising the rung is not reaching it: each q8 surface must build its contract and
+            // resolve to the q8 numeric tier the registered safety check re-derives.
+            weights_free_contract(&surface.spec)
+                .expect("every advertised q8 surface builds its weights-free contract");
+            assert_eq!(
+                resolved_numeric_tier(&surface.spec).unwrap().quant,
+                Some(Quant::Q8)
+            );
+        }
     }
 
     #[test]

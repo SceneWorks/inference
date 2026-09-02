@@ -217,9 +217,19 @@ impl Ltx25TextEncoder {
         let cfg = ModelConfig::from_json(&config).map_err(from_llm)?;
         let hidden_size = cfg.hidden_size as usize;
 
-        // (4) Load through the same seam the shipped tiers were validated on (PR #820).
-        let weights = LlmWeights::from_file(te_path, &device).map_err(from_llm)?;
-        let model = CausalLm::from_weights(&weights, "", cfg).map_err(from_llm)?;
+        // (4) Load through the same seam the shipped tiers were validated on (PR #820). A quantized
+        // source is staged on the host: uploading the complete MLX-affine encoder first would retain
+        // it while the decoder accumulates its resident QTensor form, producing a near-2x undeclared
+        // device-memory peak. The dense tier keeps its direct-to-device load path unchanged.
+        let stored_quant = cfg.quantization;
+        let model = if stored_quant.is_some() {
+            let weights = LlmWeights::from_file(te_path, &Device::Cpu).map_err(from_llm)?;
+            CausalLm::from_weights_on_device(&weights, "", cfg, stored_quant, &device)
+        } else {
+            let weights = LlmWeights::from_file(te_path, &device).map_err(from_llm)?;
+            CausalLm::from_weights(&weights, "", cfg)
+        }
+        .map_err(from_llm)?;
 
         let (aggregate, rescale) = load_aggregate(
             &proj_vb,

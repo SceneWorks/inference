@@ -1,10 +1,15 @@
 //! LTX-2.5 quant selection and terminal measurement evidence (sc-18777).
 //!
-//! Production and measurement are intentionally separate surfaces. Production `Quant::Q8` means
-//! the released INT8-ConvRot transformer/text-encoder pair. The terminal controller can additionally
-//! measure the hosted packed-q8 tier, but that mode has no production selector and cannot enter the
-//! ordinary catalog. Advanced production modes remain fail-closed until a same-run, identity-bound
-//! receipt is deliberately copied into [`ACCEPTED_MEASUREMENT_RECEIPTS`].
+//! Production and measurement are intentionally separate surfaces. Production `Quant::Q8` names the
+//! hosted packed-q8 tier (`<snapshot>/q8`) — the released MLX-affine bundle that also packs the
+//! Gemma 4 text encoder — promoted to a first-class Candle route in sc-18791 once the packed-q8
+//! projection loader landed. It shares the ordinary packed loader with q4 and is admitted
+//! unconditionally, exactly like bf16 and q4.
+//!
+//! The materially different *advanced* operators are unchanged by that promotion. INT8-ConvRot has
+//! no [`LoadSpec`] selector at all (it is reached only by the terminal controller, which names its
+//! mode explicitly), and NVFP4 stays fail-closed until a same-run, identity-bound receipt is
+//! deliberately copied into [`ACCEPTED_MEASUREMENT_RECEIPTS`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,9 +98,10 @@ pub(crate) struct SnapshotInventory {
 
 /// Every numeric source compared by the terminal controller.
 ///
-/// `PackedQ8` is intentionally not constructible from [`LoadSpec`]: the production `Quant::Q8`
-/// contract already names INT8-ConvRot. Keeping a separate terminal-only variant prevents a q8
-/// packed observation from being promoted under the ConvRot label.
+/// `PackedQ8` is the production meaning of `Quant::Q8` (sc-18791): the hosted `q8/` bundle, loaded
+/// by the same MLX-affine packed path as `Q4`. `Int8ConvRot` is the deliberately separate
+/// terminal-only variant — keeping it unconstructible from [`LoadSpec`] prevents a packed-q8
+/// observation from being reported under the ConvRot label, and vice versa.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Ltx25QuantMode {
@@ -111,7 +117,7 @@ impl Ltx25QuantMode {
         match spec.quantize {
             None => Ok(Self::Bf16),
             Some(Quant::Q4) => Ok(Self::Q4),
-            Some(Quant::Q8) => Ok(Self::Int8ConvRot),
+            Some(Quant::Q8) => Ok(Self::PackedQ8),
             Some(Quant::Nvfp4) => Ok(Self::Nvfp4),
         }
     }
@@ -257,8 +263,15 @@ const fn terminal_dev_case(
 }
 
 /// The active physical campaign pool is consumer Blackwell `sm_120`. Unsupported generations stay
-/// classified above so selecting them still fails closed, but they are not measurement rows. The
-/// upstream NVFP4 artifact is distilled-only, so no dev/NVFP4 row is representable.
+/// classified above so selecting them still fails closed, but they are not measurement rows.
+///
+/// sc-18791: every row must name a bundle the public `SceneWorks/ltx-2.5-mlx` release actually
+/// ships. That release publishes only `distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` — it has no
+/// `bundles/` tree at all — so the INT8-ConvRot and NVFP4 candidates have no measurable case and
+/// are not rows here. `Ltx25QuantMode::Int8ConvRot` and `::Nvfp4` remain classified selectors:
+/// `admit` refuses them because no terminal case covers them, which is the same fail-closed
+/// outcome the empty receipt allowlist already produced. Publishing those bundles is what makes
+/// the rows representable again.
 pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
     terminal_case(
         "ltx25-bf16-blackwell-v1",
@@ -275,16 +288,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
         Ltx25QuantMode::PackedQ8,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
-    terminal_case(
-        "ltx25-int8-convrot-blackwell-v1",
-        Ltx25QuantMode::Int8ConvRot,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
-    terminal_case(
-        "ltx25-nvfp4-blackwell-v1",
-        Ltx25QuantMode::Nvfp4,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
     terminal_dev_case(
         "ltx25-bf16-blackwell-dev-v1",
         Ltx25QuantMode::Bf16,
@@ -298,11 +301,6 @@ pub const TERMINAL_MEASUREMENT_CASES: &[Ltx25QuantMeasurementCase] = &[
     terminal_dev_case(
         "ltx25-packed-q8-blackwell-dev-v1",
         Ltx25QuantMode::PackedQ8,
-        Ltx25GpuGeneration::ConsumerBlackwellSm120,
-    ),
-    terminal_dev_case(
-        "ltx25-int8-convrot-blackwell-dev-v1",
-        Ltx25QuantMode::Int8ConvRot,
         Ltx25GpuGeneration::ConsumerBlackwellSm120,
     ),
 ];
@@ -915,9 +913,8 @@ pub fn admit(
     runtime: Option<&Ltx25QuantRuntimeIdentity>,
     accepted: &[Ltx25QuantAcceptedMeasurement],
 ) -> Ltx25QuantAdmission {
-    if mode == Ltx25QuantMode::PackedQ8 {
-        return Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: packed-q8 is a terminal comparison source, not a production selector; production Quant::Q8 means int8-convrot") };
-    }
+    // sc-18791: packed-q8 is an ordinary released tier alongside bf16 and packed-q4 — it falls
+    // through to the unconditional arm below. Only the advanced operators are receipt-gated.
     if mode == Ltx25QuantMode::Nvfp4 && gpu != Ltx25GpuGeneration::ConsumerBlackwellSm120 {
         return Ltx25QuantAdmission::Refused { reason: format!("{MODEL_25_ID}: nvfp4 requires exact consumer Blackwell sm_120; detected {}. Datacenter Blackwell is not this lane, and fallback to bf16/q4 is forbidden", gpu.id()) };
     }
@@ -1697,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn production_selectors_do_not_alias_packed_q8_to_convrot_evidence() {
+    fn production_selectors_name_packed_tiers_and_never_convrot_evidence() {
         let base = LoadSpec::new(gen_core::WeightsSource::Dir("/weights".into()));
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base).unwrap(),
@@ -1707,18 +1704,51 @@ mod tests {
             Ltx25QuantMode::from_load_spec(&base.clone().with_quant(Quant::Q4)).unwrap(),
             Ltx25QuantMode::Q4
         );
+        // sc-18791: `Quant::Q8` selects the hosted packed q8 bundle, never the ConvRot operator.
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base.clone().with_quant(Quant::Q8)).unwrap(),
-            Ltx25QuantMode::Int8ConvRot
+            Ltx25QuantMode::PackedQ8
         );
         assert_eq!(
             Ltx25QuantMode::from_load_spec(&base.with_quant(Quant::Nvfp4)).unwrap(),
             Ltx25QuantMode::Nvfp4
         );
         assert_ne!(Ltx25QuantMode::PackedQ8, Ltx25QuantMode::Int8ConvRot);
-        assert!(
-            matches!(admit(Ltx25QuantMode::PackedQ8, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, &[]), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("terminal comparison source"))
-        );
+        // The released packed tiers are admitted unconditionally, on every classified generation:
+        // no receipt, no runtime identity, no GPU allowlist.
+        for gpu in [
+            Ltx25GpuGeneration::ConsumerBlackwellSm120,
+            Ltx25GpuGeneration::AdaSm89,
+        ] {
+            for variant in [TransformerVariant::Distilled, TransformerVariant::Dev] {
+                for mode in [
+                    Ltx25QuantMode::Bf16,
+                    Ltx25QuantMode::Q4,
+                    Ltx25QuantMode::PackedQ8,
+                ] {
+                    assert_eq!(
+                        admit(mode, gpu, variant, None, &[]),
+                        Ltx25QuantAdmission::Admitted,
+                        "{} must be a first-class production tier on {}",
+                        mode.id(),
+                        gpu.id()
+                    );
+                }
+            }
+        }
+        // The advanced operators keep their unchanged receipt gate.
+        for mode in [Ltx25QuantMode::Int8ConvRot, Ltx25QuantMode::Nvfp4] {
+            assert!(matches!(
+                admit(
+                    mode,
+                    Ltx25GpuGeneration::ConsumerBlackwellSm120,
+                    TransformerVariant::Distilled,
+                    None,
+                    &[]
+                ),
+                Ltx25QuantAdmission::Refused { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1736,7 +1766,9 @@ mod tests {
         write_minimal_safetensors(&transformer);
         write_minimal_safetensors(&encoder);
 
-        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        // sc-18791: public-snapshot staging/binding reads only the runtime identity, never the
+        // case table, so this exercises it through a published case.
+        let measured = receipt("ltx25-packed-q8-blackwell-v1");
         let mut promotion = runtime(&measured);
         promotion.model_revision = revision;
         promotion.bundle_subdir = "bundles/distilled/int8".to_owned();
@@ -1866,9 +1898,24 @@ mod tests {
         assert!(ACCEPTED_MEASUREMENT_RECEIPTS.is_empty());
         assert!(!catalog_advertised(Ltx25QuantMode::Int8ConvRot));
         assert!(!catalog_advertised(Ltx25QuantMode::Nvfp4));
-        assert!(
-            matches!(admit(Ltx25QuantMode::Int8ConvRot, Ltx25GpuGeneration::ConsumerBlackwellSm120, TransformerVariant::Distilled, None, ACCEPTED_MEASUREMENT_RECEIPTS.as_slice()), Ltx25QuantAdmission::Refused { ref reason } if reason.contains("not catalog-adopted"))
-        );
+        // sc-18791: the public release ships no advanced bundle, so no terminal case covers these
+        // modes on any generation or variant. The refusal now names the missing case instead of
+        // the empty allowlist; the outcome — never admitted — is unchanged.
+        for mode in [Ltx25QuantMode::Int8ConvRot, Ltx25QuantMode::Nvfp4] {
+            for variant in [TransformerVariant::Distilled, TransformerVariant::Dev] {
+                let result = admit(
+                    mode,
+                    Ltx25GpuGeneration::ConsumerBlackwellSm120,
+                    variant,
+                    None,
+                    ACCEPTED_MEASUREMENT_RECEIPTS.as_slice(),
+                );
+                assert!(
+                    matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("no supported terminal measurement case")),
+                    "{mode:?}/{variant:?}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1897,7 +1944,7 @@ mod tests {
 
     #[test]
     fn receipt_cannot_omit_peak_wall_quality_or_identity() {
-        let mut row = receipt("ltx25-int8-convrot-blackwell-v1");
+        let mut row = receipt("ltx25-packed-q8-blackwell-v1");
         row.peak_vram_bytes = 0;
         row.wall_clock_ms = 0;
         row.quality.temporal_boundary_drift = f64::NAN;
@@ -1920,7 +1967,7 @@ mod tests {
 
     #[test]
     fn sealed_receipt_cannot_be_replayed_across_code_model_gpu_or_case_identity() {
-        let original = receipt("ltx25-int8-convrot-blackwell-v1");
+        let original = receipt("ltx25-packed-q8-blackwell-v1");
         assert!(original.validation_errors().is_empty());
         let mut mutations = Vec::new();
         let mut code = original.clone();
@@ -1936,7 +1983,7 @@ mod tests {
         gpu.gpu_name = "different GPU".to_owned();
         mutations.push(gpu);
         let mut case = original.clone();
-        case.case_id = "ltx25-int8-convrot-blackwell-dev-v1".to_owned();
+        case.case_id = "ltx25-packed-q8-blackwell-dev-v1".to_owned();
         mutations.push(case);
         let mut variant = original.clone();
         variant.transformer_variant = TransformerVariant::Dev;
@@ -1949,22 +1996,12 @@ mod tests {
 
     #[test]
     fn production_admission_compares_every_replay_sensitive_runtime_field() {
-        let accepted = receipt("ltx25-int8-convrot-blackwell-v1");
+        // sc-18791: `admit`'s receipt arm is only reachable for a mode that owns a terminal case,
+        // and the public release ships no advanced bundle, so the gate is exercised through the
+        // predicate `admit` delegates to. Every field below is still proven replay-sensitive.
+        let accepted = receipt("ltx25-packed-q8-blackwell-v1");
         let identity = runtime(&accepted);
-        let accepted_record = Ltx25QuantAcceptedMeasurement {
-            receipt: accepted.clone(),
-            runtime: identity.clone(),
-        };
-        assert_eq!(
-            admit(
-                accepted.mode,
-                accepted.gpu_generation,
-                accepted.transformer_variant,
-                Some(&identity),
-                std::slice::from_ref(&accepted_record),
-            ),
-            Ltx25QuantAdmission::Admitted
-        );
+        assert!(receipt_matches_runtime(&accepted, &identity));
         let mutations: Vec<fn(&mut Ltx25QuantRuntimeIdentity)> = vec![
             |value| value.inference_revision = "0".repeat(40),
             |value| value.executable_contract_sha256 = "0".repeat(64),
@@ -1998,26 +2035,20 @@ mod tests {
             |value| value.operator_contract_sha256 = "0".repeat(64),
             |value| value.operator_weight_inventory_sha256 = "0".repeat(64),
         ];
-        for mutate in mutations {
+        for (index, mutate) in mutations.into_iter().enumerate() {
             let mut replay = identity.clone();
             mutate(&mut replay);
-            let result = admit(
-                accepted.mode,
-                accepted.gpu_generation,
-                accepted.transformer_variant,
-                Some(&replay),
-                std::slice::from_ref(&accepted_record),
-            );
+            assert_ne!(replay, identity, "mutation {index} changed nothing");
             assert!(
-                matches!(result, Ltx25QuantAdmission::Refused { ref reason } if reason.contains("replay")),
-                "{result:?}"
+                !receipt_matches_runtime(&accepted, &replay),
+                "mutation {index} was not replay-sensitive"
             );
         }
     }
 
     #[test]
     fn promotion_copy_proof_cannot_be_replayed_across_public_identity_or_selected_bytes() {
-        let measured = receipt("ltx25-int8-convrot-blackwell-v1");
+        let measured = receipt("ltx25-packed-q8-blackwell-v1");
         let original = runtime(&measured);
         assert!(receipt_matches_runtime(&measured, &original));
 
@@ -2036,8 +2067,10 @@ mod tests {
     }
 
     #[test]
-    fn current_pool_matrix_is_sm120_only_and_nvfp4_is_distilled_only() {
-        assert_eq!(TERMINAL_MEASUREMENT_CASES.len(), 9);
+    fn current_pool_matrix_is_sm120_only_and_covers_exactly_the_published_bundles() {
+        // sc-18791: the public SceneWorks/ltx-2.5-mlx release ships `distilled/{bf16,q4,q8}` and
+        // `dev/{bf16,q4,q8}` and nothing else, so the matrix is exactly those six rows.
+        assert_eq!(TERMINAL_MEASUREMENT_CASES.len(), 6);
         assert!(TERMINAL_MEASUREMENT_CASES
             .iter()
             .all(|case| case.gpu == Ltx25GpuGeneration::ConsumerBlackwellSm120));
@@ -2046,21 +2079,17 @@ mod tests {
                 Ltx25QuantMode::Bf16,
                 Ltx25QuantMode::Q4,
                 Ltx25QuantMode::PackedQ8,
-                Ltx25QuantMode::Int8ConvRot,
             ] {
                 assert!(TERMINAL_MEASUREMENT_CASES
                     .iter()
                     .any(|case| case.mode == mode && case.transformer_variant == variant));
             }
         }
-        assert!(TERMINAL_MEASUREMENT_CASES
-            .iter()
-            .any(|case| case.mode == Ltx25QuantMode::Nvfp4
-                && case.gpu == Ltx25GpuGeneration::ConsumerBlackwellSm120));
-        assert!(!TERMINAL_MEASUREMENT_CASES
-            .iter()
-            .any(|case| case.mode == Ltx25QuantMode::Nvfp4
-                && case.transformer_variant == TransformerVariant::Dev));
+        // No row may name an unpublished advanced bundle on any variant or generation.
+        assert!(!TERMINAL_MEASUREMENT_CASES.iter().any(|case| matches!(
+            case.mode,
+            Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
+        )));
         assert!(matches!(
             admit(
                 Ltx25QuantMode::Int8ConvRot,

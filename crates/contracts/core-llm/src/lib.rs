@@ -53,6 +53,7 @@ pub mod registry;
 pub mod request;
 pub mod schedule;
 pub mod speculative;
+pub mod starvector;
 pub mod stop;
 pub mod template;
 pub mod text_llm;
@@ -81,6 +82,12 @@ pub use registry::{
 pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use starvector::{
+    DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorBoundedStream,
+    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
+    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier,
+    VisionEncoderArchitecture,
+};
 pub use stop::{StopChunk, StopMatcher};
 pub use template::{
     ChatMlTemplate, ChatTemplate, JinjaChatTemplate, Llama3Template, RenderOptions,
