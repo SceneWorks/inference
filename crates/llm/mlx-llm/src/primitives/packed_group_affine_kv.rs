@@ -378,11 +378,17 @@ impl DenseFallbackPackedDecoderCache {
         self.staged.fallback_events()
     }
 
+    /// Pending device snapshots are rollback-only state. They contribute to the telemetry's
+    /// logical transient high-water, never to cache-resident representation evidence.
     fn pending_device_snapshot_overhead(&self) -> u64 {
         self.pending_step.as_ref().map_or(0, |pending| {
-            self.staged
-                .device_layers_logical_bytes(&pending.device_layers[..pending.next_layer])
-                as u64
+            // `usize` is always representable by `u64` on supported Rust targets; retain a
+            // fail-closed zero if that platform invariant ever stops holding.
+            u64::try_from(
+                self.staged
+                    .device_layers_logical_bytes(&pending.device_layers[..pending.next_layer]),
+            )
+            .unwrap_or_default()
         })
     }
 
@@ -390,6 +396,19 @@ impl DenseFallbackPackedDecoderCache {
     pub fn model_evidence(&self) -> PackedCacheEvidence {
         let telemetry = self.staged.dispatch_telemetry();
         let representation = self.staged.representation();
+        let (code_bytes, metadata_bytes) = self.staged.retained_device_component_bytes();
+        let (pending_code_bytes, pending_metadata_bytes) =
+            self.pending_step.as_ref().map_or((0, 0), |pending| {
+                self.staged
+                    .device_layers_component_bytes(&pending.device_layers[..pending.next_layer])
+            });
+        // A failed host-size conversion becomes zero, which the sealed SC-20676 reducer rejects
+        // rather than accepting an inexact physical-representation claim.
+        let retained_device_code_bytes =
+            u64::try_from(code_bytes.saturating_add(pending_code_bytes)).unwrap_or_default();
+        let retained_device_metadata_bytes =
+            u64::try_from(metadata_bytes.saturating_add(pending_metadata_bytes))
+                .unwrap_or_default();
         PackedCacheEvidence {
             representation_identity: representation.identity,
             representation_version: representation.version,
@@ -408,9 +427,10 @@ impl DenseFallbackPackedDecoderCache {
             steady_elapsed_ms: telemetry.steady_elapsed_ms,
             uploaded_packed_bytes: telemetry.uploaded_packed_bytes,
             accepted_uploaded_packed_bytes: telemetry.accepted_uploaded_packed_bytes,
-            retained_device_packed_logical_bytes: telemetry
-                .retained_device_packed_logical_bytes
-                .saturating_add(self.pending_device_snapshot_overhead()),
+            retained_device_code_bytes,
+            retained_device_metadata_bytes,
+            retained_device_packed_logical_bytes: retained_device_code_bytes
+                .saturating_add(retained_device_metadata_bytes),
             peak_packed_argument_logical_bytes: telemetry.peak_packed_argument_logical_bytes,
             peak_packed_transient_logical_bytes: telemetry.peak_packed_transient_logical_bytes,
             dense_active: self.dense_active,
@@ -1921,30 +1941,78 @@ impl PackedGroupAffineKvCache {
     }
 
     fn device_layer_logical_bytes(&self, device: &DevicePackedLayer) -> usize {
+        let (codes, metadata) = self.device_layer_component_bytes(device);
+        codes.saturating_add(metadata)
+    }
+
+    /// Components of the arrays actually retained by one device layer. Codes are Uint8 packed
+    /// arrays; scale/zero metadata is Float16. DevicePackedLayer's resident array presence and
+    /// dimensions are the source of truth, rather than traffic or dispatch-argument counters.
+    fn device_layer_component_bytes(&self, device: &DevicePackedLayer) -> (usize, usize) {
         let rows = self.rows();
         let key_bytes = (self.group_size * self.head_dimension).div_ceil(PACKED_CODES_PER_BYTE);
         let value_bytes = self.head_dimension.div_ceil(PACKED_CODES_PER_BYTE);
         let value_groups = self.head_dimension.div_ceil(self.group_size);
-        device
+        let key_code_bytes = device
             .key_groups
             .saturating_mul(rows)
-            .saturating_mul(
-                key_bytes.saturating_add(
-                    self.head_dimension
-                        .saturating_mul(2 * std::mem::size_of::<f16>()),
-                ),
-            )
-            .saturating_add(
-                device.value_tokens.saturating_mul(rows).saturating_mul(
-                    value_bytes.saturating_add(
-                        value_groups.saturating_mul(2 * std::mem::size_of::<f16>()),
-                    ),
-                ),
-            )
+            .saturating_mul(key_bytes);
+        let value_code_bytes = device
+            .value_tokens
+            .saturating_mul(rows)
+            .saturating_mul(value_bytes);
+        let key_metadata_bytes = device
+            .key_groups
+            .saturating_mul(rows)
+            .saturating_mul(self.head_dimension)
+            .saturating_mul(std::mem::size_of::<f16>());
+        let value_metadata_bytes = device
+            .value_tokens
+            .saturating_mul(rows)
+            .saturating_mul(value_groups)
+            .saturating_mul(std::mem::size_of::<f16>());
+        // Key groups are legitimately absent until a complete group is available, while values
+        // are retained per token. Account each live device array independently so a partial tail
+        // neither vanishes from residency evidence nor invents an absent sibling array.
+        let codes = if device.key_codes.is_some() {
+            key_code_bytes
+        } else {
+            0
+        }
+        .saturating_add(if device.value_codes.is_some() {
+            value_code_bytes
+        } else {
+            0
+        });
+        let metadata = (if device.key_scales.is_some() {
+            key_metadata_bytes
+        } else {
+            0
+        })
+        .saturating_add(if device.key_zeros.is_some() {
+            key_metadata_bytes
+        } else {
+            0
+        })
+        .saturating_add(if device.value_scales.is_some() {
+            value_metadata_bytes
+        } else {
+            0
+        })
+        .saturating_add(if device.value_zeros.is_some() {
+            value_metadata_bytes
+        } else {
+            0
+        });
+        (codes, metadata)
     }
 
     pub fn retained_device_packed_logical_bytes(&self) -> usize {
         self.device_layers_logical_bytes(&self.device_layers)
+    }
+
+    pub fn retained_device_component_bytes(&self) -> (usize, usize) {
+        self.device_layers_component_bytes(&self.device_layers)
     }
 
     fn device_layers_logical_bytes(&self, layers: &[Option<DevicePackedLayer>]) -> usize {
@@ -1953,6 +2021,22 @@ impl PackedGroupAffineKvCache {
             .flatten()
             .map(|device| self.device_layer_logical_bytes(device))
             .sum()
+    }
+
+    fn device_layers_component_bytes(
+        &self,
+        layers: &[Option<DevicePackedLayer>],
+    ) -> (usize, usize) {
+        layers
+            .iter()
+            .flatten()
+            .fold((0, 0), |(codes, metadata), device| {
+                let (next_codes, next_metadata) = self.device_layer_component_bytes(device);
+                (
+                    codes.saturating_add(next_codes),
+                    metadata.saturating_add(next_metadata),
+                )
+            })
     }
 
     fn padded_pending_key_tensor(

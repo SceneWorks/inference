@@ -29,6 +29,9 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 ];
 pub const QUALITY_CONTRACT_HASH: &str =
     "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d2";
+/// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
+pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
+pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
@@ -883,6 +886,28 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_
     serde_json::to_vec_pretty(&stable(value))
 }
 
+/// Seal the same semantic core used by the SC-20671 artifact publisher.  Consumers must never
+/// treat a sidecar or a syntactically valid receipt as proof that `receiptSha256` binds it.
+pub fn receipt_semantic_seal(receipt: &Receipt) -> Result<String, String> {
+    let mut value = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+    value
+        .as_object_mut()
+        .ok_or("receipt is not an object")?
+        .remove("receiptSha256");
+    Ok(seal_bytes(
+        &canonical_json_bytes(&value).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Validate a receipt together with the semantic-core seal embedded by the producer.
+pub fn validate_sealed_receipt(receipt: &Receipt) -> Result<(), String> {
+    validate_receipt_semantics(receipt)?;
+    if receipt.receipt_sha256 != receipt_semantic_seal(receipt)? {
+        return Err("receipt semantic-core seal does not match receiptSha256".into());
+    }
+    Ok(())
+}
+
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let rfc3339 = |v: &str| {
         let b = v.as_bytes();
@@ -1418,7 +1443,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("quality evidence contains invalid numeric values".into());
     }
     if receipt.mode == "compressed"
-        && (receipt.quality.parity_max_error > 0.0001 || receipt.quality.perplexity_delta > 0.01)
+        && (receipt.quality.parity_max_error > COMPRESSED_PARITY_MAX_ERROR
+            || receipt.quality.perplexity_delta > 0.01)
     {
         return Err(format!(
             "quality thresholds failed: parityMaxError={}, perplexityDelta={}, greedyTokenAgreement={}, structuredToolAgreement={}, needleRetrieval={}, multiTurnPromptCache={}",
@@ -1437,7 +1463,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("quality contract evidence incomplete".into());
     }
     if (receipt.mode == "compressed"
-        && (receipt.quality.greedy_token_agreement < 0.999
+        && (receipt.quality.greedy_token_agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN
             || receipt.quality.structured_tool_agreement < 1.0
             || receipt.quality.needle_retrieval < 1.0
             || receipt.quality.multi_turn_prompt_cache < 1.0))
@@ -1980,7 +2006,7 @@ fn coordinate_slug(coordinate: &Coordinate) -> String {
     )
 }
 
-fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
+pub fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     let provenance = &receipt.provenance;
     canonical_json_bytes(&serde_json::json!({
         "sceneWorksRepository": provenance.scene_works_repository,
@@ -2001,7 +2027,7 @@ fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     .map_err(|error| error.to_string())
 }
 
-fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
+pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     let provenance = &receipt.provenance;
     let geometry = &receipt.geometry;
     canonical_json_bytes(&serde_json::json!({
@@ -2172,6 +2198,226 @@ pub fn publish_complete_campaign(
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+/// The one SC-20671 coordinate SC-20676 may bind for a family. It is deliberately the frozen
+/// memory-material long-context row, not the campaign's near-fit calibration row.
+pub const SC20676_BASELINE_CONTEXT_BAND: &str = "memory-material";
+
+/// A sealed candidate baseline selected from a complete SC-20671 64-coordinate publication.
+/// `inventory` is recomputed from the tested snapshot by the consumer and compared byte-for-byte.
+#[derive(Clone, Debug)]
+pub struct Sc20676BaselineRow {
+    pub receipt: Receipt,
+    pub coordinate: Coordinate,
+}
+
+fn manifest_file_bindings(
+    bundle: &ArtifactBundle,
+) -> std::collections::BTreeMap<String, (String, String)> {
+    let mut files = std::collections::BTreeMap::new();
+    files.insert(
+        bundle.receipt_name.clone(),
+        (
+            seal_bytes(&bundle.receipt),
+            seal_bytes(bundle.receipt_sidecar.as_bytes()),
+        ),
+    );
+    files.insert(
+        bundle.human_name.clone(),
+        (
+            seal_bytes(&bundle.human),
+            seal_bytes(bundle.human_sidecar.as_bytes()),
+        ),
+    );
+    for fixture in &bundle.fixtures {
+        files.insert(
+            fixture.name.clone(),
+            (
+                seal_bytes(&fixture.bytes),
+                seal_bytes(fixture.sidecar.as_bytes()),
+            ),
+        );
+    }
+    files
+}
+
+/// Reconstruct and validate the exact published SC-20671 campaign, including every artifact
+/// bundle named by the campaign manifest.  This is stricter than a receipt-only consumer: a
+/// selected row is trusted only after all 64 receipt/human/fixture bytes, sidecars, identities,
+/// and product worker PIDs have been bound back to the whole campaign.
+pub fn load_validated_complete_campaign(
+    campaign_directory: &Path,
+) -> Result<Vec<PreparedCoordinateReceipt>, String> {
+    let manifest = fs::read(campaign_directory.join("campaign.json")).map_err(|e| e.to_string())?;
+    let sidecar = fs::read_to_string(campaign_directory.join("campaign.json.sha256"))
+        .map_err(|e| e.to_string())?;
+    if sidecar != format!("{}  campaign.json\n", seal_bytes(&manifest)) {
+        return Err("SC-20671 campaign manifest sidecar does not match exact bytes".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
+    if value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || value.get("kind").and_then(serde_json::Value::as_str)
+            != Some("sc-20671-complete-coordinate-set")
+    {
+        return Err("SC-20671 campaign manifest identity is invalid".into());
+    }
+    let rows = value
+        .get("coordinates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("SC-20671 campaign manifest has no coordinate rows")?;
+    let schedule = required_schedule();
+    if rows.len() != schedule.len() {
+        return Err("SC-20671 campaign manifest is not a complete 64-coordinate set".into());
+    }
+    let mut prepared = Vec::with_capacity(schedule.len());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut global_identity = None;
+    let mut family_identities = std::collections::BTreeMap::new();
+    let mut outcomes = Vec::with_capacity(schedule.len());
+    for row in rows {
+        let slug = row
+            .get("coordinate")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("campaign coordinate is missing")?;
+        let expected_sha = row
+            .get("receiptSha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("campaign receipt seal is missing")?;
+        if !seen.insert(slug.to_owned()) {
+            return Err("SC-20671 campaign manifest repeats a coordinate".into());
+        }
+        let coordinate = schedule
+            .iter()
+            .find(|entry| coordinate_slug(&entry.coordinate) == slug)
+            .map(|entry| entry.coordinate.clone())
+            .ok_or("SC-20671 campaign manifest contains an unknown coordinate")?;
+        let item =
+            load_prepared_coordinate_receipt(&campaign_directory.join(slug), coordinate.clone())?;
+        let receipt: Receipt =
+            serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+        validate_sealed_receipt(&receipt)?;
+        let worker_pid = receipt
+            .memory
+            .phase_samples
+            .first()
+            .ok_or("SC-20671 receipt has no process-start phase")?
+            .pid;
+        if receipt.receipt_sha256 != expected_sha
+            || receipt.matrix.family != coordinate.family
+            || receipt.matrix.context_band != coordinate.context_band
+            || receipt.matrix.request_mode != coordinate.request_mode
+            || receipt.matrix.prefill_mode != coordinate.prefill_mode
+            || receipt.matrix.process_temperature != coordinate.process_temperature
+            || row.get("workerPid").and_then(serde_json::Value::as_u64)
+                != Some(u64::from(worker_pid))
+        {
+            return Err("SC-20671 manifest/receipt coordinate, PID, or seal mismatch".into());
+        }
+        let listed = row
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("SC-20671 campaign manifest row has no artifact files")?;
+        let mut manifest_files = std::collections::BTreeMap::new();
+        for file in listed {
+            let name = file
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("campaign artifact name is missing")?;
+            let bytes = file
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("campaign artifact byte seal is missing")?;
+            let sidecar = file
+                .get("sidecarSha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("campaign artifact sidecar seal is missing")?;
+            if manifest_files
+                .insert(name.to_owned(), (bytes.to_owned(), sidecar.to_owned()))
+                .is_some()
+            {
+                return Err("SC-20671 campaign manifest repeats an artifact file".into());
+            }
+        }
+        if manifest_files != manifest_file_bindings(&item.bundle) {
+            return Err("SC-20671 manifest artifact bytes or sidecars do not match bundle".into());
+        }
+        let discipline = if coordinate.process_temperature == "cold" {
+            ProcessDiscipline::FreshChild
+        } else {
+            ProcessDiscipline::ReusedWarmWorker
+        };
+        outcomes.push((coordinate.clone(), discipline, worker_pid));
+        let identity = campaign_global_identity(&receipt)?;
+        if let Some(expected) = &global_identity {
+            if expected != &identity {
+                return Err("SC-20671 campaign global identity drifted".into());
+            }
+        } else {
+            global_identity = Some(identity);
+        }
+        let family_identity = campaign_family_identity(&receipt)?;
+        if let Some(expected) = family_identities.get(coordinate.family) {
+            if expected != &family_identity {
+                return Err("SC-20671 campaign family identity drifted".into());
+            }
+        } else {
+            family_identities.insert(coordinate.family, family_identity);
+        }
+        prepared.push(item);
+    }
+    if seen.len() != schedule.len() || family_identities.len() != 2 {
+        return Err("SC-20671 campaign omits a scheduled coordinate or family identity".into());
+    }
+    validate_schedule_outcomes(&schedule, &outcomes)?;
+    Ok(prepared)
+}
+
+/// Load and validate a whole published SC-20671 campaign before selecting the one exact long-
+/// context candidate row for `family`.  This never accepts a standalone receipt: all 64 immutable
+/// schedule rows, manifest hashes, receipt seals, and coordinate/family matches must be present.
+pub fn select_sc20676_baseline_row(
+    campaign_directory: &Path,
+    family: &str,
+) -> Result<Sc20676BaselineRow, String> {
+    if !["llama", "qwen"].contains(&family) {
+        return Err("SC-20676 baseline family must be llama or qwen".into());
+    }
+    let mut selected = None;
+    for item in load_validated_complete_campaign(campaign_directory)? {
+        let coordinate = item.coordinate;
+        let receipt: Receipt =
+            serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+        if coordinate.family == family
+            && coordinate.context_band == SC20676_BASELINE_CONTEXT_BAND
+            && coordinate.request_mode == "single"
+            && coordinate.prefill_mode == "single-shot"
+            && coordinate.process_temperature == "warm"
+            && selected
+                .replace(Sc20676BaselineRow {
+                    receipt,
+                    coordinate,
+                })
+                .is_some()
+        {
+            return Err("SC-20671 campaign contains multiple SC-20676 baseline rows".into());
+        }
+    }
+    selected.ok_or("SC-20671 complete campaign lacks the required long-context baseline row".into())
+}
+
+/// Reuse SC-20671's immutable candidate snapshot contract rather than accepting an arbitrary
+/// Llama/Qwen directory for SC-20676 evidence.
+pub fn validate_sc20676_candidate_snapshot(
+    family: &str,
+    snapshot: &Path,
+) -> Result<SnapshotInventory, String> {
+    let spec = benchmark_model(family, false)?;
+    validate_benchmark_snapshot(snapshot, spec)?;
+    inventory_snapshot(snapshot).map_err(|e| e.to_string())
 }
 
 /// Load a child-produced sealed set for the parent transaction.  This is intentionally strict:
@@ -4756,7 +5002,9 @@ fn checked_git_revision(root: &Path) -> Result<String, String> {
     Ok(revision)
 }
 
-fn canonical_github_repository(remote: &str) -> Result<String, String> {
+/// Normalize only an authenticated GitHub origin form; callers compare the result with a frozen
+/// repository identity instead of stamping a path supplied by the environment.
+pub fn canonical_github_repository(remote: &str) -> Result<String, String> {
     let remote = remote.trim().trim_end_matches('/');
     let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
         path
@@ -4788,7 +5036,8 @@ fn canonical_github_repository(remote: &str) -> Result<String, String> {
     Ok(format!("github.com/{}/{}", components[0], components[1]))
 }
 
-fn checked_repository_identity(root: &Path, expected: &str) -> Result<String, String> {
+/// Read and validate a worktree's `origin` against the source-owned repository identity.
+pub fn checked_repository_identity(root: &Path, expected: &str) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -4809,13 +5058,13 @@ fn checked_repository_identity(root: &Path, expected: &str) -> Result<String, St
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LockedMlxIdentity {
-    version: String,
-    source: String,
-    revision: String,
+pub struct LockedMlxIdentity {
+    pub version: String,
+    pub source: String,
+    pub revision: String,
 }
 
-fn locked_mlx_identity(lock: &[u8]) -> Result<LockedMlxIdentity, String> {
+pub fn locked_mlx_identity(lock: &[u8]) -> Result<LockedMlxIdentity, String> {
     let text = std::str::from_utf8(lock).map_err(|e| e.to_string())?;
     let quoted = |block: &str, key: &str| {
         block.lines().find_map(|line| {
@@ -4879,7 +5128,7 @@ fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, S
 
 /// `pmset -g therm` is verbose diagnostic text, never a receipt state.  Accept only an explicit
 /// no-throttling/no-pressure observation and normalize it to the schema's semantic `nominal`.
-fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
+pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
     let normalized = value.to_ascii_lowercase();
     if normalized.contains("not nominal")
         || normalized.contains("throttl")

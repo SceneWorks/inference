@@ -14,6 +14,7 @@
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
@@ -40,7 +41,7 @@ pub enum PackedAttentionMask {
 /// Immutable evidence exported by an experimental packed cache at the same trait-object boundary
 /// used by the decoder.  A sealed harness must not need private-field access or a storage-only test
 /// path to prove that model calls stayed compressed-domain.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct PackedCacheEvidence {
     pub representation_identity: String,
     pub representation_version: u32,
@@ -59,6 +60,12 @@ pub struct PackedCacheEvidence {
     pub steady_elapsed_ms: f64,
     pub uploaded_packed_bytes: u64,
     pub accepted_uploaded_packed_bytes: u64,
+    /// Cache-resident packed code arrays, derived from the live device representation rather than
+    /// cumulative upload traffic.
+    pub retained_device_code_bytes: u64,
+    /// Cache-resident scale/zero arrays, derived from the live device representation rather than
+    /// dispatch arguments or allocator high-water.
+    pub retained_device_metadata_bytes: u64,
     pub retained_device_packed_logical_bytes: u64,
     pub peak_packed_argument_logical_bytes: u64,
     pub peak_packed_transient_logical_bytes: u64,

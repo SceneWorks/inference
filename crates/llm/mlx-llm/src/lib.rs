@@ -52,6 +52,7 @@ pub mod prepare;
 pub mod primitives;
 pub mod provider;
 pub mod residency;
+pub mod sc20676_evidence;
 pub mod snapshot;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
