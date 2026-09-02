@@ -303,10 +303,9 @@ fn observe_cache_events(
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return Ok(());
     };
-    let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
-            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+            continue;
         } else if event.lifetime == "released" {
             observer.release_event(event.operation, event.role, event.bytes);
         } else {
@@ -314,22 +313,7 @@ fn observe_cache_events(
         }
     }
     *seen = cache.events().len();
-    if !latest_by_layer.is_empty() {
-        let bytes = latest_by_layer
-            .values()
-            .try_fold(0_u64, |total, (bytes, _)| {
-                total.checked_add(*bytes).ok_or_else(|| {
-                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
-                })
-            })?;
-        let tokens = latest_by_layer
-            .values()
-            .map(|(_, tokens)| *tokens)
-            .max()
-            .unwrap_or_default();
-        let element_bytes = cache.element_bytes()?.ok_or_else(|| {
-            crate::error::Error::Msg("persistent KV snapshot has no retained arrays".into())
-        })?;
+    if let Some((bytes, tokens, element_bytes)) = cache.retained_snapshot()? {
         observer.cache_snapshot(bytes, tokens, element_bytes);
     }
     Ok(())

@@ -45,6 +45,94 @@ pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
 pub const SC20671_MIN_NATIVE_CONTEXT_TOKENS: u64 = 32 * 1024;
 
+fn valid_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let fixed = |index: usize| bytes.get(index).is_some_and(u8::is_ascii_digit);
+    let shape = (bytes.len() == 20
+        || (bytes.len() >= 22 && bytes[19] == b'.' && bytes[bytes.len() - 1] == b'Z'))
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && bytes.last() == Some(&b'Z')
+        && (0..4).all(fixed)
+        && (5..7).all(fixed)
+        && (8..10).all(fixed)
+        && (11..13).all(fixed)
+        && (14..16).all(fixed)
+        && (17..19).all(fixed)
+        && (bytes.len() == 20 || (20..bytes.len() - 1).all(fixed));
+    if !shape {
+        return false;
+    }
+    let parse =
+        |range: std::ops::Range<usize>| value.get(range).and_then(|part| part.parse::<u32>().ok());
+    let year = parse(0..4).unwrap_or(0);
+    let month = parse(5..7).unwrap_or(0);
+    let day = parse(8..10).unwrap_or(0);
+    let hour = parse(11..13).unwrap_or(99);
+    let minute = parse(14..16).unwrap_or(99);
+    let second = parse(17..19).unwrap_or(99);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [
+        0,
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    (1..=12).contains(&month)
+        && day >= 1
+        && day <= days[month as usize]
+        && hour < 24
+        && minute < 60
+        && second < 60
+}
+
+fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    if !valid_utc_timestamp(left) || !valid_utc_timestamp(right) {
+        return None;
+    }
+    let whole_seconds = left[..19].cmp(&right[..19]);
+    if whole_seconds != std::cmp::Ordering::Equal {
+        return Some(whole_seconds);
+    }
+    let left_fraction = if left.len() == 20 {
+        &[][..]
+    } else {
+        &left.as_bytes()[20..left.len() - 1]
+    };
+    let right_fraction = if right.len() == 20 {
+        &[][..]
+    } else {
+        &right.as_bytes()[20..right.len() - 1]
+    };
+    for index in 0..left_fraction.len().max(right_fraction.len()) {
+        let ordering = left_fraction
+            .get(index)
+            .copied()
+            .unwrap_or(b'0')
+            .cmp(&right_fraction.get(index).copied().unwrap_or(b'0'));
+        if ordering != std::cmp::Ordering::Equal {
+            return Some(ordering);
+        }
+    }
+    Some(std::cmp::Ordering::Equal)
+}
+
+fn utc_timestamp_before(left: &str, right: &str) -> bool {
+    compare_utc_timestamps(left, right) == Some(std::cmp::Ordering::Less)
+}
+
 /// One file which must be present, byte-for-byte, in a SC-20671 benchmark snapshot.
 /// Binding every published safetensors payload and the parsed config is sufficient to reject a
 /// caller-provided model substitution without inventing a cache path convention.
@@ -759,7 +847,7 @@ impl ReceiptBuilder {
         if self
             .phases
             .windows(2)
-            .any(|w| w[0].timestamp >= w[1].timestamp)
+            .any(|w| !utc_timestamp_before(&w[0].timestamp, &w[1].timestamp))
         {
             return Err("phase timestamps are not strictly increasing".into());
         }
@@ -923,57 +1011,6 @@ pub fn validate_sealed_receipt(receipt: &Receipt) -> Result<(), String> {
 }
 
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
-    let rfc3339 = |v: &str| {
-        let b = v.as_bytes();
-        let fixed = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
-        let shape = (b.len() == 20 || (b.len() >= 22 && b[19] == b'.' && b[b.len() - 1] == b'Z'))
-            && b.get(4) == Some(&b'-')
-            && b.get(7) == Some(&b'-')
-            && b.get(10) == Some(&b'T')
-            && b.get(13) == Some(&b':')
-            && b.get(16) == Some(&b':')
-            && b.last() == Some(&b'Z')
-            && (0..4).all(fixed)
-            && (5..7).all(fixed)
-            && (8..10).all(fixed)
-            && (11..13).all(fixed)
-            && (14..16).all(fixed)
-            && (17..19).all(fixed)
-            && (b.len() == 20 || (20..b.len() - 1).all(fixed));
-        if !shape {
-            return false;
-        }
-        let parse =
-            |range: std::ops::Range<usize>| v.get(range).and_then(|part| part.parse::<u32>().ok());
-        let year = parse(0..4).unwrap_or(0);
-        let month = parse(5..7).unwrap_or(0);
-        let day = parse(8..10).unwrap_or(0);
-        let hour = parse(11..13).unwrap_or(99);
-        let minute = parse(14..16).unwrap_or(99);
-        let second = parse(17..19).unwrap_or(99);
-        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let days = [
-            0,
-            31,
-            if leap { 29 } else { 28 },
-            31,
-            30,
-            31,
-            30,
-            31,
-            31,
-            30,
-            31,
-            30,
-            31,
-        ];
-        (1..=12).contains(&month)
-            && day >= 1
-            && day <= days[month as usize]
-            && hour < 24
-            && minute < 60
-            && second < 60
-    };
     let lowercase_hex = |v: &str, len: usize| {
         v.len() == len
             && v.bytes()
@@ -993,7 +1030,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }
     if !["dense", "compressed"].contains(&receipt.mode.as_str())
         || receipt.run_id.is_empty()
-        || !rfc3339(&receipt.captured_at)
+        || !valid_utc_timestamp(&receipt.captured_at)
     {
         return Err("receipt timestamp/run id is malformed".into());
     }
@@ -1092,13 +1129,13 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
                     || p.source != "footprint -p"
                     || p.mlx.source != "mlx_rs::memory"
                     || p.phys_footprint_peak_bytes < p.phys_footprint_bytes
-                    || !rfc3339(&p.timestamp)
+                    || !valid_utc_timestamp(&p.timestamp)
             })
     {
         return Err("phase PID evidence is inconsistent".into());
     }
     if receipt.memory.phase_samples.windows(2).any(|w| {
-        w[0].timestamp >= w[1].timestamp
+        !utc_timestamp_before(&w[0].timestamp, &w[1].timestamp)
             || w[1].phys_footprint_peak_bytes < w[0].phys_footprint_peak_bytes
     }) || receipt
         .memory
@@ -1119,13 +1156,23 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("memory containment failed".into());
     }
     for event in &receipt.memory.allocation_events {
+        let phase_index = REQUIRED_PHASES
+            .iter()
+            .position(|phase| *phase == event.phase)
+            .ok_or_else(|| "allocation event is malformed".to_string())?;
+        let phase_start = &receipt.memory.phase_samples[phase_index];
+        let next_phase = receipt.memory.phase_samples.get(phase_index + 1);
         if event.bytes == 0
             || !["cache", "attention-workspace", "weights", "output"].contains(&event.role.as_str())
             || !["persistent", "transient", "released"].contains(&event.lifetime.as_str())
             || event.phase.is_empty()
             || event.kind.is_empty()
             || !REQUIRED_PHASES.contains(&event.phase.as_str())
-            || !rfc3339(&event.timestamp)
+            || !valid_utc_timestamp(&event.timestamp)
+            || compare_utc_timestamps(&event.timestamp, &phase_start.timestamp)
+                != Some(std::cmp::Ordering::Greater)
+            || next_phase
+                .is_some_and(|sample| !utc_timestamp_before(&event.timestamp, &sample.timestamp))
         {
             return Err("allocation event is malformed".into());
         }
@@ -1156,6 +1203,34 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .map(|event| event.bytes)
         .max()
         .unwrap_or(0);
+    let max_phase_role = |phase: &str, role: &str, lifetime: &str| {
+        receipt
+            .memory
+            .allocation_events
+            .iter()
+            .filter(|event| {
+                event.phase == phase && event.role == role && event.lifetime == lifetime
+            })
+            .map(|event| event.bytes)
+            .max()
+            .unwrap_or(0)
+    };
+    let max_phase_transient = |phase: &str| {
+        receipt
+            .memory
+            .allocation_events
+            .iter()
+            .filter(|event| {
+                event.phase == phase
+                    && event.lifetime == "transient"
+                    && (event.role == "cache"
+                        || event.role == "attention-workspace"
+                        || event.role == "output")
+            })
+            .map(|event| event.bytes)
+            .max()
+            .unwrap_or(0)
+    };
     if max_role("weights", "persistent") != receipt.memory.model_weights_bytes
         || max_role("cache", "persistent") != receipt.memory.persistent_kv_bytes
         || max_transient != receipt.memory.transient_workspace_bytes
@@ -1235,7 +1310,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     }
     let weights = receipt.memory.model_weights_bytes;
     let kv = receipt.memory.persistent_kv_bytes;
-    let workspace = receipt.memory.transient_workspace_bytes;
     let sample_for = |phase: &str| {
         receipt
             .memory
@@ -1262,23 +1336,31 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("weights-loaded MLX active bytes do not contain weights".into());
     }
     let prefill_peak_window = &receipt.memory.prefill_peak_window;
-    if !rfc3339(&prefill_peak_window.started_at)
-        || prefill_peak_window.started_at <= weights_loaded.timestamp
+    if !valid_utc_timestamp(&prefill_peak_window.started_at)
+        || compare_utc_timestamps(&prefill_peak_window.started_at, &weights_loaded.timestamp)
+            != Some(std::cmp::Ordering::Greater)
         || prefill_peak_window.reset_peak_bytes != 0
         || prefill_peak_window.baseline_active_bytes < weights_loaded.mlx.active_bytes
     {
         return Err("MLX prefill peak window is invalid".into());
     }
     let prefill = sample_for("prefill-peak")?;
-    if prefill_peak_window.started_at >= prefill.timestamp {
+    if !utc_timestamp_before(&prefill_peak_window.started_at, &prefill.timestamp) {
         return Err("MLX prefill peak window is not ordered before prefill".into());
     }
+    let prefill_kv = max_phase_role("prefill-peak", "cache", "persistent");
+    let decode_kv = max_phase_role("decode-steady", "cache", "persistent");
+    if prefill_kv == 0 || prefill_kv > kv || decode_kv != kv {
+        return Err("phase-local persistent KV snapshots do not reconcile".into());
+    }
+    let prefill_workspace = max_phase_transient("prefill-peak");
+    let decode_workspace = max_phase_transient("decode-steady");
     let prefill_active_floor = prefill_peak_window
         .baseline_active_bytes
-        .checked_add(kv)
+        .checked_add(prefill_kv)
         .ok_or("prefill persistent memory floor overflows u64")?;
     let prefill_peak_floor = prefill_active_floor
-        .checked_add(workspace)
+        .checked_add(prefill_workspace)
         .ok_or("prefill attributed peak floor overflows u64")?;
     // The instantaneous sample must retain the phase-local baseline and KV. Transient workspace may
     // be released by the time the post-dispatch sample is captured, so the sealed reset window
@@ -1287,18 +1369,47 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || prefill.mlx.peak_bytes < prefill_peak_floor
     {
         return Err(format!(
-            "prefill MLX samples do not contain attributed allocations: baselineActiveBytes={}, persistentKvBytes={kv}, transientWorkspaceBytes={workspace}, activeBytes={}, activeFloor={prefill_active_floor}, peakBytes={}, peakFloor={prefill_peak_floor}",
+            "prefill MLX samples do not contain phase-local attributed allocations: baselineActiveBytes={}, prefillPersistentKvBytes={prefill_kv}, prefillTransientBytes={prefill_workspace}, activeBytes={}, activeFloor={prefill_active_floor}, peakBytes={}, peakFloor={prefill_peak_floor}",
             prefill_peak_window.baseline_active_bytes,
             prefill.mlx.active_bytes,
             prefill.mlx.peak_bytes,
         ));
     }
     let decode = sample_for("decode-steady")?;
-    let decode_total = weights
-        .checked_add(kv)
-        .ok_or("decode attributed memory overflows u64")?;
-    if active_delta(decode)? < decode_total {
-        return Err("decode MLX active bytes do not contain weights and KV".into());
+    let decode_active_floor = prefill_peak_window
+        .baseline_active_bytes
+        .checked_add(decode_kv)
+        .ok_or("decode persistent memory floor overflows u64")?;
+    let decode_peak_floor = decode_active_floor
+        .checked_add(decode_workspace)
+        .ok_or("decode attributed peak floor overflows u64")?;
+    if decode.mlx.active_bytes < decode_active_floor || decode.mlx.peak_bytes < decode_peak_floor {
+        return Err("decode MLX samples do not contain phase-local attributed allocations".into());
+    }
+    for phase in REQUIRED_PHASES
+        .into_iter()
+        .filter(|phase| !["prefill-peak", "decode-steady"].contains(phase))
+    {
+        let transient = max_phase_transient(phase);
+        if transient == 0 {
+            continue;
+        }
+        let persistent = max_phase_role(phase, "cache", "persistent");
+        if persistent == 0 {
+            return Err(format!(
+                "{phase} transient evidence has no phase-local persistent KV snapshot"
+            ));
+        }
+        let peak_floor = prefill_peak_window
+            .baseline_active_bytes
+            .checked_add(persistent)
+            .and_then(|bytes| bytes.checked_add(transient))
+            .ok_or("phase-local attributed peak floor overflows u64")?;
+        if sample_for(phase)?.mlx.peak_bytes < peak_floor {
+            return Err(format!(
+                "{phase} MLX peak bytes do not contain phase-local attributed allocations"
+            ));
+        }
     }
     if receipt.mode == "dense"
         && receipt.memory.persistent_kv_bytes.abs_diff(dense)
@@ -4051,7 +4162,7 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
         if self
             .samples
             .windows(2)
-            .any(|w| w[0].timestamp >= w[1].timestamp)
+            .any(|w| !utc_timestamp_before(&w[0].timestamp, &w[1].timestamp))
         {
             return Err("phase timestamps are not strictly increasing".into());
         }
@@ -6108,6 +6219,14 @@ mod tests {
                 bytes: 1,
             },
             ReceiptAllocation {
+                kind: "dense-kv-allocation".into(),
+                role: "cache".into(),
+                lifetime: "persistent".into(),
+                phase: "decode-steady".into(),
+                timestamp: "2026-01-01T00:00:04.100Z".into(),
+                bytes: 4,
+            },
+            ReceiptAllocation {
                 kind: "product-cache_release".into(),
                 role: "cache".into(),
                 lifetime: "released".into(),
@@ -6225,6 +6344,22 @@ mod tests {
         let mut phase_tampered = receipt.clone();
         phase_tampered.memory.phase_samples[3].source = "caller-authored".into();
         assert!(validate_receipt_semantics(&phase_tampered).is_err());
+        let mut event_outside_phase = receipt.clone();
+        event_outside_phase.memory.allocation_events[1].timestamp =
+            "2026-01-01T00:00:03.100Z".into();
+        assert!(validate_receipt_semantics(&event_outside_phase).is_err());
+        let mut event_at_phase_start = receipt.clone();
+        event_at_phase_start.memory.allocation_events[1].timestamp =
+            event_at_phase_start.memory.phase_samples[2]
+                .timestamp
+                .clone();
+        assert!(validate_receipt_semantics(&event_at_phase_start).is_err());
+        let mut equivalent_fractional_phase_start = receipt.clone();
+        equivalent_fractional_phase_start.memory.phase_samples[2].timestamp =
+            "2026-01-01T00:00:02.0000Z".into();
+        equivalent_fractional_phase_start.memory.allocation_events[1].timestamp =
+            "2026-01-01T00:00:02.000Z".into();
+        assert!(validate_receipt_semantics(&equivalent_fractional_phase_start).is_err());
         let mut calendar_tampered = receipt.clone();
         calendar_tampered.memory.phase_samples[0].timestamp = "2026-02-31T00:00:00Z".into();
         assert!(validate_receipt_semantics(&calendar_tampered).is_err());
@@ -6349,6 +6484,16 @@ mod tests {
             .mlx
             .peak_bytes = 8;
         assert!(validate_receipt_semantics(&missing_prefill_persistent_byte).is_err());
+        let mut missing_prefill_cache_snapshot = receipt.clone();
+        missing_prefill_cache_snapshot
+            .memory
+            .allocation_events
+            .retain(|event| {
+                !(event.phase == "prefill-peak"
+                    && event.role == "cache"
+                    && event.lifetime == "persistent")
+            });
+        assert!(validate_receipt_semantics(&missing_prefill_cache_snapshot).is_err());
         let mut stale_prefill_window = receipt.clone();
         stale_prefill_window
             .memory
@@ -6387,6 +6532,89 @@ mod tests {
             validate_receipt_semantics(&phase_local_peak_reset).is_ok(),
             "the sealed prefill reset boundary permits the measured peak to fall below the earlier load high-water"
         );
+        let mut shorter_prefill_cache = receipt.clone();
+        shorter_prefill_cache
+            .memory
+            .allocation_events
+            .iter_mut()
+            .find(|event| {
+                event.phase == "prefill-peak"
+                    && event.role == "cache"
+                    && event.lifetime == "persistent"
+            })
+            .unwrap()
+            .bytes = 3;
+        shorter_prefill_cache.memory.phase_samples[2]
+            .mlx
+            .active_bytes = 6;
+        shorter_prefill_cache.memory.phase_samples[2].mlx.peak_bytes = 7;
+        assert!(
+            validate_receipt_semantics(&shorter_prefill_cache).is_ok(),
+            "prefill containment must use the live prefill cache, not the larger later decode cache"
+        );
+        let mut phase_separated_allocations = shorter_prefill_cache.clone();
+        let workspace = phase_separated_allocations
+            .memory
+            .allocation_events
+            .iter_mut()
+            .find(|event| event.role == "attention-workspace")
+            .unwrap();
+        workspace.phase = "decode-steady".into();
+        workspace.timestamp = "2026-01-01T00:00:04.200Z".into();
+        assert!(
+            validate_receipt_semantics(&phase_separated_allocations).is_ok(),
+            "zero prefill workspace and nonzero decode workspace must use their own phase floors"
+        );
+        let mut oversized_prefill_cache = receipt.clone();
+        oversized_prefill_cache.memory.allocation_events[1].bytes = 5;
+        assert!(validate_receipt_semantics(&oversized_prefill_cache).is_err());
+        let mut stale_decode_cache = receipt.clone();
+        stale_decode_cache.memory.allocation_events[3].bytes = 3;
+        assert!(validate_receipt_semantics(&stale_decode_cache).is_err());
+        let mut missing_decode_active = phase_separated_allocations.clone();
+        missing_decode_active.memory.phase_samples[4]
+            .mlx
+            .active_bytes = 6;
+        assert!(validate_receipt_semantics(&missing_decode_active).is_err());
+        let mut missing_decode_peak = phase_separated_allocations.clone();
+        missing_decode_peak.memory.phase_samples[4].mlx.peak_bytes = 7;
+        assert!(validate_receipt_semantics(&missing_decode_peak).is_err());
+        let mut cancellation_attribution = receipt.clone();
+        cancellation_attribution.memory.allocation_events.extend([
+            ReceiptAllocation {
+                kind: "cancellation-cache-snapshot".into(),
+                role: "cache".into(),
+                lifetime: "persistent".into(),
+                phase: "cancellation-cleanup".into(),
+                timestamp: "2026-01-01T00:00:06.100Z".into(),
+                bytes: 4,
+            },
+            ReceiptAllocation {
+                kind: "cancellation-workspace".into(),
+                role: "output".into(),
+                lifetime: "transient".into(),
+                phase: "cancellation-cleanup".into(),
+                timestamp: "2026-01-01T00:00:06.200Z".into(),
+                bytes: 2,
+            },
+            ReceiptAllocation {
+                kind: "product-cache_release".into(),
+                role: "cache".into(),
+                lifetime: "released".into(),
+                phase: "cancellation-cleanup".into(),
+                timestamp: "2026-01-01T00:00:06.300Z".into(),
+                bytes: 4,
+            },
+        ]);
+        cancellation_attribution.memory.transient_workspace_bytes = 2;
+        assert!(validate_receipt_semantics(&cancellation_attribution).is_err());
+        cancellation_attribution.memory.phase_samples[6]
+            .mlx
+            .peak_bytes = 9;
+        cancellation_attribution.memory.phase_samples[7]
+            .mlx
+            .peak_bytes = 9;
+        assert!(validate_receipt_semantics(&cancellation_attribution).is_ok());
         let mut fixture_tampered = receipt.clone();
         fixture_tampered
             .quality

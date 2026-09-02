@@ -238,10 +238,9 @@ fn observe_cache_events(
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return Ok(());
     };
-    let mut latest_by_layer = std::collections::BTreeMap::new();
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
-            latest_by_layer.insert(event.layer, (event.bytes, event.tokens));
+            continue;
         } else if event.lifetime == "released" {
             observer.release_event(event.operation, event.role, event.bytes);
         } else {
@@ -249,22 +248,7 @@ fn observe_cache_events(
         }
     }
     *seen = cache.events().len();
-    if !latest_by_layer.is_empty() {
-        let bytes = latest_by_layer
-            .values()
-            .try_fold(0_u64, |total, (bytes, _)| {
-                total.checked_add(*bytes).ok_or_else(|| {
-                    crate::error::Error::Msg("persistent KV snapshot bytes overflow u64".into())
-                })
-            })?;
-        let tokens = latest_by_layer
-            .values()
-            .map(|(_, tokens)| *tokens)
-            .max()
-            .unwrap_or_default();
-        let element_bytes = cache.element_bytes()?.ok_or_else(|| {
-            crate::error::Error::Msg("persistent KV snapshot has no retained arrays".into())
-        })?;
+    if let Some((bytes, tokens, element_bytes)) = cache.retained_snapshot()? {
         observer.cache_snapshot(bytes, tokens, element_bytes);
     }
     Ok(())
@@ -514,6 +498,7 @@ mod tests {
         phases: Vec<&'static str>,
         logits: usize,
         probabilities: Vec<(i32, f64)>,
+        cache_snapshots: Vec<(u64, u64, u64)>,
     }
 
     impl crate::campaign::Observer for DecodeObserver {
@@ -532,6 +517,10 @@ mod tests {
         fn token_probability(&mut self, stage: &'static str, token: i32, probability: f64) {
             assert_eq!(stage, "decode");
             self.probabilities.push((token, probability));
+        }
+
+        fn cache_snapshot(&mut self, bytes: u64, tokens: u64, element_bytes: u64) {
+            self.cache_snapshots.push((bytes, tokens, element_bytes));
         }
     }
 
@@ -561,5 +550,18 @@ mod tests {
             observer.phases,
             vec!["prefill-peak", "first-token", "decode-steady"]
         );
+    }
+
+    #[test]
+    fn unchanged_live_cache_is_snapshotted_at_each_observed_phase() {
+        let mut cache = ContiguousKvCache::new(1);
+        let key = Array::from_slice(&[1.0_f32, 2.0], &[1, 1, 1, 2]);
+        cache.update(0, &key, &key).unwrap();
+        let mut seen = 0;
+        let mut observer = DecodeObserver::default();
+        let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut observer);
+        observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
+        observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
+        assert_eq!(observer.cache_snapshots, vec![(16, 1, 4), (16, 1, 4)]);
     }
 }

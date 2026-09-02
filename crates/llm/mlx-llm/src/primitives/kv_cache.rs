@@ -244,6 +244,52 @@ impl ContiguousKvCache {
         Ok(observed)
     }
 
+    /// Current cache ownership derived directly from every retained MLX K/V array. Campaign
+    /// observers call this at each phase boundary, including boundaries where no append occurred,
+    /// so phase-local evidence never relies on replaying a historical allocation event.
+    pub(crate) fn retained_snapshot(&self) -> Result<Option<(u64, u64, u64)>> {
+        if self.layers.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if self.layers.iter().any(Option::is_none) {
+            return Err(crate::error::Error::Msg(
+                "dense KV cache has incomplete layer ownership".into(),
+            ));
+        }
+        let mut total_bytes = 0_u64;
+        let mut retained_tokens = None;
+        for (keys, values) in self.layers.iter().flatten() {
+            let key_tokens = u64::try_from(keys.shape()[SEQ_AXIS as usize])
+                .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
+            let value_tokens = u64::try_from(values.shape()[SEQ_AXIS as usize])
+                .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
+            if key_tokens != value_tokens
+                || retained_tokens.is_some_and(|tokens| tokens != key_tokens)
+            {
+                return Err(crate::error::Error::Msg(
+                    "dense KV cache has inconsistent retained sequence lengths".into(),
+                ));
+            }
+            retained_tokens = Some(key_tokens);
+            let pair_bytes = array_bytes(keys)?
+                .checked_add(array_bytes(values)?)
+                .ok_or_else(|| {
+                    crate::error::Error::Msg("retained KV pair bytes overflow u64".into())
+                })?;
+            total_bytes = total_bytes.checked_add(pair_bytes).ok_or_else(|| {
+                crate::error::Error::Msg("retained KV cache bytes overflow u64".into())
+            })?;
+        }
+        let element_bytes = self.element_bytes()?.ok_or_else(|| {
+            crate::error::Error::Msg("retained KV cache has no scalar width".into())
+        })?;
+        Ok(Some((
+            total_bytes,
+            retained_tokens.unwrap_or_default(),
+            element_bytes,
+        )))
+    }
+
     /// Snapshot every layer's cached `(keys, values)` as clones (MLX arrays are refcounted, so this
     /// shares buffers rather than copying), or `None` if any layer is still empty. The prefix cache
     /// stores this after a generation so a later shared-prefix request can be [`seeded`] from it.
@@ -426,6 +472,9 @@ mod tests {
         assert_eq!(cache.offset(), 3);
         assert_eq!(cache.num_layers(), 2);
         assert_eq!(cache.element_bytes().unwrap(), Some(4));
+        assert!(cache.retained_snapshot().is_err());
+        cache.update(1, &k, &v).unwrap();
+        assert_eq!(cache.retained_snapshot().unwrap(), Some((384, 3, 4)));
     }
 
     #[test]
