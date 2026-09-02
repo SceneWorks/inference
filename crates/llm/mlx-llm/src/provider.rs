@@ -624,7 +624,7 @@ impl LlamaProvider {
     /// Seed the provider-owned prefix cache before a campaign opens its phase-local MLX peak
     /// window.  The observed cache-hit dispatch is deliberately separate so seed allocations and
     /// compile work cannot establish the peak used as measured prefill evidence.
-    pub(crate) fn campaign_seed_prefix_reuse(&self, prompt: &str) -> CoreResult<()> {
+    pub(crate) fn campaign_seed_prefix_reuse(&self, prompt: &str) -> CoreResult<f64> {
         let ids = self
             .tokenizer
             .encode(prompt, false)?
@@ -655,10 +655,17 @@ impl LlamaProvider {
         }
         let mut cache = crate::decode::PrefixCache::new(2);
         let mut sink = |_| {};
+        let dispatch_started = std::time::Instant::now();
         crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
             .map_err(to_core)?;
+        let dispatch_elapsed_ms = dispatch_started.elapsed().as_secs_f64() * 1_000.0;
+        if !dispatch_elapsed_ms.is_finite() || dispatch_elapsed_ms <= 0.0 {
+            return Err(CoreError::Load(
+                "campaign prefix seed produced no positive dispatch duration".into(),
+            ));
+        }
         *cache_slot = Some(cache);
-        Ok(())
+        Ok(dispatch_elapsed_ms)
     }
 
     /// Execute only the cache-hit half of the real prefix-reuse path with campaign observation

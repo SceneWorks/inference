@@ -596,8 +596,31 @@ pub struct ReceiptTimingSample {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
-    pub cold_compile_ms: f64,
-    pub warm_compile_ms: f64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCompileProbeEvidence {
+    pub index: u64,
+    pub operation: String,
+    pub source: String,
+    pub matrix_coordinate: String,
+    pub setup_ms: f64,
+    pub dispatch_ms: f64,
+    pub operation_evidence_sha256: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCompileAttribution {
+    pub method: String,
+    pub operation: String,
+    pub source: String,
+    pub probe_durations_ms: Vec<f64>,
+    pub probe_evidence: Vec<ReceiptCompileProbeEvidence>,
+    pub first_dispatch_ms: f64,
+    pub steady_dispatch_ms: f64,
+    pub first_dispatch_excess_ms: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -621,6 +644,7 @@ pub struct ReceiptTimings {
     pub decode_tokens_per_second: f64,
     pub cold_compile_ms: f64,
     pub warm_compile_ms: f64,
+    pub compile_attribution: ReceiptCompileAttribution,
     pub samples: Vec<ReceiptTimingSample>,
     pub summary: ReceiptTimingSummary,
 }
@@ -738,8 +762,11 @@ pub struct RawTiming {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
-    pub cold_compile_ms: f64,
-    pub warm_compile_ms: f64,
+}
+
+pub struct ProductTimingMeasurements {
+    pub samples: Vec<RawTiming>,
+    pub compile_attribution: ReceiptCompileAttribution,
 }
 
 pub struct ReceiptBuilder {
@@ -747,13 +774,14 @@ pub struct ReceiptBuilder {
     pub phases: Vec<ReceiptPhase>,
     pub allocations: Vec<ReceiptAllocation>,
     pub timings: Vec<RawTiming>,
+    pub compile_attribution: ReceiptCompileAttribution,
     pub quality: QualityObservation,
 }
 
 impl ReceiptBuilder {
     pub fn finish(mut self) -> Result<Receipt, String> {
-        self.template.schema_version = 3;
-        self.template.harness_version = "sc-20671-kv-baseline-v3".into();
+        self.template.schema_version = 4;
+        self.template.harness_version = "sc-20671-kv-baseline-v4".into();
         let digest = |v: &str| {
             v.len() == 64
                 && v.bytes()
@@ -869,14 +897,13 @@ impl ReceiptBuilder {
                 t.ttft_ms,
                 t.first_token_ms,
                 t.decode_tokens_per_second,
-                t.cold_compile_ms,
-                t.warm_compile_ms,
             ]
             .into_iter()
             .all(positive)
         }) {
             return Err("timing samples must be finite and positive".into());
         }
+        validate_compile_attribution(&self.compile_attribution, &self.template.matrix)?;
         let mean = |f: fn(&RawTiming) -> f64| {
             self.timings.iter().map(f).sum::<f64>() / self.timings.len() as f64
         };
@@ -915,8 +942,9 @@ impl ReceiptBuilder {
             ttft_ms: mean(|t| t.ttft_ms),
             first_token_ms: mean(|t| t.first_token_ms),
             decode_tokens_per_second: decode_mean,
-            cold_compile_ms: mean(|t| t.cold_compile_ms),
-            warm_compile_ms: mean(|t| t.warm_compile_ms),
+            cold_compile_ms: self.compile_attribution.first_dispatch_excess_ms,
+            warm_compile_ms: self.compile_attribution.steady_dispatch_ms,
+            compile_attribution: self.compile_attribution,
             samples: self
                 .timings
                 .into_iter()
@@ -926,8 +954,6 @@ impl ReceiptBuilder {
                     ttft_ms: t.ttft_ms,
                     first_token_ms: t.first_token_ms,
                     decode_tokens_per_second: t.decode_tokens_per_second,
-                    cold_compile_ms: t.cold_compile_ms,
-                    warm_compile_ms: t.warm_compile_ms,
                 })
                 .collect(),
             summary,
@@ -1021,8 +1047,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             && v.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
-    if receipt.schema_version != 3
-        || receipt.harness_version != "sc-20671-kv-baseline-v3"
+    if receipt.schema_version != 4
+        || receipt.harness_version != "sc-20671-kv-baseline-v4"
         || receipt.status != "complete"
         || receipt.contract_hash != QUALITY_CONTRACT_HASH
     {
@@ -1459,22 +1485,17 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         ));
     }
     if receipt.timings.samples.len() != 5
-        || !receipt
-            .timings
-            .samples
-            .iter()
-            .flat_map(|s| {
-                [
-                    s.load_ms,
-                    s.prefill_ms,
-                    s.ttft_ms,
-                    s.first_token_ms,
-                    s.decode_tokens_per_second,
-                    s.cold_compile_ms,
-                    s.warm_compile_ms,
-                ]
-            })
+        || !receipt.timings.samples.iter().all(|s| {
+            [
+                s.load_ms,
+                s.prefill_ms,
+                s.ttft_ms,
+                s.first_token_ms,
+                s.decode_tokens_per_second,
+            ]
+            .into_iter()
             .all(|v| v.is_finite() && v > 0.0)
+        })
         || ![
             receipt.timings.load_ms,
             receipt.timings.prefill_ms,
@@ -1524,6 +1545,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.timings.summary.confidence_interval_high,
         ));
     }
+    validate_compile_attribution(&receipt.timings.compile_attribution, &receipt.matrix)?;
+    if (receipt.timings.cold_compile_ms
+        - receipt.timings.compile_attribution.first_dispatch_excess_ms)
+        .abs()
+        > 1e-9
+        || (receipt.timings.warm_compile_ms
+            - receipt.timings.compile_attribution.steady_dispatch_ms)
+            .abs()
+            > 1e-9
+    {
+        return Err("compile timing aliases do not match raw attribution".into());
+    }
     let decode_mean = receipt
         .timings
         .samples
@@ -1541,8 +1574,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || (receipt.timings.prefill_ms - average(|s| s.prefill_ms)).abs() > 1e-9
         || (receipt.timings.ttft_ms - average(|s| s.ttft_ms)).abs() > 1e-9
         || (receipt.timings.first_token_ms - average(|s| s.first_token_ms)).abs() > 1e-9
-        || (receipt.timings.cold_compile_ms - average(|s| s.cold_compile_ms)).abs() > 1e-9
-        || (receipt.timings.warm_compile_ms - average(|s| s.warm_compile_ms)).abs() > 1e-9
     {
         return Err("timing field is not derived".into());
     }
@@ -1656,6 +1687,16 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("warm worker discipline evidence failed".into());
     }
+    if warm.required {
+        let expected_suite_sha256 = warmup_probe_suite_sha256(
+            &warm.session_id,
+            warm.worker_pid,
+            &receipt.timings.compile_attribution.probe_evidence,
+        )?;
+        if warm.suite_sha256 != expected_suite_sha256 {
+            return Err("warmup suite seal is not bound to compile probe evidence".into());
+        }
+    }
     let lifecycle = [
         ("append", receipt.lifecycle.append),
         ("chunkedPrefill", receipt.lifecycle.chunked_prefill),
@@ -1764,8 +1805,16 @@ fn assemble_artifacts_with_fixtures_named(
         .map(|event| event.bytes)
         .max()
         .unwrap_or(0);
+    let compile_probes = receipt
+        .timings
+        .compile_attribution
+        .probe_durations_ms
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let human = format!(
-        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Receipt hash: {}\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Steady dispatch: {} ms\n- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -1774,6 +1823,12 @@ fn assemble_artifacts_with_fixtures_named(
         receipt.run_id,
         receipt.mode,
         released_cache_bytes,
+        receipt.timings.compile_attribution.method,
+        receipt.timings.compile_attribution.operation,
+        receipt.timings.compile_attribution.source,
+        compile_probes,
+        receipt.timings.cold_compile_ms,
+        receipt.timings.warm_compile_ms,
         receipt.receipt_sha256
     )
     .into_bytes();
@@ -2128,6 +2183,29 @@ fn validate_fixture_binding(
             != Some(receipt.provenance.coordinate_operation_sha256.as_str())
     {
         return Err("receipt coordinate evidence digest is not fixture-bound".into());
+    }
+    if name == "kernel-fp32-reference" && receipt.matrix.process_temperature == "cold" {
+        let probe = receipt
+            .timings
+            .compile_attribution
+            .probe_evidence
+            .get(expected_repeat)
+            .ok_or("cold kernel fixture has no matching compile probe evidence")?;
+        let setup_ms = candidate
+            .get("compileSetupMs")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or("cold kernel fixture lacks compileSetupMs")?;
+        let dispatch_ms = candidate
+            .get("compileDispatchMs")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or("cold kernel fixture lacks compileDispatchMs")?;
+        if setup_ms != probe.setup_ms
+            || dispatch_ms != probe.dispatch_ms
+            || field(candidate, "operationEvidenceSha256")
+                != Some(probe.operation_evidence_sha256.as_str())
+        {
+            return Err("cold compile probe evidence is not bound to its repeat fixture".into());
+        }
     }
     Ok(())
 }
@@ -2787,24 +2865,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     candidate_warmups.push(half);
                 }
             }
-            let warmup = (!candidate_warmups.is_empty()).then(|| {
-                let operations = candidate_warmups
-                    .iter()
-                    .map(|half| primary_operation_evidence_digest(&half.kernel))
-                    .collect::<Vec<_>>()
-                    .join(":");
-                (
-                    seal_bytes(
-                        format!(
-                            "session={};workerPid={};operations={operations}",
-                            candidate_session.session_id(),
-                            std::process::id(),
-                        )
-                        .as_bytes(),
-                    ),
-                    candidate_session.cache_state_version(),
-                )
-            });
+            let warmup_cache_state_version =
+                (!candidate_warmups.is_empty()).then(|| candidate_session.cache_state_version());
             let mut candidate_repeats = Vec::with_capacity(5);
             for repeat in 0..5 {
                 let half = run_product_fixture_half_on_session(
@@ -2913,6 +2975,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 .collect::<Vec<_>>();
             let timings = timing_samples_from_product_repeats(
                 &kernel_runs,
+                &row.coordinate,
                 row.coordinate.process_temperature,
                 &warmup_runs,
             )?;
@@ -2924,7 +2987,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 timings,
                 &executable,
                 &fixtures,
-                warmup,
+                warmup_cache_state_version,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -3485,6 +3548,8 @@ fn product_fixture_artifact(
                 "coordinateEvidenceSha256": coordinate_operation_digest(candidate),
                 "operationGeneratedTokens": candidate.coordinate_generated_tokens,
                 "operationPromptTokens": candidate.coordinate_prompt_tokens,
+                "compileSetupMs": candidate.compile_setup_ms,
+                "compileDispatchMs": candidate.compile_dispatch_ms,
                 "qualityTranscriptSha256": product_output_digest(&candidate.output),
                 "secondaryOperation": candidate.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
                     "operation": secondary.operation.as_str(),
@@ -3494,6 +3559,8 @@ fn product_fixture_artifact(
                     "cacheStateVersion": secondary.observation.cache_state_version,
                     "generatedTokens": secondary.generated_tokens,
                     "promptTokens": secondary.prompt_tokens,
+                    "compileSetupMs": secondary.compile_setup_ms,
+                    "compileDispatchMs": secondary.compile_dispatch_ms,
                 })),
             },
             "reference": {
@@ -3507,6 +3574,8 @@ fn product_fixture_artifact(
                 "coordinateEvidenceSha256": coordinate_operation_digest(reference),
                 "operationGeneratedTokens": reference.coordinate_generated_tokens,
                 "operationPromptTokens": reference.coordinate_prompt_tokens,
+                "compileSetupMs": reference.compile_setup_ms,
+                "compileDispatchMs": reference.compile_dispatch_ms,
                 "qualityTranscriptSha256": product_output_digest(&reference.output),
                 "secondaryOperation": reference.secondary_coordinate_operation.as_ref().map(|secondary| serde_json::json!({
                     "operation": secondary.operation.as_str(),
@@ -3516,6 +3585,8 @@ fn product_fixture_artifact(
                     "cacheStateVersion": secondary.observation.cache_state_version,
                     "generatedTokens": secondary.generated_tokens,
                     "promptTokens": secondary.prompt_tokens,
+                    "compileSetupMs": secondary.compile_setup_ms,
+                    "compileDispatchMs": secondary.compile_dispatch_ms,
                 })),
             },
         },
@@ -3667,6 +3738,7 @@ pub struct ProductObserver {
     load_boundary: Option<(MemorySample, MemorySample)>,
     prefill_peak_window: Option<ReceiptPeakWindow>,
     cache_capacity_tokens: u64,
+    sampling_elapsed_ms: f64,
 }
 
 impl ProductObserver {
@@ -3690,6 +3762,7 @@ impl ProductObserver {
             load_boundary: None,
             prefill_peak_window: None,
             cache_capacity_tokens: 0,
+            sampling_elapsed_ms: 0.0,
         }
     }
 
@@ -3707,6 +3780,10 @@ impl ProductObserver {
 
     pub fn operation(&mut self, operation: &'static str) {
         self.operations.push(operation.into());
+    }
+
+    fn sampling_elapsed_ms(&self) -> f64 {
+        self.sampling_elapsed_ms
     }
 
     pub fn finish(self) -> Result<ProductObservations, String> {
@@ -3893,6 +3970,7 @@ impl Observer for ProductObserver {
             self.error = Some(format!("duplicate or out-of-order product phase {name}"));
             return;
         }
+        let sampling_started = std::time::Instant::now();
         let sampled = match name {
             "process-start" => self
                 .load_boundary
@@ -3906,6 +3984,7 @@ impl Observer for ProductObserver {
                 .ok_or_else(|| std::io::Error::other("missing product weights-loaded sample")),
             _ => sample_memory(self.pid),
         };
+        self.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
         match sampled {
             Ok(sample) => {
                 self.phases.push(ReceiptPhase {
@@ -4411,6 +4490,12 @@ pub struct ProductFixtureResult {
     pub coordinate_generated_tokens: u64,
     pub coordinate_prompt_tokens: u64,
     pub coordinate_output_sha256: String,
+    /// Product-call time consumed before the observed prefill boundary. Prefix reuse uses this for
+    /// its cache-seeding dispatch; all other coordinate operations report zero.
+    pub compile_setup_ms: f64,
+    /// Complete compile-attribution probe for the coordinate's product calls. It excludes the
+    /// campaign's pre-dispatch footprint and allocator-reset instrumentation.
+    pub compile_dispatch_ms: f64,
     /// Mixed batch/chunked coordinates seal a second independently observed product dispatch.
     /// It is absent for the ordinary single-operation rows.
     pub secondary_coordinate_operation: Option<CoordinateOperationEvidence>,
@@ -4422,6 +4507,8 @@ pub struct CoordinateOperationEvidence {
     pub generated_tokens: u64,
     pub prompt_tokens: u64,
     pub output_sha256: String,
+    pub compile_setup_ms: f64,
+    pub compile_dispatch_ms: f64,
 }
 
 fn output_has_observed_generation(output: &TextLlmOutput, saw_streamed_token: bool) -> bool {
@@ -4461,38 +4548,41 @@ fn product_output_digest(output: &TextLlmOutput) -> String {
     seal_bytes(&bytes)
 }
 
+fn canonical_operation_evidence_sha256(value: &serde_json::Value) -> String {
+    let bytes = canonical_json_bytes(value).expect("operation evidence must serialize");
+    seal_bytes(&bytes)
+}
+
 fn operation_evidence_digest(evidence: &CoordinateOperationEvidence) -> String {
-    seal_bytes(
-        format!(
-            "operation={};output={};generated={};prompt={};cache={};elapsed={:?};tokens={:?};allocations={:?}",
-            evidence.operation,
-            evidence.output_sha256,
-            evidence.generated_tokens,
-            evidence.prompt_tokens,
-            evidence.observation.cache_state_version,
-            evidence.observation.phase_elapsed_ms,
-            evidence.observation.token_probabilities,
-            evidence.observation.allocations,
-        )
-        .as_bytes(),
-    )
+    let value = serde_json::json!({
+        "operation": evidence.operation,
+        "outputSha256": evidence.output_sha256,
+        "generatedTokens": evidence.generated_tokens,
+        "promptTokens": evidence.prompt_tokens,
+        "cacheStateVersion": evidence.observation.cache_state_version,
+        "phaseElapsedMs": evidence.observation.phase_elapsed_ms,
+        "tokenProbabilities": evidence.observation.token_probabilities,
+        "allocations": evidence.observation.allocations,
+        "compileSetupMs": evidence.compile_setup_ms,
+        "compileDispatchMs": evidence.compile_dispatch_ms,
+    });
+    canonical_operation_evidence_sha256(&value)
 }
 
 fn primary_operation_evidence_digest(result: &ProductFixtureResult) -> String {
-    seal_bytes(
-        format!(
-            "operation={};output={};generated={};prompt={};cache={};elapsed={:?};tokens={:?};allocations={:?}",
-            result.coordinate_operation,
-            result.coordinate_output_sha256,
-            result.coordinate_generated_tokens,
-            result.coordinate_prompt_tokens,
-            result.observation.cache_state_version,
-            result.observation.phase_elapsed_ms,
-            result.observation.token_probabilities,
-            result.observation.allocations,
-        )
-        .as_bytes(),
-    )
+    let value = serde_json::json!({
+        "operation": result.coordinate_operation,
+        "outputSha256": result.coordinate_output_sha256,
+        "generatedTokens": result.coordinate_generated_tokens,
+        "promptTokens": result.coordinate_prompt_tokens,
+        "cacheStateVersion": result.observation.cache_state_version,
+        "phaseElapsedMs": result.observation.phase_elapsed_ms,
+        "tokenProbabilities": result.observation.token_probabilities,
+        "allocations": result.observation.allocations,
+        "compileSetupMs": result.compile_setup_ms,
+        "compileDispatchMs": result.compile_dispatch_ms,
+    });
+    canonical_operation_evidence_sha256(&value)
 }
 
 /// Stable contract binding shared by every repeat for one loaded session. Volatile timings,
@@ -4579,8 +4669,39 @@ pub fn run_product_fixture_on_session(
         coordinate_generated_tokens: primary.generated_tokens,
         coordinate_prompt_tokens: primary.prompt_tokens,
         coordinate_output_sha256: primary.output_sha256,
+        compile_setup_ms: primary.compile_setup_ms,
+        compile_dispatch_ms: primary.compile_dispatch_ms,
         secondary_coordinate_operation,
     })
+}
+
+/// Time one product dispatch while removing only the synchronous memory-sampling work performed
+/// by the campaign observer. The provider remains responsible for invoking the observer at its
+/// real phase boundaries; this wrapper prevents `/usr/bin/footprint` latency from being relabeled
+/// as model compilation or execution time.
+fn measure_product_dispatch<T>(
+    observer: &mut ProductObserver,
+    dispatch: impl FnOnce(&mut ProductObserver) -> core_llm::Result<T>,
+) -> core_llm::Result<(T, f64)> {
+    let sampling_before_ms = observer.sampling_elapsed_ms();
+    let dispatch_started = std::time::Instant::now();
+    let value = dispatch(observer)?;
+    let wall_ms = dispatch_started.elapsed().as_secs_f64() * 1_000.0;
+    let sampling_after_ms = observer.sampling_elapsed_ms();
+    let sampled_ms = sampling_after_ms - sampling_before_ms;
+    let product_ms = wall_ms - sampled_ms;
+    if !wall_ms.is_finite()
+        || !sampling_before_ms.is_finite()
+        || !sampling_after_ms.is_finite()
+        || sampled_ms < 0.0
+        || !product_ms.is_finite()
+        || product_ms <= 0.0
+    {
+        return Err(core_llm::Error::InvalidRequest(format!(
+            "invalid sampling-adjusted product duration: wall={wall_ms:.6}ms sampled={sampled_ms:.6}ms product={product_ms:.6}ms"
+        )));
+    }
+    Ok((value, product_ms))
 }
 
 /// Execute the exact requested coordinate while a product observer is attached.  Quality fixtures
@@ -4600,79 +4721,96 @@ fn run_coordinate_operation_on_session(
     observer.phase("process-start");
     observer.snapshot_inventory(session.inventory());
     observer.geometry(provider.campaign_geometry());
-    if operation == "chunked-prefix-reuse" {
-        provider.campaign_seed_prefix_reuse(prefix_prompt)?;
-    }
+    let compile_setup_ms = if operation == "chunked-prefix-reuse" {
+        provider.campaign_seed_prefix_reuse(prefix_prompt)?
+    } else {
+        0.0
+    };
     observer.begin_prefill_memory_window();
     observer.phase("weights-loaded");
     observer.allocation("weights", "persistent", session.model_weights_bytes());
 
-    let (operation, generated_tokens, prompt_tokens, output_sha256) = if operation
-        == "supported-batch"
-    {
-        let (outputs, prompt_tokens) =
-            provider.campaign_supported_batch_observed(prefix_prompt, 2, &mut observer)?;
-        let mut bytes = Vec::new();
-        let generated = outputs
-            .iter()
-            .map(|output| output.tokens.len() as u64)
-            .sum();
-        for output in outputs {
-            for token in output.tokens {
+    let (operation, generated_tokens, prompt_tokens, output_sha256, observed_dispatch_ms) =
+        if operation == "supported-batch" {
+            let ((outputs, prompt_tokens), dispatch_elapsed_ms) =
+                measure_product_dispatch(&mut observer, |observer| {
+                    provider.campaign_supported_batch_observed(prefix_prompt, 2, observer)
+                })?;
+            let mut bytes = Vec::new();
+            let generated = outputs
+                .iter()
+                .map(|output| output.tokens.len() as u64)
+                .sum();
+            for output in outputs {
+                for token in output.tokens {
+                    bytes.extend_from_slice(&token.to_le_bytes());
+                }
+            }
+            observer.operation("supported-batch");
+            (
+                "supported-batch".to_string(),
+                generated,
+                prompt_tokens,
+                seal_bytes(&bytes),
+                dispatch_elapsed_ms,
+            )
+        } else if operation == "chunked-prefix-reuse" {
+            let ((output, hits, prompt_tokens), dispatch_elapsed_ms) =
+                measure_product_dispatch(&mut observer, |observer| {
+                    provider.campaign_prefix_reuse_observed(prefix_prompt, observer)
+                })?;
+            if hits == 0 {
+                return Err(core_llm::Error::InvalidRequest(
+                    "observed prefix coordinate has no cache hit".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            for token in &output.tokens {
                 bytes.extend_from_slice(&token.to_le_bytes());
             }
-        }
-        observer.operation("supported-batch");
-        (
-            "supported-batch".to_string(),
-            generated,
-            prompt_tokens,
-            seal_bytes(&bytes),
-        )
-    } else if operation == "chunked-prefix-reuse" {
-        let (output, hits, prompt_tokens) =
-            provider.campaign_prefix_reuse_observed(prefix_prompt, &mut observer)?;
-        if hits == 0 {
+            observer.operation("chunked-prefix-reuse");
+            (
+                "chunked-prefix-reuse".to_string(),
+                output.tokens.len() as u64,
+                prompt_tokens,
+                seal_bytes(&bytes),
+                dispatch_elapsed_ms,
+            )
+        } else if operation == "single-shot-generation" {
+            let mut saw_token = false;
+            let (output, dispatch_elapsed_ms) =
+                measure_product_dispatch(&mut observer, |observer| {
+                    provider.generate_observed(
+                        &request,
+                        &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
+                        observer,
+                    )
+                })?;
+            if !output_has_observed_generation(&output, saw_token) {
+                return Err(core_llm::Error::InvalidRequest(
+                    "single coordinate produced neither a streamed token nor a parsed tool call"
+                        .into(),
+                ));
+            }
+            observer.operation("single-shot-generation");
+            (
+                "single-shot-generation".to_string(),
+                output.usage.generated_tokens as u64,
+                output.usage.prompt_tokens as u64,
+                product_output_digest(&output),
+                dispatch_elapsed_ms,
+            )
+        } else {
             return Err(core_llm::Error::InvalidRequest(
-                "observed prefix coordinate has no cache hit".into(),
+                "unknown campaign coordinate operation".into(),
             ));
-        }
-        let mut bytes = Vec::new();
-        for token in &output.tokens {
-            bytes.extend_from_slice(&token.to_le_bytes());
-        }
-        observer.operation("chunked-prefix-reuse");
-        (
-            "chunked-prefix-reuse".to_string(),
-            output.tokens.len() as u64,
-            prompt_tokens,
-            seal_bytes(&bytes),
-        )
-    } else if operation == "single-shot-generation" {
-        let mut saw_token = false;
-        let output = provider.generate_observed(
-            &request,
-            &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
-            &mut observer,
-        )?;
-        if !output_has_observed_generation(&output, saw_token) {
-            return Err(core_llm::Error::InvalidRequest(
-                "single coordinate produced neither a streamed token nor a parsed tool call".into(),
-            ));
-        }
-        observer.operation("single-shot-generation");
-        (
-            "single-shot-generation".to_string(),
-            output.usage.generated_tokens as u64,
-            output.usage.prompt_tokens as u64,
-            product_output_digest(&output),
-        )
-    } else {
+        };
+    let compile_dispatch_ms = compile_setup_ms + observed_dispatch_ms;
+    if !compile_dispatch_ms.is_finite() || compile_dispatch_ms <= 0.0 {
         return Err(core_llm::Error::InvalidRequest(
-            "unknown campaign coordinate operation".into(),
+            "coordinate produced no positive compile-attribution dispatch duration".into(),
         ));
-    };
-
+    }
     // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
     // replace the coordinate operation measured above.
     provider.campaign_prefix_reuse(prefix_prompt)?;
@@ -4689,6 +4827,8 @@ fn run_coordinate_operation_on_session(
         generated_tokens,
         prompt_tokens,
         output_sha256,
+        compile_setup_ms,
+        compile_dispatch_ms,
     })
 }
 
@@ -5094,35 +5234,207 @@ pub fn timing_from_product_observation(
     if !throughput.is_finite() || throughput <= 0.0 {
         return Err("invalid product decode throughput".into());
     }
-    let (cold_compile_ms, warm_compile_ms) = match process_temperature {
-        "cold" => (prefill_ms, prefill_ms),
-        "warm" => (prefill_ms, prefill_ms),
-        _ => return Err("unknown process temperature".into()),
-    };
+    if !matches!(process_temperature, "cold" | "warm") {
+        return Err("unknown process temperature".into());
+    }
     Ok(RawTiming {
         load_ms,
         prefill_ms,
         ttft_ms,
         first_token_ms,
         decode_tokens_per_second: throughput,
-        cold_compile_ms,
-        warm_compile_ms,
     })
 }
 
+fn expected_coordinate_operation(matrix: &ReceiptMatrix) -> Result<&'static str, String> {
+    if matrix.request_mode == "supported-batch" {
+        Ok("supported-batch")
+    } else if matrix.request_mode == "single" && matrix.prefill_mode == "chunked" {
+        Ok("chunked-prefix-reuse")
+    } else if matrix.request_mode == "single" && matrix.prefill_mode == "single-shot" {
+        Ok("single-shot-generation")
+    } else {
+        Err("matrix does not select one compile-attribution operation".into())
+    }
+}
+
+fn validate_compile_attribution(
+    attribution: &ReceiptCompileAttribution,
+    matrix: &ReceiptMatrix,
+) -> Result<(), String> {
+    let expected_source = match matrix.process_temperature.as_str() {
+        "cold" => "measured-repeats",
+        "warm" => "warmup-suites",
+        _ => return Err("unknown process temperature".into()),
+    };
+    let expected_len = if expected_source == "measured-repeats" {
+        5
+    } else {
+        2
+    };
+    let expected_coordinate = format!(
+        "{}-{}-{}-{}-{}",
+        matrix.family,
+        matrix.context_band,
+        matrix.request_mode,
+        matrix.prefill_mode,
+        matrix.process_temperature
+    );
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if attribution.method != "first-dispatch-minus-steady-v1"
+        || attribution.operation != expected_coordinate_operation(matrix)?
+        || attribution.source != expected_source
+        || attribution.probe_durations_ms.len() != expected_len
+        || attribution.probe_evidence.len() != expected_len
+        || attribution
+            .probe_durations_ms
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        || attribution
+            .probe_evidence
+            .iter()
+            .enumerate()
+            .any(|(index, evidence)| {
+                evidence.index != index as u64
+                    || evidence.operation != attribution.operation
+                    || evidence.source != attribution.source
+                    || evidence.matrix_coordinate != expected_coordinate
+                    || !evidence.setup_ms.is_finite()
+                    || evidence.setup_ms < 0.0
+                    || !evidence.dispatch_ms.is_finite()
+                    || evidence.dispatch_ms <= 0.0
+                    || evidence.dispatch_ms != attribution.probe_durations_ms[index]
+                    || !digest(&evidence.operation_evidence_sha256)
+            })
+    {
+        return Err("compile attribution identity or bound probe evidence is invalid".into());
+    }
+    let first = attribution.probe_durations_ms[0];
+    let steady = if expected_source == "measured-repeats" {
+        let mut later = attribution.probe_durations_ms[1..].to_vec();
+        later.sort_by(f64::total_cmp);
+        (later[1] + later[2]) / 2.0
+    } else {
+        attribution.probe_durations_ms[1]
+    };
+    let excess = first - steady;
+    if excess <= 0.0
+        || !excess.is_finite()
+        || (attribution.first_dispatch_ms - first).abs() > 1e-9
+        || (attribution.steady_dispatch_ms - steady).abs() > 1e-9
+        || (attribution.first_dispatch_excess_ms - excess).abs() > 1e-9
+    {
+        return Err(format!(
+            "compile attribution does not prove a positive first-dispatch excess: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
+        ));
+    }
+    Ok(())
+}
+
+fn compile_attribution_from_probes(
+    operation: &str,
+    matrix: &ReceiptMatrix,
+    probes: Vec<(f64, f64, String)>,
+) -> Result<ReceiptCompileAttribution, String> {
+    let source = match matrix.process_temperature.as_str() {
+        "cold" => "measured-repeats",
+        "warm" => "warmup-suites",
+        _ => return Err("unknown process temperature".into()),
+    };
+    let matrix_coordinate = format!(
+        "{}-{}-{}-{}-{}",
+        matrix.family,
+        matrix.context_band,
+        matrix.request_mode,
+        matrix.prefill_mode,
+        matrix.process_temperature
+    );
+    let probe_evidence = probes
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (setup_ms, dispatch_ms, operation_evidence_sha256))| {
+                ReceiptCompileProbeEvidence {
+                    index: index as u64,
+                    operation: operation.into(),
+                    source: source.into(),
+                    matrix_coordinate: matrix_coordinate.clone(),
+                    setup_ms,
+                    dispatch_ms,
+                    operation_evidence_sha256,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut attribution = ReceiptCompileAttribution {
+        method: "first-dispatch-minus-steady-v1".into(),
+        operation: operation.into(),
+        source: source.into(),
+        probe_durations_ms: probe_evidence
+            .iter()
+            .map(|evidence| evidence.dispatch_ms)
+            .collect(),
+        probe_evidence,
+        first_dispatch_ms: 0.0,
+        steady_dispatch_ms: 0.0,
+        first_dispatch_excess_ms: 0.0,
+    };
+    if attribution.probe_durations_ms.is_empty() {
+        return Err("compile attribution has no raw probes".into());
+    }
+    attribution.first_dispatch_ms = attribution.probe_durations_ms[0];
+    attribution.steady_dispatch_ms = if matrix.process_temperature == "cold" {
+        if attribution.probe_durations_ms.len() != 5 {
+            return Err("cold compile attribution requires five measured repeats".into());
+        }
+        let mut later = attribution.probe_durations_ms[1..].to_vec();
+        later.sort_by(f64::total_cmp);
+        (later[1] + later[2]) / 2.0
+    } else {
+        if attribution.probe_durations_ms.len() != 2 {
+            return Err("warm compile attribution requires two warmup suites".into());
+        }
+        attribution.probe_durations_ms[1]
+    };
+    attribution.first_dispatch_excess_ms =
+        attribution.first_dispatch_ms - attribution.steady_dispatch_ms;
+    validate_compile_attribution(&attribution, matrix)?;
+    Ok(attribution)
+}
+
+fn warmup_probe_suite_sha256(
+    session_id: &str,
+    worker_pid: u32,
+    probe_evidence: &[ReceiptCompileProbeEvidence],
+) -> Result<String, String> {
+    let bytes = canonical_json_bytes(&serde_json::json!({
+        "sessionId": session_id,
+        "workerPid": worker_pid,
+        "probeEvidence": probe_evidence,
+    }))
+    .map_err(|error| error.to_string())?;
+    Ok(seal_bytes(&bytes))
+}
+
 /// Freeze cold-versus-steady compilation attribution before receipt assembly. A cold worker uses
-/// its first measured prefill versus the median of the next four. A warm worker must supply exactly
-/// two real pre-measurement warmups and uses their first-versus-second prefill difference. The load
-/// field remains the separately measured inventory/provider load and is never relabeled as JIT.
+/// five complete product-call probes and compares the first with the median of the next four. A
+/// warm worker uses its two real pre-measurement warmups. Prefix-reuse probes add only the seed and
+/// observed-hit product calls, excluding allocator reset and footprint instrumentation.
 pub fn timing_samples_from_product_repeats(
     runs: &[&ProductFixtureResult],
+    coordinate: &Coordinate,
     process_temperature: &str,
     warmups: &[&ProductFixtureResult],
-) -> Result<Vec<RawTiming>, String> {
+) -> Result<ProductTimingMeasurements, String> {
     if runs.len() != 5 {
         return Err("receipt requires exactly five product repeats".into());
     }
-    let mut samples = runs
+    let samples = runs
         .iter()
         .map(|run| {
             timing_from_product_observation(
@@ -5132,48 +5444,43 @@ pub fn timing_samples_from_product_repeats(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (first_dispatch_ms, steady_dispatch_ms) = match process_temperature {
-        "cold" if warmups.is_empty() => {
-            let mut steady = samples[1..]
-                .iter()
-                .map(|sample| sample.prefill_ms)
-                .collect::<Vec<_>>();
-            steady.sort_by(f64::total_cmp);
-            (samples[0].prefill_ms, (steady[1] + steady[2]) / 2.0)
-        }
-        "warm" if warmups.len() == 2 => {
-            let probes = warmups
-                .iter()
-                .map(|run| {
-                    timing_from_product_observation(
-                        &run.observation,
-                        run.coordinate_generated_tokens as usize,
-                        process_temperature,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            (probes[0].prefill_ms, probes[1].prefill_ms)
-        }
+    let operation = runs[0].coordinate_operation.as_str();
+    if runs.iter().any(|run| run.coordinate_operation != operation)
+        || warmups
+            .iter()
+            .any(|run| run.coordinate_operation != operation)
+    {
+        return Err("compile attribution mixed coordinate operations".into());
+    }
+    let probe_runs = match process_temperature {
+        "cold" if warmups.is_empty() => runs,
+        "warm" if warmups.len() == 2 => warmups,
         "cold" => return Err("cold coordinate must not execute warmup suites".into()),
         "warm" => return Err("warm coordinate requires exactly two product warmup suites".into()),
         _ => return Err("unknown process temperature".into()),
     };
-    let cold_jit_ms = first_dispatch_ms - steady_dispatch_ms;
-    if !steady_dispatch_ms.is_finite()
-        || steady_dispatch_ms <= 0.0
-        || !cold_jit_ms.is_finite()
-        || cold_jit_ms <= 0.0
-    {
-        return Err(
-            "product dispatches did not expose a positive measured JIT/first-dispatch excess"
-                .into(),
-        );
-    }
-    for sample in &mut samples {
-        sample.cold_compile_ms = cold_jit_ms;
-        sample.warm_compile_ms = steady_dispatch_ms;
-    }
-    Ok(samples)
+    let probes = probe_runs
+        .iter()
+        .map(|run| {
+            (
+                run.compile_setup_ms,
+                run.compile_dispatch_ms,
+                primary_operation_evidence_digest(run),
+            )
+        })
+        .collect::<Vec<_>>();
+    let matrix = ReceiptMatrix {
+        family: coordinate.family.into(),
+        context_band: coordinate.context_band.into(),
+        request_mode: coordinate.request_mode.into(),
+        prefill_mode: coordinate.prefill_mode.into(),
+        process_temperature: coordinate.process_temperature.into(),
+    };
+    let compile_attribution = compile_attribution_from_probes(operation, &matrix, probes)?;
+    Ok(ProductTimingMeasurements {
+        samples,
+        compile_attribution,
+    })
 }
 
 fn checked_git_revision(root: &Path) -> Result<String, String> {
@@ -5374,11 +5681,24 @@ pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
 fn product_receipt(
     coordinate: &Coordinate,
     suite: &ProductFixtureSuite,
-    timings: Vec<RawTiming>,
+    timings: ProductTimingMeasurements,
     executable: &Path,
     fixtures: &[SealedFixtureArtifact],
-    warmup: Option<(String, u64)>,
+    warmup_cache_state_version: Option<u64>,
 ) -> Result<Receipt, String> {
+    let ProductTimingMeasurements {
+        samples: timing_samples,
+        compile_attribution,
+    } = timings;
+    let warmup_suite_sha256 = if warmup_cache_state_version.is_some() {
+        warmup_probe_suite_sha256(
+            &suite.kernel_candidate.observation.session_id,
+            std::process::id(),
+            &compile_attribution.probe_evidence,
+        )?
+    } else {
+        String::new()
+    };
     let quality = suite.quality()?;
     let observation = &suite.kernel_candidate.observation;
     let required_operations = [
@@ -5516,18 +5836,19 @@ fn product_receipt(
         );
     }
     let template = Receipt {
-        schema_version: 3, harness_version: "sc-20671-kv-baseline-v3".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
+        schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
-        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup.is_some(), worker_pid: std::process::id(), suite_sha256: warmup.as_ref().map(|(hash, _)| hash.clone()).unwrap_or_default(), session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup.map(|(_, version)| version).unwrap_or_default() } };
+        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
         allocations: observation.allocations.clone(),
-        timings,
+        timings: timing_samples,
+        compile_attribution,
         quality,
     }
     .finish()
@@ -5559,6 +5880,27 @@ pub fn verify_coordinate_product_controls(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn test_compile_probe_evidence(
+        operation: &str,
+        source: &str,
+        matrix_coordinate: &str,
+        dispatches: &[f64],
+    ) -> Vec<ReceiptCompileProbeEvidence> {
+        dispatches
+            .iter()
+            .enumerate()
+            .map(|(index, dispatch_ms)| ReceiptCompileProbeEvidence {
+                index: index as u64,
+                operation: operation.into(),
+                source: source.into(),
+                matrix_coordinate: matrix_coordinate.into(),
+                setup_ms: 0.0,
+                dispatch_ms: *dispatch_ms,
+                operation_evidence_sha256: format!("{index:064x}"),
+            })
+            .collect()
+    }
 
     #[test]
     fn needle_prompt_places_one_passphrase_before_the_long_context() {
@@ -5794,6 +6136,49 @@ mod tests {
     }
 
     #[test]
+    fn compile_dispatch_excludes_slow_observer_sampling_callbacks() {
+        let mut observer = ProductObserver::new();
+        let wall_started = std::time::Instant::now();
+        let (_, product_ms) = measure_product_dispatch(&mut observer, |observer| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let sampling_started = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            observer.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            Ok(())
+        })
+        .unwrap();
+        let wall_ms = wall_started.elapsed().as_secs_f64() * 1_000.0;
+        assert!(observer.sampling_elapsed_ms >= 25.0);
+        assert!(product_ms > 0.0);
+        assert!(product_ms < observer.sampling_elapsed_ms);
+        assert!((product_ms + observer.sampling_elapsed_ms - wall_ms).abs() < 10.0);
+    }
+
+    #[test]
+    fn operation_evidence_digest_is_canonical_for_realistic_floats() {
+        let realistic = 14.162040999999993;
+        let first = serde_json::json!({
+            "operation": "single-shot-generation",
+            "compileSetupMs": 0.0,
+            "compileDispatchMs": realistic,
+        });
+        let mut reversed = serde_json::Map::new();
+        reversed.insert("compileDispatchMs".into(), serde_json::json!(realistic));
+        reversed.insert("compileSetupMs".into(), serde_json::json!(0.0));
+        reversed.insert(
+            "operation".into(),
+            serde_json::json!("single-shot-generation"),
+        );
+        let second = serde_json::Value::Object(reversed);
+        let expected = seal_bytes(&canonical_json_bytes(&first).unwrap());
+        assert_eq!(canonical_operation_evidence_sha256(&first), expected);
+        assert_eq!(canonical_operation_evidence_sha256(&second), expected);
+        let (noncanonical_bytes, _) = sealed_json(&first);
+        assert_ne!(expected, seal_bytes(&noncanonical_bytes));
+    }
+
+    #[test]
     fn product_observer_sources_element_width_from_retained_cache_arrays() {
         let mut observer = ProductObserver::new();
         Observer::geometry(
@@ -6009,8 +6394,8 @@ mod tests {
     #[test]
     fn artifact_bundle_rejects_tampering_and_partial_outputs() {
         let mut template = Receipt {
-            schema_version: 3,
-            harness_version: "sc-20671-kv-baseline-v3".into(),
+            schema_version: 4,
+            harness_version: "sc-20671-kv-baseline-v4".into(),
             run_id: "run".into(),
             captured_at: "2026-01-01T00:00:00Z".into(),
             mode: "dense".into(),
@@ -6101,6 +6486,21 @@ mod tests {
                 decode_tokens_per_second: 1.0,
                 cold_compile_ms: 1.0,
                 warm_compile_ms: 1.0,
+                compile_attribution: ReceiptCompileAttribution {
+                    method: "first-dispatch-minus-steady-v1".into(),
+                    operation: "single-shot-generation".into(),
+                    source: "measured-repeats".into(),
+                    probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
+                    probe_evidence: test_compile_probe_evidence(
+                        "single-shot-generation",
+                        "measured-repeats",
+                        "llama-short-single-single-shot-cold",
+                        &[3.0, 1.0, 1.0, 1.0, 1.0],
+                    ),
+                    first_dispatch_ms: 3.0,
+                    steady_dispatch_ms: 1.0,
+                    first_dispatch_excess_ms: 2.0,
+                },
                 samples: vec![],
                 summary: ReceiptTimingSummary {
                     decode_tokens_per_second_mean: 1.0,
@@ -6242,10 +6642,23 @@ mod tests {
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
-                cold_compile_ms: 1.0,
-                warm_compile_ms: 1.0,
             })
             .collect();
+        let compile_attribution = ReceiptCompileAttribution {
+            method: "first-dispatch-minus-steady-v1".into(),
+            operation: "single-shot-generation".into(),
+            source: "measured-repeats".into(),
+            probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
+            probe_evidence: test_compile_probe_evidence(
+                "single-shot-generation",
+                "measured-repeats",
+                "llama-short-single-single-shot-cold",
+                &[3.0, 1.0, 1.0, 1.0, 1.0],
+            ),
+            first_dispatch_ms: 3.0,
+            steady_dispatch_ms: 1.0,
+            first_dispatch_excess_ms: 2.0,
+        };
         let quality = QualityObservation {
             parity_errors: vec![0.0],
             reference_perplexity: 1.0,
@@ -6264,10 +6677,11 @@ mod tests {
             phases,
             allocations,
             timings,
+            compile_attribution,
             quality,
         }
         .finish()
-        .expect("builder must produce a complete v3 receipt");
+        .expect("builder must produce a complete v4 receipt");
         assert_eq!(receipt.provenance.model_file_bytes, 100);
         assert_eq!(receipt.memory.model_weights_bytes, 1);
         let mut loosened_release = receipt.clone();
@@ -6718,6 +7132,82 @@ mod tests {
                 "invalid thermal probe unexpectedly accepted: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn compile_attribution_is_raw_recomputable_and_fail_closed() {
+        let cold_matrix = ReceiptMatrix {
+            family: "llama".into(),
+            context_band: "short".into(),
+            request_mode: "single".into(),
+            prefill_mode: "single-shot".into(),
+            process_temperature: "cold".into(),
+        };
+        let probes = |values: &[f64]| {
+            values
+                .iter()
+                .map(|value| (0.0, *value, "a".repeat(64)))
+                .collect::<Vec<_>>()
+        };
+        let cold = compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[8.0, 4.0, 5.0, 6.0, 7.0]),
+        )
+        .unwrap();
+        assert_eq!(cold.source, "measured-repeats");
+        assert_eq!(cold.first_dispatch_ms, 8.0);
+        assert_eq!(cold.steady_dispatch_ms, 5.5);
+        assert_eq!(cold.first_dispatch_excess_ms, 2.5);
+
+        let mut tampered = cold.clone();
+        tampered.probe_durations_ms[2] = 20.0;
+        assert!(validate_compile_attribution(&tampered, &cold_matrix).is_err());
+        let mut evidence_tampered = cold.clone();
+        evidence_tampered.probe_evidence[2].dispatch_ms = 20.0;
+        assert!(validate_compile_attribution(&evidence_tampered, &cold_matrix).is_err());
+        let mut wrong_source = cold.clone();
+        wrong_source.source = "warmup-suites".into();
+        assert!(validate_compile_attribution(&wrong_source, &cold_matrix).is_err());
+        let mut wrong_operation = cold;
+        wrong_operation.operation = "chunked-prefix-reuse".into();
+        assert!(validate_compile_attribution(&wrong_operation, &cold_matrix).is_err());
+
+        let warm_matrix = ReceiptMatrix {
+            family: "llama".into(),
+            context_band: "short".into(),
+            request_mode: "single".into(),
+            prefill_mode: "chunked".into(),
+            process_temperature: "warm".into(),
+        };
+        let warm = compile_attribution_from_probes(
+            "chunked-prefix-reuse",
+            &warm_matrix,
+            probes(&[12.0, 9.0]),
+        )
+        .unwrap();
+        assert_eq!(warm.source, "warmup-suites");
+        assert_eq!(warm.first_dispatch_excess_ms, 3.0);
+        let warmup_seal =
+            warmup_probe_suite_sha256(&"7".repeat(64), 42, &warm.probe_evidence).unwrap();
+        let mut rebound_warm = warm.clone();
+        rebound_warm.probe_evidence[1].setup_ms += 1.0;
+        assert_ne!(
+            warmup_seal,
+            warmup_probe_suite_sha256(&"7".repeat(64), 42, &rebound_warm.probe_evidence).unwrap()
+        );
+        assert!(compile_attribution_from_probes(
+            "chunked-prefix-reuse",
+            &warm_matrix,
+            probes(&[9.0, 12.0]),
+        )
+        .is_err());
+        assert!(compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[1.0, 1.0, 1.0, 1.0, 1.0]),
+        )
+        .is_err());
     }
 
     #[test]
