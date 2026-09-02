@@ -132,7 +132,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -145,7 +145,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            mlx_llm::text_registry(),
+            mlx_llm::catalog_text_registry(),
             mlx_llm::snapshot_preparer_registry(),
         )
     }
@@ -203,7 +203,15 @@ mod tests {
         assert!(snapshot.generator_ids.len() > 50);
         #[cfg(not(feature = "media"))]
         assert!(snapshot.generator_ids.is_empty());
-        assert_eq!(snapshot.text_llm_ids, ["mlx-llama", "mlx-joycaption"]);
+        assert_eq!(
+            snapshot.text_llm_ids,
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
         assert_eq!(snapshot.snapshot_preparer_backends, ["mlx"]);
         // The audio lane is declared Candle-native on this mlx bundle (sc-12901) — the
         // sanctioned cross-backend seam. Its ordered id surface is the audio catalog's —

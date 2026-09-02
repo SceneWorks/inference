@@ -1183,10 +1183,10 @@ impl AdaLayerNormSingle {
         Ok((scale_shift, embedded))
     }
 
-    /// LoRA targets in diffusers naming: `emb.timestep_embedder.linear1/linear2` and `linear`. (A
-    /// trained file spelling the embedder `linear_1`/`linear_2` — the PixArt convention — does NOT
-    /// resolve here and is reported skipped, matching the reference `_normalize_ltx_lora_key`, which
-    /// has no such rename; the base checkpoint names them `linear1`/`linear2`.)
+    /// LoRA targets in the converted MLX naming: `emb.timestep_embedder.linear1/linear2` and
+    /// `linear`. The LTX-2.3 loader leaves PixArt-spelled `linear_1/linear_2` targets unresolved to
+    /// preserve its reference compatibility behavior; the strict LTX-2.5 loader aliases the
+    /// official published spellings to these base names before routing.
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
             ["emb", "timestep_embedder", "linear1"] => Some(&mut self.ts_lin1),
@@ -2591,8 +2591,9 @@ impl AvDiT {
     /// text attns, the two cross-modal attns, both stacks' feed-forwards, and every stream-global
     /// projection / adaLN-single (video + audio + the four `av_ca_*` cross modules). The module name
     /// itself selects the stream (`audio_*` / `av_ca_audio_*` / `av_ca_v2a_*` → audio). A target that
-    /// names no module (e.g. the PixArt-spelled adaLN embedder `linear_1/2`, or an out-of-range block)
-    /// resolves to `None` → reported skipped, never silently dropped.
+    /// names no module (e.g. an unnormalized PixArt-spelled adaLN embedder `linear_1/2`, or an
+    /// out-of-range block) resolves to `None` → reported skipped, never silently dropped. The strict
+    /// LTX-2.5 loader normalizes its official `linear_1/2` spellings before calling this resolver.
     pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
         match path {
             // A streamed trunk holds no blocks to adapt. `LtxBlockStream::new` already refuses to

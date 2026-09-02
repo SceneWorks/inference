@@ -460,6 +460,14 @@ impl Pipeline {
             .map_err(|e| CandleError::Msg(e.to_string()))?
             .path();
         let connector = transformer.with_file_name("connector.safetensors");
+        // A SceneWorks-converted tier declares the complete split layout in `split_model.json`.
+        // Validate it before mmap and use inverse converter bridges for every sanitized component.
+        // Upstream/Comfy bundles have no tier manifest and retain their released namespaces.
+        let converted_tier = tier::Ltx25Tier::detect(&self.root)?;
+        if let Some(tier) = &converted_tier {
+            tier.validate()?;
+        }
+        let diff_vae_quant = converted_tier.as_ref().and_then(tier::Ltx25Tier::quant);
         let video_component = ltx25_video_component(self.use_diffusion_decoder);
         let video = bundle
             .require(video_component)
@@ -469,16 +477,33 @@ impl Pipeline {
             .require(LtxComponent::AudioVae)
             .map_err(|e| CandleError::Msg(e.to_string()))?
             .path();
-        // Converted tiers split the text projections/connectors out of the transformer so the
-        // conditioning stage can load them without materializing the DiT. Raw upstream bundles
-        // keep those keys in the transformer file, so the sibling is optional rather than a naming
-        // requirement on that route.
-        let mut dit_files = vec![transformer.to_path_buf()];
-        if connector.is_file() {
-            dit_files.push(connector);
-        }
-        let dit_all = candle_gen::mmap_var_builder(&dit_files, DIT_DTYPE, &self.device)?;
-        let dit_vb = dit_all.pp("model.diffusion_model");
+        // Converted tiers split the connector/projection out of the transformer and sanitize the
+        // transformer's namespace. Raw upstream bundles keep all three surfaces in the transformer
+        // file with released names. Keep their builders separate: applying the transformer remap to
+        // a connector would incorrectly rewrite its native `to_out.0` / `ff.net.*` keys.
+        let (projection_vb, connector_vb, dit_vb) = if converted_tier.is_some() {
+            if !connector.is_file() {
+                return Err(CandleError::Msg(format!(
+                    "ltx_2_5: converted tier is missing connector.safetensors beside {}",
+                    transformer.display()
+                )));
+            }
+            let transformer_vb = tier::ltx25_transformer_vb(transformer, DIT_DTYPE, &self.device)?;
+            let connector_all = tier::ltx25_connector_vb(&connector, DIT_DTYPE, &self.device)?;
+            (
+                connector_all.clone(),
+                connector_all.pp("model.diffusion_model"),
+                transformer_vb.pp("model.diffusion_model"),
+            )
+        } else {
+            let dit_all = candle_gen::mmap_var_builder(
+                &[transformer.to_path_buf()],
+                DIT_DTYPE,
+                &self.device,
+            )?;
+            let dit_root = dit_all.pp("model.diffusion_model");
+            (dit_all, dit_root.clone(), dit_root)
+        };
         let advanced_source = if matches!(
             self.quant_mode,
             Ltx25QuantMode::Int8ConvRot | Ltx25QuantMode::Nvfp4
@@ -515,8 +540,8 @@ impl Pipeline {
         }
         let te = Ltx25TextEncoder::from_bundle_av(
             bundle,
-            dit_all.clone(),
-            dit_vb,
+            projection_vb,
+            connector_vb,
             &self.av_cfg,
             &self.conn_cfg,
             &self.audio_conn_cfg,
@@ -524,34 +549,62 @@ impl Pipeline {
         let video_vb =
             candle_gen::mmap_var_builder(&[video.to_path_buf()], VAE_DTYPE, &self.device)?;
         let encoder_path = ltx25_encoder_path(&self.root, video_component, video);
-        let encoder_is_split = encoder_path != video;
-        let vae = if self.use_diffusion_decoder {
-            if with_vae_encoder {
-                let encoder_vb =
-                    candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?;
-                let encoder_root = if encoder_is_split {
-                    encoder_vb.pp("vae")
+        let converted_diff_vb = if converted_tier.is_some() && self.use_diffusion_decoder {
+            Some(tier::ltx25_diff_vae_vb(video, VAE_DTYPE, &self.device)?)
+        } else {
+            None
+        };
+        let vae = if converted_tier.is_some() {
+            if self.use_diffusion_decoder {
+                if with_vae_encoder {
+                    let encoder_vb =
+                        tier::ltx25_vae_encoder_vb(&encoder_path, VAE_DTYPE, &self.device)?;
+                    LtxVideoVae::new_encoder_only(encoder_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
                 } else {
-                    encoder_vb
+                    let stats_vb = converted_diff_vb
+                        .as_ref()
+                        .expect("converted DiffVAE builders")
+                        .1
+                        .clone();
+                    LtxVideoVae::new_statistics_only(stats_vb, config::LATENT_CHANNELS, 4)?
+                }
+            } else {
+                let decoder_vb =
+                    tier::ltx25_vae_decoder_vb(video, VAE_DTYPE, &self.device)?.pp("vae");
+                if with_vae_encoder {
+                    let encoder_vb =
+                        tier::ltx25_vae_encoder_vb(&encoder_path, VAE_DTYPE, &self.device)?
+                            .pp("vae");
+                    LtxVideoVae::new_with_encoder(
+                        decoder_vb,
+                        encoder_vb,
+                        config::LATENT_CHANNELS,
+                        4,
+                    )?
+                } else {
+                    LtxVideoVae::new(decoder_vb, config::LATENT_CHANNELS, 4)?
+                }
+            }
+        } else if self.use_diffusion_decoder {
+            if with_vae_encoder {
+                let encoder_vb = if encoder_path == video {
+                    video_vb.clone()
+                } else {
+                    candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?
                 };
-                LtxVideoVae::new_encoder_only(encoder_root, config::LATENT_CHANNELS, 4)?
+                LtxVideoVae::new_encoder_only(encoder_vb, config::LATENT_CHANNELS, 4)?
             } else {
                 LtxVideoVae::new_statistics_only(video_vb.clone(), config::LATENT_CHANNELS, 4)?
             }
         } else if with_vae_encoder {
-            let encoder_vb = if encoder_is_split {
-                candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?.pp("vae")
+            let encoder_vb = if encoder_path == video {
+                video_vb.clone()
             } else {
-                video_vb.pp("vae")
+                candle_gen::mmap_var_builder(&[encoder_path], VAE_DTYPE, &self.device)?
             };
-            LtxVideoVae::new_with_encoder(
-                video_vb.pp("vae"),
-                encoder_vb,
-                config::LATENT_CHANNELS,
-                4,
-            )?
+            LtxVideoVae::new_with_encoder(video_vb.clone(), encoder_vb, config::LATENT_CHANNELS, 4)?
         } else {
-            LtxVideoVae::new(video_vb.pp("vae"), config::LATENT_CHANNELS, 4)?
+            LtxVideoVae::new(video_vb.clone(), config::LATENT_CHANNELS, 4)?
         };
         let upsampler = LatentUpsampler::from_checkpoint(
             bundle
@@ -561,10 +614,25 @@ impl Pipeline {
             VAE_DTYPE,
             &self.device,
         )?;
-        let audio_vb =
-            candle_gen::mmap_var_builder(&[audio.to_path_buf()], VAE_DTYPE, &self.device)?;
+        let (audio_vb, vocoder_vb) = if converted_tier.is_some() {
+            let vocoder_path = audio.with_file_name("vocoder.safetensors");
+            if !vocoder_path.is_file() {
+                return Err(CandleError::Msg(format!(
+                    "ltx_2_5: converted tier is missing vocoder.safetensors beside {}",
+                    audio.display()
+                )));
+            }
+            (
+                tier::ltx25_audio_vae_vb(audio, VAE_DTYPE, &self.device)?,
+                tier::ltx25_vocoder_vb(&vocoder_path, VAE_DTYPE, &self.device)?,
+            )
+        } else {
+            let audio_vb =
+                candle_gen::mmap_var_builder(&[audio.to_path_buf()], VAE_DTYPE, &self.device)?;
+            (audio_vb.clone(), audio_vb)
+        };
         let audio_decoder = AudioDecoder::load(&audio_vb.pp("audio_vae"), &self.audio_vae_cfg)?;
-        let vocoder = LtxVocoder::load(audio_vb, &self.device, &self.vocoder_cfg)?;
+        let vocoder = LtxVocoder::load(vocoder_vb, &self.device, &self.vocoder_cfg)?;
         let diffusion_decoder = if self.use_diffusion_decoder {
             let component = bundle
                 .require(LtxComponent::DiffusionVideoVae)
@@ -574,15 +642,21 @@ impl Pipeline {
                     .config()
                     .map_err(|e| CandleError::Msg(e.to_string()))?,
             )?;
-            let diff_vb = candle_gen::mmap_var_builder(
-                &[component.path().to_path_buf()],
-                VAE_DTYPE,
-                &self.device,
-            )?;
-            Some(Arc::new(NaDiffusionDecoder::load(
-                diff_vb.pp("decoder"),
-                diff_vb,
+            let (body_vb, stats_vb) = if let Some((body_vb, stats_vb)) = converted_diff_vb {
+                (body_vb, stats_vb)
+            } else {
+                let diff_vb = candle_gen::mmap_var_builder(
+                    &[component.path().to_path_buf()],
+                    VAE_DTYPE,
+                    &self.device,
+                )?;
+                (diff_vb.pp("decoder"), diff_vb)
+            };
+            Some(Arc::new(NaDiffusionDecoder::load_quantized(
+                body_vb,
+                stats_vb,
                 &cfg,
+                diff_vae_quant,
             )?))
         } else {
             None
@@ -1831,6 +1905,13 @@ fn descriptor_25_for_variant(transformer_variant: TransformerVariant) -> ModelDe
     out.capabilities.supports_generated_keyframes = true;
     out.capabilities.max_temporal_upsample_rounds = 2;
     out.capabilities.supports_diffusion_decoder = true;
+    // sc-18791: LTX-2.5 ships BOTH hosted packed tiers on Candle. The 2.3 descriptor this inherits
+    // from advertises q4 alone because 2.3 has no released q8 route; 2.5 converts `q4/` and `q8/`
+    // side by side, the q8 bundle additionally packing the Gemma 4 text encoder, and both load
+    // through the same MLX-affine packed path. Stated on the shared section rather than per variant:
+    // the numeric tier is a property of the converted bundle, not of distilled-vs-dev, and both
+    // variants have a published q8 conversion.
+    out.capabilities.supported_quants = &[Quant::Q4, Quant::Q8];
     match transformer_variant {
         TransformerVariant::Distilled => {
             out.capabilities.supported_steps = StepSupport::Exact(vec![NATIVE_STEPS]);
@@ -2669,9 +2750,34 @@ mod tests {
         assert!(generator.descriptor.capabilities.supports_diffusion_decoder);
         assert_eq!(
             generator.descriptor.capabilities.supported_quants,
-            &[Quant::Q4],
-            "unmeasured int8-convrot/nvfp4 must stay out of the catalog surface"
+            &[Quant::Q4, Quant::Q8],
+            "both released packed tiers are catalog surface; unmeasured nvfp4 stays out"
         );
+    }
+
+    #[test]
+    fn ltx25_descriptor_advertises_both_released_packed_tiers() {
+        // sc-18791: the 2.5 route ships `q4/` and `q8/` side by side, so it overrides the LTX-2.3
+        // descriptor it is derived from (which has no released q8 route) on BOTH variants — the
+        // numeric tier belongs to the converted bundle, not to distilled-vs-dev.
+        assert_eq!(descriptor().capabilities.supported_quants, &[Quant::Q4]);
+        for descriptor in [
+            descriptor_25(),
+            descriptor_25_for_variant(TransformerVariant::Distilled),
+            descriptor_25_for_variant(TransformerVariant::Dev),
+        ] {
+            assert_eq!(
+                descriptor.capabilities.supported_quants,
+                &[Quant::Q4, Quant::Q8],
+                "LTX-2.5 advertises no tier exclusion on candle"
+            );
+            // NVFP4 is a materially different operator that is still fail-closed; advertising it
+            // here would be a declaration the loader refuses.
+            assert!(!descriptor
+                .capabilities
+                .supported_quants
+                .contains(&Quant::Nvfp4));
+        }
     }
 
     #[test]
@@ -2713,22 +2819,42 @@ mod tests {
     #[test]
     fn ltx25_catalog_route_reaches_the_quant_policy_before_bundle_loading() {
         // This is intentionally an ordinary registry load, not a selector helper. The nonexistent
-        // root proves that Q8 is parsed as the LTX ConvRot option at the provider boundary before
-        // file discovery could accidentally select a different precision.
-        let spec =
-            LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx25".into())).with_quant(Quant::Q8);
-        let result = crate::provider_registry()
-            .expect("provider registry")
-            .load(MODEL_25_ID, &spec);
-        let error = match result {
-            Ok(_) => panic!("unmeasured ConvRot must fail closed"),
+        // root proves the advanced-quant policy is reached at the provider boundary before file
+        // discovery could accidentally select a different precision. NVFP4 carries that witness now
+        // that q8 is a released tier (sc-18791); it is the remaining LoadSpec-selectable advanced
+        // operator and stays fail-closed.
+        let load = |quant| {
+            crate::provider_registry().expect("provider registry").load(
+                MODEL_25_ID,
+                &LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx25".into())).with_quant(quant),
+            )
+        };
+        let error = match load(Quant::Nvfp4) {
+            Ok(_) => panic!("unmeasured NVFP4 must fail closed"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("int8-convrot"), "got: {error}");
+        assert!(error.contains("nvfp4"), "got: {error}");
         assert!(
-            error.contains("terminal measurement case") || error.contains("not catalog-adopted"),
+            error.contains("terminal measurement case")
+                || error.contains("not catalog-adopted")
+                || error.contains("requires exact consumer Blackwell"),
             "quant policy must run before missing-bundle discovery, got: {error}"
         );
+
+        // The promoted packed tiers clear that same policy and only then meet file discovery, so
+        // the advertised q8 route is reachable rather than merely declared.
+        for quant in [Quant::Q4, Quant::Q8] {
+            let error = match load(quant) {
+                Ok(_) => panic!("a nonexistent bundle cannot load"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("not catalog-adopted")
+                    && !error.contains("terminal measurement case")
+                    && !error.contains("terminal comparison source"),
+                "{quant:?} must pass the quant policy and fail on discovery, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -2794,9 +2920,18 @@ mod tests {
         assert!(loader.contains("ltx25_video_component(self.use_diffusion_decoder)"));
         assert!(loader.contains("ltx25_encoder_path(&self.root, video_component, video)"));
         assert!(loader.contains("transformer.with_file_name(\"connector.safetensors\")"));
-        assert!(loader.contains("dit_files.push(connector)"));
+        assert!(loader.contains("Ltx25Tier::detect(&self.root)"));
+        assert!(loader.contains("tier::ltx25_transformer_vb("));
+        assert!(loader.contains("tier::ltx25_connector_vb("));
+        assert!(loader.contains("tier::ltx25_vae_encoder_vb("));
+        assert!(loader.contains("tier::ltx25_audio_vae_vb("));
+        assert!(loader.contains("tier::ltx25_vocoder_vb("));
         assert!(loader.contains("LtxVideoVae::new_encoder_only("));
         assert!(loader.contains("LtxVideoVae::new_statistics_only("));
+        assert!(loader.contains(".and_then(tier::Ltx25Tier::quant)"));
+        assert!(loader.contains("NaDiffusionDecoder::load_quantized("));
+        assert!(loader.contains("diff_vae_quant,"));
+        assert!(!loader.contains("NaDiffusionDecoder::load(body_vb, stats_vb, &cfg)"));
         assert!(
             !loader.contains(".require(LtxComponent::ConvVideoVae)"),
             "an explicit DiffVAE selection must not require an unrelated conv decoder"

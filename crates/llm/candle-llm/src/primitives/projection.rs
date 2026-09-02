@@ -16,6 +16,9 @@ use crate::primitives::quant::QuantizedLinear;
 pub struct QuantSpec {
     /// The target GGML block-quant dtype.
     pub dtype: GgmlDType,
+    /// Source group size when the checkpoint stores an MLX affine packed triple.
+    /// Dense load-time quantization ignores this value.
+    group_size: usize,
 }
 
 impl QuantSpec {
@@ -23,6 +26,7 @@ impl QuantSpec {
     pub fn q4() -> Self {
         Self {
             dtype: GgmlDType::Q4K,
+            group_size: 64,
         }
     }
 
@@ -30,15 +34,30 @@ impl QuantSpec {
     pub fn q8() -> Self {
         Self {
             dtype: GgmlDType::Q8_0,
+            group_size: 64,
         }
     }
 
     /// Map a persisted `quantization.bits` value to a spec: `4 → Q4_K`, `8 → Q8_0`. Any other width
     /// is unrecognized (`None`) — the snapshot writer only ever emits 4 or 8.
     pub fn from_bits(bits: u32) -> Option<Self> {
+        Self::from_bits_and_group_size(bits, 64)
+    }
+
+    /// Map a persisted affine quantization block to its bit width and source group size.
+    pub fn from_bits_and_group_size(bits: u32, group_size: usize) -> Option<Self> {
+        if group_size == 0 {
+            return None;
+        }
         match bits {
-            4 => Some(Self::q4()),
-            8 => Some(Self::q8()),
+            4 => Some(Self {
+                dtype: GgmlDType::Q4K,
+                group_size,
+            }),
+            8 => Some(Self {
+                dtype: GgmlDType::Q8_0,
+                group_size,
+            }),
             _ => None,
         }
     }
@@ -49,6 +68,11 @@ impl QuantSpec {
             GgmlDType::Q8_0 => 8,
             _ => 4,
         }
+    }
+
+    /// Group size declared by an MLX affine packed source.
+    pub fn group_size(&self) -> usize {
+        self.group_size
     }
 }
 
@@ -79,6 +103,33 @@ impl Projection {
                 &weight, q.dtype, bias,
             )?)),
         }
+    }
+
+    /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
+    /// matrix as a dense projection. The source is converted once to the resident Q8_0 form used by
+    /// the existing quantized forward.
+    pub fn load_mlx_affine_q8(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bias: Option<Tensor>,
+        quant: QuantSpec,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        if quant.bits() != 8 {
+            return Err(crate::error::Error::Config(format!(
+                "MLX affine projection requires Q8, got Q{}",
+                quant.bits()
+            )));
+        }
+        Ok(Projection::Quantized(QuantizedLinear::from_mlx_affine_q8(
+            weight,
+            scales,
+            biases,
+            bias,
+            quant.group_size(),
+            device,
+        )?))
     }
 
     /// `x @ weightᵀ`.
