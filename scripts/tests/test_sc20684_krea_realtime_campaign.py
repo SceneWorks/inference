@@ -15,6 +15,7 @@ SPEC = importlib.util.spec_from_file_location("sc20684_campaign", SCRIPT)
 assert SPEC and SPEC.loader
 campaign = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(campaign)
+GIB = 1024**3
 
 SOURCE = {
     "repositoryHead": "a" * 40,
@@ -39,7 +40,7 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
         "v2v": {"kind": "deterministic-smooth-motion-clip", "frameCount": 25, "vaeEncoding": "WanVae.encode-sample", "v2vStrength": 0.6},
     }
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
@@ -70,6 +71,9 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
             "heads": 40,
             "queryTokens": 8,
             "keyTokens": 16,
+            "dispatchGeometries": [
+                {"queryTokens": 8, "keyTokens": 16, "acceptedForwards": 5},
+            ],
             "headDim": 128,
             "groupSize": 64,
             "mask": "block-causal",
@@ -118,27 +122,36 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
             "steadyDenoiseEquivalentFps": 50.0,
         },
         "memory": {
-            **{name: {"physFootprintBytes": 100, "physFootprintPeakBytes": 200} for name in ("processStart", "weightsLoaded", "packedTerminal", "candidateTerminal", "verificationTerminal", "release")},
+            **{
+                name: {
+                    "physFootprintBytes": 6 * GIB,
+                    "physFootprintPeakBytes": 8 * GIB,
+                }
+                for name in (
+                    "processStart", "weightsLoaded", "packedTerminal", "candidateTerminal",
+                    "verificationTerminal", "release",
+                )
+            },
             "mlx": {
-                "weightsLoadedActiveBytes": 10,
-                "weightsLoadedCacheBytes": 2,
-                "candidateTerminalActiveBytes": 90,
-                "candidateTerminalCacheBytes": 18,
-                "verificationTerminalActiveBytes": 100,
-                "verificationTerminalCacheBytes": 20,
-                "exactActivePeakBytes": 150,
-                "sampledActivePeakBytes": 140,
-                "sampledCachePeakBytes": 30,
-                "sampledFootprintPeakBytes": 160,
-                "footprintPeakActiveBytes": 140,
-                "footprintPeakCacheBytes": 20,
+                "weightsLoadedActiveBytes": 5 * GIB,
+                "weightsLoadedCacheBytes": GIB // 2,
+                "candidateTerminalActiveBytes": 6 * GIB,
+                "candidateTerminalCacheBytes": GIB // 2,
+                "verificationTerminalActiveBytes": 6 * GIB,
+                "verificationTerminalCacheBytes": GIB // 2,
+                "exactActivePeakBytes": 15 * GIB // 2,
+                "sampledActivePeakBytes": 7 * GIB,
+                "sampledCachePeakBytes": GIB,
+                "sampledFootprintPeakBytes": 8 * GIB,
+                "footprintPeakActiveBytes": 7 * GIB,
+                "footprintPeakCacheBytes": GIB,
                 "sampleCount": 10,
                 "periodicSampleCount": 8,
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
-                "releaseActiveBytes": 90,
-                "releaseCacheBytes": 10,
+                "releaseActiveBytes": 6 * GIB,
+                "releaseCacheBytes": GIB // 2,
             },
             "releaseVerified": True,
         },
@@ -173,11 +186,12 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
 
 def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> dict:
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
-        **{key: candidate[key] for key in ("source", "model", "input", "schedule", "toolchain", "geometry")},
+        **{key: candidate[key] for key in ("source", "model", "input", "schedule", "toolchain")},
+        "geometry": {**candidate["geometry"], "dispatchGeometries": []},
         "timing": {
             "label": "fresh-process-full-schedule-dense-read-window-baseline",
             "processWallMs": 50.0,
@@ -195,25 +209,31 @@ def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> 
             "steadyDenoiseEquivalentFps": 40.0,
         },
         "memory": {
-            **{name: {"physFootprintBytes": 120, "physFootprintPeakBytes": 220} for name in ("processStart", "weightsLoaded", "generationTerminal", "release")},
+            **{
+                name: {
+                    "physFootprintBytes": 7 * GIB,
+                    "physFootprintPeakBytes": 10 * GIB,
+                }
+                for name in ("processStart", "weightsLoaded", "generationTerminal", "release")
+            },
             "mlx": {
-                "weightsLoadedActiveBytes": 10,
-                "weightsLoadedCacheBytes": 2,
-                "generationTerminalActiveBytes": 120,
-                "generationTerminalCacheBytes": 22,
-                "exactActivePeakBytes": 170,
-                "sampledActivePeakBytes": 160,
-                "sampledCachePeakBytes": 30,
-                "sampledFootprintPeakBytes": 180,
-                "footprintPeakActiveBytes": 160,
-                "footprintPeakCacheBytes": 20,
+                "weightsLoadedActiveBytes": 5 * GIB,
+                "weightsLoadedCacheBytes": GIB // 2,
+                "generationTerminalActiveBytes": 7 * GIB,
+                "generationTerminalCacheBytes": GIB // 2,
+                "exactActivePeakBytes": 19 * GIB // 2,
+                "sampledActivePeakBytes": 9 * GIB,
+                "sampledCachePeakBytes": GIB,
+                "sampledFootprintPeakBytes": 10 * GIB,
+                "footprintPeakActiveBytes": 9 * GIB,
+                "footprintPeakCacheBytes": GIB,
                 "sampleCount": 10,
                 "periodicSampleCount": 8,
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
-                "releaseActiveBytes": 110,
-                "releaseCacheBytes": 20,
+                "releaseActiveBytes": 7 * GIB,
+                "releaseCacheBytes": GIB // 2,
             },
             "releaseVerified": True,
         },
@@ -245,11 +265,12 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 run_id=baseline_run_id,
                 candidate=candidate,
             )
-            rows.append({
+            row = {
                 "mode": mode,
                 "cacheTier": tier,
                 "launcherElapsedNs": 1,
                 "artifactDirectory": f"artifacts/{mode}-{tier}",
+                "processExitCodes": {"paired": 0, "dense-baseline": 0},
                 "transcripts": {
                     role: {
                         stream: {"path": f"transcripts/{mode}-{tier}.{role}.{stream}.log", "sha256": "0" * 64, "bytes": 0}
@@ -258,20 +279,24 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                     for role in ("paired", "dense-baseline")
                 },
                 "comparison": {
-                    "candidatePhysFootprintPeakBytes": 200,
-                    "baselinePhysFootprintPeakBytes": 220,
-                    "physFootprintReductionFraction": 20 / 220,
-                    "candidateMlxFootprintPeakBytes": 160,
-                    "baselineMlxFootprintPeakBytes": 180,
-                    "mlxFootprintReductionFraction": 20 / 180,
+                    "candidatePhysFootprintPeakBytes": 8 * GIB,
+                    "baselinePhysFootprintPeakBytes": 10 * GIB,
+                    "physFootprintReductionFraction": 0.2,
+                    "candidateMlxFootprintPeakBytes": 8 * GIB,
+                    "baselineMlxFootprintPeakBytes": 10 * GIB,
+                    "mlxFootprintReductionFraction": 0.2,
                     "candidateRequestFirstFrameMs": 32.0,
                     "baselineRequestFirstFrameMs": 34.0,
+                    "candidateMeanOutputFps": 1000.0 / 1.2,
+                    "baselineMeanOutputFps": 1000.0 / (32.0 / 25.0),
                     "candidateSteadyDenoiseEquivalentFps": 50.0,
                     "baselineSteadyDenoiseEquivalentFps": 40.0,
                 },
                 "baseline": baseline,
                 "observation": candidate,
-            })
+            }
+            row["decision"] = campaign.arm_decision(row, campaign.decision_policy())
+            rows.append(row)
         return rows
 
     def write_evidence(self, evidence_root: Path, rows: list[dict]) -> None:
@@ -325,6 +350,11 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
     def test_complete_matrix_closes_only_after_all_modes_and_tiers(self) -> None:
         rows = self.complete_rows()
         campaign.validate_matrix(rows)
+        result = campaign.campaign_decision(rows, campaign.decision_policy())
+        self.assertEqual(result["overall"]["decision"], "go")
+        self.assertEqual(len(result["overall"]["eligibleGeometries"]), 6)
+        self.assertEqual(result["tiers"]["q8"]["decision"], "go")
+        self.assertEqual(result["tiers"]["q4"]["decision"], "go")
         with self.assertRaisesRegex(campaign.CampaignError, "incomplete"):
             campaign.validate_matrix(rows[:-1])
         malformed = [*rows]
@@ -336,15 +366,19 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(campaign.CampaignError, "comparison drift"):
             campaign.validate_matrix(drifted)
 
-    def test_identity_drift_and_dense_bytes_are_refused(self) -> None:
+    def test_identity_drift_is_refused_and_dense_bytes_are_a_sealed_no_go(self) -> None:
         row = observation("t2v", "q8", "run")
         row["source"] = {**SOURCE, "repositoryHead": "e" * 40}
         with self.assertRaisesRegex(campaign.CampaignError, "source identity drift"):
             self.validate_from(row)
         row = observation("t2v", "q8", "run")
         row["bytes"]["denseWindow"] = 1
-        with self.assertRaisesRegex(campaign.CampaignError, "dense window"):
-            self.validate_from(row)
+        validated = self.validate_from(row)
+        matrix_row = self.complete_rows()[0]
+        matrix_row["observation"] = validated
+        decision = campaign.arm_decision(matrix_row, campaign.decision_policy())
+        self.assertEqual(decision["decision"], "no-go")
+        self.assertIn("zeroDenseWindowBytes", decision["failedCriteria"])
 
     def test_missing_or_malformed_rows_fail_closed(self) -> None:
         row = observation("i2v", "q4", "run")
@@ -382,6 +416,25 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(campaign.CampaignError, "generated-latent geometry"):
             self.validate_from(row, mode="i2v")
 
+    def test_per_dispatch_geometry_coverage_is_exact_and_counted(self) -> None:
+        row = observation("t2v", "q8", "run")
+        row["geometry"]["dispatchGeometries"] = [
+            {"queryTokens": 8, "keyTokens": 16, "acceptedForwards": 3},
+            {"queryTokens": 4, "keyTokens": 12, "acceptedForwards": 2},
+        ]
+        validated = self.validate_from(row)
+        matrix_row = self.complete_rows()[0]
+        matrix_row["observation"] = validated
+        decision = campaign.arm_decision(matrix_row, campaign.decision_policy())
+        self.assertEqual(
+            decision["eligibleGeometry"]["geometry"]["dispatchGeometries"],
+            row["geometry"]["dispatchGeometries"],
+        )
+
+        row["geometry"]["dispatchGeometries"][0]["acceptedForwards"] = 2
+        with self.assertRaisesRegex(campaign.CampaignError, "coverage contradicts"):
+            self.validate_from(row)
+
     def test_q8_and_q4_cannot_substitute_one_another(self) -> None:
         row = observation("v2v", "q4", "run")
         row["compiledHandle"]["identity"] = "sc20684/krea-packed-affine-q8-d128-g64-v1"
@@ -392,13 +445,36 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(campaign.CampaignError, "tier-substituted"):
             self.validate_from(row, mode="v2v", tier="q4")
 
-    def test_partial_dense_fallback_and_false_release_are_refused(self) -> None:
+    def test_fallback_quality_and_release_failures_are_sealed_no_go_outcomes(self) -> None:
+        matrix_row = self.complete_rows()[0]
         row = observation("t2v", "q8", "run")
         row["fallback"] = {"count": 1, "reason": "geometry"}
-        with self.assertRaisesRegex(campaign.CampaignError, "dense fallback"):
-            self.validate_from(row)
+        matrix_row["observation"] = self.validate_from(row)
+        decision = campaign.arm_decision(matrix_row, campaign.decision_policy())
+        self.assertEqual(decision["decision"], "no-go")
+        self.assertIn("noDenseFallback", decision["failedCriteria"])
+
+        matrix_row = self.complete_rows()[1]
+        row = observation("t2v", "q4", "run")
+        row["quality"]["status"] = "fail"
+        row["quality"]["meanAbsRgbU8"] = 4.0
+        matrix_row["observation"] = self.validate_from(row, tier="q4")
+        matrix_row["processExitCodes"]["paired"] = 101
+        decision = campaign.arm_decision(matrix_row, campaign.decision_policy())
+        self.assertEqual(decision["decision"], "no-go")
+        self.assertIn("qualityPassed", decision["failedCriteria"])
+        self.assertIn("pairedProcessExitZero", decision["failedCriteria"])
+
+        matrix_row = self.complete_rows()[0]
         row = observation("t2v", "q8", "run")
-        row["memory"]["mlx"]["releaseActiveBytes"] = 101
+        row["memory"]["mlx"]["releaseActiveBytes"] = 7 * GIB
+        row["memory"]["releaseVerified"] = False
+        matrix_row["observation"] = self.validate_from(row)
+        decision = campaign.arm_decision(matrix_row, campaign.decision_policy())
+        self.assertEqual(decision["decision"], "no-go")
+        self.assertIn("candidateReleaseVerified", decision["failedCriteria"])
+
+        row["memory"]["releaseVerified"] = True
         with self.assertRaisesRegex(campaign.CampaignError, "contradicts"):
             self.validate_from(row)
         candidate = self.validate()
@@ -432,7 +508,13 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 digest, relative = line.split("  ", 1)
                 self.assertEqual(hashlib.sha256((output / relative).read_bytes()).hexdigest(), digest)
             sealed = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
-            self.assertEqual(sealed["status"], "terminal-complete")
+            self.assertEqual(sealed["schemaVersion"], campaign.RECEIPT_SCHEMA_VERSION)
+            self.assertEqual(sealed["status"], "terminal-go")
+            self.assertEqual(sealed["decision"]["overall"]["decision"], "go")
+            self.assertEqual(
+                sealed["decision"]["policySha256"],
+                campaign._canonical_sha256(campaign.decision_policy()),
+            )
             self.assertEqual(len(sealed["matrix"]), 6)
             with self.assertRaisesRegex(campaign.CampaignError, "already exists"):
                 campaign.publish(output, source=SOURCE, model=MODEL, rows=rows, evidence_root=evidence_root)
@@ -440,6 +522,57 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(campaign.CampaignError, "incomplete"):
                 campaign.publish(partial, source=SOURCE, model=MODEL, rows=rows[:-1], evidence_root=evidence_root)
             self.assertFalse(partial.exists())
+
+    def test_below_threshold_and_q4_quality_failure_publish_terminal_no_go(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = self.complete_rows()
+            for row in rows:
+                row["comparison"]["candidatePhysFootprintPeakBytes"] = (
+                    row["comparison"]["baselinePhysFootprintPeakBytes"] - 128 * 1024**2
+                )
+                row["comparison"]["physFootprintReductionFraction"] = 0.0125
+                row["observation"]["memory"]["candidateTerminal"]["physFootprintPeakBytes"] = (
+                    row["comparison"]["candidatePhysFootprintPeakBytes"]
+                )
+                row["decision"] = campaign.arm_decision(row, campaign.decision_policy())
+            q4 = next(row for row in rows if row["cacheTier"] == "q4")
+            q4["observation"]["quality"]["status"] = "fail"
+            q4["observation"]["quality"]["meanAbsRgbU8"] = 4.0
+            q4["processExitCodes"]["paired"] = 101
+            q4["decision"] = campaign.arm_decision(q4, campaign.decision_policy())
+
+            evidence_root = Path(temporary) / "evidence-source"
+            self.write_evidence(evidence_root, rows)
+            output = Path(temporary) / "receipt"
+            campaign.publish(
+                output,
+                source=SOURCE,
+                model=MODEL,
+                rows=rows,
+                evidence_root=evidence_root,
+            )
+            sealed = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+            self.assertEqual(sealed["status"], "terminal-no-go")
+            self.assertEqual(sealed["decision"]["overall"]["eligibleGeometries"], [])
+            self.assertIn(
+                "physFootprintReductionMaterial",
+                sealed["decision"]["arms"]["t2v/q8"]["failedCriteria"],
+            )
+            self.assertIn(
+                "qualityPassed",
+                sealed["decision"]["arms"]["t2v/q4"]["failedCriteria"],
+            )
+
+    def test_policy_explicitly_bounds_unswept_geometry_axes(self) -> None:
+        policy = campaign.decision_policy()
+        self.assertEqual(policy["materialMemory"]["minimumReductionBytes"], 256 * 1024**2)
+        self.assertEqual(policy["materialMemory"]["minimumReductionFraction"], 0.05)
+        self.assertEqual(policy["throughputNeutral"]["minimumMeanOutputFpsRatio"], 0.95)
+        self.assertIn("alternateGpuFamilies", policy["coverage"]["notSweptByThisSchedule"])
+        self.assertEqual(
+            policy["coverage"]["eligibilityBoundary"],
+            "only exact measured arm geometries are eligible",
+        )
 
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(

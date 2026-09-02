@@ -36,7 +36,7 @@
   ],
   "receipt": {
     "status": "producer-implemented-terminal-receipt-required",
-    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel", "inputIdentity", "denoisingSchedule", "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts", "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline", "pairedCandidateComparison"],
+    "requiredFields": ["modelIdentity", "requestGeometry", "cacheGeometry", "maskCapability", "representationIdentity", "compiledHandleIdentity", "persistentBytes", "retainedHandleBytes", "boundedScratchBytes", "denseWindowBytes", "scoreMatrixBytes", "fallbackReason", "parity", "quality", "cancellation", "timingLabel", "inputIdentity", "denoisingSchedule", "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts", "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline", "pairedCandidateComparison", "decisionPolicy", "decisionPolicySha256", "geometryCoverage", "dispatchGeometryCoverage", "processExitCodes", "perArmDecision", "tierDecision", "overallDecision", "eligibleGeometry"],
     "forbiddenClaims": ["local performance", "local memory reduction", "local quality parity", "compressed-domain execution"]
   },
   "sourceMappings": [
@@ -63,6 +63,9 @@
     ,{"path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "needle": "pub fn forward_causal_chunk_with_packed_attention"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub fn packed_metal_route_receipt"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "fn record_packed_forward_duration"}
+    ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "needle": "pub struct PackedMetalDispatchGeometry"}
     ,{"path": "crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "needle": "fn sc20684_packed_campaign_observer()"}
+    ,{"path": "scripts/sc20684_krea_realtime_campaign.py", "needle": "def decision_policy()"}
+    ,{"path": "scripts/sc20684_krea_realtime_campaign.py", "needle": "def campaign_decision("}
   ]
 }

@@ -36,7 +36,10 @@ REQUIRED_MAPPINGS = {
     ("crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs", "pub fn forward_causal_chunk_with_packed_attention"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "pub fn packed_metal_route_receipt"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "fn record_packed_forward_duration"),
+    ("crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs", "pub struct PackedMetalDispatchGeometry"),
     ("crates/media/mlx-gen/mlx-gen-krea-realtime/tests/generate_smoke.rs", "fn sc20684_packed_campaign_observer()"),
+    ("scripts/sc20684_krea_realtime_campaign.py", "def decision_policy()"),
+    ("scripts/sc20684_krea_realtime_campaign.py", "def campaign_decision("),
 }
 REQUIRED_FALLBACKS = {"disabled", "q4-quality", "handle", "geometry", "mask", "cancellation", "receipt"}
 REQUIRED_RECEIPT_FIELDS = {
@@ -47,6 +50,9 @@ REQUIRED_RECEIPT_FIELDS = {
     "processMemory", "allocatorMemory", "phaseTimings", "temporalQuality", "reviewArtifacts",
     "releaseOutcome", "rawTranscripts", "checksumManifest", "freshDenseBaseline",
     "pairedCandidateComparison",
+    "decisionPolicy", "decisionPolicySha256", "geometryCoverage", "processExitCodes",
+    "perArmDecision", "tierDecision", "overallDecision", "eligibleGeometry",
+    "dispatchGeometryCoverage",
 }
 REQUIRED_UPSTREAM_MECHANISMS = {"scalar_fused_decode_attend", "rabitq_prefill_attend"}
 REQUIRED_HEADINGS = (
@@ -138,6 +144,21 @@ def errors_for(data: dict, source_root: Path) -> list[str]:
         for needle in required:
             if needle not in source:
                 errors.append(f"compressed POC structural guard missing: {needle}")
+    campaign_source = source_root / "scripts/sc20684_krea_realtime_campaign.py"
+    if campaign_source.is_file():
+        source = campaign_source.read_text(encoding="utf-8")
+        required = (
+            "MINIMUM_MEMORY_REDUCTION_BYTES = 256 * 1024**2",
+            "MINIMUM_MEMORY_REDUCTION_FRACTION = 0.05",
+            "MINIMUM_THROUGHPUT_RATIO = 0.95",
+            "MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION = 0.05",
+            '"eligibilityBoundary": "only exact measured arm geometries are eligible"',
+            '"status": f"terminal-{decision[\'overall\'][\'decision\']}"',
+            '"eligibleGeometry": geometry if not failed else None',
+        )
+        for needle in required:
+            if needle not in source:
+                errors.append(f"sealed decision-policy guard missing: {needle}")
     return errors
 
 

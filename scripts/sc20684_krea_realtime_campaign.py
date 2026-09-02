@@ -37,12 +37,17 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 STORY = "SC-20684"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 3
 MODEL_REPOSITORY = "SceneWorks/krea-realtime-14b-mlx"
 MODEL_REVISION = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
 OBSERVATION_PREFIX = "SC20684_KREA_PROVIDER_OBSERVATION "
 BASELINE_PREFIX = "SC20684_KREA_BASELINE_OBSERVATION "
 CASES = tuple((mode, tier) for mode in ("t2v", "i2v", "v2v") for tier in ("q8", "q4"))
+MINIMUM_MEMORY_REDUCTION_BYTES = 256 * 1024**2
+MINIMUM_MEMORY_REDUCTION_FRACTION = 0.05
+MINIMUM_THROUGHPUT_RATIO = 0.95
+MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION = 0.05
 SOURCE_FILES = (
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -56,6 +61,73 @@ SOURCE_FILES = (
 
 class CampaignError(ValueError):
     """A non-terminal row or invalid provenance; no receipt may be published."""
+
+
+def decision_policy() -> dict[str, Any]:
+    """Return the source-frozen policy captured before any product process runs."""
+    return {
+        "identity": "sc20684-krea-packed-affine-decision-v1",
+        "materialMemory": {
+            "minimumReductionBytes": MINIMUM_MEMORY_REDUCTION_BYTES,
+            "minimumReductionFraction": MINIMUM_MEMORY_REDUCTION_FRACTION,
+            "requiredDomains": ["darwinPhysFootprintPeak", "mlxSampledFootprintPeak"],
+        },
+        "throughputNeutral": {
+            "minimumMeanOutputFpsRatio": MINIMUM_THROUGHPUT_RATIO,
+            "minimumSteadyDenoiseEquivalentFpsRatio": MINIMUM_THROUGHPUT_RATIO,
+            "maximumRequestFirstFrameRegressionFraction": MAXIMUM_FIRST_FRAME_REGRESSION_FRACTION,
+        },
+        "requiredSafety": {
+            "pairedProcessExitCode": 0,
+            "denseBaselineProcessExitCode": 0,
+            "compiledPackedHandle": True,
+            "minimumAcceptedPackedDispatches": 1,
+            "denseWindowBytes": 0,
+            "scoreMatrixBytes": 0,
+            "parityStatus": "pass",
+            "qualityStatus": "pass",
+            "fallbackCount": 0,
+            "cancellationStatus": "pass",
+            "releaseVerified": True,
+        },
+        "coverage": {
+            "variedAxes": [
+                "requestMode", "cacheTier", "dispatchQueryTokens", "dispatchKeyTokens",
+            ],
+            "exactPerArmAxes": [
+                "batch", "heads", "queryTokens", "keyTokens", "dispatchGeometries",
+                "headDim", "groupSize",
+                "mask", "width", "height", "frames", "latentFrames",
+                "generatedLatentFrames", "hardwareModel", "metalDevice",
+            ],
+            "fixedProductGeometry": {
+                "batch": 1,
+                "heads": 40,
+                "headDim": 128,
+                "groupSize": 64,
+                "width": 832,
+                "height": 480,
+                "frames": 25,
+            },
+            "eligibilityBoundary": "only exact measured arm geometries are eligible",
+            "notSweptByThisSchedule": [
+                "alternateHeadCounts",
+                "alternateHeadDimensions",
+                "alternateGroupSizes",
+                "alternateTileShapes",
+                "alternateWindowPolicies",
+                "alternateGpuFamilies",
+            ],
+        },
+        "aggregation": {
+            "tier": "go when at least one exact measured geometry in the tier qualifies",
+            "overall": "go when at least one exact measured geometry qualifies",
+        },
+    }
+
+
+def _canonical_sha256(value: object) -> str:
+    return _sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _sha256(data: bytes) -> str:
@@ -235,7 +307,7 @@ def _validate_observation(
     geometry = _object(
         row["geometry"],
         "geometry",
-        {"batch", "heads", "queryTokens", "keyTokens", "headDim", "groupSize", "mask", "width", "height", "frames", "latentFrames", "generatedLatentFrames"},
+        {"batch", "heads", "queryTokens", "keyTokens", "dispatchGeometries", "headDim", "groupSize", "mask", "width", "height", "frames", "latentFrames", "generatedLatentFrames"},
     )
     if geometry["batch"] != 1 or geometry["heads"] != 40 or geometry["headDim"] != 128 or geometry["groupSize"] != 64:
         raise CampaignError("provider observation did not use native Krea packed geometry")
@@ -249,21 +321,58 @@ def _validate_observation(
     if geometry["generatedLatentFrames"] != expected_generated_latents:
         raise CampaignError("provider observation did not use the product request's generated-latent geometry")
 
+    dispatch_geometries = geometry["dispatchGeometries"]
+    if not isinstance(dispatch_geometries, list):
+        raise CampaignError("geometry.dispatchGeometries must be a list")
+    dispatch_coordinates: set[tuple[int, int]] = set()
+    dispatch_count = 0
+    for index, item in enumerate(dispatch_geometries):
+        dispatch = _object(
+            item,
+            f"geometry.dispatchGeometries[{index}]",
+            {"queryTokens", "keyTokens", "acceptedForwards"},
+        )
+        query_tokens = _integer(
+            dispatch["queryTokens"],
+            f"geometry.dispatchGeometries[{index}].queryTokens",
+            minimum=1,
+        )
+        key_tokens = _integer(
+            dispatch["keyTokens"],
+            f"geometry.dispatchGeometries[{index}].keyTokens",
+            minimum=query_tokens,
+        )
+        accepted = _integer(
+            dispatch["acceptedForwards"],
+            f"geometry.dispatchGeometries[{index}].acceptedForwards",
+            minimum=1,
+        )
+        coordinate = (query_tokens, key_tokens)
+        if coordinate in dispatch_coordinates:
+            raise CampaignError("geometry.dispatchGeometries contains a duplicate coordinate")
+        dispatch_coordinates.add(coordinate)
+        dispatch_count += accepted
+
     handle = _object(row["compiledHandle"], "compiledHandle", {"identity", "retainedBytes", "compiled", "acceptedDispatches"})
     expected_handle = f"sc20684/krea-packed-affine-{expected_tier}-d128-g64-v1"
-    if handle["identity"] != expected_handle or handle["compiled"] is not True:
+    if handle["identity"] != expected_handle or type(handle["compiled"]) is not bool:
         raise CampaignError("compiled handle does not identify the launched cache tier")
-    _integer(handle["retainedBytes"], "compiledHandle.retainedBytes", minimum=1)
-    _integer(handle["acceptedDispatches"], "compiledHandle.acceptedDispatches", minimum=1)
+    _integer(handle["retainedBytes"], "compiledHandle.retainedBytes")
+    accepted_dispatches = _integer(handle["acceptedDispatches"], "compiledHandle.acceptedDispatches")
+    if handle["compiled"] != (accepted_dispatches > 0):
+        raise CampaignError("compiled handle status contradicts accepted dispatches")
+    if dispatch_count != accepted_dispatches:
+        raise CampaignError("dispatch geometry coverage contradicts accepted dispatches")
+    if dispatch_geometries and (
+        geometry["queryTokens"] != max(item["queryTokens"] for item in dispatch_geometries)
+        or geometry["keyTokens"] != max(item["keyTokens"] for item in dispatch_geometries)
+    ):
+        raise CampaignError("summary query/key geometry does not cover accepted dispatches")
 
     byte_fields = {"persistent", "retainedHandle", "boundedScratch", "denseWindow", "scoreMatrix"}
     bytes_ = _object(row["bytes"], "bytes", byte_fields)
     for key, value in bytes_.items():
         _integer(value, f"bytes.{key}")
-    if bytes_["persistent"] <= 0 or bytes_["retainedHandle"] <= 0:
-        raise CampaignError("packed persistent/retained-handle bytes must be measured")
-    if bytes_["denseWindow"] != 0 or bytes_["scoreMatrix"] != 0:
-        raise CampaignError("compressed-domain row allocated a dense window or score matrix")
 
     timing_fields = {
         "label", "processWallMs", "candidateWallMs", "loadMs", "conditioningMs", "packedGenerationMs",
@@ -278,9 +387,12 @@ def _validate_observation(
     if timing["label"] != "fresh-process-full-schedule-loaded-product":
         raise CampaignError("timing label does not identify the fresh full-schedule product path")
     for key in timing_fields - {"label", "steadyEvaluatedPackedForwardCount", "acceptedPackedAppendCount", "progressStepCount"}:
-        _number(timing[key], f"timing.{key}", positive=key in {"processWallMs", "candidateWallMs", "packedGenerationMs", "denseGenerationMs", "meanOutputFrameMs", "meanOutputFps", "coldEvaluatedPackedForwardMs", "steadyEvaluatedPackedForwardMeanMs", "acceptedPackedAppendMeanMs", "steadyDenoiseStepMeanMs", "steadyFullChunkMs", "steadyDenoiseEquivalentFps"})
-    _integer(timing["steadyEvaluatedPackedForwardCount"], "timing.steadyEvaluatedPackedForwardCount", minimum=4)
-    _integer(timing["acceptedPackedAppendCount"], "timing.acceptedPackedAppendCount", minimum=3)
+        _number(timing[key], f"timing.{key}", positive=key in {"processWallMs", "candidateWallMs", "packedGenerationMs", "denseGenerationMs", "meanOutputFrameMs", "meanOutputFps", "steadyDenoiseStepMeanMs", "steadyFullChunkMs", "steadyDenoiseEquivalentFps"})
+    steady_forward_count = _integer(
+        timing["steadyEvaluatedPackedForwardCount"],
+        "timing.steadyEvaluatedPackedForwardCount",
+    )
+    _integer(timing["acceptedPackedAppendCount"], "timing.acceptedPackedAppendCount")
     expected_progress_steps = 10 if expected_mode == "i2v" else 15
     if timing["progressStepCount"] != expected_progress_steps:
         raise CampaignError("timing progress does not cover every product chunk of the five-step schedule")
@@ -308,7 +420,8 @@ def _validate_observation(
     candidate_accounted = timing["loadMs"] + timing["conditioningMs"] + timing["packedGenerationMs"] + timing["packedDecodeMs"]
     if timing["candidateWallMs"] < candidate_accounted or timing["processWallMs"] < timing["candidateWallMs"]:
         raise CampaignError("candidate/process wall timing does not cover its measured phases")
-    if handle["acceptedDispatches"] != timing["steadyEvaluatedPackedForwardCount"] + 1:
+    cold_forward_count = 1 if timing["coldEvaluatedPackedForwardMs"] > 0 else 0
+    if accepted_dispatches != steady_forward_count + cold_forward_count:
         raise CampaignError("accepted dispatch count disagrees with cold/steady timing coverage")
 
     process_fields = {"physFootprintBytes", "physFootprintPeakBytes"}
@@ -340,51 +453,67 @@ def _validate_observation(
         raise CampaignError("exact MLX active peak cannot be below a sampled active value")
     if mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
         raise CampaignError("memory sampler coverage has an excessive gap")
-    if memory["releaseVerified"] is not True:
-        raise CampaignError("route and cancellation resources were not released")
+    if type(memory["releaseVerified"]) is not bool:
+        raise CampaignError("memory.releaseVerified must be a boolean")
     release_limit = memory["verificationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
-    if (
+    resources_released = not (
         mlx["releaseActiveBytes"] > mlx["verificationTerminalActiveBytes"]
         or mlx["releaseCacheBytes"] > mlx["verificationTerminalCacheBytes"]
         or memory["release"]["physFootprintBytes"] > release_limit
-    ):
-        raise CampaignError("release evidence contradicts its terminal resource boundaries")
+    )
 
     parity = _object(row["parity"], "parity", {"status", "candidateTier", "maxAbsError", "tolerance"})
-    if parity["status"] != "pass" or parity["candidateTier"] != expected_tier:
-        raise CampaignError("packed parity is missing or tier-substituted")
+    if parity["status"] not in {"pass", "fail"} or parity["candidateTier"] != expected_tier:
+        raise CampaignError("packed parity status is malformed or tier-substituted")
     if type(parity["maxAbsError"]) not in (int, float) or type(parity["tolerance"]) not in (int, float) or parity["maxAbsError"] < 0 or parity["tolerance"] <= 0:
         raise CampaignError("packed parity numbers are malformed")
+    if (parity["status"] == "pass") != (parity["maxAbsError"] <= parity["tolerance"]):
+        raise CampaignError("packed parity status contradicts its measured values")
 
     quality = _object(
         row["quality"],
         "quality",
         {"status", "candidateTier", "metric", "maxAbsRgbU8", "maxAbsRgbU8Tolerance", "meanAbsRgbU8", "meanAbsRgbU8Tolerance", "packedMeanTemporalDelta", "denseMeanTemporalDelta", "temporalDeltaDrift", "temporalDeltaDriftTolerance", "acknowledged"},
     )
-    if quality["status"] != "pass" or quality["candidateTier"] != expected_tier:
-        raise CampaignError("packed quality is missing or tier-substituted")
+    if quality["status"] not in {"pass", "fail"} or quality["candidateTier"] != expected_tier:
+        raise CampaignError("packed quality status is malformed or tier-substituted")
     _nonempty(quality["metric"], "quality.metric")
     for key in ("maxAbsRgbU8", "maxAbsRgbU8Tolerance", "meanAbsRgbU8", "meanAbsRgbU8Tolerance", "packedMeanTemporalDelta", "denseMeanTemporalDelta", "temporalDeltaDrift", "temporalDeltaDriftTolerance"):
         _number(quality[key], f"quality.{key}", positive=key in {"maxAbsRgbU8Tolerance", "meanAbsRgbU8Tolerance", "temporalDeltaDriftTolerance"})
-    if (
+    quality_pass = not (
         quality["maxAbsRgbU8"] > quality["maxAbsRgbU8Tolerance"]
         or quality["meanAbsRgbU8"] > quality["meanAbsRgbU8Tolerance"]
         or quality["temporalDeltaDrift"] > quality["temporalDeltaDriftTolerance"]
-    ):
+    )
+    if (quality["status"] == "pass") != quality_pass:
         raise CampaignError("packed quality status contradicts its measured values")
     if type(quality["acknowledged"]) is not bool or (expected_tier == "q4" and not quality["acknowledged"]):
         raise CampaignError("Q4 requires its separate explicit quality acknowledgement")
 
     fallback = _object(row["fallback"], "fallback", {"count", "reason"})
-    _integer(fallback["count"], "fallback.count")
-    if fallback["reason"] is not None and not isinstance(fallback["reason"], str):
-        raise CampaignError("fallback.reason must be null or a string")
-    if fallback != {"count": 0, "reason": None}:
-        raise CampaignError("representative packed product geometry used a dense fallback")
+    fallback_count = _integer(fallback["count"], "fallback.count")
+    if (
+        (fallback_count == 0 and fallback["reason"] is not None)
+        or (fallback_count > 0 and not isinstance(fallback["reason"], str))
+        or (isinstance(fallback["reason"], str) and not fallback["reason"].strip())
+    ):
+        raise CampaignError("fallback count and reason are inconsistent")
     cancellation = _object(row["cancellation"], "cancellation", {"status", "requests", "partialStateMutation", "scratchReleased"})
-    if cancellation["status"] != "pass" or cancellation["partialStateMutation"] is not False or cancellation["scratchReleased"] is not True:
-        raise CampaignError("cancellation evidence is not terminal and clean")
+    if (
+        cancellation["status"] not in {"pass", "fail"}
+        or type(cancellation["partialStateMutation"]) is not bool
+        or type(cancellation["scratchReleased"]) is not bool
+    ):
+        raise CampaignError("cancellation evidence is malformed")
     _integer(cancellation["requests"], "cancellation.requests", minimum=1)
+    cancellation_clean = (
+        cancellation["partialStateMutation"] is False
+        and cancellation["scratchReleased"] is True
+    )
+    if (cancellation["status"] == "pass") != cancellation_clean:
+        raise CampaignError("cancellation status contradicts its measured outcome")
+    if memory["releaseVerified"] != (resources_released and cancellation_clean):
+        raise CampaignError("release status contradicts its terminal resource boundaries")
     output = _object(row["output"], "output", {"status", "sha256", "denseSha256", "artifacts"})
     if output["status"] != "generated" or not _is_sha256(output["sha256"]) or not _is_sha256(output["denseSha256"]):
         raise CampaignError("product output evidence is missing")
@@ -424,9 +553,20 @@ def _validate_baseline_observation(
         raise CampaignError("dense baseline schema or producer mismatch")
     if row["runId"] != run_id or row["case"] != {"mode": expected_mode, "cacheTier": expected_tier}:
         raise CampaignError("dense baseline did not report its launched identity")
-    for key in ("source", "model", "input", "schedule", "toolchain", "geometry"):
+    for key in ("source", "model", "input", "schedule", "toolchain"):
         if row[key] != candidate[key]:
             raise CampaignError(f"dense baseline {key} differs from its paired candidate")
+
+    baseline_geometry = _object(
+        row["geometry"],
+        "dense baseline geometry",
+        set(candidate["geometry"]),
+    )
+    if baseline_geometry["dispatchGeometries"] != []:
+        raise CampaignError("dense baseline cannot claim packed dispatch geometry")
+    for key, value in candidate["geometry"].items():
+        if key != "dispatchGeometries" and baseline_geometry[key] != value:
+            raise CampaignError("dense baseline geometry differs from its paired candidate")
 
     geometry = row["geometry"]
     timing_fields = {
@@ -481,14 +621,16 @@ def _validate_baseline_observation(
         raise CampaignError("dense baseline paired allocator peak is inconsistent")
     if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"] or mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
         raise CampaignError("dense baseline allocator coverage is inconsistent")
+    if type(memory["releaseVerified"]) is not bool:
+        raise CampaignError("dense baseline memory.releaseVerified must be a boolean")
     release_limit = memory["generationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
-    if (
-        memory["releaseVerified"] is not True
-        or mlx["releaseActiveBytes"] > mlx["generationTerminalActiveBytes"]
+    resources_released = not (
+        mlx["releaseActiveBytes"] > mlx["generationTerminalActiveBytes"]
         or mlx["releaseCacheBytes"] > mlx["generationTerminalCacheBytes"]
         or memory["release"]["physFootprintBytes"] > release_limit
-    ):
-        raise CampaignError("dense baseline release evidence is inconsistent")
+    )
+    if memory["releaseVerified"] != resources_released:
+        raise CampaignError("dense baseline release status contradicts its resource boundaries")
     output = _object(row["output"], "dense baseline output", {"status", "sha256"})
     if output["status"] != "generated" or not _is_sha256(output["sha256"]):
         raise CampaignError("dense baseline output evidence is missing")
@@ -540,11 +682,159 @@ def _read_observation(stdout: str, prefix: str = OBSERVATION_PREFIX) -> dict[str
     return result
 
 
+def _exact_geometry(row: dict[str, Any]) -> dict[str, Any]:
+    observation = row["observation"]
+    toolchain = observation["toolchain"]
+    return {
+        "mode": row["mode"],
+        "cacheTier": row["cacheTier"],
+        "geometry": observation["geometry"],
+        "hardware": {
+            "hardwareModel": toolchain["hardwareModel"],
+            "metalDevice": toolchain["metalDevice"],
+        },
+    }
+
+
+def arm_decision(row: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    """Reduce one terminal candidate/baseline pair without discarding a measured No-go."""
+    candidate = row["observation"]
+    baseline = row["baseline"]
+    comparison = row["comparison"]
+    material = policy["materialMemory"]
+    throughput = policy["throughputNeutral"]
+    safety = policy["requiredSafety"]
+
+    phys_saving = (
+        comparison["baselinePhysFootprintPeakBytes"]
+        - comparison["candidatePhysFootprintPeakBytes"]
+    )
+    mlx_saving = (
+        comparison["baselineMlxFootprintPeakBytes"]
+        - comparison["candidateMlxFootprintPeakBytes"]
+    )
+    mean_output_fps_ratio = (
+        comparison["candidateMeanOutputFps"] / comparison["baselineMeanOutputFps"]
+    )
+    steady_fps_ratio = (
+        comparison["candidateSteadyDenoiseEquivalentFps"]
+        / comparison["baselineSteadyDenoiseEquivalentFps"]
+    )
+    first_frame_ratio = (
+        comparison["candidateRequestFirstFrameMs"]
+        / comparison["baselineRequestFirstFrameMs"]
+    )
+    criteria = {
+        "pairedProcessExitZero": (
+            row["processExitCodes"]["paired"] == safety["pairedProcessExitCode"]
+        ),
+        "denseBaselineProcessExitZero": (
+            row["processExitCodes"]["dense-baseline"]
+            == safety["denseBaselineProcessExitCode"]
+        ),
+        "physFootprintReductionMaterial": (
+            phys_saving >= material["minimumReductionBytes"]
+            and comparison["physFootprintReductionFraction"]
+            >= material["minimumReductionFraction"]
+        ),
+        "mlxFootprintReductionMaterial": (
+            mlx_saving >= material["minimumReductionBytes"]
+            and comparison["mlxFootprintReductionFraction"]
+            >= material["minimumReductionFraction"]
+        ),
+        "meanOutputThroughputNeutral": (
+            mean_output_fps_ratio >= throughput["minimumMeanOutputFpsRatio"]
+        ),
+        "steadyDenoiseThroughputNeutral": (
+            steady_fps_ratio >= throughput["minimumSteadyDenoiseEquivalentFpsRatio"]
+        ),
+        "requestFirstFrameNeutral": (
+            first_frame_ratio
+            <= 1.0 + throughput["maximumRequestFirstFrameRegressionFraction"]
+        ),
+        "compiledPackedHandle": (
+            candidate["compiledHandle"]["compiled"] is safety["compiledPackedHandle"]
+        ),
+        "acceptedPackedDispatch": (
+            candidate["compiledHandle"]["acceptedDispatches"]
+            >= safety["minimumAcceptedPackedDispatches"]
+        ),
+        "zeroDenseWindowBytes": (
+            candidate["bytes"]["denseWindow"] == safety["denseWindowBytes"]
+        ),
+        "zeroScoreMatrixBytes": (
+            candidate["bytes"]["scoreMatrix"] == safety["scoreMatrixBytes"]
+        ),
+        "parityPassed": candidate["parity"]["status"] == safety["parityStatus"],
+        "qualityPassed": candidate["quality"]["status"] == safety["qualityStatus"],
+        "noDenseFallback": candidate["fallback"]["count"] == safety["fallbackCount"],
+        "cancellationPassed": (
+            candidate["cancellation"]["status"] == safety["cancellationStatus"]
+        ),
+        "candidateReleaseVerified": (
+            candidate["memory"]["releaseVerified"] is safety["releaseVerified"]
+        ),
+        "baselineReleaseVerified": (
+            baseline["memory"]["releaseVerified"] is safety["releaseVerified"]
+        ),
+    }
+    failed = [name for name, passed in criteria.items() if not passed]
+    geometry = _exact_geometry(row)
+    return {
+        "decision": "go" if not failed else "no-go",
+        "failedCriteria": failed,
+        "criteria": criteria,
+        "measurements": {
+            "physFootprintSavingBytes": phys_saving,
+            "physFootprintReductionFraction": comparison["physFootprintReductionFraction"],
+            "mlxFootprintSavingBytes": mlx_saving,
+            "mlxFootprintReductionFraction": comparison["mlxFootprintReductionFraction"],
+            "meanOutputFpsRatio": mean_output_fps_ratio,
+            "steadyDenoiseEquivalentFpsRatio": steady_fps_ratio,
+            "requestFirstFrameRatio": first_frame_ratio,
+        },
+        "observedGeometry": geometry,
+        "eligibleGeometry": geometry if not failed else None,
+    }
+
+
+def campaign_decision(rows: list[dict[str, Any]], policy: dict[str, Any]) -> dict[str, Any]:
+    arms: dict[str, dict[str, Any]] = {}
+    eligible: list[dict[str, Any]] = []
+    for row in rows:
+        key = f"{row['mode']}/{row['cacheTier']}"
+        reduced = arm_decision(row, policy)
+        if row.get("decision") != reduced:
+            raise CampaignError(f"sealed arm decision drift: {key}")
+        arms[key] = reduced
+        if reduced["eligibleGeometry"] is not None:
+            eligible.append(reduced["eligibleGeometry"])
+
+    tiers: dict[str, dict[str, Any]] = {}
+    for tier in ("q8", "q4"):
+        tier_eligible = [item for item in eligible if item["cacheTier"] == tier]
+        tiers[tier] = {
+            "decision": "go" if tier_eligible else "no-go",
+            "eligibleGeometries": tier_eligible,
+        }
+    return {
+        "policy": policy,
+        "policySha256": _canonical_sha256(policy),
+        "arms": arms,
+        "tiers": tiers,
+        "overall": {
+            "decision": "go" if eligible else "no-go",
+            "eligibleGeometries": eligible,
+        },
+    }
+
+
 def run_matrix(
     command: str,
     snapshot: Path,
     source: dict[str, Any],
     model: dict[str, Any],
+    policy: dict[str, Any],
     timeout: int,
     evidence_root: Path,
 ) -> list[dict[str, Any]]:
@@ -561,7 +851,7 @@ def run_matrix(
         transcript_dir = evidence_root / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
         cell_started = time.monotonic_ns()
-        observations: dict[str, dict[str, Any]] = {}
+        observations: dict[str, Any] = {}
         transcripts: dict[str, dict[str, Any]] = {}
         for role in ("paired", "dense-baseline"):
             run_id = str(uuid.uuid4())
@@ -592,8 +882,7 @@ def run_matrix(
                 "stdout": _file_identity(stdout_path, f"transcripts/{stdout_path.name}"),
                 "stderr": _file_identity(stderr_path, f"transcripts/{stderr_path.name}"),
             }
-            if result.returncode:
-                raise CampaignError(f"{mode}/{tier}/{role} product command failed with exit {result.returncode}")
+            observations[f"{role}-process-exit-code"] = result.returncode
             stdout = result.stdout.decode("utf-8", errors="replace")
             if role == "paired":
                 observations[role] = _validate_observation(
@@ -619,12 +908,16 @@ def run_matrix(
         baseline_phys = baseline["memory"]["generationTerminal"]["physFootprintPeakBytes"]
         candidate_mlx = candidate["memory"]["mlx"]["sampledFootprintPeakBytes"]
         baseline_mlx = baseline["memory"]["mlx"]["sampledFootprintPeakBytes"]
-        rows.append({
+        row = {
             "mode": mode,
             "cacheTier": tier,
             "launcherElapsedNs": time.monotonic_ns() - cell_started,
             "artifactDirectory": f"artifacts/{cell_name}",
             "transcripts": transcripts,
+            "processExitCodes": {
+                "paired": observations["paired-process-exit-code"],
+                "dense-baseline": observations["dense-baseline-process-exit-code"],
+            },
             "comparison": {
                 "candidatePhysFootprintPeakBytes": candidate_phys,
                 "baselinePhysFootprintPeakBytes": baseline_phys,
@@ -634,16 +927,23 @@ def run_matrix(
                 "mlxFootprintReductionFraction": (baseline_mlx - candidate_mlx) / baseline_mlx,
                 "candidateRequestFirstFrameMs": candidate["timing"]["requestFirstFrameAvailableMs"],
                 "baselineRequestFirstFrameMs": baseline["timing"]["requestFirstFrameAvailableMs"],
+                "candidateMeanOutputFps": candidate["timing"]["meanOutputFps"],
+                "baselineMeanOutputFps": baseline["timing"]["meanOutputFps"],
                 "candidateSteadyDenoiseEquivalentFps": candidate["timing"]["steadyDenoiseEquivalentFps"],
                 "baselineSteadyDenoiseEquivalentFps": baseline["timing"]["steadyDenoiseEquivalentFps"],
             },
             "baseline": baseline,
             "observation": candidate,
-        })
+        }
+        row["decision"] = arm_decision(row, policy)
+        rows.append(row)
     return rows
 
 
-def validate_matrix(rows: list[dict[str, Any]]) -> None:
+def validate_matrix(
+    rows: list[dict[str, Any]],
+    policy: dict[str, Any] | None = None,
+) -> None:
     if len(rows) != len(CASES):
         raise CampaignError("matrix is incomplete")
     coordinates = [(row.get("mode"), row.get("cacheTier")) for row in rows]
@@ -658,6 +958,13 @@ def validate_matrix(rows: list[dict[str, Any]]) -> None:
         raise CampaignError("matrix artifact directories must identify every cell exactly once")
     transcript_paths = []
     for row in rows:
+        exit_codes = _object(
+            row.get("processExitCodes"),
+            "matrix process exit codes",
+            {"paired", "dense-baseline"},
+        )
+        for role, exit_code in exit_codes.items():
+            _integer(exit_code, f"matrix process exit codes.{role}")
         transcripts = _object(row.get("transcripts"), "matrix transcripts", {"paired", "dense-baseline"})
         for role in ("paired", "dense-baseline"):
             role_transcripts = _object(transcripts[role], f"matrix transcripts.{role}", {"stdout", "stderr"})
@@ -680,6 +987,7 @@ def validate_matrix(rows: list[dict[str, Any]]) -> None:
         "physFootprintReductionFraction", "candidateMlxFootprintPeakBytes",
         "baselineMlxFootprintPeakBytes", "mlxFootprintReductionFraction",
         "candidateRequestFirstFrameMs", "baselineRequestFirstFrameMs",
+        "candidateMeanOutputFps", "baselineMeanOutputFps",
         "candidateSteadyDenoiseEquivalentFps", "baselineSteadyDenoiseEquivalentFps",
     }
     for row in rows:
@@ -701,12 +1009,15 @@ def validate_matrix(rows: list[dict[str, Any]]) -> None:
             "mlxFootprintReductionFraction": (baseline_mlx - candidate_mlx) / baseline_mlx,
             "candidateRequestFirstFrameMs": candidate["timing"]["requestFirstFrameAvailableMs"],
             "baselineRequestFirstFrameMs": baseline["timing"]["requestFirstFrameAvailableMs"],
+            "candidateMeanOutputFps": candidate["timing"]["meanOutputFps"],
+            "baselineMeanOutputFps": baseline["timing"]["meanOutputFps"],
             "candidateSteadyDenoiseEquivalentFps": candidate["timing"]["steadyDenoiseEquivalentFps"],
             "baselineSteadyDenoiseEquivalentFps": baseline["timing"]["steadyDenoiseEquivalentFps"],
         }
         for key, value in expected.items():
             if type(comparison[key]) not in (int, float) or not math.isclose(comparison[key], value, rel_tol=1e-12, abs_tol=1e-12):
                 raise CampaignError(f"matrix comparison drift: {key}")
+    campaign_decision(rows, policy if policy is not None else decision_policy())
 
 
 def publish(
@@ -716,16 +1027,20 @@ def publish(
     model: dict[str, Any],
     rows: list[dict[str, Any]],
     evidence_root: Path,
+    policy: dict[str, Any] | None = None,
 ) -> Path:
     output = _checked_output(output)
-    validate_matrix(rows)
+    policy = policy if policy is not None else decision_policy()
+    validate_matrix(rows, policy)
+    decision = campaign_decision(rows, policy)
     receipt = {
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": RECEIPT_SCHEMA_VERSION,
         "story": STORY,
-        "status": "terminal-complete",
+        "status": f"terminal-{decision['overall']['decision']}",
         "launcher": {"python": platform.python_version(), "system": platform.platform()},
         "source": source,
         "model": model,
+        "decision": decision,
         "matrix": rows,
     }
     parent = output.parent
@@ -765,6 +1080,7 @@ def main() -> int:
         if args.timeout <= 0:
             raise CampaignError("--timeout must be positive")
         output = _checked_output(args.output)
+        policy = decision_policy()
         source = source_identity()
         model = snapshot_identity(args.snapshot)
         evidence_root = Path(tempfile.mkdtemp(prefix=f".{output.name}.evidence-", dir=output.parent))
@@ -774,16 +1090,32 @@ def main() -> int:
                 args.snapshot.resolve(),
                 source,
                 model,
+                policy,
                 args.timeout,
                 evidence_root,
             )
-            publish(output, source=source, model=model, rows=rows, evidence_root=evidence_root)
+            if source_identity() != source:
+                raise CampaignError("campaign source changed after decision policy was frozen")
+            publish(
+                output,
+                source=source,
+                model=model,
+                rows=rows,
+                evidence_root=evidence_root,
+                policy=policy,
+            )
         finally:
             shutil.rmtree(evidence_root, ignore_errors=True)
     except CampaignError as error:
         print(f"SC-20684 campaign refused: {error}", file=sys.stderr)
         return 1
-    print(json.dumps({"status": "published", "output": str(output), "cells": len(CASES)}, sort_keys=True))
+    result = campaign_decision(rows, policy)
+    print(json.dumps({
+        "status": "published",
+        "decision": result["overall"]["decision"],
+        "output": str(output),
+        "cells": len(CASES),
+    }, sort_keys=True))
     return 0
 
 

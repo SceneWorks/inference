@@ -466,6 +466,7 @@ pub struct CausalKvCache {
     packed_metal_accepted_forwards: usize,
     packed_metal_dense_fallbacks: usize,
     last_packed_metal_fallback: Option<String>,
+    packed_metal_dispatch_geometries: Vec<PackedMetalDispatchGeometry>,
     /// Evaluated packed-forward timing. The first accepted forward includes lazy Metal pipeline
     /// compilation; later accepted forwards are the steady evaluated distribution. Failed/fallback
     /// attempts are deliberately excluded from accepted-path timing and remain visible in the
@@ -491,6 +492,13 @@ pub struct CausalKvCache {
 /// populated from the cache which actually participated in a forward, rather than from a caller's
 /// requested tier.  It is the narrow runtime seam consumed by the SC-20684 real-weight observer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedMetalDispatchGeometry {
+    pub query_tokens: usize,
+    pub key_tokens: usize,
+    pub accepted_forwards: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedMetalRouteReceipt {
     pub compiled_handle_identity: String,
     pub retained_handle_bytes: usize,
@@ -501,6 +509,7 @@ pub struct PackedMetalRouteReceipt {
     pub accepted_forwards: usize,
     pub dense_fallbacks: usize,
     pub last_fallback_reason: Option<String>,
+    pub dispatch_geometries: Vec<PackedMetalDispatchGeometry>,
     pub first_evaluated_forward_ns: u64,
     pub steady_evaluated_forward_ns: u64,
     pub steady_evaluated_forward_count: usize,
@@ -535,6 +544,7 @@ impl CausalKvCache {
             packed_metal_accepted_forwards: 0,
             packed_metal_dense_fallbacks: 0,
             last_packed_metal_fallback: None,
+            packed_metal_dispatch_geometries: Vec::new(),
             packed_metal_first_forward_ns: None,
             packed_metal_steady_forward_ns: 0,
             packed_metal_steady_forward_count: 0,
@@ -587,6 +597,7 @@ impl CausalKvCache {
             accepted_forwards: self.packed_metal_accepted_forwards,
             dense_fallbacks: self.packed_metal_dense_fallbacks,
             last_fallback_reason: self.last_packed_metal_fallback.clone(),
+            dispatch_geometries: self.packed_metal_dispatch_geometries.clone(),
             first_evaluated_forward_ns: self.packed_metal_first_forward_ns.unwrap_or(0),
             steady_evaluated_forward_ns: self.packed_metal_steady_forward_ns,
             steady_evaluated_forward_count: self.packed_metal_steady_forward_count,
@@ -595,7 +606,12 @@ impl CausalKvCache {
         })
     }
 
-    fn record_packed_forward_duration(&mut self, elapsed: std::time::Duration) {
+    fn record_packed_forward_duration(
+        &mut self,
+        elapsed: std::time::Duration,
+        query_tokens: usize,
+        key_tokens: usize,
+    ) {
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         if self.packed_metal_first_forward_ns.is_none() {
             self.packed_metal_first_forward_ns = Some(elapsed_ns);
@@ -605,6 +621,22 @@ impl CausalKvCache {
                 .saturating_add(elapsed_ns);
             self.packed_metal_steady_forward_count =
                 self.packed_metal_steady_forward_count.saturating_add(1);
+        }
+        if let Some(geometry) = self
+            .packed_metal_dispatch_geometries
+            .iter_mut()
+            .find(|geometry| {
+                geometry.query_tokens == query_tokens && geometry.key_tokens == key_tokens
+            })
+        {
+            geometry.accepted_forwards = geometry.accepted_forwards.saturating_add(1);
+        } else {
+            self.packed_metal_dispatch_geometries
+                .push(PackedMetalDispatchGeometry {
+                    query_tokens,
+                    key_tokens,
+                    accepted_forwards: 1,
+                });
         }
     }
 
@@ -1245,6 +1277,8 @@ impl CausalKreaTransformer {
                 None
             };
         let (velocity, new_kv) = if let Some(packed_positions) = packed_positions {
+            let packed_query_tokens = q_positions.len();
+            let packed_key_tokens = packed_positions.len() + packed_query_tokens;
             let query_positions = Array::from_slice(&q_positions, &[q_positions.len() as i32]);
             let mut key_positions = packed_positions;
             key_positions.extend(q_positions.iter().copied());
@@ -1283,7 +1317,11 @@ impl CausalKreaTransformer {
                 Ok(result)
                     if packed_dispatch_complete(dispatched_layers, self.inner.num_blocks()) =>
                 {
-                    cache.record_packed_forward_duration(packed_elapsed);
+                    cache.record_packed_forward_duration(
+                        packed_elapsed,
+                        packed_query_tokens,
+                        packed_key_tokens,
+                    );
                     cache.packed_metal_accepted_forwards += 1;
                     result
                 }
@@ -1496,15 +1534,30 @@ mod tests {
     #[test]
     fn packed_timing_keeps_cold_steady_and_append_phases_distinct() {
         let mut cache = CausalKvCache::new(1, 16, 0, Some(KvCacheQuant::Q8));
-        cache.record_packed_forward_duration(std::time::Duration::from_nanos(11));
-        cache.record_packed_forward_duration(std::time::Duration::from_nanos(7));
-        cache.record_packed_forward_duration(std::time::Duration::from_nanos(5));
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(11), 4, 8);
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(7), 4, 8);
+        cache.record_packed_forward_duration(std::time::Duration::from_nanos(5), 2, 10);
         cache.record_packed_append_duration(std::time::Duration::from_nanos(3));
         cache.record_packed_append_duration(std::time::Duration::from_nanos(2));
 
         assert_eq!(cache.packed_metal_first_forward_ns, Some(11));
         assert_eq!(cache.packed_metal_steady_forward_ns, 12);
         assert_eq!(cache.packed_metal_steady_forward_count, 2);
+        assert_eq!(
+            cache.packed_metal_dispatch_geometries,
+            vec![
+                PackedMetalDispatchGeometry {
+                    query_tokens: 4,
+                    key_tokens: 8,
+                    accepted_forwards: 2,
+                },
+                PackedMetalDispatchGeometry {
+                    query_tokens: 2,
+                    key_tokens: 10,
+                    accepted_forwards: 1,
+                },
+            ]
+        );
         assert_eq!(cache.packed_metal_append_ns, 5);
         assert_eq!(cache.packed_metal_append_count, 2);
     }
