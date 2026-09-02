@@ -1239,9 +1239,20 @@ mod tests {
         };
         let eager_facts = facts(&eager);
         let deferred_facts = facts(&deferred);
-        assert_eq!(eager_facts.base_bytes, on_disk);
-        assert_eq!(eager_facts.transformer_bytes, on_disk);
-        assert_eq!(eager_facts.conditioning_bytes, on_disk);
+        // The fixture holds one understanding-path projection and nothing else, so the whole
+        // tensor payload is conditioning, the generation path is empty, and the total is the
+        // header-attested data bytes (strictly below the file length, which includes the header).
+        let data_bytes: u64 =
+            gen_core::weightsmeta::safetensors_path_tensor_headers(root.join("model.safetensors"))
+                .unwrap()
+                .iter()
+                .map(|header| header.data_bytes)
+                .sum();
+        assert!(data_bytes > 0 && data_bytes < on_disk);
+        assert_eq!(eager_facts.base_bytes, data_bytes);
+        assert_eq!(eager_facts.conditioning_bytes, data_bytes);
+        assert_eq!(eager_facts.transformer_bytes, 0);
+        assert_eq!(eager_facts.decoder_bytes, 0);
         assert_eq!(eager_facts, deferred_facts);
         // ...and the registry's own answer for the same spec is that same number.
         assert_eq!(
