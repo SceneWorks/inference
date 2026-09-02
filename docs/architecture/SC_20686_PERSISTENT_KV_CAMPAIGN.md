@@ -8,8 +8,13 @@ output, including carriage-return updates, is never parsed as campaign evidence.
 
 Every child process runs inside its own adapter-owned `sealed-run` directory. The adapter passes an
 absolute `--out` below that directory, so images and video frames cannot escape the run closure via
-an entrypoint default. The event transcript and media output therefore share one isolated parent;
-the reducer rejects a command receipt that does not preserve that relationship.
+an entrypoint default. FLUX writes `media.png`; Wan writes frames below `media`. Before deleting the
+private run directory, the publisher copies every normal-arm output into the final campaign bundle.
+Each run has a canonical media manifest that preserves output kind, relative path, byte count, and
+content hash; both that metadata hash and every media content hash are bound by the row and campaign
+receipts. Cancellation arms must seal an `absent` manifest and are rejected if they leave partial
+media behind. The event transcript and media output therefore share one isolated parent, while the
+final evidence remains independently reproducible after that private directory is removed.
 
 ## Sealed provenance and snapshot layouts
 
@@ -42,12 +47,18 @@ SceneWorks-equivalent strategies are:
 | `wan2_2_vace_fun_14b` | `sequential` |
 
 The adapter, entrypoints, observer metadata, resolved-input manifest, row receipts, and reducer all
-reject a different strategy rather than measuring a non-product residency shape.
+reject a different strategy rather than measuring a non-product residency shape. This includes the
+Wan 14B ComfyUI-expert route: campaign residency is passed explicitly through its external-expert
+loader, rather than falling back to that loader's ordinary resident default.
 
 The Wan entrypoints are wired to the product-owned observer after each real route has bound its
 snapshot-backed geometry. With observation off, the ownership hooks remain inactive and do not
 allocate campaign evidence or retain cache ids. The adapter rejects a missing, non-JSONL, or
 carriage-return-containing event transcript before reducing a campaign row.
+
+Normal/cancellation pairs are inseparable decision evidence. The reducer independently requires the
+cancel arm's product-owned cancellation identity, exactly one `cancelled` terminal, then metrics,
+invalidation, and release in product order; each coordinate decision records that verification.
 
 FLUX.2 Klein edit is an evidence-based no-go for persistent-reference-K/V productization in this
 campaign. Its `DoubleAttention` path projects reference K/V for each denoise evaluation and joins

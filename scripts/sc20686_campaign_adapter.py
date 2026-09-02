@@ -18,11 +18,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
 COVERAGE = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
-PRODUCER = "sc20686-campaign-adapter-v3"
+PRODUCER = "sc20686-campaign-adapter-v4"
 INFERENCE_ROOT = Path(__file__).resolve().parents[1]
 GEOMETRY = (
     "batch", "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
@@ -69,6 +70,8 @@ class CampaignRun:
     command: tuple
     process_samples: tuple
     event_transcript: bytes = b""
+    media_output: Optional[Path] = None
+    cleanup_root: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -589,11 +592,14 @@ def run_entrypoint(
 ):
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
-    with tempfile.TemporaryDirectory(prefix="sc20686-events-") as directory:
-        run_directory = Path(directory) / "sealed-run"
+    directory = Path(tempfile.mkdtemp(prefix="sc20686-events-"))
+    try:
+        run_directory = directory / "sealed-run"
         run_directory.mkdir()
         event_path = run_directory / "events.jsonl"
-        media_output = run_directory / "media"
+        media_output = run_directory / (
+            "media.png" if variant in FLUX_ROUTES else "media"
+        )
         command = [
             str(Path(entrypoint).resolve()), "--sc20686-campaign", "--sc20686-events",
             str(event_path), "--sc20686-source-ref", inference_revision,
@@ -648,13 +654,81 @@ def run_entrypoint(
             event_transcript = event_path.read_bytes()
         except OSError as exc:
             raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript") from exc
-    events = parse_event_transcript(event_transcript, variant, arm)
-    events.extend(process_samples)
-    if not events or not process_samples:
-        raise ValueError(f"{variant}/{arm} lacks observer or process evidence")
-    return CampaignRun(
-        events, stdout, stderr, tuple(command), tuple(process_samples), event_transcript,
-    )
+        events = parse_event_transcript(event_transcript, variant, arm)
+        events.extend(process_samples)
+        if not events or not process_samples:
+            raise ValueError(f"{variant}/{arm} lacks observer or process evidence")
+        return CampaignRun(
+            events, stdout, stderr, tuple(command), tuple(process_samples), event_transcript,
+            media_output, directory,
+        )
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def cleanup_campaign_run(run):
+    if run.cleanup_root is not None:
+        shutil.rmtree(run.cleanup_root, ignore_errors=True)
+
+
+def media_artifacts(run, stem, arm):
+    output = run.media_output
+    if output is None:
+        raise ValueError(f"{stem} lacks an adapter-owned media output")
+    output = Path(output)
+    if not output.is_absolute() or output.is_symlink():
+        raise ValueError(f"{stem} media output is not an exact regular path")
+    try:
+        out_index = run.command.index("--out")
+    except ValueError as exc:
+        raise ValueError(f"{stem} command lacks its media output") from exc
+    if out_index + 1 >= len(run.command) or Path(run.command[out_index + 1]) != output:
+        raise ValueError(f"{stem} command does not bind its exact media output")
+
+    sources = {}
+    files = []
+    output_kind = "absent"
+    if arm == "cancel":
+        if output.exists():
+            raise ValueError(f"{stem} cancellation arm left a media output")
+    else:
+        if output.is_file():
+            output_kind = "file"
+            candidates = [(output.name, output)]
+        elif output.is_dir():
+            output_kind = "directory"
+            candidates = []
+            for candidate in sorted(output.rglob("*")):
+                if candidate.is_symlink():
+                    raise ValueError(f"{stem} media output contains a symlink")
+                if candidate.is_file():
+                    candidates.append((candidate.relative_to(output).as_posix(), candidate))
+        else:
+            raise ValueError(f"{stem} full-generation arm lacks generated media")
+        if not candidates:
+            raise ValueError(f"{stem} full-generation arm has an empty media output")
+        for index, (relative_path, source) in enumerate(candidates):
+            size = source.stat().st_size
+            if size <= 0:
+                raise ValueError(f"{stem} generated media is empty: {relative_path}")
+            name = f"{stem}.media-{index:04d}"
+            content_hash = file_identity(source)
+            sources[name] = source
+            files.append({
+                "artifact": name,
+                "relative_path": relative_path,
+                "bytes": size,
+                "sha256": content_hash,
+            })
+    manifest = canonical({
+        "schema": "sc-20686-media-manifest-v1",
+        "arm": arm,
+        "output_kind": output_kind,
+        "output_name": output.name,
+        "files": files,
+    })
+    return manifest, sources
 
 
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
@@ -682,6 +756,13 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     for field in ("route_manifest_sha256", "source_map_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", str(config.get(field, ""))):
             raise ValueError(f"campaign {field} is missing")
+    media_manifests = {
+        name: item_hash
+        for name, item_hash in config.get("evidence_artifact_sha256", {}).items()
+        if name.endswith(".media.json")
+    }
+    if len(media_manifests) != 1:
+        raise ValueError("campaign evidence must bind exactly one media manifest")
     metric_keys = (
         "current_persistent_bytes", "current_read_transient_bytes",
         "candidate_persistent_bytes", "candidate_read_transient_bytes",
@@ -899,6 +980,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         "model_snapshot_bytes": snapshot_bytes,
         "input_file_sha256": dict(config.get("input_file_sha256", {})),
         "evidence_artifact_sha256": dict(config.get("evidence_artifact_sha256", {})),
+        "media_manifest_sha256": next(iter(media_manifests.values())),
         "geometry": geometry,
         "lifecycle": {
             "created": len(create_events), "reused": len(read_events),
@@ -961,45 +1043,56 @@ def render_markdown(keys, decision, source_map):
 def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None):
     rows = []
     run_artifacts = {}
-    for index, coordinate in enumerate(coordinates):
-        for arm in ("normal", "cancel"):
-            run = runner(coordinate, arm)
-            if not isinstance(run, CampaignRun):
-                raise ValueError("campaign runner must return a sealed transcript capture")
-            stem = f"run-{index:02d}-{arm}"
-            command_payload = canonical({"argv": list(run.command)})
-            process_payload = canonical({"samples": list(run.process_samples)})
-            artifacts = {
-                f"{stem}.events.jsonl": run.event_transcript,
-                f"{stem}.stdout": run.stdout,
-                f"{stem}.stderr": run.stderr,
-                f"{stem}.command.json": command_payload,
-                f"{stem}.process.json": process_payload,
-            }
-            evidence_hashes = {name: digest(payload) for name, payload in artifacts.items()}
-            row = row_builder(coordinate, arm, run.events, evidence_hashes)
-            if not isinstance(row, dict):
-                raise ValueError("row builder returned no receipt row")
-            rows.append(row)
-            run_artifacts.update(artifacts)
-    keys = [
-        (row.get("family"), row.get("variant"), row.get("coordinate_name"), row.get("arm"))
-        for row in rows
-    ]
-    if len(keys) != len(set(keys)) or len(rows) != len(coordinates) * 2:
-        raise ValueError("campaign matrix has missing or duplicate coordinates")
+    run_sources = {}
+    captured_runs = []
     final = Path(destination)
     staging = final.with_name(f".{final.name}.staging-{os.getpid()}")
     if final.exists() or staging.exists():
         raise ValueError("campaign destination or staging path already exists")
-    reducer = _load_reducer()
-    input_artifacts = dict(input_artifacts or {})
-    if "campaign-inputs.resolved.json" not in input_artifacts:
-        raise ValueError("campaign publication requires sealed resolved inputs")
-    input_artifacts.update(run_artifacts)
-    input_artifacts["sc20686_coverage_manifest.json"] = COVERAGE.read_bytes()
-    input_artifacts["sc20686_source_map.json"] = SOURCE_MAP.read_bytes()
     try:
+        for index, coordinate in enumerate(coordinates):
+            for arm in ("normal", "cancel"):
+                run = runner(coordinate, arm)
+                if not isinstance(run, CampaignRun):
+                    raise ValueError("campaign runner must return a sealed transcript capture")
+                captured_runs.append(run)
+                stem = f"run-{index:02d}-{arm}"
+                command_payload = canonical({"argv": list(run.command)})
+                process_payload = canonical({"samples": list(run.process_samples)})
+                media_manifest, media_sources = media_artifacts(run, stem, arm)
+                artifacts = {
+                    f"{stem}.events.jsonl": run.event_transcript,
+                    f"{stem}.stdout": run.stdout,
+                    f"{stem}.stderr": run.stderr,
+                    f"{stem}.command.json": command_payload,
+                    f"{stem}.process.json": process_payload,
+                    f"{stem}.media.json": media_manifest,
+                }
+                evidence_hashes = {
+                    name: digest(payload) for name, payload in artifacts.items()
+                }
+                evidence_hashes.update({
+                    name: file_identity(source) for name, source in media_sources.items()
+                })
+                row = row_builder(coordinate, arm, run.events, evidence_hashes)
+                if not isinstance(row, dict):
+                    raise ValueError("row builder returned no receipt row")
+                rows.append(row)
+                run_artifacts.update(artifacts)
+                run_sources.update(media_sources)
+        keys = [
+            (row.get("family"), row.get("variant"), row.get("coordinate_name"), row.get("arm"))
+            for row in rows
+        ]
+        if len(keys) != len(set(keys)) or len(rows) != len(coordinates) * 2:
+            raise ValueError("campaign matrix has missing or duplicate coordinates")
+        reducer = _load_reducer()
+        input_artifacts = dict(input_artifacts or {})
+        if "campaign-inputs.resolved.json" not in input_artifacts:
+            raise ValueError("campaign publication requires sealed resolved inputs")
+        input_artifacts.update(run_artifacts)
+        input_artifacts["sc20686_coverage_manifest.json"] = COVERAGE.read_bytes()
+        input_artifacts["sc20686_source_map.json"] = SOURCE_MAP.read_bytes()
         staging.mkdir(parents=False)
         sealed_rows, row_files = [], []
         artifact_payloads = dict(input_artifacts)
@@ -1018,8 +1111,12 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
             if Path(name).name != name or not isinstance(payload, bytes):
                 raise ValueError("campaign input artifact is malformed")
         artifact_hashes = {name: digest(payload) for name, payload in artifact_payloads.items()}
+        for name, source in run_sources.items():
+            if Path(name).name != name or not Path(source).is_file():
+                raise ValueError("campaign media artifact is malformed")
+            artifact_hashes[name] = file_identity(source)
         campaign = {
-            "schema": "sc-20686-campaign-bundle-v4",
+            "schema": "sc-20686-campaign-bundle-v5",
             "decision": decision,
             "artifact_sha256": artifact_hashes,
             "route_input_file_sha256": {
@@ -1036,6 +1133,15 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
             (staging / f"{name}.sha256").write_text(
                 f"{artifact_hashes[name]}  {name}\n", encoding="utf-8"
             )
+        for name, source in run_sources.items():
+            if file_identity(source) != artifact_hashes[name]:
+                raise ValueError(f"campaign media changed while sealing: {name}")
+            shutil.copyfile(source, staging / name)
+            if file_identity(staging / name) != artifact_hashes[name]:
+                raise ValueError(f"campaign media copy checksum mismatch: {name}")
+            (staging / f"{name}.sha256").write_text(
+                f"{artifact_hashes[name]}  {name}\n", encoding="utf-8"
+            )
         (staging / "campaign.json").write_bytes(campaign_raw)
         (staging / "campaign.json.sha256").write_text(
             f"{digest(campaign_raw)}  campaign.json\n", encoding="utf-8"
@@ -1046,6 +1152,9 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
         if staging.exists():
             shutil.rmtree(staging)
         raise
+    finally:
+        for run in captured_runs:
+            cleanup_campaign_run(run)
 
 
 def main():

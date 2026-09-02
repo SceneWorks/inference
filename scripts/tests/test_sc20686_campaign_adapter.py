@@ -97,7 +97,7 @@ class CampaignAdapterTests(unittest.TestCase):
             "route_manifest_sha256": "c" * 64,
             "source_map_sha256": self.source_map_hash,
             "input_file_sha256": {"reference-0": "d" * 64},
-            "evidence_artifact_sha256": {"run.stdout": "e" * 64},
+            "evidence_artifact_sha256": {"run.media.json": "e" * 64},
         }
 
     def row_args(self, cancel=False):
@@ -201,6 +201,9 @@ class CampaignAdapterTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json,os,sys,time\n"
                 "event_path = sys.argv[sys.argv.index('--sc20686-events') + 1]\n"
+                "out = sys.argv[sys.argv.index('--out') + 1]\n"
+                "os.makedirs(out)\n"
+                "open(os.path.join(out, 'frame-0000.png'), 'wb').write(b'media')\n"
                 "with open(event_path, 'w', encoding='utf-8') as events:\n"
                 "    for i in range(10000):\n"
                 "        events.write(json.dumps({'phase':'noise','payload':'x'*256}) + '\\n')\n"
@@ -234,6 +237,9 @@ class CampaignAdapterTests(unittest.TestCase):
             self.assertEqual(
                 run.command[run.command.index("--sc20686-residency") + 1], "sequential"
             )
+            self.assertTrue(run.media_output.is_dir())
+            self.adapter.cleanup_campaign_run(run)
+            self.assertFalse(run.cleanup_root.exists())
 
     def test_streaming_runner_fails_closed_on_missing_or_malformed_event_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -559,7 +565,12 @@ class CampaignAdapterTests(unittest.TestCase):
                 calls += 1
                 if calls == 2:
                     raise ValueError("boom")
-                return self.adapter.CampaignRun([], b"", b"", ("producer",), ({},))
+                media = Path(directory) / "first-media"
+                media.write_bytes(b"media")
+                return self.adapter.CampaignRun(
+                    [], b"", b"", ("producer", "--out", str(media)), ({},),
+                    media_output=media,
+                )
 
             with self.assertRaisesRegex(ValueError, "boom"):
                 self.adapter.publish_campaign(
@@ -624,7 +635,12 @@ class CampaignAdapterTests(unittest.TestCase):
             metadata = {
                 "phase": "metadata", "sample_kind": "allocator",
                 "peak_bytes": 10 * 1024**3,
+                "cancellation_armed": arm == "cancel",
             }
+            if arm == "cancel":
+                metadata["cancellation_arm_id"] = (
+                    f"test:{coordinate.variant}:{coordinate.name}"
+                )
             process = {
                 "phase": "process-sample", "sample_kind": "process",
                 "peak_bytes": 10 * 1024**3, "at_ns": 1,
@@ -655,14 +671,39 @@ class CampaignAdapterTests(unittest.TestCase):
                     "phase": "cross-kv-released", "sample_kind": "allocator",
                     "peak_bytes": 10 * 1024**3, **measured,
                 })
-            release_events.append({
+            released = {
                 "phase": "released", "sample_kind": "allocator",
                 "peak_bytes": 10 * 1024**3, **measured,
-            })
-            observer_events = [metadata, created, read, dict(read), *release_events]
+            }
+            terminal = "cancelled" if arm == "cancel" else "generation-end"
+            observer_events = [
+                metadata,
+                {"phase": "generation-start"},
+                created,
+                read,
+                dict(read),
+                *release_events,
+                {"phase": terminal},
+                {"phase": "metrics"},
+                {"phase": "invalidated"},
+                released,
+            ]
+            run_root = media_root / f"{coordinate.variant}-{coordinate.name}-{arm}"
+            run_directory = run_root / "sealed-run"
+            run_directory.mkdir(parents=True)
+            output_name = (
+                "media.png" if coordinate.family == "flux2-klein" else "media"
+            )
+            media_output = run_directory / output_name
+            if arm == "normal":
+                if coordinate.family == "flux2-klein":
+                    media_output.write_bytes(b"png-media")
+                else:
+                    media_output.mkdir()
+                    (media_output / "frame-0000.png").write_bytes(b"frame-media")
             argv = [
                 "product-entrypoint", "--sc20686-campaign", "--sc20686-events",
-                "/adapter-owned/sealed-run/events.jsonl",
+                str(run_directory / "events.jsonl"),
                 "--sc20686-source-ref", "a" * 40,
                 "--sc20686-residency",
                 self.adapter.PRODUCT_RESIDENCY[coordinate.variant],
@@ -670,11 +711,12 @@ class CampaignAdapterTests(unittest.TestCase):
             ]
             if arm == "cancel":
                 argv.append("--sc20686-cancel")
-            argv.extend(("--out", "/adapter-owned/sealed-run/media"))
+            argv.extend(("--out", str(media_output)))
             return self.adapter.CampaignRun(
                 [*observer_events, process],
                 b"".join(self.adapter.canonical(event) for event in observer_events), b"",
                 tuple(argv), (process,), b"".join(self.adapter.canonical(event) for event in observer_events),
+                media_output,
             )
 
         def row_builder(coordinate, arm, events, evidence_hashes):
@@ -706,7 +748,14 @@ class CampaignAdapterTests(unittest.TestCase):
                 "input_file_sha256": {},
                 "evidence_artifact_sha256": evidence_hashes,
                 "geometry": geometry,
-                "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
+                "media_manifest_sha256": next(
+                    item_hash for name, item_hash in evidence_hashes.items()
+                    if name.endswith(".media.json")
+                ),
+                "lifecycle": {
+                    "created": 1, "reused": 2, "invalidated": 1,
+                    "cancelled": int(arm == "cancel"), "released": 1,
+                },
                 "allocator_samples": [
                     {"phase": event["phase"], "peak_bytes": event["peak_bytes"]}
                     for event in events if event.get("sample_kind") == "allocator"
@@ -735,6 +784,7 @@ class CampaignAdapterTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as directory:
+            media_root = Path(directory) / "run-media"
             destination = Path(directory) / "campaign"
             self.adapter.publish_campaign(
                 coordinates, runner, row_builder, destination, {
@@ -745,6 +795,24 @@ class CampaignAdapterTests(unittest.TestCase):
             )
             result = self.reducer.verify_campaign_bundle(destination)
             self.assertEqual(set(result["decisions"]), {"flux2-klein", "wan"})
+            normal_media_manifest = json.loads(
+                (destination / "run-00-normal.media.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(normal_media_manifest["output_kind"], "file")
+            self.assertEqual(normal_media_manifest["output_name"], "media.png")
+            self.assertEqual(len(normal_media_manifest["files"]), 1)
+            media_path = destination / normal_media_manifest["files"][0]["artifact"]
+            self.assertTrue(media_path.is_file())
+            media_original = media_path.read_bytes()
+            media_path.write_bytes(media_original + b"tamper")
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                self.reducer.verify_campaign_bundle(destination)
+            media_path.write_bytes(media_original)
+            cancel_media_manifest = json.loads(
+                (destination / "run-00-cancel.media.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cancel_media_manifest["output_kind"], "absent")
+            self.assertEqual(cancel_media_manifest["files"], [])
             markdown = (destination / "campaign.md").read_text(encoding="utf-8")
             self.assertIn("## Sealed source map", markdown)
             self.assertIn("- Group size: `32`", markdown)

@@ -543,11 +543,11 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         };
     }
     let edited = result?;
+    save(&edited, &c.out)?;
     if campaign {
         return Ok(());
     }
     println!("\n[edit] edit done in {:.1}s", t0.elapsed().as_secs_f32());
-    save(&edited, &c.out)?;
     println!("[edit] wrote {}", c.out.display());
 
     let diff = mean_abs_diff(

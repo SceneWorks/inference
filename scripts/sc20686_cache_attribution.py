@@ -31,7 +31,7 @@ REQUIRED = (
     "source_ref", "model_snapshot_revision", "residency_strategy",
     "route_manifest_sha256", "source_map_sha256",
     "model_snapshot_sha256", "model_snapshot_bytes", "input_file_sha256",
-    "evidence_artifact_sha256", "geometry", "lifecycle", "allocator_samples",
+    "evidence_artifact_sha256", "media_manifest_sha256", "geometry", "lifecycle", "allocator_samples",
     "process_samples", "observer_events", "raw_receipt_sha256", "raw_receipt_sidecar_sha256",
     "real_weights", "full_generation", "attention_kind", "current_persistent_bytes",
     "current_read_transient_bytes", "candidate_persistent_bytes",
@@ -231,13 +231,62 @@ def validate_hash_map(value, name, allow_empty=False):
         require_digest(item, f"{name} hash")
 
 
+def validate_lifecycle(row):
+    events = row["observer_events"]
+    if not isinstance(events, list) or not events or any(
+        not isinstance(event, dict) for event in events
+    ):
+        fail("missing exact observer transcript events")
+    phases = [event.get("phase") for event in events]
+    terminal = "cancelled" if row["arm"] == "cancel" else "generation-end"
+    opposite = "generation-end" if terminal == "cancelled" else "cancelled"
+    if opposite in phases:
+        fail("observer lifecycle has the wrong terminal event")
+    singleton = ("metadata", "generation-start", terminal, "metrics", "invalidated", "released")
+    indices = {}
+    for phase in singleton:
+        matches = [index for index, value in enumerate(phases) if value == phase]
+        if len(matches) != 1:
+            fail(f"observer lifecycle requires exactly one {phase} event")
+        indices[phase] = matches[0]
+    creates = [index for index, value in enumerate(phases) if value == "cross-kv-created"]
+    reads = [index for index, value in enumerate(phases) if value == "cross-kv-read"]
+    if not creates or not reads:
+        fail("observer lifecycle lacks cache creation/read events")
+    if not (
+        indices["metadata"] < indices["generation-start"] < min(creates) < min(reads)
+        and max(creates) < indices[terminal]
+        and max(reads) < indices[terminal]
+        and indices[terminal] < indices["metrics"] < indices["invalidated"] < indices["released"]
+    ):
+        fail("observer lifecycle events are out of product order")
+    metadata = events[indices["metadata"]]
+    if row["arm"] == "cancel":
+        if metadata.get("cancellation_armed") is not True or not isinstance(
+            metadata.get("cancellation_arm_id"), str
+        ) or not metadata["cancellation_arm_id"]:
+            fail("cancel arm lacks product-owned cancellation identity")
+    elif metadata.get("cancellation_armed") not in (None, False):
+        fail("normal arm unexpectedly claims cancellation")
+    lifecycle = row["lifecycle"]
+    expected = {
+        "created": phases.count("cross-kv-created"),
+        "reused": phases.count("cross-kv-read"),
+        "invalidated": phases.count("invalidated"),
+        "cancelled": phases.count("cancelled"),
+        "released": phases.count("released"),
+    }
+    if lifecycle != expected:
+        fail("lifecycle summary differs from exact observer events")
+
+
 def validate(row, expected_source_map_hash):
     if not isinstance(row, dict):
         fail("receipt row must be an object")
     missing = set(REQUIRED) - row.keys()
     if missing:
         fail(f"missing fields: {sorted(missing)}")
-    if row["producer"] != "sc20686-campaign-adapter-v3":
+    if row["producer"] != "sc20686-campaign-adapter-v4":
         fail("untrusted producer")
     if row["family"] not in FAMILIES or not isinstance(row["variant"], str):
         fail("invalid family/variant")
@@ -259,11 +308,24 @@ def validate(row, expected_source_map_hash):
         fail("receipt does not bind the checked-in source map")
     validate_hash_map(row["input_file_sha256"], "input file identity", allow_empty=True)
     validate_hash_map(row["evidence_artifact_sha256"], "evidence artifact identity")
+    require_digest(row["media_manifest_sha256"], "media manifest identity")
+    media_manifests = {
+        name: item_hash
+        for name, item_hash in row["evidence_artifact_sha256"].items()
+        if name.endswith(".media.json")
+    }
+    if len(media_manifests) != 1 or next(iter(media_manifests.values())) != row[
+        "media_manifest_sha256"
+    ]:
+        fail("row does not bind exactly one matching media manifest")
     if row["real_weights"] is not True or row["attention_kind"] != "cross":
         fail("real product cross-attention evidence required")
-    if (row["arm"] == "normal") != (row["full_generation"] is True):
+    if not isinstance(row["full_generation"], bool) or row["full_generation"] != (
+        row["arm"] == "normal"
+    ):
         fail("arm/full-generation lifecycle mismatch")
     validate_geometry(row["geometry"])
+    validate_lifecycle(row)
     expected_candidate = packed_group32_kv_bytes(
         row["geometry"]["batch"], row["geometry"]["heads"], row["geometry"]["skv"],
         row["geometry"]["head_dimension"],
@@ -318,17 +380,10 @@ def validate(row, expected_source_map_hash):
     )[:16]
     if row["coordinate_id"] != expected_coordinate_id:
         fail("coordinate id does not bind exact geometry")
-    lifecycle = row["lifecycle"]
-    if not isinstance(lifecycle, dict) or any(
-        field not in lifecycle for field in ("created", "reused", "invalidated", "released")
-    ):
-        fail("incomplete lifecycle")
     if not isinstance(row["allocator_samples"], list) or not row["allocator_samples"]:
         fail("missing allocator samples")
     if not isinstance(row["process_samples"], list) or not row["process_samples"]:
         fail("missing process samples")
-    if not isinstance(row["observer_events"], list) or not row["observer_events"]:
-        fail("missing exact observer transcript events")
     for field in (
         "model_snapshot_bytes", "current_persistent_bytes", "current_read_transient_bytes",
         "candidate_persistent_bytes", "candidate_read_transient_bytes",
@@ -543,6 +598,8 @@ def reduce(rows):
                 if normal[field] != cancel[field]:
                     fail(f"normal/cancel identity differs: {variant}/{coordinate}/{field}")
             result = coordinate_decision(normal)
+            result["cancel_arm_verified"] = True
+            result["cancel_terminal"] = "cancelled"
             coordinate_results[f"{variant}/{coordinate}"] = result
             variant_coordinate_decisions.setdefault(variant, []).append(result["decision"])
         for variant, variant_decisions in variant_coordinate_decisions.items():
@@ -557,7 +614,7 @@ def reduce(rows):
             "self_attention_excluded": True,
         }
     return {
-        "schema": "sc-20686-cache-attribution-v4",
+        "schema": "sc-20686-cache-attribution-v5",
         "thresholds": THRESHOLDS,
         "coverage_manifest_sha256": coverage_hash,
         "source_map_sha256": source_map_hash,
@@ -567,17 +624,89 @@ def reduce(rows):
     }
 
 
-def verify_named_artifact(bundle, name, expected_hash):
+def file_sha256(path):
+    identity = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            identity.update(chunk)
+    return identity.hexdigest()
+
+
+def verify_named_artifact(bundle, name, expected_hash, load_payload=True):
     if Path(name).name != name:
         fail("bundle artifact name escapes the bundle")
-    payload = (bundle / name).read_bytes()
-    if sha256(payload) != expected_hash:
+    path = bundle / name
+    if path.is_symlink() or not path.is_file() or file_sha256(path) != expected_hash:
         fail(f"bundle artifact checksum mismatch: {name}")
     sidecar = (bundle / f"{name}.sha256").read_bytes()
     expected_sidecar = f"{expected_hash}  {name}\n".encode("utf-8")
     if sidecar != expected_sidecar:
         fail(f"bundle artifact sidecar mismatch: {name}")
-    return payload
+    return path.read_bytes() if load_payload else None
+
+
+def verify_media_manifest(row, manifest_raw, artifacts, bundle, evidence_names, expected_stem):
+    try:
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"campaign media manifest is malformed: {exc}")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != "sc-20686-media-manifest-v1"
+        or manifest.get("arm") != row["arm"]
+        or not isinstance(manifest.get("output_name"), str)
+        or not isinstance(manifest.get("files"), list)
+    ):
+        fail("campaign media manifest schema is invalid")
+    expected_output_name = "media.png" if row["variant"] == "flux2_klein_9b_edit" else "media"
+    if manifest["output_name"] != expected_output_name:
+        fail("campaign media manifest output conflicts with its route")
+    files = manifest["files"]
+    if row["arm"] == "cancel":
+        if manifest.get("output_kind") != "absent" or files:
+            fail("cancel arm must attest that no media was published")
+    elif manifest.get("output_kind") not in ("file", "directory") or not files:
+        fail("normal arm lacks sealed generated media")
+    if manifest.get("output_kind") == "file" and len(files) != 1:
+        fail("file media manifest must contain exactly one output")
+    media_names = set()
+    relative_paths = set()
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {
+            "artifact", "relative_path", "bytes", "sha256"
+        }:
+            fail("campaign media file metadata is malformed")
+        name = entry["artifact"]
+        relative_path = entry["relative_path"]
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(rf"{re.escape(expected_stem)}\.media-[0-9]{{4}}", name)
+            or not isinstance(relative_path, str)
+            or not relative_path
+            or relative_path == "."
+            or "\\" in relative_path
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+            or relative_path in relative_paths
+            or name in media_names
+        ):
+            fail("campaign media file identity is malformed")
+        size = entry["bytes"]
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            fail("campaign media file size is invalid")
+        require_digest(entry["sha256"], "campaign media file hash")
+        if artifacts.get(name) != entry["sha256"]:
+            fail("campaign media manifest hash differs from the sealed artifact")
+        media_path = bundle / name
+        if media_path.stat().st_size != size:
+            fail("campaign media manifest size differs from the sealed artifact")
+        relative_paths.add(relative_path)
+        media_names.add(name)
+    if manifest.get("output_kind") == "file" and files[0]["relative_path"] != expected_output_name:
+        fail("file media manifest does not preserve its output name")
+    if evidence_names != media_names:
+        fail("row media evidence inventory differs from its exact manifest")
+    return manifest
 
 
 def verify_campaign_bundle(bundle):
@@ -587,7 +716,7 @@ def verify_campaign_bundle(bundle):
     if (bundle / "campaign.json.sha256").read_bytes() != expected_sidecar:
         fail("campaign aggregate sidecar mismatch")
     campaign = json.loads(campaign_raw.decode("utf-8"))
-    if campaign.get("schema") != "sc-20686-campaign-bundle-v4":
+    if campaign.get("schema") != "sc-20686-campaign-bundle-v5":
         fail("invalid campaign bundle schema")
     artifacts = campaign.get("artifact_sha256")
     validate_hash_map(artifacts, "campaign artifact identity")
@@ -597,10 +726,11 @@ def verify_campaign_bundle(bundle):
     observed_files = {path.name for path in bundle.iterdir() if path.is_file()}
     if observed_files != expected_files:
         fail("campaign bundle file inventory is not exact")
-    payloads = {
-        name: verify_named_artifact(bundle, name, item_hash)
-        for name, item_hash in artifacts.items()
-    }
+    payloads = {}
+    for name, item_hash in artifacts.items():
+        payloads[name] = verify_named_artifact(
+            bundle, name, item_hash, load_payload=".media-" not in name
+        )
     sealed_rows = campaign.get("rows")
     row_files = campaign.get("row_files")
     if not isinstance(sealed_rows, list) or not isinstance(row_files, list) or len(sealed_rows) != len(row_files):
@@ -656,7 +786,10 @@ def verify_campaign_bundle(bundle):
     }
     if set(resolved_by_key) != row_coordinate_keys:
         fail("resolved input coordinate closure differs from sealed rows")
-    for row, name in zip(sealed_rows, row_files):
+    bound_media_artifacts = set()
+    for row_index, (row, name) in enumerate(zip(sealed_rows, row_files)):
+        if name != f"row-{row_index:02d}.json":
+            fail("campaign row filenames are not canonical")
         raw = payloads.get(name)
         if raw is None:
             fail(f"campaign lacks raw row/sidecar: {name}")
@@ -670,8 +803,23 @@ def verify_campaign_bundle(bundle):
             suffix: [item for item in evidence_names if item.endswith(suffix)]
             for suffix in (".events.jsonl", ".stdout", ".stderr", ".command.json", ".process.json")
         }
-        if any(len(names) != 1 for names in by_suffix.values()) or len(evidence_names) != 5:
-            fail("row evidence artifact inventory is not the exact run transcript set")
+        manifest_names = [item for item in evidence_names if item.endswith(".media.json")]
+        expected_stem = f"run-{row_index // 2:02d}-{row['arm']}"
+        if (
+            any(names != [f"{expected_stem}{suffix}"] for suffix, names in by_suffix.items())
+            or manifest_names != [f"{expected_stem}.media.json"]
+        ):
+            fail("row evidence artifact inventory lacks an exact transcript or media manifest")
+        fixed_names = {names[0] for names in by_suffix.values()} | {manifest_names[0]}
+        media_evidence_names = evidence_names - fixed_names
+        manifest_name = manifest_names[0]
+        if row.get("media_manifest_sha256") != artifacts.get(manifest_name):
+            fail("row media manifest identity differs from the sealed artifact")
+        media_manifest = verify_media_manifest(
+            row, payloads[manifest_name], artifacts, bundle, media_evidence_names,
+            expected_stem,
+        )
+        bound_media_artifacts.update(media_evidence_names | {manifest_name})
         event_transcript = payloads[by_suffix[".events.jsonl"][0]]
         try:
             if not event_transcript or b"\r" in event_transcript or not event_transcript.endswith(b"\n"):
@@ -726,7 +874,7 @@ def verify_campaign_bundle(bundle):
             or argv[4:-2] != expected_after_events
             or argv[-2] != "--out"
             or not output_path.is_absolute()
-            or output_path.name != "media"
+            or output_path.name != media_manifest["output_name"]
             or output_path.parent != event_path.parent
             or event_path.parent.name != "sealed-run"
         ):
@@ -753,6 +901,11 @@ def verify_campaign_bundle(bundle):
             resolved_input_hashes[key] = item["sha256"]
         if row["input_file_sha256"] != resolved_input_hashes:
             fail("sealed row file identities differ from sealed resolved inputs")
+    campaign_media_artifacts = {
+        name for name in artifacts if ".media-" in name or name.endswith(".media.json")
+    }
+    if campaign_media_artifacts != bound_media_artifacts:
+        fail("campaign contains media artifacts not bound to an exact run row")
     expected_input_hashes = {
         f"{row['family']}/{row['variant']}/{row['coordinate_name']}/{row['arm']}":
             row["input_file_sha256"]

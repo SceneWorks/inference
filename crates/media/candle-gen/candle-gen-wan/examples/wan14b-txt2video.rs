@@ -12,8 +12,8 @@
 //!
 //! With `--comfyui-high <file> --comfyui-low <file>` it instead loads those two in-place ComfyUI Wan2.2
 //! experts (native-Wan keys, companion scaled-fp8) via
-//! [`candle_gen_wan::wan14b::load_from_comfyui_experts`], sourcing the UMT5 TE / VAE / tokenizer from
-//! `--snapshot` (a resident Wan tier dir). The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
+//! [`candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload`], sourcing the UMT5 TE / VAE /
+//! tokenizer from `--snapshot`. The sc-10671 GPU-val path. Adding `--comfyui-te <file>`
 //! (`umt5_xxl_fp8_e4m3fn_scaled`) and/or `--comfyui-vae <file>` (`wan_2.1_vae.safetensors`) reads those
 //! components in place too (sc-10909); whichever is omitted falls back to `--snapshot`.
 
@@ -123,6 +123,10 @@ fn main() -> Result<()> {
     // sc-10671: `--comfyui-high/--comfyui-low` read the two ComfyUI experts in place (scaled-fp8 dequant
     // + native→diffusers remap), sourcing TE/VAE/tokenizer from `--snapshot`; else the registry loads
     // the whole snapshot.
+    let offload = campaign_contract
+        .as_ref()
+        .map(|(_, _, policy)| *policy)
+        .unwrap_or_default();
     let gen = match (arg(&args, "--comfyui-high"), arg(&args, "--comfyui-low")) {
         (Some(high), Some(low)) => {
             // `load_from_comfyui_experts` takes no adapters, so `--lora-high/--lora-low` would be
@@ -142,20 +146,17 @@ fn main() -> Result<()> {
                 "[smoke] comfyui experts: high={high} low={low} (in place, scaled-fp8→bf16)\n\
                  [smoke] comfyui te={te_file:?} vae={vae_file:?} (in place when Some, else snapshot)"
             );
-            candle_gen_wan::wan14b::load_from_comfyui_experts(
+            candle_gen_wan::wan14b::load_from_comfyui_experts_with_offload(
                 PathBuf::from(&high),
                 PathBuf::from(&low),
                 te_file,
                 vae_file,
                 PathBuf::from(&snapshot),
                 false,
+                offload,
             )?
         }
         _ => {
-            let offload = campaign_contract
-                .as_ref()
-                .map(|(_, _, policy)| *policy)
-                .unwrap_or_default();
             let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)))
                 .with_adapters(adapters)
                 .with_offload_policy(offload);

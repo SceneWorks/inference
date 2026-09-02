@@ -67,12 +67,29 @@ class AttributionTests(unittest.TestCase):
             **measured,
         }
         release_event = {"phase": "released", **measured}
-        observer_events = [created_event, read_event, dict(read_event)]
+        metadata_event = {
+            "phase": "metadata", "cancellation_armed": arm == "cancel",
+        }
+        if arm == "cancel":
+            metadata_event["cancellation_arm_id"] = f"test:{variant}:{coordinate}"
+        terminal = "cancelled" if arm == "cancel" else "generation-end"
+        observer_events = [
+            metadata_event,
+            {"phase": "generation-start"},
+            created_event,
+            read_event,
+            dict(read_event),
+        ]
         if family == "wan":
             observer_events.append({"phase": "cross-kv-released", **measured})
-        observer_events.append(release_event)
+        observer_events.extend((
+            {"phase": terminal},
+            {"phase": "metrics"},
+            {"phase": "invalidated"},
+            release_event,
+        ))
         row = {
-            "producer": "sc20686-campaign-adapter-v3", "family": family,
+            "producer": "sc20686-campaign-adapter-v4", "family": family,
             "variant": variant, "coordinate_name": coordinate,
             "coordinate_id": coordinate_id, "arm": arm, "source_ref": "d" * 40,
             "model_snapshot_revision": "a" * 40,
@@ -81,9 +98,13 @@ class AttributionTests(unittest.TestCase):
             "source_map_sha256": self.source_map_hash,
             "model_snapshot_sha256": "a" * 64, "model_snapshot_bytes": 1_000_000_000,
             "input_file_sha256": {},
-            "evidence_artifact_sha256": {"run.stdout": "b" * 64},
+            "evidence_artifact_sha256": {"run.media.json": "b" * 64},
+            "media_manifest_sha256": "b" * 64,
             "geometry": geometry,
-            "lifecycle": {"created": 1, "reused": 2, "invalidated": 1, "released": 1},
+            "lifecycle": {
+                "created": 1, "reused": 2, "invalidated": 1,
+                "cancelled": int(arm == "cancel"), "released": 1,
+            },
             "allocator_samples": [{"peak_bytes": 10 * 1024**3}],
             "process_samples": [{"peak_bytes": 10 * 1024**3}],
             "observer_events": observer_events,
@@ -295,7 +316,10 @@ class AttributionTests(unittest.TestCase):
             expected_candidate * cancel["geometry"]["layers"]
             if cancel["family"] == "flux2-klein" else expected_candidate
         )
-        cancel["observer_events"][0]["candidate_persistent_bytes"] = expected_candidate
+        next(
+            event for event in cancel["observer_events"]
+            if event.get("phase") == "cross-kv-created"
+        )["candidate_persistent_bytes"] = expected_candidate
         if cancel["family"] == "flux2-klein":
             exact_dense = self.reducer.dense_reference_kv_bytes(cancel["geometry"])
             cancel["current_read_transient_bytes"] = exact_dense
@@ -308,6 +332,65 @@ class AttributionTests(unittest.TestCase):
         )[:16]
         with self.assertRaisesRegex(ValueError, "geometry differs"):
             self.reducer.reduce(pair)
+
+    def test_cancel_arm_terminal_cleanup_and_pair_binding_are_fail_closed(self):
+        mutations = (
+            (
+                lambda row: (
+                    row.update(observer_events=[
+                        event for event in row["observer_events"]
+                        if event.get("phase") != "cancelled"
+                    ]),
+                    row["lifecycle"].update(cancelled=0),
+                ),
+                "exactly one cancelled",
+            ),
+            (
+                lambda row: row["observer_events"].insert(
+                    next(
+                        index for index, event in enumerate(row["observer_events"])
+                        if event.get("phase") == "invalidated"
+                    ) + 1,
+                    row["observer_events"].pop(
+                        next(
+                            index for index, event in enumerate(row["observer_events"])
+                            if event.get("phase") == "cancelled"
+                        )
+                    ),
+                ),
+                "out of product order",
+            ),
+            (
+                lambda row: (
+                    row.update(observer_events=[
+                        event for event in row["observer_events"]
+                        if event.get("phase") != "released"
+                    ]),
+                    row["lifecycle"].update(released=0),
+                ),
+                "exactly one released",
+            ),
+            (
+                lambda row: next(
+                    event for event in row["observer_events"]
+                    if event.get("phase") == "metadata"
+                ).pop("cancellation_arm_id"),
+                "cancellation identity",
+            ),
+        )
+        for mutate, expected in mutations:
+            with self.subTest(expected=expected):
+                rows = self.complete_rows()
+                cancel = next(row for row in rows if row["arm"] == "cancel")
+                mutate(cancel)
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.reducer.reduce(rows)
+
+        result = self.reducer.reduce(self.complete_rows())
+        for family in result["decisions"].values():
+            for coordinate in family["coordinates"].values():
+                self.assertTrue(coordinate["cancel_arm_verified"])
+                self.assertEqual(coordinate["cancel_terminal"], "cancelled")
 
     def test_checked_in_source_map_is_required_and_closed(self):
         rows = self.complete_rows()
@@ -384,6 +467,12 @@ class AttributionTests(unittest.TestCase):
         flux = (root / paths[0]).read_text(encoding="utf-8")
         self.assertIn("load_klein_with_memory_spec", flux)
         self.assertIn("stage_residency: true", flux)
+        self.assertLess(flux.index("save(&edited, &c.out)?"), flux.index("if campaign {", flux.index("let edited = result?")))
+        wan14b = (root / paths[2]).read_text(encoding="utf-8")
+        self.assertIn("load_from_comfyui_experts_with_offload(", wan14b)
+        self.assertNotIn("wan14b::load_from_comfyui_experts(\n", wan14b)
+        comfyui_call = wan14b.index("wan14b::load_from_comfyui_experts_with_offload(")
+        self.assertIn("offload,", wan14b[comfyui_call:comfyui_call + 500])
         for relative in (
             "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
             "crates/media/candle-gen/candle-gen-wan/src/sc20686_observer.rs",
