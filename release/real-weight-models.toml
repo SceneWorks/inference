@@ -33,6 +33,61 @@ profiles = ["llm-macos", "llm-cuda"]
 environment = ["MLX_LLM_QWEN3_MODEL", "CANDLE_LLM_QWEN3_MODEL"]
 expected_files = ["config.json", "tokenizer.json", "model.safetensors"]
 
+# SC-22261 terminal-only native StarVector campaign. These rows intentionally do not ride the
+# scheduled/all LLM sweep: the single campaign must serialize its MLX and authoritative CUDA
+# measurements and bind both implementations to the same immutable SVG-Bench receipt.
+[[models]]
+key = "starvector-1b-im2svg"
+repository = "starvector/starvector-1b-im2svg"
+revision = "380ab95d25a8e9ab1dc825debe238b4953ae13b9"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["starvector-terminal"]
+environment = ["STARVECTOR_1B_SNAPSHOT"]
+# Native Rust loads these exact model, processor, and tokenizer components. Deliberately exclude
+# the repository's Python architecture helpers: the shipping MLX/Candle providers do not execute
+# them, and a change to one cannot lend provenance to the native runtime.
+expected_files = [
+    "added_tokens.json",
+    "config.json",
+    "merges.txt",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "model.safetensors.index.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+]
+
+[[models]]
+key = "starvector-8b-im2svg"
+repository = "starvector/starvector-8b-im2svg"
+revision = "518beea8dcb5f7a37c5911e92d1d62a76beee7f9"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["starvector-terminal"]
+environment = ["STARVECTOR_8B_SNAPSHOT"]
+# The immutable snapshot has no tokenizer.json; the native tokenizer consumes the pinned
+# merges/vocabulary plus the special-token configuration directly.
+expected_files = [
+    "added_tokens.json",
+    "config.json",
+    "merges.txt",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+    "model.safetensors.index.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "vocab.json",
+]
+
 [[models]]
 # Full SigLIP2 + projector + Llama-3.1 8B JoyCaption VLM. The MLX real-weight gate prepares this
 # dense source into a Q4 text-stack snapshot while retaining the vision tower/projector dense.

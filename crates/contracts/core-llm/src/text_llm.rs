@@ -18,6 +18,16 @@ pub trait TextLlm {
     /// The provider's identity + declared capabilities (constructible without running inference).
     fn descriptor(&self) -> &TextLlmDescriptor;
 
+    /// Return this provider's narrow StarVector extension when it implements one.
+    ///
+    /// Providers are always loaded through the ordinary [`TextLlm`](Self) registry.  This
+    /// object-safe view lets a host retain that established identity, loading, cancellation, and
+    /// error lifecycle while opting into StarVector's typed SVG boundary.  `None` is the safe
+    /// default for every non-StarVector text provider.
+    fn as_starvector_provider(&self) -> Option<&dyn crate::StarVectorProvider> {
+        None
+    }
+
     /// Cheap, pre-inference validation of a request against this provider's capabilities. Must
     /// reject (not silently ignore) anything outside the declared surface.
     fn validate(&self, req: &TextLlmRequest) -> Result<()>;

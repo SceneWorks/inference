@@ -52,6 +52,8 @@ pub mod primitives;
 pub mod provider;
 pub mod residency;
 pub mod snapshot;
+pub mod starvector_1b;
+pub mod starvector_8b;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
 // integration suites pull in as `mod common;` — included by path rather than copied, so the two
@@ -77,6 +79,8 @@ pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use residency::{EncoderResidency, StreamObservation};
 pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
+pub use starvector_1b::StarVector1bProvider;
+pub use starvector_8b::StarVector8bProvider;
 
 /// Add every MLX LLM provider to an explicit registry builder.
 pub fn register_text_providers(
@@ -85,11 +89,29 @@ pub fn register_text_providers(
     registry
         .register(provider::REGISTRATION)
         .register(joycaption::REGISTRATION)
+        .register(starvector_1b::REGISTRATION)
+        .register(starvector_8b::REGISTRATION)
 }
 
 /// Build the complete, explicit MLX LLM provider catalog.
 pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
     register_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
+}
+
+/// Add only providers admitted to a shipped runtime catalog.
+pub fn register_catalog_text_providers(
+    registry: core_llm::TextLlmRegistryBuilder,
+) -> core_llm::TextLlmRegistryBuilder {
+    registry
+        .register(provider::REGISTRATION)
+        .register(joycaption::REGISTRATION)
+        .register(starvector_1b::REGISTRATION)
+        .register(starvector_8b::REGISTRATION)
+}
+
+/// Build the explicit MLX LLM catalog whose providers have admission evidence.
+pub fn catalog_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    register_catalog_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
 }
 
 /// Add the MLX snapshot preparer to an explicit registry builder.
@@ -133,13 +155,36 @@ pub fn prepare_snapshot(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_l
 #[cfg(test)]
 mod explicit_registry_tests {
     #[test]
-    fn explicit_catalog_is_complete_and_stable() {
+    fn explicit_registry_and_catalog_include_admitted_starvector_8b() {
         let explicit: Vec<String> = super::text_registry()
             .unwrap()
             .registrations()
             .map(|registration| (registration.descriptor)().id)
             .collect();
-        assert_eq!(explicit, ["mlx-llama", "mlx-joycaption"]);
+        assert_eq!(
+            explicit,
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
+
+        let admitted: Vec<String> = super::catalog_text_registry()
+            .unwrap()
+            .registrations()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(
+            admitted,
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b",
+            ]
+        );
 
         let preparers = super::snapshot_preparer_registry().unwrap();
         assert_eq!(
