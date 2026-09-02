@@ -1009,6 +1009,39 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_
     serde_json::to_vec_pretty(&stable(value))
 }
 
+/// Canonical semantic-seal bytes shared with the JavaScript consumer. JSON serializers do not
+/// agree on the shortest decimal spelling of every IEEE-754 value, so hashing their textual
+/// number rendering is not portable. Normalize every finite JSON number to its exact f64 bit
+/// pattern before applying the ordinary recursively sorted JSON representation.
+fn canonical_semantic_seal_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    fn normalize(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+        match value {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(normalize)
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array),
+            serde_json::Value::Object(values) => values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), normalize(value)?)))
+                .collect::<Result<serde_json::Map<_, _>, String>>()
+                .map(serde_json::Value::Object),
+            serde_json::Value::Number(number) => {
+                let value = number
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or("semantic seal contains a non-finite or unrepresentable number")?;
+                Ok(serde_json::Value::String(format!(
+                    "f64:{:016x}",
+                    value.to_bits()
+                )))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+    canonical_json_bytes(&normalize(value)?).map_err(|error| error.to_string())
+}
+
 /// Seal the same semantic core used by the SC-20671 artifact publisher.  Consumers must never
 /// treat a sidecar or a syntactically valid receipt as proof that `receiptSha256` binds it.
 pub fn receipt_semantic_seal(receipt: &Receipt) -> Result<String, String> {
@@ -1022,9 +1055,7 @@ pub fn receipt_semantic_seal(receipt: &Receipt) -> Result<String, String> {
         .as_object_mut()
         .ok_or("receipt is not an object")?
         .remove("receiptSha256");
-    Ok(seal_bytes(
-        &canonical_json_bytes(&value).map_err(|e| e.to_string())?,
-    ))
+    Ok(seal_bytes(&canonical_semantic_seal_bytes(&value)?))
 }
 
 /// Validate a receipt together with the semantic-core seal embedded by the producer.
@@ -2021,7 +2052,7 @@ pub fn validate_artifact_bundle_named(
     core.as_object_mut()
         .ok_or("receipt is not an object")?
         .remove("receiptSha256");
-    let expected = seal_bytes(&canonical_json_bytes(&core).map_err(|e| e.to_string())?);
+    let expected = seal_bytes(&canonical_semantic_seal_bytes(&core)?);
     if object.get("receiptSha256").and_then(|v| v.as_str()) != Some(expected.as_str()) {
         return Err("receipt semantic hash mismatch".into());
     }
@@ -5412,12 +5443,11 @@ fn warmup_probe_suite_sha256(
     worker_pid: u32,
     probe_evidence: &[ReceiptCompileProbeEvidence],
 ) -> Result<String, String> {
-    let bytes = canonical_json_bytes(&serde_json::json!({
+    let bytes = canonical_semantic_seal_bytes(&serde_json::json!({
         "sessionId": session_id,
         "workerPid": worker_pid,
         "probeEvidence": probe_evidence,
-    }))
-    .map_err(|error| error.to_string())?;
+    }))?;
     Ok(seal_bytes(&bytes))
 }
 
@@ -6176,6 +6206,39 @@ mod tests {
         assert_eq!(canonical_operation_evidence_sha256(&second), expected);
         let (noncanonical_bytes, _) = sealed_json(&first);
         assert_ne!(expected, seal_bytes(&noncanonical_bytes));
+    }
+
+    #[test]
+    fn semantic_seal_normalizes_numbers_to_exact_ieee_bits() {
+        let realistic = 14.162040999999993_f64;
+        let first = serde_json::json!({
+            "integer": 1,
+            "realistic": realistic,
+            "zero": 0.0,
+        });
+        let mut reversed = serde_json::Map::new();
+        reversed.insert("zero".into(), serde_json::json!(0));
+        reversed.insert("realistic".into(), serde_json::json!(realistic));
+        reversed.insert("integer".into(), serde_json::json!(1.0));
+        let second = serde_json::Value::Object(reversed);
+        let bytes = canonical_semantic_seal_bytes(&first).unwrap();
+        let rendered = String::from_utf8(bytes.clone()).unwrap();
+        assert!(rendered.contains(&format!("f64:{:016x}", realistic.to_bits())));
+        assert!(rendered.contains("f64:3ff0000000000000"));
+        assert!(rendered.contains("f64:0000000000000000"));
+        assert_eq!(bytes, canonical_semantic_seal_bytes(&second).unwrap());
+        assert_eq!(
+            seal_bytes(&bytes),
+            "d79227844f5a6cb8c3def3ce381ba7a79d28f5efb5b177e674b185f719363b56",
+            "the Rust seal must match the paired JavaScript fixture"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(r#"{"value":91.01400000000001}"#).unwrap();
+        assert_eq!(
+            parsed["value"].as_f64().unwrap().to_bits(),
+            0x4056_c0e5_6041_8938,
+            "receipt parsing must retain the exact number published for the JS consumer"
+        );
     }
 
     #[test]
@@ -7054,7 +7117,7 @@ mod tests {
             .remove("receiptSha256");
         assert_eq!(
             embedded_seal,
-            seal_bytes(&canonical_json_bytes(&serialized_core).unwrap()),
+            seal_bytes(&canonical_semantic_seal_bytes(&serialized_core).unwrap()),
             "the producer seal must survive exact receipt serialization and parsing"
         );
         assert!(std::str::from_utf8(&bundle.human)

@@ -29,8 +29,9 @@ mlx-rs = { workspace = true }
 core-llm = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
-# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
-serde_json = { workspace = true }
+# Config and receipt parsing. Exact float round-tripping is required because the SC-20671
+# cross-language semantic seal normalizes the published JSON numbers by their IEEE-754 bits.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
 # half-precision scalar helpers for host-side dtype handling.
