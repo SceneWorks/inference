@@ -889,7 +889,12 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_
 /// Seal the same semantic core used by the SC-20671 artifact publisher.  Consumers must never
 /// treat a sidecar or a syntactically valid receipt as proof that `receiptSha256` binds it.
 pub fn receipt_semantic_seal(receipt: &Receipt) -> Result<String, String> {
-    let mut value = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+    // Normalize through the exact serialized representation before hashing. serde_json can retain
+    // a slightly different internal Number for a producer-owned f64 than it constructs when the
+    // published bytes are parsed again (for example 14.162040999999993). Hashing the pre-serialize
+    // Value would therefore create a receipt which fails its own byte-level consumer check.
+    let bytes = receipt.bytes().map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     value
         .as_object_mut()
         .ok_or("receipt is not an object")?
@@ -1601,13 +1606,7 @@ fn assemble_artifacts_with_fixtures_named(
     human_name: &str,
     fixtures: Vec<SealedFixtureArtifact>,
 ) -> Result<ArtifactBundle, String> {
-    let mut semantic = serde_json::to_value(&receipt).map_err(|e| e.to_string())?;
-    semantic
-        .as_object_mut()
-        .ok_or("receipt is not an object")?
-        .remove("receiptSha256");
-    let semantic = canonical_json_bytes(&semantic).map_err(|e| e.to_string())?;
-    receipt.receipt_sha256 = seal_bytes(&semantic);
+    receipt.receipt_sha256 = receipt_semantic_seal(&receipt)?;
     let bytes = receipt.bytes().map_err(|e| e.to_string())?;
     let released_cache_bytes = receipt
         .memory
@@ -6052,7 +6051,7 @@ mod tests {
             cache_matches: 1,
             cache_total: 1,
         };
-        let receipt = ReceiptBuilder {
+        let mut receipt = ReceiptBuilder {
             template,
             phases,
             allocations,
@@ -6254,7 +6253,25 @@ mod tests {
         let mut partial = receipt.clone();
         partial.timings.samples.pop();
         assert!(validate_receipt_semantics(&partial).is_err());
+        // Real product timing values exercise serde_json's float representation rather than the
+        // integer-like values used by the synthetic builder fixture.
+        receipt.timings.load_ms = 14.162040999999993;
         let bundle = assemble_artifacts(receipt).expect("receipt bytes must assemble");
+        let mut serialized_core: serde_json::Value =
+            serde_json::from_slice(&bundle.receipt).expect("receipt must decode");
+        let embedded_seal = serialized_core["receiptSha256"]
+            .as_str()
+            .expect("receipt seal")
+            .to_owned();
+        serialized_core
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("receiptSha256");
+        assert_eq!(
+            embedded_seal,
+            seal_bytes(&canonical_json_bytes(&serialized_core).unwrap()),
+            "the producer seal must survive exact receipt serialization and parsing"
+        );
         assert!(std::str::from_utf8(&bundle.human)
             .unwrap()
             .contains("\n- Receipt hash: "));
