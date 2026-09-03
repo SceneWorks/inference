@@ -166,7 +166,7 @@ pub(crate) fn provider_contract(
     let streamable = streamable(spec);
     let base = gen_core::require_base_snapshot(spec, provider_id)?;
     let components = match &spec.weights {
-        WeightsSource::Dir(_) => {
+        WeightsSource::Dir(root) => {
             let mut components = PerComponentBytes::from_spec_subdirs(
                 spec,
                 &["text_encoder"],
@@ -175,6 +175,20 @@ pub(crate) fn provider_contract(
             )
             .unwrap_or_default();
             components.text_encoder = conditioning_encoder_bytes(provider_id, spec, base)?;
+            // The VAE is materialized at `lib.rs`'s `ENC_DTYPE` (f32) on EVERY route —
+            // `load_vae_seq` builds `QwenVae` from `component_vb("vae", ENC_DTYPE)` for a snapshot
+            // exactly as the ComfyUI arm below does for an imported file — so the snapshot's bf16
+            // on-disk sum under-priced the resident decoder by 2x while the imported route beside
+            // it was already f32-priced (epic SC-22657, E1). The DiT stays an on-disk sum: it is
+            // materialized at `DIT_DTYPE` (bf16), the width the hosted tiers ship.
+            let vae_dir = root.join("vae");
+            components.vae = if gen_core::weightsmeta::safetensors_path_bytes(&vae_dir) == 0 {
+                // A partial tree with no `vae/` component contributed `0` through the directory
+                // sum this replaced; keep that, and let the loader be the seam that fails on it.
+                0
+            } else {
+                f32_component_bytes(&vae_dir, "snapshot VAE")?
+            };
             components
         }
         WeightsSource::File(path) => {
@@ -272,7 +286,20 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
 
     // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
     // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
-    if af::snapshot_root(spec).is_none() {
+    //
+    // A ComfyUI single-file import IS a resolved pipeline, so it declares the same axes as a
+    // snapshot. `architecture_facts::snapshot_root` answers `None` for every `WeightsSource::File`,
+    // which left the loaded imported route publishing `MemoryArchitectureFacts::default()` — no
+    // axis at all under a lifecycle-phase formula, which the E2 conformance gate rejects and which
+    // no caller could estimate an activation from. None of these axes come from the snapshot
+    // anyway: the loader builds `QwenTransformer` from the hardcoded
+    // `config::TransformerConfig::qwen_image()` and packs against the `config` constants on both
+    // source shapes (epic SC-22657, E2).
+    let resolved = match &spec.weights {
+        WeightsSource::Dir(root) => root.is_dir(),
+        WeightsSource::File(path) => path.is_file(),
+    };
+    if !resolved {
         return gen_core::MemoryArchitectureFacts::default();
     }
     let dit = crate::config::TransformerConfig::qwen_image();
@@ -1161,6 +1188,61 @@ mod tests {
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
             .with_resolved_route(crate::edit::EDIT_2511_BASE_ROUTE)
+    }
+
+    /// AC (epic SC-22657, E1): a snapshot's VAE is priced at the f32 width `load_vae_seq`
+    /// materializes it at (`lib.rs`: `component_vb("vae", ENC_DTYPE)`), not at its bf16 on-disk
+    /// encoding — the same basis the imported-file arm beside it already used.
+    ///
+    /// *Mutation that reds this:* leaving `components.vae` as the raw
+    /// `PerComponentBytes::from_spec_subdirs` directory sum, the shape under review.
+    #[test]
+    fn a_snapshot_vae_is_priced_at_the_f32_width_its_loader_materializes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image")
+            .unwrap()
+            .to_path_buf();
+        let on_disk = gen_core::weightsmeta::safetensors_path_bytes(root.join("vae"));
+        let contract = provider_contract("qwen_image_edit", &spec).unwrap();
+        // `write_control` writes one BF16 [2, 64] tensor: 128 elements, f32-materialized.
+        assert_eq!(contract.asset_facts.decoder_bytes, 2 * 64 * 4);
+        assert_ne!(
+            contract.asset_facts.decoder_bytes, on_disk,
+            "the resident f32 decoder is not the bf16 file the snapshot ships"
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes
+        );
+    }
+
+    /// AC (epic SC-22657, E2): the ComfyUI single-file route is a RESOLVED pipeline, so its loaded
+    /// contract declares the same hardcoded geometry a snapshot load does. It previously published
+    /// `MemoryArchitectureFacts::default()` — no axis at all under a lifecycle-phase formula —
+    /// because `architecture_facts::snapshot_root` answers `None` for every `WeightsSource::File`.
+    ///
+    /// *Mutation that reds this:* restoring the `af::snapshot_root(spec).is_none()` gate, the shape
+    /// under review.
+    #[test]
+    fn an_imported_single_file_route_declares_the_geometry_its_loader_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = file_spec(&tmp);
+        let contract = provider_contract("qwen_image", &spec).unwrap();
+        assert!(
+            contract.architecture_facts.has_declared_architecture_axis(),
+            "a loaded imported route must declare the axes its trunk is built from"
+        );
+        assert_eq!(contract.architecture_facts.attention_heads, Some(24));
+        assert_eq!(contract.architecture_facts.transformer_blocks, Some(60));
+        assert_eq!(contract.architecture_facts.vae_temporal_scale, None);
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // An unresolved single file (no such path) still declares nothing.
+        let unresolved = LoadSpec::new(WeightsSource::File(tmp.path().join("absent.safetensors")));
+        assert!(architecture_facts(&unresolved).is_empty());
     }
 
     #[test]
