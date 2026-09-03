@@ -970,6 +970,22 @@ impl MemoryArchitectureFacts {
             && self.activation_dtype_width.is_none()
     }
 
+    /// Whether at least one axis actually *read from the snapshot* has been declared.
+    ///
+    /// [`Self::activation_dtype_width`] is deliberately excluded: an adopting provider emits it
+    /// from a compile-time dtype constant, so it is `Some` whenever the provider was compiled -
+    /// never evidence that the snapshot's component configs were found and parsed. A gate that
+    /// accepts it as "at least one architecture fact" is satisfied by a contract that read nothing.
+    pub const fn has_snapshot_read_axis(&self) -> bool {
+        self.attention_heads.is_some()
+            || self.head_dim.is_some()
+            || self.transformer_blocks.is_some()
+            || self.patch_size.is_some()
+            || self.latent_channels.is_some()
+            || self.vae_spatial_scale.is_some()
+            || self.vae_temporal_scale.is_some()
+    }
+
     /// Axes declared as `Some(0)`. Zero is never legitimate for any axis: an absent axis is `None`.
     pub fn zero_valued_axes(&self) -> Vec<&'static str> {
         [

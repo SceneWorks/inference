@@ -50,46 +50,42 @@ pub fn memory_strategy_conformance(contract: &MemoryProviderContract) {
     }
 }
 
-/// Check that a contract's provider-owned *facts* are honest (epic SC-22657, E1 + E2).
+/// Check the **E1 asset-facts half** of [`check_memory_contract_facts`] on its own.
 ///
-/// This is deliberately a second, opt-in check rather than an addition to
-/// [`check_memory_strategy_contract`]: providers adopt the facts axes one at a time, and a provider
-/// which has not adopted them yet must keep passing the shared conformance walk unchanged.
+/// This is separately public because a weights-free contract cannot satisfy E2 — it has no
+/// `config.json` to read, so `MemoryArchitectureFacts::default()` is its honest state — while its
+/// byte decomposition is still a claim that must hold. Such a test calls this entry point and
+/// asserts `architecture_facts.is_empty()` alongside it.
 ///
-/// Three defects are rejected:
+/// Two defects are rejected:
 ///
-/// 1. **E1 — a base total that is not its own decomposition.** `asset_facts.base_bytes` must equal
+/// 1. **A base total that is not its own decomposition.** `asset_facts.base_bytes` must equal
 ///    `conditioning_bytes + transformer_bytes + decoder_bytes` exactly. Auxiliary residency is
-///    declared once in `overlay_bytes`, so it may be folded into `base_bytes` only alongside the
-///    component field that actually carries it.
-/// 2. **E1 — one total repeated in two component fields.** A provider that cannot price a component
+///    declared once in `overlay_bytes` and is never folded into `base_bytes` as well. A component
+///    sum that overflows `u64` is reported rather than saturated: saturation would let a broken
+///    `base_bytes` of `u64::MAX` match.
+/// 2. **One total repeated in two component fields.** A provider that cannot price a component
 ///    separately must not paper over it by copying another component's byte count; a repeated
 ///    non-zero total is a dishonest decomposition even when the sum happens to add up.
-/// 3. **E2 — no architecture facts at all on a lifecycle-phase provider.** A provider publishing
-///    [`gen_core::MemoryFormulaKind::PhaseEnvelope`] or
-///    [`gen_core::MemoryFormulaKind::ComponentPhaseEnvelope`] claims per-phase activation behavior,
-///    which no caller can estimate from bytes alone. Such a contract must declare at least one
-///    architecture axis.
-///
-/// A `Some(0)` on any architecture axis is rejected as well: an absent axis is `None`, and a zero
-/// silently zeroes any activation estimate that multiplies by it.
-///
-/// Run this against a contract built for a **materialized** snapshot. A weights-free contract
-/// legitimately publishes `MemoryArchitectureFacts::default()` — it has no config.json to read —
-/// and defect 3 would flag it; assert `architecture_facts.is_empty()` on that path instead.
-pub fn check_memory_contract_facts(contract: &MemoryProviderContract) -> Result<(), Vec<String>> {
+pub fn check_memory_contract_asset_facts(
+    contract: &MemoryProviderContract,
+) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let facts = &contract.asset_facts;
 
-    let decomposed = facts
+    match facts
         .conditioning_bytes
-        .saturating_add(facts.transformer_bytes)
-        .saturating_add(facts.decoder_bytes);
-    if facts.base_bytes != decomposed {
-        errors.push(format!(
-            "asset_facts.base_bytes ({}) must equal conditioning ({}) + transformer ({}) + decoder ({}) = {decomposed}",
-            facts.base_bytes, facts.conditioning_bytes, facts.transformer_bytes, facts.decoder_bytes
-        ));
+        .checked_add(facts.transformer_bytes)
+        .and_then(|bytes| bytes.checked_add(facts.decoder_bytes))
+    {
+        Some(decomposed) if decomposed != facts.base_bytes => {
+            errors.push(format!(
+                "asset_facts.base_bytes ({}) must equal conditioning ({}) + transformer ({}) + decoder ({}) = {decomposed}",
+                facts.base_bytes, facts.conditioning_bytes, facts.transformer_bytes, facts.decoder_bytes
+            ));
+        }
+        None => errors.push("base component byte sum overflow".to_owned()),
+        _ => {}
     }
 
     for (left_name, left, right_name, right) in [
@@ -120,15 +116,63 @@ pub fn check_memory_contract_facts(contract: &MemoryProviderContract) -> Result<
         }
     }
 
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for [`check_memory_contract_asset_facts`].
+pub fn assert_memory_contract_asset_facts_conform(contract: &MemoryProviderContract) {
+    if let Err(errors) = check_memory_contract_asset_facts(contract) {
+        panic!(
+            "memory-contract asset-facts conformance FAILED for '{}':\n- {}",
+            contract.provider_id,
+            errors.join("\n- ")
+        );
+    }
+}
+
+/// Check that a contract's provider-owned *facts* are honest (epic SC-22657, E1 + E2).
+///
+/// This is deliberately a second, opt-in check rather than an addition to
+/// [`check_memory_strategy_contract`]: providers adopt the facts axes one at a time, and a provider
+/// which has not adopted them yet must keep passing the shared conformance walk unchanged.
+///
+/// The E1 byte-decomposition defects are delegated to [`check_memory_contract_asset_facts`]. On top
+/// of them this rejects:
+///
+/// **E2 — no *snapshot-read* architecture facts on a lifecycle-phase provider.** A provider
+/// publishing [`gen_core::MemoryFormulaKind::PhaseEnvelope`] or
+/// [`gen_core::MemoryFormulaKind::ComponentPhaseEnvelope`] claims per-phase activation behavior,
+/// which no caller can estimate from bytes alone. Such a contract must declare at least one axis
+/// that was actually read from the snapshot. `activation_dtype_width` does not count: providers
+/// emit it from a compile-time dtype constant, so it is present whether or not a single component
+/// `config.json` was found — see [`gen_core::MemoryArchitectureFacts::has_snapshot_read_axis`].
+///
+/// A `Some(0)` on any architecture axis is rejected as well: an absent axis is `None`, and a zero
+/// silently zeroes any activation estimate that multiplies by it.
+///
+/// Run this against a contract built for a **materialized** snapshot. A weights-free contract
+/// legitimately publishes `MemoryArchitectureFacts::default()` — it has no config.json to read —
+/// and the E2 gate would flag it; call [`check_memory_contract_asset_facts`] and assert
+/// `architecture_facts.is_empty()` on that path instead.
+pub fn check_memory_contract_facts(contract: &MemoryProviderContract) -> Result<(), Vec<String>> {
+    let mut errors = check_memory_contract_asset_facts(contract)
+        .err()
+        .unwrap_or_default();
+
     let phase_formula = matches!(
         contract.formula,
         gen_core::MemoryFormulaKind::PhaseEnvelope { .. }
             | gen_core::MemoryFormulaKind::ComponentPhaseEnvelope { .. }
     );
-    if phase_formula && contract.architecture_facts.is_empty() {
+    if phase_formula && !contract.architecture_facts.has_snapshot_read_axis() {
         errors.push(
             "a provider publishing a lifecycle-phase formula must declare at least one \
-             architecture fact; every axis is None"
+             snapshot-read architecture fact; activation_dtype_width alone is a compile-time \
+             constant, not evidence that any component config was read"
                 .to_owned(),
         );
     }
@@ -872,12 +916,83 @@ mod tests {
             contract.architecture_facts = gen_core::MemoryArchitectureFacts::default();
             let errors = check_memory_contract_facts(&contract).unwrap_err();
             assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("must declare at least one architecture fact")),
+                errors.iter().any(|error| error
+                    .contains("must declare at least one snapshot-read architecture fact")),
                 "{errors:?}"
             );
         }
+    }
+
+    /// The E2 gate must not be satisfiable by a compile-time constant. `activation_dtype_width` is
+    /// emitted from the provider's pinned dtype whether or not a single component `config.json` was
+    /// found, so a contract carrying only that axis has read nothing and must still be rejected.
+    #[test]
+    fn activation_dtype_width_alone_does_not_satisfy_the_architecture_gate() {
+        let mut contract = facts_contract();
+        contract.formula = gen_core::MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![MemoryPhase::Denoise],
+            variables: vec![gen_core::MemoryFormulaVariable::AssetBytes],
+        };
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts {
+            activation_dtype_width: Some(2),
+            ..Default::default()
+        };
+        assert!(!contract.architecture_facts.is_empty());
+        assert!(!contract.architecture_facts.has_snapshot_read_axis());
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must declare at least one snapshot-read")),
+            "{errors:?}"
+        );
+        // One genuinely snapshot-read axis alongside it is accepted.
+        contract.architecture_facts.transformer_blocks = Some(30);
+        check_memory_contract_facts(&contract).unwrap();
+    }
+
+    /// A component sum that overflows `u64` must be reported, not saturated into agreement with a
+    /// `base_bytes` of `u64::MAX`.
+    #[test]
+    fn an_overflowing_base_component_sum_is_rejected_rather_than_saturated() {
+        let mut contract = facts_contract();
+        contract.asset_facts.conditioning_bytes = u64::MAX;
+        contract.asset_facts.transformer_bytes = 1;
+        contract.asset_facts.decoder_bytes = 2;
+        contract.asset_facts.base_bytes = u64::MAX;
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "base component byte sum overflow"),
+            "{errors:?}"
+        );
+    }
+
+    /// The E1 half stands alone for the weights-free path, and the E2 gate is *not* applied there.
+    #[test]
+    fn the_asset_facts_entry_point_checks_e1_without_the_architecture_gate() {
+        let mut contract = facts_contract();
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts::default();
+        check_memory_contract_asset_facts(&contract).unwrap();
+        assert_memory_contract_asset_facts_conform(&contract);
+        // ...and it still rejects a dishonest decomposition.
+        contract.asset_facts.base_bytes += 5;
+        let errors = check_memory_contract_asset_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must equal conditioning")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "memory-contract asset-facts conformance FAILED for 'facts'")]
+    fn the_panicking_asset_facts_entry_point_names_the_provider() {
+        let mut contract = facts_contract();
+        contract.asset_facts.base_bytes += 1;
+        assert_memory_contract_asset_facts_conform(&contract);
     }
 
     #[test]
