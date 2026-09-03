@@ -11,9 +11,10 @@
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
-    LoadSpec, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
-    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
+    MemoryBehaviorRoute, MemoryBudget, MemoryCacheState, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryLifecycleCapabilities, MemoryMode,
     MemoryNumericTier, MemoryOptimizationAuthority, MemoryPhase, MemoryPrerequisiteScope,
     MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Quant,
@@ -77,10 +78,10 @@ pub fn contract_for_variant(
     spec: &LoadSpec,
 ) -> mlx_gen::Result<Option<MemoryProviderContract>> {
     if variant == Flux2Variant::Dev {
-        return Ok(Some(build_dev_t2i_contract_for_spec(spec)));
+        return Ok(Some(build_dev_t2i_contract_for_spec(spec)?));
     }
     if variant == Flux2Variant::DevEdit {
-        return Ok(Some(build_contract_for_spec(spec)));
+        return Ok(Some(build_contract_for_spec(spec)?));
     }
     if matches!(
         variant,
@@ -91,7 +92,53 @@ pub fn contract_for_variant(
     Ok(None)
 }
 
-fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
+/// The per-component asset bytes a Dev / Dev-Edit load materializes (SC-22667, E1).
+///
+/// Both Dev contracts published `MemoryAssetFacts::default()` — five zeros — on every path,
+/// including the loaded one: `contract_for_variant` builds the contract the generator carries from
+/// load onward, and nothing ever filled the facts in. All-zero facts pass the shared conformance
+/// walk vacuously (`base == cond + trans + dec` holds at `0 == 0`), so the omission never failed; it
+/// handed the fit gate a contract whose `total_resident_bytes()` was 0 for a load that holds the
+/// whole DiT, the Mistral-3 tower with its Pixtral surface, and the VAE.
+///
+/// The split is `crate::model::dev_component_footprint_for` — the registry footprint callback this
+/// crate already exposes for exactly these providers, which resolves the selected language tower
+/// through the same `EncoderContract` gate the load applies (including a pre-packed base selected
+/// without `LoadSpec::quantize`) and prices the DiT and VAE from the snapshot subdirs the load
+/// opens. It is used verbatim rather than re-derived, so the contract and the registry can never
+/// disagree about the base split.
+///
+/// On a spec that names no materialized snapshot — the registry's contract-surface sentinel, or a
+/// placeholder path — there is nothing to read and the declaration stays empty, exactly as the
+/// weights-free Klein contract does. An error from the footprint is propagated rather than
+/// swallowed into zeros: it means the snapshot fails the same gate the load applies, so there is no
+/// honest number to publish, which is also how `klein_contract_for` treats its footprint.
+///
+/// The Fun-ControlNet route is deliberately not routed through here: its contract documents why its
+/// facts stay empty (the registry fallback prices the base split and its consumer adds the control
+/// checkpoint), and a fused control branch has no honest home in this decomposition without a typed
+/// component the route's `Affine` formula cannot carry.
+fn dev_asset_facts(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<MemoryAssetFacts> {
+    if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return Ok(MemoryAssetFacts::default());
+    }
+    let footprint = crate::model::dev_component_footprint_for(provider_id, spec)?;
+    Ok(MemoryAssetFacts {
+        base_bytes: footprint
+            .text_encoder
+            .saturating_add(footprint.dit)
+            .saturating_add(footprint.vae),
+        conditioning_bytes: footprint.text_encoder,
+        transformer_bytes: footprint.dit,
+        decoder_bytes: footprint.vae,
+        overlay_bytes: 0,
+    })
+}
+
+fn build_contract_for_spec(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_EDIT_ID,
         MemoryBackendRealization::MlxMetal {
@@ -115,11 +162,14 @@ fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
         CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_EDIT_ID, spec)?;
     configure_dev_staged_residency(&mut contract, spec, true);
-    contract
+    Ok(contract)
 }
 
-fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
+fn build_dev_t2i_contract_for_spec(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_ID,
         MemoryBackendRealization::MlxMetal {
@@ -142,18 +192,21 @@ fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
         DEV_T2I_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_ID, spec)?;
     configure_dev_staged_residency(&mut contract, spec, true);
-    contract
+    Ok(contract)
 }
 
 #[cfg(test)]
 fn build_contract() -> MemoryProviderContract {
     build_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
+        .expect("a placeholder path names no materialized snapshot, so no footprint is read")
 }
 
 #[cfg(test)]
 fn build_dev_t2i_contract() -> MemoryProviderContract {
     build_dev_t2i_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
+        .expect("a placeholder path names no materialized snapshot, so no footprint is read")
 }
 
 /// Publish only the request-selectable lifecycle the Dev providers actually execute.  The
@@ -352,9 +405,9 @@ pub fn dev_control_safety_check(
 }
 
 pub fn registered_dev_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract_for_spec(_spec))
+    build_contract_for_spec(spec)
 }
 
 pub fn registered_dev_safety_check(
@@ -371,9 +424,9 @@ pub fn registered_dev_safety_check(
 }
 
 pub fn registered_dev_t2i_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_dev_t2i_contract_for_spec(_spec))
+    build_dev_t2i_contract_for_spec(spec)
 }
 
 pub fn registered_dev_t2i_safety_check(
@@ -1442,8 +1495,8 @@ mod tests {
     fn sequential_dev_contracts_publish_only_staged_residency_and_open_a_cleanup_scope() {
         let spec = LoadSpec::new(WeightsSource::Dir(Default::default()))
             .with_offload_policy(OffloadPolicy::Sequential);
-        let t2i = build_dev_t2i_contract_for_spec(&spec);
-        let edit = build_contract_for_spec(&spec);
+        let t2i = build_dev_t2i_contract_for_spec(&spec).unwrap();
+        let edit = build_contract_for_spec(&spec).unwrap();
         let control_spec = spec.clone().with_control(WeightsSource::File(
             "/nonexistent/flux2-dev-fun-controlnet-union.safetensors".into(),
         ));
@@ -1489,6 +1542,7 @@ mod tests {
             .with_load_shape(LoadShape::DeferredMaterialization);
         assert_eq!(
             build_dev_t2i_contract_for_spec(&deferred_spec)
+                .unwrap()
                 .capability(MemoryStrategy::StagedResidency)
                 .expect("complete ladder")
                 .support,
@@ -1777,6 +1831,70 @@ mod tests {
             panic!("under-budget request must reject");
         };
         assert!(reason.contains("Lower the output resolution"), "{reason}");
+    }
+
+    /// Feature-end review (SC-22667, E1): the Dev and Dev-Edit contracts published
+    /// `MemoryAssetFacts::default()` on every path, the loaded one included, while the load holds the
+    /// whole DiT, the Mistral-3 tower and the VAE. They now publish the loader's own registry
+    /// footprint whenever the spec names a materialized snapshot, and stay empty only where there is
+    /// nothing to read.
+    ///
+    /// Mutation that fails this: dropping the `materialized_root` gate in `dev_asset_facts` makes
+    /// the placeholder-path leg refuse (the footprint cannot resolve a tower under `/nonexistent`);
+    /// swallowing the footprint error into zeros makes the materialized leg publish an empty
+    /// declaration for a snapshot the loader's own gate refuses.
+    #[test]
+    fn dev_contracts_publish_asset_facts_only_from_a_materialized_snapshot() {
+        // No materialized snapshot — the registry's contract surface and every placeholder-path
+        // caller. Nothing to read, so the declaration stays empty, exactly as before.
+        let placeholder = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for contract in [
+            registered_dev_contract(&placeholder).unwrap(),
+            registered_dev_t2i_contract(&placeholder).unwrap(),
+        ] {
+            assert_eq!(
+                contract.asset_facts,
+                MemoryAssetFacts::default(),
+                "{}",
+                contract.provider_id
+            );
+        }
+
+        // A materialized directory goes through the loader's own footprint — the same
+        // `EncoderContract` gate `load` applies — and the contract publishes exactly what it says,
+        // or refuses exactly when it does.
+        let materialized = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(materialized.path().to_path_buf()));
+        type Build = fn(&LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract>;
+        for (provider_id, build) in [
+            (FLUX2_DEV_ID, registered_dev_t2i_contract as Build),
+            (FLUX2_DEV_EDIT_ID, registered_dev_contract as Build),
+        ] {
+            match crate::model::dev_component_footprint_for(provider_id, &spec) {
+                Ok(footprint) => {
+                    let contract = build(&spec).unwrap();
+                    assert_eq!(
+                        contract.asset_facts.conditioning_bytes,
+                        footprint.text_encoder
+                    );
+                    assert_eq!(contract.asset_facts.transformer_bytes, footprint.dit);
+                    assert_eq!(contract.asset_facts.decoder_bytes, footprint.vae);
+                    assert_eq!(
+                        contract.asset_facts.base_bytes,
+                        footprint.text_encoder + footprint.dit + footprint.vae
+                    );
+                    assert!(contract.conformance_errors().is_empty());
+                }
+                Err(_) => assert!(
+                    build(&spec).is_err(),
+                    "{provider_id}: a snapshot the loader's gate refuses has no honest bytes to \
+                     publish"
+                ),
+            }
+        }
+        // An empty directory is not a loadable snapshot: the language-tower gate refuses it, so
+        // the leg above is the refusing one.
+        assert!(crate::model::dev_component_footprint(&spec).is_err());
     }
 
     /// Feature-end review (SC-22667, E1): `klein_overlay` lists `adapters` as a live Klein axis and
