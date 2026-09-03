@@ -1062,20 +1062,17 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
         vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
-        // SC-22667. This line used to hardcode `HALF_ACTIVATION_WIDTH` while its own comment named
-        // the exception, so it was wrong on two counts.
-        //
-        // 1. `model.rs` selects `Dtype::Float32` for the DiT under `Precision::Fp32` and
-        //    `Dtype::Bfloat16` otherwise, so an Fp32 load published half the width it computes at.
-        // 2. The audio VAE is built at `Dtype::Float32` UNCONDITIONALLY on both the encode and the
-        //    decode side (`model.rs`), and `MemoryPhase::Decode` is a declared phase of this
-        //    contract. gen-core carries one scalar for the whole contract and cannot express a
-        //    per-phase split, so the honest scalar is the widest activation dtype any declared
-        //    phase runs: under-declaring it halves the estimate for a phase that really does run
-        //    f32, and an under-declared floor admits a render that then OOMs — the failure the
-        //    ladder exists to prevent, and the same reasoning `ComponentBytes::resolve` records
-        //    for the staged text encoder.
-        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+        // SC-22667: this hardcoded `HALF_ACTIVATION_WIDTH` while its own comment named the
+        // exception. gen-core documents the axis as the DENOISE-phase width — explicitly not a
+        // per-component byte fact — and `model.rs` selects `Dtype::Float32` for the DiT under
+        // `Precision::Fp32` and `Dtype::Bfloat16` otherwise, so an Fp32 load published half the
+        // width its own denoise loop computes at. The f32 audio VAE is deliberately NOT folded in
+        // here: it belongs to the decode phase, which this axis does not describe.
+        activation_dtype_width: Some(if spec.precision == mlx_gen::Precision::Fp32 {
+            mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+        } else {
+            mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+        }),
     }
 }
 
@@ -1665,13 +1662,43 @@ mod tests {
                 vae_spatial_scale: Some(16),
                 // A video autoencoder: four frames per latent unit.
                 vae_temporal_scale: Some(4),
-                // The audio VAE is built f32 unconditionally and `Precision::Fp32`
-                // widens the DiT too, so the one scalar is the widest declared phase (SC-22667).
-                activation_dtype_width: Some(4),
+                // The bf16 denoise loop. SC-22667 also pins the `Precision::Fp32` leg below.
+                activation_dtype_width: Some(2),
             }
         );
         assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// Feature-end review (SC-22667, E2): `activation_dtype_width` is the DENOISE-phase width, and
+    /// `model.rs` selects `Dtype::Float32` for the DiT under `Precision::Fp32` and
+    /// `Dtype::Bfloat16` otherwise. The literal used to be an unconditional 2 while its own comment
+    /// named that exception, so an Fp32 load published half the width its denoise loop computes at.
+    ///
+    /// Mutation that fails this: hardcoding `HALF_ACTIVATION_WIDTH` again — the Fp32 leg reads back
+    /// 2. Hardcoding `FLOAT32_ACTIVATION_WIDTH` instead reds the bf16 leg, which is what stops the
+    /// fix from being "declare the widest phase": the f32 audio VAE belongs to the decode phase,
+    /// which this axis does not describe.
+    #[test]
+    fn the_denoise_activation_width_follows_the_loaded_precision() {
+        let bf16 = weightless_spec();
+        assert_eq!(
+            architecture_facts(&bf16).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH)
+        );
+        let mut fp32 = bf16.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        assert_eq!(
+            architecture_facts(&fp32).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH)
+        );
+        // Nothing else on the axis set moves with the precision.
+        let widened = architecture_facts(&fp32);
+        let narrow = architecture_facts(&bf16);
+        assert_eq!(widened.attention_heads, narrow.attention_heads);
+        assert_eq!(widened.head_dim, narrow.head_dim);
+        assert_eq!(widened.transformer_blocks, narrow.transformer_blocks);
+        assert_eq!(widened.latent_channels, narrow.latent_channels);
     }
 
     /// The published `transformer/config.json` layout, emitted from a config value so the fixture
