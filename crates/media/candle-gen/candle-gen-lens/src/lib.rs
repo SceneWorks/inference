@@ -942,6 +942,53 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
     build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
 }
 
+/// Number of `block_out_channels` stages in the shared FLUX.2 `AutoencoderKL` Lens decodes
+/// through (`candle_gen_flux2::vae`'s `BLOCK_OUT` = `[128, 256, 512, 512]`). Each stage after the
+/// first halves both spatial axes, so four stages give the x8 latent scale.
+const VAE_STAGES: usize = 4;
+
+/// Architecture axes for the Lens / Lens-Turbo routes (epic SC-22657, E2).
+///
+/// Lens' geometry is not read from `transformer/config.json`: the loader builds the dual-stream
+/// MMDiT from the crate's own [`transformer::LensDitConfig::lens`] preset, which both routes share.
+/// Reading a config the loader ignores would describe a model this provider never constructs, so
+/// the axes come off the same struct handed to the DiT builder.
+///
+/// The decoder axes describe the shared FLUX.2 `AutoencoderKL` (`vae.rs` is a thin shim over
+/// `candle_gen_flux2::vae::Flux2Vae`): its 32 latent channels are exactly the DiT's `out_channels`,
+/// the value the DiT itself declares it emits, and its four `BLOCK_OUT` stages give the x8 scale.
+///
+/// `vae_temporal_scale` stays `None`: FLUX.2 ships an image VAE with no temporal axis at all. A
+/// structurally absent axis is declared absent, never zero (E2).
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
+/// there, so no axis is knowable.
+fn lens_architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    // The exact preset the DiT builder receives; Lens and Lens-Turbo share one geometry.
+    let dit = crate::transformer::LensDitConfig::lens();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        patch_size: af::declared(dit.patch_size),
+        // The DiT's `out_channels` IS the FLUX.2 latent width (32) — what the decoder consumes.
+        latent_channels: af::declared(dit.out_channels),
+        vae_spatial_scale: VAE_STAGES
+            .checked_sub(1)
+            .filter(|shift| *shift <= 5)
+            .map(|shift| 1_u32 << shift),
+        // FLUX.2 ships an image `AutoencoderKL`: there is no temporal axis to declare.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(DIT_DTYPE),
+    }
+}
+
 fn build_lens_memory_strategy_contract(
     provider_id: &'static str,
     spec: &LoadSpec,
@@ -1011,7 +1058,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         .collect();
 
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: lens_architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -2096,6 +2143,46 @@ mod weights_free_behavior_tests {
         contract
             .capability(gen_core::MemoryStrategy::BoundedTransformerResidency)
             .expect("Lens contracts carry the complete ladder")
+    }
+
+    /// AC (epic SC-22657, E2): both Lens routes publish the axes of the `LensDitConfig` preset and
+    /// the shared FLUX.2 VAE their loader actually builds, and the weights-free surface publishes
+    /// none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(temp.path().to_path_buf()));
+        for provider_id in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            let contract = build_lens_memory_strategy_contract(provider_id, &spec);
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `LensDitConfig::lens()`: `num_heads`, `head_dim`, `num_layers`, `patch_size`.
+                    attention_heads: Some(24),
+                    head_dim: Some(64),
+                    transformer_blocks: Some(48),
+                    patch_size: Some(2),
+                    // The DiT's `out_channels` is the FLUX.2 latent width the decoder consumes.
+                    latent_channels: Some(32),
+                    // The shared FLUX.2 VAE has 4 `BLOCK_OUT` stages => 3 halvings => x8.
+                    vae_spatial_scale: Some(8),
+                    // FLUX.2 ships an image `AutoencoderKL`: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    // `DIT_DTYPE` is `DType::BF16`.
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+            let surface = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            assert!(build_lens_memory_strategy_contract(provider_id, &surface)
+                .architecture_facts
+                .is_empty());
+        }
     }
 
     #[test]

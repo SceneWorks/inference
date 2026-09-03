@@ -249,6 +249,49 @@ pub(crate) fn weights_free_memory_strategy_contract(
     ))
 }
 
+/// Activation dtype the loaded Qwen-Image denoise trunk computes in. `lib.rs` pins
+/// `DIT_DTYPE = DType::BF16` for the 20B transformer — the bottleneck this contract's phase
+/// envelope prices — so this is the provider's real activation width, not a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Architecture axes for the Qwen-Image base and edit routes (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `QwenTransformer` is constructed from the
+/// hardcoded [`crate::config::TransformerConfig::qwen_image`] (the 2512 refresh is a verbatim
+/// drop-in of it), and the latent/patch axes are the `crate::config` constants the packing path
+/// executes against. Reading those same declarations keeps the published geometry identical to the
+/// model actually built.
+///
+/// `vae_temporal_scale` stays `None`. Qwen-Image decodes through `AutoencoderKLQwenImage`, a
+/// causal-Conv3d **video** autoencoder — but this crate runs it collapsed to a single frame
+/// (`src/vae.rs`: each `[O, I, kD, kH, kW]` weight reduces to its last depth tap and a plain
+/// `causal_conv2d`, and the upsamplers' `time_conv` is skipped entirely). On that image path no
+/// frames-per-latent axis exists to declare, so the axis is absent rather than zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = crate::config::TransformerConfig::qwen_image();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        // `config::PATCH` — the DiT's 2x2 packing (`in_channels = LATENT_CHANNELS * PATCH²`).
+        patch_size: af::declared(crate::config::PATCH),
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        // Both image dims must be multiples of 16 = the x8 VAE downscale then the 2x2 DiT patch
+        // (`config::SIZE_MULTIPLE`), so the decoder's spatial scale is 8.
+        vae_spatial_scale: af::declared(8),
+        // Structurally absent on the image path — see the doc comment above.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -293,7 +336,7 @@ fn build_provider_contract(
         .collect();
 
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -858,6 +901,61 @@ mod tests {
                 provider_contract(provider_id, &spec).is_err(),
                 "production admission must still validate {provider_id} assets"
             );
+        }
+    }
+
+    /// AC (epic SC-22657, E2): both Qwen-Image routes publish the geometry the loader actually
+    /// builds — the `TransformerConfig::qwen_image` trunk plus the `crate::config` latent/patch
+    /// constants — the contract passes the shared facts conformance check, and the weights-free
+    /// surface (whose sentinel root is not on disk) publishes nothing at all.
+    ///
+    /// The contract is driven through the shared builder rather than [`provider_contract`]: the
+    /// production entry point admits exact encoder and component byte inventories, which a
+    /// synthetic snapshot cannot supply, and both entry points reach the identical facts.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        snapshot.load_shape = LoadShape::DeferredMaterialization;
+        for provider_id in [crate::MODEL_ID, "qwen_image_edit"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &snapshot).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `TransformerConfig::qwen_image()`: num_heads / head_dim / num_layers.
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(60),
+                    // `config::PATCH`.
+                    patch_size: Some(2),
+                    // `config::LATENT_CHANNELS`.
+                    latent_channels: Some(16),
+                    // `config::SIZE_MULTIPLE 16` = x8 VAE downscale then the 2x2 DiT patch.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: `AutoencoderKLQwenImage` is a 3-D autoencoder run
+                    // collapsed to a single frame here, so the image path has no temporal axis.
+                    vae_temporal_scale: None,
+                    // `lib.rs: DIT_DTYPE = DType::BF16`.
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract =
+                weights_free_memory_strategy_contract(provider_id, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{provider_id} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
         }
     }
 

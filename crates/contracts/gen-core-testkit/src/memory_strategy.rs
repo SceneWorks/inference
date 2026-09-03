@@ -290,6 +290,67 @@ pub fn memory_contract_surface_registry_conformance(registry: &ProviderRegistry)
     }
 }
 
+/// Registry-wide **E1** facts walk over every registered weights-free contract surface (SC-22657).
+///
+/// The weights-free surface is built with no snapshot on disk, so
+/// [`gen_core::MemoryArchitectureFacts::default`] is its honest E2 state and
+/// [`check_memory_contract_facts`] would wrongly flag a lifecycle-phase provider on this path. What
+/// it can still be held to is its byte decomposition, so this runs
+/// [`check_memory_contract_asset_facts`] on every surface — and additionally rejects a surface that
+/// *claims* an architecture axis it cannot have read, which would mean the axis was hardcoded from
+/// the provider id rather than from the snapshot. `activation_dtype_width` is exempt: it is a
+/// compile-time dtype constant that a provider legitimately publishes with no snapshot present.
+pub fn check_memory_contract_surface_registry_facts(
+    registry: &ProviderRegistry,
+) -> Result<(), Vec<String>> {
+    let surfaces = registry
+        .memory_contract_surfaces()
+        .map_err(|error| vec![error.to_string()])?;
+    let mut errors = Vec::new();
+    for surface in surfaces {
+        let label = format!(
+            "{} [{}]",
+            surface.contract.provider_id,
+            surface.selector.id()
+        );
+        if let Err(contract_errors) = check_memory_contract_asset_facts(&surface.contract) {
+            errors.extend(
+                contract_errors
+                    .into_iter()
+                    .map(|error| format!("{label}: {error}")),
+            );
+        }
+        if surface.contract.architecture_facts.has_snapshot_read_axis() {
+            errors.push(format!(
+                "{label}: the weights-free contract surface declares a snapshot-read architecture \
+                 axis, but it is built with no snapshot to read; an axis here was inferred from \
+                 the provider id rather than from a component config"
+            ));
+        }
+        for axis in surface.contract.architecture_facts.zero_valued_axes() {
+            errors.push(format!(
+                "{label}: architecture_facts.{axis} is Some(0); a structurally absent axis is \
+                 declared None, never zero"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for [`check_memory_contract_surface_registry_facts`].
+pub fn memory_contract_surface_registry_facts_conformance(registry: &ProviderRegistry) {
+    if let Err(errors) = check_memory_contract_surface_registry_facts(registry) {
+        panic!(
+            "memory-contract surface registry facts conformance FAILED:\n- {}",
+            errors.join("\n- ")
+        );
+    }
+}
+
 fn check_memory_registration(
     registration: &MemoryRegistration,
     contract_fixture: Option<&MemoryContractFixtureRegistration>,

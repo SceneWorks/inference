@@ -5068,6 +5068,30 @@ mod tests {
         }
     }
 
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every registered contract surface in the composed media
+    /// catalog publishes an honest byte decomposition and no fabricated architecture axis.
+    ///
+    /// This is the registry-wide half of the story's acceptance test. The surfaces are built
+    /// **weights-free** — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so E2's snapshot-read gate
+    /// cannot apply here and `check_memory_contract_asset_facts` is the half that must hold. What
+    /// the walk additionally proves is the converse: a provider that published an architecture axis
+    /// on a contract built with nothing to read would have hardcoded it from its own provider id,
+    /// and the facts walk rejects that.
+    ///
+    /// `runtime-cuda` runs the same walk over the CUDA bundle's registry; this one keeps the
+    /// composition root itself covered on a lane that needs no accelerator.
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry);
+        // Non-vacuous: the walk must have had surfaces to reject.
+        assert!(
+            !registry.memory_contract_surfaces().unwrap().is_empty(),
+            "the composed catalog must publish contract surfaces for the facts walk to check"
+        );
+    }
+
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         use std::collections::{BTreeMap, BTreeSet};

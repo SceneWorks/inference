@@ -127,6 +127,31 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every generator registered in the CUDA bundle publishes
+    /// a contract surface whose byte decomposition is honest and whose architecture axes are not
+    /// fabricated.
+    ///
+    /// This is the epic's registry-wide acceptance skeleton on the shipped CUDA registry. Surfaces
+    /// are built weights-free — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so
+    /// `MemoryArchitectureFacts::default()` is their honest E2 state and the asset-facts half is
+    /// what must hold. The walk also rejects the converse defect: an architecture axis declared on
+    /// a contract that had no component config to read was inferred from the provider id.
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry()
+            .expect("the CUDA bundle composes a contract-surface registry");
+        gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry);
+        assert!(
+            !registry
+                .memory_contract_surfaces()
+                .expect("registry surfaces resolve")
+                .is_empty(),
+            "the CUDA bundle must publish contract surfaces for the facts walk to check"
+        );
+    }
+
     #[cfg(feature = "media")]
     #[test]
     fn bundle_exposes_engine_id_vae_geometry() {

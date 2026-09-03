@@ -353,6 +353,74 @@ impl PreparedSvdMemory {
     }
 }
 
+/// Snapshot-gated architecture facts for the SVD-XT route (epic SC-22657, E2).
+///
+/// SVD's denoiser is a **UNet**, not a transformer stack, and this crate's loader does not parse
+/// `unet/config.json`: it builds [`crate::config::UnetConfig`] and [`crate::config::VaeConfig`] from
+/// their `Default` impls (a transcription of the published `stabilityai/...-img2vid-xt` JSON), so
+/// those are the structures read here. Three of the eight axes are structurally absent as a result,
+/// and each is declared absent rather than guessed:
+///
+/// * `attention_heads` — the UNet's head count is **per stage** (`[5, 10, 20, 20]`). There is no
+///   single uniform head count to publish, and naming any one of them would describe one block.
+/// * `transformer_blocks` — a UNet is not a uniform stack of transformer blocks; it is a
+///   down/mid/up ladder of res-blocks with attention interleaved.
+/// * `patch_size` — the UNet consumes the latent directly; there is no patchification stage.
+///
+/// `head_dim` survives because it is uniform even though the head *count* is not: every stage's
+/// `block_out_channels[i] / num_attention_heads[i]` is 64. The quotient is computed across all
+/// stages and published only if they agree, so a config that broke that property would decline the
+/// axis rather than pick a stage.
+///
+/// `vae_temporal_scale` is `Some(1)`, and that is a real value rather than a placeholder: SVD ships
+/// `AutoencoderKLTemporalDecoder`, a 2-D encoder with a temporal decoder, so pixel frames map 1:1
+/// onto latent frames (`SvdVae::VAE_TILING { temporal_scale: 1 }`).
+///
+/// `activation_dtype_width` comes from [`crate::dense_dtype`] — the same function the loader calls
+/// to pick the dtype it materializes — so the declared width tracks the `SVD_FORCE_F16` /
+/// `SVD_FORCE_BF16` escapes instead of restating the f32 default.
+///
+/// A weights-free contract — no materialized snapshot directory — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let unet = crate::config::UnetConfig::default();
+    let vae = crate::config::VaeConfig::default();
+    let mut per_stage = unet
+        .block_out_channels
+        .iter()
+        .zip(&unet.num_attention_heads)
+        .map(|(channels, heads)| af::head_dim(af::declared(*channels), af::declared(*heads)));
+    // Uniform across every stage or nothing: `first` seeds the comparison so an empty ladder is
+    // `None` rather than a vacuous agreement.
+    let head_dim = match per_stage.next() {
+        Some(first) if first.is_some() && per_stage.all(|stage| stage == first) => first,
+        _ => None,
+    };
+    gen_core::MemoryArchitectureFacts {
+        // Structurally absent: the UNet's head count differs per stage (5/10/20/20).
+        attention_heads: None,
+        head_dim,
+        // Structurally absent: a UNet is not a uniform stack of transformer blocks.
+        transformer_blocks: None,
+        // Structurally absent: the UNet consumes the latent directly; there is no patchification.
+        patch_size: None,
+        latent_channels: af::declared(vae.latent_channels),
+        vae_spatial_scale: u32::try_from(crate::vae::SvdVae::VAE_TILING.spatial_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        // 1 is a real value here: the temporal decoder emits one frame per latent frame.
+        vae_temporal_scale: u32::try_from(crate::vae::SvdVae::VAE_TILING.temporal_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        activation_dtype_width: af::dtype_width(crate::dense_dtype()),
+    }
+}
+
 fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -360,7 +428,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -860,6 +928,47 @@ mod tests {
             &witness_spec().with_offload_policy(OffloadPolicy::Sequential)
         )
         .is_err());
+    }
+
+    /// AC (epic SC-22657, E2): the SVD contract publishes the architecture axes of the config the
+    /// loader actually instantiates, declares the three that a UNet structurally lacks, and the
+    /// weights-free surface publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let (_tmp, spec) = fixture();
+        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // Structurally absent: `UnetConfig::num_attention_heads` is per stage
+                // (`[5, 10, 20, 20]`) — there is no single uniform head count to declare.
+                attention_heads: None,
+                // Uniform even though the head count is not: every stage's
+                // `block_out_channels[i] / num_attention_heads[i]` is 64.
+                head_dim: Some(64),
+                // Structurally absent: a UNet is not a uniform stack of transformer blocks.
+                transformer_blocks: None,
+                // Structurally absent: the UNet consumes the latent directly; no patchification.
+                patch_size: None,
+                // `VaeConfig::latent_channels`.
+                latent_channels: Some(4),
+                // `SvdVae::VAE_TILING.spatial_scale` (four `block_out_channels` stages).
+                vae_spatial_scale: Some(8),
+                // A real value, not a placeholder: `AutoencoderKLTemporalDecoder` is a 2-D encoder
+                // with a temporal decoder, so pixel frames map 1:1 onto latent frames.
+                vae_temporal_scale: Some(1),
+                // `crate::dense_dtype()` — f32 by default; the only dtype that renders correctly.
+                activation_dtype_width: Some(4),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The registry surface names a sentinel that is not on disk.
+        for surface in resident_only_surface_specs() {
+            let weights_free = weights_free_resident_contract(&surface.spec).unwrap();
+            assert!(weights_free.architecture_facts.is_empty());
+        }
     }
 
     #[test]

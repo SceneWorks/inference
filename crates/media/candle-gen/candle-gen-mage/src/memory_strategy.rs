@@ -91,6 +91,49 @@ fn transformer_has_device_format(spec: &LoadSpec) -> gen_core::Result<bool> {
     Ok(PackedConfig::from_config(&config).is_some())
 }
 
+/// Activation dtype every Mage-Flow component computes in — the DiT, the CoD decoder (`vae.rs`)
+/// and the text encoder (`text_encoder.rs`) are all materialized bf16, so this is the provider's
+/// real activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes for the six Mage-Flow routes (epic SC-22657, E2).
+///
+/// The DiT axes are read from the exact file the loader parses: `pipeline::load_components` reads
+/// `<transformer dir>/config.json` and hands it to [`config::MageConfig::from_json`], whose keys
+/// are `num_heads`, `depth` and `patch_size`. Reading those same keys here publishes what the
+/// pipeline will construct; nothing is inferred from the model id.
+///
+/// `head_dim` is deliberately NOT `hidden_size / num_heads`. Mage's config carries no head-dim key
+/// at all — the loader uses the crate constant [`config::HEAD_DIM`] — so the constant is the honest
+/// value even for a snapshot whose `hidden_size` would imply a different quotient. Publishing the
+/// quotient would describe a shape this crate never runs.
+///
+/// The decoder axes are the crate constants [`config::LATENT_CHANNELS`] and
+/// [`config::VAE_DOWNSAMPLE`]: Mage's CoD decoder is built from code, not from a `vae/config.json`.
+///
+/// A weights-free contract (the registry's sentinel surface path, or a single-file import)
+/// publishes `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let dit = af::component_config(root, "transformer");
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::axis_of(dit.as_ref(), &["num_heads"]),
+        head_dim: af::declared(config::HEAD_DIM),
+        transformer_blocks: af::axis_of(dit.as_ref(), &["depth"]),
+        patch_size: af::axis_of(dit.as_ref(), &["patch_size"]),
+        latent_channels: af::declared(config::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(config::VAE_DOWNSAMPLE),
+        // Structurally absent: the CoD decoder is a still-image decoder with no temporal axis, so
+        // there is no frames-per-latent scale to declare (absent is `None`, never `Some(0)`).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 pub fn provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
@@ -146,7 +189,7 @@ pub(crate) fn provider_contract_with_components(
         .collect();
 
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -775,6 +818,73 @@ mod tests {
         let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(Quant::Q4);
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
+    }
+
+    /// A snapshot whose `transformer/config.json` carries the published Mage-Flow axes the loader
+    /// reads through [`config::MageConfig::from_json`]. `depth` is a parameter so a drifting
+    /// snapshot can be exercised.
+    fn architecture_spec(tmp: &tempfile::TempDir, depth: u64) -> LoadSpec {
+        let root = tmp.path().join(format!("sc22661-mage-depth-{depth}"));
+        let transformer = root.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "in_channels": 128,
+                "out_channels": 128,
+                "context_in_dim": 2560,
+                "hidden_size": 3072,
+                "num_heads": 24,
+                "depth": depth,
+                "axes_dim": [16, 56, 56],
+                "checkpoint": false,
+                "patch_size": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root))
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(24),
+            head_dim: Some(128),
+            transformer_blocks: Some(12),
+            patch_size: Some(1),
+            latent_channels: Some(128),
+            vae_spatial_scale: Some(16),
+            // Structurally absent: Mage's CoD decoder is a still-image decoder, so there is no
+            // frames-per-latent temporal axis to declare.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for id in PROVIDER_IDS {
+            let contract = provider_contract_for(id, &architecture_spec(&tmp, 12)).unwrap();
+            assert_eq!(contract.architecture_facts, expected, "{id}");
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        assert_eq!(
+            provider_contract_for(config::MODEL_ID, &architecture_spec(&tmp, 16))
+                .unwrap()
+                .architecture_facts
+                .transformer_blocks,
+            Some(16)
+        );
+
+        // The registry's weights-free surface names a sentinel that is not on disk, so nothing
+        // about the pipeline is resolved there and every axis stays undeclared.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(provider_contract_for(config::MODEL_ID, &weights_free)
+            .unwrap()
+            .architecture_facts
+            .is_empty());
     }
 
     #[test]

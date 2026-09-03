@@ -285,6 +285,46 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Snapshot-gated architecture facts for the LTX-2.3 route (epic SC-22657, E2).
+///
+/// The LTX-2.3 loader does not parse a transformer `config.json`: `lib.rs` builds
+/// [`crate::config::AvConfig::ltx_2_3`] directly, so those are the axes read here — reading a
+/// config the loader ignores would publish a fact about a model that is not the one loaded. (The
+/// LTX-2.5 route in [`crate::memory_strategy_2_5`] *does* read its bundle header, and reads it
+/// there.) The latent geometry comes from the crate's own compression constants, the same ones
+/// `pipeline::latent_dims` uses to size every latent this provider allocates.
+///
+/// `patch_size` is deliberately `None`: LTX patchifies inside the causal video autoencoder, not in
+/// the DiT. The DiT's `patchify_proj` is a per-token `Linear(128 -> 4096)` applied to the already
+/// flattened `[B, S, 128]` latent (`pipeline::flatten_latent`, one token per latent voxel), so the
+/// denoiser applies no spatial patch factor at all. The VAE's own `patch_size: 4`
+/// ([`crate::config::VideoVaeDeclaration`]) is a pixel-shuffle stage already folded into
+/// `SPATIAL_SCALE = 32`; publishing it as the DiT's patch would double-count it.
+///
+/// A weights-free contract (the registry's sentinel surface, which is not on disk) publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let video = crate::config::AvConfig::ltx_2_3().video;
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(video.num_heads),
+        // Declared by the preset (`inner_dim == num_heads * head_dim` = 4096), not re-derived.
+        head_dim: af::declared(video.head_dim),
+        transformer_blocks: af::declared(video.num_layers),
+        // Structurally absent: LTX patchifies inside the causal video autoencoder, not in the DiT.
+        patch_size: None,
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(crate::config::SPATIAL_SCALE),
+        vae_temporal_scale: af::declared(crate::config::TEMPORAL_SCALE),
+        // `lib.rs: DIT_DTYPE = DType::BF16`.
+        activation_dtype_width: af::dtype_width(crate::DIT_DTYPE),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
@@ -296,7 +336,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1025,6 +1065,44 @@ mod tests {
             .to_string()
             .contains("conditioning/FPS/strength identity"));
         assert_eq!(zero_fps.memory, None);
+    }
+
+    /// AC (epic SC-22657, E2): the LTX-2.3 contract publishes the architecture axes of the config
+    /// the loader actually instantiates, and the weights-free surface publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        let contract =
+            build_contract(&spec, MemoryAssetFacts::default(), CALIBRATION_FINGERPRINT).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `AvConfig::ltx_2_3().video`: 32 heads x 128 = inner dim 4096, 48 layers.
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // Structurally absent: LTX patchifies inside the causal video autoencoder, not in
+                // the DiT — `patchify_proj` is a per-token Linear(128 -> 4096) over the already
+                // flattened `[B, S, 128]` latent, so the denoiser applies no spatial patch factor.
+                patch_size: None,
+                // `config::LATENT_CHANNELS`.
+                latent_channels: Some(128),
+                // `config::SPATIAL_SCALE` / `config::TEMPORAL_SCALE`.
+                vae_spatial_scale: Some(32),
+                vae_temporal_scale: Some(8),
+                // `lib.rs: DIT_DTYPE = DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The registry fixture's weights path is a sentinel that is not on disk.
+        let weights_free =
+            weights_free_contract(&LoadSpec::new(WeightsSource::Dir("/nonexistent".into())))
+                .unwrap();
+        assert!(weights_free.architecture_facts.is_empty());
     }
 
     #[test]

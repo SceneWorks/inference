@@ -265,6 +265,13 @@ pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
 const DIT_PARTITIONS: [&str; 2] = [BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION];
 
 struct ComponentBytes {
+    /// The materialized snapshot directory the components were resolved from, when there is one.
+    ///
+    /// Carried alongside the bytes for [`architecture_facts`] (epic SC-22657, E2): the contract's
+    /// architecture axes are read out of the very `config.json` files this crate's loaders parse,
+    /// and `resolve` is the only place that knows where they live. `None` for the weights-free
+    /// fixture, which resolves no snapshot at all and therefore knows no axis.
+    root: Option<std::path::PathBuf>,
     text_encoder: u64,
     dit: u64,
     /// The AdaLN sub-stack's residency **on the DiT that was actually resolved** — see
@@ -323,6 +330,11 @@ impl ComponentBytes {
             _ => root.join(crate::tier::TEXT_ENCODER_COMPONENT),
         };
         Ok(Self {
+            // The weights-free gate: only a materialized snapshot directory carries readable
+            // component configs. The registry's contract surface names a sentinel that is not on
+            // disk, and a single-file import is not a component snapshot.
+            root: candle_gen::architecture_facts::snapshot_root(spec)
+                .map(std::path::Path::to_path_buf),
             text_encoder: safetensors_path_bytes(text_encoder),
             dit,
             // Resolved against the partition that was actually charged, whichever of the two won the
@@ -686,9 +698,75 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// The product of a list-valued downsample factor, exactly as
+/// [`crate::config::MiniMaxH3VaeConfig::from_diffusers_json`] computes it (`prod`).
+///
+/// A missing or non-integer list is `None` rather than an invented 1: an unread list is not a
+/// compression factor of one.
+fn downsample_product(vae: Option<&serde_json::Value>, key: &str) -> Option<u32> {
+    let factors = vae?.get(key)?.as_array().filter(|list| !list.is_empty())?;
+    factors
+        .iter()
+        .try_fold(1_u32, |product, factor| {
+            product.checked_mul(u32::try_from(factor.as_u64()?).ok()?)
+        })
+        .filter(|product| *product != 0)
+}
+
+/// Snapshot-read architecture facts for the MiniMax-H3 route (epic SC-22657, E2).
+///
+/// Every axis is read from the same two files this crate's own config readers parse:
+/// `<root>/transformer/config.json` through
+/// [`crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json`] (`num_attention_heads`,
+/// `attention_head_dim`, `num_layers`, `patch_size`) and `<root>/vae/config.json` through
+/// [`crate::config::MiniMaxH3VaeConfig::from_diffusers_json`] (`latent_channels`, and the products
+/// of `spatial_downsample_factors` / `temporal_downsample_factors`). Nothing is inferred from the
+/// model id, so a snapshot whose config disagrees with the published H3 config publishes what it
+/// actually says.
+///
+/// **`head_dim` is read, never derived.** H3's DiT is *not* uniform-head in the usual sense:
+/// `num_attention_heads · attention_head_dim` is `56 · 128 = 7168`, while `hidden_size` is `5376`.
+/// Dividing the hidden size by the head count would publish `96`, a width no attention head in this
+/// model has.
+///
+/// The VAE ratios are computed from the parsed factor lists rather than restating
+/// [`crate::config::VAE_RATIO`] / [`crate::config::VAE_RATIO_T`], which are themselves documented as
+/// the products of those lists; the constants are the fallback for a snapshot that ships no VAE
+/// config.
+///
+/// A weights-free contract — no resolved snapshot directory — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(
+    components: &ComponentBytes,
+) -> candle_gen::gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = components.root.as_deref() else {
+        return candle_gen::gen_core::MemoryArchitectureFacts::default();
+    };
+    let dit = af::component_config(root, BASE_DIT_PARTITION);
+    let vae = af::component_config(root, "vae");
+    if dit.is_none() && vae.is_none() {
+        return candle_gen::gen_core::MemoryArchitectureFacts::default();
+    }
+    candle_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: af::axis_of(dit.as_ref(), &["num_attention_heads"]),
+        // Read, not divided out of `hidden_size` — see the note above.
+        head_dim: af::axis_of(dit.as_ref(), &["attention_head_dim"]),
+        transformer_blocks: af::axis_of(dit.as_ref(), &["num_layers"]),
+        // `patch_size` is `(temporal, height, width)`; index 1 is the spatial entry this fact names.
+        patch_size: af::axis_at(dit.as_ref(), "patch_size", 1),
+        latent_channels: af::axis_of(vae.as_ref(), &["latent_channels"]),
+        vae_spatial_scale: downsample_product(vae.as_ref(), "spatial_downsample_factors"),
+        vae_temporal_scale: downsample_product(vae.as_ref(), "temporal_downsample_factors"),
+        // `compute_dtype_bytes()` — the bf16 width the DiT actually computes in.
+        activation_dtype_width: u32::try_from(compute_dtype_bytes()).ok(),
+    }
+}
+
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(components),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -840,6 +918,8 @@ pub fn weights_free_contract(
     _spec: &LoadSpec,
 ) -> candle_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(&ComponentBytes {
+        // No snapshot is resolved and none is traversed, so no architecture axis is knowable.
+        root: None,
         text_encoder: 0,
         dit: 0,
         // The declaration-only footprint resolves no DiT, so the sub-stack states the architecture's
@@ -969,6 +1049,82 @@ mod tests {
                 ("transformer_ref", DIT_BF16_BYTES),
             ],
         );
+    }
+
+    /// The two published component configs, cut down to exactly the keys
+    /// [`architecture_facts`] reads. `num_layers` is a parameter so a second snapshot can prove the
+    /// axes are read rather than asserted.
+    fn write_component_configs(root: &Path, num_layers: u32) {
+        std::fs::create_dir_all(root.join(BASE_DIT_PARTITION)).expect("dit dir");
+        std::fs::write(
+            root.join(BASE_DIT_PARTITION).join("config.json"),
+            format!(
+                r#"{{
+                    "_class_name": "MiniMaxH3Transformer3DModel",
+                    "num_attention_heads": 56,
+                    "attention_head_dim": 128,
+                    "hidden_size": 5376,
+                    "num_layers": {num_layers},
+                    "patch_size": [1, 2, 2]
+                }}"#
+            ),
+        )
+        .expect("dit config");
+        std::fs::create_dir_all(root.join("vae")).expect("vae dir");
+        std::fs::write(
+            root.join("vae/config.json"),
+            br#"{
+                "_class_name": "AutoencoderKLMiniMaxH3",
+                "latent_channels": 24,
+                "spatial_downsample_factors": [2, 2, 2, 2, 1, 1],
+                "temporal_downsample_factors": [1, 2, 2, 1, 1, 1]
+            }"#,
+        )
+        .expect("vae config");
+    }
+
+    /// AC (epic SC-22657, E2): the contract publishes the architecture axes read from the snapshot's
+    /// own component `config.json` files, and the weights-free surface publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        write_component_configs(root.path(), 50);
+        let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+            .expect("production contract");
+        assert_eq!(
+            contract.architecture_facts,
+            candle_gen::gen_core::MemoryArchitectureFacts {
+                // `transformer/config.json`: `num_attention_heads`, `attention_head_dim`.
+                attention_heads: Some(56),
+                // Read, never derived: 56 x 128 = 7168, but `hidden_size` is 5376, so the quotient
+                // would publish 96 — a width no attention head in this model has.
+                head_dim: Some(128),
+                transformer_blocks: Some(50),
+                // `patch_size` is `[temporal, height, width]`; index 1 is the spatial entry.
+                patch_size: Some(2),
+                // `vae/config.json`: `latent_channels`.
+                latent_channels: Some(24),
+                // Products of `spatial_downsample_factors` / `temporal_downsample_factors`, the
+                // same computation `MiniMaxH3VaeConfig::from_diffusers_json` performs.
+                vae_spatial_scale: Some(16),
+                vae_temporal_scale: Some(4),
+                // `compute_dtype_bytes()` — bf16.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The facts are read, not asserted: a config declaring a different depth publishes what it
+        // actually says.
+        write_component_configs(root.path(), 32);
+        let mutated = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+            .expect("production contract");
+        assert_eq!(mutated.architecture_facts.transformer_blocks, Some(32));
+
+        // The registry surface resolves no snapshot at all.
+        assert!(declared().architecture_facts.is_empty());
     }
 
     // --- AC1: declared Resident, not fallen-back Resident ---------------------------------------

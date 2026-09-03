@@ -93,7 +93,32 @@ pub fn provider_contract_for_paths(
 ) -> gen_core::Result<MemoryProviderContract> {
     let mut contract = provider_contract();
     contract.asset_facts = asset_facts(paths)?;
+    contract.architecture_facts = architecture_facts(paths);
     Ok(contract)
+}
+
+/// Architecture axes for a resolved InstantID composition (epic SC-22657, E2).
+///
+/// InstantID's denoiser is the **vendored SDXL UNet** and its decoder the staged
+/// `madebyollin/sdxl-vae-fp16-fix` `AutoencoderKL`: it loads both through [`candle_gen_sdxl`]
+/// (`model.rs` → `candle_gen_sdxl::load_instantid_unet`), so the axes come from that crate's own
+/// [`candle_gen_sdxl::sdxl_unet_family_architecture_facts`] rather than from duplicated constants
+/// or from a snapshot `config.json` the vendored stack never reads. The IdentityNet and face
+/// IP-Adapter are auxiliary networks bolted onto that same UNet; they change none of these axes.
+///
+/// That helper declines the four axes a UNet denoiser structurally lacks — a per-stage head count
+/// (5/10/20) is not a uniform `attention_heads`; a down/mid/up trunk is not a `transformer_blocks`
+/// stack; the UNet consumes the latent grid unpatchified; and the image `AutoencoderKL` has no
+/// temporal axis. The activation width is [`crate::model::DTYPE`] (fp16), what InstantID
+/// materializes at.
+///
+/// `paths.sdxl_base` is the proof of a materialized snapshot: [`provider_contract`] is the
+/// weights-free form, has resolved nothing, and keeps every axis `None`.
+fn architecture_facts(paths: &InstantIdPaths) -> gen_core::MemoryArchitectureFacts {
+    if !paths.sdxl_base.is_dir() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    candle_gen_sdxl::sdxl_unet_family_architecture_facts(crate::model::DTYPE)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +404,44 @@ pub(crate) mod tests {
             ),
         };
         (paths, conditioning, transformer, decoder, overlay)
+    }
+
+    /// AC (epic SC-22657, E2): a resolved InstantID composition publishes the SDXL UNet + VAE axes
+    /// it actually loads, declines the four a UNet denoiser structurally lacks, and the
+    /// weights-free contract publishes none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, ..) = priced_paths(&temp);
+        let contract = provider_contract_for_paths(&paths).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `sdxl_unet_config()` heads are per stage (5/10/20): no uniform head count exists.
+                attention_heads: None,
+                // Every stage's `out_channels / attention_head_dim` is 64 (320/5, 640/10, 1280/20).
+                head_dim: Some(64),
+                // A UNet down/mid/up trunk is not a uniform transformer-block stack.
+                transformer_blocks: None,
+                // The UNet consumes the latent grid directly; nothing is patchified.
+                patch_size: None,
+                // `sdxl_vae_config().latent_channels` (the staged `sdxl-vae-fp16-fix`).
+                latent_channels: Some(4),
+                // `block_out_channels` `[128,256,512,512]` = 4 stages => 3 halvings => x8.
+                vae_spatial_scale: Some(8),
+                // The SDXL `AutoencoderKL` is an image VAE: no temporal axis exists to declare.
+                vae_temporal_scale: None,
+                // `model::DTYPE` is fp16, the width InstantID materializes at.
+                activation_dtype_width: Some(2),
+            }
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The weights-free contract has resolved no snapshot, so no axis is knowable there.
+        assert!(provider_contract().architecture_facts.is_empty());
+        let mut unresolved = paths.clone();
+        unresolved.sdxl_base = "/__sceneworks_memory_contract_surface__".into();
+        assert!(architecture_facts(&unresolved).is_empty());
     }
 
     #[test]

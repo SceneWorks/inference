@@ -525,6 +525,58 @@ pub(crate) fn weights_free_contract(
     ))
 }
 
+/// Snapshot-read architecture axes for SenseNova-U1 (epic SC-22657, E2).
+///
+/// SenseNova is one of the few Candle providers whose loader genuinely parses JSON: the backbone is
+/// built from [`crate::config::NeoChatConfig::from_dir`], which reads `<root>/config.json`. These
+/// axes therefore read the *same* file and the *same* keys — `llm_config.num_attention_heads`,
+/// `llm_config.head_dim`, `llm_config.num_hidden_layers`, and the top-level `patch_size` — so a
+/// snapshot whose config disagrees with the published 8B-MoT values publishes what it actually
+/// says rather than what the reference checkpoint declares.
+///
+/// `head_dim` mirrors [`crate::config::NeoLlmConfig::head_dim`] exactly: the explicit key wins, and
+/// a config omitting it falls back to `hidden_size / num_attention_heads`.
+///
+/// Four axes are structurally absent and are declared absent, never zero (E2):
+///
+/// * `latent_channels` — SenseNova-U1 has no latent space at all; its flow-matching head emits RGB
+///   patches directly, so there are no latent channels to count.
+/// * `vae_spatial_scale` / `vae_temporal_scale` — the model ships no VAE (the same reason this
+///   contract declares `BoundedDecode` `StructurallyNotApplicable`), so neither scale exists.
+/// * `activation_dtype_width` — the compute width is *probed from the checkpoint itself* at load
+///   (`lib.rs::checkpoint_dtype` reads a dense tensor's header and `quant::store_dtype_for` maps it:
+///   bf16 stays bf16, anything else loads f32). It is a property of the bytes on disk, not a
+///   compile-time constant and not derivable from the resolved tier, so no width is published.
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: no config has been resolved to read.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    // The exact file `NeoChatConfig::from_dir` parses.
+    let config = af::component_config(root, "");
+    let llm = config.as_ref().and_then(|config| config.get("llm_config"));
+    let attention_heads = af::axis_of(llm, &["num_attention_heads"]);
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        // `NeoLlmConfig::head_dim()`: the explicit key, else `hidden_size / num_attention_heads`.
+        head_dim: af::axis_of(llm, &["head_dim"])
+            .or_else(|| af::head_dim(af::axis_of(llm, &["hidden_size"]), attention_heads)),
+        transformer_blocks: af::axis_of(llm, &["num_hidden_layers"]),
+        patch_size: af::axis_of(config.as_ref(), &["patch_size"]),
+        // No latent space: the flow-matching head emits RGB patches directly.
+        latent_channels: None,
+        // SenseNova ships no VAE at all, so neither decode scale exists.
+        vae_spatial_scale: None,
+        vae_temporal_scale: None,
+        // Probed from the checkpoint's own store dtype at load; not a compile-time constant.
+        activation_dtype_width: None,
+    }
+}
+
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -572,7 +624,7 @@ fn build_contract(
     // envelope used for admission accounting.
     let formula_phases = vec![MemoryPhase::Conditioning, MemoryPhase::Denoise];
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -918,6 +970,79 @@ mod tests {
             |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
         );
         std::fs::write(root.join("config.json"), config).unwrap();
+    }
+
+    /// AC (epic SC-22657, E2): the architecture axes are READ from the same `<root>/config.json`
+    /// keys `NeoChatConfig::from_dir` parses — never asserted from the published 8B-MoT values —
+    /// the four SenseNova structurally lacks stay absent, and the weights-free surface is empty.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        fn config_spec(temp: &Path, heads: u64) -> LoadSpec {
+            std::fs::create_dir_all(temp).unwrap();
+            std::fs::write(
+                temp.join("config.json"),
+                format!(
+                    r#"{{"patch_size": 16,
+                        "llm_config": {{"model_type": "qwen3", "hidden_size": 4096,
+                                        "num_hidden_layers": 42, "num_attention_heads": {heads},
+                                        "num_key_value_heads": 8, "head_dim": 128}},
+                        "vision_config": {{"hidden_size": 1024, "llm_hidden_size": 4096,
+                                           "num_channels": 3, "patch_size": 16}}}}"#
+                ),
+            )
+            .unwrap();
+            LoadSpec::new(WeightsSource::Dir(temp.to_path_buf()))
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("published");
+        let contract =
+            weights_free_contract(crate::MODEL_ID, &config_spec(&published, 32)).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `llm_config.{num_attention_heads,head_dim,num_hidden_layers}` + `patch_size`.
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(42),
+                patch_size: Some(16),
+                // No latent space at all: the flow-matching head emits RGB patches directly.
+                latent_channels: None,
+                // SenseNova ships no VAE, so neither decode scale exists to declare.
+                vae_spatial_scale: None,
+                vae_temporal_scale: None,
+                // Probed from the checkpoint's own store dtype at load, not a compile-time constant.
+                activation_dtype_width: None,
+            }
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The axes are READ, not asserted: a config declaring a different head count publishes it,
+        // and the omitted-`head_dim` fallback is `hidden_size / num_attention_heads` exactly as
+        // `NeoLlmConfig::head_dim()` computes it.
+        let other = temp.path().join("other");
+        let other = weights_free_contract(crate::MODEL_ID, &config_spec(&other, 16)).unwrap();
+        assert_eq!(other.architecture_facts.attention_heads, Some(16));
+        let derived = temp.path().join("derived");
+        std::fs::create_dir_all(&derived).unwrap();
+        std::fs::write(
+            derived.join("config.json"),
+            br#"{"llm_config": {"hidden_size": 4096, "num_attention_heads": 32}}"#,
+        )
+        .unwrap();
+        let derived =
+            weights_free_contract(crate::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(derived)))
+                .unwrap();
+        assert_eq!(derived.architecture_facts.head_dim, Some(128));
+
+        // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+        let surface = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(weights_free_contract(crate::MODEL_ID, &surface)
+            .unwrap()
+            .architecture_facts
+            .is_empty());
     }
 
     /// The fused checkpoint is priced as TWO resident sets, split by the keys the loader routes,

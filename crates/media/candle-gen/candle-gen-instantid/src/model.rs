@@ -57,7 +57,7 @@ use crate::restore;
 
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the face stack runs f32 inside [`candle_gen_face`]).
-const DTYPE: DType = DType::F16;
+pub(crate) const DTYPE: DType = DType::F16;
 
 /// ArcFace embedding width.
 const EMBEDDING_DIM: usize = 512;

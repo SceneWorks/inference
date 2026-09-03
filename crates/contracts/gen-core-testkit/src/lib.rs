@@ -72,9 +72,11 @@ pub use captioner::{
 pub use memory_strategy::{
     assert_memory_contract_asset_facts_conform, assert_memory_contract_facts_conform,
     check_memory_contract_asset_facts, check_memory_contract_facts,
-    check_memory_contract_surface_registry, check_memory_strategy_contract,
-    check_memory_strategy_registry, memory_contract_surface_registry_conformance,
-    memory_strategy_conformance, memory_strategy_registry_conformance,
+    check_memory_contract_surface_registry, check_memory_contract_surface_registry_facts,
+    check_memory_strategy_contract, check_memory_strategy_registry,
+    memory_contract_surface_registry_conformance,
+    memory_contract_surface_registry_facts_conformance, memory_strategy_conformance,
+    memory_strategy_registry_conformance,
 };
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,

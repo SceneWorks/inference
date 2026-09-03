@@ -101,6 +101,66 @@ pub(crate) fn provider_contract(
     )
 }
 
+/// Activation dtype the loaded FLUX.1 pipeline computes in — `lib.rs` / `pipeline.rs` pin
+/// `DType::BF16` for the DiT trunk, so this is the provider's real activation width rather than a
+/// memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Architecture axes for the FLUX.1 reference backbone (epic SC-22657, E2).
+///
+/// The trunk geometry comes from the same `candle_transformers::models::flux::model::Config` the
+/// loader builds the DiT from ([`crate::pipeline::flux_config`]). `dev` and `schnell` are
+/// dimensionally identical — the same `hidden_size 3072` / `num_heads 24` / `depth 19` /
+/// `depth_single_blocks 38` — and differ only in `guidance_embed`, so a single arm describes both
+/// registered providers.
+///
+/// `transformer_blocks` is the **total** trunk depth: FLUX stacks the double-stream blocks and then
+/// the single-stream blocks in one sequence, and every one of them is a materialization unit for
+/// the block-window rung. The two counts are read from `<root>/transformer/config.json`
+/// (`num_layers` / `num_single_layers`) exactly as `pipeline.rs::dit_block_counts` does for the
+/// diffusers layout, falling back to the reference constants for the BFL single-file layout that
+/// ships no `transformer/` component config — reading a different source than the loader would
+/// publish geometry the built model does not have.
+///
+/// `patch_size` is 2 without a config key: FLUX packs 2x2 latent neighbourhoods *outside* the DiT,
+/// which is why the trunk's `in_channels` is 64 = 16 latent channels x 2x2. `vae_temporal_scale`
+/// stays `None` — FLUX.1 ships the image `AutoencoderKL`, which has no temporal axis at all, and a
+/// structurally absent axis is declared absent rather than zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let dit = crate::pipeline::flux_config(crate::Variant::Dev);
+    let vae = crate::vae::native::Config::dev();
+    let transformer_config = af::component_config(root, "transformer");
+    let double = af::axis_of(transformer_config.as_ref(), &["num_layers"])
+        .or_else(|| af::declared(dit.depth));
+    let single = af::axis_of(transformer_config.as_ref(), &["num_single_layers"])
+        .or_else(|| af::declared(dit.depth_single_blocks));
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        // `hidden_size / num_heads`, published only because the trunk is uniform-head.
+        head_dim: af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads)),
+        transformer_blocks: double.and_then(|double| double.checked_add(single?)),
+        // FLUX packs 2x2 latent neighbourhoods before the trunk (`in_channels 64 = 16 * 2 * 2`);
+        // there is no `patch_size` key on either component config to read.
+        patch_size: af::declared(2),
+        // `vae::native::Config::dev().z_channels`.
+        latent_channels: af::declared(vae.z_channels),
+        // `ch_mult` is four stages, so three halvings: x8.
+        vae_spatial_scale: af::declared(vae.ch_mult.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
+        // Structurally absent: the FLUX.1 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 /// Build the shared FLUX.1 reference-backbone ladder for a bespoke provider that owns a resident
 /// conditioning stack. The caller supplies the exact resident components and a provider-specific
 /// calibration identity; this deliberately prevents a bespoke identity route from inheriting base
@@ -160,7 +220,7 @@ pub fn reference_backbone_contract(
         .collect();
 
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -572,6 +632,70 @@ pub(crate) fn registered_begin_request(
 mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
+
+    /// AC (epic SC-22657, E2): the FLUX.1 contract publishes the geometry the loader actually
+    /// builds — the `flux::model::Config` trunk, the snapshot's own double/single block counts, and
+    /// the native VAE's latent axes — passes the shared facts conformance check, and stays empty on
+    /// the weights-free surface whose sentinel root is not on disk.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        fn expected(transformer_blocks: u32) -> gen_core::MemoryArchitectureFacts {
+            gen_core::MemoryArchitectureFacts {
+                // `flux::model::Config::dev()`: `num_heads 24`, `hidden_size 3072 / 24 = 128`.
+                attention_heads: Some(24),
+                head_dim: Some(128),
+                transformer_blocks: Some(transformer_blocks),
+                // FLUX packs 2x2 outside the DiT (`in_channels 64 = 16 * 2 * 2`).
+                patch_size: Some(2),
+                // `vae::native::Config::dev().z_channels`.
+                latent_channels: Some(16),
+                // `ch_mult [1, 2, 4, 4]` — four stages, three halvings.
+                vae_spatial_scale: Some(8),
+                // Structurally absent: the FLUX.1 image autoencoder has no temporal axis.
+                vae_temporal_scale: None,
+                // `DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flux1-architecture-facts");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        // The BFL single-file layout ships no `transformer/config.json`: the block counts fall back
+        // to the reference constants, exactly as `pipeline.rs::dit_block_counts` does.
+        let bfl = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        for id in ["flux1_dev", "flux1_schnell"] {
+            let contract = provider_contract(id, &bfl).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                expected(19 + 38),
+                "{id} BFL-layout architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The diffusers layout declares its own counts, and those are what the loader builds.
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 17, "num_single_layers": 33}"#,
+        )
+        .unwrap();
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(contract.architecture_facts, expected(17 + 33));
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        let contract = provider_contract("flux1_dev", &weights_free).unwrap();
+        assert!(contract.architecture_facts.is_empty());
+        // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate does
+        // not apply to it; the byte-decomposition half of the conformance walk still does.
+        gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+    }
 
     fn write_control(path: &std::path::Path) {
         let mut header =

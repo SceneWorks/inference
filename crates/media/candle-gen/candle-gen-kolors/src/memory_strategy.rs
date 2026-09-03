@@ -541,6 +541,75 @@ fn validate_pid_source(pid: &PidWeights) -> gen_core::Result<()> {
     Ok(())
 }
 
+/// Activation dtype the loaded Kolors pipeline computes in. Unlike the rest of the SDXL family,
+/// Kolors runs **f32 everywhere** (`pipeline::f32_vb`, `unet.rs`'s "the model runs at f32" recipe —
+/// f32 activations over bf16 weights), so its activation elements cost four bytes, not two.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
+/// Architecture axes for a materialized Kolors snapshot (epic SC-22657, E2).
+///
+/// Kolors' denoiser is the **SDXL UNet**, built from the crate's own [`crate::unet::UNetShape`]
+/// rather than from any snapshot `config.json` (the loader never reads one), and its decoder is the
+/// SDXL `AutoencoderKL` from `pipeline::sdxl_vae_config`. The axes are therefore read back off
+/// those two structs.
+///
+/// Four axes are structurally absent for a UNet denoiser and are declared absent, never zero (E2):
+///
+/// * `attention_heads` — the head count is per stage (5/10/20 across `320/640/1280`); there is no
+///   single uniform head count to declare.
+/// * `transformer_blocks` — a UNet is a down/mid/up convolutional trunk, not a uniform block stack.
+/// * `patch_size` — the UNet consumes the latent grid directly; nothing is patchified.
+/// * `vae_temporal_scale` — the SDXL `AutoencoderKL` is an image VAE with no temporal axis.
+///
+/// `head_dim` *is* uniform (`out_channels / attention_head_dim` = 64 in all three stages) and is
+/// published only when every stage agrees, so a non-uniform geometry declines it rather than
+/// claiming a head width it does not have.
+///
+/// `root` is the caller's proof of a materialized snapshot: the weights-free contract surface
+/// ([`provider_contract_for`]) has resolved nothing and keeps every axis `None`.
+fn architecture_facts(root: &Path) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if !root.is_dir() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let unet = crate::unet::UNetShape::sdxl();
+    let mut stage_widths = unet
+        .blocks
+        .iter()
+        .map(|block| match block.attention_head_dim {
+            heads if heads != 0 && block.out_channels % heads == 0 => {
+                af::declared(block.out_channels / heads)
+            }
+            _ => None,
+        });
+    let head_dim = match stage_widths.next() {
+        Some(first) if first.is_some() && stage_widths.all(|width| width == first) => first,
+        _ => None,
+    };
+    let vae = crate::pipeline::sdxl_vae_config();
+    gen_core::MemoryArchitectureFacts {
+        // Per-stage head counts (5/10/20): no uniform head count exists to declare.
+        attention_heads: None,
+        head_dim,
+        // A UNet down/mid/up trunk is not a uniform transformer-block stack.
+        transformer_blocks: None,
+        // The UNet consumes the latent grid directly; there is no patchification.
+        patch_size: None,
+        latent_channels: af::declared(vae.latent_channels),
+        // Each `block_out_channels` stage after the first halves both spatial axes: 4 stages => x8.
+        vae_spatial_scale: vae
+            .block_out_channels
+            .len()
+            .checked_sub(1)
+            .filter(|shift| *shift <= 5)
+            .map(|shift| 1_u32 << shift),
+        // The SDXL `AutoencoderKL` is an image VAE: no temporal axis exists to declare.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn sealed_contract(
     provider_id: &str,
     root: &Path,
@@ -609,6 +678,9 @@ fn sealed_contract(
         });
     }
     let mut contract = provider_contract_for(provider_id);
+    // The seal is the only path that has proven a materialized snapshot, so it is the only one that
+    // may publish architecture axes; `provider_contract_for` stays the empty weights-free surface.
+    contract.architecture_facts = architecture_facts(root);
     contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
         phases: contract.lifecycle.phases.clone(),
         variables: vec![
@@ -2012,6 +2084,63 @@ mod tests {
             cache_state: MemoryCacheState::Cold,
             evidence_revision: REQUEST_EVIDENCE_REVISION.to_owned(),
         }
+    }
+
+    /// AC (epic SC-22657, E2): a sealed Kolors load publishes the axes of the SDXL UNet + VAE
+    /// configs its loader builds, declines the four a UNet denoiser structurally lacks, and the
+    /// weights-free contract surface publishes none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = canonical_base(&temp);
+        // `canonical_base` gives the ChatGLM encoder and the UNet identical tensors, which the
+        // shared conformance check reads as one component borrowing another's price. Give the
+        // encoder a second shard so every component is priced from its own distinct bytes.
+        write_named_tensors(
+            &base.join("text_encoder/extra.safetensors"),
+            &[
+                ("extra.weight", "U32", &[2, 8]),
+                ("extra.scales", "BF16", &[2, 1]),
+                ("extra.biases", "BF16", &[2, 1]),
+            ],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(base));
+        let contract = registered_contract(&spec).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `UNetShape::sdxl()` heads are per stage (5/10/20): no uniform head count exists.
+                attention_heads: None,
+                // Every stage's `out_channels / attention_head_dim` is 64 (320/5, 640/10, 1280/20).
+                head_dim: Some(64),
+                // A UNet down/mid/up trunk is not a uniform transformer-block stack.
+                transformer_blocks: None,
+                // The UNet consumes the latent grid directly; nothing is patchified.
+                patch_size: None,
+                // `pipeline::sdxl_vae_config().latent_channels`.
+                latent_channels: Some(4),
+                // `block_out_channels` `[128,256,512,512]` = 4 stages => 3 halvings => x8.
+                vae_spatial_scale: Some(8),
+                // The SDXL `AutoencoderKL` is an image VAE: no temporal axis exists to declare.
+                vae_temporal_scale: None,
+                // Kolors runs f32 activations everywhere, so four bytes per element, not two.
+                activation_dtype_width: Some(4),
+            }
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The weights-free surface has resolved no snapshot, so no axis is knowable there.
+        assert!(provider_contract().architecture_facts.is_empty());
+        for id in [crate::MODEL_ID, IP_PROVIDER_ID, CONTROL_PROVIDER_ID] {
+            assert!(provider_contract_for(id).architecture_facts.is_empty());
+        }
+        let unresolved = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(registered_contract(&unresolved)
+            .unwrap()
+            .architecture_facts
+            .is_empty());
     }
 
     #[test]

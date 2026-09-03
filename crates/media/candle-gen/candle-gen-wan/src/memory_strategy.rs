@@ -563,6 +563,56 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Snapshot-gated architecture facts for the TI2V-5B route (epic SC-22657, E2).
+///
+/// This module's contract covers exactly one provider — `config::MODEL_ID`
+/// (`wan2_2_ti2v_5b`) — so the geometry is read from the same Rust presets the loader instantiates
+/// for it, not from a `config.json` the loader never opens. Wan's Candle loader does not parse the
+/// diffusers `transformer/config.json` at all: it builds [`TransformerConfig::ti2v_5b`] and
+/// [`crate::config::VaeConfig::ti2v_5b`] directly, and the A14B presets ([`TransformerConfig::t2v_14b`] /
+/// [`TransformerConfig::i2v_14b`], `Vae16Config`) belong to the `wan14b` / `vace` generators, which
+/// publish no [`MemoryProviderContract`] at all. Declaring the A14B geometry here would be a fact
+/// about a route this contract never describes.
+///
+/// The VAE scales come from the route's own load-bearing geometry constant,
+/// [`crate::Ti2vProviderVae::VAE_TILING`] (`VaeTiling::WAN22`, x16 spatial / x4 causal temporal) —
+/// the same value the decoder plans its tiling from — rather than from a restated literal.
+///
+/// A weights-free contract (the registry's sentinel surface, which is not on disk) publishes
+/// `MemoryArchitectureFacts::default()`: nothing about the pipeline that *would* load has been
+/// resolved, so no axis is knowable.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = TransformerConfig::ti2v_5b();
+    let vae = crate::config::VaeConfig::ti2v_5b();
+    let tiling = crate::Ti2vProviderVae::VAE_TILING;
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        // `head_dim` is declared by the preset itself (`dim == num_heads * head_dim` = 3072), so it
+        // is read rather than re-derived from the product.
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        // `patch` is `(p_t, p_h, p_w) = (1, 2, 2)`; the spatial entry is the axis this fact names.
+        patch_size: af::declared(dit.patch.1),
+        // The z48 VAE's own `z_dim` is the encoder's declaration of what it produces; the DiT's
+        // `in_channels` is the consumer's view of the same 48 channels.
+        latent_channels: af::declared(vae.z_dim),
+        vae_spatial_scale: u32::try_from(tiling.spatial_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        vae_temporal_scale: u32::try_from(tiling.temporal_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        // The 5B DiT runs bf16 unconditionally (`lib.rs: DIT_DTYPE`), so this is the activation
+        // width actually materialized rather than a memory-model literal.
+        activation_dtype_width: af::dtype_width(crate::DIT_DTYPE),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
@@ -575,7 +625,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1112,6 +1162,47 @@ mod tests {
             .pop()
             .unwrap()
             .context
+    }
+
+    /// AC (epic SC-22657, E2): the TI2V-5B contract publishes the architecture axes of the config
+    /// the loader actually instantiates, and the weights-free surface publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = fixture_root(None);
+        let spec = spec(temp.path(), None);
+        let contract = memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `TransformerConfig::ti2v_5b()`: 24 heads x 128 = dim 3072, 30 layers.
+                attention_heads: Some(24),
+                head_dim: Some(128),
+                transformer_blocks: Some(30),
+                // `patch = (1, 2, 2)`; the spatial (index 1) entry.
+                patch_size: Some(2),
+                // `VaeConfig::ti2v_5b().z_dim` — the z48 Wan 2.2 autoencoder.
+                latent_channels: Some(48),
+                // `Ti2vProviderVae::VAE_TILING == VaeTiling::WAN22`: x16 spatial, x4 causal temporal.
+                vae_spatial_scale: Some(16),
+                vae_temporal_scale: Some(4),
+                // `lib.rs: DIT_DTYPE = DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The registry's weights-free surface names a sentinel that is not on disk: nothing about
+        // the pipeline that would load has been resolved, so every axis stays absent.
+        let weights_free_spec = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        let weights_free = weights_free_memory_strategy_contract(&weights_free_spec).unwrap();
+        assert!(weights_free.architecture_facts.is_empty());
+
+        // A14B (`t2v_14b` / `i2v_14b`, z16 VAE at x8 spatial) is a different generator with no
+        // memory contract of its own, so this contract must not claim its geometry.
+        assert_eq!(contract.provider_id, MODEL_ID);
     }
 
     #[test]

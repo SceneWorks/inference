@@ -172,6 +172,11 @@ fn ggml_projection_bytes(
 /// casts each decoded dense tensor to this dtype before it lands on the device.
 const COMPUTE_DTYPE_BYTES: u64 = 4;
 
+/// The same compute dtype as a `DType`, so the published activation width and
+/// [`COMPUTE_DTYPE_BYTES`] cannot drift apart: `lib.rs` pins `dtype: DType::F32` for every FLUX.2
+/// component.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
 /// The residency policy the klein fit gate prices against: the SAME probe
 /// [`Flux2Pipeline::load_klein_planned_dit`](Pipeline::load_klein_planned_dit) runs, on the same
 /// process-default device the concrete loader selects
@@ -462,6 +467,43 @@ fn resident_components(
     Ok(out)
 }
 
+/// Architecture axes for one FLUX.2 variant (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: the transformer is constructed from the
+/// hardcoded [`crate::config::Flux2Config`] the variant selects, so those same fields are what the
+/// built model actually has. Selecting the variant here mirrors the loader's own selection, which
+/// is why dev (48 heads, 8 + 48 blocks) and klein-9b (32 heads, 8 + 24 blocks) publish different
+/// geometry from one function.
+///
+/// `transformer_blocks` is the **total** trunk depth: FLUX.2 stacks the double-stream blocks and
+/// then the single-stream blocks in one sequence, and every one of them is a block-window
+/// materialization unit. `patch_size` is 2 without a config field — the 2x2 packing is what makes
+/// `in_channels` 128 = 32 latent channels x 2x2. `vae_temporal_scale` stays `None`: the FLUX.2
+/// `AutoencoderKLFlux2` is an **image** autoencoder with no temporal axis, and a structurally
+/// absent axis is declared absent rather than zero (E2).
+fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let config = variant.config();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_heads),
+        head_dim: af::declared(config.head_dim),
+        transformer_blocks: af::declared(config.num_double_layers + config.num_single_layers),
+        // The 2x2 packing outside the trunk (`in_channels 128 = num_latent_channels * 2 * 2`).
+        patch_size: af::declared(2),
+        latent_channels: af::declared(config.num_latent_channels),
+        vae_spatial_scale: af::declared(config.vae_scale_factor),
+        // Structurally absent: the FLUX.2 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 pub(crate) fn composed_provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
@@ -523,18 +565,20 @@ pub(crate) fn composed_provider_contract_for(
     // include a complete alternate snapshot's unused visual tower, unloaded decoder tail, or other
     // unrelated tensors and would make the fit gate disagree with the admitted runtime.
     let base = gen_core::require_base_snapshot(spec, provider_id)?;
+    // The same variant selection the loader makes: it picks the `Flux2Config` the transformer is
+    // built from, so it also picks the geometry this contract is allowed to publish.
+    let variant = match provider_id {
+        FLUX2_DEV_ID => Flux2Variant::Dev,
+        FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 memory provider {provider_id}"
+            )))
+        }
+    };
     let has_authored_encoder =
         spec.text_encoder.is_some() || base.join("text_encoder/config.json").is_file();
     if has_authored_encoder {
-        let variant = match provider_id {
-            FLUX2_DEV_ID => Flux2Variant::Dev,
-            FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
-            _ => {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "unknown FLUX.2 memory provider {provider_id}"
-                )))
-            }
-        };
         let builtin = WeightsSource::Dir(base.join("text_encoder"));
         let source = spec.text_encoder.as_ref().unwrap_or(&builtin);
         let roots = selected_encoder_discovery_roots(source)?;
@@ -597,7 +641,7 @@ pub(crate) fn composed_provider_contract_for(
         .collect();
 
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(variant, spec),
         provider_id: profile.provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1374,6 +1418,65 @@ mod tests {
             LoadSpec::new(WeightsSource::Dir(PathBuf::from("/flux2-dev"))).with_quant(Quant::Q4);
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec
+    }
+
+    /// AC (epic SC-22657, E2): each FLUX.2 provider publishes the geometry of the `Flux2Config`
+    /// its own loader builds — dev and klein-9b differ, and neither is inferred from a config the
+    /// loader ignores — the contract passes the shared facts conformance check, and the weights-free
+    /// surface (whose sentinel root is not on disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        snapshot.load_shape = LoadShape::DeferredMaterialization;
+        for (id, attention_heads, transformer_blocks) in [
+            // `Flux2Config::dev()`: 48 heads, 8 double + 48 single blocks.
+            (FLUX2_DEV_ID, 48, 8 + 48),
+            // `Flux2Config::klein_9b()`: 32 heads, 8 double + 24 single blocks.
+            (FLUX2_KLEIN_9B_ID, 32, 8 + 24),
+        ] {
+            let contract = composed_provider_contract_for(id, &snapshot).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(attention_heads),
+                    // `Flux2Config::head_dim` — constant across variants.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(transformer_blocks),
+                    // The 2x2 packing outside the trunk (`in_channels 128 = 32 * 2 * 2`).
+                    patch_size: Some(2),
+                    // `Flux2Config::num_latent_channels`.
+                    latent_channels: Some(32),
+                    // `Flux2Config::vae_scale_factor`.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: `AutoencoderKLFlux2` is an image autoencoder.
+                    vae_temporal_scale: None,
+                    // `lib.rs: dtype: DType::F32`, the same width as `COMPUTE_DTYPE_BYTES`.
+                    activation_dtype_width: Some(4),
+                },
+                "{id} architecture facts"
+            );
+            assert_eq!(
+                u64::from(contract.architecture_facts.activation_dtype_width.unwrap()),
+                COMPUTE_DTYPE_BYTES,
+                "{id}: the published activation width and the pricing width must not drift"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = composed_provider_contract_for(id, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{id} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
     }
 
     fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
