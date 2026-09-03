@@ -337,6 +337,36 @@ pub(crate) fn weights_free_memory_strategy_contract(
     contract_with_asset_facts(provider_id, spec, 0, 0, 0)
 }
 
+/// Architecture axes shared by all three registered Anima routes (epic SC-22657, E2).
+///
+/// This crate mirrors the reference Cosmos-Predict2 `transformer/config.json` as
+/// [`DitConfig::anima`](crate::config::DitConfig::anima), and the three variants (`anima_base`,
+/// `anima_aesthetic`, `anima_turbo`) differ only in the DiT file and their default steps/CFG, so
+/// they publish one set of axes.
+///
+/// `patch_size` is the DiT's SPATIAL patch — the `(t, h, w)` tuple's `h` component, whose `t` is 1:
+/// Anima renders a single frame through the Qwen-Image *image* autoencoder, so
+/// `vae_temporal_scale` is structurally absent and declared `None` rather than zero.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::config::DitConfig::anima();
+    let (_, patch_h, patch_w) = dit.patch_size;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest
+        // value to publish.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::config::VAE_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_COMPRESSION),
+        vae_temporal_scale: None,
+        // `pipeline.rs` drives the denoise loop at `Dtype::Bfloat16`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -359,6 +389,7 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
@@ -751,6 +782,33 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir("/nonexistent/anima-contract".into()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(shape)
+    }
+
+    /// AC (SC-22662): every registered Anima route publishes the axes of the one DiT and VAE they
+    /// share, derived from this crate's own config constants, and passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let spec = spec(LoadShape::DeferredMaterialization);
+        for id in IDS {
+            let contract = weights_free_memory_strategy_contract(id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(16),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(28),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

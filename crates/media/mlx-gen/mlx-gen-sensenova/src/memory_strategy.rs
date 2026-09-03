@@ -667,6 +667,41 @@ pub(crate) fn memory_strategy_contract_with_artifact(
     build_memory_strategy_contract(provider_id, spec, footprint, streamable, calibration)
 }
 
+/// Architecture axes shared by both registered SenseNova-U1 routes (epic SC-22657, E2).
+///
+/// SenseNova has no separate DiT: generation runs through the dense Qwen3 MoT backbone plus a
+/// shallow flow-matching head, so the attention axes are the backbone's.
+/// [`NeoLlmConfig::default`](crate::config::NeoLlmConfig) is the shipped 8B-MoT `config.json`
+/// resolved through the very parser `NeoChatConfig::from_dir` uses at load, so the two cannot drift.
+/// The quality and fast routes share that backbone and differ only in the sampling profile.
+///
+/// Four axes are declared structurally absent, all for one reason: **this provider has no VAE and no
+/// latent at all.** The FM head emits RGB patches which `unpatchify` only reshapes, so there is no
+/// latent channel count, no latent patchification factor, and no autoencoder scale — spatial or
+/// temporal — to declare. A structurally absent axis is `None`, never zero.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `NeoChatConfig::from_dir` —
+/// the loader's own parse — so the published backbone axes are the snapshot's rather than the
+/// preset's. On the weights-free surface there is no `config.json` to read and the preset, which
+/// resolves through that same parser, is the honest answer.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let llm = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::NeoChatConfig::from_dir(root).ok())
+        .map(|chat| chat.llm)
+        .unwrap_or_default();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(llm.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(llm.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(llm.num_hidden_layers),
+        patch_size: None,
+        latent_channels: None,
+        vae_spatial_scale: None,
+        vae_temporal_scale: None,
+        // `model.rs` rejects any load that is not dense bf16, and the backbone computes there.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -684,6 +719,7 @@ fn build_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(spec);
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
@@ -1634,6 +1670,74 @@ mod tests {
         }
         // Per provider: 12 bounded-attention surfaces + 6 deferred rung-4 surfaces, two routes each.
         assert_eq!(executed, 2 * (12 + 6) * 2);
+    }
+
+    /// AC (SC-22662): both registered SenseNova routes publish the axes of the Qwen3 MoT backbone
+    /// they generate through, and pass the shared facts conformance check.
+    ///
+    /// The four latent/VAE axes stay absent for one structural reason: this provider has no
+    /// autoencoder — the FM head emits RGB patches directly.
+    #[test]
+    fn architecture_facts_follow_the_backbone_config_and_declare_no_latent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(32),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(42),
+                    patch_size: None,
+                    latent_channels: None,
+                    vae_spatial_scale: None,
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+            .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the backbone axes come from
+    /// the snapshot's own `config.json` — the file `NeoChatConfig::from_dir` parses at load —
+    /// rather than from the compile-time preset. The shipped 8B-MoT fixture agrees with the
+    /// weights-free path; a fixture with mutated `llm_config` keys publishes the mutated axes,
+    /// which is the assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_backbone_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let shipped: serde_json::Value =
+            serde_json::from_str(crate::config::MOT_8B_CONFIG).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, weights_free) = fixture_spec(&tmp);
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &shipped)),
+            architecture_facts(&weights_free),
+            "the shipped 8B-MoT config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = shipped.clone();
+        mutated["llm_config"]["num_hidden_layers"] = serde_json::json!(7);
+        mutated["llm_config"]["head_dim"] = serde_json::json!(64);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
     }
 
     /// A phase-bearing context must be refused, not silently admitted against single-phase

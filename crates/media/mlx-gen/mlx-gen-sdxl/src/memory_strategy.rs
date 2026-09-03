@@ -762,6 +762,14 @@ fn contract_with_asset_facts_and_streamability(
         },
     );
     contract.load_shape = spec.load_shape;
+    // Epic SC-22657 (E2): the axes this crate's own U-Net and VAE constants declare. `model.rs`
+    // pins `DTYPE = Dtype::Float16` for the U-Net and both CLIP towers, so fp16 is the real
+    // activation width here rather than a memory-model literal.
+    contract.architecture_facts = crate::config::architecture_facts(
+        &crate::config::UNetConfig::sdxl_base(),
+        &crate::config::VaeConfig::sdxl_base(),
+        mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+    );
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
@@ -1301,6 +1309,33 @@ mod tests {
         file.extend(json);
         file.resize(file.len() + offset, 0);
         std::fs::write(path, file).unwrap();
+    }
+
+    /// AC (SC-22662): the published contract carries the crate's own U-Net/VAE axes, and passes the
+    /// shared facts conformance check on both load shapes.
+    #[test]
+    fn the_contract_publishes_the_crate_architecture_axes() {
+        for shape in [
+            LoadShape::DeferredMaterialization,
+            LoadShape::EagerMaterialization,
+        ] {
+            let contract = contract(shape);
+            assert_eq!(
+                contract.architecture_facts,
+                crate::config::architecture_facts(
+                    &crate::config::UNetConfig::sdxl_base(),
+                    &crate::config::VaeConfig::sdxl_base(),
+                    2,
+                ),
+                "{shape:?}"
+            );
+            assert_eq!(contract.architecture_facts.head_dim, Some(64));
+            assert_eq!(contract.architecture_facts.latent_channels, Some(4));
+            assert_eq!(contract.architecture_facts.vae_spatial_scale, Some(8));
+            assert_eq!(contract.architecture_facts.activation_dtype_width, Some(2));
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

@@ -27,6 +27,50 @@ pub const CALIBRATION_FINGERPRINT: &str = "sc-16593-flux2-dev-edit-evidence-v2";
 pub const DEV_T2I_CALIBRATION_FINGERPRINT: &str = "sc-18218-flux2-dev-t2i-resident-evidence-v1";
 pub const DEV_CONTROL_OVERLAY: &str = "control";
 
+/// Architecture axes for one FLUX.2 variant (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as `Flux2Config`, with
+/// `Flux2Config::klein_9b` behind the three Klein routes and `Flux2Config::dev` behind the three Dev
+/// routes. A route's overlay (edit references, KV edit, the control branch) changes what is
+/// resident, never the trunk's shape, so a variant's routes publish one set of axes.
+///
+/// `transformer_blocks` is the **sum** of the double and single stacks: the denoiser traverses both
+/// on every step. `patch_size` is derived rather than declared — `Flux2Config` has no `patch_size`
+/// field; it encodes the packing as `in_channels = num_latent_channels * patch²`.
+///
+/// `vae_temporal_scale` stays `None`: FLUX.2's autoencoder is an image autoencoder with no temporal
+/// axis, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts(
+    config: &crate::config::Flux2Config,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(config.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(config.head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            config
+                .num_double_layers
+                .saturating_add(config.num_single_layers),
+        ),
+        patch_size: latent_patch_size(config),
+        latent_channels: mlx_gen::architecture_facts::axis(config.num_latent_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(config.vae_scale_factor),
+        vae_temporal_scale: None,
+        // Weights are bf16, but the transformer runs f32 activations over them (`model.rs`), so f32
+        // is the width an activation estimate must use.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
+/// The square patch edge implied by `in_channels = num_latent_channels * patch²`.
+///
+/// A config whose ratio is not a small perfect square declines the axis rather than rounding one
+/// into existence.
+fn latent_patch_size(config: &crate::config::Flux2Config) -> Option<u32> {
+    let packed = mlx_gen::architecture_facts::axis(config.in_channels)?;
+    let latent = mlx_gen::architecture_facts::axis(config.num_latent_channels)?;
+    (1_u32..=8).find(|edge| edge * edge * latent == packed)
+}
+
 pub fn contract_for_variant(
     variant: Flux2Variant,
     spec: &LoadSpec,
@@ -56,6 +100,7 @@ fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // The only base/edit calibration receipts are eager-load captures.  A sequential lifecycle
     // releases phases after that eager assembly; it is not deferred-materialization evidence.
     contract.load_shape = LoadShape::EagerMaterialization;
@@ -83,6 +128,7 @@ fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // See the edit contract above: this fingerprint remains bound to the measured eager load.
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.formula = MemoryFormulaKind::Affine {
@@ -160,6 +206,7 @@ fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     contract.load_shape = spec.load_shape;
     // Unlike base/edit, this route is not complete without its separately-addressed control
     // artifact.  Do not publish a selectable staged rung for a bare base `LoadSpec`.
@@ -657,6 +704,7 @@ fn build_klein_contract(
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::klein_9b());
     contract.load_shape = spec.load_shape;
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
@@ -1193,6 +1241,61 @@ mod tests {
         MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryNumericTier, MemorySelection,
     };
     use mlx_gen::{Precision, Quant};
+
+    /// AC (SC-22662): every registered FLUX.2 route publishes the axes of the trunk it runs — the
+    /// three Klein routes the 9B config, the three Dev routes the Dev config — and every contract
+    /// passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_each_variants_own_config() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let klein = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(32),
+            head_dim: Some(128),
+            // 8 double + 24 single blocks.
+            transformer_blocks: Some(32),
+            // `in_channels` 128 = `num_latent_channels` 32 x 2².
+            patch_size: Some(2),
+            latent_channels: Some(32),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            // f32 activations over bf16 weights.
+            activation_dtype_width: Some(4),
+        };
+        let dev = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            // 8 double + 48 single blocks.
+            transformer_blocks: Some(56),
+            ..klein
+        };
+        assert_eq!(
+            architecture_facts(&crate::config::Flux2Config::klein_9b()),
+            klein
+        );
+        assert_eq!(architecture_facts(&crate::config::Flux2Config::dev()), dev);
+
+        for provider_id in [
+            crate::config::FLUX2_KLEIN_9B_ID,
+            crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+            crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ] {
+            let contract = weights_free_klein_contract(provider_id, &spec).unwrap();
+            assert_eq!(contract.architecture_facts, klein, "{provider_id}");
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        for contract in [
+            registered_dev_contract(&spec).unwrap(),
+            registered_dev_t2i_contract(&spec).unwrap(),
+            registered_dev_control_contract(&spec).unwrap(),
+        ] {
+            assert_eq!(
+                contract.architecture_facts, dev,
+                "{} architecture facts",
+                contract.provider_id
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
 
     fn context(total_gb: f64) -> MemoryRunContext {
         let contract = build_contract();

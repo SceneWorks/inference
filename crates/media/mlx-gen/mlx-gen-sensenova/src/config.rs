@@ -58,7 +58,7 @@ impl NeoLlmConfig {
         self.model_type.to_lowercase().contains("moe") || self.num_experts.is_some_and(|n| n > 1)
     }
 
-    fn from_value(v: &Value) -> Self {
+    pub(crate) fn from_value(v: &Value) -> Self {
         Self {
             model_type: get_str(v, "model_type", "qwen3"),
             hidden_size: get_usize(v, "hidden_size", 4096),
@@ -83,6 +83,17 @@ impl NeoLlmConfig {
                 .and_then(Value::as_u64)
                 .map(|n| n as usize),
         }
+    }
+}
+
+impl Default for NeoLlmConfig {
+    /// The dense 8B-MoT backbone this crate ships against.
+    ///
+    /// Every field falls back to the shipped `config.json` value because this resolves through the
+    /// very same crate-private `from_value` parser [`NeoChatConfig::from_dir`] uses at load, so the
+    /// preset and a parsed snapshot config cannot drift apart.
+    fn default() -> Self {
+        Self::from_value(&Value::Null)
     }
 }
 
@@ -256,9 +267,10 @@ fn get_bool(v: &Value, key: &str, default: bool) -> bool {
 }
 
 /// A minimal `config.json` carrying the 8B-MoT structural values (the parser ignores the many
-/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config and loader tests.
+/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config, loader and
+/// memory-contract tests.
 #[cfg(test)]
-const MOT_8B_CONFIG: &str = r#"{
+pub(crate) const MOT_8B_CONFIG: &str = r#"{
       "model_type": "neo_chat",
       "template": "neo1_0",
       "tie_word_embeddings": false,

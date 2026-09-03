@@ -24,6 +24,9 @@ sha2 = { workspace = true }
 mlx-llm = { workspace = true }
 
 [dev-dependencies]
+# The shared weights-free conformance suite (epic SC-22657): the crate's contract tests assert
+# the provider-declared architecture axes against it.
+sceneworks-gen-core-testkit = { workspace = true }
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old
 # `env::temp_dir().join(..)` + trailing `remove_dir_all` shape ever leaked on.

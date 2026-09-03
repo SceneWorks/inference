@@ -2311,6 +2311,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2353,6 +2354,7 @@ dependencies = [
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2396,6 +2398,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
@@ -2447,6 +2450,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-wan",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2488,6 +2492,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-boogu",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -2539,6 +2544,7 @@ dependencies = [
  "mlx-gen-face",
  "mlx-gen-flux",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "sha2",
  "tempfile",
 ]
@@ -2582,6 +2588,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-pid",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "sha2",
  "tempfile",
 ]
@@ -2650,6 +2657,7 @@ dependencies = [
  "mlx-gen",
  "mlx-llm",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -3334,6 +3342,7 @@ dependencies = [
  "mlx-llm",
  "pmetal-mlx-rs",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
  "serde",
  "serde_json",
  "sha2",

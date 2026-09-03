@@ -994,13 +994,68 @@ pub fn streamable(spec: &LoadSpec) -> bool {
     resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
 }
 
+/// Architecture axes for the MiniMax-H3 route (epic SC-22657, E2).
+///
+/// [`MiniMaxH3DitConfig::default`](crate::dit::config::MiniMaxH3DitConfig) mirrors the reference
+/// `transformer/config.json`, and `MiniMaxH3DitConfig::from_diffusers_json` parses that same file —
+/// every key required, no defaults — at load, so the two cannot disagree silently.
+///
+/// `head_dim` is the config's declared `attention_head_dim`, not `hidden_size / num_heads`: this DiT
+/// is deliberately non-uniform (`inner_dim` 7168 is wider than `hidden_size` 5376), so the quotient
+/// would be neither integral nor the head width the attention actually uses.
+///
+/// The VAE is a **video** autoencoder: `VAE_RATIO` pixels and `VAE_RATIO_T` frames per latent unit,
+/// so `vae_temporal_scale` is a real value here.
+///
+/// When `spec` names a materialized snapshot directory, [`dit_config`] re-runs the loader's own
+/// `from_diffusers_json` parse over that snapshot's `transformer/config.json`, so the published
+/// trunk axes are the snapshot's rather than the preset's.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = dit_config(spec);
+    // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
+    // the temporal factor is already carried by `vae_temporal_scale`.
+    let [_, patch_h, patch_w] = dit.patch_size;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO_T),
+        // `model.rs` loads and runs the DiT at `Dtype::Bfloat16` for every precision but `Fp32`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
+/// The DiT geometry a contract should describe: the materialized snapshot's own
+/// `transformer/config.json` when one exists, else this crate's mirror of it.
+///
+/// `from_diffusers_json` requires every key, so a partial or variant file declines rather than
+/// half-defaulting into this model's numbers — and declining falls back to the preset, which is
+/// exactly what the weights-free surface publishes.
+fn dit_config(spec: &LoadSpec) -> crate::dit::config::MiniMaxH3DitConfig {
+    mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| {
+            let path = root
+                .join(crate::model::BASE_DIT_PARTITION)
+                .join("config.json");
+            let text = std::fs::read_to_string(path).ok()?;
+            crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
+        })
+        .unwrap_or_default()
+}
+
 fn build_contract(
+    spec: &LoadSpec,
     components: &ComponentBytes,
     load_shape: LoadShape,
     streamable: bool,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
@@ -1156,6 +1211,7 @@ fn build_contract(
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
+        spec,
         &ComponentBytes::resolve(spec)?,
         resolved_load_shape(spec),
         streamable(spec),
@@ -1164,10 +1220,15 @@ pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProvider
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts.
 ///
-/// Catalog conformance uses this when the snapshot is unavailable. It must **not** touch the
-/// filesystem, and it must not diverge from [`contract_for`] in anything but the byte counts.
+/// Catalog conformance uses this when the snapshot is unavailable. It must **not** require the
+/// snapshot to exist — no byte count is read off disk here — and it must not diverge from
+/// [`contract_for`] in anything but the byte counts. It does consult the spec's weights directory
+/// for the DiT config when one is materialized (see the crate-private `dit_config`); that is not a
+/// byte count, and on the registry's never-created sentinel path it reads nothing and publishes
+/// the preset.
 pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
+        spec,
         &ComponentBytes::weights_free(),
         resolved_load_shape(spec),
         streamable(spec),
@@ -1505,6 +1566,99 @@ mod tests {
 
     fn declared() -> MemoryProviderContract {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
+    }
+
+    /// AC (SC-22662): the MiniMax-H3 contract publishes the axes of the DiT and video VAE this crate
+    /// declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let contract = declared();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(56),
+                // The config's declared head width. `hidden_size` 5376 / 56 is NOT it: this DiT's
+                // `inner_dim` (7168) is deliberately wider than its `hidden_size`.
+                head_dim: Some(128),
+                transformer_blocks: Some(50),
+                // `patch_size` is `[1, 2, 2]`: the square spatial patch is 2.
+                patch_size: Some(2),
+                latent_channels: Some(24),
+                vae_spatial_scale: Some(16),
+                // A video autoencoder: four frames per latent unit.
+                vae_temporal_scale: Some(4),
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// The published `transformer/config.json` layout, emitted from a config value so the fixture
+    /// cannot drift from the struct it mirrors. Every key is required by `from_diffusers_json`.
+    fn dit_config_json(cfg: &crate::dit::config::MiniMaxH3DitConfig) -> serde_json::Value {
+        serde_json::json!({
+            "_class_name": "MiniMaxH3Transformer3DModel",
+            "num_attention_heads": cfg.num_attention_heads,
+            "attention_head_dim": cfg.attention_head_dim,
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "num_refiner_layers": cfg.num_refiner_layers,
+            "ffn_dim": cfg.ffn_dim,
+            "in_channels": cfg.in_channels,
+            "audio_in_channels": cfg.audio_in_channels,
+            "patch_size": cfg.patch_size,
+            "text_dim": cfg.text_dim,
+            "freq_dim": cfg.freq_dim,
+            "time_embed_hidden_dim": cfg.time_embed_hidden_dim,
+            "time_embed_dim": cfg.time_embed_dim,
+            "rope_freq_dim": cfg.rope_freq_dim,
+            "rope_theta": cfg.rope_theta,
+            "norm_eps": cfg.norm_eps,
+            "qk_norm_eps": cfg.qk_norm_eps,
+            "final_norm_eps": cfg.final_norm_eps,
+        })
+    }
+
+    fn spec_for_dit_config(dir: &Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `DitBlockStream` parses at load —
+    /// rather than published from the compile-time preset. The mirror fixture agrees with the
+    /// weights-free path; a fixture with mutated keys publishes the mutated axes, which is the
+    /// assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_dit_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_dit_config(
+                mirror.path(),
+                &dit_config_json(&preset)
+            )),
+            architecture_facts(&weightless_spec()),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = dit_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        // 160, not a smaller width: `MiniMaxH3DitConfig::validate` requires the partial rotary
+        // (`2 * 3 * rope_freq_dim` = 96) to fit inside a head, and a rejected config would fall
+        // back to the preset and hide the mutation rather than publish it.
+        mutated["attention_head_dim"] = serde_json::json!(160);
+        let mutated_facts = architecture_facts(&spec_for_dit_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(160)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
     }
 
     fn support(

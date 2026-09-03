@@ -410,6 +410,40 @@ mod tests {
         spec
     }
 
+    /// AC (SC-22662): PuLID-FLUX owns no denoiser — it borrows FLUX.1-dev's contract and rewrites
+    /// the provider id — so the FLUX DiT's axes must survive that adaptation intact, and the adapted
+    /// contract must pass the shared facts conformance check.
+    #[test]
+    fn architecture_facts_ride_through_from_the_flux_backbone() {
+        let spec = spec();
+        let contract = weights_free_contract(&spec).unwrap();
+        let backbone = mlx_gen_flux::memory_strategy::weights_free_memory_strategy_contract(
+            mlx_gen_flux::FLUX1_DEV_ID,
+            &backbone_spec(&spec),
+        )
+        .unwrap();
+        assert_eq!(
+            contract.architecture_facts, backbone.architecture_facts,
+            "adapting the contract must not drop the backbone's declared axes"
+        );
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(24),
+                head_dim: Some(128),
+                // 19 joint + 38 single FLUX.1 blocks.
+                transformer_blocks: Some(57),
+                patch_size: Some(2),
+                latent_channels: Some(16),
+                vae_spatial_scale: Some(8),
+                vae_temporal_scale: None,
+                activation_dtype_width: Some(4),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
     #[test]
     fn bespoke_contract_declares_every_rung_and_identity_route() {
         let spec = spec();
