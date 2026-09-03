@@ -874,6 +874,15 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    // Epic SC-22657 (E2). Kolors runs the SDXL U-Net and the SDXL VAE unchanged — only the
+    // added-conditioning projection widens ([`mlx_gen_sdxl::UNetConfig::kolors`]) — so the axes come
+    // from the shared SDXL derivation rather than a second, driftable copy here. `registry.rs`
+    // builds the residency at `Dtype::Float16`, which is the denoiser's real activation width.
+    contract.architecture_facts = mlx_gen_sdxl::config::architecture_facts(
+        &mlx_gen_sdxl::UNetConfig::kolors(),
+        &mlx_gen_sdxl::VaeConfig::sdxl_base(),
+        mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+    );
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
@@ -1852,6 +1861,35 @@ mod tests {
                     && surface.selector.load_shape == shape
             })
             .unwrap()
+    }
+
+    /// AC (SC-22662): Kolors publishes the SDXL-family axes it actually runs. The head width, latent
+    /// channels and VAE scale are the SDXL U-Net's and VAE's; the two axes a conv U-Net cannot
+    /// express stay absent.
+    #[test]
+    fn architecture_facts_follow_the_shared_sdxl_unet_constants() {
+        for shape in [
+            LoadShape::DeferredMaterialization,
+            LoadShape::EagerMaterialization,
+        ] {
+            let contract = contract(shape);
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: None,
+                    head_dim: Some(64),
+                    transformer_blocks: None,
+                    patch_size: None,
+                    latent_channels: Some(4),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{shape:?}"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

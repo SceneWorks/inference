@@ -699,6 +699,37 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Architecture axes for the Wan 2.2 TI2V-5B route this module contracts for (epic SC-22657, E2).
+///
+/// [`WanModelConfig::wan22_ti2v_5b`](crate::config::WanModelConfig::wan22_ti2v_5b) is this crate's
+/// preset for that variant's `config.json`, which `WanModelConfig::from_model_dir` overlays a
+/// snapshot's own keys onto at load. **This is the 5B route only** — the 14B trunks are a different
+/// shape (dim 5120, 40 heads, 40 layers over the z16 VAE), which is why the axes are keyed on the
+/// 5B preset rather than on `base()`.
+///
+/// TI2V-5B pairs a wider latent (48 channels) with the z48 autoencoder's x16 spatial and x4 temporal
+/// scales, both read from the same preset's `vae_stride`/`vae_z_dim`. Being a **video** autoencoder,
+/// `vae_temporal_scale` is a real value here rather than a structurally absent one.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = crate::config::WanModelConfig::wan22_ti2v_5b();
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // Wan is bf16-native: every matmul runs bf16 over an f32 residual stream.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
@@ -712,7 +743,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     Ok(MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -1270,6 +1301,45 @@ mod tests {
     };
     use std::io::Write;
     use std::path::PathBuf;
+
+    /// AC (SC-22662): the TI2V-5B contract publishes the axes of the 5B trunk and z48 video VAE this
+    /// crate's preset declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_ti2v_5b_preset_and_its_z48_vae() {
+        for surface in (MEMORY_FIXTURE.surface_specs)() {
+            let contract = (MEMORY_FIXTURE.contract)(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    // 3072 / 24, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(30),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    // The z48 autoencoder, not the 14B routes' z16 one.
+                    latent_channels: Some(48),
+                    vae_spatial_scale: Some(16),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair IS the z48 tiling geometry this provider's VAE assignment declares.
+        assert_eq!(
+            crate::WAN_Z48_VAE_TILING.spatial_scale as u32,
+            architecture_facts().vae_spatial_scale.unwrap()
+        );
+        assert_eq!(
+            crate::WAN_Z48_VAE_TILING.temporal_scale as u32,
+            architecture_facts().vae_temporal_scale.unwrap()
+        );
+    }
 
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
     /// fixture publishes and fails the entire MLX catalog when one errors, so the published witness

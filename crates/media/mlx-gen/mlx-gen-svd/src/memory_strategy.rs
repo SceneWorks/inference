@@ -343,6 +343,54 @@ impl PreparedSvdMemory {
     }
 }
 
+/// One latent unit per output frame: SVD's encoder is 2-D per frame and its temporal decoder
+/// compresses nothing, so no `VaeTiling` models it (`vae_tiling("svd_xt")` is `None`).
+const TEMPORAL_SCALE: u32 = 1;
+
+/// Architecture axes for the SVD-XT route (epic SC-22657, E2).
+///
+/// [`UnetConfig`](crate::config::UnetConfig) and [`VaeConfig`](crate::config::VaeConfig) are static
+/// defaults constructed at load — this crate deliberately has no disk-JSON override path — so they
+/// are exactly the config the loader parses.
+///
+/// Three axes are declared structurally absent rather than invented:
+///
+/// * `attention_heads` — SVD's denoiser is a conv `UNetSpatioTemporalConditionModel`, whose head
+///   count is 5/10/20/20 across its four resolutions; no scalar is the honest answer. The *width* is
+///   uniform (320/5 = 640/10 = 1280/20 = 64) and is published instead.
+/// * `transformer_blocks` — likewise: a conv U-Net stacks no uniform transformer trunk.
+/// * `patch_size` — a conv U-Net patchifies nothing.
+///
+/// `vae_temporal_scale` is a real `Some(1)`: one latent unit IS one output frame.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let unet = crate::config::UnetConfig::default();
+    let vae = crate::config::VaeConfig::default();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: None,
+        head_dim: uniform_head_dim(&unet),
+        transformer_blocks: None,
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::vae_spatial_scale_from_stages(
+            vae.block_out_channels.len(),
+        ),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(TEMPORAL_SCALE),
+        // `model.rs` maps `Precision::Bf16` to `Dtype::Float16` for the U-Net and image encoder.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
+/// The per-head channel width, published only when every U-Net resolution agrees on it.
+fn uniform_head_dim(unet: &crate::config::UnetConfig) -> Option<u32> {
+    let mut widths = unet
+        .block_out_channels
+        .iter()
+        .zip(unet.num_attention_heads.iter())
+        .map(|(dim, heads)| mlx_gen::architecture_facts::head_dim(*dim, *heads));
+    let first = widths.next()??;
+    widths.all(|width| width == Some(first)).then_some(first)
+}
+
 fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -350,7 +398,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -752,6 +800,51 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
 mod tests {
     use super::*;
     use mlx_gen::gen_core::{Conditioning, Image, MemoryStrategySupport, OffloadPolicy};
+
+    /// AC (SC-22662): the SVD-XT contract publishes the axes of the conv U-Net and the temporal
+    /// decoder this crate declares, and passes the shared facts conformance check.
+    ///
+    /// The two axes a conv U-Net cannot express stay absent rather than being fabricated, while
+    /// `vae_temporal_scale` is a real `Some(1)`: one latent unit is one output frame.
+    #[test]
+    fn architecture_facts_follow_the_static_unet_and_vae_defaults() {
+        for surface in resident_only_surface_specs() {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: None,
+                    // 320/5 = 640/10 = 1280/20 = 64, uniform across all four resolutions.
+                    head_dim: Some(64),
+                    transformer_blocks: None,
+                    patch_size: None,
+                    latent_channels: Some(4),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: Some(1),
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published spatial scale IS the compression the latent allocation divides by.
+        assert_eq!(
+            architecture_facts().vae_spatial_scale,
+            Some(crate::VAE_SCALE)
+        );
+    }
+
+    /// A U-Net whose resolutions disagree on head width has none to publish.
+    #[test]
+    fn a_non_uniform_head_width_declines_the_axis() {
+        let unet = crate::config::UnetConfig {
+            num_attention_heads: vec![5, 10, 20, 21],
+            ..Default::default()
+        };
+        assert_eq!(uniform_head_dim(&unet), None);
+    }
 
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

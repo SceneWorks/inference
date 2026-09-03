@@ -20,6 +20,9 @@ mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-rs = { workspace = true }
 
 [dev-dependencies]
+# The shared weights-free conformance suite (epic SC-22657): the crate's contract tests assert
+# the provider-declared architecture axes against it.
+sceneworks-gen-core-testkit = { workspace = true }
 # PNG inspection output for the e2e test (matches the workspace `image` version).
 image = { workspace = true }
 

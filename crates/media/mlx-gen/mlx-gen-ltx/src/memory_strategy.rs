@@ -640,6 +640,35 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Architecture axes shared by both registered LTX-2 routes (epic SC-22657, E2).
+///
+/// [`LtxConfig::video_only_defaults`](crate::config::LtxConfig::video_only_defaults) mirrors the
+/// `embedded_config.json` transformer block the loader parses on every load, and the measured 2.3 to
+/// 2.5 delta is two booleans — not a dimension — so both routes publish one set of axes.
+///
+/// `patch_size` is declared **absent**: LTX's AvDiT has no patchify at all. `patchify_proj` is a
+/// plain `Linear` over the 128-channel latent token, and every patch factor lives inside the VAE,
+/// already folded into `vae_spatial_scale`. A structurally absent axis is declared `None`, never a
+/// stand-in 1.
+///
+/// The VAE is a **video** autoencoder, so `vae_temporal_scale` is a real value here: eight frames
+/// per latent unit over a x32 spatial scale, which `diff_vae::VIDEO_SCALE_FACTORS` restates.
+pub(crate) fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::config::LtxConfig::video_only_defaults();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::model::SPATIAL_SCALE),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::model::TEMPORAL_SCALE),
+        // The default `LoadPrecision::Bf16` load computes bf16 activations over quantized weights;
+        // `Fp32` is the separate opt-in path.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     asset_declaration: AssetDeclaration,
@@ -677,7 +706,7 @@ fn build_contract(
         }
     };
     Ok(MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -1609,6 +1638,41 @@ mod tests {
 
     fn fixture_spec() -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into())).with_quant(Quant::Q8)
+    }
+
+    /// AC (SC-22662): the LTX-2.3 route publishes the axes of the AvDiT and the video VAE this
+    /// crate declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_and_vae_constants() {
+        let contract = weights_free_memory_strategy_contract(&fixture_spec()).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // The AvDiT has no patchify: `patchify_proj` is a plain Linear over the
+                // 128-channel latent token, and every patch factor lives inside the VAE.
+                patch_size: None,
+                latent_channels: Some(128),
+                vae_spatial_scale: Some(32),
+                // A video autoencoder: eight frames per latent unit.
+                vae_temporal_scale: Some(8),
+                activation_dtype_width: Some(2),
+            },
+            "ltx_2_3 architecture facts"
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        // The published scales ARE the released DiffVAE's `(time, height, width)` factors.
+        assert_eq!(
+            [
+                contract.architecture_facts.vae_temporal_scale,
+                contract.architecture_facts.vae_spatial_scale,
+                contract.architecture_facts.vae_spatial_scale,
+            ],
+            crate::diff_vae::VIDEO_SCALE_FACTORS.map(|scale| Some(scale as u32))
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
     }
 
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the

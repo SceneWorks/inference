@@ -331,6 +331,35 @@ fn memory_strategy_contract_for_resolved_components(
     ))
 }
 
+/// Architecture axes shared by all six registered Mage-Flow routes (epic SC-22657, E2).
+///
+/// [`MageFlowConfig::mage_flow`](crate::config::MageFlowConfig::mage_flow) is this crate's mirror of
+/// the `transformer/config.json` shipped by every `microsoft/Mage-Flow*` repo, and
+/// `MageFlowConfig::from_transformer_config_json` parses that same file at load; the six routes
+/// (base/turbo x t2i/edit) differ only in weights and sampling profile, so they publish one set of
+/// axes.
+///
+/// `patch_size` is 1 — Mage flattens token-per-latent-cell with no patchify, so this is a real
+/// declared value and not a stand-in for an absent axis. `vae_temporal_scale` stays `None`:
+/// Mage-Flow is an image model whose autoencoder has no temporal axis.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::config::MageFlowConfig::mage_flow();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.head_dim()),
+        // `DEPTH_SINGLE_BLOCKS` is 0: every block is dual-stream, so `depth` IS the trunk.
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            dit.depth.saturating_add(crate::config::DEPTH_SINGLE_BLOCKS),
+        ),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_DOWNSAMPLE_FACTOR),
+        vae_temporal_scale: None,
+        // `pipeline.rs` builds the latent tokens and loads the VAE at `Dtype::Bfloat16`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn memory_strategy_contract_with_adapters(
     provider_id: &str,
     adapters: &[mlx_gen::AdapterSpec],
@@ -379,6 +408,7 @@ fn memory_strategy_contract_with_adapters(
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.load_shape = load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         load_shape,
@@ -2012,6 +2042,35 @@ mod tests {
         assert_eq!(contract.asset_facts.decoder_bytes, 2);
         assert_eq!(contract.asset_facts.base_bytes, 4_718_938);
         assert!(contract.conformance_errors().is_empty());
+    }
+
+    /// AC (SC-22662): every registered Mage-Flow route publishes the axes of the one NR-MMDiT they
+    /// share, derived from this crate's own config constants, and passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_config() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/mage-contract".into()));
+        for provider_id in MODEL_IDS {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    // 3072 / 24, derived by `MageFlowConfig::head_dim`.
+                    head_dim: Some(128),
+                    // 12 dual-stream blocks and no single-stream tail.
+                    transformer_blocks: Some(12),
+                    // Mage flattens token-per-latent-cell: a real 1, not an absent axis.
+                    patch_size: Some(1),
+                    latent_channels: Some(128),
+                    vae_spatial_scale: Some(16),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

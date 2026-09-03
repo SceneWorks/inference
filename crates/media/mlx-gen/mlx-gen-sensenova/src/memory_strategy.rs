@@ -667,6 +667,33 @@ pub(crate) fn memory_strategy_contract_with_artifact(
     build_memory_strategy_contract(provider_id, spec, footprint, streamable, calibration)
 }
 
+/// Architecture axes shared by both registered SenseNova-U1 routes (epic SC-22657, E2).
+///
+/// SenseNova has no separate DiT: generation runs through the dense Qwen3 MoT backbone plus a
+/// shallow flow-matching head, so the attention axes are the backbone's.
+/// [`NeoLlmConfig::default`](crate::config::NeoLlmConfig) is the shipped 8B-MoT `config.json`
+/// resolved through the very parser `NeoChatConfig::from_dir` uses at load, so the two cannot drift.
+/// The quality and fast routes share that backbone and differ only in the sampling profile.
+///
+/// Four axes are declared structurally absent, all for one reason: **this provider has no VAE and no
+/// latent at all.** The FM head emits RGB patches which `unpatchify` only reshapes, so there is no
+/// latent channel count, no latent patchification factor, and no autoencoder scale — spatial or
+/// temporal — to declare. A structurally absent axis is `None`, never zero.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let llm = crate::config::NeoLlmConfig::default();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(llm.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(llm.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(llm.num_hidden_layers),
+        patch_size: None,
+        latent_channels: None,
+        vae_spatial_scale: None,
+        vae_temporal_scale: None,
+        // `model.rs` rejects any load that is not dense bf16, and the backbone computes there.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -684,6 +711,7 @@ fn build_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
@@ -1634,6 +1662,37 @@ mod tests {
         }
         // Per provider: 12 bounded-attention surfaces + 6 deferred rung-4 surfaces, two routes each.
         assert_eq!(executed, 2 * (12 + 6) * 2);
+    }
+
+    /// AC (SC-22662): both registered SenseNova routes publish the axes of the Qwen3 MoT backbone
+    /// they generate through, and pass the shared facts conformance check.
+    ///
+    /// The four latent/VAE axes stay absent for one structural reason: this provider has no
+    /// autoencoder — the FM head emits RGB patches directly.
+    #[test]
+    fn architecture_facts_follow_the_backbone_config_and_declare_no_latent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(32),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(42),
+                    patch_size: None,
+                    latent_channels: None,
+                    vae_spatial_scale: None,
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// A phase-bearing context must be refused, not silently admitted against single-phase

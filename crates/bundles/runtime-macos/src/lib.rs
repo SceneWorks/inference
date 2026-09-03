@@ -153,6 +153,45 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// Epic SC-22657 (E1 + E2), story SC-22662: the registry-wide acceptance skeleton for the MLX
+    /// bundle. Every memory-contract surface this platform registers — every provider, at every
+    /// tier and materialization selector — must publish an honest byte decomposition *and*, when it
+    /// claims a lifecycle-phase formula, at least one declared architecture axis.
+    ///
+    /// The MLX provider crates mirror their reference component `config.json` as Rust constants
+    /// (see `mlx_gen::architecture_facts`), so the architecture axes are published on this
+    /// weights-free surface too; that is why the full `check_memory_contract_facts` gate is
+    /// asserted here rather than only its asset-facts half.
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_memory_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let surfaces = registry.memory_contract_surfaces().unwrap();
+        assert!(
+            !surfaces.is_empty(),
+            "the media registry must publish contract surfaces for this assertion to mean anything"
+        );
+        let mut errors = Vec::new();
+        for surface in &surfaces {
+            if let Err(surface_errors) =
+                gen_core_testkit::check_memory_contract_facts(&surface.contract)
+            {
+                errors.extend(surface_errors.into_iter().map(|error| {
+                    format!(
+                        "{} [{}]: {error}",
+                        surface.contract.provider_id,
+                        surface.selector.id()
+                    )
+                }));
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "macOS registry memory-contract facts conformance FAILED:\n- {}",
+            errors.join("\n- ")
+        );
+    }
+
     #[cfg(feature = "media")]
     #[test]
     fn bundle_exposes_narrow_selected_video_memory_apis() {

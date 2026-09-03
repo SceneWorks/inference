@@ -71,6 +71,33 @@ fn variant_for(provider_id: &str) -> mlx_gen::gen_core::Result<Sd3Variant> {
     }
 }
 
+/// Architecture axes for one SD3.5 variant (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as [`Sd3Arch`] — resolved per variant
+/// by [`Sd3Variant::arch`] — and the reference `vae/config.json` as the `crate::vae` constants, so
+/// those constants are the config every route here is built from. Large and Large-Turbo share the
+/// 38-block MMDiT; Medium is the 24-block MMDiT-X.
+///
+/// `vae_temporal_scale` stays `None`: SD3.5's AutoencoderKL is an image autoencoder with no
+/// temporal axis, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts(variant: Sd3Variant) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let arch = variant.arch();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(arch.num_heads),
+        // Declared directly by the config rather than divided out: `hidden()` IS
+        // `num_heads * head_dim` here, so the quotient would only restate the input.
+        head_dim: mlx_gen::architecture_facts::axis(arch.head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(arch.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(arch.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::vae::SD3_VAE_LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::vae::SD3_VAE_SCALE_FACTOR),
+        vae_temporal_scale: None,
+        // The MMDiT computes f32 activations over its bf16 weights (`transformer.rs`), so 4 is the
+        // activation width even though the checkpoint is 16-bit.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
 fn provider_static(provider_id: &str) -> mlx_gen::gen_core::Result<&'static str> {
     Ok(variant_for(provider_id)?.id())
 }
@@ -104,7 +131,7 @@ fn build_contract(
     calibration: Option<MemoryCalibrationIdentity>,
     footprint: mlx_gen::PerComponentBytes,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    variant_for(provider_id)?;
+    let variant = variant_for(provider_id)?;
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = clean(spec);
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -117,6 +144,7 @@ fn build_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(variant);
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
@@ -491,6 +519,43 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("transformer/config.json"), b"{}").unwrap();
         dir
+    }
+
+    /// AC (SC-22662): each registered SD3.5 route publishes the axes of the MMDiT it actually runs —
+    /// Large and Large-Turbo the 38-block plain MMDiT, Medium the 24-block MMDiT-X — and each
+    /// contract passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_each_variants_own_arch_constants() {
+        let spec = streamable_spec(std::path::Path::new("/nonexistent"));
+        let large = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(38),
+            head_dim: Some(64),
+            transformer_blocks: Some(38),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            // f32 activations over bf16 weights.
+            activation_dtype_width: Some(4),
+        };
+        let medium = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(24),
+            transformer_blocks: Some(24),
+            ..large
+        };
+        for (provider, expected) in [
+            (crate::MODEL_ID, large),
+            (crate::TURBO_MODEL_ID, large),
+            (crate::MEDIUM_MODEL_ID, medium),
+        ] {
+            let contract = weights_free_contract(provider, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{provider} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

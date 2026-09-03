@@ -460,6 +460,34 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
     )
 }
 
+/// Architecture axes for the Krea Realtime 14B route (epic SC-22657, E2).
+///
+/// [`KreaRealtimeConfig::krea_realtime_14b`](crate::config::KreaRealtimeConfig::krea_realtime_14b)
+/// carries `WanModelConfig::wan21_t2v_14b` — Krea Realtime is Wan 2.1 T2V-14B weight for weight —
+/// and `KreaRealtimeConfig::from_model_dir` overlays a snapshot's own `config.json` onto it at load.
+///
+/// The autoencoder is the Wan z16 **video** VAE, so `vae_temporal_scale` is a real value here: four
+/// frames per latent unit over a x8 spatial scale.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = crate::config::KreaRealtimeConfig::krea_realtime_14b().wan;
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // `convert::TRANSFORMER_DTYPE` pins the reused Wan trunk to `Dtype::Bfloat16`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn contract_from_asset_facts(
     spec: &LoadSpec,
     asset_facts: mlx_gen::gen_core::MemoryAssetFacts,
@@ -474,6 +502,7 @@ fn contract_from_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = None;
     contract.asset_facts = asset_facts;
     contract.lifecycle = MemoryLifecycleCapabilities {
@@ -620,6 +649,44 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
 mod tests {
     use super::*;
     use mlx_gen::Quant;
+
+    /// AC (SC-22662): the Krea Realtime contract publishes the axes of the Wan 2.1 T2V-14B trunk
+    /// and z16 video VAE it reuses, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_reused_wan_2_1_config() {
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(40),
+                    // 5120 / 40, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(40),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair IS this provider's assigned VAE geometry.
+        assert_eq!(
+            crate::VAE_TILING.spatial_scale as u32,
+            architecture_facts().vae_spatial_scale.unwrap()
+        );
+        assert_eq!(
+            crate::VAE_TILING.temporal_scale as u32,
+            architecture_facts().vae_temporal_scale.unwrap()
+        );
+    }
 
     fn tensor(path: &Path, bytes: u64, fill: u8) {
         if let Some(parent) = path.parent() {

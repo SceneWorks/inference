@@ -74,6 +74,15 @@ pub fn provider_contract(tier: MemoryNumericTier) -> MemoryProviderContract {
         attention_chunking: false,
         transformer_window_materialization: false,
     };
+    // Epic SC-22657 (E2). InstantID owns no denoiser: it layers an IdentityNet ControlNet and face
+    // IP tokens onto a stock SDXL base, loaded through `mlx_gen_sdxl::load_unet_dtype` with
+    // `UNetConfig::sdxl_base()` and `mlx_gen_sdxl::load_vae`. The axes are therefore the shared SDXL
+    // derivation's, at this crate's own `DTYPE = Dtype::Float16` activation width.
+    contract.architecture_facts = mlx_gen_sdxl::config::architecture_facts(
+        &mlx_gen_sdxl::UNetConfig::sdxl_base(),
+        &mlx_gen_sdxl::VaeConfig::sdxl_base(),
+        mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+    );
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         REQUEST_EVIDENCE_REVISION,
         LoadShape::EagerMaterialization,
@@ -153,6 +162,30 @@ pub fn validate_context(
 mod tests {
     use super::*;
     use mlx_gen::gen_core::{MemoryBehaviorRoute, MemoryStrategy};
+
+    /// AC (SC-22662): InstantID publishes the axes of the SDXL base it layers onto — it owns no
+    /// denoiser of its own — and its contract passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_are_the_shared_sdxl_base_axes() {
+        let contract = provider_contract(dense_numeric_tier());
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                // A conv U-Net has no single head count (5/10/20 across three resolutions) and no
+                // uniform transformer trunk depth; the head WIDTH is uniform and is published.
+                attention_heads: None,
+                head_dim: Some(64),
+                transformer_blocks: None,
+                patch_size: None,
+                latent_channels: Some(4),
+                vae_spatial_scale: Some(8),
+                vae_temporal_scale: None,
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
 
     #[test]
     fn only_resident_and_staged_are_selectable() {

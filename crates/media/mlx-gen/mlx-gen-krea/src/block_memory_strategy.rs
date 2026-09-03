@@ -290,6 +290,32 @@ pub(crate) fn weights_free_memory_strategy_surface_contract(
     )
 }
 
+/// Architecture axes shared by every registered Krea 2 route (epic SC-22657, E2).
+///
+/// [`Krea2Config::turbo`](crate::config::Krea2Config::turbo) is this crate's mirror of the published
+/// `transformer/config.json`, and `Krea2Config::from_snapshot` parses that same file (falling back
+/// to `turbo()` per key) at load; the five routes — Turbo, Raw, the two edit routes and the control
+/// route — run one DiT and one VAE, so they publish one set of axes.
+///
+/// `latent_channels` is [`crate::vae::VAE_CHANNELS`], the decoder's own width; the DiT's
+/// `in_channels` 64 is the 2x2-packed view of it. `vae_temporal_scale` stays `None`: Krea 2 is an
+/// image model whose autoencoder has no temporal axis, and a structurally absent axis is declared
+/// absent, never zero.
+pub(crate) fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::config::Krea2Config::turbo();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::vae::VAE_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::vae::VAE_COMPRESSION),
+        vae_temporal_scale: None,
+        // The loader gates on `Precision::Bf16` and the DiT computes there.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn memory_strategy_contract_with_components(
     provider_id: &str,
     spec: &LoadSpec,
@@ -307,6 +333,7 @@ fn memory_strategy_contract_with_components(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -1588,6 +1615,55 @@ mod tests {
         assert_eq!(
             rung.parameters.transformer_window_components,
             [TransformerComponent::Dit]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// AC (SC-22662): every registered Krea 2 route — the four base routes here and the control
+    /// route in `memory_strategy` — publishes the axes of the one DiT and VAE they share, derived
+    /// from this crate's own config constants, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let expected = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider_id in [
+            crate::model::KREA_2_TURBO_ID,
+            crate::model::KREA_2_RAW_ID,
+            crate::model::KREA_2_EDIT_ID,
+            crate::model::KREA_2_TURBO_EDIT_ID,
+        ] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        let control = crate::memory_strategy::weights_free_memory_strategy_contract(
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(control.architecture_facts, expected, "control route");
+        gen_core_testkit::assert_memory_contract_facts_conform(&control);
+
+        // The DiT's packed input width IS `latent x patch²`, so the two published axes cannot drift
+        // apart from the config they came from.
+        let dit = crate::config::Krea2Config::turbo();
+        assert_eq!(
+            crate::vae::VAE_CHANNELS as usize * dit.patch_size * dit.patch_size,
+            dit.in_channels
         );
         std::fs::remove_dir_all(root).ok();
     }

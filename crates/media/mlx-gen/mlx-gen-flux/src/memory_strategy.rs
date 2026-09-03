@@ -69,6 +69,50 @@ fn is_known_provider(provider_id: &str) -> bool {
     )
 }
 
+/// Latent channels the FLUX.1 autoencoder produces and the DiT consumes.
+///
+/// Not a config field in this crate: it is the shape literal the pack/unpack pair in
+/// [`crate::pipeline`] is written against (`[1, 16, h, w]`). Naming it here keeps the published axis
+/// and that geometry in one place.
+const LATENT_CHANNELS: u32 = 16;
+/// Pixels per latent unit on each spatial axis — the four-stage FLUX.1 AutoencoderKL.
+const VAE_SPATIAL_SCALE: u32 = 8;
+/// The 2x2 latent packing `pipeline::pack_latents` applies before the DiT. Together with
+/// [`VAE_SPATIAL_SCALE`] this is exactly [`crate::SIZE_MULTIPLE`], which the tests pin.
+const LATENT_PATCH_SIZE: u32 = 2;
+
+/// Architecture axes shared by all three registered FLUX.1 routes (epic SC-22657, E2).
+///
+/// The DiT axes are this crate's own transformer constants — `transformer::HEADS`,
+/// `transformer::HEAD_DIM` and `FluxTransformerConfig`, which the loader builds every variant from.
+/// Schnell, Dev and Dev-Control share one DiT and differ only in guidance support and the control
+/// overlay, so they publish one set of axes.
+///
+/// `transformer_blocks` is the **sum** of the joint and single stacks (19 + 38): both are
+/// transformer blocks the denoiser traverses on every step, and publishing only the joint half would
+/// understate the trunk by two thirds.
+///
+/// `vae_temporal_scale` stays `None` — FLUX.1 is an image model whose autoencoder has no temporal
+/// axis, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit =
+        crate::transformer::FluxTransformerConfig::for_variant(crate::config::FluxVariant::Dev);
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(crate::transformer::HEADS),
+        head_dim: mlx_gen::architecture_facts::axis(crate::transformer::HEAD_DIM),
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            dit.num_layers.saturating_add(dit.num_single_layers),
+        ),
+        patch_size: mlx_gen::architecture_facts::axis(LATENT_PATCH_SIZE),
+        latent_channels: mlx_gen::architecture_facts::axis(LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
+        vae_temporal_scale: None,
+        // The DiT's main residual stream is f32; only the modulation path is bf16
+        // (`transformer.rs`), so f32 is the activation width the peak is built on.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
 fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<()> {
     if !is_known_provider(provider_id) {
         return Err(CoreError::Unsupported(format!(
@@ -174,6 +218,7 @@ fn build_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
@@ -766,6 +811,44 @@ mod tests {
 
     fn write_exact_snapshot(root: &std::path::Path, quant: Option<mlx_gen::Quant>) {
         crate::artifact_inventory::write_test_snapshot(root, quant);
+    }
+
+    /// AC (SC-22662): every registered FLUX.1 route publishes the axes of the DiT it runs, derived
+    /// from this crate's own transformer constants, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_constants() {
+        for provider in [
+            crate::FLUX1_SCHNELL_ID,
+            crate::FLUX1_DEV_ID,
+            crate::FLUX1_DEV_CONTROL_ID,
+        ] {
+            let spec = sequential_spec_for(provider);
+            let contract = weights_free_memory_strategy_contract(provider, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    // 19 joint + 38 single blocks.
+                    transformer_blocks: Some(57),
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(4),
+                },
+                "{provider} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
+    /// The published spatial geometry is the one the request validator enforces: the VAE scale times
+    /// the latent packing IS [`crate::SIZE_MULTIPLE`], so neither axis can drift alone.
+    #[test]
+    fn the_published_spatial_axes_multiply_to_the_enforced_size_multiple() {
+        assert_eq!(VAE_SPATIAL_SCALE * LATENT_PATCH_SIZE, crate::SIZE_MULTIPLE);
     }
 
     #[test]

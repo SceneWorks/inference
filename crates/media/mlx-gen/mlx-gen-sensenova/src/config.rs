@@ -58,7 +58,7 @@ impl NeoLlmConfig {
         self.model_type.to_lowercase().contains("moe") || self.num_experts.is_some_and(|n| n > 1)
     }
 
-    fn from_value(v: &Value) -> Self {
+    pub(crate) fn from_value(v: &Value) -> Self {
         Self {
             model_type: get_str(v, "model_type", "qwen3"),
             hidden_size: get_usize(v, "hidden_size", 4096),
@@ -83,6 +83,14 @@ impl NeoLlmConfig {
                 .and_then(Value::as_u64)
                 .map(|n| n as usize),
         }
+    }
+}
+
+impl Default for NeoLlmConfig {
+    /// The dense 8B-MoT backbone this crate ships against: every field falls back to the shipped
+    /// `config.json` value, so this and [`NeoLlmConfig::from_value`] cannot drift apart.
+    fn default() -> Self {
+        Self::from_value(&Value::Null)
     }
 }
 

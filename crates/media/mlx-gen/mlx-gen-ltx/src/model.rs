@@ -191,12 +191,12 @@ pub fn apply_replacement_mask(frame: &Image, mask: &Image, strength: f32) -> Res
 /// Reference text-encoder token budget (`LTX2TextEncoder.encode` default `max_length=1024`).
 const MAX_PROMPT_TOKENS: usize = 1024;
 /// LTX-2 latent channels.
-const LATENT_CHANNELS: i32 = 128;
+pub(crate) const LATENT_CHANNELS: i32 = 128;
 /// Audio latent channels (pre-patchify) and mel bins — the audio latent is `(1, 8, T, 16)`.
 const AUDIO_LATENT_CHANNELS: i32 = 8;
 const AUDIO_MEL_BINS: i32 = 16;
 /// VAE temporal compression (8×): `latent_frames = 1 + (frames − 1) / 8`.
-const TEMPORAL_SCALE: u32 = 8;
+pub(crate) const TEMPORAL_SCALE: u32 = 8;
 /// Upper bound on requested `num_frames` (DoS guard, F-058): `generate` sizes the per-stage noise +
 /// audio buffers directly from the request, so an unbounded `frames` (e.g. a hostile `8_000_001`,
 /// which still satisfies `frames % 8 == 1`) would drive multi-hundred-GB allocations before any
@@ -205,7 +205,7 @@ pub(crate) const MAX_FRAMES: u32 = 1025;
 pub(crate) const MIN_SIZE: u32 = 64;
 pub(crate) const MAX_SIZE: u32 = 1280;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
-const SPATIAL_SCALE: u32 = 32;
+pub(crate) const SPATIAL_SCALE: u32 = 32;
 /// The request width/height multiple `validate_request` enforces: `2 × SPATIAL_SCALE` (= 64).
 /// Stage-1 renders at half resolution (`latent_dims` divides by `2 · SPATIAL_SCALE`), so a request
 /// dimension must be a multiple of *twice* the 32× VAE spatial compression for that division to be

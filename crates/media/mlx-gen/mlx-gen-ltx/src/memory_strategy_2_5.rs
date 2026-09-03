@@ -445,7 +445,9 @@ fn build_contract(
         ));
     }
     Ok(MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        // Shared with the 2.3 route: the measured 2.3 to 2.5 delta is two booleans, not a
+        // dimension, so both routes publish the same axes from one derivation (SC-22662).
+        architecture_facts: crate::memory_strategy::architecture_facts(),
         provider_id: LTX_2_5_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -923,6 +925,37 @@ mod tests {
         file.extend(header);
         file.extend(0_f32.to_le_bytes());
         std::fs::write(path, file).unwrap();
+    }
+
+    /// AC (SC-22662): the LTX-2.5 route publishes the same axes as the 2.3 route — the measured
+    /// delta between them is two booleans, not a dimension — and passes the shared facts check.
+    #[test]
+    fn architecture_facts_match_the_shared_ltx_derivation() {
+        let contract =
+            weights_free_memory_strategy_contract(&spec(LoadShape::EagerMaterialization)).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // The AvDiT has no patchify: `patchify_proj` is a plain Linear over the
+                // 128-channel latent token, and every patch factor lives inside the VAE.
+                patch_size: None,
+                latent_channels: Some(128),
+                vae_spatial_scale: Some(32),
+                // A video autoencoder: eight frames per latent unit.
+                vae_temporal_scale: Some(8),
+                activation_dtype_width: Some(2),
+            },
+            "ltx_2_5 architecture facts"
+        );
+        assert_eq!(
+            contract.architecture_facts,
+            crate::memory_strategy::architecture_facts()
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
     }
 
     #[test]

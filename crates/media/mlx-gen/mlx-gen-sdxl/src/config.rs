@@ -199,9 +199,88 @@ impl DiffusionConfig {
     }
 }
 
+/// Architecture axes for an SDXL-family U-Net + VAE pair (epic SC-22657, E2).
+///
+/// Shared with `mlx-gen-kolors`, which runs this very U-Net and VAE with a wider added-conditioning
+/// projection ([`UNetConfig::kolors`]) — one derivation, so the two crates cannot drift into
+/// publishing different axes for one architecture.
+///
+/// Three axes are declared structurally absent rather than invented:
+///
+/// * `attention_heads` — a conv U-Net has no single "transformer block": SDXL's head count is
+///   5/10/20 across its three resolutions, so no scalar is the honest answer. The *width* is
+///   uniform (320/5 = 640/10 = 1280/20 = 64) and is published instead.
+/// * `transformer_blocks` — likewise: the attention stack is 1/2/10 transformer layers on two of
+///   the three resolutions, mirrored down and up, so there is no uniform trunk depth to declare.
+/// * `patch_size` and `vae_temporal_scale` — a conv U-Net patchifies nothing, and SDXL's
+///   AutoencoderKL is an image autoencoder with no temporal axis.
+pub fn architecture_facts(
+    unet: &UNetConfig,
+    vae: &VaeConfig,
+    activation_dtype_width: u32,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: None,
+        head_dim: uniform_head_dim(unet),
+        transformer_blocks: None,
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels_in),
+        vae_spatial_scale: mlx_gen::architecture_facts::vae_spatial_scale_from_stages(
+            vae.block_out_channels.len(),
+        ),
+        vae_temporal_scale: None,
+        activation_dtype_width: mlx_gen::architecture_facts::axis(activation_dtype_width),
+    }
+}
+
+/// The per-head channel width, published only when every resolution agrees on it.
+fn uniform_head_dim(unet: &UNetConfig) -> Option<u32> {
+    let mut widths = unet
+        .block_out_channels
+        .iter()
+        .zip(unet.num_attention_heads.iter())
+        .map(|(dim, heads)| mlx_gen::architecture_facts::head_dim(*dim, *heads));
+    let first = widths.next()??;
+    widths.all(|width| width == Some(first)).then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC (SC-22662): the SDXL-family axes follow this crate's own config constants, and the axes a
+    /// conv U-Net cannot express stay absent rather than being fabricated.
+    #[test]
+    fn architecture_facts_follow_the_unet_and_vae_constants() {
+        for unet in [UNetConfig::sdxl_base(), UNetConfig::kolors()] {
+            let facts = architecture_facts(&unet, &VaeConfig::sdxl_base(), 2);
+            assert_eq!(
+                facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: None,
+                    head_dim: Some(64),
+                    transformer_blocks: None,
+                    patch_size: None,
+                    latent_channels: Some(4),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                }
+            );
+            assert!(facts.has_snapshot_read_axis());
+            assert!(facts.zero_valued_axes().is_empty());
+        }
+    }
+
+    /// A U-Net whose resolutions disagree on head width has none to publish.
+    #[test]
+    fn a_non_uniform_head_width_declines_the_axis() {
+        let mut unet = UNetConfig::sdxl_base();
+        unet.num_attention_heads = vec![5, 10, 21];
+        assert_eq!(uniform_head_dim(&unet), None);
+        unet.num_attention_heads = vec![5, 8, 20];
+        assert_eq!(uniform_head_dim(&unet), None, "640 / 8 = 80, not 64");
+    }
 
     #[test]
     fn sdxl_unet_dims_match_config_json() {

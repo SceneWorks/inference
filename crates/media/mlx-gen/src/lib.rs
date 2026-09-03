@@ -26,6 +26,9 @@ pub use gen_core::{
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
+// Narrowing helpers for the provider-declared architecture axes (epic SC-22657): shared so a
+// fabricated or zeroed axis cannot appear in one family and not another.
+pub mod architecture_facts;
 pub mod array;
 pub mod asset_facts;
 // Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.

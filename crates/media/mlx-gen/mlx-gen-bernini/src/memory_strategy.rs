@@ -841,6 +841,37 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// them must first show a route where the conditioning phase IS the peak.
 pub const TRANSFORMER_WINDOW_COMPONENTS: &[TransformerComponent] = &[TRANSFORMER_WINDOW_COMPONENT];
 
+/// Architecture axes shared by both registered Bernini routes (epic SC-22657, E2).
+///
+/// Bernini runs the Wan 2.2 T2V-14B trunk, whose dimensions this workspace pins as
+/// [`WanModelConfig::wan22_t2v_14b`]; the loader overlays a snapshot's own `config.json` over that
+/// preset, and [`check_loaded_expert_depth`] already refuses a snapshot whose expert depth
+/// disagrees, so the preset is the config both routes are built from.
+///
+/// `transformer_blocks` is ONE expert's depth, not [`trunk_blocks`]: a denoise step traverses the
+/// low-noise expert or the high-noise one, never both, so 80 would double the trunk an activation
+/// estimate sees. The VAE scales are the provider's own assigned geometry ([`crate::VAE_TILING`]),
+/// which is a **video** autoencoder — hence a real `vae_temporal_scale` here, unlike the image
+/// families.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = WanModelConfig::wan22_t2v_14b();
+    let (_, patch_h, patch_w) = wan.patch_size;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(expert_blocks()),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::VAE_TILING.spatial_scale),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::VAE_TILING.temporal_scale),
+        // The Wan trunk is bf16-native: every matmul runs bf16 over an f32 residual stream.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 /// One Wan expert's block depth, read from the model config rather than written as `40`.
 fn expert_blocks() -> usize {
     WanModelConfig::wan22_t2v_14b().num_layers
@@ -1018,6 +1049,7 @@ fn build_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = calibration;
     // Bernini's shipped default is BOTH experts co-resident, which is exactly what rung 0 means here,
     // so the resident selection preserves the load defaults rather than writing an all-disabled
@@ -2352,6 +2384,44 @@ mod tests {
 
     fn contract(provider_id: &str, shape: LoadShape) -> MemoryProviderContract {
         weights_free_memory_strategy_contract(provider_id, &spec(shape)).expect("contract")
+    }
+
+    /// AC (SC-22662): both registered Bernini routes publish the axes of the Wan A14B trunk and the
+    /// video VAE they run, and pass the shared facts conformance check.
+    ///
+    /// The published `transformer_blocks` is deliberately ONE expert's depth, not the 80-block
+    /// windowing index space: a denoise step traverses one expert.
+    #[test]
+    fn architecture_facts_follow_the_wan_a14b_config_and_the_video_vae() {
+        for provider_id in PROVIDER_IDS {
+            let contract = contract(provider_id, LoadShape::DeferredMaterialization);
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(40),
+                    // 5120 / 40, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(40),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        assert_eq!(
+            contract(FULL_ID, LoadShape::DeferredMaterialization)
+                .architecture_facts
+                .transformer_blocks,
+            Some(expert_blocks() as u32),
+            "the published depth is one expert's, never the 80-block windowing index space"
+        );
     }
 
     /// **The dual-expert invariant (sc-16354).** The trunk rung 4 windows over is BOTH experts in one

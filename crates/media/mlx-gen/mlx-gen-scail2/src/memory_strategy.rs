@@ -669,6 +669,38 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
     gen_core::reject_unknown_components(spec, &[], PROVIDER_ID)
 }
 
+/// Architecture axes for the SCAIL-2 route (epic SC-22657, E2).
+///
+/// [`Scail2Config::scail2_14b`](crate::config::Scail2Config::scail2_14b) wraps
+/// `WanModelConfig::scail2_14b`, this workspace's mirror of the upstream `config-14b.json`, and
+/// `Scail2Config::from_model_dir` overlays a snapshot's own keys onto it at load.
+///
+/// `latent_channels` is `vae_z_dim` (16), NOT the DiT's `in_dim` (20): those four extra channels are
+/// the binary i2v mask concatenated onto the latent, which the autoencoder neither produces nor
+/// consumes. SCAIL-2 decodes through the Wan z16 **video** autoencoder, so `vae_temporal_scale` is a
+/// real value here.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = crate::config::Scail2Config::scail2_14b().wan;
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // SCAIL-2 is the exception in this family: `generate.rs` sets the denoiser's compute dtype
+        // to `Dtype::Float32` unless `SCAIL2_COMPUTE_BF16=1` is set, because the bf16 quantized
+        // matmul overflows to NaN at this route's long sequences (sc-5681).
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -676,7 +708,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(),
         provider_id: PROVIDER_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -902,6 +934,47 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, GenerationRequest, Image, ReplacementMode};
+
+    /// AC (SC-22662): the SCAIL-2 contract publishes the axes of the Wan-derived trunk and the
+    /// z16 video VAE this crate declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_scail2_14b_config() {
+        for surface in resident_surface_specs() {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(40),
+                    // 5120 / 40, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(40),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    // `vae_z_dim`, not the DiT's `in_dim` 20 — those four extra channels are the
+                    // binary i2v mask, which the autoencoder never sees.
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    // f32 by default; bf16 is the `SCAIL2_COMPUTE_BF16=1` opt-in (sc-5681).
+                    activation_dtype_width: Some(4),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair IS this provider's assigned VAE geometry.
+        assert_eq!(
+            crate::VAE_TILING.spatial_scale as u32,
+            architecture_facts().vae_spatial_scale.unwrap()
+        );
+        assert_eq!(
+            crate::VAE_TILING.temporal_scale as u32,
+            architecture_facts().vae_temporal_scale.unwrap()
+        );
+    }
 
     fn image(width: u32, height: u32) -> Image {
         tinted_image(width, height, 7)

@@ -994,13 +994,45 @@ pub fn streamable(spec: &LoadSpec) -> bool {
     resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
 }
 
+/// Architecture axes for the MiniMax-H3 route (epic SC-22657, E2).
+///
+/// [`MiniMaxH3DitConfig::default`](crate::dit::config::MiniMaxH3DitConfig) mirrors the reference
+/// `transformer/config.json`, and `MiniMaxH3DitConfig::from_diffusers_json` parses that same file —
+/// every key required, no defaults — at load, so the two cannot disagree silently.
+///
+/// `head_dim` is the config's declared `attention_head_dim`, not `hidden_size / num_heads`: this DiT
+/// is deliberately non-uniform (`inner_dim` 7168 is wider than `hidden_size` 5376), so the quotient
+/// would be neither integral nor the head width the attention actually uses.
+///
+/// The VAE is a **video** autoencoder: `VAE_RATIO` pixels and `VAE_RATIO_T` frames per latent unit,
+/// so `vae_temporal_scale` is a real value here.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::dit::config::MiniMaxH3DitConfig::default();
+    // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
+    // the temporal factor is already carried by `vae_temporal_scale`.
+    let [_, patch_h, patch_w] = dit.patch_size;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO_T),
+        // `model.rs` loads and runs the DiT at `Dtype::Bfloat16` for every precision but `Fp32`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_contract(
     components: &ComponentBytes,
     load_shape: LoadShape,
     streamable: bool,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
-        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
@@ -1505,6 +1537,32 @@ mod tests {
 
     fn declared() -> MemoryProviderContract {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
+    }
+
+    /// AC (SC-22662): the MiniMax-H3 contract publishes the axes of the DiT and video VAE this crate
+    /// declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let contract = declared();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(56),
+                // The config's declared head width. `hidden_size` 5376 / 56 is NOT it: this DiT's
+                // `inner_dim` (7168) is deliberately wider than its `hidden_size`.
+                head_dim: Some(128),
+                transformer_blocks: Some(50),
+                // `patch_size` is `[1, 2, 2]`: the square spatial patch is 2.
+                patch_size: Some(2),
+                latent_channels: Some(24),
+                vae_spatial_scale: Some(16),
+                // A video autoencoder: four frames per latent unit.
+                vae_temporal_scale: Some(4),
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
     }
 
     fn support(
