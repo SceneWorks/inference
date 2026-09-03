@@ -130,13 +130,64 @@ impl CheckpointInventory {
         Ok(())
     }
 
-    fn bytes(&self) -> u64 {
-        self.files
-            .iter()
-            .filter_map(|(path, _)| std::fs::metadata(path).ok())
-            .fold(0_u64, |total, metadata| {
-                total.saturating_add(metadata.len())
-            })
+    /// Load-exact per-component bytes, split by the tensor keys the loader actually routes.
+    ///
+    /// SenseNova is one fused Mixture-of-Transformers checkpoint, but it is NOT one component:
+    /// every block carries an *understanding* path (`self_attn.{q,k,v,o}_proj`, `mlp`, plain norms)
+    /// and a *generation* path (the `_mot_gen` twins), and `Qwen3Backbone::from_weights_with_deferred_gen`
+    /// keeps only the former resident between windows. Publishing `conditioning = transformer =
+    /// whole checkpoint` (the previous shape) double-counted every byte and let no consumer tell the
+    /// two paths apart, so a windowed rung was priced as if the full checkpoint stayed resident.
+    ///
+    /// * `conditioning_bytes` — the understanding path: non-`_mot_gen` block tensors, the shared
+    ///   `embed_tokens` / `lm_head` / final `norm`, and the `vision_model` encoder. This is exactly the
+    ///   set a deferred-generation load keeps resident.
+    /// * `transformer_bytes` — the generation path: every `_mot_gen` tensor plus `fm_modules.*`
+    ///   (timestep / noise-scale embedders and the flow-matching head).
+    /// * `decoder_bytes` — zero, and honestly so: the FM head emits RGB patches, there is no VAE and
+    ///   the contract declares no decode phase.
+    ///
+    /// Sums tensor DATA bytes from the shard headers, so packed tiers count their `.scales` /
+    /// `.biases` alongside their codes, and an unrecognised key fails closed rather than being
+    /// silently folded into either path.
+    pub(crate) fn asset_facts(&self) -> gen_core::Result<MemoryAssetFacts> {
+        let mut conditioning_bytes = 0_u64;
+        let mut transformer_bytes = 0_u64;
+        for (path, _) in &self.files {
+            for header in gen_core::weightsmeta::safetensors_path_tensor_headers(path)? {
+                let bucket = match asset_component(&header.name) {
+                    Some(AssetComponent::Understanding) => &mut conditioning_bytes,
+                    Some(AssetComponent::Generation) => &mut transformer_bytes,
+                    None => {
+                        return Err(gen_core::Error::Unsupported(format!(
+                            "sensenova: cannot attribute tensor {} in {} to the understanding or \
+                             generation path",
+                            header.name,
+                            path.display()
+                        )));
+                    }
+                };
+                *bucket = bucket.checked_add(header.data_bytes).ok_or_else(|| {
+                    gen_core::Error::Unsupported(
+                        "sensenova: component byte total overflows u64".to_owned(),
+                    )
+                })?;
+            }
+        }
+        let base_bytes = conditioning_bytes
+            .checked_add(transformer_bytes)
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(
+                    "sensenova: base model byte total overflows u64".to_owned(),
+                )
+            })?;
+        Ok(MemoryAssetFacts {
+            base_bytes,
+            conditioning_bytes,
+            transformer_bytes,
+            decoder_bytes: 0,
+            overlay_bytes: 0,
+        })
     }
 
     pub(crate) fn validate_numeric_tier(&self, spec: &LoadSpec) -> gen_core::Result<()> {
@@ -183,6 +234,36 @@ impl CheckpointInventory {
             }
         }
         self.ensure_unchanged()
+    }
+}
+
+/// Which resident set a checkpoint tensor belongs to; see [`CheckpointInventory::asset_facts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssetComponent {
+    /// Understanding path, shared embeddings/head/norm, vision encoder.
+    Understanding,
+    /// Generation path (`_mot_gen`) and the flow-matching modules.
+    Generation,
+}
+
+/// Attribute one tensor key. `None` for a key outside the checkpoint layout the loader knows
+/// (`language_model.*`, `vision_model.*`, `fm_modules.*`), so a new top-level family cannot be
+/// priced by accident.
+fn asset_component(name: &str) -> Option<AssetComponent> {
+    if name.starts_with("fm_modules.") {
+        return Some(AssetComponent::Generation);
+    }
+    if name.starts_with("vision_model.") {
+        return Some(AssetComponent::Understanding);
+    }
+    let rest = name.strip_prefix("language_model.")?;
+    // `_mot_gen` marks every generation-path tensor, whether it is a projection
+    // (`q_proj_mot_gen`), an MLP (`mlp_mot_gen.up_proj`), a norm (`input_layernorm_mot_gen`,
+    // `q_norm_hw_mot_gen`) or the final `model.norm_mot_gen`.
+    if rest.contains("_mot_gen") {
+        Some(AssetComponent::Generation)
+    } else {
+        Some(AssetComponent::Understanding)
     }
 }
 
@@ -418,15 +499,14 @@ pub(crate) fn provider_contract(
         WeightsSource::Dir(root) if root.is_dir() => Some(CheckpointInventory::capture(root)?),
         _ => None,
     };
-    if let Some(inventory) = &inventory {
-        inventory.validate_numeric_tier(spec)?;
-    }
-    Ok(build_contract(
-        provider_id,
-        spec,
-        inventory.as_ref().map_or(0, CheckpointInventory::bytes),
-        None,
-    ))
+    let facts = match &inventory {
+        Some(inventory) => {
+            inventory.validate_numeric_tier(spec)?;
+            inventory.asset_facts()?
+        }
+        None => MemoryAssetFacts::default(),
+    };
+    Ok(build_contract(provider_id, spec, facts, None))
 }
 
 pub(crate) fn weights_free_contract(
@@ -437,7 +517,7 @@ pub(crate) fn weights_free_contract(
     Ok(build_contract(
         provider_id,
         spec,
-        0,
+        MemoryAssetFacts::default(),
         Some(MemoryCalibrationIdentity::new(
             CALIBRATION_FINGERPRINT,
             spec.load_shape,
@@ -448,7 +528,7 @@ pub(crate) fn weights_free_contract(
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
-    base_bytes: u64,
+    asset_facts: MemoryAssetFacts,
     calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     let streamable = streamable_spec(provider_id, spec);
@@ -525,13 +605,7 @@ fn build_contract(
             ],
         },
         calibration,
-        asset_facts: MemoryAssetFacts {
-            base_bytes,
-            conditioning_bytes: base_bytes,
-            transformer_bytes: base_bytes,
-            decoder_bytes: 0,
-            overlay_bytes: 0,
-        },
+        asset_facts,
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     }
 }
@@ -843,6 +917,128 @@ mod tests {
             |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
         );
         std::fs::write(root.join("config.json"), config).unwrap();
+    }
+
+    /// The fused checkpoint is priced as TWO resident sets, split by the keys the loader routes,
+    /// never as one number stamped into every field. The synthetic layout mirrors the real
+    /// `SenseNova-U1-8B` header: understanding twins, `_mot_gen` twins, shared embeddings, the
+    /// vision encoder and the FM modules.
+    #[test]
+    fn asset_facts_split_understanding_and_generation_paths_by_tensor_key() {
+        let root = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let bf16 = |rows: usize, cols: usize| Tensor::zeros((rows, cols), DType::BF16, &device);
+        let tensors = HashMap::from([
+            // understanding path: 2 * 64 * 2 B = 256 B each
+            (
+                "language_model.model.layers.0.self_attn.k_proj.weight".to_owned(),
+                bf16(2, 64).unwrap(),
+            ),
+            (
+                "language_model.model.layers.0.mlp.up_proj.weight".to_owned(),
+                bf16(2, 64).unwrap(),
+            ),
+            (
+                "language_model.model.layers.0.input_layernorm.weight".to_owned(),
+                bf16(1, 64).unwrap(),
+            ),
+            (
+                "language_model.model.embed_tokens.weight".to_owned(),
+                bf16(4, 64).unwrap(),
+            ),
+            (
+                "language_model.lm_head.weight".to_owned(),
+                bf16(4, 64).unwrap(),
+            ),
+            (
+                "language_model.model.norm.weight".to_owned(),
+                bf16(1, 64).unwrap(),
+            ),
+            (
+                "vision_model.embeddings.patch_embedding.weight".to_owned(),
+                bf16(1, 64).unwrap(),
+            ),
+            // generation path
+            (
+                "language_model.model.layers.0.self_attn.k_proj_mot_gen.weight".to_owned(),
+                bf16(2, 64).unwrap(),
+            ),
+            (
+                "language_model.model.layers.0.mlp_mot_gen.up_proj.weight".to_owned(),
+                bf16(2, 64).unwrap(),
+            ),
+            (
+                "language_model.model.layers.0.self_attn.q_norm_hw_mot_gen.weight".to_owned(),
+                bf16(1, 64).unwrap(),
+            ),
+            (
+                "language_model.model.norm_mot_gen.weight".to_owned(),
+                bf16(1, 64).unwrap(),
+            ),
+            (
+                "fm_modules.timestep_embedder.0.weight".to_owned(),
+                bf16(3, 64).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, root.path().join("model.safetensors"))
+            .unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+
+        let facts = CheckpointInventory::capture(root.path())
+            .unwrap()
+            .asset_facts()
+            .unwrap();
+        let row = 64 * 2; // one bf16 row of 64
+        let understanding = (2 + 2 + 1 + 4 + 4 + 1 + 1) * row;
+        let generation = (2 + 2 + 1 + 1 + 3) * row;
+        assert_eq!(
+            facts,
+            MemoryAssetFacts {
+                base_bytes: understanding + generation,
+                conditioning_bytes: understanding,
+                transformer_bytes: generation,
+                decoder_bytes: 0,
+                overlay_bytes: 0,
+            }
+        );
+        // The split is the loader's routing rule, not a substring accident on the layer index.
+        assert_eq!(
+            asset_component("language_model.model.layers.10.self_attn.o_proj.weight"),
+            Some(AssetComponent::Understanding)
+        );
+        assert_eq!(
+            asset_component("language_model.model.layers.10.self_attn.o_proj_mot_gen.weight"),
+            Some(AssetComponent::Generation)
+        );
+        assert_eq!(asset_component("unexpected.weight"), None);
+    }
+
+    /// A tensor outside the known layout fails closed instead of being folded into either path.
+    #[test]
+    fn asset_facts_refuse_an_unattributable_tensor() {
+        let root = tempfile::tempdir().unwrap();
+        let tensors = HashMap::from([
+            (
+                "language_model.model.layers.0.self_attn.k_proj.weight".to_owned(),
+                Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+            (
+                "new_family.weight".to_owned(),
+                Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, root.path().join("model.safetensors"))
+            .unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+        let error = CheckpointInventory::capture(root.path())
+            .unwrap()
+            .asset_facts()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot attribute tensor new_family.weight"),
+            "{error}"
+        );
     }
 
     #[test]
