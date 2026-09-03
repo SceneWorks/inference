@@ -87,8 +87,11 @@ impl NeoLlmConfig {
 }
 
 impl Default for NeoLlmConfig {
-    /// The dense 8B-MoT backbone this crate ships against: every field falls back to the shipped
-    /// `config.json` value, so this and [`NeoLlmConfig::from_value`] cannot drift apart.
+    /// The dense 8B-MoT backbone this crate ships against.
+    ///
+    /// Every field falls back to the shipped `config.json` value because this resolves through the
+    /// very same crate-private `from_value` parser [`NeoChatConfig::from_dir`] uses at load, so the
+    /// preset and a parsed snapshot config cannot drift apart.
     fn default() -> Self {
         Self::from_value(&Value::Null)
     }
