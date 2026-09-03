@@ -2061,6 +2061,7 @@ mod tests {
                     ),
                     spec.load_shape,
                 )),
+                0,
             )
             .unwrap();
             let fixtures = registered_klein_fixture(
