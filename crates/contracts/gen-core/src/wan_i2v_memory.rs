@@ -1080,17 +1080,41 @@ fn physical_resident_bytes(
     tier: MemoryNumericTier,
     phase: MemoryPhase,
 ) -> crate::Result<u64> {
-    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) && phase == MemoryPhase::Denoise {
         // VACE's public q4/q8 tiers are selected at load but materialized from the sealed dense
         // diffusers transformer after adapter folding. Charge the complete dense construction
         // surface rather than pretending the on-disk artifact is prepacked.
+        //
+        // SC-22667: this arm is scoped to the **denoise** component, which is the only one the
+        // sentence above is about. It used to return for every phase of a VACE route, which routed
+        // the route's decoder past the `Decode` arm below and priced a VAE that `model_vace.rs` /
+        // `model_vace_fun.rs` open at `VAE_DTYPE = DType::F32` as if it were materialized bf16 —
+        // half the bytes the render actually holds.
         return projected_dense_bytes(path, 2);
     }
     match (phase, tier.quant) {
         (MemoryPhase::Denoise, Some(quant)) => packed_transformer_bytes(path, quant, backend),
+        // The UMT5 encoder is packed at load on every MLX-affine quantized tier (sc-12831): the
+        // seven attention/FFN projections per block go to the Q8 floor `model::effective_te_quant`
+        // resolves, while the token embedding, the per-block norms and position-bias tables and the
+        // final norm stay dense. Charging the dense bf16 projection stack here — which is what the
+        // `_` arm below did — over-declared the largest staged component of the 5B and 14B routes
+        // by the whole packing win (measured 11.83 -> 7.72 GiB on the 5B).
+        (MemoryPhase::Conditioning, Some(quant))
+            if backend == WanI2vBackend::Mlx && matches!(quant, Quant::Q4 | Quant::Q8) =>
+        {
+            mlx_text_encoder_bytes(path, Some(MLX_TE_QUANT_BITS))
+        }
+        // The dense MLX tier keeps the seven projections bf16, but `Umt5Block::from_weights` and
+        // `assemble` upcast the same leaves on BOTH paths (`text_encoder.rs`: `norm1`, `norm2`, the
+        // per-layer `pos_embedding` table and the final `norm` are `as_dtype(Float32)` regardless of
+        // quant), so the dense arm prices those four leaves f32 too (SC-22667 review).
+        (MemoryPhase::Conditioning, None) if backend == WanI2vBackend::Mlx => {
+            mlx_text_encoder_bytes(path, None)
+        }
         (MemoryPhase::Decode, _) => projected_dense_bytes(
             path,
-            if backend == WanI2vBackend::Candle && route == WanI2vRoute::Ti2v5b {
+            if backend == WanI2vBackend::Candle && candle_decodes_f32(route) {
                 4
             } else {
                 2
@@ -1098,6 +1122,148 @@ fn physical_resident_bytes(
         ),
         _ => projected_dense_bytes(path, 2),
     }
+}
+
+/// Whether the **candle** provider for `route` opens its video autoencoder f32.
+///
+/// Three of the four do — `lib.rs` (TI2V-5B), `model_vace.rs` and `model_vace_fun.rs` all pin
+/// `VAE_DTYPE = DType::F32` — while `wan14b.rs` pins bf16 for the I2V-14B route (sc-12818). The
+/// split is per crate module rather than per family, so it is enumerated rather than derived.
+fn candle_decodes_f32(route: WanI2vRoute) -> bool {
+    match route {
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => true,
+        WanI2vRoute::I2v14b => false,
+    }
+}
+
+/// The width `mlx_gen_wan::model::effective_te_quant` floors the UMT5 encoder to whenever the DiT
+/// is on an MLX-affine quantized tier. It is deliberately **not** the DiT's own width: Q4 costs the
+/// encoder measurable prompt fidelity, so the encoder floors at Q8 for a Q4 DiT as well.
+const MLX_TE_QUANT_BITS: u64 = 8;
+
+/// MLX affine group size, the same 64 [`packed_transformer_bytes`] assumes.
+const MLX_GROUP: u64 = 64;
+
+/// Bytes the MLX loader materializes for the UMT5 text encoder — packed to `packed_bits` on a
+/// quantized tier, dense bf16 projections on the dense tier (`None`).
+///
+/// `mlx_gen_wan::text_encoder` packs exactly the seven bias-less projections of each block —
+/// `attn.{q,k,v,o}` and `ffn.{gate_proj,fc1,fc2}` — into an MLX affine triple on a quantized tier,
+/// and leaves everything else dense. The families are priced separately because they materialize at
+/// different widths, and the f32 family does so **on both tiers** (`Umt5Block::from_weights` and
+/// `assemble` upcast unconditionally, before `quantize` runs):
+///
+/// * a packed `[out, in]` projection becomes `out * in * bits / 8` code bytes plus a `scales` and a
+///   `biases` plane of `out * in / group` elements each, at the source tensor's own width; on the
+///   dense tier the same projection is the shared `quant::lin` dense arm — its stored bf16 bytes;
+/// * the per-block norms, the position-bias tables and the final `norm.weight` are upcast to **f32**
+///   by the loader (`as_dtype(Dtype::Float32)`), so they are priced at 4 bytes per element rather
+///   than at their stored bf16 width — on the dense tier as much as on a packed one;
+/// * `token_embedding.weight` is cloned as stored — the loader never casts it — so it contributes
+///   its stored bytes.
+///
+/// On a quantized tier this fails closed on any key outside those families, and on a packed
+/// projection whose input width is not a whole number of groups: either means the encoder layout
+/// moved and this pricing no longer describes what loads. The dense tier has no packing geometry to
+/// get wrong, so a leaf outside the families keeps the `projected_dense_bytes(path, 2)` treatment
+/// it always had (float at 2 B per element; packed/non-float storage refused).
+fn mlx_text_encoder_bytes(path: &Path, packed_bits: Option<u64>) -> crate::Result<u64> {
+    const PACKED_LEAVES: [&str; 7] = [
+        ".attn.q.weight",
+        ".attn.k.weight",
+        ".attn.v.weight",
+        ".attn.o.weight",
+        ".ffn.gate_proj.weight",
+        ".ffn.fc1.weight",
+        ".ffn.fc2.weight",
+    ];
+    const F32_LEAVES: [&str; 3] = [
+        ".norm1.weight",
+        ".norm2.weight",
+        ".pos_embedding.embedding.weight",
+    ];
+
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} contains no tensors",
+            path.display()
+        )));
+    }
+    headers.iter().try_fold(0_u64, |sum, header| {
+        let name = header.name.as_str();
+        let projection =
+            name.starts_with("blocks.") && PACKED_LEAVES.iter().any(|leaf| name.ends_with(leaf));
+        let bytes = if let (true, Some(bits)) = (projection, packed_bits) {
+            let [out, input] = header.shape[..] else {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} packed projection {name} is not a 2-D weight",
+                    path.display()
+                )));
+            };
+            let (out, input) = (out as u64, input as u64);
+            if input == 0 || !input.is_multiple_of(MLX_GROUP) {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} projection {name} has {input} input columns, not a whole number of \
+                     {MLX_GROUP}-wide affine groups",
+                    path.display()
+                )));
+            }
+            let elements = tensor_elements(path, header)?;
+            let codes = elements
+                .checked_mul(bits)
+                .and_then(|bits| bits.checked_div(8))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder code bytes overflow".to_owned())
+                })?;
+            // One `scales` and one `biases` plane, each `[out, input / group]` at the source width.
+            let planes = out
+                .checked_mul(input / MLX_GROUP)
+                .and_then(|entries| entries.checked_mul(2))
+                .and_then(|entries| entries.checked_mul(header.dtype.size() as u64))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder scale bytes overflow".to_owned())
+                })?;
+            codes.checked_add(planes).ok_or_else(|| {
+                crate::Error::Msg("Wan packed encoder projection bytes overflow".to_owned())
+            })?
+        } else if projection {
+            // The dense tier: `quant::lin`'s dense arm loads the projection as stored (bf16).
+            header.data_bytes
+        } else if name == "norm.weight"
+            || (name.starts_with("blocks.") && F32_LEAVES.iter().any(|leaf| name.ends_with(leaf)))
+        {
+            tensor_elements(path, header)?
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan encoder f32 tensor bytes overflow".to_owned())
+                })?
+        } else if name == "token_embedding.weight" {
+            header.data_bytes
+        } else if packed_bits.is_none() {
+            // The dense tier has no packing geometry to get wrong, so a leaf outside the named
+            // families is what `projected_dense_bytes(path, 2)` always made of it: a float tensor
+            // at 2 B per element, and a refusal for packed/non-float storage.
+            if !header.is_float() || name.ends_with(".scales") || name.ends_with(".biases") {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} dense tensor {name} has unsupported packed/non-float storage",
+                    path.display()
+                )));
+            }
+            tensor_elements(path, header)?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan projected tensor bytes overflow".to_owned())
+                })?
+        } else {
+            return Err(crate::Error::Unsupported(format!(
+                "{} encoder tensor {name} is outside the packed UMT5 key surface",
+                path.display()
+            )));
+        };
+        sum.checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan encoder byte total overflow".to_owned()))
+    })
 }
 
 fn adapter_receipts(
@@ -2635,6 +2801,56 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Write a structurally real converted `t5_encoder.safetensors` (SC-22667).
+    ///
+    /// The MLX loader packs exactly the seven bias-less projections of each block and leaves the
+    /// token embedding, the per-block norms and position-bias tables and the final norm dense, so a
+    /// fixture carrying a single tensor named `weight` cannot exercise
+    /// [`mlx_text_encoder_bytes`] at all — every arm it distinguishes needs its own key.
+    /// `dim` is a whole number of MLX affine groups, as the real encoder's is.
+    fn write_umt5_encoder(path: &Path, blocks: usize, dim: usize) {
+        let square = vec![dim, dim];
+        let vector = vec![dim];
+        let mut owned: Vec<(String, &str, Vec<usize>)> = vec![
+            (
+                "token_embedding.weight".to_owned(),
+                "BF16",
+                vec![dim * 4, dim],
+            ),
+            ("norm.weight".to_owned(), "BF16", vector.clone()),
+        ];
+        for block in 0..blocks {
+            for leaf in [
+                "attn.q",
+                "attn.k",
+                "attn.v",
+                "attn.o",
+                "ffn.gate_proj",
+                "ffn.fc1",
+                "ffn.fc2",
+            ] {
+                owned.push((
+                    format!("blocks.{block}.{leaf}.weight"),
+                    "BF16",
+                    square.clone(),
+                ));
+            }
+            for leaf in ["norm1.weight", "norm2.weight"] {
+                owned.push((format!("blocks.{block}.{leaf}"), "BF16", vector.clone()));
+            }
+            owned.push((
+                format!("blocks.{block}.pos_embedding.embedding.weight"),
+                "BF16",
+                vec![32, 8],
+            ));
+        }
+        let tensors = owned
+            .iter()
+            .map(|(name, dtype, shape)| (name.as_str(), *dtype, shape.as_slice()))
+            .collect::<Vec<_>>();
+        write_safetensors(path, &tensors);
+    }
+
     fn mlx_fixture(route: WanI2vRoute, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
         let tmp = tempfile::tempdir().unwrap();
         let tier = MemoryNumericTier {
@@ -2691,6 +2907,8 @@ mod tests {
                         ("proj.biases", "BF16", &[logical, 1]),
                     ],
                 );
+            } else if name == "t5_encoder.safetensors" {
+                write_umt5_encoder(&root.join(name), logical, 64);
             } else {
                 write_safetensors(&root.join(name), &[("weight", "BF16", &[logical, 64])]);
             }
@@ -2791,10 +3009,7 @@ mod tests {
                     &root.join("transformer/model.safetensors"),
                     &[("blocks.0.self_attn.to_q.weight", "BF16", &[8, 8])],
                 );
-                write_safetensors(
-                    &root.join("t5_encoder.safetensors"),
-                    &[("weight", "BF16", &[4, 4])],
-                );
+                write_umt5_encoder(&root.join("t5_encoder.safetensors"), 1, 64);
                 write_safetensors(
                     &root.join("vae.safetensors"),
                     &[("weight", "BF16", &[4, 4])],
@@ -3531,6 +3746,94 @@ mod tests {
         )
         .expect("the production worker selects a prepacked MLX q4 directory with quantize=None");
         assert_eq!(prepared.tier.quant, Some(Quant::Q4));
+    }
+
+    /// Feature-end review (SC-22667, E1). `mlx_gen_wan::text_encoder` packs the UMT5 encoder's seven
+    /// bias-less projections per block to the Q8 floor on **every** MLX-affine quantized tier, and
+    /// the sealed receipt must charge the packed encoder rather than the dense bf16 stack it was
+    /// built from — the largest staged component of both the 5B and 14B routes.
+    ///
+    /// The expected total is spelled out from the fixture's own geometry rather than captured, so
+    /// the test is an oracle and not a snapshot. Mutations that fail this: restoring the single
+    /// `_ => projected_dense_bytes(path, 2)` arm for the quantized `MemoryPhase::Conditioning`
+    /// case, which reports the 439_680 B shard sum on the quantized assertions; and dropping the
+    /// dense-MLX conditioning arm (SC-22667 review), which reports that same 439_680 B on the dense
+    /// assertion instead of the 445_184 B the f32 leaf upcasts make it.
+    #[test]
+    fn the_mlx_encoder_is_charged_packed_on_every_quantized_tier() {
+        // `write_umt5_encoder(_, blocks = 7, dim = 64)`, Q8 at MLX group 64:
+        //   token embedding  [256, 64] bf16, cloned as stored              = 32_768
+        //   final norm       [64]      upcast f32                          =    256
+        //   per block:  7 projections [64, 64]
+        //                 codes  4096 * 8 / 8                              =  4_096
+        //                 scales+biases  64 * (64/64) * 2 planes * 2 B     =    256
+        //               2 norms [64] upcast f32                            =    512
+        //               pos-bias [32, 8] upcast f32                        =  1_024
+        //                                                       per block  = 32_000
+        const PACKED_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * 32_000;
+        // The dense tier (SC-22667 review): the seven projections stay bf16 as stored
+        // (7 * 4096 * 2 = 57_344 per block), but `Umt5Block::from_weights` / `assemble` upcast the
+        // same leaves on this path too — the final norm (256), the two block norms (512) and the
+        // pos-bias table (1_024) — so the dense figure is NOT the plain bf16 shard sum
+        // (32_768 + 128 + 7 * 58_112 = 439_680); it is 445_184.
+        const DENSE_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * (57_344 + 512 + 1_024);
+
+        let mut dense_conditioning = 0;
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::I2v14b] {
+            for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+                let (_tmp, spec) = mlx_fixture(route, quant);
+                let prepared =
+                    PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, route.provider_id())
+                        .unwrap();
+                let conditioning = prepared.contract.asset_facts.conditioning_bytes;
+                match quant {
+                    // Q4 and Q8 agree: `effective_te_quant` floors the encoder at Q8 for both.
+                    Some(_) => assert_eq!(
+                        conditioning, PACKED_ENCODER_BYTES,
+                        "{route:?} {quant:?} conditioning"
+                    ),
+                    None => {
+                        assert_eq!(
+                            conditioning, DENSE_ENCODER_BYTES,
+                            "{route:?} dense conditioning"
+                        );
+                        dense_conditioning = conditioning;
+                    }
+                }
+            }
+        }
+        assert!(
+            PACKED_ENCODER_BYTES < dense_conditioning,
+            "packing the encoder must reduce its charged residency"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1). Both candle VACE routes open their video autoencoder at
+    /// `VAE_DTYPE = DType::F32` (`model_vace.rs`, `model_vace_fun.rs`), so the sealed decoder bytes
+    /// are four per stored bf16 element, not two.
+    ///
+    /// Mutation that fails this: widening the VACE early return in `physical_resident_bytes` back to
+    /// every phase, which routes the decoder past the `Decode` arm and halves this number.
+    #[test]
+    fn candle_vace_decodes_f32_and_is_charged_at_that_width() {
+        for route in [WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let (_tmp, spec) = vace_route_fixture(WanI2vBackend::Candle, None, route);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, route.provider_id())
+                    .unwrap();
+            // The fixture's `vae/model.safetensors` is one bf16 [4, 4] tensor: 16 elements.
+            assert_eq!(
+                prepared.contract.asset_facts.decoder_bytes,
+                16 * 4,
+                "{route:?} decoder is materialized f32"
+            );
+            // The conditioning encoder and the transformer stay bf16 on this route.
+            assert_eq!(
+                prepared.contract.asset_facts.conditioning_bytes,
+                16 * 2,
+                "{route:?} conditioning is materialized bf16"
+            );
+        }
     }
 
     #[test]

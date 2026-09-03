@@ -228,10 +228,11 @@ pub use tiling::{TilingConfig, VaeTiling};
 pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
-    read_safetensors_tensor_payloads, safetensors_dir_bytes, safetensors_file_metadata,
-    safetensors_file_tensor_locations, safetensors_path_bytes,
-    safetensors_path_quantization_metadata, safetensors_path_tensor_headers, SafetensorsFileLayout,
-    SafetensorsTensorHeader, SafetensorsTensorLocation,
+    materialized_header_bytes, materialized_path_bytes, read_safetensors_tensor_payloads,
+    safetensors_dir_bytes, safetensors_file_metadata, safetensors_file_tensor_locations,
+    safetensors_path_bytes, safetensors_path_quantization_metadata,
+    safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
+    SafetensorsTensorLocation,
 };
 // The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
 // candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the
