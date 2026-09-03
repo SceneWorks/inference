@@ -70,6 +70,7 @@ pub use captioner::{
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
 };
 pub use memory_strategy::{
+    assert_memory_contract_facts_conform, check_memory_contract_facts,
     check_memory_contract_surface_registry, check_memory_strategy_contract,
     check_memory_strategy_registry, memory_contract_surface_registry_conformance,
     memory_strategy_conformance, memory_strategy_registry_conformance,

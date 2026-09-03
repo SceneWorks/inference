@@ -676,6 +676,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: PROVIDER_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,

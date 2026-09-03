@@ -503,6 +503,7 @@ fn memory_strategy_contract_with_asset_facts(
         }
     };
     Ok(MemoryProviderContract {
+        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // Unified memory: the wired-residency budget is what the staged phases release, weights

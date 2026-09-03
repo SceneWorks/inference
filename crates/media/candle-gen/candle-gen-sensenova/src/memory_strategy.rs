@@ -572,6 +572,7 @@ fn build_contract(
     // envelope used for admission accounting.
     let formula_phases = vec![MemoryPhase::Conditioning, MemoryPhase::Denoise];
     MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

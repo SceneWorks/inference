@@ -1843,6 +1843,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     // real imported-file run is measured rather than silently relabeling Dir evidence.
     let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

@@ -50,6 +50,81 @@ pub(crate) const CALIBRATION_FINGERPRINT: &str =
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
+/// Activation dtype the loaded Z-Image pipeline computes in. `lib.rs` pins `DType::BF16`
+/// unconditionally ("Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype"),
+/// so this is the provider's real activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Read one component `config.json` from a snapshot root. A missing or unparseable file is not an
+/// error: the contract is constructible before any asset exists on disk, and every architecture
+/// axis it feeds is `Option`.
+fn component_config(root: &std::path::Path, component: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(root.join(component).join("config.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Narrow a JSON number to a declared architecture axis. Zero and out-of-range values are rejected
+/// rather than published: no axis here has a legitimate zero, and `Some(0)` would silently zero any
+/// activation estimate that multiplied by it (E2).
+fn axis(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = u32::try_from(value?.as_u64()?).ok()?;
+    (value != 0).then_some(value)
+}
+
+/// Snapshot-read architecture facts for the Z-Image routes.
+///
+/// The DiT axes come from `<root>/transformer/config.json` (`n_heads`, `dim`, `n_layers`,
+/// `all_patch_size`, `in_channels`) and the decoder axes from `<root>/vae/config.json`
+/// (`latent_channels`, `block_out_channels`). Nothing is inferred from the model id, so a snapshot
+/// whose config disagrees with the reference Turbo config publishes what it actually says.
+///
+/// `vae_temporal_scale` stays `None`: Z-Image ships the FLUX.1 image AutoencoderKL, which has no
+/// temporal axis at all. A structurally absent axis is declared absent, never zero (E2).
+///
+/// A weights-free contract — no snapshot directory, or a single-file ComfyUI import that carries no
+/// component configs — publishes `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let dit = component_config(root, "transformer");
+    let vae = component_config(root, "vae");
+    if dit.is_none() && vae.is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let attention_heads = axis(dit.as_ref().and_then(|dit| dit.get("n_heads")));
+    let hidden_dim = axis(dit.as_ref().and_then(|dit| dit.get("dim")));
+    // Z-Image's DiT is uniform-head: `dim` is exactly `n_heads * head_dim`. Publishing the quotient
+    // only when it divides evenly keeps a non-uniform snapshot from claiming a head width it lacks.
+    let head_dim = match (hidden_dim, attention_heads) {
+        (Some(dim), Some(heads)) if dim % heads == 0 => Some(dim / heads),
+        _ => None,
+    };
+    let vae_spatial_scale = vae
+        .as_ref()
+        .and_then(|vae| vae.get("block_out_channels"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|stages| u32::try_from(stages.len()).ok())
+        // Each stage after the first halves both spatial axes: four stages give the x8 scale.
+        .and_then(|stages| stages.checked_sub(1))
+        .map(|downsamples| 1_u32 << downsamples.min(31));
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        head_dim,
+        transformer_blocks: axis(dit.as_ref().and_then(|dit| dit.get("n_layers"))),
+        patch_size: axis(
+            dit.as_ref()
+                .and_then(|dit| dit.get("all_patch_size"))
+                .and_then(|patch| patch.get(0)),
+        ),
+        latent_channels: axis(dit.as_ref().and_then(|dit| dit.get("in_channels")))
+            .or_else(|| axis(vae.as_ref().and_then(|vae| vae.get("latent_channels")))),
+        vae_spatial_scale,
+        vae_temporal_scale: None,
+        activation_dtype_width: u32::try_from(ACTIVATION_DTYPE.size_in_bytes()).ok(),
+    }
+}
+
 fn ordinary_streamable(spec: &LoadSpec) -> bool {
     spec.precision == Precision::Bf16
         && matches!(spec.load_shape, LoadShape::DeferredMaterialization)
@@ -641,6 +716,7 @@ pub(crate) fn provider_contract(
             decoder_bytes: components.vae,
             overlay_bytes: 0,
         },
+        architecture_facts: architecture_facts(spec),
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
 }
@@ -1624,6 +1700,130 @@ mod tests {
             contract.generation_memory(&fixture.context.selection)
         );
         scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
+    }
+
+    /// The DiT/VAE config fields exactly as the published `SceneWorks/z-image-turbo` snapshot ships
+    /// them (verified against the on-disk q4 snapshot). Only the keys the architecture facts read
+    /// are reproduced; the values are the snapshot's, and the assertions below derive nothing from
+    /// the model id.
+    fn write_snapshot_component_configs(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{
+                "_class_name": "ZImageTransformer2DModel",
+                "all_f_patch_size": [1],
+                "all_patch_size": [2],
+                "axes_dims": [32, 48, 48],
+                "cap_feat_dim": 2560,
+                "dim": 3840,
+                "in_channels": 16,
+                "n_heads": 30,
+                "n_kv_heads": 30,
+                "n_layers": 30,
+                "n_refiner_layers": 2
+            }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("vae")).unwrap();
+        std::fs::write(
+            root.join("vae/config.json"),
+            br#"{
+                "_class_name": "AutoencoderKL",
+                "block_out_channels": [128, 256, 512, 512],
+                "in_channels": 3,
+                "latent_channels": 16,
+                "layers_per_block": 2,
+                "out_channels": 3,
+                "sample_size": 1024
+            }"#,
+        )
+        .unwrap();
+    }
+
+    fn snapshot_spec(root: std::path::PathBuf) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    /// AC: both Z-Image providers publish architecture facts read from the snapshot's component
+    /// `config.json` files, and the resulting contract passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_are_read_from_the_snapshot_component_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-turbo");
+        write_snapshot_component_configs(&root);
+        let spec = snapshot_spec(root);
+        for id in [crate::MODEL_ID, crate::base::MODEL_ID] {
+            let contract = provider_contract(id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(30),
+                    // 3840 / 30, read from `dim` and `n_heads` rather than declared.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(30),
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    // Four `block_out_channels` stages => three halvings => x8.
+                    vae_spatial_scale: Some(8),
+                    // Z-Image ships the FLUX.1 image VAE: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{id} architecture facts"
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
+    /// The facts are read, not asserted: a snapshot that disagrees with the reference Turbo config
+    /// publishes what it actually says, and an axis it cannot support stays absent.
+    #[test]
+    fn architecture_facts_follow_the_config_and_omit_unreadable_axes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-mutated");
+        write_snapshot_component_configs(&root);
+        let mut dit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("transformer/config.json")).unwrap())
+                .unwrap();
+        dit["n_layers"] = serde_json::json!(24);
+        // 3840 does not divide evenly by 7, so no honest head width exists to publish.
+        dit["n_heads"] = serde_json::json!(7);
+        dit["all_patch_size"] = serde_json::json!([0]);
+        std::fs::write(
+            root.join("transformer/config.json"),
+            serde_json::to_vec(&dit).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("vae/config.json")).unwrap();
+
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(facts.transformer_blocks, Some(24));
+        assert_eq!(facts.attention_heads, Some(7));
+        assert_eq!(facts.head_dim, None, "3840 / 7 is not a head width");
+        assert_eq!(facts.patch_size, None, "a zero axis is declared absent");
+        assert_eq!(facts.vae_spatial_scale, None, "no vae/config.json to read");
+        assert_eq!(facts.latent_channels, Some(16), "still read from the DiT");
+        assert!(facts.zero_valued_axes().is_empty());
+    }
+
+    /// A contract built before any asset exists on disk declares every axis absent rather than
+    /// fabricating the reference architecture.
+    #[test]
+    fn weights_free_contracts_publish_absent_architecture_facts() {
+        for id in [crate::MODEL_ID, crate::base::MODEL_ID] {
+            let contract = provider_contract(id, &spec()).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts::default(),
+                "{id} weights-free facts"
+            );
+            assert!(contract.architecture_facts.is_empty());
+        }
     }
 
     #[test]

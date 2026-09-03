@@ -275,6 +275,7 @@ fn memory_strategy_contract_with_asset_facts(
         MemoryFormulaVariable::TransformerWindowSize,
     ];
     Ok(MemoryProviderContract {
+        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,

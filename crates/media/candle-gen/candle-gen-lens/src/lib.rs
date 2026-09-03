@@ -1011,6 +1011,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         .collect();
 
     MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
