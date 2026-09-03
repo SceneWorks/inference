@@ -571,13 +571,34 @@ fn backbone_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 /// the `U32` code tensors sitting next to it. Anything unreadable falls back to `F32`, the
 /// pre-sc-14249 behavior. Mirrors `candle-gen-ideogram`'s `te_store_dtype` (sc-12828).
 fn checkpoint_dtype(files: &[PathBuf]) -> DType {
+    probe_checkpoint_dtype(files).unwrap_or(DType::F32)
+}
+
+/// The same probe, distinguishing "no probe tensor" from the `F32` fallback.
+///
+/// The load path wants the fallback: an unreadable probe must still load, and `F32` never truncates.
+/// The memory contract wants the opposite — an axis it could not derive is `None`, never a guess —
+/// so it reads this and maps the result through [`quant::store_dtype_for`] exactly as `backbone_vb`
+/// does, rather than publishing an activation width for a snapshot it never looked into.
+pub(crate) fn probe_checkpoint_dtype(files: &[PathBuf]) -> Option<DType> {
     const PROBE_KEY: &str = "language_model.model.norm.weight";
     // SAFETY: read-only mmap of weight files; the standard candle loading path.
     unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(files) }
         .ok()
         .and_then(|st| st.load(PROBE_KEY, &Device::Cpu).ok())
         .map(|t| t.dtype())
-        .unwrap_or(DType::F32)
+}
+
+/// The store dtype a snapshot at `root` would be loaded at, or `None` when it ships no probe tensor.
+///
+/// This is `backbone_vb`'s own pair of calls — [`backbone_files`] then
+/// [`quant::store_dtype_for`] over the probe — so the width the contract publishes is the width the
+/// load will actually use, on a packed q4/q8 tier as much as on `bf16/`.
+pub(crate) fn snapshot_store_dtype(root: &Path) -> Option<DType> {
+    let files = backbone_files(root).ok()?;
+    Some(crate::quant::store_dtype_for(probe_checkpoint_dtype(
+        &files,
+    )?))
 }
 
 /// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT

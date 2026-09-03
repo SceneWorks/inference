@@ -1144,6 +1144,46 @@ pub(crate) fn weights_free_surface_contract(
     ))
 }
 
+/// Activation dtype the loaded Ideogram 4 denoise trunk computes in. `pipeline.rs` pins
+/// `DIT_DTYPE = DType::BF16` for the conditional DiT — the bottleneck this contract's phase
+/// envelope prices — so this is the provider's real activation width, not a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Architecture axes for the Ideogram 4 routes (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `Ideogram4Transformer` is constructed from
+/// the hardcoded [`Ideogram4DitConfig::v4`], and the latent / patch / decoder axes are the
+/// `crate::config` constants the packing and decode paths execute against. Reading those same
+/// declarations is what keeps the published geometry identical to the model actually built — a
+/// snapshot `config.json` the loader ignores would describe a model this crate never constructs.
+///
+/// `vae_temporal_scale` stays `None`: Ideogram 4 decodes through the FLUX.2 `AutoencoderKLFlux2`
+/// **image** autoencoder, which has no temporal axis at all. A structurally absent axis is declared
+/// absent, never zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = Ideogram4DitConfig::v4();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        // `config::PATCH` — the DiT's 2x2 packing (`in_channels = LATENT_CHANNELS * PATCH²`).
+        patch_size: af::declared(crate::config::PATCH),
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        // `config::AE_SCALE` — the x8 spatial downscale of the FLUX.2 image autoencoder.
+        vae_spatial_scale: af::declared(crate::config::AE_SCALE),
+        // Structurally absent: an image autoencoder has no frames-per-latent axis to declare.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -1196,7 +1236,7 @@ fn build_contract(
             total.saturating_add(component.resident_bytes)
         });
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1972,6 +2012,55 @@ mod tests {
         AdapterSpec, LoadShape, MemoryBudget, MemoryCacheState, MemorySelection,
         MemoryStrategyParameters, OffloadPolicy,
     };
+
+    /// AC (epic SC-22657, E2): both Ideogram providers publish the geometry the loader actually
+    /// builds — the `Ideogram4DitConfig::v4` trunk plus the `crate::config` latent/patch/decoder
+    /// constants — the contract passes the shared facts conformance check, and the weights-free
+    /// surface (whose sentinel root is not on disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        for id in [MODEL_ID, MODEL_ID_TURBO] {
+            let contract = uncalibrated_contract(id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `Ideogram4DitConfig::v4`: num_heads / head_dim / num_layers.
+                    attention_heads: Some(18),
+                    head_dim: Some(256),
+                    transformer_blocks: Some(34),
+                    // `config::PATCH`.
+                    patch_size: Some(2),
+                    // `config::LATENT_CHANNELS` (32-ch `AutoencoderKLFlux2`).
+                    latent_channels: Some(32),
+                    // `config::AE_SCALE`.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: the FLUX.2 image autoencoder has no temporal axis.
+                    vae_temporal_scale: None,
+                    // `pipeline.rs: DIT_DTYPE = DType::BF16`.
+                    activation_dtype_width: Some(2),
+                },
+                "{id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = weights_free_contract(id, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{id} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
+    }
 
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0_usize;

@@ -74,6 +74,50 @@ fn asset_facts(spec: &LoadSpec, variant: Variant) -> gen_core::Result<MemoryAsse
     })
 }
 
+/// Snapshot-read architecture axes for the three Anima routes (epic SC-22657, E2).
+///
+/// Anima's loader parses no `transformer/config.json`: it hardcodes
+/// [`crate::config::DitConfig::anima`] (the `Cosmos-2.0-Diffusion-2B-Text2Image` geometry) and
+/// loads the VAE from the single file `vae/qwen_image_vae.safetensors`. That Rust struct and the
+/// crate's own VAE constants — never a JSON file the loader ignores — are therefore the honest
+/// source, read through `architecture_facts::declared` so they keep the same no-zero rule the
+/// JSON-reading providers apply.
+///
+/// `patch_size` is the **spatial** entry of the `(t, h, w)` triple `(1, 2, 2)`.
+///
+/// `vae_temporal_scale` is `None`. Anima is a still-image family riding the Cosmos-Predict2 video
+/// tensor layout: the latent is `[1, 16, 1, H/8, W/8]` and both of its consumers (the `pipeline`
+/// decode tail and the preview projector) squeeze that length-1 axis before an image-only NCHW
+/// decode through the Qwen-Image VAE. Nothing in this crate compresses time, so there is no
+/// frames-per-latent axis at all — and a structurally absent axis is `None`, never `Some(0)`.
+///
+/// `activation_dtype_width` is bf16's two bytes. `loader::compute_dtype` picks BF16 on cuda/metal
+/// and F32 on a bare CPU build, but this contract admits only [`Precision::Bf16`] (see
+/// [`resolved_numeric_tier`]), so bf16 is the width every contract-bearing run executes at — the
+/// same [`FLOAT_WIDTH`] the asset pricing above already uses.
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = crate::config::DitConfig::anima();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_attention_heads),
+        head_dim: af::declared(dit.attention_head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        patch_size: af::declared(dit.patch_size.1),
+        latent_channels: af::declared(crate::config::VAE_CHANNELS),
+        vae_spatial_scale: af::declared(crate::config::VAE_COMPRESSION as usize),
+        // Structurally absent: still-image family, single-frame Qwen-Image VAE decode.
+        vae_temporal_scale: None,
+        activation_dtype_width: u32::try_from(FLOAT_WIDTH).ok(),
+    }
+}
+
 /// The executable contract for a real Anima load: identical to [`weights_free_contract`] except
 /// that its [`MemoryFormulaVariable::AssetBytes`] input is the exact on-disk component inventory
 /// rather than a zero placeholder.
@@ -105,6 +149,7 @@ pub fn weights_free_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = spec.load_shape;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -292,6 +337,44 @@ mod tests {
         AdapterKind, AdapterSpec, MemoryBehaviorRoute, MemoryNumericTier, MemoryStrategy,
         Precision, WeightsSource,
     };
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+        let expected = gen_core::MemoryArchitectureFacts {
+            // `DitConfig::anima()` — the hardcoded Cosmos-Predict2 geometry the loader builds the
+            // DiT from. Anima parses no transformer `config.json`, so there is none to read.
+            attention_heads: Some(16),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            // The spatial entry of `patch_size = (1, 2, 2)` (t, h, w).
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: Anima is a still-image family on the Cosmos video tensor
+            // layout. The latent's temporal extent is always 1 and is squeezed away before the
+            // image-only Qwen-Image VAE decode, so no frames-per-latent axis exists.
+            vae_temporal_scale: None,
+            // bf16: `resolved_numeric_tier` admits only `Precision::Bf16`.
+            activation_dtype_width: Some(2),
+        };
+        for provider in IDS {
+            let contract = weights_free_contract(provider, &spec).unwrap();
+            assert_eq!(contract.architecture_facts, expected, "{provider}");
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The registry's contract surface names a sentinel that is not on disk: nothing about the
+        // pipeline is resolved there, so every axis stays undeclared.
+        let surface = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(weights_free_contract(IDS[0], &surface)
+            .unwrap()
+            .architecture_facts
+            .is_empty());
+    }
 
     #[test]
     fn all_three_exact_plain_routes_publish_only_staged_residency() {

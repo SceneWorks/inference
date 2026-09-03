@@ -277,10 +277,56 @@ fn exact_load_receipt(
 /// Build one LTX-2.5 Candle contract from an already resolved physical receipt. Rung 3 executes
 /// through `candle_gen::sdpa_budgeted_bhsd`; rung 4 executes through Candle's binding over
 /// `gen_core::block_window`; bounded decode is declared only for the convolutional VAE route.
+/// Snapshot-gated architecture facts for the LTX-2.5 route (epic SC-22657, E2).
+///
+/// Unlike LTX-2.3, this route's loader genuinely *reads* its geometry: `lib.rs` builds the DiT from
+/// [`crate::config::AvConfig::from_bundle`], which parses the transformer component's safetensors
+/// `__metadata__["config"]["transformer"]` section (`num_attention_heads`, `attention_head_dim`,
+/// `num_layers`) and keeps the [`crate::config::AvConfig::ltx_2_3`] value for any key the section
+/// omits. Passing the resolved bundle through means this publishes what the checkpoint actually
+/// says, not a dimension asserted from the model id; a bundle-free call falls back to
+/// [`crate::config::AvConfig::ltx_2_5`], which is the same 48/32/128 the loader would fall back to.
+///
+/// `patch_size` is `None` for the same structural reason as 2.3: LTX patchifies inside the causal
+/// video autoencoder, not in the DiT (`patchify_proj` is a per-token `Linear(128 -> 4096)` over the
+/// already flattened `[B, S, 128]` latent).
+///
+/// A weights-free contract (no bundle, and a sentinel weights path that is not on disk) publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(
+    spec: &LoadSpec,
+    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
+) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let video = bundle
+        .and_then(|bundle| crate::config::AvConfig::from_bundle(bundle).ok())
+        .unwrap_or_else(crate::config::AvConfig::ltx_2_5)
+        .video;
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(video.num_heads),
+        // `attention_head_dim` is declared by the config section itself, never divided out of a
+        // hidden size.
+        head_dim: af::declared(video.head_dim),
+        transformer_blocks: af::declared(video.num_layers),
+        // Structurally absent: LTX patchifies inside the causal video autoencoder, not in the DiT.
+        patch_size: None,
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(crate::config::SPATIAL_SCALE),
+        vae_temporal_scale: af::declared(crate::config::TEMPORAL_SCALE),
+        // `lib.rs: DIT_DTYPE = DType::BF16`.
+        activation_dtype_width: af::dtype_width(crate::DIT_DTYPE),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     asset_facts: MemoryAssetFacts,
     calibration_fingerprint: &str,
+    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
 ) -> gen_core::Result<MemoryProviderContract> {
     let windowed = streamable(spec);
     let decode = bounded_decode(spec);
@@ -301,7 +347,7 @@ fn build_contract(
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     Ok(MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec, bundle),
         provider_id: LTX_2_5_DISTILLED_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -348,6 +394,7 @@ fn memory_strategy_contract_for_bundle(
         spec,
         exact_load_receipt(spec, bundle)?,
         CALIBRATION_FINGERPRINT,
+        Some(bundle),
     )
 }
 
@@ -359,6 +406,9 @@ fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         spec,
         MemoryAssetFacts::default(),
         CANDLE_REGISTRY_CALIBRATION_FINGERPRINT,
+        // No bundle has been resolved for a registry surface, and none can be: the fixture spec's
+        // weights path is a sentinel that is not on disk.
+        None,
     )
 }
 
@@ -951,6 +1001,86 @@ mod tests {
             .expect("all rungs declared")
             .support
             .clone()
+    }
+
+    /// Rewrite the bundle's transformer component with an explicit `config.transformer` section,
+    /// so the test can prove the axes are *read* rather than asserted from the model id.
+    fn write_transformer_config(root: &Path, section: &str) {
+        write_safetensors(
+            &root.join("transformer.safetensors"),
+            &[
+                ("model_version", "2.5.0"),
+                ("config", &format!(r#"{{"transformer":{section}}}"#)),
+            ],
+            11,
+        );
+    }
+
+    /// AC (epic SC-22657, E2): the LTX-2.5 contract publishes the architecture axes its loader reads
+    /// out of the transformer component's own config section, and the weights-free surface publishes
+    /// none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let load = physical_spec(root, false, true);
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":32,
+                "attention_head_dim":128,"num_layers":48}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        let contract = build_contract(
+            &load,
+            MemoryAssetFacts::default(),
+            CALIBRATION_FINGERPRINT,
+            Some(&bundle),
+        )
+        .unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // Read from `config.transformer`'s own `num_attention_heads` / `attention_head_dim`
+                // / `num_layers` through `AvConfig::from_bundle`.
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // Structurally absent: LTX patchifies inside the causal video autoencoder, not in
+                // the DiT — `patchify_proj` is a per-token Linear(128 -> 4096) over the already
+                // flattened `[B, S, 128]` latent, so the denoiser applies no spatial patch factor.
+                patch_size: None,
+                // `config::LATENT_CHANNELS`.
+                latent_channels: Some(128),
+                // `config::SPATIAL_SCALE` / `config::TEMPORAL_SCALE`.
+                vae_spatial_scale: Some(32),
+                vae_temporal_scale: Some(8),
+                // `lib.rs: DIT_DTYPE = DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The facts are read, not asserted: a checkpoint declaring a different depth publishes what
+        // it actually says.
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":16,
+                "attention_head_dim":64,"num_layers":24}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        let mutated = architecture_facts(&load, Some(&bundle));
+        assert_eq!(mutated.attention_heads, Some(16));
+        assert_eq!(mutated.head_dim, Some(64));
+        assert_eq!(mutated.transformer_blocks, Some(24));
+
+        // The registry fixture resolves no bundle and names a weights path that is not on disk.
+        let weights_free = weights_free_contract(&spec(
+            OffloadPolicy::Resident,
+            LoadShape::EagerMaterialization,
+        ))
+        .unwrap();
+        assert!(weights_free.architecture_facts.is_empty());
     }
 
     #[test]

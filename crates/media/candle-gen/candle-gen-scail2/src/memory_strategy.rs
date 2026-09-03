@@ -627,6 +627,64 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
     gen_core::reject_unknown_components(spec, &[], PROVIDER_ID)
 }
 
+/// Snapshot-read architecture facts for the SCAIL-2 route (epic SC-22657, E2).
+///
+/// The DiT axes come from the very call the loader makes:
+/// [`crate::config::Scail2Config::from_model_dir`] on the snapshot root, which reads the flat
+/// `<root>/config.json` (`num_heads`, `num_layers`, `dim`, …) and keeps the shipped
+/// [`crate::config::Scail2Config::scail2_14b`] value for any key the file omits. Both snapshot
+/// layouts are handled the same way because the loader handles them the same way: `pipeline::load`
+/// reads the config from the root for `SharedMlxTier` and `LegacyComponents` alike, and only the
+/// *weight* files move under `transformer/`. So a snapshot whose config disagrees with the shipped
+/// 14B config publishes what it actually says.
+///
+/// `head_dim` is [`crate::config::Scail2Config::head_dim`] — `dim / num_heads`, the same quotient
+/// the model builds its attention from — and is declined when the config makes it inexact.
+///
+/// The VAE axes come from SCAIL-2's concrete VAE assignment: it decodes through
+/// `candle_gen_wan::vae16::WanVae16` at `Vae16Config::wan21()`, whose geometry this crate re-exports
+/// as [`crate::VAE_TILING`] (x8 spatial, x4 temporal).
+///
+/// **`activation_dtype_width` is 4, not 2.** This provider computes in f32 on purpose:
+/// `pipeline::transformer_vb` loads the DiT at `DType::F32` because "bf16 overflows to NaN at high
+/// token length" (`lib.rs`). Declaring the family-typical bf16 width here would halve every
+/// activation estimate.
+///
+/// A weights-free contract — no materialized snapshot directory — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::Scail2Config::from_model_dir(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let tiling = crate::VAE_TILING;
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_heads),
+        // `head_dim()` is `dim / num_heads`; publish it only when the division is exact, so a config
+        // with a non-uniform pair cannot claim a head width it does not have.
+        head_dim: (config.num_heads != 0 && config.dim % config.num_heads == 0)
+            .then(|| af::declared(config.head_dim()))
+            .flatten(),
+        transformer_blocks: af::declared(config.num_layers),
+        // `patch` is `(p_t, p_h, p_w) = (1, 2, 2)` — a Rust-only field the config reader never
+        // overrides; the spatial (index 1) entry is the axis this fact names.
+        patch_size: af::declared(config.patch.1),
+        latent_channels: af::declared(config.vae_z_dim),
+        vae_spatial_scale: u32::try_from(tiling.spatial_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        vae_temporal_scale: u32::try_from(tiling.temporal_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        // f32, not bf16 — see the note above.
+        activation_dtype_width: af::dtype_width(candle_gen::candle_core::DType::F32),
+    }
+}
+
 fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -634,7 +692,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: PROVIDER_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -920,6 +978,75 @@ pub(crate) mod tests {
             };
             assert_eq!(contract.capability(strategy).unwrap().support, expected);
         }
+    }
+
+    /// AC (epic SC-22657, E2): the contract publishes the architecture axes read from the snapshot's
+    /// own `config.json` — the very call `pipeline::load` makes — and the weights-free surface
+    /// publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // The upstream `configs/config-14b.json` layout, cut down to the keys
+        // `Scail2Config::from_model_dir` reads.
+        std::fs::write(
+            root.join("config.json"),
+            br#"{
+                "dim": 5120,
+                "ffn_dim": 13824,
+                "num_heads": 40,
+                "num_layers": 40,
+                "in_dim": 20,
+                "out_dim": 16,
+                "mask_dim": 28
+            }"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `config.json: num_heads`.
+                attention_heads: Some(40),
+                // `Scail2Config::head_dim()` = `dim / num_heads` = 5120 / 40.
+                head_dim: Some(128),
+                // `config.json: num_layers`.
+                transformer_blocks: Some(40),
+                // `Scail2Config::patch = (1, 2, 2)` — a Rust-only field; index 1 is the spatial
+                // entry.
+                patch_size: Some(2),
+                // `Scail2Config::vae_z_dim`.
+                latent_channels: Some(16),
+                // `crate::VAE_TILING` (`WanVae16::VAE_TILING`, the Wan 2.1 z16 autoencoder).
+                vae_spatial_scale: Some(8),
+                vae_temporal_scale: Some(4),
+                // f32, not bf16: `pipeline::transformer_vb` loads the DiT at `DType::F32` because
+                // bf16 overflows to NaN at high token length.
+                activation_dtype_width: Some(4),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The facts are read, not asserted: a config declaring a different depth and width publishes
+        // what it actually says.
+        std::fs::write(
+            root.join("config.json"),
+            br#"{"dim": 2048, "num_heads": 16, "num_layers": 24}"#,
+        )
+        .unwrap();
+        let mutated = architecture_facts(&spec);
+        assert_eq!(mutated.attention_heads, Some(16));
+        assert_eq!(mutated.head_dim, Some(128));
+        assert_eq!(mutated.transformer_blocks, Some(24));
+
+        // The registry surface names a sentinel that is not on disk.
+        let weights_free = weights_free_resident_contract(&LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        )))
+        .unwrap();
+        assert!(weights_free.architecture_facts.is_empty());
     }
 
     #[test]

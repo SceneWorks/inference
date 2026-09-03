@@ -1825,6 +1825,56 @@ candle_gen::register_generators! {
     pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
 }
 
+/// Activation dtype every Krea route computes the DiT in. `pipeline.rs` pins `DIT_DTYPE =
+/// DType::BF16` for the dense, packed and convrot loads alike, so this is the provider's real
+/// activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes shared by every Krea 2 route (epic SC-22657, E2).
+///
+/// The DiT axes come from the **same** configuration the loader builds its model from:
+/// [`crate::config::Krea2Config::from_snapshot`] parses `<root>/transformer/config.json`
+/// (`num_attention_heads`, `attention_head_dim`, `num_layers`) plus `<root>/model_index.json`
+/// (`patch_size`), falling back per field to the published [`config::Krea2Config::turbo`] reference
+/// exactly as the loader does. Reading the axes back off that struct therefore publishes what the
+/// pipeline will actually execute — a snapshot whose config disagrees with the reference publishes
+/// what it says, and nothing is inferred from the model id.
+///
+/// Krea 2 is a **dense single-stream** DiT: `num_layers` is the whole trunk (there is no
+/// double/single split to add together), and `hidden_size` is *derived* as
+/// `num_attention_heads · attention_head_dim`, so `attention_head_dim` is already the per-head
+/// width and needs no divisibility check.
+///
+/// The decoder axes are the reused Qwen-Image `AutoencoderKLQwenImage` constants
+/// ([`vae::VAE_CHANNELS`], [`vae::VAE_COMPRESSION`]) rather than JSON: the loader constructs that
+/// VAE from code, so `<root>/vae/config.json` is not what runs and must not be read here.
+///
+/// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
+/// snapshot whose transformer config cannot be parsed — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::Krea2Config::from_snapshot(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_attention_heads),
+        head_dim: af::declared(config.attention_head_dim),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        latent_channels: af::declared(crate::vae::VAE_CHANNELS as usize),
+        vae_spatial_scale: af::declared(crate::vae::VAE_COMPRESSION as usize),
+        // Structurally absent: Krea drives the Qwen-Image VAE collapsed to a single frame on the
+        // image path, so there is no frames-per-latent axis to declare (absent is `None`, never 0).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
@@ -1843,7 +1893,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     // real imported-file run is measured rather than silently relabeling Dir evidence.
     let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -2007,6 +2057,7 @@ fn build_krea_request_scoped_memory_strategy_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = spec.load_shape;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -2654,11 +2705,18 @@ fn build_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     let quant = actual_quant_tier(spec, "krea_2_turbo_control")?;
-    Ok(build_krea_control_memory_strategy_contract_for_tier(quant))
+    Ok(build_krea_control_memory_strategy_contract_for_tier(
+        quant, spec,
+    ))
 }
 
+/// The control route runs the same Krea 2 DiT and Qwen-Image VAE as Turbo, so it reads the same
+/// snapshot axes. `spec` is threaded in alongside the already-resolved tier purely so those axes
+/// come from the snapshot actually being loaded; the weights-free surface passes the registry's
+/// sentinel spec and therefore still publishes no facts.
 fn build_krea_control_memory_strategy_contract_for_tier(
     quant: Option<Quant>,
+    spec: &LoadSpec,
 ) -> gen_core::MemoryProviderContract {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -2677,6 +2735,7 @@ fn build_krea_control_memory_strategy_contract_for_tier(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -2773,6 +2832,7 @@ fn weights_free_krea_control_memory_strategy_contract(
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     Ok(build_krea_control_memory_strategy_contract_for_tier(
         spec.quantize,
+        spec,
     ))
 }
 
@@ -3123,6 +3183,92 @@ mod tests {
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(root.to_path_buf()),
         )
+    }
+
+    /// The published Krea-2 Turbo `transformer/config.json` axes the loader actually reads through
+    /// [`config::Krea2Config::from_snapshot`], plus the `model_index.json` that carries
+    /// `patch_size`. `num_layers` is a parameter so a drifting snapshot can be exercised.
+    fn write_reference_dit_config(root: &Path, num_layers: usize) {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "num_attention_heads": 48,
+                "attention_head_dim": 128,
+                "num_key_value_heads": 12,
+                "num_layers": num_layers,
+                "in_channels": 64,
+                "intermediate_size": 16384,
+                "axes_dims_rope": [32, 48, 48],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("model_index.json"), br#"{"patch_size": 2}"#).unwrap();
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: the reused Qwen-Image `AutoencoderKLQwenImage` decodes exactly
+            // one frame per image here, so Krea has no frames-per-latent axis to declare.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(turbo.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&turbo);
+
+        let raw = build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&raw);
+
+        let control = build_krea_control_memory_strategy_contract_for_tier(None, &spec);
+        assert_eq!(control.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&control);
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        let drifted = tempfile::tempdir().unwrap();
+        write_reference_dit_config(drifted.path(), 24);
+        let drifted_spec = LoadSpec::new(WeightsSource::Dir(drifted.path().to_path_buf()));
+        assert_eq!(
+            build_krea_turbo_memory_strategy_contract(&drifted_spec)
+                .architecture_facts
+                .transformer_blocks,
+            Some(24)
+        );
+
+        // The registry's weights-free surface names a sentinel that is not on disk: nothing about
+        // the pipeline is resolved there, so every axis stays undeclared.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&weights_free)
+            .architecture_facts
+            .is_empty());
+        assert!(
+            build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+        assert!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
     }
 
     #[test]

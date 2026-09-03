@@ -878,6 +878,48 @@ pub fn weights_free_surface_contract(
     weights_free_contract(provider_id, &spec)
 }
 
+/// Activation dtype the loaded SD3.5 pipeline computes in. `lib.rs` pins `DType::BF16`
+/// unconditionally on every route, so this is the provider's real activation width rather than a
+/// memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-scoped architecture axes for an SD3.5 route (epic SC-22657, E2).
+///
+/// SD3.5's geometry is deliberately *not* read from `transformer/config.json`: the loader builds
+/// the MMDiT from the crate's own [`crate::config::Sd3Config`] preset, selected from the variant
+/// exactly as `pipeline::Variant::config` does (Large/Turbo share the Large preset; Medium is the
+/// MMDiT-X preset). Reading a config the loader ignores would describe a model this provider never
+/// constructs, so the axes come off the same struct the loader hands to the transformer builder.
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
+/// there, so no axis is knowable.
+fn architecture_facts(route: Sd35Route, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    // The same variant -> preset selection `pipeline::Variant::config` performs at load.
+    let config = match route {
+        Sd35Route::Large | Sd35Route::LargeTurbo => crate::config::Sd3Config::large(),
+        Sd35Route::Medium => crate::config::Sd3Config::medium(),
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_heads),
+        head_dim: af::declared(config.head_dim),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        // `vae::LATENT_CHANNELS` is the encoder's own declaration of what it produces; the DiT's
+        // `in_channels` is the consumer's view of the same 16 channels.
+        latent_channels: af::declared(crate::vae::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(crate::vae::SPATIAL_SCALE as usize),
+        // SD3.5 ships the image `AutoencoderKL`: there is no temporal axis to declare at all.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_contract(
     route: Sd35Route,
     spec: &LoadSpec,
@@ -909,7 +951,7 @@ fn build_contract(
             total.saturating_add(component.resident_bytes)
         });
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(route, spec),
         provider_id: route.provider_id().to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1699,6 +1741,67 @@ mod tests {
             .with_adapters(adapters);
         spec.precision = Precision::Bf16;
         spec
+    }
+
+    /// AC (epic SC-22657, E2): every SD3.5 route publishes the architecture axes of the
+    /// `Sd3Config` preset its loader actually builds, and the weights-free surface publishes none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        for (route, heads, layers) in [
+            (Sd35Route::Large, 38, 38),
+            (Sd35Route::LargeTurbo, 38, 38),
+            (Sd35Route::Medium, 24, 24),
+        ] {
+            let (_temp, root) = fixture(route, "bf16");
+            // The shared fixture gives the encoders and the DiT the same byte total, which the
+            // conformance check reads as one component borrowing another's price. Widen the DiT
+            // shards so every component is priced from its own distinct bytes.
+            for (index, path) in direct_safetensors(&root.join("transformer"))
+                .unwrap()
+                .into_iter()
+                .enumerate()
+            {
+                write_safetensors(
+                    &path,
+                    None,
+                    &[(&format!("blocks.{index}.weight"), "BF16", &[8, 8], 128)],
+                );
+            }
+            let load = spec(route, &root, Vec::new());
+            let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+            let contract = contract_from_receipt(&load, &receipt);
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `Sd3Config::large()` / `::medium()`: `num_heads`, `head_dim`, `num_layers`,
+                    // `patch_size` — the exact struct `Variant::config` hands the MMDiT builder.
+                    attention_heads: Some(heads),
+                    head_dim: Some(64),
+                    transformer_blocks: Some(layers),
+                    patch_size: Some(2),
+                    // `vae::LATENT_CHANNELS` / `vae::SPATIAL_SCALE`.
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // SD3.5 ships the image `AutoencoderKL`: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    // `lib.rs` pins `DType::BF16` on every route.
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                route.provider_id()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+            let weights_free = weights_free_contract(
+                route.provider_id(),
+                &LoadSpec::new(WeightsSource::Dir(
+                    "/__sceneworks_memory_contract_surface__".into(),
+                )),
+            )
+            .unwrap();
+            assert!(weights_free.architecture_facts.is_empty());
+        }
     }
 
     #[test]

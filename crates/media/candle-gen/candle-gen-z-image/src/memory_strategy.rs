@@ -1828,9 +1828,11 @@ mod tests {
                 .expect("unit-test loads retain their memory contract");
             assert_eq!(
                 published.architecture_facts, expected,
-                "{label}: memory_strategy_contract() must publish the snapshot-read facts"
+                "{label}: memory_strategy_contract() must publish the config-derived facts"
             );
-            assert!(published.architecture_facts.has_snapshot_read_axis());
+            assert!(published
+                .architecture_facts
+                .has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(published);
         }
     }
