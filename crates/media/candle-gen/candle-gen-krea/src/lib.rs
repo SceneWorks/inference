@@ -1852,10 +1852,39 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
 /// snapshot whose transformer config cannot be parsed — publishes
 /// `MemoryArchitectureFacts::default()`.
+/// The materialized Krea snapshot this spec loads its config, tokenizer, TE and VAE from.
+///
+/// `spec.weights` on the snapshot routes, and the `BASE_SNAPSHOT_COMPONENT` directory on the
+/// single-file import routes — which is exactly what [`resolved_base_and_native`] resolves for the
+/// loader, restated here without the `id`-keyed validation so the weights-free surface stays quiet.
+///
+/// SC-22667 (E2): reading only `spec.weights` published `MemoryArchitectureFacts::default()` for
+/// every `load_from_native_dit_file` load, even though that route hands the loader a resident
+/// turnkey snapshot precisely *because* the single file omits the DiT architecture config — the
+/// axes are read from disk on that route, they were simply read from a directory this function was
+/// not looking at.
+fn materialized_snapshot_root(spec: &LoadSpec) -> Option<&std::path::Path> {
+    candle_gen::architecture_facts::snapshot_root(spec).or_else(|| {
+        match spec.components.get(BASE_SNAPSHOT_COMPONENT) {
+            Some(WeightsSource::Dir(root)) if root.is_dir() => Some(root.as_path()),
+            _ => None,
+        }
+    })
+}
+
+/// The imported single-file DiT this spec loads, when it has one. `resolved_base_and_native` pairs
+/// the same file with its pin for the loader; the contract only needs its header surface.
+fn native_dit_path(spec: &LoadSpec) -> Option<&std::path::Path> {
+    match &spec.weights {
+        WeightsSource::File(path) => Some(path.as_path()),
+        WeightsSource::Dir(_) => None,
+    }
+}
+
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
-    let Some(root) = af::snapshot_root(spec) else {
+    let Some(root) = materialized_snapshot_root(spec) else {
         return gen_core::MemoryArchitectureFacts::default();
     };
     let Ok(config) = crate::config::Krea2Config::from_snapshot(root) else {
@@ -1873,6 +1902,166 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         vae_temporal_scale: None,
         activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
     }
+}
+
+/// The `language_model` tensor `pipeline::load_te_weights` probes to decide the TE **store** dtype
+/// (sc-12828): bf16 when the snapshot ships bf16, else an f32 store with no silent truncation.
+const TE_STORE_PROBE: &str = "language_model.layers.0.input_layernorm.weight";
+
+/// Bytes per element of the DiT's load dtype (`pipeline::DIT_DTYPE = DType::BF16`).
+const DIT_WIDTH: u64 = 2;
+
+/// Bytes per element of the autoencoder's load dtype — `vae::vae_varbuilder` opens the reused
+/// Qwen-Image VAE at `DType::F32` (decode-precision-sensitive), from a checkpoint that ships bf16.
+const VAE_WIDTH: u64 = 4;
+
+fn is_edit_route(provider_id: &str) -> bool {
+    matches!(provider_id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID)
+}
+
+/// The TE store width this snapshot resolves to, from the same probe the loader uses.
+fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
+    match headers.iter().find(|header| header.name == TE_STORE_PROBE) {
+        Some(header) if header.dtype == gen_core::weightsmeta::Dtype::BF16 => 2,
+        // Either the snapshot does not ship bf16 (the loader reopens at f32), or the probe key is
+        // absent and there is nothing to justify the halved store — both take the f32 branch, which
+        // is the loader's own fail-safe direction.
+        _ => 4,
+    }
+}
+
+/// Load-exact bytes of the DiT the loader will build.
+///
+/// One rule covers all four sources this provider accepts, because Candle's own `coerce_float`
+/// boundary is the rule: a float tensor is materialized at `DIT_DTYPE` and everything else keeps its
+/// stored width. That prices a dense diffusers `transformer/` at bf16, a native single-file import
+/// at bf16, and an INT8-ConvRot file at its resident `i8` code planes plus their scales. The one
+/// source that needs more is an **MLX-packed tier**, whose affine triples Candle repacks into a
+/// device-format GGML tensor that is neither the source sidecars nor a dense matrix of the packed
+/// weight's shortened last dimension — `mlx_packed_qtensor_resident_bytes` is the shared pricing for
+/// exactly that conversion.
+fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let group = loader::read_packed_config(path)
+        .ok()
+        .flatten()
+        .map(|config| config.group_size as usize)
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
+    let mut total = 0_u64;
+    let mut dense = Vec::new();
+    for header in &headers {
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            // Priced with the `.weight` of their triple; an orphan simply falls through as dense.
+            if let Some(base) = header
+                .name
+                .strip_suffix(".scales")
+                .or_else(|| header.name.strip_suffix(".biases"))
+            {
+                if by_name.contains_key(format!("{base}.weight").as_str()) {
+                    continue;
+                }
+            }
+            dense.push(header.clone());
+            continue;
+        }
+        let triple = header.name.strip_suffix(".weight").and_then(|base| {
+            Some((
+                *by_name.get(format!("{base}.scales").as_str())?,
+                *by_name.get(format!("{base}.biases").as_str())?,
+            ))
+        });
+        match triple {
+            Some((scales, biases)) => {
+                total = total
+                    .checked_add(candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                        header, scales, biases, group,
+                    )?)
+                    .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            }
+            None => dense.push(header.clone()),
+        }
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(
+            &dense, DIT_WIDTH, path,
+        )?)
+        .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))
+}
+
+/// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
+/// sweep SC-22667).
+///
+/// Every Krea contract used to publish `MemoryAssetFacts::default()` — all zeros — on a fully
+/// materialized load, on the grounds that the manifest phase curves already carry the measured
+/// resident floors. That reasoning is about the *predicted peak*, which these fields do not feed:
+/// `predicted_peak_from_base` never reads `base_bytes`. What they do feed is
+/// `MemoryProviderContract::total_resident_bytes` and the E1 decomposition, and a zero there is not
+/// a conservative estimate but an absent fact — on the request-scoped routes it sat beside a formula
+/// that declares `MemoryFormulaVariable::AssetBytes`.
+///
+/// The three fields follow the *One network, one field* rule. The Qwen-Image autoencoder is charged
+/// once, in `decoder_bytes`, on every route including the Edit ones that VAE-encode their references
+/// through the same weights; the Qwen3-VL vision tower is Edit-only residency and joins
+/// `conditioning_bytes` there and nowhere else.
+/// A component that is not readable yet contributes **no signal**, never a load failure.
+///
+/// Krea's `build` is lazy: it constructs a generator whose components open on first use, so a
+/// contract is legitimately built before a shard exists on disk (and the registry's own surface
+/// specs resolve nothing at all). Refusing a load because a pre-load admission fact could not be
+/// measured would be the strictly worse trade — the same call `candle-gen-ltx`'s
+/// `component_footprint_reports_no_signal_rather_than_failing` documents — so an unreadable
+/// component reads as 0 here and `load_components` surfaces the real error moments later.
+fn component_bytes_or_no_signal(bytes: gen_core::Result<u64>) -> u64 {
+    bytes.unwrap_or(0)
+}
+
+fn loaded_asset_facts(
+    provider_id: &str,
+    root: &std::path::Path,
+    native_dit: Option<&std::path::Path>,
+    convrot_dit: Option<&std::path::Path>,
+    encoder_source: &gen_core::ValidatedEncoderSource,
+) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let language = encoder_source
+        .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+        .unwrap_or_default();
+    let te_width = te_store_width(&language);
+    let mut conditioning = component_bytes_or_no_signal(gen_core::materialized_header_bytes(
+        &language, te_width, root,
+    ));
+    if is_edit_route(provider_id) {
+        // `pipeline::vision()` materializes the tower lazily on the Edit routes only.
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap_or_default();
+        conditioning = conditioning.saturating_add(component_bytes_or_no_signal(
+            gen_core::materialized_header_bytes(&vision, te_width, root),
+        ));
+    }
+    let transformer = component_bytes_or_no_signal(match (convrot_dit, native_dit) {
+        (Some(convrot), _) => dit_resident_bytes(convrot),
+        (None, Some(native)) => dit_resident_bytes(native),
+        (None, None) => dit_resident_bytes(&root.join("transformer")),
+    });
+    let decoder = component_bytes_or_no_signal(gen_core::materialized_path_bytes(
+        root.join("vae"),
+        VAE_WIDTH,
+    ));
+    Ok(gen_core::MemoryAssetFacts {
+        base_bytes: conditioning
+            .saturating_add(transformer)
+            .saturating_add(decoder),
+        conditioning_bytes: conditioning,
+        transformer_bytes: transformer,
+        decoder_bytes: decoder,
+        // Krea's adapter/PiD/control overlays are outside this base declaration; the routes that
+        // accept them do so through their own request scope, and none is charged here.
+        overlay_bytes: 0,
+    })
 }
 
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
@@ -1993,8 +2182,10 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
             TURBO_MEMORY_CALIBRATION_FINGERPRINT,
             LoadShape::DeferredMaterialization,
         )),
-        // The Krea manifest phase curves already contain the measured resident floors. Asset facts
-        // remain zero here rather than substituting on-disk shard sums for load-exact CUDA residency.
+        // Zero here, and only here: this builder also serves the weights-free surface, which
+        // resolves no snapshot. A **validated** load stamps the load-exact decomposition over these
+        // through `loaded_asset_facts` (SC-22667, E1); see
+        // `validated_krea_turbo_memory_strategy_contract`.
         asset_facts: gen_core::MemoryAssetFacts::default(),
         runtime: MemoryRuntimeSemantics::default(),
     }
@@ -2003,8 +2194,18 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
 fn validated_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    validate_load_spec(spec, KREA_2_TURBO_ID)?;
-    Ok(build_krea_turbo_memory_strategy_contract(spec))
+    let (root, native_dit, convrot_dit, _, encoder_source) =
+        validate_load_spec(spec, KREA_2_TURBO_ID)?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    let _ = &native_dit;
+    contract.asset_facts = loaded_asset_facts(
+        KREA_2_TURBO_ID,
+        &root,
+        native_dit_path(spec),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
 }
 
 fn registered_krea_turbo_memory_strategy_contract(
@@ -2096,8 +2297,20 @@ fn validated_krea_request_scoped_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    validate_load_spec(spec, provider_id)?;
-    build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+    let (root, native_dit, convrot_dit, _, encoder_source) = validate_load_spec(spec, provider_id)?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    // SC-22667 (E1). This route's formula declares `MemoryFormulaVariable::AssetBytes`, so the
+    // all-zero `compatibility_default` facts it inherited were a formula input that was never
+    // supplied.
+    let _ = &native_dit;
+    contract.asset_facts = loaded_asset_facts(
+        provider_id,
+        &root,
+        native_dit_path(spec),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
 }
 
 fn surface_selector_matches_request_scoped_spec(
@@ -3268,6 +3481,140 @@ mod tests {
                 .unwrap()
                 .architecture_facts
                 .is_empty()
+        );
+    }
+
+    /// Header-only safetensors, for fixtures whose subject is tensor geometry rather than values.
+    fn write_tensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, dtype, shape) in tensors {
+            let width = match dtype {
+                "U8" => 1_u64,
+                "BF16" | "F16" => 2,
+                "F32" | "U32" => 4,
+                other => panic!("unhandled fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() as u64 * width;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Feature-end review (SC-22667, E2). `load_from_native_dit_file` routes a single-file DiT
+    /// import through a **resident turnkey snapshot** precisely because the single file omits the
+    /// DiT architecture config — so the axes on that route are read from disk exactly as they are on
+    /// a snapshot load, from the `BASE_SNAPSHOT_COMPONENT` directory.
+    ///
+    /// Mutation that fails this: narrowing `materialized_snapshot_root` back to
+    /// `architecture_facts::snapshot_root(spec)`, which sees a `WeightsSource::File` and publishes
+    /// `MemoryArchitectureFacts::default()` — every axis `None` on a fully materialized load.
+    #[test]
+    fn a_single_file_import_publishes_the_base_snapshots_architecture_axes() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let imported = valid_imported_spec(fixture.path(), "kreamania_variant5.safetensors");
+
+        let facts = build_krea_turbo_memory_strategy_contract(&imported).architecture_facts;
+        assert!(
+            facts.has_declared_architecture_axis(),
+            "the base snapshot supplies the geometry this route loads"
+        );
+        assert_eq!(facts.attention_heads, Some(48));
+        assert_eq!(facts.head_dim, Some(128));
+        assert_eq!(facts.transformer_blocks, Some(28));
+        assert_eq!(facts.patch_size, Some(2));
+        // The decoder axes are the reused Qwen-Image constants either way.
+        assert_eq!(facts.latent_channels, Some(16));
+        assert_eq!(facts.vae_spatial_scale, Some(8));
+
+        // A single-file spec with NO base snapshot resolves nothing and declares nothing.
+        let bare = LoadSpec::new(WeightsSource::File(
+            fixture.path().join("kreamania_variant5.safetensors"),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&bare)
+            .architecture_facts
+            .is_empty());
+    }
+
+    /// Feature-end review (SC-22667, E1). Every loaded Krea contract used to publish
+    /// `MemoryAssetFacts::default()` — all zeros — including the request-scoped routes whose formula
+    /// declares `MemoryFormulaVariable::AssetBytes`. A validated load now publishes the per-component
+    /// decomposition at the widths the loader opens each component in.
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = loaded_asset_facts(…)` stamp
+    /// from `validated_krea_turbo_memory_strategy_contract`, which restores the all-zero facts.
+    #[test]
+    fn a_validated_load_publishes_its_per_component_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        // The reused Qwen-Image autoencoder ships bf16 and is opened f32.
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[("decoder.conv_out.weight", "BF16", &[8, 8])],
+        );
+
+        let contract = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        let facts = contract.asset_facts;
+        assert_eq!(facts.transformer_bytes, 4_096 * 2, "the DiT is opened bf16");
+        assert_eq!(
+            facts.decoder_bytes,
+            64 * 4,
+            "the autoencoder is opened f32; its shards weigh half this"
+        );
+        assert!(
+            facts.conditioning_bytes > 0,
+            "the validated encoder source is priced"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The request-scoped routes carry the same decomposition, and their formula declares
+        // `AssetBytes` — the variable that was never supplied before.
+        let raw =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.asset_facts, facts);
+        assert!(raw
+            .formula
+            .uses(gen_core::MemoryFormulaVariable::AssetBytes));
+        gen_core_testkit::check_memory_contract_asset_facts(&raw)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface resolves no snapshot and still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_turbo_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
         );
     }
 

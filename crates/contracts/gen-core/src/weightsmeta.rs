@@ -852,6 +852,63 @@ pub fn safetensors_path_bytes(path: impl AsRef<Path>) -> u64 {
     }
 }
 
+/// Bytes a loader materializes for every tensor at `path`, when it opens that component at a single
+/// float width (epic SC-22657, E1; feature-end sweep SC-22667).
+///
+/// [`safetensors_path_bytes`] answers a *different* question — how many bytes the component occupies
+/// **on disk** — and the two disagree by a factor of two on every component whose loader opens it at
+/// a width the checkpoint does not store in. The canonical cases in this workspace are a bf16 VAE
+/// opened f32 (under-priced 2x by an on-disk sum) and an f32-on-disk text encoder opened bf16
+/// (over-priced 2x). E1 asks for the bytes the loader materializes, so a provider whose component
+/// dtype is pinned in code prices it here rather than from file lengths.
+///
+/// The per-tensor rule is Candle's own `coerce_float` boundary, mirrored:
+///
+/// * `F16 | BF16 | F32 | F64` are **cast** to `float_width`, so they contribute
+///   `element_count * float_width`;
+/// * every other dtype — the integer code planes of a packed tier, `U8`, `BOOL`, and `F8_E4M3`,
+///   which no shared loader casts — contributes its **stored** `data_bytes`.
+///
+/// That second arm is what makes one call correct for a dense snapshot and for an already-packed
+/// q4/q8 tier of the same component: the packed code planes keep their stored width while the dense
+/// residual (norms, biases, embeddings) is priced at the width it is opened in.
+///
+/// `path` may be a single `.safetensors` file or a sharded directory, with
+/// [`safetensors_path_tensor_headers`]'s duplicate-key semantics (later shard wins), so a component
+/// that ships several shards is counted once per logical tensor. Only headers are read; no tensor
+/// payload is touched, which keeps this usable inside a pre-load admission gate.
+///
+/// Errors when `path` holds no readable safetensors — a caller that must tolerate an absent
+/// component decides that itself rather than being handed a silent `0`.
+pub fn materialized_path_bytes(path: impl AsRef<Path>, float_width: u64) -> Result<u64> {
+    let path = path.as_ref();
+    let headers = safetensors_path_tensor_headers(path)?;
+    materialized_header_bytes(&headers, float_width, path)
+}
+
+/// [`materialized_path_bytes`] over headers a caller has already read — and possibly filtered to the
+/// subset its own route materializes, which is the point of exposing this half. `origin` only names
+/// the component in the overflow error.
+pub fn materialized_header_bytes(
+    headers: &[SafetensorsTensorHeader],
+    float_width: u64,
+    origin: &Path,
+) -> Result<u64> {
+    headers.iter().try_fold(0_u64, |total, header| {
+        let resident = if header.is_float() {
+            header.materialized_bytes(float_width)?
+        } else {
+            header.data_bytes
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            Error::Msg(format!(
+                "{} materialized byte sum overflow",
+                origin.display()
+            ))
+        })
+    })
+}
+
 // =================================================================================================
 // LoRA / LoKr / LoHa / kohya format parsing (string + metadata only).
 // =================================================================================================

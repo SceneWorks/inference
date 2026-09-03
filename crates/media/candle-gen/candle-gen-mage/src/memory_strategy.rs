@@ -13,7 +13,8 @@ use candle_gen::gen_core::{
     MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
     MemoryRequestScope, MemoryRunContext, MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-    MemoryWindowMaterialization, Precision, Quant, TransformerComponent, WeightsSource,
+    MemoryWindowMaterialization, Precision, PrecisionFloorComponent, Quant,
+    SafetensorsTensorHeader, TransformerComponent, WeightsSource,
 };
 use candle_gen::quant::PackedConfig;
 use std::sync::{Arc, Mutex};
@@ -94,7 +95,194 @@ fn transformer_has_device_format(spec: &LoadSpec) -> gen_core::Result<bool> {
 /// Activation dtype every Mage-Flow component computes in — the DiT, the CoD decoder (`vae.rs`)
 /// and the text encoder (`text_encoder.rs`) are all materialized bf16, so this is the provider's
 /// real activation width rather than a memory-model literal.
+///
+/// Under `MemoryArchitectureFacts::activation_dtype_width`'s SC-22667 definition this is the
+/// **denoise** width, and Mage is the easy case: every component opens at the same dtype, so the
+/// per-phase distinction the contract draws does not split this provider.
 const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Bytes per element of [`ACTIVATION_DTYPE`] — the width `Weights::from_dir` opens **every** Mage
+/// component at (`text_encoder.rs`, `transformer.rs` and `vae.rs` all pass `DType::BF16`).
+const COMPONENT_WIDTH: u64 = 2;
+
+/// The Qwen3-VL vision tower inside the shared text-encoder directory.
+///
+/// `MageTextEncoder::load_inner` builds it only when `multimodal` is set, which
+/// `MagePipeline::load_components` and `load_text` pass as `false`: a generation route materializes
+/// the language stack alone and never touches these tensors.
+const VISION_TOWER_PREFIX: &str = "model.visual.";
+
+/// The CoD autoencoder's **encoder** half inside the shared VAE directory (`MageVaeEncoder::load`'s
+/// own `PREFIX`). `MageVae::load` — the generation-route constructor — passes `with_encoder = false`
+/// and leaves every one of these tensors on disk; only `load_full`, which the Edit provider calls,
+/// materializes them.
+const VAE_ENCODER_PREFIX: &str = "student.dconv_encoder.";
+
+/// The language stack's quantized projections (`candle_gen_boogu::text_encoder`): the four attention
+/// projections and the three MLP projections of each decoder layer, and nothing else — the token
+/// embedding stays a dense `QEmbedding` and the norms load f32.
+const TEXT_ENCODER_PACKED_LEAVES: [&str; 7] = [
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
+];
+
+/// The DiT projection whose resident tier is floored by
+/// [`PrecisionFloorComponent::TransformerHead`] — `MageTransformer::place` folds this one at
+/// `component_quant(TransformerHead, selected)` while every other projection takes `selected`.
+const TRANSFORMER_HEAD_KEY: &str = "norm_out.linear.weight";
+
+/// Headers of one component directory, or none when the component is not on disk.
+///
+/// An absent component contributing `0` is the behaviour
+/// [`gen_core::safetensors_path_bytes`] already had here, and several admission fixtures depend on
+/// it; gating on that sum keeps it while still failing closed on a malformed shard.
+fn component_headers(path: &std::path::Path) -> gen_core::Result<Vec<SafetensorsTensorHeader>> {
+    if gen_core::safetensors_path_bytes(path) == 0 {
+        return Ok(Vec::new());
+    }
+    gen_core::safetensors_path_tensor_headers(path)
+}
+
+/// Resident bytes of one projection folded to a GGUF block tier.
+///
+/// `crate::quant::quantize_onto` routes every fold through `QLinear::quantize_dequant_onto`, whose
+/// block type is `candle_gen::quant::ggml_dtype(quant)` — `Q4_0` (18 B per 32 values) or `Q8_0`
+/// (34 B per 32 values). The dense `[out, in]` weight is gone once the fold completes; the bias,
+/// which the fold promotes to f32, is not.
+fn folded_projection_bytes(
+    header: &SafetensorsTensorHeader,
+    quant: Quant,
+) -> gen_core::Result<u64> {
+    let dtype = candle_gen::quant::ggml_dtype(quant)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    let block = dtype.block_size() as u64;
+    let elements = header
+        .element_count()
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    if block == 0 || !elements.is_multiple_of(block) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "mage-flow: projection {} has {elements} elements, not a whole number of {block}-wide \
+             {dtype:?} blocks",
+            header.name
+        )));
+    }
+    (elements / block)
+        .checked_mul(dtype.type_size() as u64)
+        .ok_or_else(|| gen_core::Error::Msg("mage-flow: folded projection bytes overflow".into()))
+}
+
+/// Load-exact bytes of a component whose linears fold to a GGUF tier at load.
+///
+/// `keep` selects the tensors this route materializes at all, `folds` names the ones the loader
+/// quantizes and at which tier (`None` leaves the tensor dense at [`COMPONENT_WIDTH`]). An
+/// already-packed source is left to [`gen_core::materialized_path_bytes`]'s non-float arm — its
+/// `U32` code plane keeps its stored width and its `scales`/`biases` are priced as read.
+fn component_bytes(
+    dir: &std::path::Path,
+    keep: impl Fn(&str) -> bool,
+    folds: impl Fn(&SafetensorsTensorHeader) -> Option<Quant>,
+) -> gen_core::Result<u64> {
+    let headers = component_headers(dir)?;
+    let mut dense = Vec::new();
+    let mut total = 0_u64;
+    for header in headers {
+        if !keep(&header.name) {
+            continue;
+        }
+        match folds(&header) {
+            Some(quant) => {
+                total = total
+                    .checked_add(folded_projection_bytes(&header, quant)?)
+                    .ok_or_else(|| {
+                        gen_core::Error::Msg("mage-flow: component byte overflow".into())
+                    })?;
+            }
+            None => dense.push(header),
+        }
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(
+            &dense,
+            COMPONENT_WIDTH,
+            dir,
+        )?)
+        .ok_or_else(|| gen_core::Error::Msg("mage-flow: component byte overflow".into()))
+}
+
+/// The bytes each Mage component **materializes** for `provider_id`'s route (epic SC-22657, E1;
+/// feature-end sweep SC-22667).
+///
+/// This is deliberately not `crate::component_footprint`, which is the registry's on-disk size seam
+/// and is documented as an upper bound. Three things separate the two, and each of them moved a
+/// contract's numbers:
+///
+/// * **The generation routes do not load the whole text-encoder or VAE directory.** The Qwen3-VL
+///   vision tower ([`VISION_TOWER_PREFIX`]) and the CoD encoder ([`VAE_ENCODER_PREFIX`]) are Edit-only,
+///   and an on-disk sum charged every text-to-image render for both.
+/// * **A quantized load never holds the dense projections.** `MageTransformer::load_with_quant`
+///   stages on CPU and folds each of the 174 live projections onto the device as a `Q4_0`/`Q8_0`
+///   tensor, and `MageTextEncoder::load_inner` folds the language stack's seven per-layer
+///   projections at the [`PrecisionFloorComponent::TextEncoder`] floor. Charging the bf16 source
+///   over-declared the two largest components by roughly the whole quantization win.
+/// * **A physical q4/q8 tier is already packed**, and its `U32` code plane must be priced as stored
+///   rather than as a dense matrix of its shortened last dimension.
+pub(crate) fn loaded_component_bytes(
+    provider_id: &str,
+    spec: &LoadSpec,
+    dirs: &crate::MageComponentDirs,
+) -> gen_core::Result<gen_core::PerComponentBytes> {
+    let multimodal = is_edit(provider_id);
+    let quant = resolved_quant(spec)?;
+    let text_encoder_quant = quant.map(|selected| {
+        crate::quant::component_quant(PrecisionFloorComponent::TextEncoder, selected)
+    });
+    let head_quant = quant.map(|selected| {
+        crate::quant::component_quant(PrecisionFloorComponent::TransformerHead, selected)
+    });
+    Ok(gen_core::PerComponentBytes {
+        text_encoder: component_bytes(
+            &dirs.text_encoder,
+            |name| multimodal || !name.starts_with(VISION_TOWER_PREFIX),
+            |header| {
+                text_encoder_quant.filter(|_| {
+                    TEXT_ENCODER_PACKED_LEAVES
+                        .iter()
+                        .any(|leaf| header.name.ends_with(leaf))
+                        && header.is_float()
+                })
+            },
+        )?,
+        dit: component_bytes(
+            &dirs.transformer,
+            |_| true,
+            |header| {
+                // Every live projection is a rank-2 float `.weight`; the norms this DiT carries are
+                // rank-1 tensors and it has no convolutions at all, so the shape is the predicate.
+                let projection = header.name.ends_with(".weight")
+                    && header.shape.len() == 2
+                    && header.is_float();
+                if !projection {
+                    return None;
+                }
+                if header.name.ends_with(TRANSFORMER_HEAD_KEY) {
+                    head_quant
+                } else {
+                    quant
+                }
+            },
+        )?,
+        vae: component_bytes(
+            &dirs.vae,
+            |name| multimodal || !name.starts_with(VAE_ENCODER_PREFIX),
+            |_| None,
+        )?,
+    })
+}
 
 /// Snapshot-read architecture axes for the six Mage-Flow routes (epic SC-22657, E2).
 ///
@@ -106,11 +294,16 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// `head_dim` comes from the same source. Mage's config carries no head-dim key, but it does carry
 /// `hidden_size` — [`config::MageConfig::from_json`] reads it — so the honest per-head width is the
 /// quotient `hidden_size / num_heads`, which on the reference snapshot is 3072 / 24 = the crate
-/// constant [`config::HEAD_DIM`]. Publishing that constant unconditionally while the heads and
+/// constant `config::HEAD_DIM`. Publishing that constant unconditionally while the heads and
 /// blocks beside it came from the config would make a snapshot with a different `hidden_size`
-/// report a width its own trunk does not have. The constant survives only as the fallback for a
-/// config that omits `hidden_size` — and `af::head_dim` declines a quotient that does not divide
-/// evenly rather than rounding one, so a non-uniform snapshot publishes no width at all.
+/// report a width its own trunk does not have. `af::head_dim` declines a quotient that does not
+/// divide evenly rather than rounding one, so a non-uniform snapshot publishes no width at all.
+///
+/// **There is no preset fallback for a config that omits `hidden_size`** (SC-22667, the
+/// `MemoryArchitectureFacts` preset-fallback rule). `MageConfig::from_json` reads `hidden_size`
+/// through its required-integer accessor and **errors** on a config that omits it, so a partial
+/// config has no loadable head width at all and `config::HEAD_DIM` is not what such a load would
+/// use — it is what a load that never happens would have used. The axis is declared absent instead.
 ///
 /// The decoder axes are the crate constants [`config::LATENT_CHANNELS`] and
 /// [`config::VAE_DOWNSAMPLE`]: Mage's CoD decoder is built from code, not from a `vae/config.json`.
@@ -127,14 +320,11 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     let attention_heads = af::axis_of(dit.as_ref(), &["num_heads"]);
     gen_core::MemoryArchitectureFacts {
         attention_heads,
-        // `hidden_size / num_heads` from the config the loader parses. The crate constant covers
-        // only a config that declares no `hidden_size` at all; a config that declares one the head
-        // count does not divide publishes no width rather than falling back to a preset that would
-        // contradict it.
-        head_dim: match af::axis_of(dit.as_ref(), &["hidden_size"]) {
-            Some(hidden_size) => af::head_dim(Some(hidden_size), attention_heads),
-            None => af::declared(config::HEAD_DIM),
-        },
+        // `hidden_size / num_heads` from the config the loader parses — and nothing else. A config
+        // the loader would refuse (no `hidden_size`) and one it would load with a non-uniform trunk
+        // (a quotient that does not divide) both publish no width, rather than a crate preset the
+        // load would never reach.
+        head_dim: af::head_dim(af::axis_of(dit.as_ref(), &["hidden_size"]), attention_heads),
         transformer_blocks: af::axis_of(dit.as_ref(), &["depth"]),
         patch_size: af::axis_of(dit.as_ref(), &["patch_size"]),
         latent_channels: af::declared(config::LATENT_CHANNELS),
@@ -150,7 +340,18 @@ pub fn provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    provider_contract_with_components(provider_id, spec, crate::component_footprint(spec)?)
+    provider_contract_with_dirs(provider_id, spec, &crate::resolved_component_dirs(spec)?)
+}
+
+/// The production contract for an already-resolved component layout — the entry point the loader
+/// itself uses, so the generator and the registry price the identical directories.
+pub(crate) fn provider_contract_with_dirs(
+    provider_id: &str,
+    spec: &LoadSpec,
+    dirs: &crate::MageComponentDirs,
+) -> gen_core::Result<MemoryProviderContract> {
+    let components = loaded_component_bytes(provider_id, spec, dirs)?;
+    provider_contract_with_components(provider_id, spec, components)
 }
 
 pub(crate) fn provider_contract_with_components(
@@ -821,6 +1022,137 @@ pub fn registered_begin_request(
 mod tests {
     use super::*;
 
+    /// Minimal header-only bf16 safetensors file. The payload is zero-filled: every assertion here
+    /// is over tensor *geometry*, which lives in the header, and nothing reads a value.
+    fn write_bf16(path: &std::path::Path, tensors: &[(&str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, shape) in tensors {
+            let bytes = shape.iter().product::<usize>() as u64 * 2;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A snapshot carrying the Edit-only tensors alongside the ones every route loads: the Qwen3-VL
+    /// vision tower inside `text_encoder/`, and the CoD encoder inside `vae/`.
+    fn multimodal_snapshot(tmp: &tempfile::TempDir, name: &str) -> LoadSpec {
+        let spec = architecture_spec(tmp, 12);
+        let WeightsSource::Dir(root) = &spec.weights else {
+            unreachable!()
+        };
+        let root = root.clone();
+        let _ = name;
+        write_bf16(
+            &root.join("text_encoder/model.safetensors"),
+            &[
+                ("model.language_model.embed_tokens.weight", &[64, 8]),
+                ("model.language_model.norm.weight", &[8]),
+                ("model.visual.blocks.0.attn.qkv.weight", &[32, 8]),
+            ],
+        );
+        write_bf16(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("student.decoder.proj_out.weight", &[16, 8]),
+                ("student.dconv_encoder.proj_out.weight", &[24, 8]),
+            ],
+        );
+        write_bf16(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", &[64, 64])],
+        );
+        spec
+    }
+
+    /// Feature-end review (SC-22667, E1). `MagePipeline::load_components` builds the text encoder
+    /// with `multimodal = false` and the autoencoder through `MageVae::load` (`with_encoder =
+    /// false`), so a generation route never materializes the Qwen3-VL vision tower or the CoD
+    /// encoder — and must not charge either. The Edit provider passes `true` / `load_full` and does.
+    ///
+    /// Mutation that fails this: dropping the `multimodal ||` guards from `loaded_component_bytes`
+    /// so both components keep the whole directory — the generation route then reads 1_664 B of
+    /// conditioning and 640 B of decoder, the Edit figures, on every text-to-image render.
+    #[test]
+    fn generation_routes_do_not_charge_the_edit_only_vision_tower_or_vae_encoder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = multimodal_snapshot(&tmp, "edit-only");
+        // language stack: 64*8 + 8 = 520 elements, bf16 -> 1_040 B; vision tower 32*8 -> 512 B.
+        // decoder half 16*8 -> 256 B; CoD encoder half 24*8 -> 384 B.
+        let generation = contract_rl(&spec).unwrap();
+        assert_eq!(generation.asset_facts.conditioning_bytes, 1_040);
+        assert_eq!(generation.asset_facts.decoder_bytes, 256);
+
+        let edit = contract_edit(&spec).unwrap();
+        assert_eq!(edit.asset_facts.conditioning_bytes, 1_040 + 512);
+        assert_eq!(edit.asset_facts.decoder_bytes, 256 + 384);
+
+        for contract in [&generation, &edit] {
+            gen_core_testkit::check_memory_contract_asset_facts(contract)
+                .unwrap_or_else(|errors| panic!("{errors:?}"));
+        }
+        assert!(
+            generation.asset_facts.base_bytes < edit.asset_facts.base_bytes,
+            "the Edit route holds strictly more than the generation route"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1). A quantized Mage load never holds the dense projections:
+    /// `MageTransformer::load_with_quant` stages on CPU and folds all 174 live projections onto the
+    /// device as GGUF blocks, with `norm_out.linear` floored to Q8 by
+    /// [`PrecisionFloorComponent::TransformerHead`] even when Q4 is selected.
+    ///
+    /// Mutation that fails this: returning `None` from `loaded_component_bytes`'s DiT `folds`
+    /// closure, which restores the dense 16_512 B figure for every tier.
+    #[test]
+    fn a_quantized_load_charges_the_folded_projections_not_the_dense_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = architecture_spec(&tmp, 12);
+        let WeightsSource::Dir(root) = &spec.weights else {
+            unreachable!()
+        };
+        write_bf16(
+            &root.join("transformer/model.safetensors"),
+            &[
+                ("img_in.weight", &[64, 64]),
+                ("norm_out.linear.weight", &[64, 64]),
+                ("txt_norm.weight", &[64]),
+            ],
+        );
+        // 4_096-element projections: bf16 8_192 B, Q4_0 128 blocks * 18 B = 2_304 B, Q8_0
+        // 128 * 34 = 4_352 B. The rank-1 norm is never folded: 64 * 2 = 128 B.
+        for (quant, expected) in [
+            (None, 8_192 + 8_192 + 128),
+            // Q4 body + the Q8-floored head.
+            (Some(Quant::Q4), 2_304 + 4_352 + 128),
+            (Some(Quant::Q8), 4_352 + 4_352 + 128),
+        ] {
+            let mut spec = spec.clone();
+            spec.quantize = quant;
+            let contract = contract_rl(&spec).unwrap();
+            assert_eq!(
+                contract.asset_facts.transformer_bytes, expected,
+                "{quant:?} transformer bytes"
+            );
+        }
+    }
+
     fn spec(tmp: &tempfile::TempDir) -> LoadSpec {
         let root = tmp.path().join("sc15813-mage-packed-contract");
         let transformer = root.join("transformer");
@@ -950,7 +1282,13 @@ mod tests {
             candle_gen::architecture_facts::declared(config::HEAD_DIM)
         );
 
-        // The crate constant survives only where there is no `hidden_size` to divide...
+        // SC-22667, the `MemoryArchitectureFacts` preset-fallback rule ("fall back to a preset only
+        // where the LOADER itself falls back to that preset; otherwise declare the axis None"):
+        // there is NO crate-constant fallback for a config that omits `hidden_size`.
+        // `MageConfig::from_json` reads it through its required-integer accessor and errors, so this
+        // snapshot does not load at all and `config::HEAD_DIM` is not the width it would run — it is
+        // the width a load that never happens would have run. This assertion previously pinned
+        // `Some(128)`, which is the shape the rule forbids.
         let no_hidden = tmp.path().join("sc22661-mage-no-hidden-size");
         std::fs::create_dir_all(no_hidden.join("transformer")).unwrap();
         std::fs::write(
@@ -958,6 +1296,11 @@ mod tests {
             br#"{"num_heads": 24, "depth": 12, "patch_size": 1}"#,
         )
         .unwrap();
+        assert!(
+            config::MageConfig::from_json(r#"{"num_heads": 24, "depth": 12, "patch_size": 1}"#)
+                .is_err(),
+            "the premise of the assertion below: this config does not load"
+        );
         assert_eq!(
             provider_contract_for(
                 config::MODEL_ID,
@@ -966,7 +1309,7 @@ mod tests {
             .unwrap()
             .architecture_facts
             .head_dim,
-            Some(128)
+            None
         );
         // ...and never where the declared pair is non-uniform: no honest width exists there.
         let ragged = tmp.path().join("sc22661-mage-ragged");

@@ -241,15 +241,21 @@ fn exact_load_receipt(
             )?,
         ],
     )?;
+    let audio_path = component_path(LtxComponent::AudioVae)?;
+    // SC-22667 (E1): on a **converted** tier the vocoder is its own file beside the audio VAE.
+    // `lib.rs` requires it there (`ltx_2_5: converted tier is missing vocoder.safetensors beside
+    // …`) and opens it at `VAE_DTYPE`. `LtxComponent::AudioVae` names one file carrying both the
+    // `audio_vae` and `vocoder` config sections, which is true of the **bundle** layout and only
+    // there — so charging that component alone left the whole vocoder resident and unpriced on
+    // every converted tier. Presence is the gate because it is the loader's own gate: a bundle has
+    // no such sibling file and contributes 0, with its vocoder already inside the audio-VAE file.
+    let vocoder_path = audio_path.with_file_name("vocoder.safetensors");
     let decoder_bytes = checked_sum(
         "decoder component",
         [
             required_component_bytes(video_path, 4, "selected video decoder")?,
-            required_component_bytes(
-                component_path(LtxComponent::AudioVae)?,
-                4,
-                "audio VAE and vocoder",
-            )?,
+            required_component_bytes(audio_path, 4, "audio VAE")?,
+            optional_component_bytes(&vocoder_path, 4, "converted-tier vocoder")?,
         ],
     )?;
     let overlay_bytes = spec.adapters.iter().try_fold(0_u64, |total, adapter| {
@@ -1199,6 +1205,49 @@ mod tests {
             ),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    /// Feature-end review (SC-22667, E1). A converted 2.5 tier splits the vocoder out into its own
+    /// `vocoder.safetensors` beside the audio VAE — `lib.rs` refuses to load a converted tier
+    /// without it and opens it at `VAE_DTYPE` — while the bundle layout keeps both the `audio_vae`
+    /// and `vocoder` config sections inside one file. Charging `LtxComponent::AudioVae` alone was
+    /// therefore correct for a bundle and left the whole vocoder resident and unpriced on every
+    /// converted tier.
+    ///
+    /// Mutation that fails this: dropping the `optional_component_bytes(&vocoder_path, …)` term, so
+    /// the sibling file reads as 0 and the decoder stays at the bundle figure.
+    #[test]
+    fn a_converted_tiers_sibling_vocoder_is_charged_to_the_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let load = physical_spec(directory.path(), false, true);
+
+        // The bundle shape: the vocoder lives inside `audio_vae.safetensors`, with no sibling.
+        let bundle = memory_strategy_contract(&load).unwrap();
+        assert_eq!(bundle.asset_facts.decoder_bytes, 68 + 76);
+
+        // The converted shape: the same components plus the split-out vocoder the loader requires.
+        write_safetensors(&directory.path().join("vocoder.safetensors"), &[], 47);
+        let converted = memory_strategy_contract(&load).unwrap();
+        assert_eq!(
+            converted.asset_facts.decoder_bytes,
+            68 + 76 + 47 * 4,
+            "the sibling vocoder is resident and must be charged"
+        );
+        // Nothing else moves, and `base_bytes` stays its own decomposition.
+        assert_eq!(
+            converted.asset_facts.conditioning_bytes,
+            bundle.asset_facts.conditioning_bytes
+        );
+        assert_eq!(
+            converted.asset_facts.transformer_bytes,
+            bundle.asset_facts.transformer_bytes
+        );
+        assert_eq!(
+            converted.asset_facts.base_bytes,
+            bundle.asset_facts.base_bytes + 47 * 4
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&converted)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
     }
 
     #[test]

@@ -3424,17 +3424,6 @@ mod tests {
     use crate::voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
     use std::path::PathBuf;
 
-    fn assert_artifact_seal_mismatch(error: crate::Error) {
-        match error {
-            crate::Error::Unsupported(reason)
-                if reason.starts_with("artifact seal mismatch after load: ") => {}
-            crate::Error::Unsupported(reason) => {
-                panic!("expected the shared artifact-seal rejection, got: {reason}")
-            }
-            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
-        }
-    }
-
     struct DummyGen {
         desc: ModelDescriptor,
     }

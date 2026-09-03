@@ -272,6 +272,15 @@ struct ComponentBytes {
     /// and `resolve` is the only place that knows where they live. `None` for the weights-free
     /// fixture, which resolves no snapshot at all and therefore knows no axis.
     root: Option<std::path::PathBuf>,
+    /// The DiT partition directory that was actually charged — the staged override when one is
+    /// installed, else `<root>/<partition>`.
+    ///
+    /// Carried for [`architecture_facts`] (SC-22667, E2): a split install stages the DiT **outside**
+    /// the snapshot, so `<root>/transformer/config.json` may not exist at all and reading the trunk
+    /// axes from there published `None` for four axes the load reads from a file it holds open.
+    /// `resolve` is the only place that knows which of the two partitions won, and reading the
+    /// config off the loser would describe a partition that is not being charged.
+    dit_dir: Option<std::path::PathBuf>,
     text_encoder: u64,
     dit: u64,
     /// The AdaLN sub-stack's residency **on the DiT that was actually resolved** — see
@@ -335,6 +344,9 @@ impl ComponentBytes {
             // disk, and a single-file import is not a component snapshot.
             root: candle_gen::architecture_facts::snapshot_root(spec)
                 .map(std::path::Path::to_path_buf),
+            // Only when it is on disk: the registry's sentinel surface names a partition nobody
+            // creates, and an unresolved partition knows no axis.
+            dit_dir: dit_dir.is_dir().then(|| dit_dir.clone()),
             text_encoder: safetensors_path_bytes(text_encoder),
             dit,
             // Resolved against the partition that was actually charged, whichever of the two won the
@@ -744,7 +756,17 @@ fn architecture_facts(
     let Some(root) = components.root.as_deref() else {
         return candle_gen::gen_core::MemoryArchitectureFacts::default();
     };
-    let dit = af::component_config(root, BASE_DIT_PARTITION);
+    // SC-22667: read the trunk axes from the partition `ComponentBytes::resolve` actually charged.
+    // A split `q4`/`q8` install stages the DiT outside the snapshot through `spec.components`, so
+    // `<root>/transformer/config.json` need not exist — and reading only there published `None` for
+    // `attention_heads`, `head_dim`, `transformer_blocks` and `patch_size` on exactly the installs
+    // whose config the loader has open. `<root>/<partition>` remains the fallback, which is what
+    // `resolve` itself falls back to, so a flat snapshot is unchanged.
+    let dit = components
+        .dit_dir
+        .as_deref()
+        .and_then(|dir| af::config_file(&dir.join("config.json")))
+        .or_else(|| af::component_config(root, BASE_DIT_PARTITION));
     let vae = af::component_config(root, "vae");
     if dit.is_none() && vae.is_none() {
         return candle_gen::gen_core::MemoryArchitectureFacts::default();
@@ -920,6 +942,7 @@ pub fn weights_free_contract(
     Ok(build_contract(&ComponentBytes {
         // No snapshot is resolved and none is traversed, so no architecture axis is knowable.
         root: None,
+        dit_dir: None,
         text_encoder: 0,
         dit: 0,
         // The declaration-only footprint resolves no DiT, so the sub-stack states the architecture's
@@ -1125,6 +1148,61 @@ mod tests {
 
         // The registry surface resolves no snapshot at all.
         assert!(declared().architecture_facts.is_empty());
+    }
+
+    /// Feature-end review (SC-22667, E2). A split `q4`/`q8` install stages the DiT **outside** the
+    /// snapshot through `spec.components`, so `<root>/transformer/` need not exist — but the loader
+    /// still parses a `config.json`, the staged one, and the four trunk axes are therefore known.
+    ///
+    /// Mutation that fails this: reading only `af::component_config(root, BASE_DIT_PARTITION)`, the
+    /// shape under review — `attention_heads`, `head_dim`, `transformer_blocks` and `patch_size` all
+    /// read `None` on this install while the VAE axes beside them read fine, which is the exact
+    /// asymmetry that made the omission invisible.
+    #[test]
+    fn a_staged_dit_publishes_the_trunk_axes_of_the_partition_it_charges() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged tempdir");
+        // The snapshot carries everything EXCEPT the transformer partition.
+        sparse_snapshot(
+            root.path(),
+            &[
+                ("text_encoder", TEXT_ENCODER_BYTES),
+                ("vae", VIDEO_VAE_BYTES),
+                ("audio_vae", AUDIO_VAE_BYTES),
+            ],
+        );
+        write_component_configs(root.path(), 50);
+        // `write_component_configs` also writes `<root>/transformer/config.json`; drop the whole
+        // partition so this fixture is the split install it claims to be.
+        std::fs::remove_dir_all(root.path().join(BASE_DIT_PARTITION)).expect("drop the partition");
+        assert!(!root.path().join(BASE_DIT_PARTITION).is_dir());
+
+        // The staged partition carries its own config, with a depth the snapshot never declared.
+        sparse_snapshot(staged.path(), &[(BASE_DIT_PARTITION, DIT_Q8_BYTES)]);
+        std::fs::write(
+            staged.path().join(BASE_DIT_PARTITION).join("config.json"),
+            r#"{"_class_name":"MiniMaxH3Transformer3DModel","num_attention_heads":56,
+                "attention_head_dim":128,"hidden_size":5376,"num_layers":41,
+                "patch_size":[1,2,2],"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .expect("staged dit config");
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+            BASE_DIT_PARTITION,
+            WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
+        );
+        let facts = contract_for(&spec).expect("contract").architecture_facts;
+        assert_eq!(facts.attention_heads, Some(56));
+        assert_eq!(facts.head_dim, Some(128));
+        assert_eq!(
+            facts.transformer_blocks,
+            Some(41),
+            "the depth comes from the STAGED partition, not the snapshot"
+        );
+        assert_eq!(facts.patch_size, Some(2));
+        // The VAE axes still come from the snapshot, which is where that component lives.
+        assert_eq!(facts.latent_channels, Some(24));
+        assert_eq!(facts.vae_spatial_scale, Some(16));
     }
 
     // --- AC1: declared Resident, not fallen-back Resident ---------------------------------------
