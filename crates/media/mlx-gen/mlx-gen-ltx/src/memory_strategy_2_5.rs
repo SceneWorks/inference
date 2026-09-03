@@ -282,6 +282,14 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
         .path()
         .to_path_buf();
     let connector_path = transformer_path.with_file_name("connector.safetensors");
+    // `build_ltx25` resolves the converted vocoder as an unclaimed secondary sibling beside the
+    // audio VAE that owns the merged upstream audio/vocoder configuration. Same derivation here,
+    // so the contract cannot price a different file from the one the load opens.
+    let vocoder_path = bundle
+        .require(LtxComponent::AudioVae)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+        .path()
+        .with_file_name("vocoder.safetensors");
     let enhancer_path = crate::model::ltx25_enhancer_dir(spec)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
 
@@ -304,6 +312,16 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
                 "audio/video connector",
                 ResidentProjection::Stored,
             )?,
+            // SC-22667: a converted 2.5 tier splits the VAE encoder into its own
+            // `vae_encoder.safetensors`; `ltx25_encoder_path` falls back to the DECODER file for a
+            // raw split bundle that keeps the encoder beside its decoder. That fallback is charged
+            // here unconditionally, because it is a genuine SECOND residency rather than a double
+            // count of one network: `LtxVideoVae::encode` takes the lazy path, and
+            // `Weights::from_file` followed by `Weights::materialize` evaluates EVERY tensor in the
+            // named file — so on a raw bundle the whole decoder file is materialized a second time
+            // while the built decoder is still resident. Skipping the charge when the two paths
+            // coincide would violate E3 (never predict a fit that OOMs) on exactly the raw bundles
+            // this fallback exists for.
             required_projected_bytes(
                 &encoder_path,
                 "selected video VAE encoder",
@@ -362,9 +380,17 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
                     .require(LtxComponent::AudioVae)
                     .map_err(|error| gen_core::Error::Msg(error.to_string()))?
                     .path(),
-                "audio VAE and vocoder",
+                "audio VAE",
                 ResidentProjection::Float32,
             )?,
+            // SC-22667: the vocoder was never priced. `LtxComponent::AudioVae` carries the merged
+            // audio/vocoder CONFIG — which is what `VocoderConfig::from_bundle` reads out of it,
+            // and why the label here used to claim both — but the vocoder WEIGHTS are a separate
+            // sibling file that `build_ltx25` resolves, opens, materializes and builds
+            // unconditionally on every 2.5 load, with no route gate. The 2.3 registration in this
+            // same crate already charges `vocoder.safetensors` at `Float32`, so this was an
+            // omission in the 2.5 port rather than a family design choice.
+            required_projected_bytes(&vocoder_path, "vocoder", ResidentProjection::Float32)?,
         ],
     )?;
     if !adapters_have_load_exact_additive_accounting(spec)? {
@@ -1032,6 +1058,9 @@ mod tests {
             "vae_decoder.safetensors",
             "vae_encoder.safetensors",
             "audio_vae.safetensors",
+            // The vocoder: a separate sibling file `build_ltx25` opens, materializes and builds on
+            // every 2.5 load. This fixture did not carry it, which is how it went unpriced.
+            "vocoder.safetensors",
             "duration.safetensors",
             "spatial.safetensors",
             "temporal.safetensors",
@@ -1070,15 +1099,35 @@ mod tests {
         let contract = memory_strategy_contract(&spec).unwrap();
         assert_eq!(contract.asset_facts.conditioning_bytes, 16);
         assert_eq!(contract.asset_facts.transformer_bytes, 12);
-        assert_eq!(contract.asset_facts.decoder_bytes, 8);
-        assert_eq!(contract.asset_facts.base_bytes, 36);
+        assert_eq!(
+            contract.asset_facts.decoder_bytes, 12,
+            "SC-22667: the decode phase is the video VAE, the audio VAE AND the vocoder"
+        );
+        assert_eq!(contract.asset_facts.base_bytes, 40);
         assert_eq!(contract.asset_facts.overlay_bytes, 0);
+
+        // SC-22667: a RAW split bundle keeps the VAE encoder inside its decoder file, and
+        // `ltx25_encoder_path` falls back to that file. The conditioning phase still charges it,
+        // because `LtxVideoVae::encode` re-opens that path and `Weights::materialize` evaluates
+        // every tensor in it — a second full residency of the decoder file, alongside the built
+        // decoder. So the totals are UNCHANGED from the converted-tier layout above: dropping the
+        // separate `vae_encoder.safetensors` must not move a single field.
+        //
+        // Mutation that fails this: re-introducing an `if encoder_path == video_path { 0 }` guard
+        // in the conditioning sum — conditioning reads back 12 and `base_bytes` 36, under-pricing
+        // the peak the loader actually reaches and violating E3.
+        std::fs::remove_file(root.join("vae_encoder.safetensors")).unwrap();
+        let shared = memory_strategy_contract(&spec).unwrap();
+        assert_eq!(shared.asset_facts.conditioning_bytes, 16);
+        assert_eq!(shared.asset_facts.decoder_bytes, 12);
+        assert_eq!(shared.asset_facts.base_bytes, 40);
+        write_one_tensor(&root.join("vae_encoder.safetensors"));
 
         std::fs::create_dir_all(root.join("enhancer")).unwrap();
         write_one_tensor(&root.join("enhancer/model.safetensors"));
         let enhanced_contract = memory_strategy_contract(&spec).unwrap();
         assert_eq!(enhanced_contract.asset_facts.conditioning_bytes, 18);
-        assert_eq!(enhanced_contract.asset_facts.base_bytes, 38);
+        assert_eq!(enhanced_contract.asset_facts.base_bytes, 42);
 
         write_one_tensor(&root.join("adapter.safetensors"));
         let adapter_bytes = std::fs::metadata(root.join("adapter.safetensors"))
@@ -1091,7 +1140,7 @@ mod tests {
             AdapterKind::Lora,
         ));
         let adapted_contract = memory_strategy_contract(&adapted).unwrap();
-        assert_eq!(adapted_contract.asset_facts.base_bytes, 38);
+        assert_eq!(adapted_contract.asset_facts.base_bytes, 42);
         assert_eq!(adapted_contract.asset_facts.overlay_bytes, adapter_bytes);
         let MemoryFormulaKind::ComponentPhaseEnvelope {
             resident_components,

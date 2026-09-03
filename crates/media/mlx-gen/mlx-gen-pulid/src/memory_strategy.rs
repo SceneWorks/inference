@@ -146,6 +146,28 @@ impl IdentityArtifactInventory {
     }
 }
 
+/// Whether the loader materializes each `identity_paths` entry as f32, in that exact order:
+/// PuLID encoder, EVA tower, SCRFD, ArcFace, BiSeNet.
+///
+/// `load_pulid_flux` does `pulid.cast_all(Dtype::Float32)` on the encoder and `load_eva` does the
+/// same for the EVA tower (`pulid_flux.rs`), while the three face models are handed to
+/// `FaceAnalysis` with no cast at all and therefore stay at their stored width. Pricing all five
+/// from `metadata().len()` underprices the first two by exactly 2x whenever the artifact ships
+/// f16/bf16 — the same defect class sc-15839 fixed for the SDXL VAE, whose
+/// `resolve_vae_weight_file` doc names `ResidentProjection::Float32` as the remedy.
+const IDENTITY_MATERIALIZED_AS_F32: [bool; 5] = [true, true, false, false, false];
+
+/// Bytes one admitted identity artifact occupies on device, at the width the loader materializes
+/// it in rather than the width it is stored in.
+fn materialized_identity_bytes(path: &Path, upcast_to_f32: bool) -> CoreResult<u64> {
+    let projection = if upcast_to_f32 {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    } else {
+        mlx_gen::asset_facts::ResidentProjection::Stored
+    };
+    mlx_gen::asset_facts::projected_safetensors_bytes(path, |_| projection)
+}
+
 pub(crate) fn admitted_identity_inventory(
     spec: &LoadSpec,
 ) -> CoreResult<IdentityArtifactInventory> {
@@ -154,7 +176,8 @@ pub(crate) fn admitted_identity_inventory(
     let files = identity_paths(spec)?
         .into_iter()
         .zip(EXPECTED.iter().copied())
-        .map(|(path, expected)| {
+        .zip(IDENTITY_MATERIALIZED_AS_F32)
+        .map(|((path, expected), upcast_to_f32)| {
             let admitted_path = path.canonicalize().map_err(|error| {
                 CoreError::Unsupported(format!(
                     "pulid_flux: resolve {} during admission: {error}",
@@ -162,22 +185,17 @@ pub(crate) fn admitted_identity_inventory(
                 ))
             })?;
             let admitted_hash = hash(&admitted_path)?;
-            Ok((path, admitted_path, admitted_hash, expected))
+            Ok((path, admitted_path, admitted_hash, expected, upcast_to_f32))
         })
         .collect::<CoreResult<Vec<_>>>()?;
-    for (_, admitted_path, admitted_hash, expected) in &files {
+    for (_, admitted_path, admitted_hash, expected, upcast_to_f32) in &files {
         exact_calibration &= admitted_hash == expected;
-        bytes = bytes.saturating_add(
-            admitted_path
-                .metadata()
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?
-                .len(),
-        );
+        bytes = bytes.saturating_add(materialized_identity_bytes(admitted_path, *upcast_to_f32)?);
     }
     let inventory = IdentityArtifactInventory {
         files: files
             .into_iter()
-            .map(|(path, admitted_path, admitted_hash, _)| (path, admitted_path, admitted_hash))
+            .map(|(path, admitted_path, admitted_hash, _, _)| (path, admitted_path, admitted_hash))
             .collect(),
         bytes,
         exact_calibration,
@@ -199,7 +217,8 @@ pub(crate) const IDENTITY_COMPONENT_ID: &str = "pulid_identity_stack";
 fn adapt(
     mut contract: MemoryProviderContract,
     spec: &LoadSpec,
-    identity_bytes: Option<u64>,
+    identity_bytes: u64,
+    exact_calibration: bool,
     weights_free: bool,
 ) -> MemoryProviderContract {
     contract.provider_id = crate::pulid_flux::MODEL_ID.into();
@@ -208,7 +227,16 @@ fn adapt(
     // and `base_bytes` stays exactly the sum of the three base-model component fields. Folding it
     // into `base_bytes` — the shape under review — published a base that was not its own
     // decomposition.
-    if let Some(identity_bytes) = identity_bytes.filter(|bytes| *bytes > 0) {
+    //
+    // SC-22667: the pricing is **unconditional**, keyed only on what the loader materializes. It
+    // used to be gated on `IdentityArtifactInventory::is_exact_calibration`, so any pinned-SHA
+    // drift — a re-download, a re-quantized EVA tower, a newer `pulid_flux_v0.9.1.safetensors` —
+    // published `overlay_bytes == 0` and no component while `load_pulid_flux` still materialized
+    // the whole identity stack. Nothing on that path refuses the load (`admitted_identity_inventory`
+    // only records the flag), so the fit gate was handed a contract that omitted several gigabytes
+    // of resident weights. Hash exactness is evidence about *measurement*, so it now gates exactly
+    // one thing: the `calibration` field below.
+    if identity_bytes > 0 {
         contract.asset_facts.overlay_bytes = contract
             .asset_facts
             .overlay_bytes
@@ -220,15 +248,31 @@ fn adapt(
             bounded_by: None,
             residency: MemoryComponentResidency::WholeRender,
         };
+        // APPEND, never replace (SC-22667). The borrowed FLUX.1 contract now declares its own
+        // auxiliary components — an IP-adapter, an adapter stack, a resident PiD pair — and
+        // `overlay_bytes` above already carries their bytes. Overwriting the vector with just the
+        // identity stack would leave `overlay_bytes` and the declared component bytes disagreeing,
+        // which the shared validator reports as a conformance error.
         contract.formula = match contract.formula {
-            MemoryFormulaKind::PhaseEnvelope { phases, variables }
-            | MemoryFormulaKind::ComponentPhaseEnvelope {
-                phases, variables, ..
-            } => MemoryFormulaKind::ComponentPhaseEnvelope {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases,
+                    variables,
+                    resident_components: vec![component],
+                }
+            }
+            MemoryFormulaKind::ComponentPhaseEnvelope {
                 phases,
                 variables,
-                resident_components: vec![component],
-            },
+                mut resident_components,
+            } => {
+                resident_components.push(component);
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases,
+                    variables,
+                    resident_components,
+                }
+            }
             other => other,
         };
     }
@@ -237,7 +281,7 @@ fn adapt(
             STATIC_CALIBRATION,
             spec.load_shape,
         ))
-    } else if identity_bytes.is_some() && contract.calibration.is_some() {
+    } else if exact_calibration && contract.calibration.is_some() {
         Some(MemoryCalibrationIdentity::new(
             MEMORY_CALIBRATION_FINGERPRINT,
             spec.load_shape,
@@ -263,7 +307,8 @@ pub(crate) fn contract_with_inventory(
     Ok(adapt(
         contract,
         spec,
-        inventory.is_exact_calibration().then(|| inventory.bytes()),
+        inventory.bytes(),
+        inventory.is_exact_calibration(),
         false,
     ))
 }
@@ -274,7 +319,7 @@ pub fn weights_free_contract(spec: &LoadSpec) -> CoreResult<MemoryProviderContra
         mlx_gen_flux::FLUX1_DEV_ID,
         &base,
     )?;
-    Ok(adapt(contract, spec, Some(0), true))
+    Ok(adapt(contract, spec, 0, false, true))
 }
 
 pub fn safety_check(
@@ -837,36 +882,106 @@ mod tests {
         assert_eq!(bounded_transformer, 3);
     }
 
-    #[test]
-    fn noncanonical_identity_is_admitted_uncalibrated_and_pinned() {
-        let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
+    /// Write a minimal single-tensor safetensors file so the header-only resident projection can
+    /// price it. `dtype` is the safetensors dtype string and must agree with `width`, because
+    /// `safetensors_file_tensor_locations` refuses a header whose payload length is not
+    /// `element_count * dtype.size()`.
+    fn write_identity_artifact(path: &Path, dtype: &str, elements: usize, width: usize) {
+        let data_bytes = elements * width;
+        let mut header = format!(
+            "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+        )
+        .into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + data_bytes, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Element counts and stored dtypes for the five identity artifacts, in `identity_paths` order.
+    /// The encoder and the EVA tower ship at half precision — exactly the case that used to be
+    /// underpriced.
+    const ARTIFACTS: [(&str, usize, usize); 5] = [
+        ("F16", 100, 2),
+        ("BF16", 50, 2),
+        ("F16", 40, 2),
+        ("F32", 10, 4),
+        ("F16", 20, 2),
+    ];
+
+    /// Build a noncanonical-but-well-formed identity stack under `root`, point `spec` at it, and
+    /// return the encoder path so a caller can mutate it.
+    fn identity_fixture(root: &Path, spec: &mut LoadSpec) -> PathBuf {
         let face = root.join("face");
         std::fs::create_dir_all(&face).unwrap();
         let encoder = root.join("encoder.safetensors");
         let eva = root.join("eva.safetensors");
-        std::fs::write(&encoder, b"compatible noncanonical encoder").unwrap();
-        std::fs::write(&eva, b"compatible noncanonical eva").unwrap();
-        for name in [
-            "scrfd_10g.safetensors",
-            "arcface_iresnet100.safetensors",
-            "bisenet_parsing.safetensors",
-        ] {
-            std::fs::write(face.join(name), name.as_bytes()).unwrap();
+        let paths = [
+            encoder.clone(),
+            eva.clone(),
+            face.join("scrfd_10g.safetensors"),
+            face.join("arcface_iresnet100.safetensors"),
+            face.join("bisenet_parsing.safetensors"),
+        ];
+        for (path, (dtype, elements, width)) in paths.iter().zip(ARTIFACTS) {
+            write_identity_artifact(path, dtype, elements, width);
         }
-
-        let mut spec = spec();
         spec.identity = Some(IdentityWeights {
             encoder: Some(WeightsSource::File(encoder.clone())),
             eva: Some(WeightsSource::File(eva)),
             face_dir: Some(WeightsSource::Dir(face)),
         });
+        encoder
+    }
+
+    #[test]
+    fn noncanonical_identity_is_admitted_uncalibrated_and_pinned() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        let mut spec = spec();
+        let encoder = identity_fixture(&root, &mut spec);
         let inventory = admitted_identity_inventory(&spec).unwrap();
         assert!(!inventory.is_exact_calibration());
         inventory.ensure_unchanged().unwrap();
 
-        std::fs::write(&encoder, b"mutated noncanonical encoder").unwrap();
+        write_identity_artifact(&encoder, "F16", 101, 2);
         assert!(inventory.ensure_unchanged().is_err());
+    }
+
+    /// Feature-end review (SC-22667, E1): identity bytes must be priced at the width the loader
+    /// **materializes**, not the width the artifact is stored in. `load_pulid_flux` casts the PuLID
+    /// encoder and `load_eva` casts the EVA tower to f32 unconditionally, while the three face
+    /// models keep their stored width — so a `metadata().len()` sum underprices the stack by
+    /// exactly the encoder's and EVA's half-precision deficit.
+    ///
+    /// Mutation that fails this: setting `IDENTITY_MATERIALIZED_AS_F32` to `[false; 5]` (or going
+    /// back to `admitted_path.metadata()?.len()`) makes `bytes()` the stored sum, 460, not 760.
+    #[test]
+    fn identity_bytes_are_priced_at_the_width_the_loader_materializes() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        let mut spec = spec();
+        identity_fixture(&root, &mut spec);
+        let inventory = admitted_identity_inventory(&spec).unwrap();
+
+        let stored: u64 = ARTIFACTS
+            .iter()
+            .map(|(_, elements, width)| (elements * width) as u64)
+            .sum();
+        assert_eq!(stored, 460);
+        assert_eq!(
+            inventory.bytes(),
+            // encoder 100 x f32 + EVA 50 x f32 + the three face models at their stored width.
+            400 + 200 + 80 + 40 + 40,
+            "the upcast encoder and EVA tower must be priced at 4 bytes per element"
+        );
+        assert!(
+            inventory.bytes() > stored,
+            "pricing from stored bytes underprices an f16/bf16 identity stack"
+        );
     }
 
     /// Feature-end review (SC-22667, E1): the identity stack is an auxiliary network beside the
@@ -934,18 +1049,39 @@ mod tests {
             contract.conformance_errors()
         );
 
-        // An inventory that is not the exact calibrated stack prices no identity bytes at all —
-        // neither into the overlay nor, as before, into the base.
-        let uncalibrated = IdentityArtifactInventory {
+        // SC-22667: an inventory whose pinned SHAs have drifted still LOADS the whole identity
+        // stack — `admitted_identity_inventory` only records the flag, nothing refuses the load —
+        // so it must publish exactly the same bytes. Hash exactness is evidence about measurement,
+        // and it now gates only the `calibration` field.
+        //
+        // Mutation that fails this: restoring the `inventory.is_exact_calibration().then(..)` gate
+        // in `contract_with_inventory`, which returns `overlay_bytes == 0` and no component here
+        // while the loader materializes 4096 B of identity weights.
+        let drifted = IdentityArtifactInventory {
             files: Vec::new(),
             bytes: 4096,
             exact_calibration: false,
         };
-        let contract = contract_with_inventory(&spec, &uncalibrated).unwrap();
-        assert_eq!(contract.asset_facts.base_bytes, 3 + 5 + 4);
-        assert_eq!(contract.asset_facts.overlay_bytes, 0);
-        assert!(contract.resident_components().is_empty());
-        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+        let drifted = contract_with_inventory(&spec, &drifted).unwrap();
+        assert_eq!(drifted.asset_facts.base_bytes, 3 + 5 + 4);
+        assert_eq!(
+            drifted.asset_facts.overlay_bytes, 4096,
+            "a drifted identity stack is still resident and must still be priced"
+        );
+        assert_eq!(drifted.resident_components().len(), 1);
+        assert_eq!(
+            drifted.asset_facts, contract.asset_facts,
+            "pinned-hash drift must not move a single byte of the published asset facts"
+        );
+        assert_eq!(
+            drifted.resident_components(),
+            contract.resident_components()
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&drifted)
             .unwrap_or_else(|errors| panic!("asset facts: {errors:?}"));
+        assert!(
+            drifted.calibration.is_none(),
+            "only the calibration identity may be withheld on pinned-hash drift"
+        );
     }
 }

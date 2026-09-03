@@ -685,6 +685,16 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
 /// On the weights-free surface there is no config to read and the preset is what the loader would
 /// itself start from.
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    architecture_facts_with_compute(spec, crate::compute_bf16_opt_in())
+}
+
+/// The derivation with the denoiser's compute selection passed in, so both sides of the
+/// `SCAIL2_COMPUTE_BF16` hatch are reachable from a test without mutating process environment
+/// shared by every other test in the binary.
+fn architecture_facts_with_compute(
+    spec: &LoadSpec,
+    compute_bf16: bool,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     let wan = mlx_gen::architecture_facts::materialized_root(spec)
         .and_then(|root| crate::config::Scail2Config::from_model_dir(root).ok())
         .unwrap_or_else(crate::config::Scail2Config::scail2_14b)
@@ -693,7 +703,11 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
-        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667). `head_dim()` is a
+        // plain `dim / num_heads`: `Scail2Config::from_model_dir` overlays snapshot keys with no
+        // validation, so a non-uniform stack published a rounded, fabricated width and a
+        // `"num_heads": 0` divided by zero before `axis` could decline anything.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
         transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
         // A single scalar can only describe a square patch; an anisotropic one has no honest value.
         patch_size: (patch_h == patch_w)
@@ -704,8 +718,14 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
         // SCAIL-2 is the exception in this family: `generate.rs` sets the denoiser's compute dtype
         // to `Dtype::Float32` unless `SCAIL2_COMPUTE_BF16=1` is set, because the bf16 quantized
-        // matmul overflows to NaN at this route's long sequences (sc-5681).
-        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+        // matmul overflows to NaN at this route's long sequences (sc-5681). SC-22667: this used to
+        // hardcode 4 while naming that hatch in its own comment, so an opted-in run published a 2x
+        // over-estimate of every activation. Both sides now read the same predicate.
+        activation_dtype_width: Some(if compute_bf16 {
+            mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+        } else {
+            mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+        }),
     }
 }
 
@@ -983,6 +1003,61 @@ mod tests {
             crate::VAE_TILING.temporal_scale as u32,
             preset_facts.vae_temporal_scale.unwrap()
         );
+    }
+
+    /// Feature-end review (SC-22667, E2): `head_dim` must come from the exactness-gated helper.
+    /// `Scail2Config::from_model_dir` overlays snapshot keys with no validation, so the old
+    /// `axis(wan.head_dim())` published a rounded, fabricated per-head width for a non-uniform
+    /// stack — and divided by zero outright for `"num_heads": 0`.
+    ///
+    /// Mutation that fails this: restoring `axis(wan.head_dim())` — the first case then publishes
+    /// `Some(128)` for a hidden dimension no head count divides, and the second panics.
+    #[test]
+    fn head_width_is_declined_for_a_non_uniform_or_degenerate_head_stack() {
+        let preset = crate::config::Scail2Config::scail2_14b();
+
+        let uneven_dir = tempfile::tempdir().unwrap();
+        let mut uneven = scail2_config_json(&preset);
+        uneven["dim"] = serde_json::json!(5121);
+        let facts = architecture_facts(&spec_for_config(uneven_dir.path(), &uneven));
+        assert_eq!(facts.attention_heads, Some(40));
+        assert_eq!(
+            facts.head_dim, None,
+            "40 heads do not divide 5121; a rounded quotient would invent a width"
+        );
+
+        let headless_dir = tempfile::tempdir().unwrap();
+        let mut headless = scail2_config_json(&preset);
+        headless["num_heads"] = serde_json::json!(0);
+        let facts = architecture_facts(&spec_for_config(headless_dir.path(), &headless));
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+    }
+
+    /// Feature-end review (SC-22667, E2): the published activation width must track the dtype the
+    /// denoiser actually computes in. `generate` runs f32 by default and bf16 under
+    /// `SCAIL2_COMPUTE_BF16=1`; the contract used to hardcode 4 while its own comment named that
+    /// hatch, so an opted-in run published a 2x over-estimate.
+    ///
+    /// Mutation that fails this: hardcoding `FLOAT32_ACTIVATION_WIDTH` again — the bf16 leg then
+    /// reports 4.
+    #[test]
+    fn the_activation_width_follows_the_denoiser_compute_hatch() {
+        let spec = weights_free_spec();
+        assert_eq!(
+            architecture_facts_with_compute(&spec, false).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH)
+        );
+        assert_eq!(
+            architecture_facts_with_compute(&spec, true).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH)
+        );
+        // Nothing else on the axis set moves with it.
+        let f32_facts = architecture_facts_with_compute(&spec, false);
+        let bf16_facts = architecture_facts_with_compute(&spec, true);
+        assert_eq!(f32_facts.attention_heads, bf16_facts.attention_heads);
+        assert_eq!(f32_facts.head_dim, bf16_facts.head_dim);
+        assert_eq!(f32_facts.transformer_blocks, bf16_facts.transformer_blocks);
     }
 
     /// A spec whose weights directory is the registry's never-created contract-surface sentinel:

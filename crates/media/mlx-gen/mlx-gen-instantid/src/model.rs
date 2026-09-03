@@ -584,7 +584,10 @@ impl InstantId {
         identity: crate::memory_strategy::InstantIdMemoryIdentity,
         context: MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract(tier);
+        // SC-22667: the LOADED contract prices what this load materializes. `provider_contract`
+        // takes only a numeric tier and published `MemoryAssetFacts::default()` — five zeros for a
+        // route that holds a whole SDXL base plus the IdentityNet and face IP-Adapter.
+        let contract = crate::memory_strategy::provider_contract_for_paths(paths, tier);
         crate::memory_strategy::validate_context(&contract, tier, &identity, &context)?;
         let staged_residency = context.selection.strategy == MemoryStrategy::StagedResidency;
         let mut model = if staged_residency {

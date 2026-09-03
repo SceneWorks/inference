@@ -101,18 +101,24 @@
 //! depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
+    adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
+    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
     MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
-    TransformerComponent,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec};
 
 use crate::config::{DitConfig, Variant};
+
+/// Provider-local identity of the resident LoRA/LoKr factor stack (epic SC-22657, E1). One stack per
+/// load: `apply_anima_adapters` installs every requested adapter into the same `AdaptableLinear`
+/// chain, so they are declared once, together.
+pub(crate) const ADAPTER_COMPONENT_ID: &str = "anima.adapters.forward_residuals";
 
 /// The **default** decode tile edge in output pixels — what a rung-2 request that names no geometry
 /// decodes at.
@@ -394,23 +400,68 @@ fn contract_with_asset_facts(
         MEMORY_CALIBRATION_FINGERPRINT,
         spec.load_shape,
     ));
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::AttentionChunkSize,
-            // Rung 4 makes transformer weight residency a VARIABLE of the peak rather than a
-            // constant folded into `AssetBytes`: at window 1 the trunk contributes one block of 28.
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+    // SC-22667 (E1): a request's LoRA/LoKr stack is resident beside the base model, so it is priced
+    // as an overlay rather than silently omitted.
+    //
+    // `AnimaHeavy::apply_adapters` installs the stack on EVERY heavy load, warm and staged alike
+    // (`model.rs`), and `apply_anima_adapters` routes it into `AdaptableLinear`, which evaluates
+    // `base(x) + Σ adapter.residual(x)` and never mutates the (possibly packed) base weight —
+    // i.e. [`AdapterResidencyMode::Additive`], not a folded merge. Rung 4 holds a second reference:
+    // `block_stream.rs::capture_adapters` clones every installed adapter into the stream so rebuilt
+    // blocks can replay it. None of that is inside the snapshot subdirs `component_footprint` sums,
+    // so before this the contract reported the bare-base decomposition for a LoRA render.
+    //
+    // `None` from the shared helper means an additive stack was requested and at least one source
+    // could not be sized; fail closed on it rather than publish a zero the shared validator would
+    // wave through — the same disposition mlx-gen-chroma takes.
+    let adapter_bytes =
+        adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive).ok_or_else(
+            || {
+                CoreError::Unsupported(
+                "anima: an adapter stack was requested but at least one source could not be sized; \
+                 refusing to declare a zero the shared validator would wave through"
+                    .to_owned(),
+            )
+            },
+        )?;
+    contract.asset_facts.overlay_bytes = adapter_bytes;
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::AttentionChunkSize,
+        // Rung 4 makes transformer weight residency a VARIABLE of the peak rather than a
+        // constant folded into `AssetBytes`: at window 1 the trunk contributes one block of 28.
+        MemoryFormulaVariable::TransformerWindowSize,
+        MemoryFormulaVariable::OverlayBytes,
+    ];
+    // The component axis only where there IS a resident overlay: the shared validator refuses a
+    // declared component with zero bytes, and `ComponentPhaseEnvelope` with an empty vector would
+    // claim an axis this load does not use.
+    contract.formula = if adapter_bytes == 0 {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![MemoryResidentComponent {
+                id: ADAPTER_COMPONENT_ID.to_owned(),
+                kind: MemoryComponentKind::AdapterStack,
+                resident_bytes: adapter_bytes,
+                // Rung 4's window bounds the 28 DiT blocks, not the adapter factors: the stream
+                // replays every captured adapter into each rebuilt block, so no published rung
+                // releases them.
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        }
     };
     contract.asset_facts.conditioning_bytes = conditioning_bytes;
     contract.asset_facts.transformer_bytes = transformer_bytes;
@@ -782,6 +833,75 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir("/nonexistent/anima-contract".into()))
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(shape)
+    }
+
+    /// Feature-end review (SC-22667, E1): a requested LoRA/LoKr stack is installed into the resident
+    /// Anima stack — `AdaptableLinear` forward residuals over the (possibly packed) base, plus rung
+    /// 4's captured replay copy — so it must be declared once in `overlay_bytes` and once as a typed
+    /// `AdapterStack` component. It used to be invisible: `component_footprint` sums only the
+    /// snapshot's `text_encoders`/`diffusion_models`/`vae` entries, and adapter files live outside
+    /// the snapshot entirely.
+    ///
+    /// Mutation that fails this: dropping `contract.asset_facts.overlay_bytes = adapter_bytes;`, or
+    /// pinning the formula to `MemoryFormulaKind::PhaseEnvelope` unconditionally — either leaves the
+    /// adapted load reporting `overlay_bytes == 0` with no resident component.
+    #[test]
+    fn a_requested_adapter_stack_is_priced_as_a_resident_overlay() {
+        use mlx_gen::{AdapterKind, AdapterSpec};
+
+        let root_tmp = tempfile::tempdir().unwrap();
+        let adapter = root_tmp.path().join("lora.safetensors");
+        // `adapter_stack_resident_bytes` prices an additive stack at its on-disk length, so the
+        // file's contents are irrelevant and only its size is pinned here.
+        std::fs::write(&adapter, vec![0_u8; 2048]).unwrap();
+
+        let clean = weights_free_memory_strategy_contract(
+            IDS[0],
+            &spec(LoadShape::DeferredMaterialization),
+        )
+        .unwrap();
+        assert_eq!(clean.asset_facts.overlay_bytes, 0);
+        assert!(clean.resident_components().is_empty());
+        assert!(
+            matches!(clean.formula, MemoryFormulaKind::PhaseEnvelope { .. }),
+            "a clean base load must stay on the componentless formula"
+        );
+
+        let mut adapted = spec(LoadShape::DeferredMaterialization);
+        adapted
+            .adapters
+            .push(AdapterSpec::new(adapter, 1.0, AdapterKind::Lora));
+        let contract = weights_free_memory_strategy_contract(IDS[0], &adapted).unwrap();
+        assert_eq!(contract.asset_facts.overlay_bytes, 2048);
+        assert_eq!(contract.auxiliary_resident_bytes(), 2048);
+        assert_eq!(
+            contract.asset_facts.base_bytes, 0,
+            "an adapter is auxiliary: it must never move the base decomposition"
+        );
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, ADAPTER_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::AdapterStack);
+        assert_eq!(components[0].resident_bytes, 2048);
+        assert_eq!(
+            components[0].residency,
+            MemoryComponentResidency::WholeRender
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        // An additive stack that cannot be sized fails closed rather than declaring a zero the
+        // shared validator would wave through.
+        let mut unsizable = spec(LoadShape::DeferredMaterialization);
+        unsizable.adapters.push(AdapterSpec::new(
+            root_tmp.path().join("absent.safetensors"),
+            1.0,
+            AdapterKind::Lora,
+        ));
+        assert!(weights_free_memory_strategy_contract(IDS[0], &unsizable).is_err());
     }
 
     /// AC (SC-22662): every registered Anima route publishes the axes of the one DiT and VAE they

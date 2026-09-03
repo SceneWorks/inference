@@ -247,7 +247,10 @@ pub fn architecture_facts(
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
-        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667): `head_dim()` is a
+        // plain `dim / num_heads`, which rounds a non-uniform stack into a fabricated width and
+        // panics on a `"num_heads": 0` snapshot key before `axis` can decline it.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
         transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
         // A single scalar can only describe a square patch; an anisotropic one has no honest value.
         patch_size: (patch_h == patch_w)
@@ -256,7 +259,9 @@ pub fn architecture_facts(
         latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
         vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
-        // Both Wan trunks are bf16-native: every matmul runs bf16 over an f32 residual stream.
+        // gen-core documents `activation_dtype_width` as the DENOISE-phase width, explicitly not a
+        // per-component byte fact, so the f32 autoencoder and the f32 UMT5-XXL activations do NOT
+        // widen it. Wan is bf16-native: every denoise matmul runs bf16 over an f32 residual stream.
         activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
     }
 }

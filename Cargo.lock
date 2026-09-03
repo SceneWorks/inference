@@ -2399,6 +2399,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
