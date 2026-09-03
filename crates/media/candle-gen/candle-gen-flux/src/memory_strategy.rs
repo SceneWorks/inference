@@ -109,10 +109,17 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// Architecture axes for the FLUX.1 reference backbone (epic SC-22657, E2).
 ///
 /// The trunk geometry comes from the same `candle_transformers::models::flux::model::Config` the
-/// loader builds the DiT from ([`crate::pipeline::flux_config`]). `dev` and `schnell` are
-/// dimensionally identical — the same `hidden_size 3072` / `num_heads 24` / `depth 19` /
-/// `depth_single_blocks 38` — and differ only in `guidance_embed`, so a single arm describes both
-/// registered providers.
+/// loader builds the DiT from — and from the *variant that provider id selects*, resolved through
+/// [`crate::Variant::from_model_id`] exactly as `candle-gen-flux2` threads its own variant. The two
+/// registered variants happen to be dimensionally identical today (`hidden_size 3072` /
+/// `num_heads 24` / `depth 19` / `depth_single_blocks 38`, differing only in `guidance_embed`), but
+/// pinning the dev preset for both would silently publish dev's geometry for schnell the moment
+/// that stopped being true, which is the class of defect these facts exist to remove.
+///
+/// Heads and head width are read from `<root>/transformer/config.json` where the diffusers layout
+/// ships one (`num_attention_heads` / `attention_head_dim`), with the variant preset as the
+/// fallback for the BFL single-file layout that ships no component config — the same read-then-fall-back
+/// shape the block counts already use.
 ///
 /// `transformer_blocks` is the **total** trunk depth: FLUX stacks the double-stream blocks and then
 /// the single-stream blocks in one sequence, and every one of them is a materialization unit for
@@ -122,11 +129,13 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// ships no `transformer/` component config — reading a different source than the loader would
 /// publish geometry the built model does not have.
 ///
-/// `patch_size` is 2 without a config key: FLUX packs 2x2 latent neighbourhoods *outside* the DiT,
-/// which is why the trunk's `in_channels` is 64 = 16 latent channels x 2x2. `vae_temporal_scale`
-/// stays `None` — FLUX.1 ships the image `AutoencoderKL`, which has no temporal axis at all, and a
-/// structurally absent axis is declared absent rather than zero (E2).
-fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+/// `patch_size` has no config key on either component, so it is *derived* rather than asserted:
+/// FLUX packs 2x2 latent neighbourhoods outside the DiT, which is exactly why the trunk's
+/// `in_channels` is 64 = 16 latent channels x 2x2, and
+/// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
+/// pair. `vae_temporal_scale` stays `None` — FLUX.1 ships the image `AutoencoderKL`, which has no
+/// temporal axis at all, and a structurally absent axis is declared absent rather than zero (E2).
+fn architecture_facts(provider_id: &str, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
     // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
@@ -134,23 +143,33 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     let Some(root) = af::snapshot_root(spec) else {
         return gen_core::MemoryArchitectureFacts::default();
     };
-    let dit = crate::pipeline::flux_config(crate::Variant::Dev);
+    // The variant this provider id names, not a pinned `Dev`. A bespoke identity route built on
+    // this shared backbone (`reference_backbone_contract`) carries its own id and runs the dev
+    // trunk, which is what the fallback covers.
+    let variant = crate::Variant::from_model_id(provider_id).unwrap_or(crate::Variant::Dev);
+    let dit = crate::pipeline::flux_config(variant);
     let vae = crate::vae::native::Config::dev();
     let transformer_config = af::component_config(root, "transformer");
     let double = af::axis_of(transformer_config.as_ref(), &["num_layers"])
         .or_else(|| af::declared(dit.depth));
     let single = af::axis_of(transformer_config.as_ref(), &["num_single_layers"])
         .or_else(|| af::declared(dit.depth_single_blocks));
+    let latent_channels = af::declared(vae.z_channels);
+    let attention_heads = af::axis_of(transformer_config.as_ref(), &["num_attention_heads"])
+        .or_else(|| af::declared(dit.num_heads));
     gen_core::MemoryArchitectureFacts {
-        attention_heads: af::declared(dit.num_heads),
-        // `hidden_size / num_heads`, published only because the trunk is uniform-head.
-        head_dim: af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads)),
+        attention_heads,
+        // The diffusers layout declares the head width; the BFL single-file layout ships no
+        // component config, so the variant preset's `hidden_size / num_heads` stands in — published
+        // only because that quotient divides evenly.
+        head_dim: af::axis_of(transformer_config.as_ref(), &["attention_head_dim"])
+            .or_else(|| af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads))),
         transformer_blocks: double.and_then(|double| double.checked_add(single?)),
-        // FLUX packs 2x2 latent neighbourhoods before the trunk (`in_channels 64 = 16 * 2 * 2`);
-        // there is no `patch_size` key on either component config to read.
-        patch_size: af::declared(2),
+        // The packing edge the trunk's own input width implies: `in_channels 64 / 16 latent
+        // channels = 4`, a 2x2 neighbourhood.
+        patch_size: af::patch_size_from_channels(af::declared(dit.in_channels), latent_channels),
         // `vae::native::Config::dev().z_channels`.
-        latent_channels: af::declared(vae.z_channels),
+        latent_channels,
         // `ch_mult` is four stages, so three halvings: x8.
         vae_spatial_scale: af::declared(vae.ch_mult.len())
             .and_then(|stages| stages.checked_sub(1))
@@ -220,7 +239,7 @@ pub fn reference_backbone_contract(
         .collect();
 
     Ok(MemoryProviderContract {
-        architecture_facts: architecture_facts(spec),
+        architecture_facts: architecture_facts(provider_id, spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -672,7 +691,7 @@ mod tests {
                 expected(19 + 38),
                 "{id} BFL-layout architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
 
@@ -686,13 +705,44 @@ mod tests {
         assert_eq!(contract.architecture_facts, expected(17 + 33));
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
+        // ...and so are the heads and the head width, when the diffusers layout declares them.
+        // Publishing the variant preset over a config the snapshot ships would describe a trunk
+        // this snapshot does not have.
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 19, "num_single_layers": 38,
+                 "num_attention_heads": 12, "attention_head_dim": 256}"#,
+        )
+        .unwrap();
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(contract.architecture_facts.attention_heads, Some(12));
+        assert_eq!(contract.architecture_facts.head_dim, Some(256));
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        // Restore the layout the remaining assertions were written against.
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 17, "num_single_layers": 33}"#,
+        )
+        .unwrap();
+
+        // `patch_size` is DERIVED, not asserted: the trunk's own `in_channels` over the latent
+        // channel count is the packing area, and the published axis is its square root.
+        let dit = crate::pipeline::flux_config(crate::Variant::Dev);
+        let vae = crate::vae::native::Config::dev();
+        let patch = contract.architecture_facts.patch_size.unwrap() as usize;
+        assert_eq!(
+            dit.in_channels,
+            vae.z_channels * patch * patch,
+            "the published patch size must be the one the trunk's input width implies"
+        );
+
         // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
         let weights_free = LoadSpec::new(WeightsSource::Dir(
             "/__sceneworks_memory_contract_surface__".into(),
         ));
         let contract = provider_contract("flux1_dev", &weights_free).unwrap();
         assert!(contract.architecture_facts.is_empty());
-        // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate does
+        // A weights-free contract legitimately declares nothing, so the E2 config-derived gate does
         // not apply to it; the byte-decomposition half of the conformance walk still does.
         gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
     }

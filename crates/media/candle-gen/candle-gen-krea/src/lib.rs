@@ -1852,7 +1852,7 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
 /// snapshot whose transformer config cannot be parsed — publishes
 /// `MemoryArchitectureFacts::default()`.
-fn krea_architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
     let Some(root) = af::snapshot_root(spec) else {
@@ -1893,7 +1893,7 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     // real imported-file run is measured rather than silently relabeling Dir evidence.
     let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
-        architecture_facts: krea_architecture_facts(spec),
+        architecture_facts: architecture_facts(spec),
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -2057,7 +2057,7 @@ fn build_krea_request_scoped_memory_strategy_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
-    contract.architecture_facts = krea_architecture_facts(spec);
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = spec.load_shape;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -2735,7 +2735,7 @@ fn build_krea_control_memory_strategy_contract_for_tier(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
-    contract.architecture_facts = krea_architecture_facts(spec);
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![

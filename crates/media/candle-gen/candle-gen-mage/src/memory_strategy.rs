@@ -103,10 +103,14 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// are `num_heads`, `depth` and `patch_size`. Reading those same keys here publishes what the
 /// pipeline will construct; nothing is inferred from the model id.
 ///
-/// `head_dim` is deliberately NOT `hidden_size / num_heads`. Mage's config carries no head-dim key
-/// at all — the loader uses the crate constant [`config::HEAD_DIM`] — so the constant is the honest
-/// value even for a snapshot whose `hidden_size` would imply a different quotient. Publishing the
-/// quotient would describe a shape this crate never runs.
+/// `head_dim` comes from the same source. Mage's config carries no head-dim key, but it does carry
+/// `hidden_size` — [`config::MageConfig::from_json`] reads it — so the honest per-head width is the
+/// quotient `hidden_size / num_heads`, which on the reference snapshot is 3072 / 24 = the crate
+/// constant [`config::HEAD_DIM`]. Publishing that constant unconditionally while the heads and
+/// blocks beside it came from the config would make a snapshot with a different `hidden_size`
+/// report a width its own trunk does not have. The constant survives only as the fallback for a
+/// config that omits `hidden_size` — and `af::head_dim` declines a quotient that does not divide
+/// evenly rather than rounding one, so a non-uniform snapshot publishes no width at all.
 ///
 /// The decoder axes are the crate constants [`config::LATENT_CHANNELS`] and
 /// [`config::VAE_DOWNSAMPLE`]: Mage's CoD decoder is built from code, not from a `vae/config.json`.
@@ -120,9 +124,17 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         return gen_core::MemoryArchitectureFacts::default();
     };
     let dit = af::component_config(root, "transformer");
+    let attention_heads = af::axis_of(dit.as_ref(), &["num_heads"]);
     gen_core::MemoryArchitectureFacts {
-        attention_heads: af::axis_of(dit.as_ref(), &["num_heads"]),
-        head_dim: af::declared(config::HEAD_DIM),
+        attention_heads,
+        // `hidden_size / num_heads` from the config the loader parses. The crate constant covers
+        // only a config that declares no `hidden_size` at all; a config that declares one the head
+        // count does not divide publishes no width rather than falling back to a preset that would
+        // contradict it.
+        head_dim: match af::axis_of(dit.as_ref(), &["hidden_size"]) {
+            Some(hidden_size) => af::head_dim(Some(hidden_size), attention_heads),
+            None => af::declared(config::HEAD_DIM),
+        },
         transformer_blocks: af::axis_of(dit.as_ref(), &["depth"]),
         patch_size: af::axis_of(dit.as_ref(), &["patch_size"]),
         latent_channels: af::declared(config::LATENT_CHANNELS),
@@ -874,6 +886,66 @@ mod tests {
                 .architecture_facts
                 .transformer_blocks,
             Some(16)
+        );
+
+        // `head_dim` is the config's own `hidden_size / num_heads`, NOT the crate constant. A
+        // snapshot whose trunk is 3072 wide across 16 heads runs 192-wide heads, and publishing
+        // `config::HEAD_DIM` (128) there would describe a trunk this snapshot does not have.
+        let non_default = tmp.path().join("sc22661-mage-16-heads");
+        std::fs::create_dir_all(non_default.join("transformer")).unwrap();
+        std::fs::write(
+            non_default.join("transformer/config.json"),
+            br#"{"hidden_size": 3072, "num_heads": 16, "depth": 12, "patch_size": 1}"#,
+        )
+        .unwrap();
+        let contract = provider_contract_for(
+            config::MODEL_ID,
+            &LoadSpec::new(WeightsSource::Dir(non_default)),
+        )
+        .unwrap();
+        assert_eq!(contract.architecture_facts.attention_heads, Some(16));
+        assert_eq!(
+            contract.architecture_facts.head_dim,
+            Some(192),
+            "head_dim must follow the snapshot's own hidden_size / num_heads"
+        );
+        assert_ne!(
+            contract.architecture_facts.head_dim,
+            candle_gen::architecture_facts::declared(config::HEAD_DIM)
+        );
+
+        // The crate constant survives only where there is no `hidden_size` to divide...
+        let no_hidden = tmp.path().join("sc22661-mage-no-hidden-size");
+        std::fs::create_dir_all(no_hidden.join("transformer")).unwrap();
+        std::fs::write(
+            no_hidden.join("transformer/config.json"),
+            br#"{"num_heads": 24, "depth": 12, "patch_size": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_contract_for(
+                config::MODEL_ID,
+                &LoadSpec::new(WeightsSource::Dir(no_hidden))
+            )
+            .unwrap()
+            .architecture_facts
+            .head_dim,
+            Some(128)
+        );
+        // ...and never where the declared pair is non-uniform: no honest width exists there.
+        let ragged = tmp.path().join("sc22661-mage-ragged");
+        std::fs::create_dir_all(ragged.join("transformer")).unwrap();
+        std::fs::write(
+            ragged.join("transformer/config.json"),
+            br#"{"hidden_size": 3073, "num_heads": 24, "depth": 12, "patch_size": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_contract_for(config::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(ragged)))
+                .unwrap()
+                .architecture_facts
+                .head_dim,
+            None
         );
 
         // The registry's weights-free surface names a sentinel that is not on disk, so nothing

@@ -16,11 +16,27 @@ use serde_json::Value;
 
 /// The materialized snapshot directory a contract is being built for, or `None`.
 ///
-/// This is the single gate that keeps a **weights-free** contract's architecture facts empty. The
+/// The rule this actually applies is narrow: the spec's weights must be a
+/// [`gen_core::WeightsSource::Dir`] **whose path exists on disk as a directory**. It does not
+/// compare the path against the registry's sentinel constant, and it does not look inside the
+/// directory.
+///
+/// Existence is nevertheless what keeps a **weights-free** contract's architecture facts empty. The
 /// registry builds its contract surfaces against the sentinel path
-/// `/__sceneworks_memory_contract_surface__`, which is deliberately not on disk: nothing about the
-/// pipeline that *would* be loaded has been resolved there, so no axis is knowable and every one
-/// stays `None` (E2). A single-file import is likewise not a component snapshot.
+/// `/__sceneworks_memory_contract_surface__`, which is deliberately never created, so `is_dir()`
+/// fails there and every axis stays `None` (E2). Two consequences follow from the gate being
+/// existence rather than identity:
+///
+/// * It **fails closed** for a renamed sentinel. A different sentinel name is still a path nobody
+///   creates, so it still yields `None` and nothing here needs updating when the constant moves.
+///   The only way to lose the guarantee is for someone to materialize a sentinel directory.
+/// * For a **preset-only** provider — one whose axes are mirrored from its own crate constants
+///   because its loader builds the geometry in code rather than parsing it — *any* existing
+///   directory yields the full geometry. The directory is only being used as the "a real snapshot
+///   was resolved" signal, and no file inside it is read. A provider that parses component configs
+///   instead degrades per axis: an empty directory yields `None` for every axis it would have read.
+///
+/// A single-file import is likewise not a component snapshot.
 pub fn snapshot_root(spec: &gen_core::LoadSpec) -> Option<&Path> {
     match &spec.weights {
         gen_core::WeightsSource::Dir(root) if root.is_dir() => Some(root.as_path()),
@@ -99,6 +115,32 @@ pub fn head_dim(hidden_dim: Option<u32>, attention_heads: Option<u32>) -> Option
         (Some(dim), Some(heads)) if dim % heads == 0 => Some(dim / heads),
         _ => None,
     }
+}
+
+/// Spatial patchification factor, derived from the trunk's input width against the latent channel
+/// count it consumes.
+///
+/// A FLUX-family trunk takes `in_channels = latent_channels * patch * patch` because the 2x2 (or
+/// larger) neighbourhood packing happens *outside* the transformer, so the ratio of the two numbers
+/// the configs already declare is the packing area and its square root is the axis. Deriving it
+/// keeps the axis tied to the two constants that would move together if a variant ever repacked;
+/// a `declared(2)` literal would keep publishing 2 while `in_channels` said otherwise.
+///
+/// Declined — rather than rounded — whenever the pair cannot mean a square packing: a ratio that
+/// does not divide evenly, or an area that is not a perfect square, describes a layout this
+/// derivation does not understand, and inventing a factor for it would poison every activation
+/// estimate that multiplied by it (E2).
+pub fn patch_size_from_channels(
+    in_channels: Option<u32>,
+    latent_channels: Option<u32>,
+) -> Option<u32> {
+    let (input, latent) = (in_channels?, latent_channels?);
+    if latent == 0 || input % latent != 0 {
+        return None;
+    }
+    let area = input / latent;
+    let patch = f64::from(area).sqrt().round() as u32;
+    (patch != 0 && patch * patch == area).then_some(patch)
 }
 
 /// Pixels per latent unit, read from a VAE's per-stage channel list (`block_out_channels` on a
@@ -306,10 +348,41 @@ mod tests {
             "/__sceneworks_memory_contract_surface__".into(),
         ));
         assert_eq!(snapshot_root(&weights_free), None);
+        // The gate is existence, not a comparison against that constant, so it fails closed for a
+        // renamed sentinel: any path nobody creates is still not a root.
+        let renamed = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(
+            "/__some_other_contract_surface_sentinel__".into(),
+        ));
+        assert_eq!(snapshot_root(&renamed), None);
+        // ...and conversely, a preset-only provider gets its full geometry from *any* existing
+        // directory, because nothing inside it is read.
+        let empty = tempfile::tempdir().unwrap();
+        let bare =
+            gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(empty.path().to_path_buf()));
+        assert_eq!(snapshot_root(&bare), Some(empty.path()));
         let single_file = gen_core::LoadSpec::new(gen_core::WeightsSource::File(
             tmp.path().join("model.safetensors"),
         ));
         assert_eq!(snapshot_root(&single_file), None);
+    }
+
+    /// The patch axis is the square root of `in_channels / latent_channels`, and any pair that
+    /// cannot mean a square packing is declined rather than rounded into one.
+    #[test]
+    fn the_patch_size_is_derived_from_the_channel_pair_or_declined() {
+        // FLUX.1 / Chroma: 64 = 16 * 2 * 2. FLUX.2: 128 = 32 * 2 * 2.
+        assert_eq!(patch_size_from_channels(Some(64), Some(16)), Some(2));
+        assert_eq!(patch_size_from_channels(Some(128), Some(32)), Some(2));
+        // A 4x4 packing is read as 4, not clamped to the familiar 2.
+        assert_eq!(patch_size_from_channels(Some(256), Some(16)), Some(4));
+        // An unpatchified trunk consumes the latent directly.
+        assert_eq!(patch_size_from_channels(Some(16), Some(16)), Some(1));
+        // Not divisible, and divisible but not a perfect square: no honest factor exists.
+        assert_eq!(patch_size_from_channels(Some(65), Some(16)), None);
+        assert_eq!(patch_size_from_channels(Some(32), Some(16)), None);
+        assert_eq!(patch_size_from_channels(Some(64), Some(0)), None);
+        assert_eq!(patch_size_from_channels(None, Some(16)), None);
+        assert_eq!(patch_size_from_channels(Some(64), None), None);
     }
 
     #[test]

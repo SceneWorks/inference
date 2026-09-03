@@ -1026,7 +1026,7 @@ pub(crate) mod tests {
                 activation_dtype_width: Some(4),
             }
         );
-        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
         // The facts are read, not asserted: a config declaring a different depth and width publishes

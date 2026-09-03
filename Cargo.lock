@@ -542,6 +542,7 @@ dependencies = [
  "candle-gen-z-image",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

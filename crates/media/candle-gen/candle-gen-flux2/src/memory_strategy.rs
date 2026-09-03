@@ -477,8 +477,10 @@ fn resident_components(
 ///
 /// `transformer_blocks` is the **total** trunk depth: FLUX.2 stacks the double-stream blocks and
 /// then the single-stream blocks in one sequence, and every one of them is a block-window
-/// materialization unit. `patch_size` is 2 without a config field — the 2x2 packing is what makes
-/// `in_channels` 128 = 32 latent channels x 2x2. `vae_temporal_scale` stays `None`: the FLUX.2
+/// materialization unit. `patch_size` has no config field of its own, so it is *derived* from the
+/// pair that implies it — `in_channels 128 / num_latent_channels 32 = 4`, a 2x2 neighbourhood —
+/// through [`candle_gen::architecture_facts::patch_size_from_channels`], rather than written as a
+/// literal that would keep saying 2 if a variant ever repacked. `vae_temporal_scale` stays `None`: the FLUX.2
 /// `AutoencoderKLFlux2` is an **image** autoencoder with no temporal axis, and a structurally
 /// absent axis is declared absent rather than zero (E2).
 fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
@@ -494,8 +496,12 @@ fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Memor
         attention_heads: af::declared(config.num_heads),
         head_dim: af::declared(config.head_dim),
         transformer_blocks: af::declared(config.num_double_layers + config.num_single_layers),
-        // The 2x2 packing outside the trunk (`in_channels 128 = num_latent_channels * 2 * 2`).
-        patch_size: af::declared(2),
+        // The packing edge the trunk's own input width implies: `in_channels / num_latent_channels`
+        // is the neighbourhood area, and its square root is the axis.
+        patch_size: af::patch_size_from_channels(
+            af::declared(config.in_channels),
+            af::declared(config.num_latent_channels),
+        ),
         latent_channels: af::declared(config.num_latent_channels),
         vae_spatial_scale: af::declared(config.vae_scale_factor),
         // Structurally absent: the FLUX.2 image autoencoder has no frames-per-latent axis.
@@ -1461,7 +1467,7 @@ mod tests {
                 COMPUTE_DTYPE_BYTES,
                 "{id}: the published activation width and the pricing width must not drift"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
             // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
@@ -1473,7 +1479,7 @@ mod tests {
                 contract.architecture_facts.is_empty(),
                 "{id} weights-free facts must be empty"
             );
-            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
             // does not apply to it; the byte-decomposition half of the conformance walk still does.
             gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
         }

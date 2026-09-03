@@ -133,21 +133,24 @@ mod tests {
     ///
     /// This is the epic's registry-wide acceptance skeleton on the shipped CUDA registry. Surfaces
     /// are built weights-free — the registry names the sentinel snapshot
-    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so
-    /// `MemoryArchitectureFacts::default()` is their honest E2 state and the asset-facts half is
-    /// what must hold. The walk also rejects the converse defect: an architecture axis declared on
-    /// a contract that had no component config to read was inferred from the provider id.
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so every provider here
+    /// lands on the walk's Candle arm, where `MemoryArchitectureFacts::default()` is the required
+    /// state and an axis declared with no component config to read was inferred from the provider
+    /// id.
+    ///
+    /// The walk's **materialized** arm is deliberately not driven here: it needs a per-provider
+    /// snapshot fixture, `candle-gen-catalog` owns those and runs that half over the same
+    /// composition on a lane that needs no accelerator. This bundle's job is to prove the *shipped
+    /// CUDA* set is composed and honest, not to rebuild fixtures.
     #[cfg(feature = "media")]
     #[test]
     fn every_registered_contract_surface_publishes_honest_facts() {
         let registry = super::memory_contract_surface_registry()
             .expect("the CUDA bundle composes a contract-surface registry");
-        gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry);
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
         assert!(
-            !registry
-                .memory_contract_surfaces()
-                .expect("registry surfaces resolve")
-                .is_empty(),
+            coverage.surfaces_checked > 0,
             "the CUDA bundle must publish contract surfaces for the facts walk to check"
         );
     }

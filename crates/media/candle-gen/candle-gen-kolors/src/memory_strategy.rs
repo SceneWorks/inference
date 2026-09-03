@@ -1477,12 +1477,27 @@ fn composed_route_id(contract: &MemoryProviderContract) -> gen_core::Result<&'st
 /// The sealed contract with real asset facts is minted at load by [`provider_contract_for_ip`] /
 /// [`provider_contract_for_control`] from the caller's typed paths — a `LoadSpec` cannot name them —
 /// so the registry's answer is the route/strategy declaration with zero asset facts.
-pub fn ip_composed_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    Ok(provider_contract_for(IP_PROVIDER_ID))
+///
+/// The **architecture** axes are a different matter, and are published here whenever the spec names
+/// a materialized snapshot. Both compositions denoise through the same SDXL UNet and decode through
+/// the same `AutoencoderKL` as the base route, built from this crate's own structs, so the overlay
+/// the caller will hang off them changes no axis in [`architecture_facts`]. Withholding them
+/// because the *asset* facts need typed paths would leave two registered routes publishing a
+/// lifecycle-phase formula with no geometry behind it (epic SC-22657, E2).
+pub fn ip_composed_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(composed_contract_for(IP_PROVIDER_ID, spec))
 }
 
-pub fn control_composed_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    Ok(provider_contract_for(CONTROL_PROVIDER_ID))
+pub fn control_composed_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(composed_contract_for(CONTROL_PROVIDER_ID, spec))
+}
+
+fn composed_contract_for(provider_id: &str, spec: &LoadSpec) -> MemoryProviderContract {
+    let mut contract = provider_contract_for(provider_id);
+    if let Some(root) = candle_gen::architecture_facts::snapshot_root(spec) {
+        contract.architecture_facts = architecture_facts(root);
+    }
+    contract
 }
 
 /// The bespoke admission, callable before any weight file exists. Both routes consume exactly one
@@ -2106,27 +2121,25 @@ mod tests {
         );
         let spec = LoadSpec::new(WeightsSource::Dir(base));
         let contract = registered_contract(&spec).unwrap();
-        assert_eq!(
-            contract.architecture_facts,
-            gen_core::MemoryArchitectureFacts {
-                // `UNetShape::sdxl()` heads are per stage (5/10/20): no uniform head count exists.
-                attention_heads: None,
-                // Every stage's `out_channels / attention_head_dim` is 64 (320/5, 640/10, 1280/20).
-                head_dim: Some(64),
-                // A UNet down/mid/up trunk is not a uniform transformer-block stack.
-                transformer_blocks: None,
-                // The UNet consumes the latent grid directly; nothing is patchified.
-                patch_size: None,
-                // `pipeline::sdxl_vae_config().latent_channels`.
-                latent_channels: Some(4),
-                // `block_out_channels` `[128,256,512,512]` = 4 stages => 3 halvings => x8.
-                vae_spatial_scale: Some(8),
-                // The SDXL `AutoencoderKL` is an image VAE: no temporal axis exists to declare.
-                vae_temporal_scale: None,
-                // Kolors runs f32 activations everywhere, so four bytes per element, not two.
-                activation_dtype_width: Some(4),
-            }
-        );
+        let expected = gen_core::MemoryArchitectureFacts {
+            // `UNetShape::sdxl()` heads are per stage (5/10/20): no uniform head count exists.
+            attention_heads: None,
+            // Every stage's `out_channels / attention_head_dim` is 64 (320/5, 640/10, 1280/20).
+            head_dim: Some(64),
+            // A UNet down/mid/up trunk is not a uniform transformer-block stack.
+            transformer_blocks: None,
+            // The UNet consumes the latent grid directly; nothing is patchified.
+            patch_size: None,
+            // `pipeline::sdxl_vae_config().latent_channels`.
+            latent_channels: Some(4),
+            // `block_out_channels` `[128,256,512,512]` = 4 stages => 3 halvings => x8.
+            vae_spatial_scale: Some(8),
+            // The SDXL `AutoencoderKL` is an image VAE: no temporal axis exists to declare.
+            vae_temporal_scale: None,
+            // Kolors runs f32 activations everywhere, so four bytes per element, not two.
+            activation_dtype_width: Some(4),
+        };
+        assert_eq!(contract.architecture_facts, expected);
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
         // The weights-free surface has resolved no snapshot, so no axis is knowable there.
@@ -2141,6 +2154,22 @@ mod tests {
             .unwrap()
             .architecture_facts
             .is_empty());
+
+        // ...but the two bespoke compositions publish the same axes as the base route once the spec
+        // names a materialized snapshot. Both denoise through the same SDXL UNet and decode through
+        // the same `AutoencoderKL`, so the overlay changes no axis; only the *asset* facts need the
+        // typed paths a `LoadSpec` cannot carry (sc-22661).
+        for composed in [ip_composed_contract, control_composed_contract] {
+            let contract = composed(&spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{} composed architecture facts",
+                contract.provider_id
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            // ...and stay empty on the weights-free surface, where nothing has been resolved.
+            assert!(composed(&unresolved).unwrap().architecture_facts.is_empty());
+        }
     }
 
     #[test]

@@ -964,7 +964,7 @@ const VAE_STAGES: usize = 4;
 /// A weights-free contract — the registry's sentinel surface path, or a single-file import —
 /// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
 /// there, so no axis is knowable.
-fn lens_architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
     if af::snapshot_root(spec).is_none() {
@@ -1058,7 +1058,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         .collect();
 
     MemoryProviderContract {
-        architecture_facts: lens_architecture_facts(spec),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

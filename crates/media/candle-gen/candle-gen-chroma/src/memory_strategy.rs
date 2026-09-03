@@ -1077,9 +1077,12 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// identical to the model actually built.
 ///
 /// `transformer_blocks` is the **total** trunk depth: Chroma stacks the 19 double-stream blocks and
-/// then the 38 single-stream blocks in one sequence. `patch_size` is 2 without a config field — the
-/// FLUX-style 2x2 packing outside the trunk is what makes `in_channels` 64 = 16 latent channels x
-/// 2x2. `vae_temporal_scale` stays `None`: Chroma decodes through the FLUX.1 image `AutoencoderKL`,
+/// then the 38 single-stream blocks in one sequence. `patch_size` has no config field, so it is
+/// *derived* from the pair that implies it: the FLUX-style packing outside the trunk is what makes
+/// `in_channels` 64 = 16 latent channels x 2x2, and
+/// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
+/// ratio rather than restating it as a literal that would survive a repack.
+/// `vae_temporal_scale` stays `None`: Chroma decodes through the FLUX.1 image `AutoencoderKL`,
 /// which has no temporal axis at all, and a structurally absent axis is declared absent, never
 /// zero (E2).
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
@@ -1096,8 +1099,12 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         attention_heads: af::declared(dit.num_attention_heads),
         head_dim: af::declared(dit.attention_head_dim),
         transformer_blocks: af::declared(dit.num_layers + dit.num_single_layers),
-        // The 2x2 packing outside the trunk (`in_channels 64 = LATENT_CHANNELS * 2 * 2`).
-        patch_size: af::declared(2),
+        // The packing edge the trunk's own input width implies: `in_channels / LATENT_CHANNELS` is
+        // the neighbourhood area, and its square root is the axis.
+        patch_size: af::patch_size_from_channels(
+            af::declared(dit.in_channels),
+            af::declared(crate::vae::LATENT_CHANNELS),
+        ),
         latent_channels: af::declared(crate::vae::LATENT_CHANNELS),
         // `vae::BLOCK_OUT` is four stages, so three halvings: x8.
         vae_spatial_scale: af::declared(crate::vae::BLOCK_OUT.len())
@@ -1900,7 +1907,7 @@ mod tests {
                 "{} architecture facts",
                 route.provider
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
             // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
@@ -1913,7 +1920,7 @@ mod tests {
                 "{} weights-free facts must be empty",
                 route.provider
             );
-            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
             // does not apply to it; the byte-decomposition half of the conformance walk still does.
             gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
         }

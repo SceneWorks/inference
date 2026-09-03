@@ -1275,7 +1275,7 @@ mod tests {
                 },
                 "{variant:?} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             // The facts walk also re-checks the E1 byte decomposition, and `fixture_snapshot`
             // writes every component at the same synthetic size — a fixture artifact, not a
             // contract defect. Run the full walk over the same-facts contract that publishes no
@@ -1293,7 +1293,7 @@ mod tests {
                 contract.architecture_facts.is_empty(),
                 "{variant:?} weights-free facts must be empty"
             );
-            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
             // does not apply to it; the byte-decomposition half of the conformance walk still does.
             gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
         }

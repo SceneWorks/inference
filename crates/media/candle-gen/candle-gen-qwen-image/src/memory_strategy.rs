@@ -940,7 +940,7 @@ mod tests {
                 },
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
             // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
@@ -953,7 +953,7 @@ mod tests {
                 contract.architecture_facts.is_empty(),
                 "{provider_id} weights-free facts must be empty"
             );
-            // A weights-free contract legitimately declares nothing, so the E2 snapshot-read gate
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
             // does not apply to it; the byte-decomposition half of the conformance walk still does.
             gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
         }

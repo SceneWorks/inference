@@ -1189,7 +1189,7 @@ mod tests {
                 activation_dtype_width: Some(2),
             }
         );
-        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
         // The registry's weights-free surface names a sentinel that is not on disk: nothing about
