@@ -289,6 +289,21 @@ fn klein_planned_dit_bytes(
     Ok(total)
 }
 
+/// [`f32_or_packed_component_bytes`] for a snapshot component that a partial tree may simply not
+/// have: an absent (or tensor-free) component contributes `0`, as the raw directory sum it replaced
+/// did, instead of failing a contract that the loader would only fail later and more precisely.
+fn snapshot_component_bytes(
+    path: &std::path::Path,
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+) -> gen_core::Result<u64> {
+    if gen_core::weightsmeta::safetensors_path_bytes(path) == 0 {
+        return Ok(0);
+    }
+    f32_or_packed_component_bytes(path, quant, component, keep_embedding_dense, false)
+}
+
 fn f32_or_packed_component_bytes(
     path: &std::path::Path,
     quant: Option<Quant>,
@@ -510,6 +525,60 @@ fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Memor
     }
 }
 
+/// Bytes of the conditioning stack's **vision** half — the Pixtral vision tower
+/// (`vision_tower.*`) and the Mistral3 multimodal projector (`multi_modal_projector.*`) that
+/// [`crate::caption_upsample::CaptionUpsampler::new`] builds when `include_vision` is set.
+///
+/// Only FLUX.2-**dev** has one: `Pipeline::load_caption_upsampler` returns `None` for klein, so
+/// klein is charged nothing here. On dev, the edit surface is the caller of
+/// `load_caption_upsampler(true)` (`edit_provider.rs`, both the warm and the staged encode legs),
+/// so those weights are genuinely resident for the edit route while the plain t2i route builds the
+/// upsampler with `include_vision = false`.
+///
+/// `MemoryAssetFacts::conditioning_bytes` is documented as *the conditioning encoder stack (text
+/// and/or vision encoders)*, and this is that stack's vision half; it is not an auxiliary standing
+/// beside the base model. It is charged unconditionally on dev because a
+/// [`MemoryProviderContract`] carries no route discriminator — the edit provider composes the very
+/// same contract as t2i — and of the two available errors, over-declaring by a ~2 GB tower on t2i
+/// is a conservative fit, while omitting it on edit is a false admit. `ValidatedEncoderSource`'s
+/// `materialized_language_tensor_headers` deliberately excludes these names, which is why they had
+/// to be added back here rather than being covered by the language sum.
+///
+/// The tower is never quantized (`vision.rs`: "The tower remains dense f32 even when the language
+/// model is quantized"), so it is priced with `quant = None`. `source` is the very
+/// [`WeightsSource`] `Pipeline::component_vb_on("text_encoder", ..)` loads the tower through, so a
+/// caller-authored encoder is read from the file the loader will read.
+fn selected_vision_tower_bytes(
+    variant: Flux2Variant,
+    source: &WeightsSource,
+) -> gen_core::Result<u64> {
+    if !variant.is_dev() {
+        return Ok(0);
+    }
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    let vision_prefix = format!("{}.", crate::vision::VISION_PREFIX);
+    let projector_prefix = format!("{}.", crate::vision::PROJECTOR_PREFIX);
+    let vision: Vec<_> = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
+        .into_iter()
+        .filter(|header| {
+            header.name.starts_with(&vision_prefix) || header.name.starts_with(&projector_prefix)
+        })
+        .collect();
+    if vision.is_empty() {
+        return Ok(0);
+    }
+    f32_or_packed_tensor_headers(
+        &vision,
+        None,
+        "selected vision tower",
+        false,
+        false,
+        "selected direct-shard inventory",
+    )
+}
+
 pub(crate) fn composed_provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
@@ -522,13 +591,40 @@ pub(crate) fn composed_provider_contract_for(
     // same specs with the same message.
     let streamable = streamable(spec);
     let mut components = match &spec.weights {
-        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .unwrap_or_default(),
+        WeightsSource::Dir(root) => {
+            // Every snapshot component is priced the way the File arm below already prices its
+            // own: at the width this pipeline MATERIALIZES it, not at its on-disk encoding.
+            // `lib.rs` pins `dtype: DType::F32` for every FLUX.2 component
+            // ([`COMPUTE_DTYPE_BYTES`]), so a bf16 snapshot DiT and VAE cost twice their on-disk
+            // bytes once resident; the raw `PerComponentBytes::from_spec_subdirs` sum this
+            // replaced under-priced both by exactly 2x while the text encoder beside them was
+            // already f32/quant-priced — one contract, two different bases (epic SC-22657, E1).
+            let quant = resolved_quant(spec)?;
+            let text_encoder_quant = (provider_id == FLUX2_DEV_ID).then_some(quant).flatten();
+            PerComponentBytes {
+                text_encoder: snapshot_component_bytes(
+                    &root.join("text_encoder"),
+                    text_encoder_quant,
+                    "snapshot text encoder",
+                    true,
+                )?,
+                dit: snapshot_component_bytes(
+                    &root.join("transformer"),
+                    quant,
+                    "snapshot transformer",
+                    false,
+                )?,
+                // The WHOLE `vae/` component, encoder half included, on both ids. `Flux2Vae::new`
+                // (t2i, `load_heavy_seq` / the resident load) is decode-only, but the edit and
+                // control providers that compose this very same contract — `edit_provider.rs` for
+                // dev AND klein, `control_provider.rs` for dev — build `Flux2Vae::new_with_encoder`
+                // (`encoder.*` + `quant_conv`) from the same source, and a `MemoryProviderContract`
+                // carries no route discriminator. Same policy as `selected_vision_tower_bytes`: of
+                // the two available errors, over-declaring the encoder half on t2i is a
+                // conservative fit while omitting it on edit / control is a false admit (E3).
+                vae: snapshot_component_bytes(&root.join("vae"), None, "snapshot VAE", false)?,
+            }
+        }
         WeightsSource::File(dit) => {
             let base = gen_core::require_base_snapshot(spec, provider_id)?;
             let quant = resolved_quant(spec)?;
@@ -556,6 +652,7 @@ pub(crate) fn composed_provider_contract_for(
                         f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
                     }
                 })?,
+                // Whole component, encoder half included — see the Dir arm above.
                 vae: f32_or_packed_component_bytes(
                     &base.join("vae"),
                     None,
@@ -596,7 +693,7 @@ pub(crate) fn composed_provider_contract_for(
             .then(|| resolved_quant(spec))
             .transpose()?
             .flatten();
-        components.text_encoder = f32_or_packed_tensor_headers(
+        let language_bytes = f32_or_packed_tensor_headers(
             headers,
             text_encoder_quant,
             "selected text encoder",
@@ -604,6 +701,11 @@ pub(crate) fn composed_provider_contract_for(
             false,
             "selected direct-shard inventory",
         )?;
+        components.text_encoder = language_bytes
+            .checked_add(selected_vision_tower_bytes(variant, source)?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg("FLUX.2 conditioning byte sum overflow".to_owned())
+            })?;
     }
     let resident_components = resident_components(provider_id, spec)?;
     let overlay_bytes = resident_components
@@ -1787,6 +1889,102 @@ mod tests {
                 provider_contract(&spec).is_ok(),
                 "File loader/contract validation drift for {name}"
             );
+        }
+    }
+
+    /// AC (epic SC-22657, E1): a Dir snapshot's DiT and VAE are priced at the width the pipeline
+    /// materializes them (`lib.rs`: `dtype: DType::F32`), the same basis the text encoder beside
+    /// them already used — not at their bf16 on-disk encoding.
+    ///
+    /// *Mutation that reds this:* pricing the Dir arm through
+    /// `PerComponentBytes::from_spec_subdirs(spec, .., &["transformer"], &["vae"])`, the raw
+    /// on-disk sum under review, which returns half of each of these.
+    #[test]
+    fn a_directory_snapshot_prices_the_dit_and_vae_at_the_materialized_f32_width() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("base");
+            // Deliberately distinct element counts, so a swapped component cannot pass.
+            for (component, elements) in [("transformer", 32_usize), ("vae", 8)] {
+                std::fs::create_dir_all(root.join(component)).unwrap();
+                write_typed_safetensors(
+                    &root.join(component).join("model.safetensors"),
+                    &[("probe", "BF16", &[elements], elements * 2)],
+                );
+            }
+            gen_core_testkit::write_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                variant.encoder_contract(),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let facts = provider_contract_for(variant.id(), &spec)
+                .unwrap()
+                .asset_facts;
+            assert_eq!(
+                facts.transformer_bytes,
+                32 * COMPUTE_DTYPE_BYTES,
+                "{}: the bf16 snapshot DiT is materialized f32",
+                variant.id()
+            );
+            assert_eq!(
+                facts.decoder_bytes,
+                8 * COMPUTE_DTYPE_BYTES,
+                "{}: the bf16 snapshot VAE is materialized f32",
+                variant.id()
+            );
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+            );
+        }
+    }
+
+    /// AC (epic SC-22657, E1): FLUX.2-dev's conditioning stack includes the Pixtral vision tower
+    /// and the Mistral3 projector that `load_caption_upsampler(true)` builds for the edit route;
+    /// klein, whose `load_caption_upsampler` returns `None`, is charged nothing for one.
+    ///
+    /// *Mutation that reds this:* dropping the `selected_vision_tower_bytes` addend, the shape
+    /// under review, which left ~2 GB of resident conditioning weights unpriced because
+    /// `materialized_language_tensor_headers` deliberately excludes those names.
+    #[test]
+    fn dev_conditioning_prices_the_vision_tower_the_edit_route_loads() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            for selection in [EncoderSelection::Builtin, EncoderSelection::OverrideDir] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (spec, selected) = directory_spec_with_encoder(&tmp, variant, selection);
+                let conditioning = || {
+                    provider_contract_for(variant.id(), &spec)
+                        .unwrap()
+                        .asset_facts
+                        .conditioning_bytes
+                };
+                let baseline = conditioning();
+                for (name, shape) in [
+                    (
+                        format!("{}.patch_conv.weight", crate::vision::VISION_PREFIX),
+                        vec![4_usize, 3],
+                    ),
+                    (
+                        format!("{}.linear_1.weight", crate::vision::PROJECTOR_PREFIX),
+                        vec![5_usize, 2],
+                    ),
+                ] {
+                    append_sparse_f16_tensor(&selected.join("model.safetensors"), &name, &shape);
+                }
+                let expected = if variant.is_dev() {
+                    // f32-materialized: the tower is never quantized.
+                    baseline + (4 * 3 + 5 * 2) * COMPUTE_DTYPE_BYTES
+                } else {
+                    baseline
+                };
+                assert_eq!(
+                    conditioning(),
+                    expected,
+                    "{} {selection:?}: vision-tower residency",
+                    variant.id()
+                );
+            }
         }
     }
 

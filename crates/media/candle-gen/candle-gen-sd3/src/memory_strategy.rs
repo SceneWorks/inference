@@ -219,15 +219,31 @@ impl Sd35LoadReceipt {
                     .and_then(|bytes| checked_add(total, bytes, "text encoder bytes"))
             })?;
         let vae_paths = direct_safetensors(&root.join("vae"))?;
-        let vae_bf16 = selected_float_bytes(&vae_paths, 2)?;
-        let vae_f32 = selected_float_bytes(&vae_paths, 4)?;
+        // The autoencoder is materialized TWICE, at two widths, over two different key subsets
+        // (epic SC-22657, E1):
+        //
+        // * `pipeline::load_decoder` builds the whole `AutoEncoderKL` at the pipeline dtype —
+        //   bf16 — on every route, and
+        // * `pipeline::load_vae_encoder` builds a *separate* raw `VaeEncoder` over the `encoder.`
+        //   prefix at `vae::ENC_DTYPE` (f32) on the img2img / `Reference` route, which the
+        //   generator caches for the rest of the load.
+        //
+        // Both are charged, each at the width its own loader lands it at. The previous
+        // `vae_bf16.max(vae_f32)` was neither: `max` always selects the f32 total, so the decoder
+        // field carried exactly twice the bf16 `AutoEncoderKL` a t2i load holds — a stamped
+        // "widest phase" literal rather than any quantity the loader materializes. A txt2img-only
+        // load never builds the f32 encoder, but the contract carries no route discriminator, and
+        // the conservative direction is to declare the encoder that a cached img2img load does
+        // hold. One network, one field: both materializations are the autoencoder, so they are
+        // charged once, together, in `decoder_bytes`.
+        let vae_decoder_bf16 = selected_float_bytes(&vae_paths, 2)?;
+        let vae_encoder_f32 =
+            selected_float_bytes_where(&vae_paths, 4, |name| name.starts_with("encoder."))?;
         let adapters = capture_adapters(spec)?;
         let components = gen_core::PerComponentBytes {
             text_encoder,
             dit: transformer_bytes,
-            // The I2I encoder materializes the same sealed VAE tensors in F32 before the BF16
-            // decoder phase. Price the widest VAE phase, not merely the resident decoder width.
-            vae: vae_bf16.max(vae_f32),
+            vae: checked_add(vae_decoder_bf16, vae_encoder_f32, "VAE bytes")?,
         };
         let physical_identity = physical_identity(route, tier, &inventory, &adapters);
         let receipt = Self {
@@ -536,6 +552,16 @@ fn selected_headers(
 }
 
 fn selected_float_bytes(paths: &[PathBuf], realized_width: u64) -> gen_core::Result<u64> {
+    selected_float_bytes_where(paths, realized_width, |_| true)
+}
+
+/// [`selected_float_bytes`] restricted to the tensors `keep` admits — the seam a component that is
+/// materialized twice, at two widths, over two different key subsets needs.
+fn selected_float_bytes_where(
+    paths: &[PathBuf],
+    realized_width: u64,
+    keep: impl Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
     selected_headers(paths)?
         .values()
@@ -545,6 +571,9 @@ fn selected_float_bytes(paths: &[PathBuf], realized_width: u64) -> gen_core::Res
                     "SD3.5 dense component tensor {} must be BF16, got {:?}",
                     header.name, header.dtype
                 )));
+            }
+            if !keep(&header.name) {
+                return Ok(total);
             }
             checked_add(
                 total,
@@ -1741,6 +1770,52 @@ mod tests {
             .with_adapters(adapters);
         spec.precision = Precision::Bf16;
         spec
+    }
+
+    /// AC (epic SC-22657, E1): `decoder_bytes` is what the two VAE loaders materialize — the whole
+    /// `AutoEncoderKL` at the pipeline's bf16 plus the img2img route's separate f32 `VaeEncoder`
+    /// over the `encoder.` prefix — never a `max()` of two hypothetical widths.
+    ///
+    /// *Mutation that reds this:* restoring `vae: vae_bf16.max(vae_f32)`, the shape under review,
+    /// which always resolves to the f32 total (twice the bf16 decoder a t2i load holds) and is
+    /// blind to which half of the component the second materialization actually covers.
+    #[test]
+    fn the_decoder_field_prices_both_vae_materializations_at_their_own_widths() {
+        let route = Sd35Route::Large;
+        let (_temp, root) = fixture(route, "bf16");
+        // An asymmetric VAE: the encoder half is deliberately NOT half the file, so a `max()` over
+        // whole-component widths cannot coincide with the honest sum.
+        write_safetensors(
+            &root.join("vae/diffusion_pytorch_model.safetensors"),
+            None,
+            &[
+                ("encoder.conv_in.weight", "BF16", &[4, 4], 32),
+                ("decoder.conv_out.weight", "BF16", &[16, 4], 128),
+            ],
+        );
+        let load = spec(route, &root, Vec::new());
+        let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+
+        let whole_component_elements = 4 * 4 + 16 * 4;
+        let encoder_elements = 4 * 4;
+        assert_eq!(
+            receipt.components.vae,
+            whole_component_elements * 2 + encoder_elements * 4,
+            "bf16 AutoEncoderKL + the f32 encoder-half the img2img route caches"
+        );
+        assert_ne!(
+            receipt.components.vae,
+            whole_component_elements * 4,
+            "the decoder field must not be the whole component stamped at f32"
+        );
+        let contract = contract_from_receipt(&load, &receipt);
+        assert_eq!(contract.asset_facts.decoder_bytes, receipt.components.vae);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes
+        );
     }
 
     /// AC (epic SC-22657, E2): every SD3.5 route publishes the architecture axes of the

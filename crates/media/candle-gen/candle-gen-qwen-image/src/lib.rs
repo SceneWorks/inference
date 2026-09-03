@@ -2048,9 +2048,11 @@ mod tests {
         let snapshot = dir.path().join("snapshot");
         write_valid_text_encoder(&snapshot);
         std::fs::create_dir_all(snapshot.join("vae")).unwrap();
+        // The memory contract prices the VAE over the `decoder.` namespace `QwenVae::new` reads
+        // and refuses a file with none, exactly as the constructor would.
         safetensors::save(
             &HashMap::from([(
-                "fixture.weight".to_string(),
+                "decoder.fixture.weight".to_string(),
                 Tensor::zeros((2,), DType::F32, &Device::Cpu).unwrap(),
             )]),
             snapshot.join("vae").join("model.safetensors"),
