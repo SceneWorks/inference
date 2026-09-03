@@ -306,10 +306,34 @@ pub(crate) fn weights_free_memory_strategy_surface_contract(
 /// the loader's own `transformer/config.json` parse — so the published trunk axes are the
 /// snapshot's rather than the preset's. On the weights-free surface there is nothing to read and
 /// the preset, which that parser itself falls back to per key, is the honest answer.
+///
+/// SC-22667: the two cases are now separated. A *missing* key degrades to the preset because
+/// `Krea2Config::from_snapshot` itself degrades per key, so the loader builds exactly that
+/// geometry. An `Err` — an unreadable file, malformed JSON, or a config that fails `validate` —
+/// does NOT: `load_transformer_with_stream` propagates it and refuses the load, so publishing the
+/// turbo preset would describe a model this snapshot cannot produce. The trunk axes are declared
+/// absent there instead, which is the rule this very file already states 250 lines down for the
+/// sibling base-config projection ("a config that IS present but unreadable or invalid propagates
+/// as an error — it is never degraded into `None`", and by the same token never into a preset).
 pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = mlx_gen::architecture_facts::materialized_root(spec)
-        .and_then(|root| crate::config::Krea2Config::from_snapshot(root).ok())
-        .unwrap_or_else(crate::config::Krea2Config::turbo);
+    let dit = match mlx_gen::architecture_facts::materialized_root(spec) {
+        None => Some(crate::config::Krea2Config::turbo()),
+        Some(root) => crate::config::Krea2Config::from_snapshot(root).ok(),
+    };
+    let Some(dit) = dit else {
+        return mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: None,
+            head_dim: None,
+            transformer_blocks: None,
+            patch_size: None,
+            // The latent axes are the decoder's own crate constants, not config reads, so they
+            // survive a refused trunk parse and the contract still declares a real axis.
+            latent_channels: mlx_gen::architecture_facts::axis(crate::vae::VAE_CHANNELS),
+            vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::vae::VAE_COMPRESSION),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        };
+    };
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
         head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
@@ -1742,6 +1766,62 @@ mod tests {
             mutated_facts.transformer_blocks,
             Some(7),
             "the materialized path must publish the snapshot's depth, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): a materialized snapshot whose `transformer/config.json`
+    /// is present but **unparseable or invalid** must declare its trunk axes absent rather than
+    /// degrade into the turbo preset. `load_transformer_with_stream` propagates that same
+    /// `Krea2Config::from_snapshot` error and refuses the load, so a preset published here would
+    /// describe a model this snapshot cannot produce. A *missing key* is the other case and keeps
+    /// the preset, because the parser itself defaults per key and the loader builds exactly that.
+    ///
+    /// This is the rule the same file already states for the sibling base-config projection: a
+    /// present-but-unreadable config is never degraded.
+    ///
+    /// Mutation that fails this: restoring `.unwrap_or_else(crate::config::Krea2Config::turbo)` —
+    /// the malformed fixture then publishes the preset's trunk axes as if they had been read off
+    /// the snapshot.
+    #[test]
+    fn an_invalid_snapshot_config_declares_the_trunk_axes_absent() {
+        let preset = crate::config::Krea2Config::turbo();
+        let weights_free = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        let declared = architecture_facts(&weights_free);
+
+        let malformed = tempfile::tempdir().unwrap();
+        let transformer = malformed.path().join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), b"{not json").unwrap();
+        let spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            malformed.path().to_path_buf(),
+        ));
+        let facts = architecture_facts(&spec);
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+        assert_eq!(facts.transformer_blocks, None);
+        assert_eq!(facts.patch_size, None);
+        assert_ne!(
+            facts, declared,
+            "an unreadable trunk config must not publish the preset"
+        );
+        // The decoder's own crate constants survive, so a real architecture axis is still declared.
+        assert_eq!(facts.latent_channels, declared.latent_channels);
+        assert_eq!(facts.vae_spatial_scale, declared.vae_spatial_scale);
+        assert!(facts.has_declared_architecture_axis());
+        assert!(facts.zero_valued_axes().is_empty());
+
+        // A snapshot that merely OMITS a key keeps the preset for it: `from_snapshot` defaults per
+        // key and the loader builds exactly that geometry.
+        let partial_dir = tempfile::tempdir().unwrap();
+        let mut partial = krea_transformer_config_json(&preset);
+        partial.as_object_mut().unwrap().remove("num_layers");
+        assert_eq!(
+            architecture_facts(&spec_for_transformer_config(partial_dir.path(), &partial))
+                .transformer_blocks,
+            declared.transformer_blocks,
+            "an omitted key degrades to the preset in the loader too"
         );
     }
 

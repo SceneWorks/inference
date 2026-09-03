@@ -722,7 +722,10 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
-        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667): `head_dim()` is a
+        // plain `dim / num_heads`, which rounds a non-uniform stack into a fabricated width and
+        // panics on a `"num_heads": 0` snapshot key before `axis` can decline it.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
         transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
         // A single scalar can only describe a square patch; an anisotropic one has no honest value.
         patch_size: (patch_h == patch_w)
