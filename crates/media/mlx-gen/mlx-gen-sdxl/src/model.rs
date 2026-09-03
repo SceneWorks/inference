@@ -1654,14 +1654,73 @@ pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
     match &spec.weights {
-        WeightsSource::Dir(_) => mlx_gen::PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder", "text_encoder_2"],
-            &["unet"],
-            &["vae"],
-        ),
+        WeightsSource::Dir(root) => Ok(snapshot_component_footprint(root)),
         WeightsSource::File(file) => fused_ldm_component_footprint(file, spec.quantize),
     }
+}
+
+/// Header-only resident projection for a diffusers **snapshot tree** — the directory twin of
+/// [`fused_ldm_component_footprint`], and for the same two reasons (SC-22667).
+///
+/// A plain `.safetensors` sum over `unet/`, `text_encoder*/` and `vae/` was wrong twice over:
+///
+/// * **The VAE was under-priced by exactly 2x, at every tier.** [`loader::load_vae`] does
+///   `w.cast_all(Dtype::Float32)` unconditionally — the SDXL VAE is fp16-unstable — while every
+///   SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors`.
+///   [`loader::resolve_vae_weight_file`]'s own doc has named this since sc-15839, down to the
+///   `ResidentProjection::Float32` remedy; nothing had ever called it from a contract. The fused
+///   branch below already prices its VAE tensors at `materialized_bytes(4)`, so the two snapshot
+///   shapes disagreed with each other.
+/// * **Side-by-side dtype variants were counted twice.** A component directory holding both
+///   `<stem>.safetensors` and `<stem>.fp16.safetensors` contributed both, while
+///   [`loader::resolve_weight_file`] opens exactly one of them. gen-core's own
+///   `PerComponentBytes` doc names this hazard.
+///
+/// The two errors point in opposite directions and land on different components, so they never
+/// cancelled. Each component is now sized from the exact file the resident load resolves, at the
+/// width that load materializes it in: the VAE f32, the U-Net and the two CLIP towers 16-bit
+/// (`DTYPE`), which is the same width the fused branch charges them. The shared projection detects
+/// an existing affine pack by its `.scales` companion and leaves those tensors at stored width, so
+/// a turnkey packed snapshot is not re-inflated to dense.
+///
+/// A component whose file cannot be resolved or read keeps its previous directory sum. This runs at
+/// contract time, ahead of any deferred component load, so an incomplete tree must not become a
+/// contract-time refusal.
+fn snapshot_component_footprint(root: &Path) -> mlx_gen::PerComponentBytes {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+
+    let mut footprint = mlx_gen::PerComponentBytes::from_root_subdirs(
+        root,
+        &["text_encoder", "text_encoder_2"],
+        &["unet"],
+        &["vae"],
+    );
+    let projected = |file: Option<std::path::PathBuf>, projection: ResidentProjection| {
+        projected_safetensors_bytes(file?, move |_| projection).ok()
+    };
+    let half = ResidentProjection::Bfloat16;
+
+    let clip_l = projected(
+        loader::resolve_weight_file(root, "text_encoder", "model", DTYPE).ok(),
+        half,
+    );
+    let clip_g = projected(
+        loader::resolve_weight_file(root, "text_encoder_2", "model", DTYPE).ok(),
+        half,
+    );
+    if let (Some(clip_l), Some(clip_g)) = (clip_l, clip_g) {
+        footprint.text_encoder = clip_l.saturating_add(clip_g);
+    }
+    if let Some(unet) = projected(loader::resolve_unet_weight_file(root, DTYPE).ok(), half) {
+        footprint.dit = unet;
+    }
+    if let Some(vae) = projected(
+        loader::resolve_vae_weight_file(root).ok(),
+        ResidentProjection::Float32,
+    ) {
+        footprint.vae = vae;
+    }
+    footprint
 }
 
 /// Header-only resident projection for a fused LDM/A1111 checkpoint.  Unlike a snapshot tree, a
@@ -1815,6 +1874,107 @@ pub const ACTIVATION_MEMORY_REGISTRATION: mlx_gen::gen_core::ActivationMemoryReg
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feature-end review (SC-22667, E1): the snapshot footprint must price the exact file each
+    /// component load resolves, at the width that load materializes it in.
+    ///
+    /// Two independent errors, in opposite directions, on different components:
+    /// `loader::load_vae` `cast_all(Dtype::Float32)`s unconditionally over the fp16 variant every
+    /// SceneWorks tier ships (2x under, named by `resolve_vae_weight_file`'s own doc since
+    /// sc-15839), while a directory sum counted BOTH `<stem>.safetensors` and
+    /// `<stem>.fp16.safetensors` when a snapshot carries the pair (over, on the U-Net).
+    ///
+    /// Mutation that fails this: restoring `PerComponentBytes::from_spec_subdirs` for the `Dir`
+    /// branch — `vae` halves to the stored 100 and `dit` inflates to the sum of both U-Net
+    /// variants plus their headers.
+    #[test]
+    fn snapshot_footprint_resolves_one_file_per_component_at_its_materialized_width() {
+        /// One-tensor safetensors file; `dtype` must agree with `width` because the shared header
+        /// reader refuses a payload length that is not `elements * dtype.size()`.
+        fn write_tensor(path: &std::path::Path, dtype: &str, elements: usize, width: usize) {
+            let data_bytes = elements * width;
+            let mut header = format!(
+                "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+            )
+            .into_bytes();
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.resize(bytes.len() + data_bytes, 0);
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for component in ["unet", "vae", "text_encoder", "text_encoder_2"] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        // The U-Net ships BOTH dtype variants side by side; only the fp16 one is opened at `DTYPE`.
+        write_tensor(
+            &root.join("unet/diffusion_pytorch_model.fp16.safetensors"),
+            "F16",
+            100,
+            2,
+        );
+        write_tensor(
+            &root.join("unet/diffusion_pytorch_model.safetensors"),
+            "F32",
+            100,
+            4,
+        );
+        // The VAE ships ONLY the fp16 variant — the shape every SceneWorks SDXL tier has — and is
+        // upcast to f32 on load regardless.
+        write_tensor(
+            &root.join("vae/diffusion_pytorch_model.fp16.safetensors"),
+            "F16",
+            50,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder/model.fp16.safetensors"),
+            "F16",
+            20,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder_2/model.fp16.safetensors"),
+            "F16",
+            30,
+            2,
+        );
+
+        let spec = mlx_gen::LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        let footprint = component_footprint(&spec).unwrap();
+        assert_eq!(
+            footprint.dit, 200,
+            "only the resolved fp16 U-Net may be counted, at 2 bytes per element"
+        );
+        assert_eq!(
+            footprint.vae, 200,
+            "the VAE is materialized f32: 50 elements at 4 bytes, not the 100 stored"
+        );
+        assert_eq!(footprint.text_encoder, 20 * 2 + 30 * 2);
+
+        // A directory sum would have been strictly larger on the U-Net and exactly half on the VAE.
+        let stored = mlx_gen::PerComponentBytes::from_root_subdirs(
+            root,
+            &["text_encoder", "text_encoder_2"],
+            &["unet"],
+            &["vae"],
+        );
+        assert!(stored.dit > footprint.dit, "{stored:?}");
+        assert!(stored.vae < footprint.vae, "{stored:?}");
+
+        // An incomplete tree keeps the previous directory sum rather than refusing at contract time.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_spec = mlx_gen::LoadSpec::new(WeightsSource::Dir(bare.path().to_path_buf()));
+        let bare_footprint = component_footprint(&bare_spec).unwrap();
+        assert_eq!(bare_footprint.dit, 0);
+        assert_eq!(bare_footprint.vae, 0);
+        assert_eq!(bare_footprint.text_encoder, 0);
+    }
 
     #[test]
     fn strength_resolution_preserves_defaults_explicit_values_and_clamping() {

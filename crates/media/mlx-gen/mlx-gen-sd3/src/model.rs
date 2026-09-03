@@ -588,20 +588,66 @@ fn img2img_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
 // The registration constants bridge the crate's rich `Result` into backend-neutral
 // `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
-/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the THREE
-/// text encoders (CLIP-L `text_encoder/`, CLIP-G `text_encoder_2/`, T5-XXL `text_encoder_3/`), the MMDiT
-/// (`transformer/`), and the VAE (`vae/`), summed from the exact snapshot subdirs [`crate::loader`]
-/// loads. (`text_encoder_3/` ships f32 + fp16 shards side by side; the on-disk sum counts both, matching
-/// the worker's whole-model total — a conservative over-count on the encoder side, the safe direction.)
+/// Per-component footprint (sc-10894) for the MLX fit-gate's staged-residency split — the THREE
+/// text encoders (CLIP-L `text_encoder/`, CLIP-G `text_encoder_2/`, T5-XXL `text_encoder_3/`), the
+/// MMDiT (`transformer/`), and the VAE (`vae/`).
+///
+/// The conditioning field is **projected**, not summed off disk (SC-22667). A directory sum was
+/// wrong in both directions at once and the two errors do not cancel, because they land on
+/// different files:
+///
+/// * `load_clip_l` and `load_clip_g` each do `w.cast_all(Dtype::Float32)` unconditionally, and the
+///   pinned SD3.5-Large snapshot stores both at 2 bytes per element — so CLIP-L (123.65M params)
+///   plus CLIP-G (694.66M) were under-declared by their own stored size, about 1.6 GB.
+/// * `text_encoder_3/` ships f32 and fp16 shards side by side and
+///   [`gen_core::resolve_sd3_text_encoder_artifacts`] deliberately selects only the master set, so
+///   the directory sum counted shards no load ever opens.
+///
+/// The projection therefore prices exactly the artifacts the resolver hands `load_text_encoders`:
+/// the two CLIP files at their **materialized** f32 width, and the selected T5 shards at their
+/// stored width (`T5TextEncoder::from_weights` performs no `cast_all`; the T5 promotes internally
+/// per activation).
+///
+/// When those artifacts cannot be resolved — a snapshot with no `text_encoder*` subtree at all,
+/// which the structural admission path deliberately accepts — the previous directory sum stands.
+/// This builder runs at contract time, ahead of any deferred component load, so an unresolvable
+/// encoder set must not become a contract-time refusal.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
-    mlx_gen::PerComponentBytes::from_spec_subdirs(
+    let mut footprint = mlx_gen::PerComponentBytes::from_spec_subdirs(
         spec,
         &["text_encoder", "text_encoder_2", "text_encoder_3"],
         &["transformer"],
         &["vae"],
-    )
+    )?;
+    if let mlx_gen::WeightsSource::Dir(root) = &spec.weights {
+        if let Some(projected) = projected_conditioning_bytes(root) {
+            footprint.text_encoder = projected;
+        }
+    }
+    Ok(footprint)
+}
+
+/// Bytes the three text encoders occupy on device, at the width each is materialized in.
+///
+/// `None` means the exact artifact set could not be resolved or read; see [`component_footprint`]
+/// for why that keeps the directory sum rather than failing the contract.
+fn projected_conditioning_bytes(root: &std::path::Path) -> Option<u64> {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+
+    let artifacts = mlx_gen::gen_core::resolve_sd3_text_encoder_artifacts(root).ok()?;
+    let clip_l =
+        projected_safetensors_bytes(&artifacts.clip_l, |_| ResidentProjection::Float32).ok()?;
+    let clip_g =
+        projected_safetensors_bytes(&artifacts.clip_g, |_| ResidentProjection::Float32).ok()?;
+    let mut total = clip_l.saturating_add(clip_g);
+    for shard in &artifacts.t5_shards {
+        total = total.saturating_add(
+            projected_safetensors_bytes(shard, |_| ResidentProjection::Stored).ok()?,
+        );
+    }
+    Some(total)
 }
 
 mlx_gen::register_generators! {
@@ -651,6 +697,94 @@ mod tests {
     use super::*;
     use mlx_gen::{ConditioningKind, Modality};
     use std::cell::Cell;
+
+    /// Feature-end review (SC-22667, E1): the conditioning field must price what the loader
+    /// materializes, at the width it materializes it in. `load_clip_l` and `load_clip_g` both
+    /// `cast_all(Dtype::Float32)` unconditionally over half-precision masters, and
+    /// `resolve_sd3_text_encoder_artifacts` selects only the master T5 shard family while
+    /// `text_encoder_3/` also ships an fp16 family. A directory sum was therefore wrong in both
+    /// directions at once, on different files, so the two errors could not cancel.
+    ///
+    /// Mutation that fails this: dropping the `projected_conditioning_bytes` override in
+    /// `component_footprint` — `text_encoder` falls back to the stored directory sum, which counts
+    /// the two CLIP masters at half their materialized size and adds the fp16 shard nobody loads.
+    #[test]
+    fn conditioning_bytes_price_the_resolved_artifacts_at_their_materialized_width() {
+        /// One-tensor safetensors file: `dtype` must agree with `width`, because the shared header
+        /// reader refuses a payload length that is not `elements * dtype.size()`.
+        fn write_tensor(path: &std::path::Path, dtype: &str, elements: usize, width: usize) {
+            let data_bytes = elements * width;
+            let mut header = format!(
+                "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+            )
+            .into_bytes();
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.resize(bytes.len() + data_bytes, 0);
+            std::fs::write(path, bytes).unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for component in [
+            "text_encoder",
+            "text_encoder_2",
+            "text_encoder_3",
+            "transformer",
+        ] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        // CLIP-L and CLIP-G ship at half precision and are upcast to f32 on every load.
+        write_tensor(&root.join("text_encoder/model.safetensors"), "F16", 100, 2);
+        write_tensor(&root.join("text_encoder_2/model.safetensors"), "F16", 50, 2);
+        // The T5 master family, plus the fp16 family the resolver deliberately does not select.
+        write_tensor(
+            &root.join("text_encoder_3/model-00001-of-00001.safetensors"),
+            "BF16",
+            40,
+            2,
+        );
+        write_tensor(
+            &root.join("text_encoder_3/model.fp16-00001-of-00001.safetensors"),
+            "F16",
+            40,
+            2,
+        );
+        std::fs::write(
+            root.join("text_encoder_3/model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+        // The resolver refuses an fp16 family without its own authoritative index, so the fixture
+        // ships the complete side-by-side pair the real snapshot has.
+        std::fs::write(
+            root.join("text_encoder_3/model.safetensors.index.fp16.json"),
+            br#"{"weight_map":{"weight":"model.fp16-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        let footprint = component_footprint(&spec).unwrap();
+        assert_eq!(
+            footprint.text_encoder,
+            // CLIP-L 100 x f32 + CLIP-G 50 x f32 + the selected T5 shard at its stored width.
+            400 + 200 + 80,
+            "the two upcast CLIP towers must be priced at 4 bytes per element, and only the master \
+             T5 shard family may be counted"
+        );
+
+        // A snapshot with no encoder subtree at all is the structural-admission shape: the resolver
+        // declines, and the previous directory sum (zero here) stands rather than the contract
+        // refusing at build time.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join("transformer")).unwrap();
+        let bare_spec =
+            mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir(bare.path().to_path_buf()));
+        assert_eq!(component_footprint(&bare_spec).unwrap().text_encoder, 0);
+    }
 
     struct CountingReferencePreparer<'a> {
         expected_route: Sd3Variant,
