@@ -10,13 +10,14 @@
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
-    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, Quant, TransformerComponent,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
+    LoadSpec, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget,
+    MemoryCacheState, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
+    MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode,
+    MemoryNumericTier, MemoryOptimizationAuthority, MemoryPhase, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Quant,
+    TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -684,12 +685,34 @@ fn klein_calibration_fingerprint(
     ))
 }
 
+/// Provider-local identity of Klein's resident LoRA/LoKr factor stack.
+const KLEIN_ADAPTER_COMPONENT_ID: &str = "flux2_klein.adapters.forward_residuals";
+
+/// Load-exact bytes of the adapter stack a Klein load keeps resident.
+///
+/// `apply_flux2_adapters` routes into the shared `apply_adapters_strict`, which installs
+/// `AdaptableLinear` residuals evaluated as `base(x) + sum(adapter.residual(x))` and never mutates
+/// the packed base — [`AdapterResidencyMode::Additive`]. `None` from the shared helper means an
+/// additive stack was requested and at least one source could not be sized; fail closed on it
+/// rather than declare a zero the shared validator would wave through.
+fn klein_adapter_bytes(spec: &LoadSpec) -> mlx_gen::gen_core::Result<u64> {
+    mlx_gen::gen_core::adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive)
+        .ok_or_else(|| {
+            mlx_gen::gen_core::Error::Unsupported(
+                "flux2_klein: an adapter stack was requested but at least one source could not be \
+                 sized; refusing to declare a zero the shared validator would wave through"
+                    .to_owned(),
+            )
+        })
+}
+
 fn build_klein_contract(
     provider_id: &str,
     spec: &LoadSpec,
     footprint: mlx_gen::PerComponentBytes,
     streamable: bool,
     calibration: Option<MemoryCalibrationIdentity>,
+    adapter_bytes: u64,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = klein_overlay(spec).is_none();
@@ -707,21 +730,45 @@ fn build_klein_contract(
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::klein_9b());
     contract.load_shape = spec.load_shape;
     contract.calibration = calibration;
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::OverlayBytes,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::OverlayBytes,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::TransformerWindowSize,
+    ];
+    // SC-22667 (E1): `klein_overlay` lists `adapters` as a live Klein axis and
+    // `validate_klein_load_axes` deliberately does NOT reject it, so an adapted Klein load is a
+    // reachable composition. `load_flux2_heavy` then installs the stack as forward-time residuals
+    // over the (possibly quantized) transformer — the crate's own comment says so — i.e. genuinely
+    // extra resident bytes, never folded into the base. Adapter files live outside the snapshot
+    // tree `from_spec_subdirs` walks, so `overlay_bytes` stayed 0 while the contract already
+    // declared `OverlayBytes` as a formula input. The component axis is claimed only where there
+    // IS an overlay: the shared validator refuses a zero-byte component declaration.
+    contract.asset_facts.overlay_bytes = adapter_bytes;
+    contract.formula = if adapter_bytes == 0 {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![MemoryResidentComponent {
+                id: KLEIN_ADAPTER_COMPONENT_ID.to_owned(),
+                kind: MemoryComponentKind::AdapterStack,
+                resident_bytes: adapter_bytes,
+                // No published Klein rung bounds the adapter factors: rung 4's window covers the
+                // transformer blocks, and an adapted load withdraws rungs 2-4 anyway.
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        }
     };
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -828,6 +875,7 @@ pub fn klein_contract_for(
         },
         streamable,
         calibration,
+        klein_adapter_bytes(spec)?,
     )
 }
 
@@ -851,6 +899,9 @@ pub(crate) fn weights_free_klein_contract(
             ),
             spec.load_shape,
         )),
+        // No adapter overlay either: sizing one means opening its checkpoint, and this path exists
+        // to produce the declaration without touching a weight file.
+        0,
     )
 }
 
@@ -926,6 +977,7 @@ pub(crate) fn weights_free_klein_surface_contract(
             ),
             surface.spec.load_shape,
         )),
+        0,
     )
 }
 
@@ -1727,6 +1779,87 @@ mod tests {
         assert!(reason.contains("Lower the output resolution"), "{reason}");
     }
 
+    /// Feature-end review (SC-22667, E1): `klein_overlay` lists `adapters` as a live Klein axis and
+    /// `validate_klein_load_axes` deliberately does not reject it, so an adapted Klein load is a
+    /// reachable composition. `load_flux2_heavy` installs the stack as forward-time residuals over
+    /// the (possibly quantized) transformer — never folded — and those files sit outside the
+    /// snapshot subtree the footprint walks, so `overlay_bytes` stayed 0 while the contract already
+    /// declared `OverlayBytes` as a formula input.
+    ///
+    /// Mutation that fails this: passing `0` instead of `klein_adapter_bytes(spec)?` at the
+    /// production call site — `overlay_bytes` drops to 0, no component is declared, and the formula
+    /// falls back to `PhaseEnvelope`.
+    #[test]
+    fn a_klein_adapter_stack_is_priced_as_a_resident_overlay() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        let clean = build_klein_contract(
+            crate::FLUX2_KLEIN_9B_ID,
+            &spec,
+            Default::default(),
+            true,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(clean.asset_facts.overlay_bytes, 0);
+        assert!(clean.resident_components().is_empty());
+        assert!(matches!(
+            clean.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
+
+        let adapted = build_klein_contract(
+            crate::FLUX2_KLEIN_9B_ID,
+            &spec,
+            Default::default(),
+            true,
+            None,
+            2048,
+        )
+        .unwrap();
+        assert_eq!(adapted.asset_facts.overlay_bytes, 2048);
+        assert_eq!(adapted.auxiliary_resident_bytes(), 2048);
+        assert_eq!(
+            adapted.asset_facts.base_bytes, clean.asset_facts.base_bytes,
+            "an adapter is auxiliary: it must never move the base decomposition"
+        );
+        let components = adapted.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, KLEIN_ADAPTER_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::AdapterStack);
+        assert_eq!(components[0].resident_bytes, 2048);
+        assert!(
+            adapted.conformance_errors().is_empty(),
+            "{:?}",
+            adapted.conformance_errors()
+        );
+
+        // The sizing helper prices an additive stack at its on-disk length and fails closed on a
+        // source it cannot size, rather than declaring a zero the shared validator would accept.
+        let tmp = tempfile::tempdir().unwrap();
+        let lora = tmp.path().join("lora.safetensors");
+        std::fs::write(&lora, vec![0_u8; 2048]).unwrap();
+        let mut sized = spec.clone();
+        sized.adapters.push(mlx_gen::AdapterSpec::new(
+            lora,
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert_eq!(klein_adapter_bytes(&sized).unwrap(), 2048);
+        assert_eq!(klein_adapter_bytes(&spec).unwrap(), 0);
+
+        let mut unsizable = spec;
+        unsizable.adapters.push(mlx_gen::AdapterSpec::new(
+            tmp.path().join("absent.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert!(klein_adapter_bytes(&unsizable).is_err());
+    }
+
     #[test]
     fn klein_contract_declares_every_shared_rung_for_the_exact_structural_route() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
@@ -1741,6 +1874,7 @@ mod tests {
                 "fixture-v1",
                 spec.load_shape,
             )),
+            0,
         )
         .unwrap();
         assert!(
@@ -1802,6 +1936,7 @@ mod tests {
                 Default::default(),
                 klein_streamable(&spec),
                 None,
+                0,
             )
             .unwrap();
             assert_eq!(
