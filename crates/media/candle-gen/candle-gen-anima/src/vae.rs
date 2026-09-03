@@ -85,30 +85,36 @@ pub fn convert_vae_key(key: &str) -> String {
     }
 }
 
-/// Load the Qwen-Image VAE from Anima's single-file `qwen_image_vae.safetensors` on `device`. Run in
-/// f32 (the qwen-image golden convention): the denoised latents are f32 and this avoids a mixed-dtype
-/// conv, at a negligible memory cost for the small VAE.
+/// The dtype every Anima VAE tensor is materialized at: f32 (the qwen-image golden convention —
+/// the denoised latents are f32 and this avoids a mixed-dtype conv), **not** the DiT's bf16.
+///
+/// It is a named constant because `memory_strategy::VAE_FLOAT_WIDTH` prices the resident decoder
+/// against it; the two must not drift, and a unit test pins them together.
+pub const LOAD_DTYPE: DType = DType::F32;
+
+/// Load the Qwen-Image VAE from Anima's single-file `qwen_image_vae.safetensors` on `device` at
+/// [`LOAD_DTYPE`], at a modest memory cost for the small VAE.
 pub fn load_vae(path: impl AsRef<Path>, device: &Device) -> Result<QwenVae> {
     // Load + cast every tensor to f32 (candle_gen::Weights coerces floats on load), then rename keys.
-    let src = candle_gen::Weights::from_file(path.as_ref(), device, DType::F32)?;
+    let src = candle_gen::Weights::from_file(path.as_ref(), device, LOAD_DTYPE)?;
     let keys: Vec<String> = src.keys().cloned().collect();
     let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
     for k in &keys {
         map.insert(convert_vae_key(k), src.require(k)?);
     }
-    let vb = VarBuilder::from_tensors(map, DType::F32, device);
+    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
     QwenVae::new(vb).map_err(Into::into)
 }
 
-/// Load only Anima's Qwen-Image VAE encoder for training-time image caching.
+/// Load only Anima's Qwen-Image VAE encoder for training-time image caching, at [`LOAD_DTYPE`].
 pub fn load_vae_encoder(path: impl AsRef<Path>, device: &Device) -> Result<QwenVaeEncoder> {
-    let src = candle_gen::Weights::from_file(path.as_ref(), device, DType::F32)?;
+    let src = candle_gen::Weights::from_file(path.as_ref(), device, LOAD_DTYPE)?;
     let keys: Vec<String> = src.keys().cloned().collect();
     let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
     for k in &keys {
         map.insert(convert_vae_key(k), src.require(k)?);
     }
-    let vb = VarBuilder::from_tensors(map, DType::F32, device);
+    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
     QwenVaeEncoder::new(vb).map_err(Into::into)
 }
 

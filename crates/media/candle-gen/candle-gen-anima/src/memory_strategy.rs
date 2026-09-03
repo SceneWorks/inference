@@ -20,9 +20,18 @@ use crate::config::Variant;
 const IDS: &[&str] = &["anima_base", "anima_aesthetic", "anima_turbo"];
 const FINGERPRINT: &str = "anima-candle-request-scoped-conditioning-v1";
 
-/// Every Anima component is materialized at the native bf16 compute dtype
-/// ([`resolved_numeric_tier`] refuses anything else), so each float element costs two bytes.
+/// The Qwen3 conditioner and the Cosmos DiT are materialized at the native bf16 compute dtype
+/// ([`resolved_numeric_tier`] refuses anything else), so each of their float elements costs two
+/// bytes.
 const FLOAT_WIDTH: u64 = 2;
+
+/// The VAE is **not** loaded at [`FLOAT_WIDTH`]. [`crate::vae::load_vae`] reads
+/// `vae/qwen_image_vae.safetensors` through `candle_gen::Weights::from_file(.., DType::F32)` and
+/// builds its `VarBuilder` at `DType::F32` (the qwen-image golden convention: the denoised latents
+/// are f32 and a mixed-dtype conv is avoided), so every float element of the decoder costs four
+/// bytes on device. Pricing it at the DiT's bf16 width under-charged the resident decoder by
+/// exactly 2x (epic SC-22657, E1).
+const VAE_FLOAT_WIDTH: u64 = 4;
 
 fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
     match provider_id {
@@ -35,14 +44,15 @@ fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
     }
 }
 
-/// Bytes one resolved component occupies once loaded: float tensors at the compute width, packed
+/// Bytes one resolved component occupies once loaded: float tensors at `float_width` — the width
+/// **that component's** loader materializes them at, not one crate-wide constant — and packed
 /// (integer) codes at their stored width. Header-only — no tensor data is materialized.
-fn component_bytes(path: &Path) -> gen_core::Result<u64> {
+fn component_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
     gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
         .iter()
         .try_fold(0_u64, |sum, header| {
             let bytes = if header.is_float() {
-                header.materialized_bytes(FLOAT_WIDTH)?
+                header.materialized_bytes(float_width)?
             } else {
                 header.data_bytes
             };
@@ -58,11 +68,17 @@ fn component_bytes(path: &Path) -> gen_core::Result<u64> {
 /// they are priced together. `overlay_bytes` stays zero because Anima folds LoRA/LoKr into the DiT
 /// (Resident) or refuses them (staged) and therefore never declares
 /// [`MemoryFormulaVariable::OverlayBytes`].
+///
+/// Each component is priced at the width **its own** loader materializes: the conditioner and DiT
+/// at [`FLOAT_WIDTH`], the VAE at [`VAE_FLOAT_WIDTH`] (see that constant for the loader evidence).
 fn asset_facts(spec: &LoadSpec, variant: Variant) -> gen_core::Result<MemoryAssetFacts> {
     let root = crate::loader::resolve_split_files(&spec.weights)?;
-    let conditioning = component_bytes(&root.join(crate::loader::TEXT_ENCODER_FILE))?;
-    let transformer = component_bytes(&root.join("diffusion_models").join(variant.dit_filename()))?;
-    let decoder = component_bytes(&root.join(crate::loader::VAE_FILE))?;
+    let conditioning = component_bytes(&root.join(crate::loader::TEXT_ENCODER_FILE), FLOAT_WIDTH)?;
+    let transformer = component_bytes(
+        &root.join("diffusion_models").join(variant.dit_filename()),
+        FLOAT_WIDTH,
+    )?;
+    let decoder = component_bytes(&root.join(crate::loader::VAE_FILE), VAE_FLOAT_WIDTH)?;
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -575,7 +591,7 @@ mod tests {
         use std::collections::HashMap;
 
         let root = temp.path().join("anima_priced");
-        let write = |relative: &str, rows: usize, columns: usize| -> u64 {
+        let write = |relative: &str, rows: usize, columns: usize, width: u64| -> u64 {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut tensors = HashMap::new();
@@ -584,18 +600,46 @@ mod tests {
                 Tensor::zeros((rows, columns), DType::F32, &Device::Cpu).unwrap(),
             );
             candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
-            // The written tensor is F32 on disk but bf16 once materialized: exactly two bytes per
-            // element, derived from the shape written here rather than pinned to a literal.
-            (rows as u64) * (columns as u64) * FLOAT_WIDTH
+            // Priced at the width the component's OWN loader materializes it at, derived from the
+            // shape written here rather than pinned to a literal.
+            (rows as u64) * (columns as u64) * width
         };
         let transformer = write(
             &format!("diffusion_models/{}", variant.dit_filename()),
             64,
             32,
+            FLOAT_WIDTH,
         );
-        let conditioning = write(crate::loader::TEXT_ENCODER_FILE, 16, 8);
-        let decoder = write(crate::loader::VAE_FILE, 4, 2);
+        let conditioning = write(crate::loader::TEXT_ENCODER_FILE, 16, 8, FLOAT_WIDTH);
+        // `vae::load_vae` reads the file at `DType::F32`, so the decoder is four bytes per element
+        // — never the DiT's bf16 width.
+        let decoder = write(crate::loader::VAE_FILE, 4, 2, VAE_FLOAT_WIDTH);
         (root, conditioning, transformer, decoder)
+    }
+
+    /// The decoder is materialized f32 by [`crate::vae::load_vae`], so its priced bytes must be
+    /// exactly twice the bf16 sum of the same tensors — never the DiT's [`FLOAT_WIDTH`].
+    ///
+    /// Reds under the pre-SC-22667 pricing (`component_bytes(vae, FLOAT_WIDTH)`), which returned
+    /// half of this.
+    #[test]
+    fn the_vae_is_priced_at_the_f32_width_its_loader_materializes() {
+        assert_eq!(
+            VAE_FLOAT_WIDTH as usize,
+            crate::vae::LOAD_DTYPE.size_in_bytes(),
+            "the priced VAE width must be the dtype `load_vae` materializes its tensors at"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let (root, _, _, decoder) = write_priced_split_files(&temp, Variant::Base);
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let facts = contract("anima_base", &spec).unwrap().asset_facts;
+        let bf16_sum = component_bytes(&root.join(crate::loader::VAE_FILE), FLOAT_WIDTH).unwrap();
+        assert_eq!(facts.decoder_bytes, decoder);
+        assert_eq!(
+            facts.decoder_bytes,
+            2 * bf16_sum,
+            "the f32 decoder must not be priced at the bf16 DiT width"
+        );
     }
 
     #[test]
