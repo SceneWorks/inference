@@ -30,6 +30,15 @@ pub const DECODER_HIDDEN_SIZE: usize = 2048;
 /// The exact resized StarCoder vocabulary, including the model's three added tokens.
 pub const VOCAB_SIZE: usize = 49_156;
 
+/// Join the half-precision vision adapter output to the decoder's dense embedding stream.
+///
+/// The published 1B snapshot deliberately mixes f16 CLIP/adapter tensors with f32 GPTBigCode
+/// tensors, so the decoder embeddings are the dtype and device authority at this boundary.
+fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result<Tensor> {
+    let vision = vision.to_dtype(text.dtype())?.to_device(text.device())?;
+    Ok(Tensor::cat(&[&vision, text], 1)?)
+}
+
 /// Native-only, exact configuration facts for the StarVector-1B image-to-SVG snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StarVectorConfig {
@@ -395,8 +404,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
             let ids = input_ids(&self.prompt, pixels.device())
                 .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
             let text = model.decoder.embeddings(&ids).map_err(to_core)?;
-            let initial = Tensor::cat(&[&vision, &text], 1)
-                .map_err(|e| core_llm::Error::Msg(e.to_string()))?;
+            let initial = concatenate_conditioning_embeddings(&vision, &text).map_err(to_core)?;
             let mut logits = model.decoder.forward_embeds(&initial, 0).map_err(to_core)?;
             let mut stream = core_llm::StarVectorBoundedStream::new(req);
             for index in 0..req.text_request.max_new_tokens {
@@ -515,6 +523,21 @@ mod tests {
         assert!(StarVectorImageProcessor::default()
             .preprocess(&[0; 4], 1, 1, &Device::Cpu)
             .is_err());
+    }
+
+    #[test]
+    fn conditioning_join_uses_decoder_embedding_dtype() {
+        let vision = Tensor::ones((1, 2, 3), DType::F16, &Device::Cpu).unwrap();
+        let text = Tensor::zeros((1, 1, 3), DType::F32, &Device::Cpu).unwrap();
+
+        let joined = concatenate_conditioning_embeddings(&vision, &text).unwrap();
+
+        assert_eq!(joined.dtype(), DType::F32);
+        assert_eq!(joined.dims(), &[1, 3, 3]);
+        assert_eq!(
+            joined.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        );
     }
 
     struct FixtureProvider {
