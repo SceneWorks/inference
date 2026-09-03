@@ -1393,7 +1393,11 @@ mod registry_tests {
         let generation = memory_strategy::contract_rl(&spec).unwrap();
         let edit = memory_strategy::contract_edit(&spec).unwrap();
         assert_eq!(generation.asset_facts.conditioning_bytes, 13);
-        assert_eq!(edit.asset_facts.conditioning_bytes, 30);
+        // SC-22667: the Edit route's conditioning is the text encoder alone; the shared VAE is
+        // charged once, in `decoder_bytes` (this assertion previously pinned 13 + 17 = 30, which
+        // left `base_bytes` 41 short of its own 13 + 11 + 30 decomposition).
+        assert_eq!(edit.asset_facts.conditioning_bytes, 13);
+        assert_eq!(edit.asset_facts.decoder_bytes, 17);
         assert_eq!(generation.asset_facts.base_bytes, 41);
         assert_eq!(edit.asset_facts.base_bytes, 41);
     }

@@ -942,11 +942,6 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
     build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
 }
 
-/// Number of `block_out_channels` stages in the shared FLUX.2 `AutoencoderKL` Lens decodes
-/// through (`candle_gen_flux2::vae`'s `BLOCK_OUT` = `[128, 256, 512, 512]`). Each stage after the
-/// first halves both spatial axes, so four stages give the x8 latent scale.
-const VAE_STAGES: usize = 4;
-
 /// Architecture axes for the Lens / Lens-Turbo routes (epic SC-22657, E2).
 ///
 /// Lens' geometry is not read from `transformer/config.json`: the loader builds the dual-stream
@@ -955,8 +950,9 @@ const VAE_STAGES: usize = 4;
 /// the axes come off the same struct handed to the DiT builder.
 ///
 /// The decoder axes describe the shared FLUX.2 `AutoencoderKL` (`vae.rs` is a thin shim over
-/// `candle_gen_flux2::vae::Flux2Vae`): its 32 latent channels are exactly the DiT's `out_channels`,
-/// the value the DiT itself declares it emits, and its four `BLOCK_OUT` stages give the x8 scale.
+/// `candle_gen_flux2::vae::Flux2Vae`) and are read off that crate's own constants rather than
+/// restated here (SC-22667): its `LATENT_CHANNELS` (32, exactly the DiT's `out_channels`) and its
+/// `BLOCK_OUT` stage list, whose four stages — three halvings — give the x8 scale.
 ///
 /// `vae_temporal_scale` stays `None`: FLUX.2 ships an image VAE with no temporal axis at all. A
 /// structurally absent axis is declared absent, never zero (E2).
@@ -977,12 +973,13 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         head_dim: af::declared(dit.head_dim),
         transformer_blocks: af::declared(dit.num_layers),
         patch_size: af::declared(dit.patch_size),
-        // The DiT's `out_channels` IS the FLUX.2 latent width (32) — what the decoder consumes.
-        latent_channels: af::declared(dit.out_channels),
-        vae_spatial_scale: VAE_STAGES
-            .checked_sub(1)
-            .filter(|shift| *shift <= 5)
-            .map(|shift| 1_u32 << shift),
+        // The decoder's own latent width — which the DiT's `out_channels` must equal, a pin the
+        // tests hold — read off the crate that builds the decoder.
+        latent_channels: af::declared(candle_gen_flux2::vae::LATENT_CHANNELS),
+        // Each `BLOCK_OUT` stage after the first halves both spatial axes.
+        vae_spatial_scale: af::declared(candle_gen_flux2::vae::BLOCK_OUT.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
         // FLUX.2 ships an image `AutoencoderKL`: there is no temporal axis to declare.
         vae_temporal_scale: None,
         activation_dtype_width: af::dtype_width(DIT_DTYPE),
@@ -2174,6 +2171,23 @@ mod weights_free_behavior_tests {
                 "{provider_id} architecture facts"
             );
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+            // SC-22667: the decoder axes are `candle_gen_flux2::vae`'s own constants — the crate
+            // that builds the decoder — and the DiT's `out_channels` agrees with them rather than
+            // standing in for them. Mutation that fails this: a local `VAE_STAGES` literal (the
+            // shape under review) that drifts from `BLOCK_OUT.len()`.
+            let facts = contract.architecture_facts;
+            assert_eq!(
+                facts.latent_channels,
+                Some(candle_gen_flux2::vae::LATENT_CHANNELS as u32)
+            );
+            assert_eq!(
+                facts.latent_channels,
+                Some(crate::transformer::LensDitConfig::lens().out_channels as u32)
+            );
+            assert_eq!(
+                facts.vae_spatial_scale,
+                Some(1 << (candle_gen_flux2::vae::BLOCK_OUT.len() - 1))
+            );
 
             // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
             let surface = LoadSpec::new(WeightsSource::Dir(

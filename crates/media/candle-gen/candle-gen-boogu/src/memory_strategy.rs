@@ -470,15 +470,13 @@ fn projected_facts(
     let conditioning_bytes = projected_component(root, "mllm", 2, route == Route::Edit)?;
     let transformer_bytes = projected_component(root, "transformer", 2, false)?;
     let decoder_bytes = projected_component(root, "vae", 4, false)?;
-    // The standalone reference encoder materializes a second f32 VAE view on every Edit request and
-    // on the Base/Turbo img2img surface. Until the receipt splits encoder/decoder keys, charge the
-    // complete VAE again: conservative logical tensor bytes, never container bytes.
-    let reference_encoder_bytes = decoder_bytes;
-    let conditioning_bytes = conditioning_bytes
-        .checked_add(reference_encoder_bytes)
-        .ok_or_else(|| {
-            gen_core::Error::Msg("boogu: conditioning byte projection overflow".into())
-        })?;
+    // One network, one field (epic SC-22657, E1; feature-end ruling SC-22667). The reference
+    // encoder every Edit request and the Base/Turbo img2img surface run during conditioning is
+    // the same f32 VAE weights the decode phase runs, so those bytes are charged exactly once, in
+    // `decoder_bytes`. They used to be folded into `conditioning_bytes` as well, which charged one
+    // resident network twice against every fit decision. That the VAE is *resident during
+    // conditioning* on those routes is a lifecycle fact the contract cannot yet state per base
+    // component — see `MemoryAssetFacts` — and is recorded on this crate's contract doc instead.
     let base_bytes = conditioning_bytes
         .checked_add(transformer_bytes)
         .and_then(|v| v.checked_add(decoder_bytes))
@@ -677,6 +675,14 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     }
 }
 
+/// Assemble the Boogu contract over sealed asset facts.
+///
+/// **Decoder residency during conditioning.** On the Edit route and the Base/Turbo img2img
+/// surface the reference image is encoded through the same f32 VAE that later decodes, so the
+/// decoder is resident during the `Conditioning` phase as well as `Decode`. `asset_facts` charges
+/// those bytes once, in `decoder_bytes` (one network, one field — `MemoryAssetFacts`); the
+/// contract has no per-phase residency declaration for a base component, so this note is where
+/// that co-residency is stated until it does.
 fn build_contract(
     provider: &str,
     spec: &LoadSpec,
@@ -1812,11 +1818,31 @@ mod tests {
             for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
                 let (_temp, root) = artifact(provider, quant);
                 let receipt =
-                    ArtifactReceipt::capture(provider, &exact_spec(provider, root, quant)).unwrap();
+                    ArtifactReceipt::capture(provider, &exact_spec(provider, root.clone(), quant))
+                        .unwrap();
                 assert!(receipt.canonical);
                 assert_eq!(receipt.tier, quant);
                 assert!(receipt.facts.decoder_bytes > 400_000);
                 assert!(receipt.facts.base_bytes > receipt.facts.decoder_bytes);
+                // One network, one field (SC-22667): the conditioning field is the MLLM alone —
+                // the VAE the reference encoder shares with decode is charged once, in
+                // `decoder_bytes` — and the base total is exactly its own decomposition.
+                // Mutation that fails this: folding `decoder_bytes` into `conditioning_bytes`
+                // again (the shape under review), which moves the field off the MLLM projection.
+                assert_eq!(
+                    receipt.facts.conditioning_bytes,
+                    projected_component(&root, "mllm", 2, provider == BOOGU_IMAGE_EDIT_ID).unwrap(),
+                    "{provider} {quant:?}: conditioning must be the MLLM alone"
+                );
+                assert_eq!(
+                    receipt.facts.base_bytes,
+                    receipt.facts.conditioning_bytes
+                        + receipt.facts.transformer_bytes
+                        + receipt.facts.decoder_bytes
+                );
+                // (The shared `check_memory_contract_asset_facts` is not run here: the synthetic
+                // artifact gives the MLLM and the transformer identical tensor bytes, which trips
+                // its repeated-total rule for a reason that is the fixture's, not the provider's.)
                 assert!(receipt
                     .inventory
                     .iter()

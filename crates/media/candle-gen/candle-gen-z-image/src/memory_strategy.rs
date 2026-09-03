@@ -15,6 +15,8 @@ use candle_gen::gen_core::{
     MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
     MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
 };
+use candle_transformers::models::z_image::transformer::Config as DitConfig;
+use candle_transformers::models::z_image::vae::VaeConfig;
 use gen_core::MemoryPhase;
 #[cfg(any(feature = "cuda", test))]
 use gen_core::MemoryRequestScope;
@@ -58,79 +60,47 @@ pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
 /// so this is the provider's real activation width rather than a memory-model literal.
 const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
 
-/// Read one component `config.json` from a snapshot root. A missing or unparseable file is not an
-/// error: the contract is constructible before any asset exists on disk, and every architecture
-/// axis it feeds is `Option`.
-fn component_config(root: &std::path::Path, component: &str) -> Option<serde_json::Value> {
-    let bytes = std::fs::read(root.join(component).join("config.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Narrow a JSON number to a declared architecture axis. Zero and out-of-range values are rejected
-/// rather than published: no axis here has a legitimate zero, and `Some(0)` would silently zero any
-/// activation estimate that multiplied by it (E2).
-fn axis(value: Option<&serde_json::Value>) -> Option<u32> {
-    let value = u32::try_from(value?.as_u64()?).ok()?;
-    (value != 0).then_some(value)
-}
-
-/// Snapshot-read architecture facts for the Z-Image routes.
+/// Architecture axes for the Z-Image routes (epic SC-22657, E2).
 ///
-/// The DiT axes come from `<root>/transformer/config.json` (`n_heads`, `dim`, `n_layers`,
-/// `all_patch_size`) and the decoder axes from `<root>/vae/config.json` (`latent_channels`,
-/// `block_out_channels`); the DiT's `in_channels` is read only as the `latent_channels` fallback
-/// for a snapshot that ships no VAE config. Nothing is inferred from the model id, so a snapshot
-/// whose config disagrees with the reference Turbo config publishes what it actually says.
+/// These are the **loader's** geometry, not the snapshot's `config.json`. `pipeline.rs` builds
+/// every DiT from `DitConfig::z_image_turbo()` and every autoencoder from `VaeConfig::z_image()`
+/// — the component `config.json` files are read at load only for their `quantization` block — so
+/// a snapshot whose `transformer/config.json` says `n_layers: 24` still loads a 30-block trunk.
+/// Publishing what that file says (the shape the feature-end review caught) would describe a
+/// pipeline this crate never constructs; the axes therefore come off the same two presets handed
+/// to the builders, the way `candle-gen-qwen-image` and `candle-gen-flux2` publish theirs.
 ///
-/// `vae_temporal_scale` stays `None`: Z-Image ships the FLUX.1 image AutoencoderKL, which has no
-/// temporal axis at all. A structurally absent axis is declared absent, never zero (E2).
+/// `head_dim` is `dim / n_heads` as `DitConfig::head_dim` computes it, published through the
+/// shared divisibility rule. `vae_spatial_scale` is the halving count of `block_out_channels`
+/// (four stages, three halvings, x8). `vae_temporal_scale` stays `None`: Z-Image ships the FLUX.1
+/// image AutoencoderKL, which has no temporal axis at all, and a structurally absent axis is
+/// declared absent, never zero.
 ///
-/// A weights-free contract — no snapshot directory, or a single-file ComfyUI import that carries no
-/// component configs — publishes `MemoryArchitectureFacts::default()`.
+/// A weights-free contract — the registry's sentinel surface, or a single-file ComfyUI import —
+/// publishes `MemoryArchitectureFacts::default()`: no pipeline has been resolved there. The gate is
+/// [`candle_gen::architecture_facts::snapshot_root`], an existing directory, rather than a bare
+/// `WeightsSource::Dir` match.
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return gen_core::MemoryArchitectureFacts::default();
-    };
-    let dit = component_config(root, "transformer");
-    let vae = component_config(root, "vae");
-    if dit.is_none() && vae.is_none() {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
         return gen_core::MemoryArchitectureFacts::default();
     }
-    let attention_heads = axis(dit.as_ref().and_then(|dit| dit.get("n_heads")));
-    let hidden_dim = axis(dit.as_ref().and_then(|dit| dit.get("dim")));
-    // Z-Image's DiT is uniform-head: `dim` is exactly `n_heads * head_dim`. Publishing the quotient
-    // only when it divides evenly keeps a non-uniform snapshot from claiming a head width it lacks.
-    let head_dim = match (hidden_dim, attention_heads) {
-        (Some(dim), Some(heads)) if dim % heads == 0 => Some(dim / heads),
-        _ => None,
-    };
-    let vae_spatial_scale = vae
-        .as_ref()
-        .and_then(|vae| vae.get("block_out_channels"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|stages| u32::try_from(stages.len()).ok())
-        // Each stage after the first halves both spatial axes: four stages give the x8 scale.
-        .and_then(|stages| stages.checked_sub(1))
-        // A pathological stage count has no honest scale to publish. Clamping the shift would
-        // invent one; declining the axis says what is actually known (E2).
-        .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples));
+    // Exactly the presets `pipeline.rs` hands to the DiT and `AutoEncoderKL` builders.
+    let dit = DitConfig::z_image_turbo();
+    let vae = VaeConfig::z_image();
     gen_core::MemoryArchitectureFacts {
-        attention_heads,
-        head_dim,
-        transformer_blocks: axis(dit.as_ref().and_then(|dit| dit.get("n_layers"))),
-        patch_size: axis(
-            dit.as_ref()
-                .and_then(|dit| dit.get("all_patch_size"))
-                .and_then(|patch| patch.get(0)),
-        ),
-        // `vae/config.json:latent_channels` is the authoritative key: it is the encoder's own
-        // declaration of what it produces. The DiT's `in_channels` is the *consumer's* view and is
-        // only the fallback for a snapshot that ships no VAE config.
-        latent_channels: axis(vae.as_ref().and_then(|vae| vae.get("latent_channels")))
-            .or_else(|| axis(dit.as_ref().and_then(|dit| dit.get("in_channels")))),
-        vae_spatial_scale,
+        attention_heads: af::declared(dit.n_heads),
+        head_dim: af::head_dim(af::declared(dit.dim), af::declared(dit.n_heads)),
+        transformer_blocks: af::declared(dit.n_layers),
+        patch_size: dit.all_patch_size.first().copied().and_then(af::declared),
+        latent_channels: af::declared(vae.latent_channels),
+        // Each stage after the first halves both spatial axes: four stages give the x8 scale.
+        vae_spatial_scale: af::declared(vae.block_out_channels.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
         vae_temporal_scale: None,
-        activation_dtype_width: u32::try_from(ACTIVATION_DTYPE.size_in_bytes()).ok(),
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
     }
 }
 
@@ -1777,10 +1747,11 @@ mod tests {
         spec
     }
 
-    /// AC: both Z-Image providers publish architecture facts read from the snapshot's component
-    /// `config.json` files, and the resulting contract passes the shared facts conformance check.
+    /// AC: both Z-Image providers publish the architecture facts of the pipeline the loader
+    /// actually builds — `DitConfig::z_image_turbo()` and `VaeConfig::z_image()` — and the
+    /// resulting contract passes the shared facts conformance check.
     #[test]
-    fn architecture_facts_are_read_from_the_snapshot_component_configs() {
+    fn architecture_facts_are_the_loader_presets() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("z-image-turbo");
         write_snapshot_component_configs(&root);
@@ -1791,10 +1762,11 @@ mod tests {
                 contract.architecture_facts,
                 gen_core::MemoryArchitectureFacts {
                     attention_heads: Some(30),
-                    // 3840 / 30, read from `dim` and `n_heads` rather than declared.
+                    // `DitConfig::z_image_turbo()`: `dim 3840 / n_heads 30`.
                     head_dim: Some(128),
                     transformer_blocks: Some(30),
                     patch_size: Some(2),
+                    // `VaeConfig::z_image().latent_channels`.
                     latent_channels: Some(16),
                     // Four `block_out_channels` stages => three halvings => x8.
                     vae_spatial_scale: Some(8),
@@ -1806,6 +1778,21 @@ mod tests {
             );
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
+        // The published values ARE the preset's fields, not literals that happen to agree with it.
+        let dit = DitConfig::z_image_turbo();
+        let vae = VaeConfig::z_image();
+        let facts = provider_contract(crate::MODEL_ID, &spec)
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(facts.attention_heads, Some(dit.n_heads as u32));
+        assert_eq!(facts.head_dim, Some(dit.head_dim() as u32));
+        assert_eq!(facts.transformer_blocks, Some(dit.n_layers as u32));
+        assert_eq!(facts.patch_size, Some(dit.all_patch_size[0] as u32));
+        assert_eq!(facts.latent_channels, Some(vae.latent_channels as u32));
+        assert_eq!(
+            facts.vae_spatial_scale,
+            Some(1 << (vae.block_out_channels.len() - 1))
+        );
 
         // AC 1 is phrased in terms of the published `Generator::memory_strategy_contract()` surface,
         // not the crate-internal builder. A real load over the same snapshot must expose the exact
@@ -1837,67 +1824,40 @@ mod tests {
         }
     }
 
-    /// The facts are read, not asserted: a snapshot that disagrees with the reference Turbo config
-    /// publishes what it actually says, and an axis it cannot support stays absent.
+    /// Feature-end review (SC-22667, E2): the published facts are the **loader's**, and a
+    /// divergent snapshot `config.json` does not change them. This is stated honestly rather than
+    /// as a virtue: `pipeline.rs` hardcodes `DitConfig::z_image_turbo()` and `VaeConfig::z_image()`
+    /// and reads the component configs only for their `quantization` block, so a snapshot whose
+    /// config says `n_layers: 24` still loads — and must be priced as — a 30-block trunk. The
+    /// previous test asserted the opposite ("a mutated config follows"), which described a
+    /// pipeline this crate never constructs.
+    ///
+    /// Mutation that fails this: reading `n_layers` / `n_heads` / `latent_channels` back out of
+    /// the component configs (the shape under review) — the divergent values below then surface.
     #[test]
-    fn architecture_facts_follow_the_config_and_omit_unreadable_axes() {
+    fn a_divergent_snapshot_config_does_not_change_the_loader_facts() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("z-image-mutated");
+        let root = tmp.path().join("z-image-divergent");
         write_snapshot_component_configs(&root);
+        let reference = provider_contract(crate::MODEL_ID, &snapshot_spec(root.clone()))
+            .unwrap()
+            .architecture_facts;
+
         let mut dit: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("transformer/config.json")).unwrap())
                 .unwrap();
         dit["n_layers"] = serde_json::json!(24);
-        // 3840 does not divide evenly by 7, so no honest head width exists to publish.
         dit["n_heads"] = serde_json::json!(7);
-        dit["all_patch_size"] = serde_json::json!([0]);
-        // The DiT's consumer-side view disagrees with the VAE's own declaration. `vae/config.json:
-        // latent_channels` is authoritative, so the VAE's 16 must win over the DiT's 4.
+        dit["all_patch_size"] = serde_json::json!([4]);
         dit["in_channels"] = serde_json::json!(4);
         std::fs::write(
             root.join("transformer/config.json"),
             serde_json::to_vec(&dit).unwrap(),
         )
         .unwrap();
-
-        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root.clone()))
-            .unwrap()
-            .architecture_facts;
-        assert_eq!(facts.transformer_blocks, Some(24));
-        assert_eq!(facts.attention_heads, Some(7));
-        assert_eq!(facts.head_dim, None, "3840 / 7 is not a head width");
-        assert_eq!(facts.patch_size, None, "a zero axis is declared absent");
-        assert_eq!(facts.vae_spatial_scale, Some(8));
-        assert_eq!(
-            facts.latent_channels,
-            Some(16),
-            "vae/config.json:latent_channels outranks the DiT's in_channels"
-        );
-        assert!(facts.zero_valued_axes().is_empty());
-
-        // Only with no VAE config at all does the DiT's `in_channels` stand in for it.
-        std::fs::remove_file(root.join("vae/config.json")).unwrap();
-        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
-            .unwrap()
-            .architecture_facts;
-        assert_eq!(facts.vae_spatial_scale, None, "no vae/config.json to read");
-        assert_eq!(
-            facts.latent_channels,
-            Some(4),
-            "the DiT is the fallback, not the primary"
-        );
-    }
-
-    /// A stage count no `u32` scale can express declines the axis rather than clamping the shift
-    /// into a fabricated scale.
-    #[test]
-    fn a_pathological_vae_stage_count_declines_the_spatial_scale_axis() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("z-image-wide-vae");
-        write_snapshot_component_configs(&root);
         let mut vae: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("vae/config.json")).unwrap()).unwrap();
-        // Seven stages => six halvings => x64, past the x32 the axis can honestly express.
+        vae["latent_channels"] = serde_json::json!(4);
         vae["block_out_channels"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7]);
         std::fs::write(
             root.join("vae/config.json"),
@@ -1905,16 +1865,26 @@ mod tests {
         )
         .unwrap();
 
-        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root.clone()))
             .unwrap()
             .architecture_facts;
         assert_eq!(
-            facts.vae_spatial_scale, None,
-            "an out-of-range stage count has no honest scale to publish"
+            facts, reference,
+            "the loader ignores these keys, so the published facts must too"
         );
-        // The rest of the snapshot is still read: the decline is axis-local.
-        assert_eq!(facts.latent_channels, Some(16));
         assert_eq!(facts.transformer_blocks, Some(30));
+        assert_eq!(facts.attention_heads, Some(30));
+        assert_eq!(facts.latent_channels, Some(16));
+        assert_eq!(facts.vae_spatial_scale, Some(8));
+
+        // Nor does the absence of a component config: only the presence of a resolved snapshot
+        // directory gates the facts, because that is all the loader needs to build its presets.
+        std::fs::remove_file(root.join("vae/config.json")).unwrap();
+        std::fs::remove_file(root.join("transformer/config.json")).unwrap();
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(facts, reference);
     }
 
     /// A contract built before any asset exists on disk declares every axis absent rather than

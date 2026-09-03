@@ -253,16 +253,19 @@ pub(crate) fn provider_contract_with_components(
             calibration_fingerprint,
             spec.load_shape,
         )),
+        // One network, one field (epic SC-22657, E1; feature-end ruling SC-22667). The Edit
+        // routes encode their references through the same CoD autoencoder weights that decode, so
+        // the VAE is resident during `Conditioning` as well as `Decode` there — but its bytes are
+        // charged exactly once, in `decoder_bytes`. Folding them into `conditioning_bytes` too
+        // (the previous shape) made `base_bytes` no longer its own decomposition on every Edit
+        // route. The contract has no per-phase residency declaration for a base component, so
+        // that co-residency is stated here rather than in the byte fields.
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
                 .saturating_add(components.dit)
                 .saturating_add(components.vae),
-            conditioning_bytes: if is_edit(provider_id) {
-                components.text_encoder.saturating_add(components.vae)
-            } else {
-                components.text_encoder
-            },
+            conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.vae,
             overlay_bytes: 0,
@@ -856,6 +859,39 @@ mod tests {
         )
         .unwrap();
         LoadSpec::new(WeightsSource::Dir(root))
+    }
+
+    /// Feature-end review (SC-22667, E1): on the Edit routes the CoD autoencoder encodes the
+    /// references AND decodes the result, but it is one network and is charged once, in
+    /// `decoder_bytes`; `conditioning_bytes` is the text encoder alone and `base_bytes` is exactly
+    /// the sum of the three fields. Nonzero component bytes are used on purpose: the zero-byte
+    /// weights-free fixture satisfies `base == sum` for any decomposition.
+    ///
+    /// Mutation that fails this: `conditioning_bytes: text_encoder + vae` on the Edit routes (the
+    /// shape under review) — conditioning reads 16 + 8 and `check_memory_contract_asset_facts`
+    /// reports `base_bytes 36 != 12 + 24 + 8 = 44`.
+    #[test]
+    fn edit_routes_charge_the_shared_autoencoder_once_in_decoder_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let components = gen_core::PerComponentBytes {
+            text_encoder: 16,
+            dit: 12,
+            vae: 8,
+        };
+        for id in PROVIDER_IDS {
+            let contract =
+                provider_contract_with_components(id, &architecture_spec(&tmp, 12), components)
+                    .unwrap();
+            assert_eq!(
+                contract.asset_facts.conditioning_bytes, 16,
+                "{id}: conditioning is the text encoder alone"
+            );
+            assert_eq!(contract.asset_facts.transformer_bytes, 12);
+            assert_eq!(contract.asset_facts.decoder_bytes, 8);
+            assert_eq!(contract.asset_facts.base_bytes, 16 + 12 + 8);
+            gen_core_testkit::check_memory_contract_asset_facts(&contract)
+                .unwrap_or_else(|errors| panic!("{id}: {errors:?}"));
+        }
     }
 
     #[test]

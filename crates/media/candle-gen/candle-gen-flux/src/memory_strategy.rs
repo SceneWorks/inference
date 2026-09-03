@@ -116,10 +116,12 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// pinning the dev preset for both would silently publish dev's geometry for schnell the moment
 /// that stopped being true, which is the class of defect these facts exist to remove.
 ///
-/// Heads and head width are read from `<root>/transformer/config.json` where the diffusers layout
-/// ships one (`num_attention_heads` / `attention_head_dim`), with the variant preset as the
-/// fallback for the BFL single-file layout that ships no component config — the same read-then-fall-back
-/// shape the block counts already use.
+/// Heads and head width come from that preset **only** — never from `<root>/transformer/config.json`.
+/// `pipeline.rs::dit_block_counts` threads exactly two keys of that file into the trunk
+/// (`num_layers` / `num_single_layers`); `num_attention_heads` / `attention_head_dim` are not
+/// read at load, so a snapshot declaring them differently still builds the preset's 24 x 128
+/// attention. Publishing the file's values (the shape the feature-end review caught) would describe
+/// a trunk this crate never constructs.
 ///
 /// `transformer_blocks` is the **total** trunk depth: FLUX stacks the double-stream blocks and then
 /// the single-stream blocks in one sequence, and every one of them is a materialization unit for
@@ -155,15 +157,13 @@ fn architecture_facts(provider_id: &str, spec: &LoadSpec) -> gen_core::MemoryArc
     let single = af::axis_of(transformer_config.as_ref(), &["num_single_layers"])
         .or_else(|| af::declared(dit.depth_single_blocks));
     let latent_channels = af::declared(vae.z_channels);
-    let attention_heads = af::axis_of(transformer_config.as_ref(), &["num_attention_heads"])
-        .or_else(|| af::declared(dit.num_heads));
     gen_core::MemoryArchitectureFacts {
-        attention_heads,
-        // The diffusers layout declares the head width; the BFL single-file layout ships no
-        // component config, so the variant preset's `hidden_size / num_heads` stands in — published
-        // only because that quotient divides evenly.
-        head_dim: af::axis_of(transformer_config.as_ref(), &["attention_head_dim"])
-            .or_else(|| af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads))),
+        // The preset the loader builds the trunk from; the config file's head keys are not threaded
+        // into the model, so they are not read here either.
+        attention_heads: af::declared(dit.num_heads),
+        // The preset's `hidden_size / num_heads`, published only because that quotient divides
+        // evenly.
+        head_dim: af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads)),
         transformer_blocks: double.and_then(|double| double.checked_add(single?)),
         // The packing edge the trunk's own input width implies: `in_channels 64 / 16 latent
         // channels = 4`, a 2x2 neighbourhood.
@@ -705,9 +705,11 @@ mod tests {
         assert_eq!(contract.architecture_facts, expected(17 + 33));
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
 
-        // ...and so are the heads and the head width, when the diffusers layout declares them.
-        // Publishing the variant preset over a config the snapshot ships would describe a trunk
-        // this snapshot does not have.
+        // ...but NOT the heads or the head width (SC-22667): `dit_block_counts` threads only the
+        // two block counts into the trunk, so a config declaring a different attention shape still
+        // builds the preset's 24 x 128 and must be priced as such. Mutation that fails this:
+        // reading `num_attention_heads` / `attention_head_dim` back out of the config with the
+        // preset as a fallback (the shape under review).
         std::fs::write(
             root.join("transformer/config.json"),
             br#"{"num_layers": 19, "num_single_layers": 38,
@@ -715,8 +717,9 @@ mod tests {
         )
         .unwrap();
         let contract = provider_contract("flux1_dev", &bfl).unwrap();
-        assert_eq!(contract.architecture_facts.attention_heads, Some(12));
-        assert_eq!(contract.architecture_facts.head_dim, Some(256));
+        assert_eq!(contract.architecture_facts.attention_heads, Some(24));
+        assert_eq!(contract.architecture_facts.head_dim, Some(128));
+        assert_eq!(contract.architecture_facts, expected(19 + 38));
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         // Restore the layout the remaining assertions were written against.
         std::fs::write(
