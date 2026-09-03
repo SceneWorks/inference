@@ -1660,20 +1660,25 @@ pub(crate) fn component_footprint(
 }
 
 /// Header-only resident projection for a diffusers **snapshot tree** — the directory twin of
-/// [`fused_ldm_component_footprint`], and for the same two reasons (SC-22667).
+/// the fused-checkpoint projection, and for the same two reasons (SC-22667).
+///
+/// `pub` for `mlx-gen-instantid` (SC-22667): InstantID layers its IdentityNet and face IP-Adapter
+/// onto a stock SDXL base loaded through this crate's own `load_unet_dtype` / `load_vae`, so it
+/// needs the same per-component resolution and dtype projection the resident load performs rather
+/// than a second derivation of the rule.
 ///
 /// A plain `.safetensors` sum over `unet/`, `text_encoder*/` and `vae/` was wrong twice over:
 ///
-/// * **The VAE was under-priced by exactly 2x, at every tier.** [`loader::load_vae`] does
+/// * **The VAE was under-priced by exactly 2x, at every tier.** `loader::load_vae` does
 ///   `w.cast_all(Dtype::Float32)` unconditionally — the SDXL VAE is fp16-unstable — while every
 ///   SceneWorks SDXL-family tier ships only `diffusion_pytorch_model.fp16.safetensors`.
-///   [`loader::resolve_vae_weight_file`]'s own doc has named this since sc-15839, down to the
+///   `loader::resolve_vae_weight_file`'s own doc has named this since sc-15839, down to the
 ///   `ResidentProjection::Float32` remedy; nothing had ever called it from a contract. The fused
 ///   branch below already prices its VAE tensors at `materialized_bytes(4)`, so the two snapshot
 ///   shapes disagreed with each other.
 /// * **Side-by-side dtype variants were counted twice.** A component directory holding both
 ///   `<stem>.safetensors` and `<stem>.fp16.safetensors` contributed both, while
-///   [`loader::resolve_weight_file`] opens exactly one of them. gen-core's own
+///   `loader::resolve_weight_file` opens exactly one of them. gen-core's own
 ///   `PerComponentBytes` doc names this hazard.
 ///
 /// The two errors point in opposite directions and land on different components, so they never
@@ -1686,7 +1691,7 @@ pub(crate) fn component_footprint(
 /// A component whose file cannot be resolved or read keeps its previous directory sum. This runs at
 /// contract time, ahead of any deferred component load, so an incomplete tree must not become a
 /// contract-time refusal.
-fn snapshot_component_footprint(root: &Path) -> mlx_gen::PerComponentBytes {
+pub fn snapshot_component_footprint(root: &Path) -> mlx_gen::PerComponentBytes {
     use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 
     let mut footprint = mlx_gen::PerComponentBytes::from_root_subdirs(
