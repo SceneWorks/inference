@@ -77,10 +77,10 @@ pub fn contract_for_variant(
     spec: &LoadSpec,
 ) -> mlx_gen::Result<Option<MemoryProviderContract>> {
     if variant == Flux2Variant::Dev {
-        return Ok(Some(build_dev_t2i_contract_for_spec(spec)?));
+        return Ok(Some(build_dev_t2i_contract_for_spec(spec)));
     }
     if variant == Flux2Variant::DevEdit {
-        return Ok(Some(build_contract_for_spec(spec)?));
+        return Ok(Some(build_contract_for_spec(spec)));
     }
     if matches!(
         variant,
@@ -109,23 +109,40 @@ pub fn contract_for_variant(
 ///
 /// On a spec that names no materialized snapshot — the registry's contract-surface sentinel, or a
 /// placeholder path — there is nothing to read and the declaration stays empty, exactly as the
-/// weights-free Klein contract does. An error from the footprint is propagated rather than
-/// swallowed into zeros: it means the snapshot fails the same gate the load applies, so there is no
-/// honest number to publish, which is also how `klein_contract_for` treats its footprint.
+/// weights-free Klein contract does. A snapshot the footprint refuses also publishes the empty
+/// declaration; see [`dev_asset_facts_with`] for why that is not a contract refusal here.
 ///
 /// The Fun-ControlNet route is deliberately not routed through here: its contract documents why its
 /// facts stay empty (the registry fallback prices the base split and its consumer adds the control
 /// checkpoint), and a fused control branch has no honest home in this decomposition without a typed
 /// component the route's `Affine` formula cannot carry.
-fn dev_asset_facts(
+fn dev_asset_facts(provider_id: &str, spec: &LoadSpec) -> MemoryAssetFacts {
+    dev_asset_facts_with(crate::model::dev_component_footprint_for, provider_id, spec)
+}
+
+/// [`dev_asset_facts`] with the footprint derivation passed in, so the mapping and both of its
+/// empty-declaration legs are reachable from a test without a full Dev snapshot on disk.
+///
+/// A footprint **error** publishes the empty declaration rather than refusing the contract. The
+/// registered contract callback is consulted *before* any load — the requested-vs-packed tier
+/// rejection and every other registered safety check read the contract first — on snapshots that
+/// may carry only their transformer tier evidence, and the Dev registry footprint fails closed on
+/// anything short of a complete snapshot. Turning that into a contract refusal would mask the
+/// actionable tier rejection behind an I/O error. The empty declaration is the pre-existing
+/// shape and errs large: `total_resident_bytes()` is 0, so the fit gate credits nothing as already
+/// resident.
+fn dev_asset_facts_with(
+    footprint: impl Fn(&str, &LoadSpec) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes>,
     provider_id: &str,
     spec: &LoadSpec,
-) -> mlx_gen::gen_core::Result<MemoryAssetFacts> {
+) -> MemoryAssetFacts {
     if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
-        return Ok(MemoryAssetFacts::default());
+        return MemoryAssetFacts::default();
     }
-    let footprint = crate::model::dev_component_footprint_for(provider_id, spec)?;
-    Ok(MemoryAssetFacts {
+    let Ok(footprint) = footprint(provider_id, spec) else {
+        return MemoryAssetFacts::default();
+    };
+    MemoryAssetFacts {
         base_bytes: footprint
             .text_encoder
             .saturating_add(footprint.dit)
@@ -134,10 +151,10 @@ fn dev_asset_facts(
         transformer_bytes: footprint.dit,
         decoder_bytes: footprint.vae,
         overlay_bytes: 0,
-    })
+    }
 }
 
-fn build_contract_for_spec(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_EDIT_ID,
         MemoryBackendRealization::MlxMetal {
@@ -161,14 +178,12 @@ fn build_contract_for_spec(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryP
         CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
-    contract.asset_facts = dev_asset_facts(FLUX2_DEV_EDIT_ID, spec)?;
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_EDIT_ID, spec);
     configure_dev_staged_residency(&mut contract, spec, true);
-    Ok(contract)
+    contract
 }
 
-fn build_dev_t2i_contract_for_spec(
-    spec: &LoadSpec,
-) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_ID,
         MemoryBackendRealization::MlxMetal {
@@ -191,21 +206,19 @@ fn build_dev_t2i_contract_for_spec(
         DEV_T2I_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
-    contract.asset_facts = dev_asset_facts(FLUX2_DEV_ID, spec)?;
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_ID, spec);
     configure_dev_staged_residency(&mut contract, spec, true);
-    Ok(contract)
+    contract
 }
 
 #[cfg(test)]
 fn build_contract() -> MemoryProviderContract {
     build_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
-        .expect("a placeholder path names no materialized snapshot, so no footprint is read")
 }
 
 #[cfg(test)]
 fn build_dev_t2i_contract() -> MemoryProviderContract {
     build_dev_t2i_contract_for_spec(&LoadSpec::new(WeightsSource::Dir(Default::default())))
-        .expect("a placeholder path names no materialized snapshot, so no footprint is read")
 }
 
 /// Publish only the request-selectable lifecycle the Dev providers actually execute.  The
@@ -406,7 +419,7 @@ pub fn dev_control_safety_check(
 pub fn registered_dev_contract(
     spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    build_contract_for_spec(spec)
+    Ok(build_contract_for_spec(spec))
 }
 
 pub fn registered_dev_safety_check(
@@ -425,7 +438,7 @@ pub fn registered_dev_safety_check(
 pub fn registered_dev_t2i_contract(
     spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    build_dev_t2i_contract_for_spec(spec)
+    Ok(build_dev_t2i_contract_for_spec(spec))
 }
 
 pub fn registered_dev_t2i_safety_check(
@@ -1494,8 +1507,8 @@ mod tests {
     fn sequential_dev_contracts_publish_only_staged_residency_and_open_a_cleanup_scope() {
         let spec = LoadSpec::new(WeightsSource::Dir(Default::default()))
             .with_offload_policy(OffloadPolicy::Sequential);
-        let t2i = build_dev_t2i_contract_for_spec(&spec).unwrap();
-        let edit = build_contract_for_spec(&spec).unwrap();
+        let t2i = build_dev_t2i_contract_for_spec(&spec);
+        let edit = build_contract_for_spec(&spec);
         let control_spec = spec.clone().with_control(WeightsSource::File(
             "/nonexistent/flux2-dev-fun-controlnet-union.safetensors".into(),
         ));
@@ -1541,7 +1554,6 @@ mod tests {
             .with_load_shape(LoadShape::DeferredMaterialization);
         assert_eq!(
             build_dev_t2i_contract_for_spec(&deferred_spec)
-                .unwrap()
                 .capability(MemoryStrategy::StagedResidency)
                 .expect("complete ladder")
                 .support,
@@ -1835,19 +1847,66 @@ mod tests {
     /// Feature-end review (SC-22667, E1): the Dev and Dev-Edit contracts published
     /// `MemoryAssetFacts::default()` on every path, the loaded one included, while the load holds the
     /// whole DiT, the Mistral-3 tower and the VAE. They now publish the loader's own registry
-    /// footprint whenever the spec names a materialized snapshot, and stay empty only where there is
-    /// nothing to read.
+    /// footprint whenever the spec names a materialized snapshot the footprint can price, and stay
+    /// empty where there is nothing to read or the footprint refuses the snapshot.
     ///
-    /// Mutation that fails this: dropping the `materialized_root` gate in `dev_asset_facts` makes
-    /// the placeholder-path leg refuse (the footprint cannot resolve a tower under `/nonexistent`);
-    /// swallowing the footprint error into zeros makes the materialized leg publish an empty
-    /// declaration for a snapshot the loader's own gate refuses.
+    /// The mapping is exercised through the injectable seam because the production footprint needs
+    /// a complete Dev snapshot on disk. Mutations that fail this: dropping the `materialized_root`
+    /// gate publishes the stub's 12 bytes for the placeholder path; mis-wiring any of the three
+    /// fields or `base_bytes` reds the materialized leg; turning a footprint error into a refusal
+    /// (or into non-zero facts) reds the third leg; and passing `Default::default()` instead of
+    /// `dev_asset_facts(..)` at either production builder reds the registered-contract leg.
     #[test]
-    fn dev_contracts_publish_asset_facts_only_from_a_materialized_snapshot() {
+    fn dev_contracts_publish_the_footprint_only_for_a_materialized_snapshot() {
+        let priced = |_: &str, _: &LoadSpec| {
+            Ok(mlx_gen::PerComponentBytes {
+                text_encoder: 3,
+                dit: 5,
+                vae: 4,
+            })
+        };
+        let refused = |provider_id: &str, _: &LoadSpec| {
+            Err(CoreError::Unsupported(format!(
+                "{provider_id}: fixture snapshot refused"
+            )))
+        };
+
         // No materialized snapshot — the registry's contract surface and every placeholder-path
-        // caller. Nothing to read, so the declaration stays empty, exactly as before.
+        // caller. Nothing to read, so the declaration stays empty whatever a footprint would say.
         let placeholder = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert_eq!(
+            dev_asset_facts_with(priced, FLUX2_DEV_ID, &placeholder),
+            MemoryAssetFacts::default()
+        );
+
+        // A materialized snapshot the footprint prices publishes exactly that split, base included.
+        let materialized = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(materialized.path().to_path_buf()));
+        assert_eq!(
+            dev_asset_facts_with(priced, FLUX2_DEV_ID, &spec),
+            MemoryAssetFacts {
+                base_bytes: 12,
+                conditioning_bytes: 3,
+                transformer_bytes: 5,
+                decoder_bytes: 4,
+                overlay_bytes: 0,
+            }
+        );
+
+        // A materialized snapshot the footprint refuses keeps the empty declaration: the registered
+        // contract is read before any load, and the tier rejection behind it must stay reachable.
+        assert_eq!(
+            dev_asset_facts_with(refused, FLUX2_DEV_ID, &spec),
+            MemoryAssetFacts::default()
+        );
+
+        // The production builders are wired to the derivation: an empty materialized directory is
+        // exactly the refused shape (the Dev footprint fails closed short of a complete snapshot),
+        // so both registered contracts still build and still declare nothing.
+        assert!(crate::model::dev_component_footprint(&spec).is_err());
         for contract in [
+            registered_dev_contract(&spec).unwrap(),
+            registered_dev_t2i_contract(&spec).unwrap(),
             registered_dev_contract(&placeholder).unwrap(),
             registered_dev_t2i_contract(&placeholder).unwrap(),
         ] {
@@ -1857,43 +1916,8 @@ mod tests {
                 "{}",
                 contract.provider_id
             );
+            assert!(contract.conformance_errors().is_empty());
         }
-
-        // A materialized directory goes through the loader's own footprint — the same
-        // `EncoderContract` gate `load` applies — and the contract publishes exactly what it says,
-        // or refuses exactly when it does.
-        let materialized = tempfile::tempdir().unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir(materialized.path().to_path_buf()));
-        type Build = fn(&LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract>;
-        for (provider_id, build) in [
-            (FLUX2_DEV_ID, registered_dev_t2i_contract as Build),
-            (FLUX2_DEV_EDIT_ID, registered_dev_contract as Build),
-        ] {
-            match crate::model::dev_component_footprint_for(provider_id, &spec) {
-                Ok(footprint) => {
-                    let contract = build(&spec).unwrap();
-                    assert_eq!(
-                        contract.asset_facts.conditioning_bytes,
-                        footprint.text_encoder
-                    );
-                    assert_eq!(contract.asset_facts.transformer_bytes, footprint.dit);
-                    assert_eq!(contract.asset_facts.decoder_bytes, footprint.vae);
-                    assert_eq!(
-                        contract.asset_facts.base_bytes,
-                        footprint.text_encoder + footprint.dit + footprint.vae
-                    );
-                    assert!(contract.conformance_errors().is_empty());
-                }
-                Err(_) => assert!(
-                    build(&spec).is_err(),
-                    "{provider_id}: a snapshot the loader's gate refuses has no honest bytes to \
-                     publish"
-                ),
-            }
-        }
-        // An empty directory is not a loadable snapshot: the language-tower gate refuses it, so
-        // the leg above is the refusing one.
-        assert!(crate::model::dev_component_footprint(&spec).is_err());
     }
 
     /// Feature-end review (SC-22667, E1): `klein_overlay` lists `adapters` as a live Klein axis and
