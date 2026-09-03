@@ -49,6 +49,7 @@ pub mod memory_strategy;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;
+pub mod wan_i2v;
 
 pub use audio_embedder::{
     audio_embedder_conformance, check_audio_embed_joint, check_audio_embedder_registry,

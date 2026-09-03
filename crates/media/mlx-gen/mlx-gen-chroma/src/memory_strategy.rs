@@ -677,20 +677,17 @@ pub fn contract_for(
     )
 }
 
-/// Latent channels the FLUX.1 autoencoder Chroma reuses produces, and pixels per latent unit on
-/// each spatial axis. Chroma loads that VAE through `mlx_gen_flux::load_vae`, so these describe the
-/// same four-stage image autoencoder FLUX.1 ships.
-const LATENT_CHANNELS: u32 = 16;
-const VAE_SPATIAL_SCALE: u32 = 8;
-/// The 2x2 latent packing applied before the DiT: `in_channels` 64 is exactly
-/// `LATENT_CHANNELS * LATENT_PATCH_SIZE²`, which the tests pin against the config.
-const LATENT_PATCH_SIZE: u32 = 2;
-
 /// Architecture axes shared by all three registered Chroma routes (epic SC-22657, E2).
 ///
 /// [`ChromaTransformerConfig`](crate::config::ChromaTransformerConfig) is this crate's mirror of the
 /// reference `transformer/config.json` and is identical across HD, Base and Flash — only the weights
 /// and the sampling profile differ — so one derivation serves all three.
+///
+/// The latent axes are the **loader's** constants, not a second copy of them (SC-22667): Chroma
+/// unpacks DiT tokens through `mlx_gen_flux::unpack_latents`, whose `LATENT_CHANNELS` /
+/// `LATENT_PATCH_SIZE` are the reshape it executes, and decodes through the FLUX.1 autoencoder
+/// `mlx_gen_flux::load_vae` builds, whose up-block count is where
+/// [`mlx_gen_flux::memory_strategy::vae_spatial_scale`] reads the x8 from.
 ///
 /// `transformer_blocks` is the **sum** of the joint and single stacks (19 + 38): the denoiser
 /// traverses both on every step. `vae_temporal_scale` stays `None` — the FLUX.1 image autoencoder
@@ -703,9 +700,9 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
         transformer_blocks: mlx_gen::architecture_facts::axis(
             dit.num_layers.saturating_add(dit.num_single_layers),
         ),
-        patch_size: mlx_gen::architecture_facts::axis(LATENT_PATCH_SIZE),
-        latent_channels: mlx_gen::architecture_facts::axis(LATENT_CHANNELS),
-        vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
+        patch_size: mlx_gen::architecture_facts::axis(mlx_gen_flux::LATENT_PATCH_SIZE),
+        latent_channels: mlx_gen::architecture_facts::axis(mlx_gen_flux::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen_flux::memory_strategy::vae_spatial_scale(),
         vae_temporal_scale: None,
         // The DiT runs f32 activations over its bf16 (or quantized) weights (`transformer.rs`).
         activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
@@ -1185,22 +1182,36 @@ mod tests {
         }
     }
 
-    /// The published latent geometry is the config's, not a second copy of it: the DiT's packed
-    /// `in_channels` IS `latent_channels * patch²`.
+    /// The published latent geometry is the loader's, not a second copy of it (SC-22667): the
+    /// DiT's packed `in_channels` IS `mlx_gen_flux`'s `LATENT_CHANNELS * LATENT_PATCH_SIZE²` — the
+    /// reshape `unpack_latents` executes — and the VAE scale is read off the decoder config
+    /// `mlx_gen_flux::load_vae` builds.
+    ///
+    /// Mutation that fails this: a local `LATENT_CHANNELS` / `VAE_SPATIAL_SCALE` /
+    /// `LATENT_PATCH_SIZE` literal triple (the shape under review) that drifts from either loader
+    /// constant.
     #[test]
     fn the_published_latent_geometry_reconstructs_the_dit_input_width() {
         let dit = crate::config::ChromaTransformerConfig::default();
+        let facts = architecture_facts();
         assert_eq!(
-            LATENT_CHANNELS * LATENT_PATCH_SIZE * LATENT_PATCH_SIZE,
+            facts.latent_channels.unwrap() * facts.patch_size.unwrap() * facts.patch_size.unwrap(),
             dit.in_channels as u32
         );
-        // `VAE_SPATIAL_SCALE`'s doc claims the x8 of the four-stage FLUX.1 autoencoder. That scale
-        // is not a free constant: `SIZE_MULTIPLE` is what the sampler rounds a request to, and it
-        // is exactly `vae_scale * patch`. Deriving the pin from those two keeps the published axis
-        // tied to the geometry the sampler already enforces.
         assert_eq!(
-            VAE_SPATIAL_SCALE,
-            crate::model::SIZE_MULTIPLE / LATENT_PATCH_SIZE
+            facts.latent_channels.unwrap() * facts.patch_size.unwrap() * facts.patch_size.unwrap(),
+            mlx_gen_flux::PACKED_TOKEN_WIDTH as u32
+        );
+        // The VAE scale is not a free constant: `SIZE_MULTIPLE` is what the sampler rounds a
+        // request to, and it is exactly `vae_scale * patch`. Deriving the pin from those two keeps
+        // the published axis tied to the geometry the sampler already enforces.
+        assert_eq!(
+            facts.vae_spatial_scale.unwrap(),
+            crate::model::SIZE_MULTIPLE / facts.patch_size.unwrap()
+        );
+        assert_eq!(
+            facts.vae_spatial_scale,
+            mlx_gen_flux::memory_strategy::vae_spatial_scale()
         );
     }
 

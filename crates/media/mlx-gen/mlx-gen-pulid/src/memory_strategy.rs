@@ -34,8 +34,9 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
     standard_memory_strategy_safety_check, Error as CoreError, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryMode, MemoryNumericTier,
-    MemoryOptimizationAuthority, MemoryProviderContract, MemoryRequestScope, MemoryRunContext,
+    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency,
+    MemoryFormulaKind, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
     MemorySafetyDecision, MemoryStrategy, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
@@ -191,6 +192,10 @@ pub(crate) fn backbone_spec(spec: &LoadSpec) -> LoadSpec {
     base
 }
 
+/// Provider-local identity of the typed resident identity stack (EVA-CLIP, IDFormer and the face
+/// models). Stable across loads: the route holds exactly one such stack.
+pub(crate) const IDENTITY_COMPONENT_ID: &str = "pulid_identity_stack";
+
 fn adapt(
     mut contract: MemoryProviderContract,
     spec: &LoadSpec,
@@ -198,10 +203,35 @@ fn adapt(
     weights_free: bool,
 ) -> MemoryProviderContract {
     contract.provider_id = crate::pulid_flux::MODEL_ID.into();
-    contract.asset_facts.base_bytes = contract
-        .asset_facts
-        .base_bytes
-        .saturating_add(identity_bytes.unwrap_or(0));
+    // The identity stack is an auxiliary resident network beside the FLUX.1 base, not part of it
+    // (epic SC-22657, E1): it is declared once in `overlay_bytes` and as a typed resident component,
+    // and `base_bytes` stays exactly the sum of the three base-model component fields. Folding it
+    // into `base_bytes` — the shape under review — published a base that was not its own
+    // decomposition.
+    if let Some(identity_bytes) = identity_bytes.filter(|bytes| *bytes > 0) {
+        contract.asset_facts.overlay_bytes = contract
+            .asset_facts
+            .overlay_bytes
+            .saturating_add(identity_bytes);
+        let component = MemoryResidentComponent {
+            id: IDENTITY_COMPONENT_ID.to_owned(),
+            kind: MemoryComponentKind::IdentityEncoder,
+            resident_bytes: identity_bytes,
+            bounded_by: None,
+            residency: MemoryComponentResidency::WholeRender,
+        };
+        contract.formula = match contract.formula {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables }
+            | MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases, variables, ..
+            } => MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases,
+                variables,
+                resident_components: vec![component],
+            },
+            other => other,
+        };
+    }
     contract.calibration = if weights_free {
         Some(MemoryCalibrationIdentity::new(
             STATIC_CALIBRATION,
@@ -837,5 +867,85 @@ mod tests {
 
         std::fs::write(&encoder, b"mutated noncanonical encoder").unwrap();
         assert!(inventory.ensure_unchanged().is_err());
+    }
+
+    /// Feature-end review (SC-22667, E1): the identity stack is an auxiliary network beside the
+    /// FLUX.1 base. On the loaded path (`contract_with_inventory`, an exact-calibration inventory)
+    /// its bytes land once in `overlay_bytes` and in one typed `IdentityEncoder` resident
+    /// component, and `base_bytes` stays exactly the sum of the three base-model fields.
+    ///
+    /// Mutation that fails this: `adapt` doing `base_bytes += identity_bytes` with no component (the
+    /// shape under review) — `check_memory_contract_asset_facts` then reports `base_bytes (12+4096)`
+    /// != `conditioning + transformer + decoder (12)`, `overlay_bytes` stays 0 and no resident
+    /// component is declared.
+    #[test]
+    fn loaded_identity_bytes_are_an_overlay_component_and_base_stays_its_own_sum() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        // A FLUX.1 snapshot the backbone footprint can price: `component_footprint` stats the
+        // `.safetensors` bytes under each component directory.
+        for (component, bytes) in [("text_encoder", 3_u8), ("transformer", 5), ("vae", 4)] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            std::fs::write(
+                root.join(component).join("model.safetensors"),
+                vec![0_u8; usize::from(bytes)],
+            )
+            .unwrap();
+        }
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root))
+            .with_quant(Quant::Q4)
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        spec.identity = Some(IdentityWeights {
+            encoder: Some(WeightsSource::File("/encoder".into())),
+            eva: Some(WeightsSource::File("/eva".into())),
+            face_dir: Some(WeightsSource::Dir("/face".into())),
+        });
+        let inventory = IdentityArtifactInventory {
+            files: Vec::new(),
+            bytes: 4096,
+            exact_calibration: true,
+        };
+
+        let contract = contract_with_inventory(&spec, &inventory).unwrap();
+        assert_eq!(contract.asset_facts.conditioning_bytes, 3);
+        assert_eq!(contract.asset_facts.transformer_bytes, 5);
+        assert_eq!(contract.asset_facts.decoder_bytes, 4);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            3 + 5 + 4,
+            "the base total must be its own decomposition, without the identity stack"
+        );
+        assert_eq!(contract.asset_facts.overlay_bytes, 4096);
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, IDENTITY_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::IdentityEncoder);
+        assert_eq!(components[0].resident_bytes, 4096);
+        assert_eq!(
+            components[0].residency,
+            MemoryComponentResidency::WholeRender
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+            .unwrap_or_else(|errors| panic!("asset facts: {errors:?}"));
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+
+        // An inventory that is not the exact calibrated stack prices no identity bytes at all —
+        // neither into the overlay nor, as before, into the base.
+        let uncalibrated = IdentityArtifactInventory {
+            files: Vec::new(),
+            bytes: 4096,
+            exact_calibration: false,
+        };
+        let contract = contract_with_inventory(&spec, &uncalibrated).unwrap();
+        assert_eq!(contract.asset_facts.base_bytes, 3 + 5 + 4);
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        assert!(contract.resident_components().is_empty());
+        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+            .unwrap_or_else(|errors| panic!("asset facts: {errors:?}"));
     }
 }

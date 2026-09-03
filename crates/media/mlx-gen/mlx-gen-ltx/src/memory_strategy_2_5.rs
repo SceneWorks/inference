@@ -45,6 +45,23 @@ use mlx_gen::gen_core;
 use crate::memory_strategy::{decode_tile_edges, DECODE_OVERLAP};
 use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
 
+/// Architecture axes for the LTX-2.5 route (epic SC-22657, E2; SC-22667 follow-up).
+///
+/// The axis derivation is shared with the 2.3 route — the measured 2.3 to 2.5 delta is two
+/// booleans, not a dimension — but the **config source is not**: `build_ltx25` never reads
+/// `embedded_config.json`. It resolves the split bundle and parses the transformer component's own
+/// `__metadata__` config section through `LtxConfig::from_bundle`, so that is the parse re-run here
+/// when `spec` names a materialized bundle. A spec whose bundle cannot be resolved, or whose
+/// transformer carries no config section, publishes the preset the shared derivation starts from —
+/// on the weights-free surface there is nothing to read.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|_| crate::bundle::resolve_split_bundle(spec).ok())
+        .and_then(|bundle| crate::config::LtxConfig::from_bundle(&bundle).ok())
+        .unwrap_or_else(crate::config::LtxConfig::video_only_defaults);
+    crate::memory_strategy::architecture_facts_for(&dit, spec)
+}
+
 /// The LTX-2.5 MLX engine id.
 ///
 /// A distinct id from [`crate::MODEL_ID`] (`ltx_2_3`) rather than a route overlay on it: the two
@@ -445,9 +462,7 @@ fn build_contract(
         ));
     }
     Ok(MemoryProviderContract {
-        // Shared with the 2.3 route: the measured 2.3 to 2.5 delta is two booleans, not a
-        // dimension, so both routes publish the same axes from one derivation (SC-22662).
-        architecture_facts: crate::memory_strategy::architecture_facts(spec),
+        architecture_facts: architecture_facts(spec),
         provider_id: LTX_2_5_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -956,6 +971,54 @@ mod tests {
         );
         assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// SC-22667: the 2.5 axes are re-parsed through the 2.5 loader's own source — the split
+    /// bundle's transformer `__metadata__` via `LtxConfig::from_bundle` — never through the 2.3
+    /// `embedded_config.json` parse, and the activation width follows `spec.precision` exactly as
+    /// `build_ltx25` selects the DiT precision from it.
+    ///
+    /// Mutations that fail this: reusing `crate::memory_strategy::architecture_facts(spec)` (the
+    /// 2.3 parse, the shape under review) makes the `embedded_config.json` assertion publish 9
+    /// blocks; a literal `HALF_ACTIVATION_WIDTH` makes the `Fp32` assertion read 2.
+    #[test]
+    fn architecture_facts_come_from_the_bundle_parse_and_the_admitted_precision() {
+        // A 2.3-style `embedded_config.json` beside a bundle root is NOT what the 2.5 loader reads:
+        // its depth must not surface.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("embedded_config.json"),
+            r#"{"transformer":{"num_layers":9,"rope_type":"split"}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::EagerMaterialization);
+        let facts = architecture_facts(&spec);
+        assert_eq!(
+            facts.transformer_blocks,
+            Some(48),
+            "the 2.3 embedded config is not the 2.5 loader's source"
+        );
+        assert_eq!(
+            crate::memory_strategy::architecture_facts(&spec).transformer_blocks,
+            Some(9),
+            "(the 2.3 derivation does read it, which is exactly why 2.5 must not share it)"
+        );
+
+        // Width follows the precision the loader will run: bf16 by default, f32 on the opt-in path.
+        assert_eq!(facts.activation_dtype_width, Some(2));
+        let mut fp32 = spec.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        assert_eq!(architecture_facts(&fp32).activation_dtype_width, Some(4));
+        assert_eq!(
+            weights_free_memory_strategy_contract(&fp32)
+                .unwrap()
+                .architecture_facts
+                .activation_dtype_width,
+            Some(4)
+        );
     }
 
     #[test]

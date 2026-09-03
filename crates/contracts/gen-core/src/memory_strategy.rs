@@ -911,11 +911,32 @@ impl MemoryPeakBreakdown {
 /// `base_bytes` is exactly the sum of the three base-model component fields. Auxiliary networks
 /// never belong in any of those four fields; they are declared once in `overlay_bytes` and, when
 /// non-zero alongside both formula variables, by typed resident components.
+///
+/// ## One network, one field
+///
+/// Every base-model network is charged in exactly **one** of the three component fields, even when
+/// the provider runs it in more than one [`MemoryPhase`]. The canonical case is an edit or img2img
+/// route that encodes its reference through the same autoencoder weights it later decodes with:
+/// those bytes belong to `decoder_bytes` alone, and `conditioning_bytes` stays the text/vision
+/// encoder stack. Folding the VAE into `conditioning_bytes` as well would either break
+/// `base_bytes == sum` or, if `base_bytes` were computed from the folded sum, charge one resident
+/// network twice against every fit decision.
+///
+/// The phase in which a shared network is *resident* is a lifecycle property, not a byte-count one.
+/// The contract has no per-phase residency declaration for base components today — only the
+/// typed auxiliary components in [`MemoryFormulaKind::ComponentPhaseEnvelope`] carry a
+/// [`MemoryComponentResidency`] — so a provider whose decoder is co-resident during conditioning
+/// documents that on its own contract builder and leaves these fields as the one-network-one-field
+/// decomposition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
     pub base_bytes: u64,
+    /// The conditioning encoder stack (text and/or vision encoders). A shared autoencoder used as
+    /// the reference encoder is **not** included here; see *One network, one field* above.
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
+    /// The autoencoder, charged once whether it only decodes or also encodes a reference during
+    /// conditioning.
     pub decoder_bytes: u64,
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].

@@ -1004,14 +1004,17 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 /// is deliberately non-uniform (`inner_dim` 7168 is wider than `hidden_size` 5376), so the quotient
 /// would be neither integral nor the head width the attention actually uses.
 ///
-/// The VAE is a **video** autoencoder: `VAE_RATIO` pixels and `VAE_RATIO_T` frames per latent unit,
-/// so `vae_temporal_scale` is a real value here.
+/// The VAE is a **video** autoencoder: `patch_size` pixels and `patch_size_t` frames per latent
+/// unit as `MiniMaxH3VaeConfig` states them (the products of the per-level downsample factors), so
+/// `vae_temporal_scale` is a real value here.
 ///
-/// When `spec` names a materialized snapshot directory, [`dit_config`] re-runs the loader's own
-/// `from_diffusers_json` parse over that snapshot's `transformer/config.json`, so the published
-/// trunk axes are the snapshot's rather than the preset's.
+/// When `spec` names a materialized snapshot directory, [`dit_config`] and [`vae_config`] re-run the
+/// loaders' own `from_diffusers_json` parses over that snapshot's `transformer/config.json` and
+/// `vae/config.json`, so every published axis is the snapshot's rather than the preset's
+/// (SC-22667: the VAE axes were preset constants although `vae.rs` parses the snapshot config).
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     let dit = dit_config(spec);
+    let vae = vae_config(spec);
     // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
     // the temporal factor is already carried by `vae_temporal_scale`.
     let [_, patch_h, patch_w] = dit.patch_size;
@@ -1022,9 +1025,9 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         patch_size: (patch_h == patch_w)
             .then(|| mlx_gen::architecture_facts::axis(patch_h))
             .flatten(),
-        latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
-        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO),
-        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_RATIO_T),
+        latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
         // `model.rs` loads and runs the DiT at `Dtype::Bfloat16` for every precision but `Fp32`.
         activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
     }
@@ -1044,6 +1047,20 @@ fn dit_config(spec: &LoadSpec) -> crate::dit::config::MiniMaxH3DitConfig {
                 .join("config.json");
             let text = std::fs::read_to_string(path).ok()?;
             crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
+        })
+        .unwrap_or_default()
+}
+
+/// The video-VAE geometry a contract should describe: the materialized snapshot's own
+/// `vae/config.json` — the file `vae.rs` parses through this same
+/// `MiniMaxH3VaeConfig::from_diffusers_json` at load — when one exists and parses, else this
+/// crate's mirror of the shipped VAE. As with the DiT, a partial or variant file declines whole
+/// rather than half-defaulting.
+fn vae_config(spec: &LoadSpec) -> crate::config::MiniMaxH3VaeConfig {
+    mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| {
+            let text = std::fs::read_to_string(root.join("vae").join("config.json")).ok()?;
+            crate::config::MiniMaxH3VaeConfig::from_diffusers_json(&text).ok()
         })
         .unwrap_or_default()
 }
@@ -1658,6 +1675,101 @@ mod tests {
             (mutated_facts.transformer_blocks, mutated_facts.head_dim),
             (Some(7), Some(160)),
             "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
+
+    /// The published `vae/config.json` layout, emitted from a config value so the fixture cannot
+    /// drift from the struct it mirrors. Every key is required by
+    /// `MiniMaxH3VaeConfig::from_diffusers_json`, which also re-derives `patch_size` /
+    /// `patch_size_t` as the products of the two per-level factor lists.
+    fn vae_config_json(cfg: &crate::config::MiniMaxH3VaeConfig) -> serde_json::Value {
+        serde_json::json!({
+            "latent_channels": cfg.latent_channels,
+            "out_channels": cfg.out_channels,
+            "decoder_num_layers": cfg.num_layers,
+            "decoder_num_attention_heads": cfg.num_heads,
+            "decoder_attention_head_dim": cfg.head_dim,
+            "decoder_num_register_tokens": cfg.num_register_tokens,
+            "decoder_ffn_mult": cfg.ffn_mult,
+            "decoder_rope_theta": cfg.rope_theta,
+            "decoder_rope_dim_ratio": cfg.rope_dim_ratio,
+            "decoder_norm_eps": cfg.norm_eps,
+            "clip_length": cfg.clip_length,
+            "token_drop": cfg.token_drop,
+            "latents_mean": cfg.latents_mean,
+            "latents_std": cfg.latents_std,
+            "in_channels": cfg.in_channels,
+            "block_out_channels": cfg.block_out_channels,
+            "layers_per_block": cfg.layers_per_block,
+            "spatial_downsample_factors": cfg.spatial_downsample_factors,
+            "temporal_downsample_factors": cfg.temporal_downsample_factors,
+            "norm_num_groups": cfg.norm_num_groups,
+            "norm_eps": cfg.encoder_norm_eps,
+        })
+    }
+
+    /// SC-22667: the VAE axes are read out of the snapshot's own `vae/config.json` — the file the
+    /// VAE loader parses — rather than published from the `VAE_RATIO` / `LATENT_CHANNELS` preset
+    /// constants. The mirror fixture agrees with the weights-free path; a fixture with mutated
+    /// factor lists and latent width publishes the mutated axes.
+    ///
+    /// Mutation that fails this: `latent_channels: axis(LATENT_CHANNELS)`,
+    /// `vae_spatial_scale: axis(VAE_RATIO)`, `vae_temporal_scale: axis(VAE_RATIO_T)` (the preset
+    /// shape under review) — the mutated fixture then reads back 24 / 16 / 4.
+    #[test]
+    fn materialized_vae_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::MiniMaxH3VaeConfig::default();
+
+        let mirror = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mirror.path().join("vae")).unwrap();
+        std::fs::write(
+            mirror.path().join("vae/config.json"),
+            vae_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        let mirror_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            mirror.path().to_path_buf(),
+        ));
+        assert_eq!(
+            architecture_facts(&mirror_spec),
+            architecture_facts(&weightless_spec()),
+            "a snapshot mirroring the published VAE config must publish the preset's axes"
+        );
+
+        // Halve the latent width and the spatial compression, keep everything the validator
+        // cross-checks consistent (`latents_mean/std` per channel, one factor per level).
+        let mut mutated = preset.clone();
+        mutated.latent_channels = 12;
+        mutated.latents_mean = vec![0.0; 12];
+        mutated.latents_std = vec![1.0; 12];
+        let levels = mutated.spatial_downsample_factors.len();
+        mutated.spatial_downsample_factors = vec![1; levels];
+        mutated.spatial_downsample_factors[0] = 8;
+        mutated.temporal_downsample_factors = vec![1; levels];
+        mutated.temporal_downsample_factors[0] = 2;
+        let mutated_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mutated_dir.path().join("vae")).unwrap();
+        std::fs::write(
+            mutated_dir.path().join("vae/config.json"),
+            vae_config_json(&mutated).to_string(),
+        )
+        .unwrap();
+        let facts = architecture_facts(&LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            mutated_dir.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (Some(12), Some(8), Some(2)),
+            "the materialized path must publish the snapshot's VAE geometry, not the preset's"
+        );
+        // The trunk axes are untouched by a VAE-only fixture.
+        assert_eq!(
+            facts.transformer_blocks,
+            architecture_facts(&weightless_spec()).transformer_blocks
         );
     }
 

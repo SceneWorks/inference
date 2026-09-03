@@ -283,9 +283,12 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
         // `config::PATCH` — the DiT's 2x2 packing (`in_channels = LATENT_CHANNELS * PATCH²`).
         patch_size: af::declared(crate::config::PATCH),
         latent_channels: af::declared(crate::config::LATENT_CHANNELS),
-        // Both image dims must be multiples of 16 = the x8 VAE downscale then the 2x2 DiT patch
-        // (`config::SIZE_MULTIPLE`), so the decoder's spatial scale is 8.
-        vae_spatial_scale: af::declared(8),
+        // The decoder tail's own x8 (`vae::TAIL_TILING.spatial_scale`, the geometry the tiled
+        // decode executes against), not a literal restating it. `config::SIZE_MULTIPLE` is that
+        // scale times `config::PATCH`, which the tests pin.
+        vae_spatial_scale: u32::try_from(crate::vae::TAIL_TILING.spatial_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
         // Structurally absent on the image path — see the doc comment above.
         vae_temporal_scale: None,
         activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
@@ -942,6 +945,18 @@ mod tests {
             );
             assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+            // SC-22667: the scale is the decoder tail's own tiling geometry, and together with the
+            // DiT patch it IS the enforced size multiple. Mutation that fails this: a bare literal
+            // that drifts from `vae::TAIL_TILING.spatial_scale` (the shape under review).
+            assert_eq!(
+                contract.architecture_facts.vae_spatial_scale,
+                Some(crate::vae::TAIL_TILING.spatial_scale as u32)
+            );
+            assert_eq!(
+                contract.architecture_facts.vae_spatial_scale.unwrap()
+                    * contract.architecture_facts.patch_size.unwrap(),
+                crate::config::SIZE_MULTIPLE
+            );
 
             // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
             let weights_free = LoadSpec::new(WeightsSource::Dir(

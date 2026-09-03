@@ -69,17 +69,20 @@ fn is_known_provider(provider_id: &str) -> bool {
     )
 }
 
-/// Latent channels the FLUX.1 autoencoder produces and the DiT consumes.
-///
-/// Not a config field in this crate: it is the shape literal the pack/unpack pair in
-/// [`crate::pipeline`] is written against (`[1, 16, h, w]`). Naming it here keeps the published axis
-/// and that geometry in one place.
-const LATENT_CHANNELS: u32 = 16;
-/// Pixels per latent unit on each spatial axis — the four-stage FLUX.1 AutoencoderKL.
-const VAE_SPATIAL_SCALE: u32 = 8;
-/// The 2x2 latent packing `pipeline::pack_latents` applies before the DiT. Together with
-/// [`VAE_SPATIAL_SCALE`] this is exactly [`crate::SIZE_MULTIPLE`], which the tests pin.
-const LATENT_PATCH_SIZE: u32 = 2;
+/// Pixels per latent unit on each spatial axis of the autoencoder `loader::load_vae` builds: one
+/// halving per upsampling decoder block of `VaeDecoderConfig::default_z_image()` — the very config
+/// handed to `Vae::from_weights` — so three of the four up-blocks give the x8 (SC-22667: this was
+/// a bare `8` beside the loader rather than read off it). Shared with `mlx-gen-chroma`, which
+/// decodes through the same loader.
+pub fn vae_spatial_scale() -> Option<u32> {
+    mlx_gen::architecture_facts::vae_spatial_scale_from_downsamples(
+        mlx_gen_z_image::vae::VaeDecoderConfig::default_z_image()
+            .up_blocks
+            .iter()
+            .filter(|(_, upsamples)| *upsamples)
+            .count(),
+    )
+}
 
 /// Architecture axes shared by all three registered FLUX.1 routes (epic SC-22657, E2).
 ///
@@ -87,6 +90,10 @@ const LATENT_PATCH_SIZE: u32 = 2;
 /// `transformer::HEAD_DIM` and `FluxTransformerConfig`, which the loader builds every variant from.
 /// Schnell, Dev and Dev-Control share one DiT and differ only in guidance support and the control
 /// overlay, so they publish one set of axes.
+///
+/// The latent axes are the loader's constants rather than restated literals: [`crate::LATENT_CHANNELS`]
+/// and [`crate::LATENT_PATCH_SIZE`] are the reshape `pipeline::pack_latents` / `unpack_latents`
+/// execute, and [`vae_spatial_scale`] is read off the decoder config `load_vae` builds.
 ///
 /// `transformer_blocks` is the **sum** of the joint and single stacks (19 + 38): both are
 /// transformer blocks the denoiser traverses on every step, and publishing only the joint half would
@@ -103,9 +110,9 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
         transformer_blocks: mlx_gen::architecture_facts::axis(
             dit.num_layers.saturating_add(dit.num_single_layers),
         ),
-        patch_size: mlx_gen::architecture_facts::axis(LATENT_PATCH_SIZE),
-        latent_channels: mlx_gen::architecture_facts::axis(LATENT_CHANNELS),
-        vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
+        patch_size: mlx_gen::architecture_facts::axis(crate::LATENT_PATCH_SIZE),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::LATENT_CHANNELS),
+        vae_spatial_scale: vae_spatial_scale(),
         vae_temporal_scale: None,
         // The DiT's main residual stream is f32; only the modulation path is bf16
         // (`transformer.rs`), so f32 is the activation width the peak is built on.
@@ -848,7 +855,18 @@ mod tests {
     /// the latent packing IS [`crate::SIZE_MULTIPLE`], so neither axis can drift alone.
     #[test]
     fn the_published_spatial_axes_multiply_to_the_enforced_size_multiple() {
-        assert_eq!(VAE_SPATIAL_SCALE * LATENT_PATCH_SIZE, crate::SIZE_MULTIPLE);
+        // SC-22667: both factors are the loader's — the decoder config's up-block count and the
+        // pack/unpack reshape constant — not literals beside it. Mutation that fails this: a
+        // `VAE_SPATIAL_SCALE` / `LATENT_PATCH_SIZE` literal pair in this module that drifts from
+        // either loader constant.
+        assert_eq!(
+            vae_spatial_scale().unwrap() * crate::LATENT_PATCH_SIZE as u32,
+            crate::SIZE_MULTIPLE
+        );
+        assert_eq!(
+            crate::LATENT_CHANNELS * crate::LATENT_PATCH_SIZE * crate::LATENT_PATCH_SIZE,
+            crate::pipeline::PACKED_TOKEN_WIDTH
+        );
     }
 
     #[test]

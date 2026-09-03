@@ -655,13 +655,30 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 /// per latent unit over a x32 spatial scale, which `diff_vae::VIDEO_SCALE_FACTORS` restates.
 ///
 /// When `spec` names a materialized snapshot directory this re-runs `LtxConfig::from_model_dir` —
-/// the loader's own `embedded_config.json` parse — so the published trunk axes are the snapshot's
-/// rather than the preset's. On the weights-free surface there is nothing to read, and the preset
-/// is what `from_model_dir` itself falls back to.
+/// the 2.3 loader's own `embedded_config.json` parse — so the published trunk axes are the
+/// snapshot's rather than the preset's. On the weights-free surface there is nothing to read, and
+/// the preset is what `from_model_dir` itself falls back to. The 2.5 route parses a different
+/// source (its split bundle's transformer `__metadata__`) and goes through
+/// [`architecture_facts_for`] with that config instead.
 pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     let dit = mlx_gen::architecture_facts::materialized_root(spec)
         .and_then(|root| crate::config::LtxConfig::from_model_dir(root).ok())
         .unwrap_or_else(crate::config::LtxConfig::video_only_defaults);
+    architecture_facts_for(&dit, spec)
+}
+
+/// The shared LTX axis derivation over an already-resolved transformer config: the trunk axes off
+/// `dit`, the video-VAE axes off this crate's constants, and the activation width off the precision
+/// the loader will run `spec` at (SC-22667).
+///
+/// Both loaders select the DiT precision from `spec.precision` — `Bf16` (the `LoadSpec` default)
+/// computes bf16 activations over quantized weights, `Fp32` computes f32 activations over the same
+/// weights (`model.rs`, the quality target) — so the width is derived from that field rather than
+/// pinned to the half-precision literal, which described only the default path.
+pub(crate) fn architecture_facts_for(
+    dit: &crate::config::LtxConfig,
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
         head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
@@ -670,9 +687,15 @@ pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryAr
         latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::model::SPATIAL_SCALE),
         vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::model::TEMPORAL_SCALE),
-        // The default `LoadPrecision::Bf16` load computes bf16 activations over quantized weights;
-        // `Fp32` is the separate opt-in path.
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        activation_dtype_width: Some(activation_dtype_width(spec)),
+    }
+}
+
+/// Bytes per activation element for the precision `model.rs` selects from `spec.precision`.
+pub(crate) fn activation_dtype_width(spec: &LoadSpec) -> u32 {
+    match spec.precision {
+        mlx_gen::Precision::Bf16 => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+        mlx_gen::Precision::Fp32 => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
     }
 }
 
@@ -1649,6 +1672,28 @@ mod tests {
 
     /// AC (SC-22662): the LTX-2.3 route publishes the axes of the AvDiT and the video VAE this
     /// crate declares, and passes the shared facts conformance check.
+    /// SC-22667: the activation width follows the precision `model.rs` selects the DiT path from —
+    /// `Bf16` runs bf16 activations, the `Fp32` opt-in runs f32 ones — rather than the
+    /// half-precision literal that described only the default path.
+    ///
+    /// Mutation that fails this: `activation_dtype_width: Some(HALF_ACTIVATION_WIDTH)` (the shape
+    /// under review) — the `Fp32` assertion then reads 2.
+    #[test]
+    fn activation_width_follows_the_selected_precision() {
+        let bf16 = fixture_spec();
+        assert_eq!(architecture_facts(&bf16).activation_dtype_width, Some(2));
+        let mut fp32 = bf16.clone();
+        fp32.precision = Precision::Fp32;
+        assert_eq!(architecture_facts(&fp32).activation_dtype_width, Some(4));
+        assert_eq!(
+            weights_free_memory_strategy_contract(&fp32)
+                .unwrap()
+                .architecture_facts
+                .activation_dtype_width,
+            Some(4)
+        );
+    }
+
     #[test]
     fn architecture_facts_follow_the_crate_transformer_and_vae_constants() {
         let contract = weights_free_memory_strategy_contract(&fixture_spec()).unwrap();

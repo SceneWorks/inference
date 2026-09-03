@@ -14,8 +14,16 @@ pub fn prepare_load_spec(spec: &mut LoadSpec, provider_id: &str) -> gen_core::Re
     gen_core::wan_i2v_memory::prepare_load_spec(spec, WanI2vBackend::Candle, provider_id)
 }
 
+/// Seal the Candle receipt for `provider_id` and stamp this crate's architecture axes onto it.
+///
+/// The sealed `prepared.contract` is exactly what every Wan I2V generator returns from
+/// `Generator::memory_strategy_contract()`, so the axes must be stamped here rather than only on
+/// the per-request contract [`request_contract_for_mode`] builds — otherwise the loaded path
+/// publishes `gen_core::wan_i2v_memory`'s empty default (epic SC-22657, E2).
 pub fn prepare(spec: &LoadSpec, provider_id: &str) -> gen_core::Result<PreparedWanI2vMemory> {
-    PreparedWanI2vMemory::prepare(spec, WanI2vBackend::Candle, provider_id)
+    let prepared = PreparedWanI2vMemory::prepare(spec, WanI2vBackend::Candle, provider_id)?;
+    let facts = architecture_facts(prepared.route);
+    Ok(prepared.with_architecture_facts(facts))
 }
 
 pub fn request_evidence_revision(
@@ -347,6 +355,55 @@ mod tests {
     /// The scale pair is asserted against each route's assigned VAE tiling rather than against
     /// literals, so a VAE reassignment cannot leave the published axes describing the old
     /// autoencoder.
+    /// Feature-end review (SC-22667, blocker): the contract a **loaded** generator publishes is the
+    /// sealed `prepared.contract`, and `gen_core::wan_i2v_memory` can only seal the empty default
+    /// axes into it. Every route's `prepare` must therefore hand back a receipt whose contract
+    /// already carries this crate's facts — the per-request overlay in `request_contract_for_mode`
+    /// is not enough, because `Generator::memory_strategy_contract()` never goes through it.
+    ///
+    /// Mutation that fails this: `prepare` returning `PreparedWanI2vMemory::prepare(..)` unstamped
+    /// (the shape under review) — every route then publishes `is_empty()` facts.
+    #[test]
+    fn the_sealed_contract_every_loaded_route_publishes_carries_the_trunk_and_vae_axes() {
+        use gen_core::wan_i2v_memory::WanI2vRoute;
+
+        for route in [
+            WanI2vRoute::Ti2v5b,
+            WanI2vRoute::I2v14b,
+            WanI2vRoute::Vace,
+            WanI2vRoute::VaceFun,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = gen_core_testkit::wan_i2v::write_candle_snapshot(tmp.path(), route);
+            let prepared = prepare(&spec, route.provider_id())
+                .unwrap_or_else(|error| panic!("{}: {error}", route.provider_id()));
+            let sealed = &prepared.contract;
+            assert_eq!(
+                sealed.architecture_facts,
+                architecture_facts(route),
+                "{}: the sealed contract must publish this crate's axes",
+                route.provider_id()
+            );
+            assert!(
+                sealed.architecture_facts.has_declared_architecture_axis(),
+                "{}: a loaded route must not publish the backend-neutral empty default",
+                route.provider_id()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(sealed);
+            // The per-request overlay agrees with the seal: neither path may drift from the other.
+            let mode = match route {
+                WanI2vRoute::Vace => "extend_clip",
+                _ => "image_to_video",
+            };
+            assert_eq!(
+                request_contract_for_mode(&prepared, mode)
+                    .unwrap()
+                    .architecture_facts,
+                sealed.architecture_facts
+            );
+        }
+    }
+
     #[test]
     fn every_i2v_route_publishes_its_trunk_and_vae_axes() {
         use gen_core::wan_i2v_memory::WanI2vRoute;

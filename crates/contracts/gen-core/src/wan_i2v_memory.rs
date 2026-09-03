@@ -438,6 +438,36 @@ fn repo_dir(repository: &str) -> String {
     format!("models--{}", repository.replace('/', "--"))
 }
 
+/// Where a converted snapshot for `route` on `backend` must live under an HF-cache-shaped `base`
+/// for the dense (bf16) tier to pass [`PreparedWanI2vMemory::prepare`]'s repository/revision check:
+/// `<base>/models--<owner>--<name>/snapshots/<pinned revision>[/bf16]`.
+///
+/// The VACE routes carry an artifact receipt instead of a pinned revision, so any directory is a
+/// valid root for them and `base.join("vace")` is returned.
+///
+/// Test-support only: the backend crates' loaded-contract tests seal a receipt over a tiny synthetic
+/// snapshot, and this is the one piece of the layout they cannot express through the public API.
+#[doc(hidden)]
+pub fn fixture_snapshot_root(base: &Path, backend: WanI2vBackend, route: WanI2vRoute) -> PathBuf {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        return base.join("vace");
+    }
+    let tier = MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: None,
+        component_precision_floors: &[],
+    };
+    let (repository, revision) = repository_policy(backend, route, tier);
+    let root = base
+        .join(repo_dir(repository))
+        .join("snapshots")
+        .join(revision);
+    match backend {
+        WanI2vBackend::Mlx => root.join("bf16"),
+        WanI2vBackend::Candle => root,
+    }
+}
+
 fn repository_revision(
     root: &Path,
     repository: &str,
@@ -1498,6 +1528,24 @@ impl PreparedWanI2vMemory {
         };
         prepared.ensure_unchanged()?;
         Ok(prepared)
+    }
+
+    /// The materialized snapshot directory this receipt was sealed over — the same `WeightsSource::Dir`
+    /// root the backend loader parses its model config from.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Stamp the backend's architecture axes onto the sealed contract (epic SC-22657, E2).
+    ///
+    /// This module is backend-neutral and holds no model config, so its `contract` builder can only
+    /// publish `MemoryArchitectureFacts::default()`. The contract a loaded generator hands back through
+    /// `Generator::memory_strategy_contract()` **is** `self.contract`, so a backend that only
+    /// overlays its axes on the per-request contract leaves the loaded path publishing the empty
+    /// default. Each backend's `prepare` therefore stamps its route facts here, once, at seal time.
+    pub fn with_architecture_facts(mut self, facts: crate::MemoryArchitectureFacts) -> Self {
+        self.contract.architecture_facts = facts;
+        self
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {

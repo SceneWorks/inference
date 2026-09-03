@@ -127,6 +127,11 @@ impl NeoVisionConfig {
     }
 }
 
+/// The flow-matching head's pixel patch edge a `config.json` that omits `patch_size` resolves to —
+/// the shipped 8B-MoT value. The memory contract publishes this on the weights-free surface, where
+/// no config exists to read, so the parser and the contract cannot drift apart.
+pub const DEFAULT_PATCH_SIZE: usize = 16;
+
 /// The top-level NEO-Unify config (`config.json`, `model_type == "neo_chat"`): the dense Qwen3
 /// backbone + the vision embedder + the flow-matching image-generation knobs.
 #[derive(Clone, Debug, PartialEq)]
@@ -193,7 +198,7 @@ impl NeoChatConfig {
             pad_token_id: get_usize(v, "pad_token_id", 151_643) as u32,
             tie_word_embeddings: get_bool(v, "tie_word_embeddings", false),
             downsample_ratio: get_f32(v, "downsample_ratio", 0.5),
-            patch_size: get_usize(v, "patch_size", 16),
+            patch_size: get_usize(v, "patch_size", DEFAULT_PATCH_SIZE),
             timestep_shift: get_f32(v, "timestep_shift", 1.0),
             time_schedule: get_str(v, "time_schedule", "standard"),
             time_shift_type: get_str(v, "time_shift_type", "exponential"),
