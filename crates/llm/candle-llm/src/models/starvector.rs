@@ -96,6 +96,10 @@ pub struct StarVectorClip {
     ln_out_b: Tensor,
 }
 
+fn align_clip_pixels(pixels: &Tensor, convolution: &Tensor) -> Result<Tensor> {
+    Ok(pixels.to_dtype(convolution.dtype())?)
+}
+
 impl StarVectorClip {
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let p = "model.image_encoder.visual_encoder";
@@ -114,7 +118,8 @@ impl StarVectorClip {
     }
 
     pub fn forward(&self, pixels: &Tensor) -> Result<Tensor> {
-        let patches = conv2d(pixels, &self.conv, None, CLIP_PATCH, 0)?;
+        let pixels = align_clip_pixels(pixels, &self.conv)?;
+        let patches = conv2d(&pixels, &self.conv, None, CLIP_PATCH, 0)?;
         let (batch, _, height, width) = patches.dims4()?;
         if (height, width) != (16, 16) {
             return Err(Error::Msg(format!(
@@ -362,6 +367,17 @@ mod tests {
     use super::*;
     use candle_core::Device;
     use std::collections::HashMap;
+
+    #[test]
+    fn clip_aligns_f32_preprocessing_with_f16_checkpoint_weights() {
+        let device = Device::Cpu;
+        let pixels = Tensor::zeros((1,), DType::F32, &device).unwrap();
+        let conv = Tensor::zeros((1,), DType::F16, &device).unwrap();
+
+        let aligned = align_clip_pixels(&pixels, &conv).unwrap();
+
+        assert_eq!(aligned.dtype(), DType::F16);
+    }
 
     #[test]
     fn decoder_projection_preserves_published_out_in_layout() {
