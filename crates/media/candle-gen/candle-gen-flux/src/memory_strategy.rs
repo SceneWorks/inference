@@ -101,6 +101,56 @@ pub(crate) fn provider_contract(
     )
 }
 
+/// Whether the snapshot at `root` loads through the **diffusers component layout**
+/// (`transformer/`, `vae/` subdirs) rather than the black-forest-labs single-file layout — the same
+/// discrimination `pipeline::FluxPipeline::uses_diffusers_layout` performs before it picks a
+/// loader, mirrored here so pricing and loading read the same component paths.
+///
+/// Best-effort by design: a `transformer/config.json` that is unreadable or malformed reads as
+/// "not packed" here, because this seam prices bytes and the loader itself is the one that must
+/// fail loudly on a corrupt snapshot.
+fn uses_diffusers_layout(root: &std::path::Path, variant: crate::Variant) -> bool {
+    let packed = std::fs::read_to_string(root.join("transformer").join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| candle_gen::quant::PackedConfig::from_config(&value))
+        .is_some();
+    // The BFL root checkpoint is checked FIRST for the non-packed case so a *full* black-forest-labs
+    // snapshot — which ships BOTH the root single-file AND the diffusers subdirs — is priced on the
+    // stock path it actually takes.
+    packed
+        || (!root.join(variant.transformer_file()).is_file() && root.join("transformer").is_dir())
+}
+
+/// The exact component paths this spec's loader resolves, priced as on-disk `.safetensors` sums.
+///
+/// Both layouts read the text encoders from `text_encoder/` + `text_encoder_2/`, but they differ on
+/// the other two components, and naming only the diffusers subdirs published **zero** transformer
+/// and decoder bytes for every stock BFL snapshot — the layout `pipeline::load_stock_components`
+/// serves, which reads the DiT from the root `flux1-{dev,schnell}.safetensors` and the VAE from the
+/// root `ae.safetensors` (epic SC-22657, E1).
+///
+/// `PerComponentBytes::from_root_subdirs` accepts a flat component **file** as readily as a subdir,
+/// so the BFL arm names those two files directly. FLUX.1 materializes every component at bf16
+/// (`lib.rs` pins `DType::BF16`) and both layouts ship bf16 tensors, so the on-disk sum is the
+/// resident size.
+fn loaded_component_bytes(spec: &LoadSpec, variant: crate::Variant) -> PerComponentBytes {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return PerComponentBytes::default();
+    };
+    const TEXT_ENCODERS: &[&str] = &["text_encoder", "text_encoder_2"];
+    if uses_diffusers_layout(root, variant) {
+        PerComponentBytes::from_root_subdirs(root, TEXT_ENCODERS, &["transformer"], &["vae"])
+    } else {
+        PerComponentBytes::from_root_subdirs(
+            root,
+            TEXT_ENCODERS,
+            &[variant.transformer_file()],
+            &["ae.safetensors"],
+        )
+    }
+}
+
 /// Activation dtype the loaded FLUX.1 pipeline computes in — `lib.rs` / `pipeline.rs` pin
 /// `DType::BF16` for the DiT trunk, so this is the provider's real activation width rather than a
 /// memory-model literal.
@@ -126,10 +176,11 @@ const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core
 /// `transformer_blocks` is the **total** trunk depth: FLUX stacks the double-stream blocks and then
 /// the single-stream blocks in one sequence, and every one of them is a materialization unit for
 /// the block-window rung. The two counts are read from `<root>/transformer/config.json`
-/// (`num_layers` / `num_single_layers`) exactly as `pipeline.rs::dit_block_counts` does for the
-/// diffusers layout, falling back to the reference constants for the BFL single-file layout that
-/// ships no `transformer/` component config — reading a different source than the loader would
-/// publish geometry the built model does not have.
+/// (`num_layers` / `num_single_layers`) exactly as `pipeline.rs::dit_block_counts` does — and, like
+/// that function, **only on the diffusers layout that calls it**. The BFL single-file layout builds
+/// `IpFlux` straight from the preset, so it publishes the preset's counts even when a full BFL
+/// snapshot happens to ship a `transformer/` config alongside its root checkpoint: reading a
+/// different source than the loader would publish geometry the built model does not have.
 ///
 /// `patch_size` has no config key on either component, so it is *derived* rather than asserted:
 /// FLUX packs 2x2 latent neighbourhoods outside the DiT, which is exactly why the trunk's
@@ -151,7 +202,14 @@ fn architecture_facts(provider_id: &str, spec: &LoadSpec) -> gen_core::MemoryArc
     let variant = crate::Variant::from_model_id(provider_id).unwrap_or(crate::Variant::Dev);
     let dit = crate::pipeline::flux_config(variant);
     let vae = crate::vae::native::Config::dev();
-    let transformer_config = af::component_config(root, "transformer");
+    // Read the block counts from `transformer/config.json` only on the layout whose loader reads
+    // them. `pipeline::dit_block_counts` is called from `load_diffusers_components` alone; the
+    // stock BFL path builds `IpFlux::new(&flux_config(variant), ..)`, whose depth comes from the
+    // preset. A *full* BFL snapshot ships both the root single file and the diffusers subdirs, so
+    // reading the file unconditionally published a trunk depth the stock loader never builds.
+    let transformer_config =
+        uses_diffusers_layout(root, variant).then(|| af::component_config(root, "transformer"));
+    let transformer_config = transformer_config.flatten();
     let double = af::axis_of(transformer_config.as_ref(), &["num_layers"])
         .or_else(|| af::declared(dit.depth));
     let single = af::axis_of(transformer_config.as_ref(), &["num_single_layers"])
@@ -191,13 +249,10 @@ pub fn reference_backbone_contract(
     calibration_fingerprint: &str,
 ) -> gen_core::Result<MemoryProviderContract> {
     let streamable = streamable(spec);
-    let components = PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder", "text_encoder_2"],
-        &["transformer"],
-        &["vae"],
-    )
-    .unwrap_or_default();
+    // The variant this provider id names — the same selection `architecture_facts` makes, and the
+    // one that decides which root BFL checkpoint filename the stock layout carries.
+    let variant = crate::Variant::from_model_id(provider_id).unwrap_or(crate::Variant::Dev);
+    let components = loaded_component_bytes(spec, variant);
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -680,8 +735,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("flux1-architecture-facts");
         std::fs::create_dir_all(root.join("transformer")).unwrap();
-        // The BFL single-file layout ships no `transformer/config.json`: the block counts fall back
-        // to the reference constants, exactly as `pipeline.rs::dit_block_counts` does.
+        // No `transformer/config.json` at all: the block counts fall back to the reference
+        // constants, exactly as `pipeline.rs::dit_block_counts` does.
         let bfl = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_load_shape(LoadShape::DeferredMaterialization);
         for id in ["flux1_dev", "flux1_schnell"] {
@@ -748,6 +803,97 @@ mod tests {
         // A weights-free contract legitimately declares nothing, so the E2 config-derived gate does
         // not apply to it; the byte-decomposition half of the conformance walk still does.
         gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+
+        // A FULL black-forest-labs snapshot ships the root single file AND the diffusers subdirs.
+        // `uses_diffusers_layout` keeps it on the stock loader, which builds `IpFlux` from the
+        // preset — so the config's counts must NOT be published for it (SC-22667).
+        // Mutation that reds this: reading `af::component_config` unconditionally, the shape under
+        // review.
+        std::fs::write(root.join("flux1-dev.safetensors"), [0_u8; 16]).unwrap();
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            expected(19 + 38),
+            "a full BFL snapshot builds the preset trunk, not the diffusers config's 17 + 33"
+        );
+        // Schnell has its own root filename, so the same tree is still a diffusers snapshot for it.
+        assert_eq!(
+            provider_contract("flux1_schnell", &bfl)
+                .unwrap()
+                .architecture_facts,
+            expected(17 + 33)
+        );
+    }
+
+    /// AC (epic SC-22657, E1): the priced components are the ones this snapshot's loader resolves.
+    ///
+    /// The stock black-forest-labs layout reads the DiT from the root
+    /// `flux1-{dev,schnell}.safetensors` and the VAE from the root `ae.safetensors`
+    /// (`pipeline::load_stock_components` / `flux1_load::{dit_vb, vae}`), so naming only the
+    /// diffusers `transformer/` + `vae/` subdirs published **zero** transformer and decoder bytes
+    /// for every BFL snapshot — a base total made entirely of text encoders.
+    ///
+    /// *Mutation that reds this:* pricing through
+    /// `PerComponentBytes::from_spec_subdirs(spec, .., &["transformer"], &["vae"])` on both
+    /// layouts, the shape under review.
+    #[test]
+    fn the_stock_bfl_layout_prices_its_root_dit_and_ae_checkpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flux1-bfl-priced");
+        // Distinct sizes so a swapped component assignment cannot pass.
+        for (component, size) in [("text_encoder", 64_usize), ("text_encoder_2", 128)] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            std::fs::write(
+                root.join(component).join("model.safetensors"),
+                vec![0; size],
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("flux1-dev.safetensors"), vec![0; 4096]).unwrap();
+        std::fs::write(root.join("ae.safetensors"), vec![0; 512]).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        let facts = provider_contract("flux1_dev", &spec).unwrap().asset_facts;
+        assert_eq!(facts.conditioning_bytes, 64 + 128);
+        assert_eq!(
+            facts.transformer_bytes, 4096,
+            "the root BFL DiT checkpoint is the transformer this layout loads"
+        );
+        assert_eq!(
+            facts.decoder_bytes, 512,
+            "the root ae.safetensors is the decoder this layout loads"
+        );
+        assert_eq!(facts.base_bytes, 64 + 128 + 4096 + 512);
+        gen_core_testkit::assert_memory_contract_asset_facts_conform(
+            &provider_contract("flux1_dev", &spec).unwrap(),
+        );
+
+        // The diffusers layout still prices its component subdirs.
+        let diffusers = tmp.path().join("flux1-diffusers-priced");
+        for (component, size) in [
+            ("text_encoder", 64_usize),
+            ("text_encoder_2", 128),
+            ("transformer", 2048),
+            ("vae", 256),
+        ] {
+            std::fs::create_dir_all(diffusers.join(component)).unwrap();
+            std::fs::write(
+                diffusers.join(component).join("model.safetensors"),
+                vec![0; size],
+            )
+            .unwrap();
+        }
+        let facts = provider_contract(
+            "flux1_dev",
+            &LoadSpec::new(WeightsSource::Dir(diffusers))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        )
+        .unwrap()
+        .asset_facts;
+        assert_eq!(facts.transformer_bytes, 2048);
+        assert_eq!(facts.decoder_bytes, 256);
+        assert_eq!(facts.base_bytes, 64 + 128 + 2048 + 256);
     }
 
     fn write_control(path: &std::path::Path) {
