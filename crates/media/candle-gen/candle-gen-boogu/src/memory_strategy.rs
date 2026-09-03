@@ -619,6 +619,64 @@ fn estimated_behavior_context(
     })
 }
 
+/// Activation dtype the Boogu DiT computes in. `pipeline.rs` pins `DIT_DTYPE = DType::BF16`
+/// (candle's native CUDA width for the 10 B trunk), so this is the provider's real activation
+/// width rather than a memory-model literal. The FLUX.1 VAE runs f32, but the phase envelope's
+/// activation term describes the denoiser.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes for the three Boogu routes (epic SC-22657, E2).
+///
+/// The DiT axes come from the **same** configuration the loader builds its model from:
+/// `pipeline::load_components` calls [`crate::config::BooguConfig::from_snapshot`], which parses
+/// `<root>/transformer/config.json` (`num_attention_heads`, `hidden_size`, `num_layers`,
+/// `patch_size`, …) and falls back per field to the published [`config::BooguConfig::base`]
+/// reference. Reading the axes back off the returned struct publishes what the pipeline will
+/// actually construct; a snapshot whose config disagrees with the reference publishes what it says.
+///
+/// `head_dim` is `hidden_size / num_attention_heads` (3360 / 28 = 120) and is published only when
+/// the division is exact, so a non-uniform-head snapshot claims no head width it does not have.
+///
+/// `transformer_blocks` is `num_layers`, the **total** trunk: the config's
+/// `num_double_stream_layers` (8) is the double-stream prefix already counted inside it, not an
+/// addend.
+///
+/// The decoder axes come from the `VaeConfig::z_image()` the loader constructs at
+/// `pipeline.rs` — `latent_channels = 16`, and a four-entry `block_out_channels` whose three
+/// downsampling stages give the ×8 spatial scale — rather than from a `vae/config.json` the loader
+/// never reads.
+///
+/// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
+/// snapshot whose transformer config cannot be parsed — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::BooguConfig::from_snapshot(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let vae = candle_transformers::models::z_image::vae::VaeConfig::z_image();
+    let attention_heads = af::declared(config.num_attention_heads);
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        head_dim: af::head_dim(af::declared(config.hidden_size), attention_heads),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        latent_channels: af::declared(vae.latent_channels),
+        vae_spatial_scale: af::spatial_scale_from_stages(
+            Some(&serde_json::json!({ "block_out_channels": vae.block_out_channels })),
+            &["block_out_channels"],
+        ),
+        // Structurally absent: the FLUX.1 16-channel AutoencoderKL is an image VAE with no
+        // temporal axis at all (absent is `None`, never `Some(0)`).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_contract(
     provider: &str,
     spec: &LoadSpec,
@@ -631,7 +689,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: provider.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1419,6 +1477,83 @@ mod tests {
     use candle_gen::candle_core::{
         safetensors as candle_safetensors, DType as CandleDType, Tensor,
     };
+
+    /// A snapshot whose `transformer/config.json` carries the published Boogu-Image-0.1 axes the
+    /// loader reads through [`config::BooguConfig::from_snapshot`]. `num_layers` is a parameter so
+    /// a drifting snapshot can be exercised.
+    fn architecture_spec(root: &Path, num_layers: u64) -> LoadSpec {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "patch_size": 2,
+                "in_channels": 16,
+                "out_channels": 16,
+                "hidden_size": 3360,
+                "num_layers": num_layers,
+                "num_double_stream_layers": 8,
+                "num_refiner_layers": 2,
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+                "axes_dim_rope": [40, 40, 40],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = architecture_spec(fixture.path(), 40);
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(28),
+            // hidden_size 3360 / 28 heads, published only because it divides exactly.
+            head_dim: Some(120),
+            // `num_layers` is the TOTAL trunk; the 8 `num_double_stream_layers` are its
+            // double-stream prefix, already counted inside it.
+            transformer_blocks: Some(40),
+            patch_size: Some(2),
+            // `VaeConfig::z_image()` — the FLUX.1 16-channel AutoencoderKL the loader constructs,
+            // whose four `block_out_channels` stages give the x8 spatial scale.
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: an image VAE has no temporal axis at all.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
+            let contract = build_contract(provider, &spec, true, MemoryAssetFacts::default());
+            assert_eq!(contract.architecture_facts, expected, "{provider}");
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        let drifted = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_contract(
+                BOOGU_IMAGE_ID,
+                &architecture_spec(drifted.path(), 32),
+                true,
+                MemoryAssetFacts::default(),
+            )
+            .architecture_facts
+            .transformer_blocks,
+            Some(32)
+        );
+
+        // The registry's contract surface names a sentinel that is not on disk: nothing about the
+        // pipeline is resolved there, so every axis stays undeclared.
+        let surface = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(
+            build_contract(BOOGU_IMAGE_ID, &surface, true, MemoryAssetFacts::default())
+                .architecture_facts
+                .is_empty()
+        );
+    }
 
     fn write_tensors(path: &Path, tensors: Vec<(&str, Tensor)>) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

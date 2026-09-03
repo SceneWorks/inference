@@ -497,6 +497,7 @@ dependencies = [
  "image",
  "rand",
  "rand_distr",
+ "sceneworks-gen-core-testkit",
  "serde_json",
  "sha2",
  "tempfile",
@@ -541,6 +542,7 @@ dependencies = [
  "candle-gen-z-image",
  "sceneworks-gen-core-testkit",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -659,6 +661,7 @@ dependencies = [
  "candle-gen-pid",
  "candle-gen-sdxl",
  "rand",
+ "sceneworks-gen-core-testkit",
  "tempfile",
 ]
 
@@ -857,6 +860,7 @@ dependencies = [
  "image",
  "rand",
  "safetensors 0.4.5",
+ "sceneworks-gen-core-testkit",
  "sha2",
  "tempfile",
 ]
@@ -3325,6 +3329,7 @@ dependencies = [
  "candle-gen-catalog",
  "candle-llm",
  "runtime-catalog",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]

@@ -2386,7 +2386,11 @@ mod tests {
 
         std::fs::write(&file, b"same-size-b").expect("replace fixture with same-size bytes");
         let forced_stamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_123);
-        std::fs::File::open(&file)
+        // A read-only handle cannot carry a timestamp write on Windows (`PermissionDenied`), so the
+        // replacement stamp goes through a writable handle, as the sibling fixture below does.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
             .expect("open fixture")
             .set_modified(forced_stamp)
             .expect("advance replacement stamp");

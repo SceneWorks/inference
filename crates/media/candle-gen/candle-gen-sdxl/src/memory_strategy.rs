@@ -654,6 +654,85 @@ fn asset_facts(
     })
 }
 
+/// Activation dtype every SDXL-family Candle route computes in. `lib.rs` pins `DType::F16` on the
+/// loaded generator, so this is the provider's real activation width, not a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F16;
+
+/// Architecture axes for the vendored SDXL UNet + `sdxl-vae-fp16-fix` decoder (epic SC-22657, E2).
+///
+/// The axes come off the two Rust configs the loader actually builds from —
+/// [`crate::unet::sdxl_unet_config`] and `pipeline::sdxl_vae_config` — not from any snapshot
+/// `config.json`, because the vendored stack ignores the on-disk config entirely.
+///
+/// Four of the eight axes are structurally absent for a UNet denoiser and are therefore declared
+/// absent rather than zero (E2):
+///
+/// * `attention_heads` — the UNet's head count is per stage (5/10/20 across `320/640/1280`); there
+///   is no single uniform head count to declare.
+/// * `transformer_blocks` — a UNet is a down/mid/up convolutional trunk, not a uniform stack of
+///   transformer blocks.
+/// * `patch_size` — the UNet consumes the latent grid directly; nothing is patchified.
+/// * `vae_temporal_scale` — SDXL ships the image `AutoencoderKL`, which has no temporal axis.
+///
+/// `head_dim` *is* uniform: `out_channels / heads` is 64 in all three stages. It is published only
+/// when every stage agrees, so a geometry that ever stopped being uniform declines the axis rather
+/// than claiming a head width it does not have.
+///
+/// `activation_dtype` is a parameter because the same UNet geometry is loaded by sibling providers
+/// at their own pinned compute width (InstantID's fp16, Kolors' f32).
+pub fn sdxl_unet_family_architecture_facts(
+    activation_dtype: candle_gen::candle_core::DType,
+) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let unet = crate::unet::sdxl_unet_config();
+    // In diffusers' SDXL config `attention_head_dim` is the per-block HEAD COUNT, so the per-head
+    // width is the stage quotient. Publish it only if every stage produces the same quotient.
+    let mut stage_widths = unet
+        .blocks
+        .iter()
+        .map(|block| match block.attention_head_dim {
+            heads if heads != 0 && block.out_channels % heads == 0 => {
+                af::declared(block.out_channels / heads)
+            }
+            _ => None,
+        });
+    let head_dim = match stage_widths.next() {
+        Some(first) if first.is_some() && stage_widths.all(|width| width == first) => first,
+        _ => None,
+    };
+    let vae = crate::pipeline::sdxl_vae_config();
+    gen_core::MemoryArchitectureFacts {
+        // Per-stage head counts (5/10/20): no uniform head count exists to declare.
+        attention_heads: None,
+        head_dim,
+        // A UNet trunk is not a uniform transformer-block stack.
+        transformer_blocks: None,
+        // The UNet consumes the latent directly; there is no patchification.
+        patch_size: None,
+        latent_channels: af::declared(vae.latent_channels),
+        // Each `block_out_channels` stage after the first halves both spatial axes: 4 stages => x8.
+        vae_spatial_scale: vae
+            .block_out_channels
+            .len()
+            .checked_sub(1)
+            .filter(|shift| *shift <= 5)
+            .map(|shift| 1_u32 << shift),
+        // SDXL ships the image `AutoencoderKL`: there is no temporal axis to declare.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(activation_dtype),
+    }
+}
+
+/// Snapshot-scoped facts for the SDXL routes: the weights-free contract surface (the registry's
+/// sentinel path, or a single-file import) resolves no snapshot, so no axis is knowable there.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    if candle_gen::architecture_facts::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    sdxl_unet_family_architecture_facts(ACTIVATION_DTYPE)
+}
+
 fn build_contract(
     spec: &LoadSpec,
     surface: SdxlSurface,
@@ -667,7 +746,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
+        architecture_facts: architecture_facts(spec),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: backend(),
         strategies: MemoryStrategy::ALL
@@ -1351,6 +1430,54 @@ mod tests {
         (spec, root)
     }
 
+    /// AC (epic SC-22657, E2): a materialized SDXL snapshot publishes the axes of the vendored
+    /// UNet + VAE configs the loader builds, declines the four a UNet denoiser structurally lacks,
+    /// and the weights-free surface publishes none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, root) = dense_spec(&temp);
+        // The shared fixture gives the encoders and the VAE the same byte total, which the
+        // conformance check reads as one component borrowing another's price. Widen the encoder
+        // shards so every component is priced from its own distinct bytes.
+        for component in ["text_encoder", "text_encoder_2"] {
+            let path = root.join(component).join("model.fp16.safetensors");
+            let tensor = Tensor::zeros((4, 4), DType::F16, &Device::Cpu).unwrap();
+            safetensors::serialize_to_file(vec![("x.weight".to_owned(), tensor)], None, &path)
+                .unwrap();
+        }
+        let contract = provider_contract_for_spec(&spec).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `sdxl_unet_config()` heads are per stage (5/10/20): no uniform head count.
+                attention_heads: None,
+                // Every stage's `out_channels / attention_head_dim` is 64 (320/5, 640/10, 1280/20).
+                head_dim: Some(64),
+                // A UNet down/mid/up trunk is not a uniform transformer-block stack.
+                transformer_blocks: None,
+                // The UNet consumes the latent grid directly; nothing is patchified.
+                patch_size: None,
+                // `sdxl_vae_config().latent_channels`.
+                latent_channels: Some(4),
+                // `block_out_channels` `[128,256,512,512]` = 4 stages => 3 halvings => x8.
+                vae_spatial_scale: Some(8),
+                // SDXL ships the image `AutoencoderKL`: no temporal axis exists to declare.
+                vae_temporal_scale: None,
+                // `lib.rs` pins `DType::F16` on the loaded generator.
+                activation_dtype_width: Some(2),
+            }
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+        for route in SDXL_ROUTES {
+            assert!(routed_weights_free_contract(*route)
+                .architecture_facts
+                .is_empty());
+        }
+    }
+
     #[test]
     fn route_table_is_exact_and_distinct() {
         assert_eq!(SDXL_ROUTES.len(), 5);
@@ -1660,7 +1787,12 @@ mod tests {
         let mut replacement = original.clone();
         replacement[0] ^= 1;
         std::fs::write(&source, replacement).unwrap();
-        std::fs::File::open(&source)
+        // A read-only handle cannot carry a timestamp write on Windows (`PermissionDenied`), so the
+        // replacement stamp goes through a writable handle — the shape
+        // `candle_gen::quant::sidecar::restore_modified` already uses.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
             .unwrap()
             .set_modified(
                 std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_456),

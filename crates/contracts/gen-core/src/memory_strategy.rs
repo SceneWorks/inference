@@ -922,7 +922,12 @@ pub struct MemoryAssetFacts {
     pub overlay_bytes: u64,
 }
 
-/// Provider-owned, snapshot-read model architecture facts used as activation-formula inputs.
+/// Provider-owned model architecture facts used as activation-formula inputs.
+///
+/// An axis is *derived from a component config*: parsed out of the materialized snapshot by a
+/// provider whose loader parses it, or mirrored as a crate constant by a provider whose loader
+/// builds the same geometry in code. Which of the two a provider may use is a property of its
+/// backend, checked by the registry gate rather than expressible in this type.
 ///
 /// Every axis is an `Option` on purpose. `None` means **not declared**, and a provider must use it
 /// for two distinct cases which both differ from `Some(0)`:
@@ -933,8 +938,10 @@ pub struct MemoryAssetFacts {
 ///   on disk).
 ///
 /// A zero is never a legitimate value for any of these axes, so a defaulted `0` would silently
-/// poison any activation estimate that multiplied by it. Providers therefore read these from the
-/// component `config.json` files of the materialized snapshot, and publish `None` otherwise.
+/// poison any activation estimate that multiplied by it. Providers therefore derive these from the
+/// component config their own loader uses - the snapshot's `config.json` where it parses one, the
+/// crate's own model-config constructor where it builds the geometry in code - and publish `None`
+/// otherwise.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryArchitectureFacts {
     /// Attention heads in one transformer block.
@@ -970,13 +977,22 @@ impl MemoryArchitectureFacts {
             && self.activation_dtype_width.is_none()
     }
 
-    /// Whether at least one axis actually *read from the snapshot* has been declared.
+    /// Whether at least one axis derived from a component config has been declared - whether that
+    /// config was parsed from the snapshot or mirrored as a crate constant.
+    ///
+    /// Both derivations count on purpose. A Candle provider that parses `transformer/config.json`
+    /// and an MLX provider that mirrors the same geometry as compile-time preset constants have
+    /// each stated the architecture the loader will build; only the *source* differs, and every
+    /// caller of this predicate cares that the geometry was stated at all. Which of the two a given
+    /// surface is *allowed* to use is a separate, backend-keyed rule that lives on the registry
+    /// gate, not here.
     ///
     /// [`Self::activation_dtype_width`] is deliberately excluded: an adopting provider emits it
-    /// from a compile-time dtype constant, so it is `Some` whenever the provider was compiled -
-    /// never evidence that the snapshot's component configs were found and parsed. A gate that
-    /// accepts it as "at least one architecture fact" is satisfied by a contract that read nothing.
-    pub const fn has_snapshot_read_axis(&self) -> bool {
+    /// from a compile-time dtype constant that is identical for every model the crate loads, so it
+    /// is `Some` whenever the provider was compiled - never evidence that any component geometry
+    /// was stated. A gate that accepts it as "at least one architecture fact" is satisfied by a
+    /// contract that declared nothing about the model.
+    pub const fn has_declared_architecture_axis(&self) -> bool {
         self.attention_heads.is_some()
             || self.head_dim.is_some()
             || self.transformer_blocks.is_some()
