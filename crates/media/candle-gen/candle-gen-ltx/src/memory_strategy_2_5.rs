@@ -305,7 +305,15 @@ fn exact_load_receipt(
 /// `num_layers`) and keeps the [`crate::config::AvConfig::ltx_2_3`] value for any key the section
 /// omits. Passing the resolved bundle through means this publishes what the checkpoint actually
 /// says, not a dimension asserted from the model id; a bundle-free call falls back to
-/// [`crate::config::AvConfig::ltx_2_5`], which is the same 48/32/128 the loader would fall back to.
+/// [`crate::config::AvConfig::ltx_2_5`], which is the same 48/32/128 the loader would fall back to
+/// (that preset's video half IS [`crate::config::TransformerConfig::ltx_2_3`]'s, and `ltx_2_3` is
+/// the per-key fallback base `from_transformer_config` starts from).
+///
+/// A bundle that FAILS to parse publishes `None` for the three trunk axes (epic SC-22657, E2). It
+/// used to publish the 2.5 preset, which described a load that cannot happen: `lib.rs`'s
+/// `AvConfig::from_bundle(&bundle)?` refuses that bundle outright, so there is no geometry for a
+/// preset to stand in for — and the preset was not even what the loader would have fallen back to.
+/// Structurally unknowable is `None`, never a guess.
 ///
 /// `patch_size` is `None` for the same structural reason as 2.3: LTX patchifies inside the causal
 /// video autoencoder, not in the DiT (`patchify_proj` is a per-token `Linear(128 -> 4096)` over the
@@ -322,16 +330,26 @@ fn architecture_facts(
     if af::snapshot_root(spec).is_none() {
         return gen_core::MemoryArchitectureFacts::default();
     }
-    let video = bundle
-        .and_then(|bundle| crate::config::AvConfig::from_bundle(bundle).ok())
-        .unwrap_or_else(crate::config::AvConfig::ltx_2_5)
-        .video;
+    let video = match bundle {
+        // Parsed: the exact section the loader reads. Refused: no trunk axis is knowable.
+        Some(bundle) => crate::config::AvConfig::from_bundle(bundle)
+            .ok()
+            .map(|config| config.video),
+        // Not yet resolved to a bundle: the preset the loader's own per-key base agrees with.
+        None => Some(crate::config::AvConfig::ltx_2_5().video),
+    };
     gen_core::MemoryArchitectureFacts {
-        attention_heads: af::declared(video.num_heads),
+        attention_heads: video
+            .as_ref()
+            .and_then(|video| af::declared(video.num_heads)),
         // `attention_head_dim` is declared by the config section itself, never divided out of a
         // hidden size.
-        head_dim: af::declared(video.head_dim),
-        transformer_blocks: af::declared(video.num_layers),
+        head_dim: video
+            .as_ref()
+            .and_then(|video| af::declared(video.head_dim)),
+        transformer_blocks: video
+            .as_ref()
+            .and_then(|video| af::declared(video.num_layers)),
         // Structurally absent: LTX patchifies inside the causal video autoencoder, not in the DiT.
         patch_size: None,
         latent_channels: af::declared(crate::config::LATENT_CHANNELS),
@@ -1101,6 +1119,61 @@ mod tests {
         ))
         .unwrap();
         assert!(weights_free.architecture_facts.is_empty());
+    }
+
+    /// AC (epic SC-22657, E2): a bundle whose transformer config the LOADER REFUSES publishes no
+    /// trunk axis. `lib.rs` does `AvConfig::from_bundle(&bundle)?`, so this checkpoint never builds
+    /// a DiT at all — publishing the `ltx_2_5` preset here would be a geometry fact about a load
+    /// that cannot happen (and not even the value the loader's `ltx_2_3` per-key base would give).
+    #[test]
+    fn a_bundle_the_loader_refuses_publishes_no_trunk_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let load = physical_spec(root, false, true);
+        // All four `CAPTION_V2_EXPECTED_CONFIG` keys declared, one with the wrong value: upstream's
+        // strict rule (`gen_core::ltx_checkpoint::caption_feature_version`) rejects it, so
+        // `AvConfig::from_bundle` — and therefore the loader — errors on this exact bundle. The
+        // trunk keys are present and healthy, to prove the `None`s come from the refusal rather
+        // than from a missing section.
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":32,
+                "attention_head_dim":128,"num_layers":48,
+                "caption_proj_before_connector":false,
+                "caption_projection_first_linear":false,
+                "caption_proj_input_norm":false,
+                "caption_projection_second_linear":false}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        assert!(
+            crate::config::AvConfig::from_bundle(&bundle).is_err(),
+            "fixture must be a bundle the loader itself refuses"
+        );
+
+        let facts = architecture_facts(&load, Some(&bundle));
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+        assert_eq!(facts.transformer_blocks, None);
+        // Specifically not the 2.5 preset this used to publish.
+        let preset = crate::config::AvConfig::ltx_2_5().video;
+        assert_ne!(facts.attention_heads, Some(preset.num_heads as u32));
+        assert_ne!(facts.head_dim, Some(preset.head_dim as u32));
+        assert_ne!(facts.transformer_blocks, Some(preset.num_layers as u32));
+        // The axes that do NOT come from the transformer config are unaffected: crate constants and
+        // the DiT dtype, knowable without parsing anything.
+        assert_eq!(facts.latent_channels, Some(128));
+        assert_eq!(facts.vae_spatial_scale, Some(32));
+        assert_eq!(facts.vae_temporal_scale, Some(8));
+        assert_eq!(facts.activation_dtype_width, Some(2));
+
+        let contract = build_contract(
+            &load,
+            MemoryAssetFacts::default(),
+            CALIBRATION_FINGERPRINT,
+            Some(&bundle),
+        )
+        .unwrap();
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
     }
 
     #[test]

@@ -1116,11 +1116,25 @@ mod tests {
         }
     }
 
+    /// One dense bf16 projection plus the always-dense final RMSNorm.
+    ///
+    /// The norm is not decoration: it is the tensor [`probe_checkpoint_dtype`] reads, so a fixture
+    /// without it describes a checkpoint whose store dtype is unknowable and whose load therefore
+    /// takes `backbone_vb`'s f32 fallback — a doubled resident width no shipped tier has.
     fn write_minimal_dense_checkpoint(root: &Path) {
-        let key = "language_model.model.layers.0.self_attn.k_proj.weight".to_owned();
-        let tensor = Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap();
+        let projection = "language_model.model.layers.0.self_attn.k_proj.weight".to_owned();
+        let norm = "language_model.model.norm.weight".to_owned();
         candle_gen::candle_core::safetensors::save(
-            &HashMap::from([(key, tensor)]),
+            &HashMap::from([
+                (
+                    projection,
+                    Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+                (
+                    norm,
+                    Tensor::zeros((64,), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+            ]),
             root.join("model.safetensors"),
         )
         .unwrap();
@@ -1260,18 +1274,21 @@ mod tests {
         };
         let eager_facts = facts(&eager);
         let deferred_facts = facts(&deferred);
-        // The fixture holds one understanding-path projection and nothing else, so the whole
-        // tensor payload is conditioning, the generation path is empty, and the total is the
-        // header-attested data bytes (strictly below the file length, which includes the header).
-        let data_bytes: u64 =
+        // The fixture holds only understanding-path tensors, so the whole payload is conditioning
+        // and the generation path is empty. The total is what the LOADER materializes, not what the
+        // shards store: the bf16 projection rides the bf16 store (`vb.get_unchecked`) at its stored
+        // width, while the RMSNorm is widened to f32 by `quant::get_f32` and so costs twice its
+        // stored bytes. Still strictly below the file length, which also carries the header.
+        let stored: u64 =
             gen_core::weightsmeta::safetensors_path_tensor_headers(root.join("model.safetensors"))
                 .unwrap()
                 .iter()
                 .map(|header| header.data_bytes)
                 .sum();
-        assert!(data_bytes > 0 && data_bytes < on_disk);
-        assert_eq!(eager_facts.base_bytes, data_bytes);
-        assert_eq!(eager_facts.conditioning_bytes, data_bytes);
+        let materialized = stored + 64 * 2; // the [64] norm's bf16 -> f32 widening
+        assert!(materialized > stored && materialized < on_disk);
+        assert_eq!(eager_facts.base_bytes, materialized);
+        assert_eq!(eager_facts.conditioning_bytes, materialized);
         assert_eq!(eager_facts.transformer_bytes, 0);
         assert_eq!(eager_facts.decoder_bytes, 0);
         assert_eq!(eager_facts, deferred_facts);

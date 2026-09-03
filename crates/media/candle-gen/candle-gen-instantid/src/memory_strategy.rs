@@ -52,13 +52,41 @@ fn component_bytes(path: &Path) -> gen_core::Result<u64> {
         })
 }
 
+/// Bytes the [`candle_gen_face`] SCRFD + ArcFace stack occupies once `candle_gen_face::load_on`
+/// materializes it.
+///
+/// That loader reads exactly the two files [`candle_gen_face::ANALYSIS_STACK_FILES`] names and
+/// coerces every tensor to **f32**, so the stack is priced at 4 bytes per float element and NOT at
+/// [`FLOAT_WIDTH`] — it is not part of the fp16 diffusion graph. Pricing the whole dir instead would
+/// also charge a `bisenet_parsing.safetensors` that shares the layout but that InstantID never loads.
+fn face_stack_bytes(dir: &Path) -> gen_core::Result<u64> {
+    const FACE_WIDTH: u64 = 4;
+    candle_gen_face::ANALYSIS_STACK_FILES
+        .iter()
+        .try_fold(0_u64, |sum, file| {
+            let bytes = gen_core::weightsmeta::materialized_path_bytes(dir.join(file), FACE_WIDTH)?;
+            sum.checked_add(bytes).ok_or_else(|| {
+                gen_core::Error::Msg("instantid: face stack byte sum overflow".into())
+            })
+        })
+}
+
 /// Load-exact component bytes for the exact InstantID composition.
 ///
-/// IdentityNet and the face IP-Adapter are auxiliary networks resident alongside the SDXL base, so
-/// they are declared in `overlay_bytes` (the aggregate this contract's
+/// IdentityNet, the face IP-Adapter, the optional OpenPose ControlNet and the optional
+/// face-analysis stack are auxiliary networks resident alongside the SDXL base, so they are
+/// declared in `overlay_bytes` (the aggregate this contract's
 /// [`MemoryFormulaVariable::OverlayBytes`] makes load-bearing) rather than folded into the three
 /// base-model fields. User LoRA/LoKr adapters are folded onto the UNet at load and therefore add no
 /// resident bytes of their own.
+///
+/// OpenPose and the face stack are priced **because the served generator holds them**:
+/// `InstantId::with_openpose` loads a second full SDXL ControlNet through the same
+/// `load_sdxl_controlnet` as IdentityNet, `with_face` loads SCRFD + ArcFace, and a staged reload
+/// re-materializes both. Before epic SC-22657 neither had a field on [`InstantIdPaths`] at all, so
+/// this function could not have charged them even in principle — an under-price of two whole
+/// networks, which is exactly the defect class E1 excludes. A composition that attaches neither
+/// leaves both `None` and pays nothing.
 pub fn asset_facts(paths: &InstantIdPaths) -> gen_core::Result<MemoryAssetFacts> {
     let conditioning = component_bytes(&paths.sdxl_base.join("text_encoder"))?
         .saturating_add(component_bytes(&paths.sdxl_base.join("text_encoder_2"))?);
@@ -74,6 +102,14 @@ pub fn asset_facts(paths: &InstantIdPaths) -> gen_core::Result<MemoryAssetFacts>
                 )
             })?,
         );
+    let overlay = match &paths.openpose {
+        Some(source) => overlay.saturating_add(component_bytes(source_path(source))?),
+        None => overlay,
+    };
+    let overlay = match &paths.face_dir {
+        Some(dir) => overlay.saturating_add(face_stack_bytes(dir)?),
+        None => overlay,
+    };
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -263,6 +299,7 @@ pub fn validate_context(
 pub(crate) mod tests {
     use super::*;
     use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryStrategy};
+    use std::path::PathBuf;
 
     #[test]
     fn only_resident_and_staged_are_selectable() {
@@ -402,8 +439,86 @@ pub(crate) mod tests {
                 WeightsSource::Dir(root.join("sdxl")),
                 WeightsSource::File(root.join("vae/diffusion_pytorch_model.safetensors")),
             ),
+            openpose: None,
+            face_dir: None,
         };
         (paths, conditioning, transformer, decoder, overlay)
+    }
+
+    /// The two auxiliary networks, written as a synthetic tree beside a [`priced_paths`] fixture.
+    /// Returns the OpenPose source, the face dir, and the exact bytes each must add to the overlay.
+    pub(crate) fn priced_extras(temp: &tempfile::TempDir) -> (WeightsSource, PathBuf, u64, u64) {
+        use candle_gen::candle_core::{DType, Device, Tensor};
+        use std::collections::HashMap;
+
+        let extra = temp.path().join("instantid_extras");
+        let write = |path: PathBuf, rows: usize, columns: usize| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let tensors = HashMap::from([(
+                "x.weight".to_owned(),
+                Tensor::zeros((rows, columns), DType::F32, &Device::Cpu).unwrap(),
+            )]);
+            candle_gen::candle_core::safetensors::save(&tensors, &path).unwrap();
+        };
+        write(
+            extra.join("openpose/diffusion_pytorch_model.safetensors"),
+            10,
+            8,
+        );
+        let face = extra.join("face");
+        write(face.join(candle_gen_face::ANALYSIS_STACK_FILES[0]), 5, 4);
+        write(face.join(candle_gen_face::ANALYSIS_STACK_FILES[1]), 7, 4);
+        // A file the shared face layout may hold but `load_on` never reads: never charged.
+        write(face.join("bisenet_parsing.safetensors"), 100, 100);
+        (
+            WeightsSource::Dir(extra.join("openpose")),
+            face,
+            10 * 8 * FLOAT_WIDTH, // fp16, like every other diffusion component
+            (5 * 4 + 7 * 4) * 4,  // f32, the width `candle_gen_face::load_on` coerces to
+        )
+    }
+
+    /// AC (epic SC-22657, E1): the OpenPose ControlNet and the face-analysis stack are networks the
+    /// served generator holds resident on the priced route, so attaching them must move
+    /// `overlay_bytes` STRICTLY up — by the OpenPose ControlNet at the fp16 compute width and by the
+    /// SCRFD + ArcFace pair at the f32 width `candle_gen_face::load_on` coerces them to.
+    ///
+    /// Before this they had no field on `InstantIdPaths` at all, so the pose route was admitted with
+    /// two whole networks charged nowhere.
+    #[test]
+    fn openpose_and_the_face_stack_are_priced_into_the_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bare, _, _, _, overlay) = priced_paths(&temp);
+        let (openpose, face, openpose_bytes, face_bytes) = priced_extras(&temp);
+
+        // Bare composition first — nothing attached, nothing extra charged.
+        assert_eq!(asset_facts(&bare).unwrap().overlay_bytes, overlay);
+
+        let mut posed = bare.clone();
+        posed.openpose = Some(openpose.clone());
+        posed.face_dir = Some(face.clone());
+        let priced = asset_facts(&posed).unwrap();
+        assert_eq!(priced.overlay_bytes, overlay + openpose_bytes + face_bytes);
+        assert!(
+            priced.overlay_bytes > overlay,
+            "attaching two resident networks must raise the declared overlay"
+        );
+        // The base fields describe the SDXL trunk only; overlays never leak into them.
+        assert_eq!(priced.base_bytes, asset_facts(&bare).unwrap().base_bytes);
+
+        // Each axis moves the price on its own, so one covering for the other cannot pass.
+        let mut only_pose = bare.clone();
+        only_pose.openpose = Some(openpose);
+        assert_eq!(
+            asset_facts(&only_pose).unwrap().overlay_bytes,
+            overlay + openpose_bytes
+        );
+        let mut only_face = bare.clone();
+        only_face.face_dir = Some(face);
+        assert_eq!(
+            asset_facts(&only_face).unwrap().overlay_bytes,
+            overlay + face_bytes
+        );
     }
 
     /// AC (epic SC-22657, E2): a resolved InstantID composition publishes the SDXL UNet + VAE axes
