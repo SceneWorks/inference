@@ -39,6 +39,22 @@ fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result
     Ok(Tensor::cat(&[&vision, text], 1)?)
 }
 
+/// Select the one token produced by this single-image provider.
+fn next_token_id(logits: &Tensor) -> Result<i32> {
+    let selected = logits.argmax(candle_core::D::Minus1)?;
+    let cardinality = selected.elem_count();
+    if cardinality != 1 {
+        return Err(Error::Msg(format!(
+            "starvector token selection produced {cardinality} tokens from logits {:?}; expected exactly one",
+            logits.dims()
+        )));
+    }
+    // Last-axis argmax preserves all leading axes, so the real single-image provider returns
+    // `[1]` for its `[1, vocab]` logits in both prefill and cached decode. Validate cardinality
+    // before removing that provider batch axis; blindly squeezing would accept an invalid batch.
+    Ok(selected.reshape(())?.to_scalar::<u32>()? as i32)
+}
+
 /// Native-only, exact configuration facts for the StarVector-1B image-to-SVG snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StarVectorConfig {
@@ -411,12 +427,7 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 if req.text_request.cancel.is_cancelled() {
                     break;
                 }
-                let id = logits
-                    .argmax(candle_core::D::Minus1)
-                    .map_err(|e| core_llm::Error::Msg(e.to_string()))?
-                    .to_scalar::<u32>()
-                    .map_err(|e| core_llm::Error::Msg(e.to_string()))?
-                    as i32;
+                let id = next_token_id(&logits).map_err(to_core)?;
                 let decoded = self.tokenizer.decode(&[id as u32], true)?;
                 if !decoded.is_empty() {
                     match stream.push(&decoded, started.elapsed())? {
@@ -538,6 +549,36 @@ mod tests {
             joined.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
         );
+    }
+
+    #[test]
+    fn token_selection_preserves_singleton_value_for_prefill_and_cached_decode() {
+        let device = Device::Cpu;
+        let prefill = Tensor::from_vec(vec![0.0f32, 1.0, 9.0, 2.0], (1, 4), &device).unwrap();
+        let cached_decode = Tensor::from_vec(vec![8.0f32, 3.0, 2.0, 1.0], (1, 4), &device).unwrap();
+
+        assert_eq!(
+            (
+                next_token_id(&prefill).unwrap(),
+                next_token_id(&cached_decode).unwrap()
+            ),
+            (2, 0)
+        );
+    }
+
+    #[test]
+    fn token_selection_rejects_non_singleton_cardinality() {
+        let device = Device::Cpu;
+        let batched =
+            Tensor::from_vec(vec![0.0f32, 5.0, 1.0, 7.0, 0.0, 2.0], (2, 3), &device).unwrap();
+
+        match next_token_id(&batched) {
+            Err(Error::Msg(message)) => assert_eq!(
+                message,
+                "starvector token selection produced 2 tokens from logits [2, 3]; expected exactly one"
+            ),
+            other => panic!("expected a classified model-output error, got {other:?}"),
+        }
     }
 
     struct FixtureProvider {
