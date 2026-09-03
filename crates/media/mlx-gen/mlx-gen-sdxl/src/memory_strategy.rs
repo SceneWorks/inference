@@ -168,13 +168,14 @@
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, MemoryBackendRealization,
-    MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind,
+    adapter_stack_resident_bytes, standard_memory_strategy_safety_check, AdapterResidencyMode,
+    Error as CoreError, MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
     MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
     MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract,
-    MemoryRequestScope, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
-    TransformerComponent,
+    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision,
+    MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, ResidentRequestMemory,
+    Result as CoreResult, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, LoadShape, LoadSpec, OffloadPolicy, WeightsSource};
@@ -668,7 +669,170 @@ pub fn memory_strategy_contract(
         components.text_encoder,
         components.dit,
         components.vae,
+        resident_overlay_components(spec)?,
     )
+}
+
+/// Provider-local identities of the auxiliary networks an SDXL load can keep resident.
+const CONTROL_COMPONENT_ID: &str = "sdxl.control.branches";
+const IP_ADAPTER_COMPONENT_ID: &str = "sdxl.ip_adapter.image_encoder_resampler_and_kv";
+const PID_COMPONENT_ID: &str = "sdxl.pid.student_and_caption_encoder";
+const ADAPTER_COMPONENT_ID: &str = "sdxl.adapters.forward_residuals";
+
+/// The **auxiliary networks this load keeps resident alongside the base three**, priced load-exact
+/// (SC-22667, E1).
+///
+/// The module doc has always said what rung 0 holds warm — "U-Net + control/IP/VAE/PiD" — and
+/// `model::load_heavy` / `build_ldm_heavy` materialize exactly that set, yet every contract this
+/// provider published carried `overlay_bytes == 0` with no component. The shared validator only
+/// cross-checks the overlay legs when there is one, so the zero passed silently, and a rung-1 or
+/// rung-4 selection admitted for a ControlNet / IP-Adapter / PiD load under-predicted its peak by
+/// the whole overlay set. Kolors, which loads these through this crate's own loaders, has priced
+/// them since sc-15839; this is the same derivation on the family's base provider.
+///
+/// Each projection mirrors what the loader actually does, not what the file stores:
+///
+/// * **ControlNet** — `loader::load_controlnet` opens `spec.control` and then every
+///   `spec.extra_controls` entry (MultiControlNet, sc-3378) and casts each dense branch to the fp16
+///   compute dtype, so a branch is priced at 2 bytes/element. The shared primitive independently
+///   forces `Stored` for an already-packed triple. All branches are one `ControlBranch` component:
+///   they are installed together and no published rung releases one without the others.
+/// * **IP-Adapter** — the image encoder plus the first existing IP weight file in
+///   `loader::IP_ADAPTER_WEIGHT_FILES` order, both cast to fp16. Both are resident: the encoder and
+///   resampler live on the generator, the K/V pairs are installed into the U-Net. A
+///   `WeightsSource::File` IP-Adapter is rejected by `load` before any weight is opened, so it prices
+///   nothing; a directory holding neither candidate is priced as its encoder alone, and the loader
+///   refuses it moments later with the actionable message.
+/// * **PiD** — priced only under [`OffloadPolicy::Resident`], where `build_residency` passes
+///   `load_pid = true` unconditionally and the student plus its Gemma caption encoder are held for
+///   the life of the generator. The `Sequential` arm passes `req.use_pid` per request, so a
+///   non-PiD generate never materializes them and a load-time contract must not charge them. Both
+///   are loaded verbatim (`PidEngine::load`: `Weights::from_file` / `from_dir`, no cast), so
+///   `Stored` is exact.
+/// * **Adapters** — `adapters::apply_sdxl_adapters_with` installs a LoRA/LoKr one of two ways, and
+///   `adapters_are_replayable` above spells out which: on a dense base it `merge_dense_delta`s the
+///   factors into the U-Net weight, which adds no independent residency
+///   ([`AdapterResidencyMode::Folded`], positive evidence of zero); on a pre-quantized snapshot at
+///   the requested tier the merge is impossible and the factors ride as forward-time residuals
+///   ([`AdapterResidencyMode::Additive`]). `None` from the shared helper means an additive stack was
+///   requested and a source could not be sized; that fails closed rather than declaring a zero the
+///   shared validator would wave through.
+fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResidentComponent>> {
+    use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
+
+    // Matches `load_controlnet` / `load_ip_adapter`: dense payloads are cast to the fp16 compute
+    // dtype (2 bytes/element); an already-packed triple is left alone, which the shared primitive
+    // handles on its own.
+    let compute_dtype = |_: &_| ResidentProjection::Bfloat16;
+    let mut components = Vec::new();
+
+    let mut control_bytes = 0_u64;
+    for source in spec.control.iter().chain(&spec.extra_controls) {
+        let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
+        control_bytes =
+            control_bytes.saturating_add(projected_safetensors_bytes(path, compute_dtype)?);
+    }
+    push_overlay(
+        &mut components,
+        CONTROL_COMPONENT_ID,
+        MemoryComponentKind::ControlBranch,
+        control_bytes,
+    );
+
+    if let Some(WeightsSource::Dir(root)) = &spec.ip_adapter {
+        let encoder = projected_safetensors_bytes(
+            root.join(crate::loader::IP_ADAPTER_IMAGE_ENCODER_FILE),
+            compute_dtype,
+        )?;
+        let adapter = match crate::loader::IP_ADAPTER_WEIGHT_FILES
+            .iter()
+            .map(|file| root.join(file))
+            .find(|path| path.exists())
+        {
+            Some(file) => projected_safetensors_bytes(file, compute_dtype)?,
+            None => 0,
+        };
+        push_overlay(
+            &mut components,
+            IP_ADAPTER_COMPONENT_ID,
+            MemoryComponentKind::IpAdapter,
+            encoder.saturating_add(adapter),
+        );
+    }
+
+    if spec.offload_policy == OffloadPolicy::Resident {
+        if let Some(pid) = &spec.pid {
+            let (WeightsSource::Dir(checkpoint) | WeightsSource::File(checkpoint)) =
+                &pid.checkpoint;
+            let (WeightsSource::Dir(gemma) | WeightsSource::File(gemma)) = &pid.gemma;
+            // `PidEngine::load` prefers Gemma's merged single file and falls back to the shard dir.
+            let merged = gemma.join(mlx_gen_pid::engine::GEMMA_MERGED_FILE);
+            let gemma_source = if merged.is_file() {
+                merged
+            } else {
+                gemma.clone()
+            };
+            let student = projected_safetensors_bytes(checkpoint, |_| ResidentProjection::Stored)?;
+            let caption =
+                projected_safetensors_bytes(&gemma_source, |_| ResidentProjection::Stored)?;
+            push_overlay(
+                &mut components,
+                PID_COMPONENT_ID,
+                // `AdapterStack` is the closest existing kind for an auxiliary network installed
+                // beside the base model's own transformers. What the contract arithmetic consumes
+                // is `MemoryComponentKind::is_auxiliary()`, which is true for it — the same
+                // disposition Kolors and FLUX.1 take.
+                MemoryComponentKind::AdapterStack,
+                student.saturating_add(caption),
+            );
+        }
+    }
+
+    let adapter_mode = if spec.quantize.is_some() && load_leaves_blocks_lazy(spec) {
+        AdapterResidencyMode::Additive
+    } else {
+        AdapterResidencyMode::Folded
+    };
+    let adapter_bytes = adapter_stack_resident_bytes(&spec.adapters, adapter_mode).ok_or_else(
+        || {
+            CoreError::Unsupported(
+                "sdxl: an adapter stack was requested on a packed base but at least one source \
+                 could not be sized; refusing to declare a zero the shared validator would wave \
+                 through"
+                    .to_owned(),
+            )
+        },
+    )?;
+    push_overlay(
+        &mut components,
+        ADAPTER_COMPONENT_ID,
+        MemoryComponentKind::AdapterStack,
+        adapter_bytes,
+    );
+
+    Ok(components)
+}
+
+/// Record one overlay, skipping a zero. The shared validator refuses a declared component with zero
+/// bytes, and a component that measured zero is not evidence of residency anyway.
+fn push_overlay(
+    into: &mut Vec<MemoryResidentComponent>,
+    id: &str,
+    kind: MemoryComponentKind,
+    resident_bytes: u64,
+) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(MemoryResidentComponent {
+        id: id.to_owned(),
+        kind,
+        resident_bytes,
+        // No published rung bounds an overlay on this family: rung 4's window covers the U-Net's
+        // `Transformer2D` sub-stacks and nothing else.
+        bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
+    });
 }
 
 /// Declaration-equivalent contract used by weights-free registry conformance. Structure, parameter
@@ -677,7 +841,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
-    contract_with_asset_facts(provider_id, spec, 0, 0, 0)
+    contract_with_asset_facts(provider_id, spec, 0, 0, 0, Vec::new())
 }
 
 /// Whether the registry surface this selector names leaves the U-Net blocks lazy.
@@ -711,6 +875,9 @@ pub(crate) fn weights_free_memory_surface_contract(
         0,
         0,
         0,
+        // No overlays either: sizing one means opening its checkpoint, and this path exists to
+        // produce the declaration without touching a weight file.
+        Vec::new(),
     )
 }
 
@@ -720,6 +887,7 @@ fn contract_with_asset_facts(
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
+    overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
     contract_with_asset_facts_and_streamability(
         provider_id,
@@ -728,6 +896,7 @@ fn contract_with_asset_facts(
         conditioning_bytes,
         transformer_bytes,
         decoder_bytes,
+        overlays,
     )
 }
 
@@ -738,6 +907,7 @@ fn contract_with_asset_facts_and_streamability(
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
+    overlays: Vec<MemoryResidentComponent>,
 ) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
@@ -791,20 +961,36 @@ fn contract_with_asset_facts_and_streamability(
     if geometry_decode {
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables,
+    let overlay_bytes = overlays.iter().fold(0_u64, |total, component| {
+        total.saturating_add(component.resident_bytes)
+    });
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    contract.formula = if overlays.is_empty() {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        // SC-22667: the overlay set is only a variable of the peak when there IS one, so a plain
+        // txt2img load keeps the exact envelope it always declared rather than gaining a variable
+        // that never varies — the same shape Kolors has published since sc-15839.
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: overlays,
+        }
     };
     contract.asset_facts.conditioning_bytes = conditioning_bytes;
     contract.asset_facts.transformer_bytes = transformer_bytes;
     contract.asset_facts.decoder_bytes = decoder_bytes;
+    // `base_bytes` is the three BASE components and must exclude the overlay, which the shared
+    // validator checks; `total_resident_bytes()` is what adds the two together for an adopter.
     contract.asset_facts.base_bytes = conditioning_bytes
         .saturating_add(transformer_bytes)
         .saturating_add(decoder_bytes);
+    contract.asset_facts.overlay_bytes = overlay_bytes;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -1788,5 +1974,220 @@ mod tests {
             4096,
             "the largest self-attention key axis at 1024² is 4096, not the full-resolution 16384"
         );
+    }
+
+    /// One-tensor safetensors file; `dtype` must agree with `width` because the shared header
+    /// reader refuses a payload length that is not `elements * dtype.size()`.
+    fn write_tensor(path: &std::path::Path, dtype: &str, elements: usize, width: usize) {
+        let data_bytes = elements * width;
+        let mut header = format!(
+            "{{\"weight\":{{\"dtype\":\"{dtype}\",\"shape\":[{elements}],\"data_offsets\":[0,{data_bytes}]}}}}"
+        )
+        .into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + data_bytes, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Feature-end review (SC-22667, E1): the module doc has always said what rung 0 holds warm —
+    /// "U-Net + control/IP/VAE/PiD" — and `model::load_heavy` / `build_ldm_heavy` materialize
+    /// exactly that, yet every contract published `overlay_bytes == 0` with no component. Each
+    /// auxiliary network is now declared once in `overlay_bytes` and once as a typed component, at
+    /// the width the loader materializes it in, and `base_bytes` stays exactly the sum of the three
+    /// base-model fields.
+    ///
+    /// Mutation that fails this: passing `Vec::new()` at the production `memory_strategy_contract`
+    /// call site instead of `resident_overlay_components(spec)?` — `overlay_bytes` drops to 0,
+    /// `resident_components()` empties, and the formula falls back to `PhaseEnvelope`. Pricing the
+    /// ControlNet at `Stored` instead of the fp16 compute width reds the f32-stored branch (40 B
+    /// stored, 20 B resident).
+    #[test]
+    fn resident_auxiliary_networks_are_declared_as_overlay_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let fused = root.join("sdxl.safetensors");
+        write_fused_contract_fixture(&fused);
+        let clean = LoadSpec::new(WeightsSource::File(fused))
+            .with_offload_policy(OffloadPolicy::Resident);
+        let base = memory_strategy_contract(crate::MODEL_ID, &clean).unwrap();
+        assert_eq!(base.asset_facts.overlay_bytes, 0);
+        assert!(base.resident_components().is_empty());
+        assert!(
+            matches!(base.formula, MemoryFormulaKind::PhaseEnvelope { .. }),
+            "a clean base load must stay on the componentless formula"
+        );
+
+        // Two ControlNet branches, one stored f16 and one stored f32. `load_controlnet` casts BOTH
+        // to the fp16 compute dtype, so the f32 file is priced at half its stored size.
+        let control = root.join("control.safetensors");
+        write_tensor(&control, "F16", 40, 2);
+        let extra = root.join("extra_control.safetensors");
+        write_tensor(&extra, "F32", 10, 4);
+        // An h94/IP-Adapter layout: the ViT-H encoder plus the `plus` weights. No plus-face file,
+        // so the loader's fallback candidate is the one that must be priced.
+        let ip = root.join("ip");
+        std::fs::create_dir_all(ip.join("models/image_encoder")).unwrap();
+        std::fs::create_dir_all(ip.join("sdxl_models")).unwrap();
+        write_tensor(
+            &ip.join(crate::loader::IP_ADAPTER_IMAGE_ENCODER_FILE),
+            "F16",
+            30,
+            2,
+        );
+        write_tensor(&ip.join(crate::loader::IP_ADAPTER_WEIGHT_FILES[1]), "F16", 20, 2);
+        // A PiD pair, loaded verbatim: the student file and a Gemma shard directory that carries no
+        // merged single file, so `PidEngine::load` falls back to the directory.
+        let pid = root.join("pid.safetensors");
+        write_tensor(&pid, "BF16", 10, 2);
+        let gemma = root.join("gemma");
+        std::fs::create_dir_all(&gemma).unwrap();
+        write_tensor(&gemma.join("model-00001-of-00001.safetensors"), "BF16", 5, 2);
+        // A LoRA on a DENSE base is merged into the U-Net weight: folded, no independent residency.
+        let lora = root.join("lora.safetensors");
+        std::fs::write(&lora, vec![0_u8; 64]).unwrap();
+
+        let mut spec = clean
+            .clone()
+            .with_control(WeightsSource::File(control))
+            .with_pid(WeightsSource::File(pid), WeightsSource::Dir(gemma));
+        spec.extra_controls.push(WeightsSource::File(extra));
+        spec.ip_adapter = Some(WeightsSource::Dir(ip));
+        spec.adapters
+            .push(AdapterSpec::new(lora, 1.0, mlx_gen::AdapterKind::Lora));
+
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        let control_bytes: u64 = 40 * 2 + 10 * 2;
+        let ip_bytes: u64 = 30 * 2 + 20 * 2;
+        let pid_bytes: u64 = 10 * 2 + 5 * 2;
+        assert_eq!(
+            contract.asset_facts.overlay_bytes,
+            control_bytes + ip_bytes + pid_bytes
+        );
+        assert_eq!(
+            contract.auxiliary_resident_bytes(),
+            contract.asset_facts.overlay_bytes
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes, base.asset_facts.base_bytes,
+            "an auxiliary network must never move the base decomposition"
+        );
+        assert_eq!(
+            contract.total_resident_bytes(),
+            base.asset_facts.base_bytes + contract.asset_facts.overlay_bytes
+        );
+        let components = contract.resident_components();
+        let ids: Vec<&str> = components
+            .iter()
+            .map(|component| component.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                CONTROL_COMPONENT_ID,
+                IP_ADAPTER_COMPONENT_ID,
+                PID_COMPONENT_ID
+            ],
+            "a merged LoRA declares no component"
+        );
+        assert_eq!(components[0].kind, MemoryComponentKind::ControlBranch);
+        assert_eq!(components[0].resident_bytes, control_bytes);
+        assert_eq!(components[1].kind, MemoryComponentKind::IpAdapter);
+        assert_eq!(components[1].resident_bytes, ip_bytes);
+        assert_eq!(components[2].resident_bytes, pid_bytes);
+        assert!(matches!(
+            &contract.formula,
+            MemoryFormulaKind::ComponentPhaseEnvelope { variables, .. }
+                if variables.contains(&MemoryFormulaVariable::OverlayBytes)
+        ));
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // Under `Sequential` the PiD pair follows `req.use_pid` per request, so a load-time contract
+        // must not charge it.
+        let sequential = spec.clone().with_offload_policy(OffloadPolicy::Sequential);
+        let sequential = memory_strategy_contract(crate::MODEL_ID, &sequential).unwrap();
+        assert_eq!(
+            sequential.asset_facts.overlay_bytes,
+            control_bytes + ip_bytes
+        );
+        assert_eq!(sequential.resident_components().len(), 2);
+    }
+
+    /// Feature-end review (SC-22667, E1): `apply_sdxl_adapters_with` merges a LoRA into a dense
+    /// U-Net weight (no independent residency) but pushes it as a forward-time residual on a
+    /// pre-quantized snapshot at the requested tier, where the merge is impossible — the same
+    /// distinction `adapters_are_replayable` draws for rung 4. Only the residual case is a resident
+    /// overlay.
+    ///
+    /// Mutation that fails this: pinning the residency mode to `Folded` — the packed leg reads back
+    /// `overlay_bytes == 0` while the loader holds 2048 B of factors — or to `Additive`, which
+    /// charges the dense leg for factors that were merged away.
+    #[test]
+    fn a_lora_on_a_packed_snapshot_is_priced_as_a_resident_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("unet")).unwrap();
+        // The packed-tier marker `load_leaves_blocks_lazy` reads: at the requested tier the load
+        // re-quantizes nothing, and the LoRA cannot be merged into a packed weight.
+        std::fs::write(
+            root.join("unet/config.json"),
+            br#"{"quantization":{"bits":4,"group_size":64}}"#,
+        )
+        .unwrap();
+        write_tensor(
+            &root.join("unet/diffusion_pytorch_model.safetensors"),
+            "F16",
+            100,
+            2,
+        );
+        let lora = root.join("lora.safetensors");
+        std::fs::write(&lora, vec![0_u8; 2048]).unwrap();
+        let mut adapted = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        adapted
+            .adapters
+            .push(AdapterSpec::new(lora, 1.0, mlx_gen::AdapterKind::Lora));
+
+        // No tier requested: a dense load, so the factors are merged and add nothing.
+        let folded = memory_strategy_contract(crate::MODEL_ID, &adapted).unwrap();
+        assert_eq!(folded.asset_facts.overlay_bytes, 0);
+        assert!(folded.resident_components().is_empty());
+
+        // The pre-quantized base at its own tier: forward-time residuals beside the packed U-Net.
+        let packed = adapted.clone().with_quant(Quant::Q4);
+        let additive = memory_strategy_contract(crate::MODEL_ID, &packed).unwrap();
+        assert_eq!(additive.asset_facts.overlay_bytes, 2048);
+        assert_eq!(
+            additive.asset_facts.base_bytes, folded.asset_facts.base_bytes,
+            "an adapter is auxiliary: it must never move the base decomposition"
+        );
+        let components = additive.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, ADAPTER_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::AdapterStack);
+        assert_eq!(components[0].resident_bytes, 2048);
+        assert!(
+            additive.conformance_errors().is_empty(),
+            "{:?}",
+            additive.conformance_errors()
+        );
+
+        // An additive stack that cannot be sized fails closed rather than declaring a zero the
+        // shared validator would wave through.
+        let mut unsizable =
+            LoadSpec::new(WeightsSource::Dir(root.to_path_buf())).with_quant(Quant::Q4);
+        unsizable.adapters.push(AdapterSpec::new(
+            root.join("absent.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert!(memory_strategy_contract(crate::MODEL_ID, &unsizable).is_err());
     }
 }
