@@ -205,13 +205,69 @@ impl MemoryRequestScope for WanI2vRequestScope {
     }
 }
 
+/// The trunk and autoencoder geometry each Wan I2V route actually runs (epic SC-22657, E2).
+///
+/// `gen_core::wan_i2v_memory` builds one shared contract for all four routes and publishes
+/// [`gen_core::MemoryArchitectureFacts::default`] there, because it is backend-neutral and holds no
+/// model config. This crate does: the routes are the same two Wan trunks the rest of the crate is
+/// built from, so the axes are read off the same presets rather than restated as literals.
+///
+/// `Ti2v5b` is the dense 5B over the z48 autoencoder; the three 14B routes — plain I2V, VACE and
+/// VACE-Fun — are the A14B trunk over the z16 one. VACE's extra control channels do not move any
+/// axis here: `vace_in_channels` widens the *control* latent the trunk concatenates, while
+/// `vae_z_dim` is what the autoencoder itself produces and consumes.
+///
+/// `transformer_blocks` is ONE expert's depth on the dual-expert 14B routes, exactly as the
+/// preset's `num_layers` states it: a denoise step traverses the low-noise expert or the high-noise
+/// one, never both.
+pub fn architecture_facts(
+    route: gen_core::wan_i2v_memory::WanI2vRoute,
+) -> gen_core::MemoryArchitectureFacts {
+    let wan = match route {
+        gen_core::wan_i2v_memory::WanI2vRoute::Ti2v5b => {
+            crate::config::WanModelConfig::wan22_ti2v_5b()
+        }
+        gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
+        | gen_core::wan_i2v_memory::WanI2vRoute::Vace
+        | gen_core::wan_i2v_memory::WanI2vRoute::VaceFun => {
+            crate::config::WanModelConfig::wan22_i2v_14b()
+        }
+    };
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // Both Wan trunks are bf16-native: every matmul runs bf16 over an f32 residual stream.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
+/// The per-request contract for one public mode, with this crate's architecture axes published over
+/// the backend-neutral default `gen_core::wan_i2v_memory` can only supply.
+pub fn request_contract_for_mode(
+    prepared: &PreparedWanI2vMemory,
+    mode: &str,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let mut contract = gen_core::wan_i2v_memory::contract_for_mode_key(prepared, mode)?;
+    contract.architecture_facts = architecture_facts(prepared.route);
+    Ok(contract)
+}
+
 pub fn begin_request<'a>(
     prepared: &'a PreparedWanI2vMemory,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope + 'a>>> {
     gen_core::wan_i2v_memory::validate_context(prepared, context)?;
-    let request_contract =
-        gen_core::wan_i2v_memory::contract_for_mode_key(prepared, context.mode.as_key())?;
+    let request_contract = request_contract_for_mode(prepared, context.mode.as_key())?;
     let memory = request_contract.generation_memory(&context.selection);
     let mut config = mlx_gen::request_scope::MlxRequestScopeConfig::new(
         prepared.route.provider_id(),
@@ -261,6 +317,73 @@ pub fn selected_strategy(request: &GenerationRequest) -> MemoryStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC (SC-22662, review follow-up): the three 14B I2V routes publish the A14B trunk's axes, not
+    /// `MemoryArchitectureFacts::default()`. `gen_core::wan_i2v_memory` has no model config, so its
+    /// shared contract can only publish the empty default; this crate overlays the real geometry.
+    ///
+    /// The scale pair is asserted against the provider's own assigned VAE tiling rather than
+    /// against literals, exactly as `memory_strategy.rs` does for the z48 route — so a VAE
+    /// reassignment cannot leave the published axes describing the old autoencoder.
+    #[test]
+    fn every_i2v_route_publishes_its_trunk_and_vae_axes() {
+        use gen_core::wan_i2v_memory::WanI2vRoute;
+
+        let ti2v = architecture_facts(WanI2vRoute::Ti2v5b);
+        assert_eq!(
+            ti2v,
+            gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(24),
+                // 3072 / 24.
+                head_dim: Some(128),
+                transformer_blocks: Some(30),
+                patch_size: Some(2),
+                latent_channels: Some(48),
+                vae_spatial_scale: Some(16),
+                vae_temporal_scale: Some(4),
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert_eq!(
+            (ti2v.vae_spatial_scale, ti2v.vae_temporal_scale),
+            (
+                Some(crate::WAN_Z48_VAE_TILING.spatial_scale as u32),
+                Some(crate::WAN_Z48_VAE_TILING.temporal_scale as u32)
+            )
+        );
+
+        for route in [WanI2vRoute::I2v14b, WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let facts = architecture_facts(route);
+            assert_eq!(
+                facts,
+                gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(40),
+                    // 5120 / 40.
+                    head_dim: Some(128),
+                    // ONE expert's depth: a denoise step traverses one expert, never both.
+                    transformer_blocks: Some(40),
+                    patch_size: Some(2),
+                    // `vae_z_dim`, not VACE's wider control-latent `vace_in_channels`.
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: Some(4),
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                route.provider_id()
+            );
+            // The published pair IS the z16 tiling geometry these routes' VAE assignment declares.
+            assert_eq!(
+                (facts.vae_spatial_scale, facts.vae_temporal_scale),
+                (
+                    Some(crate::WAN_Z16_VAE_TILING.spatial_scale as u32),
+                    Some(crate::WAN_Z16_VAE_TILING.temporal_scale as u32)
+                )
+            );
+            assert!(facts.has_declared_architecture_axis());
+            assert_ne!(facts, gen_core::MemoryArchitectureFacts::default());
+        }
+    }
 
     #[test]
     fn active_first_last_receipt_clears_on_finish_and_drop() {

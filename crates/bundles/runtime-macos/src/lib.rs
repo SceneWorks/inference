@@ -155,40 +155,47 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 mod tests {
     /// Epic SC-22657 (E1 + E2), story SC-22662: the registry-wide acceptance skeleton for the MLX
     /// bundle. Every memory-contract surface this platform registers — every provider, at every
-    /// tier and materialization selector — must publish an honest byte decomposition *and*, when it
-    /// claims a lifecycle-phase formula, at least one declared architecture axis.
+    /// tier and materialization selector — must publish an honest byte decomposition *and* declare
+    /// at least one architecture axis.
     ///
-    /// The MLX provider crates mirror their reference component `config.json` as Rust constants
-    /// (see `mlx_gen::architecture_facts`), so the architecture axes are published on this
-    /// weights-free surface too; that is why the full `check_memory_contract_facts` gate is
-    /// asserted here rather than only its asset-facts half.
+    /// The walk is the shared, backend-keyed
+    /// `gen_core_testkit::check_memory_contract_surface_registry_facts` rather than a per-surface
+    /// `check_memory_contract_facts` loop (the SC-22661 reconciliation). The rule for a
+    /// weights-free surface differs by backend, and this bundle is the MLX arm: an MLX provider
+    /// mirrors its family's reference component `config.json` as Rust constants (see
+    /// `mlx_gen::architecture_facts`), so its geometry exists before any snapshot does and a
+    /// surface declaring *nothing* is withholding facts it already holds. Deferring to the gate
+    /// rather than restating a rule here is what keeps this bundle and that single source of truth
+    /// from drifting apart.
+    ///
+    /// No materialized-root lookup is supplied: that arm exists for a backend whose axes appear
+    /// only once a snapshot is on disk, and this registry composes no such provider.
+    ///
+    /// The coverage floors keep the walk from passing vacuously. `mlx_gen_catalog` pins the exact
+    /// shape — 54 memory-strategy registrations and `49 * 12 + 6 + 3` surfaces — so those numbers
+    /// are asserted here as floors: a provider or a selector silently dropping out of the macOS
+    /// composition reds here instead of quietly shrinking what this gate covers.
     #[cfg(feature = "media")]
     #[test]
     fn every_registered_memory_contract_surface_publishes_honest_facts() {
         let registry = super::memory_contract_surface_registry().unwrap();
-        let surfaces = registry.memory_contract_surfaces().unwrap();
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
         assert!(
-            !surfaces.is_empty(),
-            "the media registry must publish contract surfaces for this assertion to mean anything"
+            coverage.surfaces_checked >= 49 * 12 + 6 + 3,
+            "the macOS registry walked only {} contract surfaces; mlx-gen-catalog pins {}",
+            coverage.surfaces_checked,
+            49 * 12 + 6 + 3
         );
-        let mut errors = Vec::new();
-        for surface in &surfaces {
-            if let Err(surface_errors) =
-                gen_core_testkit::check_memory_contract_facts(&surface.contract)
-            {
-                errors.extend(surface_errors.into_iter().map(|error| {
-                    format!(
-                        "{} [{}]: {error}",
-                        surface.contract.provider_id,
-                        surface.selector.id()
-                    )
-                }));
-            }
-        }
+
+        let providers: std::collections::BTreeSet<&str> = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect();
         assert!(
-            errors.is_empty(),
-            "macOS registry memory-contract facts conformance FAILED:\n- {}",
-            errors.join("\n- ")
+            providers.len() >= 54,
+            "the macOS registry composes only {} memory-strategy providers; mlx-gen-catalog pins 54",
+            providers.len()
         );
     }
 

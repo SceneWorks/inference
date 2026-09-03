@@ -722,7 +722,7 @@ mod tests {
                 contract.architecture_facts, expected,
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         // The packed DiT input width the loader consumes is exactly `latent x patch²`, so the two
@@ -731,6 +731,12 @@ mod tests {
         assert_eq!(
             dit.out_channels * dit.patch_size * dit.patch_size,
             dit.in_channels
+        );
+        // The constant's doc claims it is the same x8 `VaeTiling::QWEN_IMAGE` pins; assert that pin
+        // rather than leaving the two free to drift.
+        assert_eq!(
+            VAE_SPATIAL_SCALE,
+            mlx_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE.spatial_scale as u32
         );
     }
 

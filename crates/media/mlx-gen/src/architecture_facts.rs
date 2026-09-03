@@ -13,6 +13,28 @@
 //! This module owns only the narrowing arithmetic, so a fabricated or zeroed axis cannot appear in
 //! one family and not another.
 
+/// The materialized snapshot directory a contract is being built for, or `None`.
+///
+/// An MLX provider mirrors its family's reference `config.json` as crate constants, so its axes are
+/// publishable before any asset exists — that is what lets the weights-free catalog surface satisfy
+/// the E2 gate. But the *loader* overlays a materialized snapshot's own config over that preset, so
+/// on the materialized path the preset is a guess, not the geometry. This is the gate a provider's
+/// `architecture_facts` uses to tell the two paths apart: when it yields a root, the provider
+/// re-runs its own snapshot parse and publishes what the snapshot actually says; when it yields
+/// `None` there is nothing to read and the preset is the honest answer.
+///
+/// The rule is narrow: the spec's weights must be a [`gen_core::WeightsSource::Dir`] **whose path
+/// exists on disk as a directory**. It does not compare the path against the registry's sentinel
+/// constant, so it fails closed for a renamed sentinel — the registry's
+/// `/__sceneworks_memory_contract_surface__` is a path nobody creates, and any other unmaterialized
+/// path behaves identically. A single-file import is not a component snapshot either.
+pub fn materialized_root(spec: &gen_core::LoadSpec) -> Option<&std::path::Path> {
+    match &spec.weights {
+        gen_core::WeightsSource::Dir(root) if root.is_dir() => Some(root.as_path()),
+        _ => None,
+    }
+}
+
 /// Bytes per element of a bf16 or f16 activation.
 pub const HALF_ACTIVATION_WIDTH: u32 = 2;
 
@@ -86,5 +108,18 @@ mod tests {
         assert_eq!(super::vae_spatial_scale_from_downsamples(3), Some(8));
         assert_eq!(super::vae_spatial_scale_from_downsamples(0), Some(1));
         assert_eq!(super::vae_spatial_scale_from_downsamples(6), None);
+    }
+
+    #[test]
+    fn a_materialized_root_is_only_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(dir.path().to_path_buf()));
+        assert_eq!(super::materialized_root(&spec), Some(dir.path()));
+
+        // The registry's weights-free surface: a `Dir` nobody ever creates.
+        let sentinel = gen_core::LoadSpec::new(gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(super::materialized_root(&sentinel), None);
     }
 }

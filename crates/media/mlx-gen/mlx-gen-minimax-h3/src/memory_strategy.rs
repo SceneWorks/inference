@@ -1006,8 +1006,12 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 ///
 /// The VAE is a **video** autoencoder: `VAE_RATIO` pixels and `VAE_RATIO_T` frames per latent unit,
 /// so `vae_temporal_scale` is a real value here.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = crate::dit::config::MiniMaxH3DitConfig::default();
+///
+/// When `spec` names a materialized snapshot directory, [`dit_config`] re-runs the loader's own
+/// `from_diffusers_json` parse over that snapshot's `transformer/config.json`, so the published
+/// trunk axes are the snapshot's rather than the preset's.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = dit_config(spec);
     // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
     // the temporal factor is already carried by `vae_temporal_scale`.
     let [_, patch_h, patch_w] = dit.patch_size;
@@ -1026,13 +1030,32 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
     }
 }
 
+/// The DiT geometry a contract should describe: the materialized snapshot's own
+/// `transformer/config.json` when one exists, else this crate's mirror of it.
+///
+/// `from_diffusers_json` requires every key, so a partial or variant file declines rather than
+/// half-defaulting into this model's numbers — and declining falls back to the preset, which is
+/// exactly what the weights-free surface publishes.
+fn dit_config(spec: &LoadSpec) -> crate::dit::config::MiniMaxH3DitConfig {
+    mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| {
+            let path = root
+                .join(crate::model::BASE_DIT_PARTITION)
+                .join("config.json");
+            let text = std::fs::read_to_string(path).ok()?;
+            crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
+        })
+        .unwrap_or_default()
+}
+
 fn build_contract(
+    spec: &LoadSpec,
     components: &ComponentBytes,
     load_shape: LoadShape,
     streamable: bool,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
-        architecture_facts: architecture_facts(),
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
@@ -1188,6 +1211,7 @@ fn build_contract(
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
+        spec,
         &ComponentBytes::resolve(spec)?,
         resolved_load_shape(spec),
         streamable(spec),
@@ -1196,10 +1220,14 @@ pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProvider
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts.
 ///
-/// Catalog conformance uses this when the snapshot is unavailable. It must **not** touch the
-/// filesystem, and it must not diverge from [`contract_for`] in anything but the byte counts.
+/// Catalog conformance uses this when the snapshot is unavailable. It must **not** require the
+/// snapshot to exist — no byte count is read off disk here — and it must not diverge from
+/// [`contract_for`] in anything but the byte counts. It does consult the spec's weights directory
+/// for the DiT config when one is materialized (see [`dit_config`]); that is not a byte count, and
+/// on the registry's never-created sentinel path it reads nothing and publishes the preset.
 pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
+        spec,
         &ComponentBytes::weights_free(),
         resolved_load_shape(spec),
         streamable(spec),
@@ -1561,8 +1589,75 @@ mod tests {
                 activation_dtype_width: Some(2),
             }
         );
-        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// The published `transformer/config.json` layout, emitted from a config value so the fixture
+    /// cannot drift from the struct it mirrors. Every key is required by `from_diffusers_json`.
+    fn dit_config_json(cfg: &crate::dit::config::MiniMaxH3DitConfig) -> serde_json::Value {
+        serde_json::json!({
+            "_class_name": "MiniMaxH3Transformer3DModel",
+            "num_attention_heads": cfg.num_attention_heads,
+            "attention_head_dim": cfg.attention_head_dim,
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "num_refiner_layers": cfg.num_refiner_layers,
+            "ffn_dim": cfg.ffn_dim,
+            "in_channels": cfg.in_channels,
+            "audio_in_channels": cfg.audio_in_channels,
+            "patch_size": cfg.patch_size,
+            "text_dim": cfg.text_dim,
+            "freq_dim": cfg.freq_dim,
+            "time_embed_hidden_dim": cfg.time_embed_hidden_dim,
+            "time_embed_dim": cfg.time_embed_dim,
+            "rope_freq_dim": cfg.rope_freq_dim,
+            "rope_theta": cfg.rope_theta,
+            "norm_eps": cfg.norm_eps,
+            "qk_norm_eps": cfg.qk_norm_eps,
+            "final_norm_eps": cfg.final_norm_eps,
+        })
+    }
+
+    fn spec_for_dit_config(dir: &Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `DitBlockStream` parses at load —
+    /// rather than published from the compile-time preset. The mirror fixture agrees with the
+    /// weights-free path; a fixture with mutated keys publishes the mutated axes, which is the
+    /// assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_dit_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_dit_config(
+                mirror.path(),
+                &dit_config_json(&preset)
+            )),
+            architecture_facts(&weightless_spec()),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = dit_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        // 160, not a smaller width: `MiniMaxH3DitConfig::validate` requires the partial rotary
+        // (`2 * 3 * rope_freq_dim` = 96) to fit inside a head, and a rejected config would fall
+        // back to the preset and hide the mutation rather than publish it.
+        mutated["attention_head_dim"] = serde_json::json!(160);
+        let mutated_facts = architecture_facts(&spec_for_dit_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(160)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
     }
 
     fn support(

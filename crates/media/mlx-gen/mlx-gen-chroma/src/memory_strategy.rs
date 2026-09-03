@@ -677,8 +677,6 @@ pub fn contract_for(
     )
 }
 
-/// Declaration-equivalent, zero-filesystem contract used only by registry conformance.
-#[doc(hidden)]
 /// Latent channels the FLUX.1 autoencoder Chroma reuses produces, and pixels per latent unit on
 /// each spatial axis. Chroma loads that VAE through `mlx_gen_flux::load_vae`, so these describe the
 /// same four-stage image autoencoder FLUX.1 ships.
@@ -714,6 +712,8 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
     }
 }
 
+/// Declaration-equivalent, zero-filesystem contract used only by registry conformance.
+#[doc(hidden)]
 pub fn weights_free_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -1180,7 +1180,7 @@ mod tests {
                 },
                 "{provider} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
     }
@@ -1193,6 +1193,14 @@ mod tests {
         assert_eq!(
             LATENT_CHANNELS * LATENT_PATCH_SIZE * LATENT_PATCH_SIZE,
             dit.in_channels as u32
+        );
+        // `VAE_SPATIAL_SCALE`'s doc claims the x8 of the four-stage FLUX.1 autoencoder. That scale
+        // is not a free constant: `SIZE_MULTIPLE` is what the sampler rounds a request to, and it
+        // is exactly `vae_scale * patch`. Deriving the pin from those two keeps the published axis
+        // tied to the geometry the sampler already enforces.
+        assert_eq!(
+            VAE_SPATIAL_SCALE,
+            crate::model::SIZE_MULTIPLE / LATENT_PATCH_SIZE
         );
     }
 

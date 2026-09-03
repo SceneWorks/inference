@@ -1280,7 +1280,7 @@ mod tests {
         ] {
             let contract = weights_free_klein_contract(provider_id, &spec).unwrap();
             assert_eq!(contract.architecture_facts, klein, "{provider_id}");
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         for contract in [

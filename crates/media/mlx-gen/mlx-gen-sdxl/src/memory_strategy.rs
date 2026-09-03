@@ -1333,7 +1333,7 @@ mod tests {
             assert_eq!(contract.architecture_facts.latent_channels, Some(4));
             assert_eq!(contract.architecture_facts.vae_spatial_scale, Some(8));
             assert_eq!(contract.architecture_facts.activation_dtype_width, Some(2));
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
     }

@@ -679,8 +679,16 @@ pub(crate) fn memory_strategy_contract_with_artifact(
 /// latent at all.** The FM head emits RGB patches which `unpatchify` only reshapes, so there is no
 /// latent channel count, no latent patchification factor, and no autoencoder scale — spatial or
 /// temporal — to declare. A structurally absent axis is `None`, never zero.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let llm = crate::config::NeoLlmConfig::default();
+///
+/// When `spec` names a materialized snapshot directory this re-runs `NeoChatConfig::from_dir` —
+/// the loader's own parse — so the published backbone axes are the snapshot's rather than the
+/// preset's. On the weights-free surface there is no `config.json` to read and the preset, which
+/// resolves through that same parser, is the honest answer.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let llm = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::NeoChatConfig::from_dir(root).ok())
+        .map(|chat| chat.llm)
+        .unwrap_or_default();
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(llm.num_attention_heads),
         head_dim: mlx_gen::architecture_facts::axis(llm.head_dim()),
@@ -711,7 +719,7 @@ fn build_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts = architecture_facts(spec);
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
@@ -1689,10 +1697,47 @@ mod tests {
                 },
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         std::fs::remove_dir_all(root).ok();
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+            .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the backbone axes come from
+    /// the snapshot's own `config.json` — the file `NeoChatConfig::from_dir` parses at load —
+    /// rather than from the compile-time preset. The shipped 8B-MoT fixture agrees with the
+    /// weights-free path; a fixture with mutated `llm_config` keys publishes the mutated axes,
+    /// which is the assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_backbone_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let shipped: serde_json::Value =
+            serde_json::from_str(crate::config::MOT_8B_CONFIG).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, weights_free) = fixture_spec(&tmp);
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &shipped)),
+            architecture_facts(&weights_free),
+            "the shipped 8B-MoT config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = shipped.clone();
+        mutated["llm_config"]["num_hidden_layers"] = serde_json::json!(7);
+        mutated["llm_config"]["head_dim"] = serde_json::json!(64);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
     }
 
     /// A phase-bearing context must be refused, not silently admitted against single-phase

@@ -468,8 +468,17 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
 ///
 /// The autoencoder is the Wan z16 **video** VAE, so `vae_temporal_scale` is a real value here: four
 /// frames per latent unit over a x8 spatial scale.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let wan = crate::config::KreaRealtimeConfig::krea_realtime_14b().wan;
+///
+/// When `spec` names a materialized snapshot directory this re-runs
+/// `KreaRealtimeConfig::from_model_dir` — the loader's own parse — so the published trunk axes are
+/// the snapshot's rather than the preset's. Krea Realtime typically ships without a `config.json`,
+/// and `from_model_dir` keeps the shipped preset in that case, so a config-less snapshot publishes
+/// exactly what the weights-free surface does.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::KreaRealtimeConfig::from_model_dir(root).ok())
+        .unwrap_or_else(crate::config::KreaRealtimeConfig::krea_realtime_14b)
+        .wan;
     let (_, patch_h, patch_w) = wan.patch_size;
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     mlx_gen::gen_core::MemoryArchitectureFacts {
@@ -502,7 +511,7 @@ fn contract_from_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts = architecture_facts(spec);
     contract.calibration = None;
     contract.asset_facts = asset_facts;
     contract.lifecycle = MemoryLifecycleCapabilities {
@@ -674,17 +683,75 @@ mod tests {
                 "{} architecture facts",
                 surface.selector.id()
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         // The published pair IS this provider's assigned VAE geometry.
+        let preset_facts = architecture_facts(&weights_free_spec());
         assert_eq!(
             crate::VAE_TILING.spatial_scale as u32,
-            architecture_facts().vae_spatial_scale.unwrap()
+            preset_facts.vae_spatial_scale.unwrap()
         );
         assert_eq!(
             crate::VAE_TILING.temporal_scale as u32,
-            architecture_facts().vae_temporal_scale.unwrap()
+            preset_facts.vae_temporal_scale.unwrap()
+        );
+    }
+
+    /// A spec whose weights directory is the registry's never-created contract-surface sentinel:
+    /// the weights-free path, where the preset is the only geometry there is.
+    fn weights_free_spec() -> LoadSpec {
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+    }
+
+    fn spec_for_config(dir: &Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes come from the
+    /// snapshot's own `config.json` — the file `KreaRealtimeConfig::from_model_dir` overlays at
+    /// load — rather than from the compile-time preset. A snapshot mirroring the reference config
+    /// agrees with the weights-free path; a fixture with mutated keys publishes the mutated axes,
+    /// which is what the unconditional `architecture_facts()` this replaced would fail.
+    ///
+    /// The third arm pins the shipped shape: Krea Realtime ships transformer-only with no
+    /// `config.json` at all, and such a snapshot must still publish the Wan 2.1 14B preset.
+    #[test]
+    fn materialized_trunk_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::KreaRealtimeConfig::krea_realtime_14b().wan;
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &preset.to_json())),
+            architecture_facts(&weights_free_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = preset.to_json();
+        mutated["num_layers"] = serde_json::json!(7);
+        mutated["vae_z_dim"] = serde_json::json!(32);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (
+                mutated_facts.transformer_blocks,
+                mutated_facts.latent_channels
+            ),
+            (Some(7), Some(32)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        let bare_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            bare.path().to_path_buf(),
+        ));
+        assert_eq!(
+            architecture_facts(&bare_spec),
+            architecture_facts(&weights_free_spec()),
+            "the shipped config-less snapshot must publish the preset's axes"
         );
     }
 

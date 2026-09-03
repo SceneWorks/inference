@@ -234,7 +234,16 @@ pub fn architecture_facts(
 }
 
 /// The per-head channel width, published only when every resolution agrees on it.
+///
+/// A length mismatch between `block_out_channels` and `num_attention_heads` declines the axis
+/// rather than zipping: `zip` stops at the shorter vector, so a config that lists a head count for
+/// only some resolutions would publish "every resolution agrees" on the basis of a prefix, while
+/// the resolutions it never looked at could disagree. A config that cannot pair its two vectors is
+/// not a uniform-head stack; it is one this derivation does not understand.
 fn uniform_head_dim(unet: &UNetConfig) -> Option<u32> {
+    if unet.block_out_channels.len() != unet.num_attention_heads.len() {
+        return None;
+    }
     let mut widths = unet
         .block_out_channels
         .iter()
@@ -267,7 +276,7 @@ mod tests {
                     activation_dtype_width: Some(2),
                 }
             );
-            assert!(facts.has_snapshot_read_axis());
+            assert!(facts.has_declared_architecture_axis());
             assert!(facts.zero_valued_axes().is_empty());
         }
     }
@@ -280,6 +289,30 @@ mod tests {
         assert_eq!(uniform_head_dim(&unet), None);
         unet.num_attention_heads = vec![5, 8, 20];
         assert_eq!(uniform_head_dim(&unet), None, "640 / 8 = 80, not 64");
+
+        // A head-count vector shorter than the resolution list declines rather than zipping: the
+        // surviving prefix here is uniform (320/5 = 640/10 = 64), so a `zip` would publish
+        // `Some(64)` on the strength of resolutions it never examined.
+        let mut short = UNetConfig::sdxl_base();
+        short
+            .num_attention_heads
+            .truncate(short.block_out_channels.len() - 1);
+        assert!(!short.num_attention_heads.is_empty());
+        assert_eq!(
+            uniform_head_dim(&short),
+            None,
+            "a truncated head list is not a uniform stack"
+        );
+
+        // And the mirror case: more head counts than resolutions.
+        let mut long = UNetConfig::sdxl_base();
+        long.num_attention_heads
+            .push(*long.num_attention_heads.last().unwrap());
+        assert_eq!(
+            uniform_head_dim(&long),
+            None,
+            "an over-long head list is not a uniform stack"
+        );
     }
 
     #[test]

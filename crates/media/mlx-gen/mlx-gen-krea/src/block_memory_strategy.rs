@@ -301,8 +301,15 @@ pub(crate) fn weights_free_memory_strategy_surface_contract(
 /// `in_channels` 64 is the 2x2-packed view of it. `vae_temporal_scale` stays `None`: Krea 2 is an
 /// image model whose autoencoder has no temporal axis, and a structurally absent axis is declared
 /// absent, never zero.
-pub(crate) fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = crate::config::Krea2Config::turbo();
+///
+/// When `spec` names a materialized snapshot directory this re-runs `Krea2Config::from_snapshot` —
+/// the loader's own `transformer/config.json` parse — so the published trunk axes are the
+/// snapshot's rather than the preset's. On the weights-free surface there is nothing to read and
+/// the preset, which that parser itself falls back to per key, is the honest answer.
+pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::Krea2Config::from_snapshot(root).ok())
+        .unwrap_or_else(crate::config::Krea2Config::turbo);
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
         head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
@@ -333,7 +340,7 @@ fn memory_strategy_contract_with_components(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts = architecture_facts(spec);
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -1647,7 +1654,7 @@ mod tests {
                 contract.architecture_facts, expected,
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         let control = crate::memory_strategy::weights_free_memory_strategy_contract(
@@ -1666,6 +1673,76 @@ mod tests {
             dit.in_channels
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The `transformer/config.json` keys `Krea2Config::from_json` reads, emitted from a config
+    /// value so the fixture cannot drift from the struct it mirrors.
+    fn krea_transformer_config_json(cfg: &crate::config::Krea2Config) -> serde_json::Value {
+        serde_json::json!({
+            "in_channels": cfg.in_channels,
+            "num_attention_heads": cfg.num_attention_heads,
+            "num_key_value_heads": cfg.num_kv_heads,
+            "attention_head_dim": cfg.attention_head_dim,
+            "num_layers": cfg.num_layers,
+            "intermediate_size": cfg.intermediate_size,
+            "norm_eps": cfg.norm_eps,
+            "axes_dims_rope": cfg.axes_dims_rope,
+            "rope_theta": cfg.rope_theta,
+            "timestep_embed_dim": cfg.timestep_embed_dim,
+            "num_text_layers": cfg.num_text_layers,
+            "num_layerwise_text_blocks": cfg.num_layerwise_text_blocks,
+            "num_refiner_text_blocks": cfg.num_refiner_text_blocks,
+            "text_hidden_dim": cfg.text_hidden_dim,
+            "text_intermediate_size": cfg.text_intermediate_size,
+            "text_num_attention_heads": cfg.text_num_attention_heads,
+            "text_num_key_value_heads": cfg.text_num_kv_heads,
+        })
+    }
+
+    fn spec_for_transformer_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the DiT axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `Krea2Config::from_snapshot` parses
+    /// at load — rather than published from the compile-time preset. The mirror fixture agrees
+    /// with the weights-free path; a fixture whose `num_layers` is mutated publishes the mutated
+    /// depth, which is what the unconditional `architecture_facts()` this replaced would fail.
+    ///
+    /// `num_layers` is the mutated key because it is the only trunk axis a snapshot can move on
+    /// its own: `Krea2Config::validate` ties `attention_head_dim` to `sum(axes_dims_rope)` and to
+    /// `text_hidden_dim`, so mutating the head width alone is rejected by the parser rather than
+    /// published.
+    #[test]
+    fn materialized_dit_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::Krea2Config::turbo();
+        let weights_free = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_transformer_config(
+                mirror.path(),
+                &krea_transformer_config_json(&preset)
+            )),
+            architecture_facts(&weights_free),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = krea_transformer_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        let mutated_facts =
+            architecture_facts(&spec_for_transformer_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            mutated_facts.transformer_blocks,
+            Some(7),
+            "the materialized path must publish the snapshot's depth, not the preset's"
+        );
     }
 
     #[test]

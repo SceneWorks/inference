@@ -679,8 +679,16 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
 /// the binary i2v mask concatenated onto the latent, which the autoencoder neither produces nor
 /// consumes. SCAIL-2 decodes through the Wan z16 **video** autoencoder, so `vae_temporal_scale` is a
 /// real value here.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let wan = crate::config::Scail2Config::scail2_14b().wan;
+///
+/// When `spec` names a materialized snapshot directory this re-runs `Scail2Config::from_model_dir`
+/// — the loader's own parse — so the published axes are the snapshot's rather than the preset's.
+/// On the weights-free surface there is no config to read and the preset is what the loader would
+/// itself start from.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::Scail2Config::from_model_dir(root).ok())
+        .unwrap_or_else(crate::config::Scail2Config::scail2_14b)
+        .wan;
     let (_, patch_h, patch_w) = wan.patch_size;
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     mlx_gen::gen_core::MemoryArchitectureFacts {
@@ -708,7 +716,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
-        architecture_facts: architecture_facts(),
+        architecture_facts: architecture_facts(spec),
         provider_id: PROVIDER_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -962,17 +970,76 @@ mod tests {
                 "{} architecture facts",
                 surface.selector.id()
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         // The published pair IS this provider's assigned VAE geometry.
+        let preset_facts = architecture_facts(&weights_free_spec());
         assert_eq!(
             crate::VAE_TILING.spatial_scale as u32,
-            architecture_facts().vae_spatial_scale.unwrap()
+            preset_facts.vae_spatial_scale.unwrap()
         );
         assert_eq!(
             crate::VAE_TILING.temporal_scale as u32,
-            architecture_facts().vae_temporal_scale.unwrap()
+            preset_facts.vae_temporal_scale.unwrap()
+        );
+    }
+
+    /// A spec whose weights directory is the registry's never-created contract-surface sentinel:
+    /// the weights-free path, where the preset is the only geometry there is.
+    fn weights_free_spec() -> LoadSpec {
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+    }
+
+    /// The upstream `config-14b.json` keys `Scail2Config::from_model_dir` actually reads.
+    fn scail2_config_json(cfg: &crate::config::Scail2Config) -> serde_json::Value {
+        serde_json::json!({
+            "in_dim": cfg.wan.in_dim,
+            "out_dim": cfg.wan.out_dim,
+            "dim": cfg.wan.dim,
+            "ffn_dim": cfg.wan.ffn_dim,
+            "num_heads": cfg.wan.num_heads,
+            "num_layers": cfg.wan.num_layers,
+            "mask_dim": cfg.mask_dim,
+        })
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the axes are the snapshot's
+    /// own, because `Scail2Config::from_model_dir` overlays that snapshot's `config.json` over the
+    /// preset. A fixture mirroring the reference config agrees with the weights-free preset path;
+    /// a fixture with mutated keys publishes the mutated axes — which is what the unconditional
+    /// `architecture_facts()` this function replaced would fail.
+    #[test]
+    fn materialized_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::Scail2Config::scail2_14b();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(
+                mirror.path(),
+                &scail2_config_json(&preset)
+            )),
+            architecture_facts(&weights_free_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = scail2_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        mutated["dim"] = serde_json::json!(2560);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            // 2560 / 40 heads.
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
         );
     }
 

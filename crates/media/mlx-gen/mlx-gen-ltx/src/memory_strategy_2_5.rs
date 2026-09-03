@@ -447,7 +447,7 @@ fn build_contract(
     Ok(MemoryProviderContract {
         // Shared with the 2.3 route: the measured 2.3 to 2.5 delta is two booleans, not a
         // dimension, so both routes publish the same axes from one derivation (SC-22662).
-        architecture_facts: crate::memory_strategy::architecture_facts(),
+        architecture_facts: crate::memory_strategy::architecture_facts(spec),
         provider_id: LTX_2_5_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -952,9 +952,9 @@ mod tests {
         );
         assert_eq!(
             contract.architecture_facts,
-            crate::memory_strategy::architecture_facts()
+            crate::memory_strategy::architecture_facts(&spec(LoadShape::EagerMaterialization))
         );
-        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
     }
 

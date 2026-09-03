@@ -267,9 +267,10 @@ fn get_bool(v: &Value, key: &str, default: bool) -> bool {
 }
 
 /// A minimal `config.json` carrying the 8B-MoT structural values (the parser ignores the many
-/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config and loader tests.
+/// fields it does not model — `min_pixels`, `P_mean`, …). Shared by the config, loader and
+/// memory-contract tests.
 #[cfg(test)]
-const MOT_8B_CONFIG: &str = r#"{
+pub(crate) const MOT_8B_CONFIG: &str = r#"{
       "model_type": "neo_chat",
       "template": "neo1_0",
       "tie_word_embeddings": false,

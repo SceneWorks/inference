@@ -954,7 +954,7 @@ mod tests {
                 },
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         // The published pair reconstructs the pipeline's enforced stride, so neither axis can drift

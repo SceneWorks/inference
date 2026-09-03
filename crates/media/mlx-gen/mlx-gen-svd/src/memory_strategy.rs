@@ -381,7 +381,16 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 }
 
 /// The per-head channel width, published only when every U-Net resolution agrees on it.
+///
+/// A length mismatch between `block_out_channels` and `num_attention_heads` declines the axis
+/// rather than zipping: `zip` stops at the shorter vector, so a config that lists a head count for
+/// only some resolutions would publish "every resolution agrees" on the basis of a prefix, while
+/// the resolutions it never looked at could disagree. A config that cannot pair its two vectors is
+/// not a uniform-head stack; it is one this derivation does not understand.
 fn uniform_head_dim(unet: &crate::config::UnetConfig) -> Option<u32> {
+    if unet.block_out_channels.len() != unet.num_attention_heads.len() {
+        return None;
+    }
     let mut widths = unet
         .block_out_channels
         .iter()
@@ -826,7 +835,7 @@ mod tests {
                 "{} architecture facts",
                 surface.selector.id()
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
         // The published spatial scale IS the compression the latent allocation divides by.
@@ -844,6 +853,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(uniform_head_dim(&unet), None);
+
+        // A head-count vector shorter than the resolution list declines rather than zipping: the
+        // surviving prefix is uniform, so a `zip` would publish a width on the strength of
+        // resolutions it never examined.
+        let mut short = crate::config::UnetConfig::default();
+        short
+            .num_attention_heads
+            .truncate(short.block_out_channels.len() - 1);
+        assert!(!short.num_attention_heads.is_empty());
+        assert_eq!(
+            uniform_head_dim(&short),
+            None,
+            "a truncated head list is not a uniform stack"
+        );
+
+        // And the mirror case: more head counts than resolutions.
+        let mut long = crate::config::UnetConfig::default();
+        long.num_attention_heads
+            .push(*long.num_attention_heads.last().unwrap());
+        assert_eq!(
+            uniform_head_dim(&long),
+            None,
+            "an over-long head list is not a uniform stack"
+        );
     }
 
     fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {

@@ -119,6 +119,7 @@ pub fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<
 pub fn memory_strategy_contract(provider_id: &str, _tier: Option<Quant>) -> MemoryProviderContract {
     memory_strategy_contract_with_adapters(
         provider_id,
+        None,
         &[],
         Default::default(),
         mlx_gen::LoadShape::EagerMaterialization,
@@ -140,6 +141,7 @@ pub(crate) fn weights_free_memory_strategy_contract(
     let streamable = streamable_spec(spec)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(spec),
         &spec.adapters,
         Default::default(),
         spec.load_shape,
@@ -219,6 +221,7 @@ pub fn weights_free_memory_surface_contract(
     validate_load_contract(provider_id, &surface.spec)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(&surface.spec),
         &surface.spec.adapters,
         Default::default(),
         surface.spec.load_shape,
@@ -324,6 +327,7 @@ fn memory_strategy_contract_for_resolved_components(
     let streamable = streamable_resolved_components(spec, dirs)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(spec),
         &spec.adapters,
         components,
         spec.load_shape,
@@ -342,8 +346,14 @@ fn memory_strategy_contract_for_resolved_components(
 /// `patch_size` is 1 — Mage flattens token-per-latent-cell with no patchify, so this is a real
 /// declared value and not a stand-in for an absent axis. `vae_temporal_scale` stays `None`:
 /// Mage-Flow is an image model whose autoencoder has no temporal axis.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = crate::config::MageFlowConfig::mage_flow();
+///
+/// When `spec` names a materialized snapshot directory, [`dit_config`] re-runs the loader's own
+/// `from_transformer_config_json` parse over that snapshot's `transformer/config.json`, so the
+/// published trunk axes are the snapshot's rather than the preset's. `None` is the eager
+/// [`memory_strategy_contract`] entry point, which is handed no load identity at all and therefore
+/// has no snapshot to read: it publishes the preset, exactly as it did before.
+fn architecture_facts(spec: Option<&LoadSpec>) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = dit_config(spec);
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
         head_dim: mlx_gen::architecture_facts::axis(dit.head_dim()),
@@ -360,8 +370,35 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
     }
 }
 
+/// The trunk geometry a contract should describe: the materialized snapshot's own
+/// `transformer/config.json` when one exists, else this crate's mirror of it.
+///
+/// Both snapshot layouts are accepted, because both are loadable: the pipeline's
+/// `<root>/transformer/config.json`, and a caller-owned fine-tuned transformer directory whose
+/// own `config.json` sits at the root (`is_finetuned_transformer_dir`).
+///
+/// `from_transformer_config_json` requires every consumed key and pins the ones this port
+/// hardcodes, so a partial or divergent file declines rather than half-defaulting into this
+/// model's numbers — and declining falls back to the preset.
+fn dit_config(spec: Option<&LoadSpec>) -> crate::config::MageFlowConfig {
+    spec.and_then(mlx_gen::architecture_facts::materialized_root)
+        .and_then(|root| {
+            [root.join("transformer"), root.to_path_buf()]
+                .into_iter()
+                .find_map(|dir| {
+                    let json = std::fs::read_to_string(
+                        dir.join(crate::transformer::TRANSFORMER_CONFIG_FILE),
+                    )
+                    .ok()?;
+                    crate::config::MageFlowConfig::from_transformer_config_json(&json).ok()
+                })
+        })
+        .unwrap_or_else(crate::config::MageFlowConfig::mage_flow)
+}
+
 fn memory_strategy_contract_with_adapters(
     provider_id: &str,
+    spec: Option<&LoadSpec>,
     adapters: &[mlx_gen::AdapterSpec],
     components: mlx_gen::PerComponentBytes,
     load_shape: mlx_gen::LoadShape,
@@ -408,7 +445,7 @@ fn memory_strategy_contract_with_adapters(
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.load_shape = load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts = architecture_facts(spec);
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         MEMORY_CALIBRATION_FINGERPRINT,
         load_shape,
@@ -1887,6 +1924,7 @@ mod tests {
 
         let mut deferred = memory_strategy_contract_with_adapters(
             "mage_flow",
+            None,
             &[],
             Default::default(),
             mlx_gen::LoadShape::DeferredMaterialization,
@@ -2068,9 +2106,79 @@ mod tests {
                 },
                 "{provider_id} architecture facts"
             );
-            assert!(contract.architecture_facts.has_snapshot_read_axis());
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
+    }
+
+    /// The `transformer/config.json` keys `from_transformer_config_json` requires, emitted from a
+    /// config value so the fixture cannot drift from the struct it mirrors.
+    fn transformer_config_json(cfg: &crate::config::MageFlowConfig) -> serde_json::Value {
+        serde_json::json!({
+            "in_channels": cfg.in_channels,
+            "out_channels": cfg.out_channels,
+            "context_in_dim": cfg.context_in_dim,
+            "hidden_size": cfg.hidden_size,
+            "num_heads": cfg.num_heads,
+            "depth": cfg.depth,
+            "axes_dim": cfg.axes_dim,
+            "checkpoint": cfg.checkpoint,
+            "patch_size": cfg.patch_size,
+        })
+    }
+
+    fn spec_for_transformer_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join(crate::transformer::TRANSFORMER_CONFIG_FILE),
+            config.to_string(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `MageTransformer::load` parses —
+    /// rather than published from the compile-time preset. The mirror fixture agrees with the
+    /// weights-free path; a fixture whose `depth` is mutated publishes the mutated block count,
+    /// which is what the unconditional `architecture_facts()` this replaced would fail.
+    ///
+    /// `depth` is the mutated key because it is the trunk axis a snapshot can move on its own:
+    /// `MageFlowConfig::validate` ties `hidden_size`/`num_heads` to `sum(axes_dim)`, so mutating
+    /// the head width alone is rejected by the parser rather than published.
+    #[test]
+    fn materialized_trunk_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::MageFlowConfig::mage_flow();
+        let weights_free = LoadSpec::new(WeightsSource::Dir("/nonexistent/mage-contract".into()));
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(Some(&spec_for_transformer_config(
+                mirror.path(),
+                &transformer_config_json(&preset)
+            ))),
+            architecture_facts(Some(&weights_free)),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+        // The eager entry point carries no load identity at all and still publishes the preset.
+        assert_eq!(
+            architecture_facts(None),
+            architecture_facts(Some(&weights_free))
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = transformer_config_json(&preset);
+        mutated["depth"] = serde_json::json!(7);
+        let mutated_facts = architecture_facts(Some(&spec_for_transformer_config(
+            mutated_dir.path(),
+            &mutated,
+        )));
+        assert_eq!(
+            mutated_facts.transformer_blocks,
+            Some(7),
+            "the materialized path must publish the snapshot's depth, not the preset's"
+        );
     }
 
     #[test]

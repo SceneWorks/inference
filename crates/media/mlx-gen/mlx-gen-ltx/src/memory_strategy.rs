@@ -653,8 +653,15 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 ///
 /// The VAE is a **video** autoencoder, so `vae_temporal_scale` is a real value here: eight frames
 /// per latent unit over a x32 spatial scale, which `diff_vae::VIDEO_SCALE_FACTORS` restates.
-pub(crate) fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = crate::config::LtxConfig::video_only_defaults();
+///
+/// When `spec` names a materialized snapshot directory this re-runs `LtxConfig::from_model_dir` —
+/// the loader's own `embedded_config.json` parse — so the published trunk axes are the snapshot's
+/// rather than the preset's. On the weights-free surface there is nothing to read, and the preset
+/// is what `from_model_dir` itself falls back to.
+pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::LtxConfig::from_model_dir(root).ok())
+        .unwrap_or_else(crate::config::LtxConfig::video_only_defaults);
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
         head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
@@ -706,7 +713,7 @@ fn build_contract(
         }
     };
     Ok(MemoryProviderContract {
-        architecture_facts: architecture_facts(),
+        architecture_facts: architecture_facts(spec),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -1662,7 +1669,7 @@ mod tests {
             },
             "ltx_2_3 architecture facts"
         );
-        assert!(contract.architecture_facts.has_snapshot_read_axis());
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
         // The published scales ARE the released DiffVAE's `(time, height, width)` factors.
         assert_eq!(
             [
@@ -1673,6 +1680,55 @@ mod tests {
             crate::diff_vae::VIDEO_SCALE_FACTORS.map(|scale| Some(scale as u32))
         );
         gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// The `embedded_config.json` keys `LtxConfig::from_model_dir` reads for the three trunk axes
+    /// this provider publishes. Emitted from a config value so the fixture cannot drift.
+    fn embedded_config_json(cfg: &crate::config::LtxConfig) -> serde_json::Value {
+        serde_json::json!({
+            "transformer": {
+                "num_attention_heads": cfg.num_attention_heads,
+                "attention_head_dim": cfg.attention_head_dim,
+                "num_layers": cfg.num_layers,
+            }
+        })
+    }
+
+    fn spec_for_embedded_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("embedded_config.json"), config.to_string()).unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes come from the
+    /// snapshot's own `embedded_config.json` — the file the loader parses — rather than from the
+    /// compile-time preset. The mirror fixture agrees with the weights-free path; a fixture with
+    /// mutated keys publishes the mutated axes, which is what the unconditional
+    /// `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_trunk_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::LtxConfig::video_only_defaults();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_embedded_config(
+                mirror.path(),
+                &embedded_config_json(&preset)
+            )),
+            architecture_facts(&fixture_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = embedded_config_json(&preset);
+        mutated["transformer"]["num_layers"] = serde_json::json!(7);
+        mutated["transformer"]["attention_head_dim"] = serde_json::json!(64);
+        let mutated_facts =
+            architecture_facts(&spec_for_embedded_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
     }
 
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
