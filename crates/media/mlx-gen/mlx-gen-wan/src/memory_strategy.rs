@@ -734,8 +734,18 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
         vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
-        // Wan is bf16-native: every matmul runs bf16 over an f32 residual stream.
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        // SC-22667 (E2). This declared `HALF_ACTIVATION_WIDTH` for the DiT alone, but gen-core
+        // carries ONE scalar for the whole contract — "bytes per element of the activation dtype" —
+        // and this contract declares Conditioning and Decode as phases alongside Denoise. Two of
+        // those three run f32: `vae.rs` says outright that everything in the autoencoder runs f32
+        // (the reference upcasts it, and f32 also sidesteps the bf16 NAX kernel history), and
+        // `text_encoder.rs` runs the whole UMT5-XXL with f32 activations, promoting
+        // `matmul(f32, bf16)` to an f32 GEMM. The honest single scalar is therefore the widest
+        // activation dtype any declared phase runs. Under-declaring it halves the estimate for two
+        // real phases, and an under-declared floor admits a render that then OOMs — the failure the
+        // ladder exists to prevent. The bf16-native denoise matmuls are unchanged; only their
+        // f32 residual stream and the two f32 phases are now described.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
     }
 }
 
@@ -1331,7 +1341,9 @@ mod tests {
                     vae_spatial_scale: Some(16),
                     // A video autoencoder: four frames per latent unit.
                     vae_temporal_scale: Some(4),
-                    activation_dtype_width: Some(2),
+                    // Two of the three declared phases run f32 (the z16 autoencoder and
+                    // the UMT5-XXL activations), so the one scalar is the widest of them.
+                    activation_dtype_width: Some(4),
                 },
                 "{} architecture facts",
                 surface.selector.id()

@@ -675,6 +675,36 @@ struct ComponentBytes {
     overlay: u64,
 }
 
+/// Bytes a `spec.precision`-following component occupies once loaded (SC-22667).
+///
+/// `LinearNoBias::from_weights` and the DiT block builder call `cast_weights(dtype)` on every
+/// **dense** base, and `model.rs` selects that dtype as `Float32` under [`Precision::Fp32`] and
+/// `Bfloat16` otherwise. A bf16-stored dense checkpoint loaded at Fp32 therefore materializes twice
+/// its on-disk size, which the plain `safetensors_path_bytes` sum could not see. A packed q4/q8
+/// tier is unaffected: `cast_weights` is deliberately not applied to a packed base, and the shared
+/// projection detects an existing affine pack by its `.scales` companion and leaves it at stored
+/// width.
+fn materialized_component_bytes(path: &std::path::Path, precision: mlx_gen::Precision) -> u64 {
+    if precision == mlx_gen::Precision::Fp32 {
+        materialized_f32_bytes(path)
+    } else {
+        safetensors_path_bytes(path)
+    }
+}
+
+/// Bytes a component that is materialized f32 regardless of `spec.precision` occupies.
+///
+/// Falls back to the on-disk sum when the source cannot be read as safetensors. This runs at
+/// contract time, ahead of any component load, so an absent or not-yet-staged component must keep
+/// its previous accounting rather than turn the contract into a refusal.
+fn materialized_f32_bytes(path: &std::path::Path) -> u64 {
+    let stored = safetensors_path_bytes(path);
+    mlx_gen::asset_facts::projected_safetensors_bytes(path, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    })
+    .unwrap_or(stored)
+}
+
 impl ComponentBytes {
     fn resolve(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Self> {
         let root = match &spec.weights {
@@ -685,7 +715,7 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(DIT_COMPONENT),
         };
-        let dit_bytes = safetensors_path_bytes(&dit);
+        let dit_bytes = materialized_component_bytes(&dit, spec.precision);
         // **The condition encoder honors its own staged override too** (sc-19120 / sc-20267). It did
         // NOT before, and the omission was `DIT_COMPONENT`'s own bug one component over: sc-19120
         // made the text encoder per-tier and staged **independently** of the DiT, so a split `q4`
@@ -714,11 +744,15 @@ impl ComponentBytes {
             )));
         };
         Ok(Self {
+            // The Qwen3 condition encoder is built at `Dtype::Bfloat16` on every path
+            // (`text_encoder/encoder.rs`), so it does not follow `spec.precision`.
             text_encoder: safetensors_path_bytes(text_encoder),
             dit: dit_bytes,
             adaln: resolved_adaln_bytes(&dit, dit_bytes),
-            video_vae: safetensors_path_bytes(root.join("vae")),
-            audio_vae: safetensors_path_bytes(root.join("audio_vae")),
+            video_vae: materialized_component_bytes(&root.join("vae"), spec.precision),
+            // The audio VAE is a BigVGAN stack built at `Dtype::Float32` unconditionally, on both
+            // the encode and the decode side (`model.rs`) — never at `self.dtype`.
+            audio_vae: materialized_f32_bytes(&root.join("audio_vae")),
             overlay,
         })
     }
@@ -1028,8 +1062,20 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
         vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
-        // `model.rs` loads and runs the DiT at `Dtype::Bfloat16` for every precision but `Fp32`.
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        // SC-22667. This line used to hardcode `HALF_ACTIVATION_WIDTH` while its own comment named
+        // the exception, so it was wrong on two counts.
+        //
+        // 1. `model.rs` selects `Dtype::Float32` for the DiT under `Precision::Fp32` and
+        //    `Dtype::Bfloat16` otherwise, so an Fp32 load published half the width it computes at.
+        // 2. The audio VAE is built at `Dtype::Float32` UNCONDITIONALLY on both the encode and the
+        //    decode side (`model.rs`), and `MemoryPhase::Decode` is a declared phase of this
+        //    contract. gen-core carries one scalar for the whole contract and cannot express a
+        //    per-phase split, so the honest scalar is the widest activation dtype any declared
+        //    phase runs: under-declaring it halves the estimate for a phase that really does run
+        //    f32, and an under-declared floor admits a render that then OOMs — the failure the
+        //    ladder exists to prevent, and the same reasoning `ComponentBytes::resolve` records
+        //    for the staged text encoder.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
     }
 }
 
@@ -1039,16 +1085,31 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
 /// `from_diffusers_json` requires every key, so a partial or variant file declines rather than
 /// half-defaulting into this model's numbers — and declining falls back to the preset, which is
 /// exactly what the weights-free surface publishes.
+///
+/// SC-22667: the DiT is honored at its **resolved** location, not under the snapshot root. It is
+/// the one tiered component, so a split `q4` install stages [`DIT_COMPONENT`] outside the snapshot
+/// and has no `root/transformer` at all — `model.rs` says exactly that where it probes the same
+/// file, and `ComponentBytes::resolve` already applies the staged override for both the DiT and the
+/// text encoder. Reading only under the root made the probe miss on every split install, so the
+/// preset was published although the loaded config was one `spec.components` lookup away.
 fn dit_config(spec: &LoadSpec) -> crate::dit::config::MiniMaxH3DitConfig {
-    mlx_gen::architecture_facts::materialized_root(spec)
-        .and_then(|root| {
-            let path = root
-                .join(crate::model::BASE_DIT_PARTITION)
-                .join("config.json");
-            let text = std::fs::read_to_string(path).ok()?;
-            crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
-        })
-        .unwrap_or_default()
+    resolved_dit_config(spec).unwrap_or_default()
+}
+
+/// The DiT config as the loader would resolve it, or `None` when no materialized directory carries
+/// a parseable one.
+fn resolved_dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3DitConfig> {
+    let staged = match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(staged)) => Some(staged.clone()),
+        _ => None,
+    };
+    let root_partition = mlx_gen::architecture_facts::materialized_root(spec)
+        .map(|root| root.join(crate::model::BASE_DIT_PARTITION));
+    // Staged first, exactly as `resolve_dit_dir` prefers it.
+    staged.into_iter().chain(root_partition).find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+        crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
+    })
 }
 
 /// The video-VAE geometry a contract should describe: the materialized snapshot's own
@@ -1604,7 +1665,9 @@ mod tests {
                 vae_spatial_scale: Some(16),
                 // A video autoencoder: four frames per latent unit.
                 vae_temporal_scale: Some(4),
-                activation_dtype_width: Some(2),
+                // The audio VAE is built f32 unconditionally and `Precision::Fp32`
+                // widens the DiT too, so the one scalar is the widest declared phase (SC-22667).
+                activation_dtype_width: Some(4),
             }
         );
         assert!(contract.architecture_facts.has_declared_architecture_axis());
@@ -1675,6 +1738,65 @@ mod tests {
             (mutated_facts.transformer_blocks, mutated_facts.head_dim),
             (Some(7), Some(160)),
             "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): the DiT is the one tiered component, so a split `q4`
+    /// install stages [`DIT_COMPONENT`] OUTSIDE the snapshot and carries no `root/transformer` at
+    /// all — `model.rs` says exactly that where it probes the same file, and
+    /// `ComponentBytes::resolve` already honours the staged override for the DiT and the text
+    /// encoder. `dit_config` read only under the root, so every split install fell back to the
+    /// preset although the loaded config was one `spec.components` lookup away.
+    ///
+    /// Mutation that fails this: dropping the staged leg from `resolved_dit_config` — the split
+    /// fixture then publishes the preset's 50 blocks instead of the staged config's 7.
+    #[test]
+    fn a_split_tier_install_reads_the_dit_config_at_its_staged_location() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+        let mut staged_config = dit_config_json(&preset);
+        staged_config["num_layers"] = serde_json::json!(7);
+
+        // A snapshot root with NO `transformer/` at all, plus the DiT staged elsewhere.
+        let root = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        std::fs::write(staged.path().join("config.json"), staged_config.to_string()).unwrap();
+        let mut spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            root.path().to_path_buf(),
+        ));
+        spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            mlx_gen::gen_core::WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(
+            architecture_facts(&spec).transformer_blocks,
+            Some(7),
+            "a staged DiT partition must be read where `resolve_dit_dir` would read it"
+        );
+
+        // The staged partition WINS over a root partition, exactly as `resolve_dit_dir` prefers it.
+        let both = tempfile::tempdir().unwrap();
+        let transformer = both.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            dit_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        let mut both_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            both.path().to_path_buf(),
+        ));
+        both_spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            mlx_gen::gen_core::WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(architecture_facts(&both_spec).transformer_blocks, Some(7));
+
+        // A flat snapshot with no staged component is unchanged.
+        let flat = tempfile::tempdir().unwrap();
+        let flat_spec = spec_for_dit_config(flat.path(), &dit_config_json(&preset));
+        assert_eq!(
+            architecture_facts(&flat_spec).transformer_blocks,
+            architecture_facts(&weightless_spec()).transformer_blocks
         );
     }
 
