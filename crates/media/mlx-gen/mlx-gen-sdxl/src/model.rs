@@ -1700,9 +1700,10 @@ pub fn snapshot_component_footprint(root: &Path) -> mlx_gen::PerComponentBytes {
         &["unet"],
         &["vae"],
     );
-    let projected = |file: Option<std::path::PathBuf>, projection: ResidentProjection| {
-        projected_safetensors_bytes(file?, move |_| projection).ok()
-    };
+    let projected =
+        |file: Option<std::path::PathBuf>, projection: ResidentProjection| -> Option<u64> {
+            projected_safetensors_bytes(file?, move |_| projection).ok()
+        };
     let half = ResidentProjection::Bfloat16;
 
     let clip_l = projected(

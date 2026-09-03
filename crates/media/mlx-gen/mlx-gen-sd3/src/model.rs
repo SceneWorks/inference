@@ -600,7 +600,7 @@ fn img2img_strength(reference: Option<f32>, request: Option<f32>) -> f32 {
 ///   pinned SD3.5-Large snapshot stores both at 2 bytes per element — so CLIP-L (123.65M params)
 ///   plus CLIP-G (694.66M) were under-declared by their own stored size, about 1.6 GB.
 /// * `text_encoder_3/` ships f32 and fp16 shards side by side and
-///   [`gen_core::resolve_sd3_text_encoder_artifacts`] deliberately selects only the master set, so
+///   `resolve_sd3_text_encoder_artifacts` deliberately selects only the master set, so
 ///   the directory sum counted shards no load ever opens.
 ///
 /// The projection therefore prices exactly the artifacts the resolver hands `load_text_encoders`:

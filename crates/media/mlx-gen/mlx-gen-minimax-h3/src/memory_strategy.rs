@@ -678,7 +678,7 @@ struct ComponentBytes {
 /// Bytes a `spec.precision`-following component occupies once loaded (SC-22667).
 ///
 /// `LinearNoBias::from_weights` and the DiT block builder call `cast_weights(dtype)` on every
-/// **dense** base, and `model.rs` selects that dtype as `Float32` under [`Precision::Fp32`] and
+/// **dense** base, and `model.rs` selects that dtype as `Float32` under `Precision::Fp32` and
 /// `Bfloat16` otherwise. A bf16-stored dense checkpoint loaded at Fp32 therefore materializes twice
 /// its on-disk size, which the plain `safetensors_path_bytes` sum could not see. A packed q4/q8
 /// tier is unaffected: `cast_weights` is deliberately not applied to a packed base, and the shared
