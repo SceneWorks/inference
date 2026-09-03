@@ -414,11 +414,16 @@ impl SafetensorsTensorHeader {
     /// compute dtype. Integer and boolean tensors remain stored-width.
     ///
     /// `F8_E4M3` is deliberately **excluded**: `candle_gen::weights::coerce_float` only casts
-    /// `F16 | BF16 | F32 | F64`, so an fp8 payload stays at its stored width and needs an explicit,
-    /// route-owned dequantization contract (paired `weight_scale`/`scales` companions) before it can
-    /// be priced. Admission guards therefore fail closed on fp8 through this predicate; a route that
-    /// genuinely accepts fp8 declares it explicitly, the way
-    /// [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
+    /// `F16 | BF16 | F32 | F64`, so through the shared loader an fp8 payload stays at its stored
+    /// width and needs an explicit, route-owned dequantization contract (paired
+    /// `weight_scale`/`scales` companions) before it can be priced. Admission guards therefore fail
+    /// closed on fp8 through this predicate; a route that genuinely accepts fp8 declares it
+    /// explicitly, the way [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
+    ///
+    /// What the row occupies *after* such a route loads it is that route's fact, not this
+    /// predicate's: a planned single-file import (`candle_gen::logical_weights`) decodes an fp8 row
+    /// to dense bf16 wherever its residency policy masks the packed fp8 leg, so a pricing built on
+    /// `is_float()` alone under-declares those rows by half — see [`materialized_path_bytes`].
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
@@ -850,6 +855,75 @@ pub fn safetensors_path_bytes(path: impl AsRef<Path>) -> u64 {
     } else {
         0
     }
+}
+
+/// Bytes a loader materializes for every tensor at `path`, when it opens that component at a single
+/// float width (epic SC-22657, E1; feature-end sweep SC-22667).
+///
+/// [`safetensors_path_bytes`] answers a *different* question — how many bytes the component occupies
+/// **on disk** — and the two disagree by a factor of two on every component whose loader opens it at
+/// a width the checkpoint does not store in. The canonical cases in this workspace are a bf16 VAE
+/// opened f32 (under-priced 2x by an on-disk sum) and an f32-on-disk text encoder opened bf16
+/// (over-priced 2x). E1 asks for the bytes the loader materializes, so a provider whose component
+/// dtype is pinned in code prices it here rather than from file lengths.
+///
+/// The per-tensor rule is Candle's own `coerce_float` boundary, mirrored:
+///
+/// * `F16 | BF16 | F32 | F64` are **cast** to `float_width`, so they contribute
+///   `element_count * float_width`;
+/// * every other dtype — the integer code planes of a packed tier, `U8`, `BOOL`, and `F8_E4M3` —
+///   contributes its **stored** `data_bytes`.
+///
+/// That second arm is what makes one call correct for a dense snapshot and for an already-packed
+/// q4/q8 tier of the same component: the packed code planes keep their stored width while the dense
+/// residual (norms, biases, embeddings) is priced at the width it is opened in.
+///
+/// **The fp8 arm is a floor, not a universal fact.** What an `F8_E4M3` row occupies after load is
+/// **loader-specific**: the shared `coerce_float` never casts it, so a loader that reads the raw
+/// mmap holds it at 1 B/element — but a loader that routes the file through the checkpoint-codec
+/// plan (`candle_gen::logical_weights`, which every planned single-file import uses) decodes an fp8
+/// row to its codec's dense resident encoding, bf16, at 2 B/element with the `weight_scale` applied,
+/// on every host whose residency policy masks the packed fp8 leg. A provider whose route takes that
+/// decode must price the fp8 rows itself (from the plan, or at its dense width) rather than through
+/// this function, which would under-declare them by exactly half.
+///
+/// `path` may be a single `.safetensors` file or a sharded directory, with
+/// [`safetensors_path_tensor_headers`]'s duplicate-key semantics (later shard wins), so a component
+/// that ships several shards is counted once per logical tensor. Only headers are read; no tensor
+/// payload is touched, which keeps this usable inside a pre-load admission gate.
+///
+/// Errors when `path` cannot be read as safetensors — a missing path, a directory with no
+/// `.safetensors` file in it (`safetensors_path_tensor_headers` refuses that rather than answering an
+/// empty header list), or a malformed header — so a caller that must tolerate an absent component
+/// decides that itself rather than being handed a silent `0`. A well-formed file that declares zero
+/// tensors is readable and prices `0`.
+pub fn materialized_path_bytes(path: impl AsRef<Path>, float_width: u64) -> Result<u64> {
+    let path = path.as_ref();
+    let headers = safetensors_path_tensor_headers(path)?;
+    materialized_header_bytes(&headers, float_width, path)
+}
+
+/// [`materialized_path_bytes`] over headers a caller has already read — and possibly filtered to the
+/// subset its own route materializes, which is the point of exposing this half. `origin` only names
+/// the component in the overflow error.
+pub fn materialized_header_bytes(
+    headers: &[SafetensorsTensorHeader],
+    float_width: u64,
+    origin: &Path,
+) -> Result<u64> {
+    headers.iter().try_fold(0_u64, |total, header| {
+        let resident = if header.is_float() {
+            header.materialized_bytes(float_width)?
+        } else {
+            header.data_bytes
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            Error::Msg(format!(
+                "{} materialized byte sum overflow",
+                origin.display()
+            ))
+        })
+    })
 }
 
 // =================================================================================================
@@ -2266,5 +2340,49 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("no .safetensors files"), "unexpected: {err}");
+    }
+
+    /// SC-22667 review: the doc on [`materialized_path_bytes`] promises an error, never a silent `0`,
+    /// for a path with nothing readable. Pin each half of that sentence.
+    ///
+    /// Mutation that fails this: making `safetensors_path_tensor_headers` return `Ok(vec![])` for a
+    /// directory with no `.safetensors` file (the reading under review), which turns the first
+    /// assertion into `Ok(0)`.
+    #[test]
+    fn materialized_path_bytes_errors_on_unreadable_paths_and_prices_readable_ones() {
+        let tmp = fixture_dir("gencore_materialized_path_");
+        let root = tmp.path();
+
+        // An existing directory with no `.safetensors` in it is unreadable, not empty.
+        let empty = root.join("empty-component");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("config.json"), b"{}").unwrap();
+        let err = materialized_path_bytes(&empty, 4)
+            .expect_err("a directory holding no shard must error")
+            .to_string();
+        assert!(err.contains("no .safetensors files"), "unexpected: {err}");
+
+        // A missing path errors too.
+        assert!(materialized_path_bytes(root.join("absent"), 4).is_err());
+
+        // A well-formed shard that declares zero tensors IS readable and prices 0 — the doc's
+        // stated exception.
+        let zero = root.join("zero.safetensors");
+        let mut bytes = (2_u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&zero, bytes).unwrap();
+        assert_eq!(materialized_path_bytes(&zero, 4).unwrap(), 0);
+
+        // And a float tensor is priced at the requested width, not its stored one.
+        let bf16 = root.join("component").join("model.safetensors");
+        std::fs::create_dir_all(bf16.parent().unwrap()).unwrap();
+        write_header(
+            &bf16,
+            r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#,
+        );
+        assert_eq!(
+            materialized_path_bytes(bf16.parent().unwrap(), 4).unwrap(),
+            8
+        );
     }
 }

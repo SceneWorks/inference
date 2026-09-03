@@ -912,6 +912,25 @@ impl MemoryPeakBreakdown {
 /// never belong in any of those four fields; they are declared once in `overlay_bytes` and, when
 /// non-zero alongside both formula variables, by typed resident components.
 ///
+/// ## What "auxiliary" means (SC-22667)
+///
+/// **Auxiliary means outside the base model, not merely outside the usual three names.** The set is
+/// closed and enumerated by [`MemoryComponentKind::is_auxiliary`]: a control branch, an adapter
+/// stack, an IP-Adapter, an identity encoder — networks a *request* opts into, which a plain render
+/// of the same checkpoint does not load. Those are the ones `overlay_bytes` exists for, and the
+/// reason it is excluded from `base_bytes` is precisely that a fit decision for a request without
+/// them must not carry them.
+///
+/// A base-model network the route **always** loads is therefore charged in one of the three base
+/// fields even when it is none of "the text encoder", "the DiT" or "the image VAE" — LTX-2.5's
+/// latent upsamplers, audio VAE, vocoder and duration head are all of this kind. Each goes in the
+/// field naming the role it plays (a duration head conditions, an upsampler is part of the denoise
+/// stack, an audio decoder decodes), charged exactly once, under the *One network, one field* rule
+/// below. Moving them to `overlay_bytes` would be a byte-accounting **error**, not a stylistic
+/// choice: [`MemoryProviderContract::total_resident_bytes`] adds `overlay_bytes` only for a
+/// contract that also declares typed auxiliary components, so bytes parked there by a provider with
+/// no such component simply vanish from the total.
+///
 /// ## One network, one field
 ///
 /// Every base-model network is charged in exactly **one** of the three component fields, even when
@@ -963,6 +982,27 @@ pub struct MemoryAssetFacts {
 /// component config their own loader uses - the snapshot's `config.json` where it parses one, the
 /// crate's own model-config constructor where it builds the geometry in code - and publish `None`
 /// otherwise.
+///
+/// # The preset-fallback rule (SC-22667)
+///
+/// **Fall back to a preset only where the LOADER itself falls back to that preset; otherwise declare
+/// the axis `None`.** A contract that substitutes a crate preset for an axis the loader would have
+/// refused to load without is describing a render that cannot happen, and one that publishes `None`
+/// for an axis the loader supplies from a preset is withholding a fact the run will use.
+///
+/// The rule is per axis and per parse outcome, not per provider, because both backends' config
+/// readers mix the two behaviours:
+///
+/// * A reader that defaults **per key** (candle Krea's `Krea2Config::from_json` takes each missing
+///   key from `Krea2Config::turbo`) makes the preset the loaded value, so reading the axes back off
+///   the parsed struct is correct — including for keys the file omitted.
+/// * A reader that **requires** every key (candle Mage's `MageConfig::from_json`, MLX Mage's
+///   `MageFlowConfig::from_transformer_config_json`) fails the load on a partial file, so a partial
+///   file has no loadable geometry and every axis it would have supplied is `None`. Substituting
+///   the crate preset there — `.ok().unwrap_or_else(preset)` — publishes numbers no load will use.
+/// * An axis the loader **never** reads from a config, because it constructs that component from
+///   code (Mage's CoD decoder, Krea's reused Qwen-Image VAE), is a preset axis unconditionally: the
+///   crate constant *is* what the loader builds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryArchitectureFacts {
     /// Attention heads in one transformer block.
@@ -981,6 +1021,21 @@ pub struct MemoryArchitectureFacts {
     /// for image models.
     pub vae_temporal_scale: Option<u32>,
     /// Bytes per element of the activation dtype (2 for bf16/f16, 4 for f32).
+    ///
+    /// **Which dtype, on a provider whose phases differ (SC-22667):** the width the **denoise**
+    /// phase computes in — the transformer's activation dtype. Almost every provider here runs its
+    /// DiT bf16 while opening the autoencoder f32, and some upcast conditioning per matmul, so
+    /// "the" activation width is only well defined once it is pinned to one phase.
+    ///
+    /// Denoise is the phase this names because it is the phase this axis is *for*: the other seven
+    /// axes are attention and latent geometry, and the estimate they feed multiplies out the
+    /// attention scores and per-block activations of the trunk. A VAE width published here would be
+    /// multiplied into an attention formula that never runs at that width.
+    ///
+    /// It follows that this axis is **not** a per-component byte fact and must never be used to
+    /// price one: the bytes a decoder or encoder materializes belong in
+    /// [`MemoryAssetFacts::decoder_bytes`] / [`MemoryAssetFacts::conditioning_bytes`], measured at
+    /// the width that component is actually opened in.
     pub activation_dtype_width: Option<u32>,
 }
 
