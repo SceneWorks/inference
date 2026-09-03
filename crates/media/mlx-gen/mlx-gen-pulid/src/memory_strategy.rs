@@ -248,15 +248,31 @@ fn adapt(
             bounded_by: None,
             residency: MemoryComponentResidency::WholeRender,
         };
+        // APPEND, never replace (SC-22667). The borrowed FLUX.1 contract now declares its own
+        // auxiliary components — an IP-adapter, an adapter stack, a resident PiD pair — and
+        // `overlay_bytes` above already carries their bytes. Overwriting the vector with just the
+        // identity stack would leave `overlay_bytes` and the declared component bytes disagreeing,
+        // which the shared validator reports as a conformance error.
         contract.formula = match contract.formula {
-            MemoryFormulaKind::PhaseEnvelope { phases, variables }
-            | MemoryFormulaKind::ComponentPhaseEnvelope {
-                phases, variables, ..
-            } => MemoryFormulaKind::ComponentPhaseEnvelope {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases,
+                    variables,
+                    resident_components: vec![component],
+                }
+            }
+            MemoryFormulaKind::ComponentPhaseEnvelope {
                 phases,
                 variables,
-                resident_components: vec![component],
-            },
+                mut resident_components,
+            } => {
+                resident_components.push(component);
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases,
+                    variables,
+                    resident_components,
+                }
+            }
             other => other,
         };
     }
