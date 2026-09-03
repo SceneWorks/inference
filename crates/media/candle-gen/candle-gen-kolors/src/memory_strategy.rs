@@ -1481,9 +1481,9 @@ fn composed_route_id(contract: &MemoryProviderContract) -> gen_core::Result<&'st
 /// The **architecture** axes are a different matter, and are published here whenever the spec names
 /// a materialized snapshot. Both compositions denoise through the same SDXL UNet and decode through
 /// the same `AutoencoderKL` as the base route, built from this crate's own structs, so the overlay
-/// the caller will hang off them changes no axis in [`architecture_facts`]. Withholding them
-/// because the *asset* facts need typed paths would leave two registered routes publishing a
-/// lifecycle-phase formula with no geometry behind it (epic SC-22657, E2).
+/// the caller will hang off them changes no axis this crate's own `architecture_facts` derives.
+/// Withholding them because the *asset* facts need typed paths would leave two registered routes
+/// publishing a lifecycle-phase formula with no geometry behind it (epic SC-22657, E2).
 pub fn ip_composed_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     Ok(composed_contract_for(IP_PROVIDER_ID, spec))
 }
