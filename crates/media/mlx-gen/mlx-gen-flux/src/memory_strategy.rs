@@ -244,6 +244,11 @@ const CONTROL_COMPONENT_ID: &str = "flux1.control.branch";
 /// absent overlay source must price zero rather than turn a deferred load into a contract-time
 /// refusal. The adapter stack keeps the shared fail-closed helper, because there `None` means an
 /// additive stack was requested and could not be sized at all.
+///
+/// SC-22667 review: the control branch is the one exception to "no cast". It is packed in place by
+/// `FluxControlTransformer::quantize` under `spec.quantize`, so it is projected through the shared
+/// primitive at the requested tier — and falls back to the same `safetensors_path_bytes` reading on
+/// any header error, which keeps the zero-on-absent contract stated above.
 fn resident_overlay_components(
     provider_id: &str,
     spec: &LoadSpec,
@@ -265,11 +270,42 @@ fn resident_overlay_components(
         if let Some(mlx_gen::WeightsSource::Dir(source) | mlx_gen::WeightsSource::File(source)) =
             &spec.control
         {
+            // SC-22667 review: the control branch follows the requested tier.
+            // `load_control_heavy` runs `transformer.quantize(bits)` under `spec.quantize`, and
+            // `FluxControlTransformer::quantize` packs the BRANCH alongside the base DiT, so
+            // pricing it at its stored width was tier-blind — a Q4 branch is roughly a quarter of
+            // that, enough to refuse a fit that would have succeeded. The eligibility test is
+            // `quantize_map`'s verbatim: this crate's `pack_all` predicate is `true`, leaving the
+            // rank-two `.weight` shape guard as the whole scope. Everything else keeps its stored
+            // width, exactly as before, and an already-packed triple is left alone by the shared
+            // primitive.
+            //
+            // `unwrap_or(0)` preserves the zero-on-absent contract the module doc above states:
+            // this runs inside the production contract builder, ahead of any deferred load.
+            let group_size = crate::quant::GROUP_SIZE as usize;
+            let bits = spec.quantize.map(mlx_gen::Quant::bits);
+            let projection =
+                move |tensor: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| match bits {
+                    Some(bits)
+                        if tensor.name.ends_with(".weight")
+                            && matches!(
+                                tensor.shape.as_slice(),
+                                [_, input] if *input >= group_size && *input % group_size == 0
+                            ) =>
+                    {
+                        mlx_gen::asset_facts::ResidentProjection::GroupQuantized {
+                            bits,
+                            group_size,
+                        }
+                    }
+                    _ => mlx_gen::asset_facts::ResidentProjection::Stored,
+                };
             push_overlay(
                 &mut components,
                 CONTROL_COMPONENT_ID,
                 MemoryComponentKind::ControlBranch,
-                mlx_gen::safetensors_path_bytes(source),
+                mlx_gen::asset_facts::projected_safetensors_bytes(source, projection)
+                    .unwrap_or_else(|_| mlx_gen::safetensors_path_bytes(source)),
             );
         }
     }

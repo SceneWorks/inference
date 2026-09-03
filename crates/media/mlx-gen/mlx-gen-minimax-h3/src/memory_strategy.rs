@@ -1046,9 +1046,33 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 /// loaders' own `from_diffusers_json` parses over that snapshot's `transformer/config.json` and
 /// `vae/config.json`, so every published axis is the snapshot's rather than the preset's
 /// (SC-22667: the VAE axes were preset constants although `vae.rs` parses the snapshot config).
+///
+/// SC-22667 review: an install that HAS a DiT to load — a materialized snapshot, or a staged
+/// [`DIT_COMPONENT`] directory — but whose `transformer/config.json` is missing, partial or
+/// unparseable no longer degrades into the preset. `MiniMaxH3Dit::load_dir` errors on exactly that
+/// file, so a preset published here would describe a model this load will never build. A provider
+/// falls back to a preset only where the LOADER falls back to it; otherwise the trunk axes are
+/// declared absent. The VAE axes survive the absent branch because they are their own config read
+/// with a crate-constant fallback, so the contract still declares a real architecture axis and the
+/// MLX weights-free gate stays satisfied.
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = dit_config(spec);
     let vae = vae_config(spec);
+    let Some(dit) = dit_config(spec) else {
+        return mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: None,
+            head_dim: None,
+            transformer_blocks: None,
+            patch_size: None,
+            latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
+            vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
+            vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
+            activation_dtype_width: Some(if spec.precision == mlx_gen::Precision::Fp32 {
+                mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+            } else {
+                mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+            }),
+        };
+    };
     // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
     // the temporal factor is already carried by `vae_temporal_scale`.
     let [_, patch_h, patch_w] = dit.patch_size;
@@ -1076,12 +1100,11 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
     }
 }
 
-/// The DiT geometry a contract should describe: the materialized snapshot's own
-/// `transformer/config.json` when one exists, else this crate's mirror of it.
+/// The DiT geometry a contract should describe: the config the loader would parse, or `None` when
+/// there IS a DiT to load and that config cannot be read.
 ///
 /// `from_diffusers_json` requires every key, so a partial or variant file declines rather than
-/// half-defaulting into this model's numbers — and declining falls back to the preset, which is
-/// exactly what the weights-free surface publishes.
+/// half-defaulting into this model's numbers.
 ///
 /// SC-22667: the DiT is honored at its **resolved** location, not under the snapshot root. It is
 /// the one tiered component, so a split `q4` install stages [`DIT_COMPONENT`] outside the snapshot
@@ -1089,24 +1112,38 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
 /// file, and `ComponentBytes::resolve` already applies the staged override for both the DiT and the
 /// text encoder. Reading only under the root made the probe miss on every split install, so the
 /// preset was published although the loaded config was one `spec.components` lookup away.
-fn dit_config(spec: &LoadSpec) -> crate::dit::config::MiniMaxH3DitConfig {
-    resolved_dit_config(spec).unwrap_or_default()
+///
+/// SC-22667 review: the preset is returned only where the LOADER would use it — a spec that names
+/// neither a materialized root nor a staged DiT directory, i.e. the weights-free registry surface
+/// with no load to describe. Once either is present, `MiniMaxH3Dit::load_dir` reads
+/// `<resolved>/config.json` and propagates any read or parse failure, so this returns `None` and the
+/// caller declares the trunk axes absent instead of substituting numbers the load cannot produce.
+fn dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3DitConfig> {
+    let staged = matches!(
+        spec.components.get(DIT_COMPONENT),
+        Some(WeightsSource::Dir(_))
+    );
+    if !staged && mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return Some(crate::dit::config::MiniMaxH3DitConfig::default());
+    }
+    resolved_dit_config(spec)
 }
 
-/// The DiT config as the loader would resolve it, or `None` when no materialized directory carries
-/// a parseable one.
+/// The DiT config as the loader would resolve it, or `None` when that directory carries no
+/// parseable one.
+///
+/// The directory precedence is `resolve_dit_dir`'s exactly: a staged [`DIT_COMPONENT`] directory
+/// WINS OUTRIGHT and is never followed by a root fallback, because the loader does not fall back
+/// either — a staged tier whose `config.json` is unreadable fails the load rather than silently
+/// building the snapshot's base geometry.
 fn resolved_dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3DitConfig> {
-    let staged = match spec.components.get(DIT_COMPONENT) {
-        Some(WeightsSource::Dir(staged)) => Some(staged.clone()),
-        _ => None,
+    let dir = match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(staged)) => staged.clone(),
+        _ => mlx_gen::architecture_facts::materialized_root(spec)?
+            .join(crate::model::BASE_DIT_PARTITION),
     };
-    let root_partition = mlx_gen::architecture_facts::materialized_root(spec)
-        .map(|root| root.join(crate::model::BASE_DIT_PARTITION));
-    // Staged first, exactly as `resolve_dit_dir` prefers it.
-    staged.into_iter().chain(root_partition).find_map(|dir| {
-        let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
-        crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
-    })
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
 }
 
 /// The video-VAE geometry a contract should describe: the materialized snapshot's own
@@ -1827,6 +1864,91 @@ mod tests {
         );
     }
 
+    /// Feature-end review (SC-22667, E2): a spec that HAS a DiT to load but no readable
+    /// `transformer/config.json` must declare the trunk axes ABSENT, not publish the preset.
+    /// `MiniMaxH3Dit::load_dir` errors on exactly that file, so the preset would describe a model
+    /// this load can never build — the same rule Mage's `dit_config` follows. The VAE axes survive,
+    /// so the contract still declares a real architecture axis.
+    ///
+    /// Mutations that fail this:
+    /// * restoring `resolved_dit_config(spec).unwrap_or_default()` — every leg below reads back the
+    ///   preset's 50 blocks instead of `None`;
+    /// * chaining a root fallback after the staged directory in `resolved_dit_config` — the third
+    ///   leg reads back `Some(50)` from the root partition that `resolve_dit_dir` never opens.
+    #[test]
+    fn an_unreadable_dit_config_declares_the_trunk_absent_rather_than_the_preset() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+        let vae_preset = crate::config::MiniMaxH3VaeConfig::default();
+
+        // A materialized snapshot with no `transformer/config.json` at all.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_facts = architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+            bare.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                bare_facts.attention_heads,
+                bare_facts.head_dim,
+                bare_facts.transformer_blocks,
+                bare_facts.patch_size
+            ),
+            (None, None, None, None),
+            "a materialized snapshot the loader would reject must not publish the preset trunk"
+        );
+        assert_eq!(
+            bare_facts.latent_channels,
+            mlx_gen::architecture_facts::axis(vae_preset.latent_channels),
+            "the VAE axes are their own read and must survive the absent trunk"
+        );
+
+        // A materialized snapshot whose config is present but unparseable.
+        let partial = tempfile::tempdir().unwrap();
+        let transformer = partial.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        let mut missing_key = dit_config_json(&preset);
+        missing_key
+            .as_object_mut()
+            .unwrap()
+            .remove("num_attention_heads");
+        std::fs::write(transformer.join("config.json"), missing_key.to_string()).unwrap();
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                partial.path().to_path_buf()
+            )))
+            .transformer_blocks,
+            None,
+            "a partial config declines whole; `from_diffusers_json` requires every key"
+        );
+
+        // A STAGED DiT whose config is unreadable does not fall back to a readable root partition:
+        // `resolve_dit_dir` returns the staged directory outright and `load_dir` fails there.
+        let both = tempfile::tempdir().unwrap();
+        let root_transformer = both.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&root_transformer).unwrap();
+        std::fs::write(
+            root_transformer.join("config.json"),
+            dit_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let mut staged_spec = LoadSpec::new(WeightsSource::Dir(both.path().to_path_buf()));
+        staged_spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(
+            architecture_facts(&staged_spec).transformer_blocks,
+            None,
+            "a staged DiT wins outright; the root partition is not a fallback for it"
+        );
+
+        // And with NO load to describe at all, the preset is still what the registry publishes.
+        assert_eq!(
+            architecture_facts(&weightless_spec()).transformer_blocks,
+            mlx_gen::architecture_facts::axis(preset.num_layers),
+        );
+    }
+
     /// The published `vae/config.json` layout, emitted from a config value so the fixture cannot
     /// drift from the struct it mirrors. Every key is required by
     /// `MiniMaxH3VaeConfig::from_diffusers_json`, which also re-derives `patch_size` /
@@ -1868,6 +1990,20 @@ mod tests {
     #[test]
     fn materialized_vae_axes_come_from_the_snapshot_rather_than_the_preset() {
         let preset = crate::config::MiniMaxH3VaeConfig::default();
+        // SC-22667 review: both fixtures below mirror the DiT config too. A materialized snapshot
+        // with no readable `transformer/config.json` now declares its TRUNK axes absent (the loader
+        // errors on that file), so a VAE-only fixture can no longer be compared against the
+        // weights-free preset — and an absent trunk would say nothing about the VAE axes this test
+        // is for.
+        let mirror_dit = |root: &std::path::Path| {
+            let transformer = root.join(crate::model::BASE_DIT_PARTITION);
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                dit_config_json(&crate::dit::config::MiniMaxH3DitConfig::default()).to_string(),
+            )
+            .unwrap();
+        };
 
         let mirror = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(mirror.path().join("vae")).unwrap();
@@ -1876,6 +2012,7 @@ mod tests {
             vae_config_json(&preset).to_string(),
         )
         .unwrap();
+        mirror_dit(mirror.path());
         let mirror_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
             mirror.path().to_path_buf(),
         ));
@@ -1903,6 +2040,7 @@ mod tests {
             vae_config_json(&mutated).to_string(),
         )
         .unwrap();
+        mirror_dit(mutated_dir.path());
         let facts = architecture_facts(&LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
             mutated_dir.path().to_path_buf(),
         )));

@@ -131,6 +131,12 @@ fn dev_asset_facts(provider_id: &str, spec: &LoadSpec) -> MemoryAssetFacts {
 /// actionable tier rejection behind an I/O error. The empty declaration is the pre-existing
 /// shape and errs large: `total_resident_bytes()` is 0, so the fit gate credits nothing as already
 /// resident.
+///
+/// The error is swallowed silently rather than logged: this crate carries no `tracing` or `log`
+/// dependency, and the reachable case — a snapshot short of a complete Dev layout, read before any
+/// load — is expected rather than exceptional. What keeps the `Ok` arm from silently becoming
+/// unreachable is a positive test against the real footprint and a complete snapshot, not a log
+/// line: see `the_production_dev_footprint_is_accepted_and_published_for_a_complete_snapshot`.
 fn dev_asset_facts_with(
     footprint: impl Fn(&str, &LoadSpec) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes>,
     provider_id: &str,
@@ -258,10 +264,23 @@ fn configure_dev_staged_residency(
 /// The provider has a real resident execution path, a request-selectable sequential lifecycle, and
 /// a registered component-footprint fallback. It has no control-specific calibration evidence, so
 /// its staged strategy remains estimate-authorized only; the route/tier safety gate below remains
-/// fully load-exact. Asset facts deliberately remain empty: the registry fallback prices the base split,
-/// while its consumer adds the control checkpoint. Relabelling that estimate as provider load-exact
-/// facts would hide the runtime distinction between an effective packed base and a dense control
-/// branch when no explicit quantization request was made.
+/// fully load-exact.
+///
+/// SC-22667 review: the asset facts no longer sit on the all-zero registry fallback. The base
+/// split — the selected language tower, the transformer and the VAE — is the same load-exact
+/// derivation the T2I and Edit routes publish, one call away through
+/// [`crate::model::dev_control_component_footprint`], which is the very callback this route's
+/// registration already declares. Publishing it means the fit gate credits the bytes that are
+/// genuinely resident instead of crediting nothing.
+///
+/// What is deliberately **omitted** is the control BRANCH itself. It has no typed home under this
+/// contract's `Affine` formula (no `MemoryResidentComponent` list, and `overlay_bytes` names an
+/// adapter stack, which a Fun-Controlnet checkpoint is not), and its resident width depends on a
+/// runtime distinction — an effective packed base against a dense control branch — that the
+/// pre-calibration evidence cannot settle. So `overlay_bytes` stays 0 and the branch remains the
+/// consumer's addition on top of these base facts, exactly as before. That errs SMALL against the
+/// branch alone, which is why the route's staged rung stays estimate-authorized and its load-exact
+/// route/tier gate is unchanged.
 fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_CONTROL_ID,
@@ -274,6 +293,11 @@ fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
     );
     contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     contract.load_shape = spec.load_shape;
+    contract.asset_facts = dev_asset_facts_with(
+        |_, spec| crate::model::dev_control_component_footprint(spec),
+        FLUX2_DEV_CONTROL_ID,
+        spec,
+    );
     // Unlike base/edit, this route is not complete without its separately-addressed control
     // artifact.  Do not publish a selectable staged rung for a bare base `LoadSpec`.
     configure_dev_staged_residency(&mut contract, spec, spec.control.is_some());
@@ -1918,6 +1942,118 @@ mod tests {
             );
             assert!(contract.conformance_errors().is_empty());
         }
+    }
+
+    /// A complete Dev snapshot the **production** `dev_component_footprint_for` accepts, written
+    /// against the real encoder contracts. The weight payload is a sparse `set_len` hole, so a
+    /// logically multi-gigabyte tower costs no disk: the footprint reads safetensors HEADERS and
+    /// never the payload. `write_typed_safetensors` is the same tiny-component trick `model.rs`
+    /// uses for the generic transformer/VAE accounting.
+    fn complete_dev_snapshot(fixture: &std::path::Path) -> LoadSpec {
+        let root = fixture.join("base");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+            crate::config::DEV_VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            let header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.extend([0_u8; 2]);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        }
+        // No `quantization` section: the base tier is dense, so the selected language tower is
+        // admitted dense and `effective_base_quant` resolves to `None`.
+        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        LoadSpec::new(WeightsSource::Dir(root))
+    }
+
+    /// Feature-end review (SC-22667, E1): the injected-seam test above proves the MAPPING, but
+    /// every leg it drives through a production builder lands on the empty declaration, so nothing
+    /// proved the production footprint can be ACCEPTED at all — a `dev_asset_facts` permanently
+    /// stuck on its `Err` arm would have passed the whole file. This is the positive leg: a
+    /// complete snapshot, the real `dev_component_footprint_for`, non-zero facts out of the
+    /// registered contract.
+    ///
+    /// It also pins issue 3 of the same review: Dev-Control was left on the all-zero fallback while
+    /// its own registered footprint callback sat one call away. Its conditioning must be the
+    /// language tower ALONE — `dev_control_component_footprint` passes
+    /// `include_builtin_multimodal: false` — so it is strictly smaller than T2I's, which proves the
+    /// control route is wired to its OWN footprint rather than borrowing Dev's.
+    ///
+    /// Mutations that fail this:
+    /// * returning `MemoryAssetFacts::default()` from `dev_asset_facts_with`'s `Ok` arm — every
+    ///   `assert!(.. > 0)` reds;
+    /// * dropping the `contract.asset_facts = dev_asset_facts_with(..)` line from
+    ///   `build_dev_control_contract` — the control legs red back to zero;
+    /// * wiring Dev-Control to `dev_component_footprint_for` instead of
+    ///   `dev_control_component_footprint` — the builtin multimodal surface is charged and the
+    ///   strict inequality reds;
+    /// * mis-summing `base_bytes` — the three equality legs red.
+    #[test]
+    fn the_production_dev_footprint_is_accepted_and_published_for_a_complete_snapshot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = complete_dev_snapshot(fixture.path());
+
+        for (provider_id, contract) in [
+            (FLUX2_DEV_ID, registered_dev_t2i_contract(&spec).unwrap()),
+            (FLUX2_DEV_EDIT_ID, registered_dev_contract(&spec).unwrap()),
+            (
+                FLUX2_DEV_CONTROL_ID,
+                registered_dev_control_contract(&spec).unwrap(),
+            ),
+        ] {
+            let footprint = if provider_id == FLUX2_DEV_CONTROL_ID {
+                crate::model::dev_control_component_footprint(&spec)
+            } else {
+                crate::model::dev_component_footprint_for(provider_id, &spec)
+            }
+            .unwrap_or_else(|error| {
+                panic!("{provider_id}: the production footprint must accept a complete Dev snapshot: {error}")
+            });
+
+            let facts = contract.asset_facts;
+            assert!(
+                facts.conditioning_bytes > 0
+                    && facts.transformer_bytes > 0
+                    && facts.decoder_bytes > 0,
+                "{provider_id}: every phase of a complete snapshot is priced"
+            );
+            assert_eq!(
+                facts.conditioning_bytes, footprint.text_encoder,
+                "{provider_id}"
+            );
+            assert_eq!(facts.transformer_bytes, footprint.dit, "{provider_id}");
+            assert_eq!(facts.decoder_bytes, footprint.vae, "{provider_id}");
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes,
+                "{provider_id}: base_bytes is the split's sum"
+            );
+            assert_eq!(
+                facts.overlay_bytes, 0,
+                "{provider_id}: no adapter stack is configured"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{provider_id}");
+        }
+
+        // The control route omits the builtin Pixtral + projector surface that Dev and Dev-Edit
+        // retain for caption upsampling, so it must price a STRICTLY smaller conditioning phase.
+        assert!(
+            registered_dev_control_contract(&spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes
+                < registered_dev_t2i_contract(&spec)
+                    .unwrap()
+                    .asset_facts
+                    .conditioning_bytes,
+            "the control route must publish its own multimodal-free footprint"
+        );
     }
 
     /// Feature-end review (SC-22667, E1): `klein_overlay` lists `adapters` as a live Klein axis and

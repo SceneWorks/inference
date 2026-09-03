@@ -313,22 +313,20 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
                 ResidentProjection::Stored,
             )?,
             // SC-22667: a converted 2.5 tier splits the VAE encoder into its own
-            // `vae_encoder.safetensors`, but `ltx25_encoder_path` falls back to the DECODER file
-            // for a raw split bundle that keeps the encoder beside its decoder — and that file is
-            // already charged in full to `decoder_bytes` below. Charging it here too counted one
-            // resident network twice against every fit decision, silently, because `base_bytes`
-            // stayed its own sum either way. gen-core's *One network, one field* rule names exactly
-            // this case: a shared autoencoder used as the reference encoder belongs to
-            // `decoder_bytes` alone.
-            if encoder_path == video_path {
-                0
-            } else {
-                required_projected_bytes(
-                    &encoder_path,
-                    "selected video VAE encoder",
-                    ResidentProjection::Float32,
-                )?
-            },
+            // `vae_encoder.safetensors`; `ltx25_encoder_path` falls back to the DECODER file for a
+            // raw split bundle that keeps the encoder beside its decoder. That fallback is charged
+            // here unconditionally, because it is a genuine SECOND residency rather than a double
+            // count of one network: `LtxVideoVae::encode` takes the lazy path, and
+            // `Weights::from_file` followed by `Weights::materialize` evaluates EVERY tensor in the
+            // named file — so on a raw bundle the whole decoder file is materialized a second time
+            // while the built decoder is still resident. Skipping the charge when the two paths
+            // coincide would violate E3 (never predict a fit that OOMs) on exactly the raw bundles
+            // this fallback exists for.
+            required_projected_bytes(
+                &encoder_path,
+                "selected video VAE encoder",
+                ResidentProjection::Float32,
+            )?,
             required_projected_bytes(
                 bundle
                     .require(LtxComponent::DurationHead)
@@ -1109,18 +1107,20 @@ mod tests {
         assert_eq!(contract.asset_facts.overlay_bytes, 0);
 
         // SC-22667: a RAW split bundle keeps the VAE encoder inside its decoder file, and
-        // `ltx25_encoder_path` falls back to that file. Its bytes are already charged in full to
-        // `decoder_bytes`, so the conditioning phase must not charge them a second time —
-        // gen-core's *One network, one field* rule puts a shared autoencoder in `decoder_bytes`
-        // alone. `base_bytes` stayed its own sum either way, so nothing caught this before.
+        // `ltx25_encoder_path` falls back to that file. The conditioning phase still charges it,
+        // because `LtxVideoVae::encode` re-opens that path and `Weights::materialize` evaluates
+        // every tensor in it — a second full residency of the decoder file, alongside the built
+        // decoder. So the totals are UNCHANGED from the converted-tier layout above: dropping the
+        // separate `vae_encoder.safetensors` must not move a single field.
         //
-        // Mutation that fails this: dropping the `encoder_path == video_path` guard — conditioning
-        // reads back 16 and `base_bytes` 40, charging one resident network twice.
+        // Mutation that fails this: re-introducing an `if encoder_path == video_path { 0 }` guard
+        // in the conditioning sum — conditioning reads back 12 and `base_bytes` 36, under-pricing
+        // the peak the loader actually reaches and violating E3.
         std::fs::remove_file(root.join("vae_encoder.safetensors")).unwrap();
         let shared = memory_strategy_contract(&spec).unwrap();
-        assert_eq!(shared.asset_facts.conditioning_bytes, 12);
+        assert_eq!(shared.asset_facts.conditioning_bytes, 16);
         assert_eq!(shared.asset_facts.decoder_bytes, 12);
-        assert_eq!(shared.asset_facts.base_bytes, 36);
+        assert_eq!(shared.asset_facts.base_bytes, 40);
         write_one_tensor(&root.join("vae_encoder.safetensors"));
 
         std::fs::create_dir_all(root.join("enhancer")).unwrap();

@@ -720,17 +720,46 @@ const ADAPTER_COMPONENT_ID: &str = "sdxl.adapters.forward_residuals";
 fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResidentComponent>> {
     use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 
-    // Matches `load_controlnet` / `load_ip_adapter`: dense payloads are cast to the fp16 compute
-    // dtype (2 bytes/element); an already-packed triple is left alone, which the shared primitive
-    // handles on its own.
+    // Matches `load_ip_adapter`: dense payloads are cast to the fp16 compute dtype (2
+    // bytes/element); an already-packed triple is left alone, which the shared primitive handles on
+    // its own. The IP-adapter is deliberately NOT tier-projected — `load_sdxl` quantizes only the
+    // U-Net and the control branches, never the adapter.
     let compute_dtype = |_: &_| ResidentProjection::Bfloat16;
     let mut components = Vec::new();
+
+    // SC-22667 review: the control branches follow the requested tier. `load_sdxl` runs
+    // `control.quantize(bits)` for every branch alongside the U-Net under `spec.quantize`, so
+    // pricing them fp16 was tier-blind. The eligibility test below is `quantize_map`'s verbatim —
+    // its `is_unet_target` predicate is `true`, leaving the rank-two `.weight` shape guard as the
+    // whole scope, which is exactly `ControlNet::quantize`'s Linear-only reach: the 4-D convs and
+    // the 1-D norms are not packed, so they keep the fp16 compute cast. Erring large would have
+    // been E3-safe, but a Q4 branch is ~4x smaller than its dense pricing, which is enough to
+    // refuse a fit that would have succeeded.
+    let control_group_size = crate::quant::GROUP_SIZE as usize;
+    let control_bits = spec.quantize.map(mlx_gen::Quant::bits);
+    let control_projection =
+        move |tensor: &mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader| match control_bits {
+            Some(bits)
+                if tensor.name.ends_with(".weight")
+                    && matches!(
+                        tensor.shape.as_slice(),
+                        [_, input] if *input >= control_group_size
+                            && *input % control_group_size == 0
+                    ) =>
+            {
+                ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: control_group_size,
+                }
+            }
+            _ => ResidentProjection::Bfloat16,
+        };
 
     let mut control_bytes = 0_u64;
     for source in spec.control.iter().chain(&spec.extra_controls) {
         let (WeightsSource::Dir(path) | WeightsSource::File(path)) = source;
         control_bytes =
-            control_bytes.saturating_add(projected_safetensors_bytes(path, compute_dtype)?);
+            control_bytes.saturating_add(projected_safetensors_bytes(path, control_projection)?);
     }
     push_overlay(
         &mut components,
@@ -1990,6 +2019,150 @@ mod tests {
         bytes.extend(header);
         bytes.resize(bytes.len() + data_bytes, 0);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A multi-tensor safetensors file. Each entry is `(name, dtype, shape, data_bytes)`; the
+    /// caller keeps `data_bytes` consistent with the shape and dtype width, as the shared header
+    /// reader checks it.
+    fn write_named_tensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
+        let mut entries = Vec::new();
+        let mut offset = 0_usize;
+        for (name, dtype, shape, data_bytes) in tensors {
+            let shape = shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let end = offset + data_bytes;
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{end}]}}"
+            ));
+            offset = end;
+        }
+        let mut header = format!("{{{}}}", entries.join(",")).into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Feature-end review (SC-22667, E1): `load_sdxl` runs `control.quantize(bits)` on every branch
+    /// alongside the U-Net under `spec.quantize`, so pricing the branches at the flat fp16 compute
+    /// width was tier-blind. It erred large, which is E3-safe, but a Q4 branch is roughly a quarter
+    /// of its dense pricing — easily enough to refuse a fit that would have succeeded.
+    ///
+    /// The projection is `quantize_map`'s scope verbatim: this family's `is_unet_target` predicate
+    /// is `true`, so the rank-two `.weight` shape guard at [`crate::quant::GROUP_SIZE`] is the whole
+    /// packing scope, matching `ControlNet::quantize`'s Linear-only reach. The 4-D conv and the 1-D
+    /// norm below are the two shapes that must NOT move, and they are why a blanket per-file
+    /// projection would be wrong.
+    ///
+    /// Mutations that fail this:
+    /// * restoring the flat `compute_dtype` closure at the control loop — the Q4 and Q8 legs read
+    ///   back the dense 2368;
+    /// * dropping the rank-two guard so every tensor projects `GroupQuantized` — the conv and norm
+    ///   legs shrink and the Q4 total drops below 896;
+    /// * dropping the `input % group_size` guard — the ineligible-width leg reds;
+    /// * projecting the IP-adapter at the tier too — its leg reds, and the loader never packs it.
+    #[test]
+    fn control_branches_are_priced_at_the_requested_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let control = root.join("control.safetensors");
+        write_named_tensors(
+            &control,
+            &[
+                // Rank two, 128 = 2 * GROUP_SIZE: the one packable tensor.
+                ("mid_block.attn.to_q.weight", "F16", &[8, 128], 8 * 128 * 2),
+                // Rank four: a conv, never packed.
+                ("down_blocks.0.conv.weight", "F16", &[4, 4, 3, 3], 288),
+                // Rank one: a norm scale, never packed.
+                ("mid_block.norm.weight", "F16", &[16], 32),
+            ],
+        );
+        // Rank two but 40 is not a multiple of GROUP_SIZE, so `quantize_map` leaves it dense.
+        let narrow = root.join("narrow.safetensors");
+        write_named_tensors(&narrow, &[("proj.weight", "F16", &[8, 40], 8 * 40 * 2)]);
+        let ip = root.join("ip");
+        std::fs::create_dir_all(ip.join("models/image_encoder")).unwrap();
+        std::fs::create_dir_all(ip.join("sdxl_models")).unwrap();
+        write_tensor(
+            &ip.join(crate::loader::IP_ADAPTER_IMAGE_ENCODER_FILE),
+            "F16",
+            30,
+            2,
+        );
+        write_tensor(
+            &ip.join(crate::loader::IP_ADAPTER_WEIGHT_FILES[1]),
+            "F16",
+            20,
+            2,
+        );
+
+        let dense_conv_and_norm: u64 = 288 + 32;
+        let ip_bytes: u64 = 30 * 2 + 20 * 2;
+        let control_of = |spec: &LoadSpec| {
+            resident_overlay_components(spec)
+                .unwrap()
+                .into_iter()
+                .find(|component| component.id == CONTROL_COMPONENT_ID)
+                .expect("a configured control branch is declared")
+                .resident_bytes
+        };
+        let ip_of = |spec: &LoadSpec| {
+            resident_overlay_components(spec)
+                .unwrap()
+                .into_iter()
+                .find(|component| component.id == IP_ADAPTER_COMPONENT_ID)
+                .expect("a configured IP-adapter is declared")
+                .resident_bytes
+        };
+
+        let base = LoadSpec::new(WeightsSource::File(root.join("sdxl.safetensors")))
+            .with_control(WeightsSource::File(control));
+        let mut dense = base.clone();
+        dense.ip_adapter = Some(WeightsSource::Dir(ip));
+        assert_eq!(
+            control_of(&dense),
+            8 * 128 * 2 + dense_conv_and_norm,
+            "a dense load keeps every tensor at the fp16 compute width"
+        );
+
+        // Q4: codes = out * input * 4 / 8, tables = out * (input / 64) * 4.
+        let q4 = dense.clone().with_quant(mlx_gen::Quant::Q4);
+        assert_eq!(
+            control_of(&q4),
+            (8 * 128 * 4 / 8) + (8 * (128 / 64) * 4) + dense_conv_and_norm,
+        );
+        assert_eq!(control_of(&q4), 576 + dense_conv_and_norm);
+
+        let q8 = dense.clone().with_quant(mlx_gen::Quant::Q8);
+        assert_eq!(
+            control_of(&q8),
+            (8 * 128 * 8 / 8) + (8 * (128 / 64) * 4) + dense_conv_and_norm,
+        );
+        assert!(
+            control_of(&q4) < control_of(&q8) && control_of(&q8) < control_of(&dense),
+            "Q4 < Q8 < dense"
+        );
+
+        // A rank-two weight whose input width is not a multiple of the group size is left dense by
+        // `quantize_map`, so the tier must not move it.
+        let mut narrow_spec = base.clone();
+        narrow_spec.control = Some(WeightsSource::File(narrow));
+        assert_eq!(
+            control_of(&narrow_spec.clone().with_quant(mlx_gen::Quant::Q4)),
+            control_of(&narrow_spec),
+            "an ineligible width is not packed at any tier"
+        );
+
+        // `load_sdxl` quantizes only the U-Net and the control branches; the IP-adapter is cast and
+        // left dense, so its pricing must be tier-independent.
+        assert_eq!(ip_of(&dense), ip_bytes);
+        assert_eq!(ip_of(&q4), ip_bytes);
     }
 
     /// Feature-end review (SC-22667, E1): the module doc has always said what rung 0 holds warm —

@@ -164,7 +164,7 @@ pub fn provider_contract_for_paths(
         .saturating_add(base.dit)
         .saturating_add(base.vae);
 
-    // Both auxiliaries are cast to `DTYPE` (fp16) on load, so 16 bits per element is exact; the
+    // The face IP-adapter is cast to `DTYPE` (fp16) on load, so 16 bits per element is exact; the
     // shared projection leaves an already-packed tensor at its stored width. A source that cannot
     // be read prices zero rather than turning the contract into a refusal — the loader raises the
     // actionable error against the same path moments later.
@@ -173,7 +173,41 @@ pub fn provider_contract_for_paths(
     };
     let (WeightsSource::Dir(identitynet) | WeightsSource::File(identitynet)) = &paths.identitynet;
     let mut components = Vec::new();
-    let identitynet_bytes = projected(identitynet, ResidentProjection::Bfloat16);
+    // SC-22667 review: the IdentityNet follows the requested tier. `reload` runs
+    // `identitynet.quantize(bits)` alongside the U-Net whenever a packed tier is selected, so flat
+    // fp16 pricing was tier-blind — a Q4 branch is roughly a quarter of it, enough to refuse a fit
+    // that would have succeeded. The IdentityNet is an `mlx_gen_sdxl` ControlNet, so the
+    // eligibility test is `quantize_map`'s verbatim at SDXL's group size (the codebase-wide
+    // `DEFAULT_GROUP_SIZE`): SDXL's `is_unet_target` predicate is `true`, leaving the rank-two
+    // `.weight` shape guard as the whole scope, which is exactly `ControlNet::quantize`'s
+    // Linear-only reach. The 4-D convs and the 1-D norms keep the fp16 compute cast, and the face
+    // IP-adapter stays flat fp16 because `reload` only `cast_all(DTYPE)`s it.
+    //
+    // Still tier-blind, and deliberately left so: the SDXL base split above comes from
+    // `mlx_gen_sdxl::snapshot_component_footprint`, which prices a snapshot's stored bytes with no
+    // knowledge of `tier`. On a dense snapshot loaded at Q4 that OVER-prices the U-Net, which is
+    // E3-safe (a refused fit, never an admitted OOM), and correcting it belongs in that shared SDXL
+    // helper — with its own callers — rather than in this consumer.
+    let identitynet_group_size = mlx_gen::quant::DEFAULT_GROUP_SIZE as usize;
+    let identitynet_bits = tier.quant.map(mlx_gen::Quant::bits);
+    let identitynet_bytes =
+        projected_safetensors_bytes(identitynet, move |tensor| match identitynet_bits {
+            Some(bits)
+                if tensor.name.ends_with(".weight")
+                    && matches!(
+                        tensor.shape.as_slice(),
+                        [_, input] if *input >= identitynet_group_size
+                            && *input % identitynet_group_size == 0
+                    ) =>
+            {
+                ResidentProjection::GroupQuantized {
+                    bits,
+                    group_size: identitynet_group_size,
+                }
+            }
+            _ => ResidentProjection::Bfloat16,
+        })
+        .unwrap_or(0);
     if identitynet_bytes > 0 {
         components.push(MemoryResidentComponent {
             id: IDENTITYNET_COMPONENT_ID.to_owned(),
