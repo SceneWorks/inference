@@ -473,9 +473,20 @@ fn validate_native_vae(root: &Path) -> gen_core::Result<()> {
 /// * `model.visual.*` — the Qwen3-VL vision tower. Only the **Edit** route constructs it
 ///   (`pipeline::load_edit_components`, `Weights::from_dir(mllm, .., VAE_DTYPE)` = f32). Base/Turbo
 ///   never do — their img2img surface loads the standalone VAE encoder alone (sc-11786) — so
-///   charging the tower there billed every plain request for a network no such load materializes.
+///   charging the tower there billed every plain request for a network no such load *retains*.
 /// * Anything else sharing `mllm/` (an `lm_head` tail, a sibling head) is built by neither loader
 ///   and is therefore not resident on any route.
+///
+/// This field prices **post-load residency**, not the load transient. `pipeline::load_te_weights`
+/// runs `Weights::from_dir(mllm, .., bf16)`, which eagerly materializes *every* `mllm/` tensor on
+/// the device — the vision tower and any `lm_head` included — and, when its norm probe finds a
+/// non-bf16 store, reads the whole directory again at f32 with the bf16 map still alive;
+/// `BooguTextEncoder::load` then retains only `model.language_model.*` and the map is dropped.
+/// That spike lasts for the duration of the encoder build on every route, exceeds the bytes
+/// declared here by the non-`language_model` remainder of `mllm/` at the store width, and is
+/// bounded on the Edit route by the same directory's f32 materialization of the tower, which IS
+/// charged there. A consumer estimating the TE *load* rather than the resident encoder must add
+/// that remainder; the resident fields are for the render that follows.
 fn mllm_tensor_width(name: &str, route: Route) -> Option<u64> {
     /// Leaves the text encoder reads with `Weights::get_f32` rather than at the bf16 store width:
     /// the per-head q/k RMSNorms, both decoder-layer norms, and the final norm.

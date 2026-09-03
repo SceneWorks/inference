@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::gen_core::{
     self, AdapterResidencyMode, LoadSpec, MemoryAssetFacts, MemoryBackendRealization,
-    MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant,
-    WeightsSource,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryResidentComponent,
+    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
 use sha2::{Digest, Sha256};
 
@@ -514,8 +514,15 @@ impl SdxlArtifactSeal {
             receipt.update(identity.as_bytes());
         }
         let receipt = format!("{:x}", receipt.finalize());
-        let facts = asset_facts(spec, &root, tier)?;
-        let contract = build_contract(spec, surface, tier, facts, route_fingerprint(route));
+        let (facts, components) = asset_facts(spec, &root, surface, tier)?;
+        let contract = build_contract(
+            spec,
+            surface,
+            tier,
+            facts,
+            components,
+            route_fingerprint(route),
+        );
         let seal = Self {
             contract,
             tier,
@@ -580,9 +587,17 @@ fn load_overlay_identity(spec: &LoadSpec) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("+"))
 }
 
-fn tensor_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
+/// Resident bytes of the tensors in one `.safetensors` file whose name `keep` admits: floats at
+/// `float_width`, integer codes at their stored width. A tensor the loader never reads is not
+/// charged, which is what `keep` expresses.
+fn filtered_tensor_bytes(
+    path: &Path,
+    float_width: u64,
+    keep: &dyn Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
         .iter()
+        .filter(|header| keep(&header.name))
         .try_fold(0_u64, |sum, header| {
             let bytes = if header.is_float() {
                 header.materialized_bytes(float_width)?
@@ -595,13 +610,21 @@ fn tensor_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
 }
 
 fn source_tensor_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
+    filtered_source_tensor_bytes(path, float_width, &|_| true)
+}
+
+fn filtered_source_tensor_bytes(
+    path: &Path,
+    float_width: u64,
+    keep: &dyn Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
     files
         .into_iter()
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
         .try_fold(0_u64, |sum, path| {
-            sum.checked_add(tensor_bytes(&path, float_width)?)
+            sum.checked_add(filtered_tensor_bytes(&path, float_width, keep)?)
                 .ok_or_else(|| gen_core::Error::Msg("sdxl: component byte sum overflow".into()))
         })
 }
@@ -616,11 +639,165 @@ const FLOAT_WIDTH: u64 = 2;
 /// `ip_provider::load` materializes at [`FLOAT_WIDTH`] beside the IP bundle.
 const IP_IMAGE_ENCODER_COMPONENT: &str = "sdxl_ip_image_encoder";
 
+/// The decode half of the diffusers `AutoencoderKL` checkpoint — the only tensors
+/// [`crate::vae_decoder::SdxlVaeDecoder::new`] reads (`post_quant_conv` and everything under
+/// `decoder.`, which includes `decoder.conv_norm_out` / `decoder.conv_out`). `encoder.*` and
+/// `quant_conv` are never opened by that loader.
+const VAE_DECODER_PREFIXES: &[&str] = &["decoder.", "post_quant_conv."];
+
+fn is_vae_decoder_tensor(name: &str) -> bool {
+    VAE_DECODER_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Resident bytes of the `sdxl-vae-fp16-fix` checkpoint on `surface`, at the f16 width both of its
+/// loaders materialize it at.
+///
+/// * [`SdxlSurface::Registered`] builds only [`crate::vae_decoder::SdxlVaeDecoder`]
+///   (`loaders::load_sdxl_vae`, through the mmap-backed `from_file`), so only the decoder namespace
+///   is resident: charging `encoder.*` + `quant_conv` billed ~half the checkpoint for tensors that
+///   loader never opens (epic SC-22657, E1). A checkpoint with no decoder tensors is refused rather
+///   than priced at zero — the loader would fail on it too.
+/// * [`SdxlSurface::Bespoke`] prices the whole checkpoint: the edit and detail providers ALSO build
+///   `VaeMomentsEncoder` from the same file (`loaders::load_sdxl_vae_encoder`, `encoder.*` +
+///   `quant_conv` via mmap), so both halves are resident there. The IP provider shares that surface
+///   without an encoder and is therefore over-declared by the encoder half — the surface carries no
+///   per-provider discriminator, and of the two available errors only that one is conservative
+///   (E3).
+fn vae_tensor_bytes(source: &Path, surface: SdxlSurface) -> gen_core::Result<u64> {
+    match surface {
+        SdxlSurface::Bespoke => source_tensor_bytes(source, FLOAT_WIDTH),
+        SdxlSurface::Registered => {
+            let decoder =
+                filtered_source_tensor_bytes(source, FLOAT_WIDTH, &is_vae_decoder_tensor)?;
+            if decoder == 0 {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "sdxl: VAE {} has no `decoder.` / `post_quant_conv` tensors for the decoder to load",
+                    source.display()
+                )));
+            }
+            Ok(decoder)
+        }
+    }
+}
+
+/// Width of one float element of the PiD student and its Gemma caption encoder once resident:
+/// `PidEngine::load` reads both through `Weights::from_file(s)` at
+/// [`candle_gen_pid::engine::LOAD_DTYPE`] (f32), whatever the checkpoint ships, so a bf16
+/// Gemma-2-2B costs ~10.4 GB resident, not ~5.2 GB (epic SC-22657, E3). Read from the loader's own
+/// constant so the two cannot drift.
+fn pid_float_width() -> u64 {
+    candle_gen_pid::engine::LOAD_DTYPE.size_in_bytes() as u64
+}
+
+/// The Gemma source `PidEngine::load` opens: the merged single file when the snapshot ships it,
+/// else the whole shard directory — never both, so a directory carrying both is not summed twice.
+fn pid_gemma_source(gemma: &Path) -> PathBuf {
+    let merged = gemma.join(candle_gen_pid::engine::GEMMA_MERGED_FILE);
+    if merged.is_file() {
+        merged
+    } else {
+        gemma.to_path_buf()
+    }
+}
+
+/// Resident bytes of one PiD checkpoint source (a file or a shard directory), packed-aware.
+///
+/// A dense float tensor lands at [`pid_float_width`]. A SANA-published packed Gemma tier
+/// (`gemma2::validate_packed_tier`: every attention/MLP projection as an MLX group-64
+/// `.weight` U32 / `.scales` / `.biases` triple) is repacked by `linear_from_weights` into one
+/// resident GGML `QTensor` (`Q4_1` / `Q8_0`) — priced through
+/// [`candle_gen::quant::mlx_packed_qtensor_resident_bytes`], with the sidecars as transient pack
+/// inputs — rather than at the on-disk byte count of its three source tensors, which is neither the
+/// resident size nor an upper bound of it.
+fn pid_source_bytes(source: &Path) -> gen_core::Result<u64> {
+    let mut files = Vec::new();
+    collect_files(source, &mut files)?;
+    files
+        .into_iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
+        .try_fold(0_u64, |sum, path| {
+            sum.checked_add(pid_file_bytes(&path)?)
+                .ok_or_else(|| gen_core::Error::Msg("sdxl: PiD byte sum overflow".into()))
+        })
+}
+
+fn pid_file_bytes(path: &Path) -> gen_core::Result<u64> {
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::HashMap<_, _>>();
+    let width = pid_float_width();
+    headers.iter().try_fold(0_u64, |sum, header| {
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            // MLX affine sidecars: transient inputs to the repack, not separately resident.
+            return Ok(sum);
+        }
+        let packed = header.name.strip_suffix(".weight").and_then(|base| {
+            Some((
+                *by_name.get(format!("{base}.scales").as_str())?,
+                *by_name.get(format!("{base}.biases").as_str())?,
+            ))
+        });
+        let bytes = match packed {
+            Some((scales, biases)) => candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                header,
+                scales,
+                biases,
+                candle_gen::quant::MLX_GROUP_SIZE,
+            )?,
+            None if header.is_float() => header.materialized_bytes(width)?,
+            None => header.data_bytes,
+        };
+        sum.checked_add(bytes)
+            .ok_or_else(|| gen_core::Error::Msg("sdxl: PiD tensor byte sum overflow".into()))
+    })
+}
+
+/// Stable provider-local ids of the typed auxiliary components this contract can declare.
+const CONTROL_COMPONENT_ID: &str = "sdxl_control";
+const IP_ADAPTER_COMPONENT_ID: &str = "sdxl_ip_adapter";
+const PID_STUDENT_COMPONENT_ID: &str = "sdxl_pid_student";
+const PID_CAPTION_ENCODER_COMPONENT_ID: &str = "sdxl_pid_caption_encoder";
+const ADAPTER_STACK_COMPONENT_ID: &str = "sdxl_adapter_stack";
+
+/// Record one auxiliary network as a typed resident component, skipping a zero: the shared
+/// validator refuses a declared component with zero bytes, and a source that priced to nothing is
+/// not evidence of residency (the loader fails on it before anything is resident).
+fn push_overlay(
+    into: &mut Vec<MemoryResidentComponent>,
+    id: String,
+    kind: MemoryComponentKind,
+    resident_bytes: u64,
+) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(MemoryResidentComponent {
+        id,
+        kind,
+        resident_bytes,
+        // No published rung bounds an SDXL overlay: block windowing is `Missing` on every surface
+        // and staged residency releases base phases, never an auxiliary.
+        bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
+    });
+}
+
+/// The priced base fields plus one typed [`MemoryResidentComponent`] per auxiliary network the
+/// spec stages. `overlay_bytes` is the sum of those components by construction, which is the
+/// agreement `MemoryProviderContract::conformance_errors` demands of a contract that declares both
+/// `AssetBytes` and `OverlayBytes` — the registered `sdxl` id seals this surface with `spec.control`
+/// set (`lib.rs` routes control renders through it), so an untyped non-zero overlay there was a
+/// non-conformant contract that any selector reading `conformance_errors` would refuse.
 fn asset_facts(
     spec: &LoadSpec,
     root: &Path,
+    surface: SdxlSurface,
     tier: MemoryNumericTier,
-) -> gen_core::Result<MemoryAssetFacts> {
+) -> gen_core::Result<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
     let width = FLOAT_WIDTH;
     let conditioning = source_tensor_bytes(&root.join("text_encoder"), width)?
         .saturating_add(source_tensor_bytes(&root.join("text_encoder_2"), width)?);
@@ -636,62 +813,105 @@ fn asset_facts(
     // numerically stable at f16. Pricing it at four bytes charged twice the decoder this seal can
     // admit. (The fused A1111 route, whose checkpoint VAE genuinely loads f32, never reaches here:
     // `SdxlArtifactSeal::capture_for` requires a snapshot directory.) Epic SC-22657, E1.
-    let decoder = source_tensor_bytes(decoder_source, width)?;
+    let decoder = vae_tensor_bytes(decoder_source, surface)?;
+
+    let mut components = Vec::new();
+    for (index, control) in spec
+        .control
+        .iter()
+        .chain(spec.extra_controls.iter())
+        .enumerate()
+    {
+        // MultiControlNet holds several distinct branches at once; the id, not the kind, tells
+        // them apart.
+        let id = if index == 0 {
+            CONTROL_COMPONENT_ID.to_owned()
+        } else {
+            format!("{CONTROL_COMPONENT_ID}_{}", index + 1)
+        };
+        push_overlay(
+            &mut components,
+            id,
+            MemoryComponentKind::ControlBranch,
+            source_tensor_bytes(source_path(control), width)?,
+        );
+    }
+    if let Some(ip_adapter) = &spec.ip_adapter {
+        push_overlay(
+            &mut components,
+            IP_ADAPTER_COMPONENT_ID.to_owned(),
+            MemoryComponentKind::IpAdapter,
+            source_tensor_bytes(source_path(ip_adapter), width)?,
+        );
+    }
+    // The CLIP ViT-H/14 image encoder the IP-Adapter route loads beside its bundle
+    // (`ip_provider::load`, `Weights::from_file(.., DTYPE)`), staged as the
+    // `sdxl_ip_image_encoder` component and pinned by `validate_ip_spec`: ~1.3 GB of resident
+    // auxiliary weights that no field charged (epic SC-22657, E1).
+    if let Some(encoder) = spec.components.get(IP_IMAGE_ENCODER_COMPONENT) {
+        push_overlay(
+            &mut components,
+            IP_IMAGE_ENCODER_COMPONENT.to_owned(),
+            MemoryComponentKind::IpAdapter,
+            source_tensor_bytes(source_path(encoder), width)?,
+        );
+    }
     // The PiD super-resolving decoder (epic 7840 / sc-7853). `LoadSpec::pid` makes the component
     // build load `PidEngine::from_spec` once alongside the base model — unconditionally, not per
     // request — and PiD runs on the Resident rung (`validate_context` refuses it only for the
     // *optimized* rungs), so both of its files are resident for the whole render while no field
     // charged either of them (epic SC-22657, E1).
     //
-    // They are base components, not auxiliaries standing beside the base: one network, one field
-    // (`gen_core::MemoryAssetFacts`). The student IS a decoder, co-resident with the native VAE it
-    // decodes in place of, so it joins `decoder_bytes`; its Gemma caption encoder is a conditioning
-    // encoder, so it joins `conditioning_bytes`.
-    let (pid_conditioning, pid_decoder) = match spec.pid.as_ref() {
-        Some(pid) => (
-            source_tensor_bytes(source_path(&pid.gemma), width)?,
-            source_tensor_bytes(source_path(&pid.checkpoint), width)?,
-        ),
-        None => (0, 0),
-    };
-    let conditioning = conditioning.saturating_add(pid_conditioning);
-    let decoder = decoder.saturating_add(pid_decoder);
-    let mut overlay = spec
-        .control
-        .iter()
-        .chain(spec.extra_controls.iter())
-        .chain(spec.ip_adapter.iter())
-        // The CLIP ViT-H/14 image encoder the IP-Adapter route loads beside its bundle
-        // (`ip_provider::load`, `Weights::from_file(.., DTYPE)`), staged as the
-        // `sdxl_ip_image_encoder` component and pinned by `validate_ip_spec`: ~1.3 GB of resident
-        // auxiliary weights that no field charged (epic SC-22657, E1). It joins the same aggregate
-        // the IP bundle beside it already uses, so it cannot flip an otherwise-empty overlay.
-        .chain(spec.components.get(IP_IMAGE_ENCODER_COMPONENT))
-        .map(source_path)
-        .try_fold(0_u64, |sum, path| {
-            Ok::<_, gen_core::Error>(sum.saturating_add(source_tensor_bytes(path, width)?))
-        })?;
+    // It is an optional add-on network standing beside the base model, which
+    // `gen_core::MemoryAssetFacts` says never belongs in the three base fields: one typed
+    // auxiliary component per checkpoint, summed into `overlay_bytes`. `AdapterStack` is the
+    // closest existing kind for an auxiliary network installed beside the base model's own
+    // networks (the Kolors PiD declaration's precedent); what the contract arithmetic consumes is
+    // `MemoryComponentKind::is_auxiliary()`, which it satisfies.
+    if let Some(pid) = spec.pid.as_ref() {
+        push_overlay(
+            &mut components,
+            PID_STUDENT_COMPONENT_ID.to_owned(),
+            MemoryComponentKind::AdapterStack,
+            pid_source_bytes(source_path(&pid.checkpoint))?,
+        );
+        push_overlay(
+            &mut components,
+            PID_CAPTION_ENCODER_COMPONENT_ID.to_owned(),
+            MemoryComponentKind::AdapterStack,
+            pid_source_bytes(&pid_gemma_source(source_path(&pid.gemma)))?,
+        );
+    }
     let adapter_mode = if tier.quant.is_some() {
         AdapterResidencyMode::Additive
     } else {
         AdapterResidencyMode::Folded
     };
-    overlay = overlay.saturating_add(
+    push_overlay(
+        &mut components,
+        ADAPTER_STACK_COMPONENT_ID.to_owned(),
+        MemoryComponentKind::AdapterStack,
         gen_core::adapter_stack_resident_bytes(&spec.adapters, adapter_mode).ok_or_else(|| {
             gen_core::Error::Unsupported(
                 "sdxl: every additive packed adapter must have an exact non-zero size".into(),
             )
         })?,
     );
-    Ok(MemoryAssetFacts {
-        base_bytes: conditioning
-            .saturating_add(transformer)
-            .saturating_add(decoder),
-        conditioning_bytes: conditioning,
-        transformer_bytes: transformer,
-        decoder_bytes: decoder,
-        overlay_bytes: overlay,
-    })
+    let overlay = components.iter().fold(0_u64, |sum, component| {
+        sum.saturating_add(component.resident_bytes)
+    });
+    Ok((
+        MemoryAssetFacts {
+            base_bytes: conditioning
+                .saturating_add(transformer)
+                .saturating_add(decoder),
+            conditioning_bytes: conditioning,
+            transformer_bytes: transformer,
+            decoder_bytes: decoder,
+            overlay_bytes: overlay,
+        },
+        components,
+    ))
 }
 
 /// Activation dtype every SDXL-family Candle route computes in. `lib.rs` pins `DType::F16` on the
@@ -778,6 +998,7 @@ fn build_contract(
     surface: SdxlSurface,
     _tier: MemoryNumericTier,
     asset_facts: MemoryAssetFacts,
+    resident_components: Vec<MemoryResidentComponent>,
     fingerprint: String,
 ) -> MemoryProviderContract {
     let phases = vec![
@@ -833,7 +1054,10 @@ fn build_contract(
             attention_chunking: true,
             transformer_window_materialization: false,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
+        // The component variant of the phase envelope: every auxiliary network `asset_facts`
+        // sums into `overlay_bytes` is also declared as a typed resident component, which is what
+        // lets a non-zero overlay conform. A weights-free surface declares none.
+        formula: MemoryFormulaKind::ComponentPhaseEnvelope {
             phases,
             variables: vec![
                 MemoryFormulaVariable::AssetBytes,
@@ -844,6 +1068,7 @@ fn build_contract(
                 MemoryFormulaVariable::DecodeTileArea,
                 MemoryFormulaVariable::AttentionChunkSize,
             ],
+            resident_components,
         },
         calibration: Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)),
         asset_facts,
@@ -1376,6 +1601,7 @@ pub fn weights_free_contract_for_route(
         surface,
         tier,
         MemoryAssetFacts::default(),
+        Vec::new(),
         route_fingerprint(route),
     )
 }
@@ -1411,6 +1637,27 @@ mod tests {
                 ("x.weight".to_owned(), weight),
                 ("x.scales".to_owned(), scales),
                 ("x.biases".to_owned(), biases),
+            ],
+            None,
+            path,
+        )
+        .unwrap();
+    }
+
+    /// The fp16-fix VAE fixture: one f16 decoder element (`decoder.conv_out.weight`) beside eight
+    /// f16 encoder elements (`encoder.conv_in.weight`) that only the bespoke surface's
+    /// `VaeMomentsEncoder` opens.
+    fn write_vae(path: &Path) {
+        safetensors::serialize_to_file(
+            vec![
+                (
+                    "decoder.conv_out.weight".to_owned(),
+                    Tensor::zeros((1,), DType::F16, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "encoder.conv_in.weight".to_owned(),
+                    Tensor::zeros((8,), DType::F16, &Device::Cpu).unwrap(),
+                ),
             ],
             None,
             path,
@@ -1461,7 +1708,7 @@ mod tests {
         }
         std::fs::write(&clip_l, b"{}").unwrap();
         std::fs::write(&clip_g, b"{}").unwrap();
-        write_tensor(&vae, DType::F16);
+        write_vae(&vae);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_resolved_route("sdxl")
             .with_component("tokenizer_clip_l", WeightsSource::File(clip_l))
@@ -1472,35 +1719,51 @@ mod tests {
 
     /// AC (epic SC-22657, E1): every SDXL asset field prices what the loader materializes.
     ///
-    /// Three defects are pinned:
+    /// Four defects are pinned:
     ///
-    /// 1. **The fp16-fix VAE is loaded f16.** `SdxlVaeDecoder::from_file(.., self.dtype, ..)` with
-    ///    `dtype: DType::F16`; pricing it at four bytes charged twice the resident decoder.
-    ///    *Mutation that reds this:* `source_tensor_bytes(decoder_source, 4)`, the shape under
-    ///    review.
-    /// 2. **The IP-Adapter CLIP ViT-H image encoder is resident.** `ip_provider::load` materializes
-    ///    the `sdxl_ip_image_encoder` component beside the IP bundle; no field charged it.
-    ///    *Mutation that reds this:* dropping the `IP_IMAGE_ENCODER_COMPONENT` link from the
-    ///    overlay chain.
-    /// 3. **PiD is resident when staged.** `LoadSpec::pid` makes the component build load the
-    ///    student and its Gemma encoder once alongside the base model; the student is charged to
-    ///    `decoder_bytes` and its caption encoder to `conditioning_bytes` (one network, one field).
-    ///    *Mutation that reds this:* dropping the `pid_conditioning` / `pid_decoder` addends.
+    /// 1. **The fp16-fix VAE is loaded f16, decoder half only.** `SdxlVaeDecoder::from_file(..,
+    ///    self.dtype, ..)` with `dtype: DType::F16` reads `decoder.*` + `post_quant_conv` and
+    ///    nothing else; pricing the whole file at four bytes charged ~4x the resident decoder.
+    ///    *Mutations that red this:* `source_tensor_bytes(decoder_source, 4)`, and pricing the
+    ///    registered surface through `source_tensor_bytes` without the decoder filter.
+    /// 2. **The bespoke surface also holds the encoder.** The edit and detail providers build
+    ///    `VaeMomentsEncoder` from the same checkpoint. *Mutation that reds this:* applying the
+    ///    decoder filter on `SdxlSurface::Bespoke` too.
+    /// 3. **The IP-Adapter CLIP ViT-H image encoder is resident, and typed.** `ip_provider::load`
+    ///    materializes the `sdxl_ip_image_encoder` component beside the IP bundle; both are
+    ///    declared as `IpAdapter` components whose sum is the overlay.
+    ///    *Mutation that reds this:* dropping the `IP_IMAGE_ENCODER_COMPONENT` `push_overlay`.
+    /// 4. **PiD is resident when staged, at the width its engine loads, as an auxiliary.**
+    ///    `PidEngine::load` materializes the student and its Gemma encoder through
+    ///    `Weights::from_file(s)` at [`candle_gen_pid::engine::LOAD_DTYPE`] (f32) — four bytes per
+    ///    f16 element on disk, not two — and PiD is an optional add-on network, so both land in
+    ///    `overlay_bytes` as typed components and in none of the three base fields.
+    ///    *Mutations that red this:* pricing PiD at `FLOAT_WIDTH`; routing the student into
+    ///    `decoder_bytes` again.
     #[test]
     fn asset_facts_price_the_f16_decoder_and_every_staged_auxiliary() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, root) = dense_spec(&temp);
         let base = provider_contract_for_spec(&spec).unwrap().asset_facts;
-        // The fixture's `vae_fp16_fix` is one f16 element: two resident bytes, not four.
+        // The fixture's `vae_fp16_fix` is one f16 decoder element beside eight f16 encoder
+        // elements: two resident bytes on the registered surface, which builds only the decoder.
         assert_eq!(
             base.decoder_bytes, 2,
-            "the fp16-fix VAE is materialized f16"
+            "the registered surface materializes the f16 decoder namespace only"
         );
         assert_eq!(
             base.base_bytes,
             base.conditioning_bytes + base.transformer_bytes + base.decoder_bytes
         );
         assert_eq!(base.overlay_bytes, 0, "a plain route stages no auxiliary");
+        // The bespoke surface (edit / detail) also builds `VaeMomentsEncoder` from that file.
+        let bespoke = SdxlArtifactSeal::capture_for(&spec, SdxlSurface::Bespoke).unwrap();
+        assert_eq!(
+            bespoke.contract().asset_facts.decoder_bytes,
+            2 + 8 * 2,
+            "the bespoke surface holds both VAE halves at f16"
+        );
+        assert!(bespoke.contract().conformance_errors().is_empty());
 
         // The IP-Adapter route stages its bundle AND its CLIP ViT-H image encoder.
         let ip_bundle = root.join("ip-adapter-plus.safetensors");
@@ -1519,14 +1782,28 @@ mod tests {
             IP_IMAGE_ENCODER_COMPONENT,
             WeightsSource::File(ip_encoder.clone()),
         );
+        let ip_contract = provider_contract_for_spec(&ip_spec).unwrap();
         assert_eq!(
-            provider_contract_for_spec(&ip_spec)
-                .unwrap()
-                .asset_facts
-                .overlay_bytes,
+            ip_contract.asset_facts.overlay_bytes,
             2 + 16 * 16 * 2,
             "the IP bundle and the CLIP ViT-H image encoder it loads beside it are both resident"
         );
+        assert_eq!(
+            component_table(&ip_contract),
+            vec![
+                (
+                    IP_ADAPTER_COMPONENT_ID.to_owned(),
+                    MemoryComponentKind::IpAdapter,
+                    2
+                ),
+                (
+                    IP_IMAGE_ENCODER_COMPONENT.to_owned(),
+                    MemoryComponentKind::IpAdapter,
+                    16 * 16 * 2
+                ),
+            ]
+        );
+        assert!(ip_contract.conformance_errors().is_empty());
 
         // A PiD-bearing spec stages the student checkpoint and the Gemma caption encoder.
         let pid_checkpoint = root.join("pid-student.safetensors");
@@ -1551,29 +1828,209 @@ mod tests {
             checkpoint: WeightsSource::File(pid_checkpoint),
             gemma: WeightsSource::Dir(gemma),
         });
-        let pid_facts = provider_contract_for_spec(&pid_spec).unwrap().asset_facts;
+        let pid_contract = provider_contract_for_spec(&pid_spec).unwrap();
+        let pid_facts = pid_contract.asset_facts;
+        // Both files are read at the engine's f32 load dtype: four bytes per f16 element on disk.
         assert_eq!(
-            pid_facts.decoder_bytes,
-            base.decoder_bytes + 4 * 4 * 2,
-            "the PiD student decodes in place of the native VAE and is resident beside it"
+            candle_gen_pid::engine::LOAD_DTYPE.size_in_bytes(),
+            4,
+            "PiD's loader materializes f32; the pricing below assumes that width"
         );
         assert_eq!(
-            pid_facts.conditioning_bytes,
-            base.conditioning_bytes + 2 * 4 * 2,
-            "PiD's Gemma caption encoder is a resident conditioning encoder"
+            component_table(&pid_contract),
+            vec![
+                (
+                    PID_STUDENT_COMPONENT_ID.to_owned(),
+                    MemoryComponentKind::AdapterStack,
+                    4 * 4 * 4
+                ),
+                (
+                    PID_CAPTION_ENCODER_COMPONENT_ID.to_owned(),
+                    MemoryComponentKind::AdapterStack,
+                    2 * 4 * 4
+                ),
+            ],
+            "the student and its Gemma caption encoder are typed auxiliaries at the f32 load width"
         );
+        assert_eq!(pid_facts.overlay_bytes, 4 * 4 * 4 + 2 * 4 * 4);
+        // An optional add-on network never joins the three base fields.
+        assert_eq!(pid_facts.decoder_bytes, base.decoder_bytes);
+        assert_eq!(pid_facts.conditioning_bytes, base.conditioning_bytes);
+        assert_eq!(pid_facts.transformer_bytes, base.transformer_bytes);
+        assert_eq!(pid_facts.base_bytes, base.base_bytes);
+        assert!(
+            pid_contract.conformance_errors().is_empty(),
+            "{:?}",
+            pid_contract.conformance_errors()
+        );
+    }
+
+    /// `(id, kind, resident_bytes)` of every declared resident component, in declaration order.
+    fn component_table(
+        contract: &MemoryProviderContract,
+    ) -> Vec<(String, MemoryComponentKind, u64)> {
+        contract
+            .resident_components()
+            .iter()
+            .map(|component| {
+                assert_eq!(component.bounded_by, None);
+                assert_eq!(component.residency, MemoryComponentResidency::WholeRender);
+                (
+                    component.id.clone(),
+                    component.kind,
+                    component.resident_bytes,
+                )
+            })
+            .collect()
+    }
+
+    /// AC (epic SC-22657, E3): the Gemma caption encoder is priced from the file `PidEngine::load`
+    /// opens — the merged `gemma-2-2b-it.safetensors` when present, else every shard — and a
+    /// packed (SANA-published) tier is priced as the GGML `QTensor` `linear_from_weights` repacks
+    /// each MLX affine triple into, not as the on-disk bytes of its three source tensors.
+    ///
+    /// The fixture's `[64, 128]` Q4 projection packs to `64 * 16` U32 codes + two `[64, 2]` f16
+    /// sidecars (4_608 B on disk) and lands as `Q4_1`: `64 * 128 / 32` blocks of 20 B = 5_120 B.
+    ///
+    /// *Mutations that red this:* pricing the packed `.weight` at `header.data_bytes` (4_096 +
+    /// sidecars); summing the whole `gemma/` directory instead of `pid_gemma_source` (the shard
+    /// joins the merged file); pricing dense tensors at `FLOAT_WIDTH`.
+    #[test]
+    fn pid_gemma_is_priced_from_the_file_the_engine_opens_at_its_resident_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, root) = dense_spec(&temp);
+        let pid_checkpoint = root.join("pid-student.safetensors");
+        write_tensor(&pid_checkpoint, DType::F16);
+        let gemma = root.join("gemma");
+        std::fs::create_dir_all(&gemma).unwrap();
+        let merged = gemma.join(candle_gen_pid::engine::GEMMA_MERGED_FILE);
+        safetensors::serialize_to_file(
+            vec![
+                (
+                    "model.layers.0.mlp.down_proj.weight".to_owned(),
+                    Tensor::zeros((64, 16), DType::U32, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "model.layers.0.mlp.down_proj.scales".to_owned(),
+                    Tensor::zeros((64, 2), DType::F16, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "model.layers.0.mlp.down_proj.biases".to_owned(),
+                    Tensor::zeros((64, 2), DType::F16, &Device::Cpu).unwrap(),
+                ),
+                (
+                    "model.embed_tokens.weight".to_owned(),
+                    Tensor::zeros((2, 4), DType::F16, &Device::Cpu).unwrap(),
+                ),
+            ],
+            None,
+            &merged,
+        )
+        .unwrap();
+        // A shard beside the merged file: `PidEngine::load` never opens it when the merged file
+        // exists, so it must not be priced either.
+        let shard = gemma.join("model-00001-of-00001.safetensors");
+        safetensors::serialize_to_file(
+            vec![(
+                "model.norm.weight".to_owned(),
+                Tensor::zeros((100,), DType::F16, &Device::Cpu).unwrap(),
+            )],
+            None,
+            &shard,
+        )
+        .unwrap();
+        let mut pid_spec = spec.clone();
+        pid_spec.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(pid_checkpoint),
+            gemma: WeightsSource::Dir(gemma.clone()),
+        });
+        let caption_bytes = |spec: &LoadSpec| {
+            component_table(&provider_contract_for_spec(spec).unwrap())
+                .into_iter()
+                .find(|(id, _, _)| id == PID_CAPTION_ENCODER_COMPONENT_ID)
+                .map(|(_, _, bytes)| bytes)
+                .unwrap()
+        };
         assert_eq!(
-            pid_facts.base_bytes,
-            pid_facts.conditioning_bytes + pid_facts.transformer_bytes + pid_facts.decoder_bytes
+            caption_bytes(&pid_spec),
+            64 * 128 / 32 * 20 + 2 * 4 * 4,
+            "the merged file alone: one Q4_1 QTensor plus the f32 embedding"
         );
-        // Base components, not an aggregate overlay: PiD must not flip an otherwise-empty
-        // `overlay_bytes` non-zero, which this PhaseEnvelope contract cannot back with typed
-        // auxiliary components and which `MemoryProviderContract::conformance_errors` rejects.
-        assert_eq!(pid_facts.overlay_bytes, 0);
-        assert!(provider_contract_for_spec(&pid_spec)
-            .unwrap()
-            .conformance_errors()
-            .is_empty());
+
+        // Without the merged file the engine falls back to every shard in the directory.
+        std::fs::remove_file(&merged).unwrap();
+        assert_eq!(
+            caption_bytes(&pid_spec),
+            100 * 4,
+            "the shard directory at the f32 load width"
+        );
+    }
+
+    /// The registered `sdxl` id seals its contract with `spec.control` set (`lib.rs` routes control
+    /// renders through `SdxlControlGenerator` under that id), so a control render's contract must
+    /// conform: every overlay source is a typed `MemoryResidentComponent` whose sum is
+    /// `overlay_bytes`, on the registered surface as well as the bespoke one, while the weights-free
+    /// surface keeps declaring nothing.
+    ///
+    /// *Mutation that reds this:* leaving `overlay_bytes` an untyped aggregate (skipping every
+    /// `push_overlay` and summing the sources directly) — `conformance_errors` then reports the
+    /// non-zero overlay without typed auxiliary components.
+    #[test]
+    fn registered_control_renders_declare_typed_overlay_components_and_conform() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, root) = dense_spec(&temp);
+        let control = root.join("controlnet.safetensors");
+        let extra = root.join("controlnet-2.safetensors");
+        for (path, elements) in [(&control, 3), (&extra, 5)] {
+            safetensors::serialize_to_file(
+                vec![(
+                    "x.weight".to_owned(),
+                    Tensor::zeros((elements,), DType::F16, &Device::Cpu).unwrap(),
+                )],
+                None,
+                path,
+            )
+            .unwrap();
+        }
+        let mut control_spec = spec.clone();
+        control_spec.control = Some(WeightsSource::File(control));
+        control_spec.extra_controls = vec![WeightsSource::File(extra)];
+
+        for surface in [SdxlSurface::Registered, SdxlSurface::Bespoke] {
+            let contract = SdxlArtifactSeal::capture_for(&control_spec, surface)
+                .unwrap()
+                .contract()
+                .clone();
+            assert_eq!(
+                component_table(&contract),
+                vec![
+                    (
+                        CONTROL_COMPONENT_ID.to_owned(),
+                        MemoryComponentKind::ControlBranch,
+                        3 * 2
+                    ),
+                    (
+                        format!("{CONTROL_COMPONENT_ID}_2"),
+                        MemoryComponentKind::ControlBranch,
+                        5 * 2
+                    ),
+                ],
+                "{surface:?}: one typed branch per ControlNet source"
+            );
+            assert_eq!(contract.asset_facts.overlay_bytes, 3 * 2 + 5 * 2);
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{surface:?}: {:?}",
+                contract.conformance_errors()
+            );
+        }
+
+        // The weights-free surface is unchanged: no bytes, no components, still conformant.
+        let weights_free = weights_free_contract(&control_spec).unwrap();
+        assert_eq!(weights_free.asset_facts, MemoryAssetFacts::default());
+        assert!(weights_free.resident_components().is_empty());
+        assert!(weights_free.conformance_errors().is_empty());
+        gen_core_testkit::assert_memory_contract_asset_facts_conform(&weights_free);
     }
 
     /// AC (epic SC-22657, E2): a materialized SDXL snapshot publishes the axes of the vendored

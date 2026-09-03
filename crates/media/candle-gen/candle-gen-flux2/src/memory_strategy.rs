@@ -614,6 +614,14 @@ pub(crate) fn composed_provider_contract_for(
                     "snapshot transformer",
                     false,
                 )?,
+                // The WHOLE `vae/` component, encoder half included, on both ids. `Flux2Vae::new`
+                // (t2i, `load_heavy_seq` / the resident load) is decode-only, but the edit and
+                // control providers that compose this very same contract — `edit_provider.rs` for
+                // dev AND klein, `control_provider.rs` for dev — build `Flux2Vae::new_with_encoder`
+                // (`encoder.*` + `quant_conv`) from the same source, and a `MemoryProviderContract`
+                // carries no route discriminator. Same policy as `selected_vision_tower_bytes`: of
+                // the two available errors, over-declaring the encoder half on t2i is a
+                // conservative fit while omitting it on edit / control is a false admit (E3).
                 vae: snapshot_component_bytes(&root.join("vae"), None, "snapshot VAE", false)?,
             }
         }
@@ -644,6 +652,7 @@ pub(crate) fn composed_provider_contract_for(
                         f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
                     }
                 })?,
+                // Whole component, encoder half included — see the Dir arm above.
                 vae: f32_or_packed_component_bytes(
                     &base.join("vae"),
                     None,

@@ -106,8 +106,59 @@ fn imported_dit_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
     })
 }
 
-fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
-    cast_component_bytes(path, 4, component, |_| Ok(()))
+/// On-disk key prefixes of the Qwen-Image VAE's **decode half** — everything the decode-only
+/// `QwenVae::new` reads: `post_quant_conv` + `decoder.*` in diffusers naming (the snapshot `vae/`),
+/// `conv2.*` + `decoder.*` in the native WAN naming a ComfyUI single file ships before
+/// `comfyui::remap_vae_wan_to_diffusers` renames it.
+const VAE_DECODER_PREFIXES: &[&str] = &["decoder.", "post_quant_conv.", "conv2."];
+
+/// The encoder half — `quant_conv` + `encoder.*` (diffusers) / `conv1.*` + `encoder.*` (WAN) —
+/// which only `QwenVaeEncoder::new` reads.
+const VAE_ENCODER_PREFIXES: &[&str] = &["encoder.", "quant_conv.", "conv1."];
+
+/// Whether `provider_id`'s loaders build `QwenVaeEncoder` beside the decoder: the edit route
+/// (`edit.rs`, both the warm and the staged legs, for the reference encode) and the Fun-Control
+/// route (`control_fun.rs`, for the control-image encode). `qwen_image` builds nothing but
+/// `QwenVae` (`load_vae_seq` / the resident load).
+fn builds_vae_encoder(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "qwen_image_edit" | "qwen_image_2512_fun_control"
+    )
+}
+
+/// f32 resident bytes of the VAE tensors `provider_id`'s loaders actually materialize: the decode
+/// half on every route, plus the encoder half where [`builds_vae_encoder`]. Both loaders read
+/// through an mmap-backed `VarBuilder` (or, for the ComfyUI file, a host map the device copy is
+/// drawn from key by key), so a tensor neither constructor names never reaches the device —
+/// charging the whole file billed the t2i route for an encoder it never builds (epic SC-22657,
+/// E1). A source with no decoder tensors is refused rather than priced at zero: `QwenVae::new`
+/// fails on it too.
+fn vae_component_bytes(
+    path: &std::path::Path,
+    provider_id: &str,
+    component: &str,
+) -> gen_core::Result<u64> {
+    let with_encoder = builds_vae_encoder(provider_id);
+    let starts_with_any =
+        |name: &str, prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
+    let loaded = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
+        .into_iter()
+        .filter(|tensor| {
+            starts_with_any(&tensor.name, VAE_DECODER_PREFIXES)
+                || (with_encoder && starts_with_any(&tensor.name, VAE_ENCODER_PREFIXES))
+        })
+        .collect::<Vec<_>>();
+    if !loaded
+        .iter()
+        .any(|tensor| starts_with_any(&tensor.name, VAE_DECODER_PREFIXES))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen-image {component} {} has no `decoder.` / `post_quant_conv` tensors for `QwenVae` to load",
+            path.display()
+        )));
+    }
+    cast_tensor_headers_bytes(&loaded, 4, component, |_| Ok(()))
 }
 
 fn selected_language_encoder_bytes(
@@ -179,25 +230,28 @@ pub(crate) fn provider_contract(
             // `load_vae_seq` builds `QwenVae` from `component_vb("vae", ENC_DTYPE)` for a snapshot
             // exactly as the ComfyUI arm below does for an imported file — so the snapshot's bf16
             // on-disk sum under-priced the resident decoder by 2x while the imported route beside
-            // it was already f32-priced (epic SC-22657, E1). The DiT stays an on-disk sum: it is
-            // materialized at `DIT_DTYPE` (bf16), the width the hosted tiers ship.
+            // it was already f32-priced (epic SC-22657, E1). Only the tensors this route's
+            // constructors read are priced (`vae_component_bytes`): the decode half, plus the
+            // encoder half on the edit route that builds `QwenVaeEncoder`. The DiT stays an on-disk
+            // sum: it is materialized at `DIT_DTYPE` (bf16), the width the hosted tiers ship.
             let vae_dir = root.join("vae");
             components.vae = if gen_core::weightsmeta::safetensors_path_bytes(&vae_dir) == 0 {
                 // A partial tree with no `vae/` component contributed `0` through the directory
                 // sum this replaced; keep that, and let the loader be the seam that fails on it.
                 0
             } else {
-                f32_component_bytes(&vae_dir, "snapshot VAE")?
+                vae_component_bytes(&vae_dir, provider_id, "snapshot VAE")?
             };
             components
         }
         WeightsSource::File(path) => {
             let vae = match spec.components.get(gen_core::COMFYUI_VAE_COMPONENT) {
-                Some(WeightsSource::Dir(path)) => f32_component_bytes(path, "VAE")?,
-                Some(WeightsSource::File(path)) => {
-                    spec.read_file_unchanged_if_prepared(path, |p| f32_component_bytes(p, "VAE"))?
-                }
-                None => f32_component_bytes(&base.join("vae"), "base VAE")?,
+                Some(WeightsSource::Dir(path)) => vae_component_bytes(path, provider_id, "VAE")?,
+                Some(WeightsSource::File(path)) => spec
+                    .read_file_unchanged_if_prepared(path, |p| {
+                        vae_component_bytes(p, provider_id, "VAE")
+                    })?,
+                None => vae_component_bytes(&base.join("vae"), provider_id, "base VAE")?,
             };
             PerComponentBytes {
                 text_encoder: conditioning_encoder_bytes(provider_id, spec, base)?,
@@ -1179,11 +1233,18 @@ mod tests {
             crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
-        for component in ["transformer", "vae"] {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_control(&dir.join("model.safetensors"));
-        }
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_control(&root.join("transformer/model.safetensors"));
+        // One BF16 [2, 64] decoder tensor beside one BF16 [2, 64] encoder tensor: only the edit
+        // route, which builds `QwenVaeEncoder`, materializes the second.
+        std::fs::create_dir_all(root.join("vae")).unwrap();
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_in.weight", "BF16", &[2, 64], 256),
+                ("encoder.conv_in.weight", "BF16", &[2, 64], 256),
+            ],
+        );
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
@@ -1192,10 +1253,15 @@ mod tests {
 
     /// AC (epic SC-22657, E1): a snapshot's VAE is priced at the f32 width `load_vae_seq`
     /// materializes it at (`lib.rs`: `component_vb("vae", ENC_DTYPE)`), not at its bf16 on-disk
-    /// encoding — the same basis the imported-file arm beside it already used.
+    /// encoding — the same basis the imported-file arm beside it already used — and over the
+    /// tensors the route's constructors read: `QwenVae` is decode-only, so the t2i route is charged
+    /// the decoder namespace alone, while edit and Fun-Control, which also build
+    /// `QwenVaeEncoder`, are charged both halves.
     ///
-    /// *Mutation that reds this:* leaving `components.vae` as the raw
-    /// `PerComponentBytes::from_spec_subdirs` directory sum, the shape under review.
+    /// *Mutations that red this:* leaving `components.vae` as the raw
+    /// `PerComponentBytes::from_spec_subdirs` directory sum (the shape under review); pricing the
+    /// whole file at f32 on every route (`f32`-width `cast_component_bytes` without the namespace
+    /// filter — the t2i figure doubles).
     #[test]
     fn a_snapshot_vae_is_priced_at_the_f32_width_its_loader_materializes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1205,8 +1271,25 @@ mod tests {
             .to_path_buf();
         let on_disk = gen_core::weightsmeta::safetensors_path_bytes(root.join("vae"));
         let contract = provider_contract("qwen_image_edit", &spec).unwrap();
-        // `write_control` writes one BF16 [2, 64] tensor: 128 elements, f32-materialized.
-        assert_eq!(contract.asset_facts.decoder_bytes, 2 * 64 * 4);
+        // The fixture's decoder AND encoder tensors, BF16 [2, 64] each, f32-materialized: the edit
+        // route builds `QwenVaeEncoder` beside `QwenVae`.
+        assert_eq!(contract.asset_facts.decoder_bytes, 2 * (2 * 64 * 4));
+        assert_eq!(
+            provider_contract("qwen_image_2512_fun_control", &spec)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            2 * (2 * 64 * 4),
+            "Fun-Control encodes its control image through `QwenVaeEncoder` too"
+        );
+        assert_eq!(
+            provider_contract("qwen_image", &spec)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            2 * 64 * 4,
+            "the t2i route builds the decode-only `QwenVae`: the encoder tensor is not charged"
+        );
         assert_ne!(
             contract.asset_facts.decoder_bytes, on_disk,
             "the resident f32 decoder is not the bf16 file the snapshot ships"

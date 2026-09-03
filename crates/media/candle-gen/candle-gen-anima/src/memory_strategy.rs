@@ -25,12 +25,12 @@ const FINGERPRINT: &str = "anima-candle-request-scoped-conditioning-v1";
 /// bytes.
 const FLOAT_WIDTH: u64 = 2;
 
-/// The VAE is **not** loaded at [`FLOAT_WIDTH`]. [`crate::vae::load_vae`] reads
-/// `vae/qwen_image_vae.safetensors` through `candle_gen::Weights::from_file(.., DType::F32)` and
-/// builds its `VarBuilder` at `DType::F32` (the qwen-image golden convention: the denoised latents
-/// are f32 and a mixed-dtype conv is avoided), so every float element of the decoder costs four
-/// bytes on device. Pricing it at the DiT's bf16 width under-charged the resident decoder by
-/// exactly 2x (epic SC-22657, E1).
+/// The VAE is **not** loaded at [`FLOAT_WIDTH`]. [`crate::vae::load_vae`] reads the decode half of
+/// `vae/qwen_image_vae.safetensors` through `candle_gen::Weights::from_file_filtered(..,
+/// DType::F32, ..)` and builds its `VarBuilder` at `DType::F32` (the qwen-image golden convention:
+/// the denoised latents are f32 and a mixed-dtype conv is avoided), so every float element of the
+/// decoder costs four bytes on device. Pricing it at the DiT's bf16 width under-charged the resident
+/// decoder by exactly 2x (epic SC-22657, E1).
 const VAE_FLOAT_WIDTH: u64 = 4;
 
 fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
@@ -48,8 +48,19 @@ fn variant_for(provider_id: &str) -> gen_core::Result<Variant> {
 /// **that component's** loader materializes them at, not one crate-wide constant — and packed
 /// (integer) codes at their stored width. Header-only — no tensor data is materialized.
 fn component_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
+    filtered_component_bytes(path, float_width, &|_| true)
+}
+
+/// [`component_bytes`] over only the tensors whose on-disk key `keep` admits — the seam for a
+/// component whose loader opens a subset of its file.
+fn filtered_component_bytes(
+    path: &Path,
+    float_width: u64,
+    keep: &dyn Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
         .iter()
+        .filter(|header| keep(&header.name))
         .try_fold(0_u64, |sum, header| {
             let bytes = if header.is_float() {
                 header.materialized_bytes(float_width)?
@@ -71,6 +82,12 @@ fn component_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
 ///
 /// Each component is priced at the width **its own** loader materializes: the conditioner and DiT
 /// at [`FLOAT_WIDTH`], the VAE at [`VAE_FLOAT_WIDTH`] (see that constant for the loader evidence).
+///
+/// The VAE is priced over the **decode half only** ([`crate::vae::DECODER_KEY_PREFIXES`]): every
+/// inference route builds the decode-only `QwenVae` through [`crate::vae::load_vae`], and the
+/// encoder half is opened by nothing but the training-time `load_vae_encoder`. Charging the whole
+/// file billed ~half a VAE for tensors no render materializes (epic SC-22657, E1). A VAE file with
+/// no decoder tensors is refused rather than priced at zero — `load_vae` fails on it too.
 fn asset_facts(spec: &LoadSpec, variant: Variant) -> gen_core::Result<MemoryAssetFacts> {
     let root = crate::loader::resolve_split_files(&spec.weights)?;
     let conditioning = component_bytes(&root.join(crate::loader::TEXT_ENCODER_FILE), FLOAT_WIDTH)?;
@@ -78,7 +95,15 @@ fn asset_facts(spec: &LoadSpec, variant: Variant) -> gen_core::Result<MemoryAsse
         &root.join("diffusion_models").join(variant.dit_filename()),
         FLOAT_WIDTH,
     )?;
-    let decoder = component_bytes(&root.join(crate::loader::VAE_FILE), VAE_FLOAT_WIDTH)?;
+    let vae_file = root.join(crate::loader::VAE_FILE);
+    let decoder =
+        filtered_component_bytes(&vae_file, VAE_FLOAT_WIDTH, &crate::vae::is_decoder_key)?;
+    if decoder == 0 {
+        return Err(gen_core::Error::Unsupported(format!(
+            "anima: VAE {} has no `decoder.` / `conv2.` tensors for `load_vae` to materialize",
+            vae_file.display()
+        )));
+    }
     Ok(MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -611,17 +636,37 @@ mod tests {
             FLOAT_WIDTH,
         );
         let conditioning = write(crate::loader::TEXT_ENCODER_FILE, 16, 8, FLOAT_WIDTH);
-        // `vae::load_vae` reads the file at `DType::F32`, so the decoder is four bytes per element
-        // — never the DiT's bf16 width.
-        let decoder = write(crate::loader::VAE_FILE, 4, 2, VAE_FLOAT_WIDTH);
+        // `vae::load_vae` reads the decode half of the file at `DType::F32`, so the decoder is
+        // four bytes per `decoder.*` / `conv2.*` element — never the DiT's bf16 width, and never
+        // the `encoder.*` tensors written beside them, which only the trainer opens.
+        let vae = root.join(crate::loader::VAE_FILE);
+        std::fs::create_dir_all(vae.parent().unwrap()).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "decoder.head.2.weight".to_string(),
+            Tensor::zeros((4, 2), DType::F32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "conv2.weight".to_string(),
+            Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "encoder.head.2.weight".to_string(),
+            Tensor::zeros((8, 2), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(&tensors, &vae).unwrap();
+        let decoder = (4 * 2 + 2 * 2) * VAE_FLOAT_WIDTH;
         (root, conditioning, transformer, decoder)
     }
 
-    /// The decoder is materialized f32 by [`crate::vae::load_vae`], so its priced bytes must be
-    /// exactly twice the bf16 sum of the same tensors — never the DiT's [`FLOAT_WIDTH`].
+    /// The decoder is materialized f32 by [`crate::vae::load_vae`] — and only the decode half of
+    /// the file is: its priced bytes are exactly twice the bf16 sum of the `decoder.*` / `conv2.*`
+    /// tensors, never the DiT's [`FLOAT_WIDTH`] and never the `encoder.*` tensors the trainer-only
+    /// `load_vae_encoder` opens.
     ///
-    /// Reds under the pre-SC-22667 pricing (`component_bytes(vae, FLOAT_WIDTH)`), which returned
-    /// half of this.
+    /// *Mutations that red this:* `component_bytes(vae, FLOAT_WIDTH)` (the pre-SC-22667 width);
+    /// `component_bytes(vae, VAE_FLOAT_WIDTH)` without the decoder filter (the whole-file sum,
+    /// which is what the loader materialized before it went `from_file_filtered`).
     #[test]
     fn the_vae_is_priced_at_the_f32_width_its_loader_materializes() {
         assert_eq!(
@@ -633,12 +678,24 @@ mod tests {
         let (root, _, _, decoder) = write_priced_split_files(&temp, Variant::Base);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         let facts = contract("anima_base", &spec).unwrap().asset_facts;
-        let bf16_sum = component_bytes(&root.join(crate::loader::VAE_FILE), FLOAT_WIDTH).unwrap();
+        let vae = root.join(crate::loader::VAE_FILE);
+        let decoder_bf16_sum =
+            filtered_component_bytes(&vae, FLOAT_WIDTH, &crate::vae::is_decoder_key).unwrap();
+        let whole_file_f32_sum = component_bytes(&vae, VAE_FLOAT_WIDTH).unwrap();
         assert_eq!(facts.decoder_bytes, decoder);
         assert_eq!(
             facts.decoder_bytes,
-            2 * bf16_sum,
+            2 * decoder_bf16_sum,
             "the f32 decoder must not be priced at the bf16 DiT width"
+        );
+        assert_eq!(
+            whole_file_f32_sum,
+            decoder + 8 * 2 * VAE_FLOAT_WIDTH,
+            "fixture sanity: the encoder tensor is in the file"
+        );
+        assert!(
+            facts.decoder_bytes < whole_file_f32_sum,
+            "the encoder half is not materialized by any render and must not be charged"
         );
     }
 
