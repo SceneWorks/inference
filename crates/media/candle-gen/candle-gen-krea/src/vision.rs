@@ -31,7 +31,7 @@ pub const VISION_END_ID: u32 = 151653;
 
 /// The vision tower runs f32 (parity-grade for this encoder, shared with the boogu port); the DiT casts
 /// the resulting features to bf16.
-const VISION_DTYPE: DType = DType::F32;
+pub(crate) const VISION_DTYPE: DType = DType::F32;
 
 /// Krea 2 Raw's Qwen3-VL-**4B** `vision_config` (verbatim from the real `text_encoder/config.json`,
 /// sc-10875). Distinct from boogu's [`VisionConfig::qwen3_vl`] (8B) in exactly four fields: `hidden_size`

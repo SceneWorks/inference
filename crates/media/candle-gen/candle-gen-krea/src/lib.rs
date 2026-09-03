@@ -1872,15 +1872,6 @@ fn materialized_snapshot_root(spec: &LoadSpec) -> Option<&std::path::Path> {
     })
 }
 
-/// The imported single-file DiT this spec loads, when it has one. `resolved_base_and_native` pairs
-/// the same file with its pin for the loader; the contract only needs its header surface.
-fn native_dit_path(spec: &LoadSpec) -> Option<&std::path::Path> {
-    match &spec.weights {
-        WeightsSource::File(path) => Some(path.as_path()),
-        WeightsSource::Dir(_) => None,
-    }
-}
-
 fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     use candle_gen::architecture_facts as af;
 
@@ -1915,8 +1906,67 @@ const DIT_WIDTH: u64 = 2;
 /// Qwen-Image VAE at `DType::F32` (decode-precision-sensitive), from a checkpoint that ships bf16.
 const VAE_WIDTH: u64 = 4;
 
+/// Bytes per element of the Edit-only Qwen3-VL vision tower's load dtype (SC-22667 review):
+/// `vision::load_vision_tower_from_source` opens it at [`vision::VISION_DTYPE`] = `DType::F32`
+/// unconditionally — **not** at the TE store width, which is 2 whenever the snapshot ships bf16. A
+/// test pins this constant to that dtype.
+const VISION_WIDTH: u64 = 4;
+
+/// Bytes per element of the text encoder on the **control** route: `control_provider::load_control_text`
+/// opens `Weights::from_dir(.., DType::F32)`, not the bf16-probed store the generation pipeline uses.
+const CONTROL_TE_WIDTH: u64 = 4;
+
+const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
+
 fn is_edit_route(provider_id: &str) -> bool {
     matches!(provider_id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID)
+}
+
+fn is_control_route(provider_id: &str) -> bool {
+    provider_id == KREA_2_TURBO_CONTROL_ID
+}
+
+/// The `vae/` tensors only `QwenVaeEncoder::new` reads: the `encoder.*` subtree and its
+/// `quant_conv`. `QwenVae::new` (decode) reads `post_quant_conv` and `decoder.*`; the prefix test is
+/// anchored so `post_quant_conv` cannot match it.
+fn vae_tensor_is_encoder_only(name: &str) -> bool {
+    name.starts_with("encoder.") || name.starts_with("quant_conv.")
+}
+
+/// Whether `provider_id`'s heavy phase materializes the Qwen-Image VAE **encoder** alongside the
+/// decoder — every Krea route does, on the load shapes that matter (SC-22667 review):
+///
+/// * the Edit routes VAE-encode their references (`pipeline::load_edit_components`, `lib.rs`'s
+///   `img2img_encoder`);
+/// * the control route builds `QwenVaeEncoder::new` eagerly in `load_control_heavy`
+///   (`control_provider.rs`), beside `load_vae`;
+/// * the text-to-image routes are **request-scoped**: their staged heavy twins
+///   (`pipeline::load_residency_heavy_for_request`, `load_residency_heavy_native`,
+///   `load_residency_heavy_convrot`) all construct `vae_encoder: load_vae_encoder(root, device)`
+///   eagerly on every `StagedResidency` request, whatever the request is, and the resident twin
+///   materializes the same encoder lazily on the first img2img request.
+///
+/// The only render that never holds the encoder is a resident-shape text-to-image request — a
+/// **request-time** fact this per-load declaration cannot see, and one whose absence is chosen
+/// precisely when memory is *not* tight. E3 (estimates only ever err large) settles the remaining
+/// choice: the staged path is the memory-tight path and it holds the encoder, so the encoder is
+/// charged on every route rather than under-declared on the one shape the fit gate exists for.
+/// The decode-only subtree is still separated by [`vae_tensor_is_encoder_only`], so a route whose
+/// loader is later shown never to materialize the encoder can drop it by name.
+fn vae_encoder_materialized(_provider_id: &str) -> bool {
+    true
+}
+
+/// Load-exact bytes of the Qwen-Image autoencoder as `provider_id` materializes it, opened at
+/// [`VAE_WIDTH`] from a bf16 checkpoint.
+fn vae_resident_bytes(root: &std::path::Path, provider_id: &str) -> gen_core::Result<u64> {
+    let dir = root.join("vae");
+    let with_encoder = vae_encoder_materialized(provider_id);
+    let kept = gen_core::safetensors_path_tensor_headers(&dir)?
+        .into_iter()
+        .filter(|header| with_encoder || !vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    gen_core::materialized_header_bytes(&kept, VAE_WIDTH, &dir)
 }
 
 /// The TE store width this snapshot resolves to, from the same probe the loader uses.
@@ -1930,16 +1980,21 @@ fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
     }
 }
 
-/// Load-exact bytes of the DiT the loader will build.
+/// Load-exact bytes of the DiT the loader will build from a **snapshot `transformer/`** or an
+/// **INT8-ConvRot** single file — the two DiT sources the shared `Weights` reader opens directly.
 ///
-/// One rule covers all four sources this provider accepts, because Candle's own `coerce_float`
-/// boundary is the rule: a float tensor is materialized at `DIT_DTYPE` and everything else keeps its
-/// stored width. That prices a dense diffusers `transformer/` at bf16, a native single-file import
-/// at bf16, and an INT8-ConvRot file at its resident `i8` code planes plus their scales. The one
-/// source that needs more is an **MLX-packed tier**, whose affine triples Candle repacks into a
-/// device-format GGML tensor that is neither the source sidecars nor a dense matrix of the packed
-/// weight's shortened last dimension — `mlx_packed_qtensor_resident_bytes` is the shared pricing for
-/// exactly that conversion.
+/// Candle's own `coerce_float` boundary is the rule for both: a float tensor is materialized at
+/// `DIT_DTYPE` and everything else keeps its stored width. That prices a dense diffusers
+/// `transformer/` at bf16 and an INT8-ConvRot file at its resident `i8` code planes; the ConvRot
+/// per-row `weight_scale` is read through `get_native_f32` and stays at its stored f32 width, so it
+/// is priced as stored rather than cast. The one source that needs more is an **MLX-packed tier**,
+/// whose affine triples Candle repacks into a device-format GGML tensor that is neither the source
+/// sidecars nor a dense matrix of the packed weight's shortened last dimension —
+/// `mlx_packed_qtensor_resident_bytes` is the shared pricing for exactly that conversion.
+///
+/// A **planned single-file native import** is NOT priced here (SC-22667 review): that route reads
+/// every projection through the checkpoint-codec plan, whose residency decides per row whether an
+/// fp8 / NVFP4 layer stays packed or decodes dense — see [`native_dit_resident_bytes`].
 fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
     let headers = gen_core::safetensors_path_tensor_headers(path)?;
     let by_name = headers
@@ -1954,6 +2009,13 @@ fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
     let mut total = 0_u64;
     let mut dense = Vec::new();
     for header in &headers {
+        if header.name.ends_with(".weight_scale") {
+            // ConvRot's per-output-row int8 scale: `get_native_f32` keeps it at its stored f32.
+            total = total
+                .checked_add(header.data_bytes)
+                .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            continue;
+        }
         if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
             // Priced with the `.weight` of their triple; an orphan simply falls through as dense.
             if let Some(base) = header
@@ -1992,6 +2054,100 @@ fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
         .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))
 }
 
+/// The residency policy the memory contract prices a planned native import under: the SAME
+/// [`loader::native_import_residency`] the loader plans under, probed on the same process-default
+/// device the loader constructs on (`candle_gen::default_device`). A device that will not construct
+/// is priced dense — the larger of the two residencies, and also the truth: a loader that cannot
+/// build the device cannot take the native leg either.
+fn native_pricing_residency() -> candle_gen::logical_weights::CandleCodecResidency {
+    match candle_gen::default_device() {
+        Ok(device) => loader::native_import_residency(&device),
+        Err(_) => candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    }
+}
+
+/// Load-exact bytes of a **planned single-file native DiT import**, priced from the compiled plan
+/// the loader consumes (SC-22667 review).
+///
+/// `Weights::from_pinned_native_file_for` compiles `plan_logical_weights` over this file under
+/// `residency` and reads every projection through it, so the per-row residency is the plan's, not
+/// the stored header's:
+///
+/// * a **Dense** row — a stored bf16/f32 projection, an fp8 row (the fp8 leg is masked for this
+///   import on every host, so an `F8_E4M3` weight takes the exact dense decode with its
+///   `weight_scale` applied), an int8-per-row projection, or an NVFP4 row on a host below the
+///   `sm_120` floor — lands as a dense `DIT_DTYPE` matrix over its **logical** shape, and its
+///   scale companions are consumed by the decode; pricing an fp8 row at its stored byte, as the
+///   `coerce_float` rule does, under-declares it by exactly half;
+/// * a **Packed** row — an NVFP4 projection on an `sm_120` host — stays in its stored container
+///   (`residency.resident_bytes`, nibbles already sliced for a transformed output) and **retains**
+///   its scale companions, *unless* Krea's own role table serves it W4A16: `Krea2Transformer::load`
+///   builds an NVFP4 import under `DitPlan::nvfp4(Nvfp4Quant::Mixed)`, whose `execution_role_for_layer`
+///   sends the edge blocks, the context readers, the post-nonlinearity leaves and the trunk head to
+///   dense bf16 (`demote_packed_row_to_dense`), which holds 2 B per logical element and consumes the
+///   companions in its one-time dequant.
+///
+/// `cfg` is the base snapshot's architecture config, exactly as the loader hands it in
+/// (`DeclaredLogicalShapes::FromConfig`), so a block-padded layer prices at its true geometry;
+/// `None` plans at the stored grid, which is what the loader does with no config in scope.
+fn native_dit_resident_bytes(
+    path: &std::path::Path,
+    cfg: Option<&crate::config::Krea2Config>,
+    residency: &candle_gen::logical_weights::CandleCodecResidency,
+) -> gen_core::Result<u64> {
+    use gen_core::checkpoint_codec::ResidencyMode;
+
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
+    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
+        &prefix,
+        crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
+    );
+    let plan = candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let dit_plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed);
+    let dit_plan = match cfg {
+        Some(cfg) => dit_plan.with_num_layers(cfg.num_layers),
+        None => dit_plan,
+    };
+    let overflow = || gen_core::Error::Msg("krea: native DiT byte overflow".into());
+    let dense_bytes = |shape: &[usize]| -> gen_core::Result<u64> {
+        shape
+            .iter()
+            .try_fold(DIT_WIDTH, |acc, dim| acc.checked_mul(*dim as u64))
+            .ok_or_else(overflow)
+    };
+    let mut total = 0_u64;
+    let mut packed_owner = std::collections::BTreeSet::new();
+    for tensor in &plan.tensors {
+        let base = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .unwrap_or(&tensor.logical_key);
+        let bytes = match tensor.residency.mode {
+            ResidencyMode::Packed if dit_plan.execution_role_for_layer(base).is_packed_w4a4() => {
+                packed_owner.insert(tensor.physical_key.as_str());
+                tensor.residency.resident_bytes
+            }
+            // A Packed-priced row the role table serves W4A16: dense bf16 over the logical shape.
+            ResidencyMode::Packed | ResidencyMode::Dense => dense_bytes(&tensor.shape)?,
+        };
+        total = total.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for companion in &plan.companions {
+        if companion.resident_bytes == 0
+            || !packed_owner.contains(companion.owner_physical_key.as_str())
+        {
+            // Consumed by a dense decode (or a W4A16 dequant): nothing stays resident.
+            continue;
+        }
+        total = total
+            .checked_add(companion.resident_bytes)
+            .ok_or_else(overflow)?;
+    }
+    Ok(total)
+}
+
 /// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
 /// sweep SC-22667).
 ///
@@ -2005,8 +2161,10 @@ fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
 ///
 /// The three fields follow the *One network, one field* rule. The Qwen-Image autoencoder is charged
 /// once, in `decoder_bytes`, on every route including the Edit ones that VAE-encode their references
-/// through the same weights; the Qwen3-VL vision tower is Edit-only residency and joins
-/// `conditioning_bytes` there and nowhere else.
+/// through the same weights (its encoder half by [`vae_encoder_materialized`]); the Qwen3-VL vision
+/// tower is Edit-only residency and joins `conditioning_bytes` there and nowhere else, at the f32
+/// [`VISION_WIDTH`] its loader opens it in. The control route's text encoder is opened f32
+/// ([`CONTROL_TE_WIDTH`]) where the generation pipeline probes for a bf16 store.
 /// A component that is not readable yet contributes **no signal**, never a load failure.
 ///
 /// Krea's `build` is lazy: it constructs a generator whose components open on first use, so a
@@ -2029,28 +2187,36 @@ fn loaded_asset_facts(
     let language = encoder_source
         .materialized_language_tensor_headers(&ENCODER_CONTRACT)
         .unwrap_or_default();
-    let te_width = te_store_width(&language);
+    let te_width = if is_control_route(provider_id) {
+        CONTROL_TE_WIDTH
+    } else {
+        te_store_width(&language)
+    };
     let mut conditioning = component_bytes_or_no_signal(gen_core::materialized_header_bytes(
         &language, te_width, root,
     ));
     if is_edit_route(provider_id) {
-        // `pipeline::vision()` materializes the tower lazily on the Edit routes only.
+        // `pipeline::vision()` materializes the tower lazily on the Edit routes only — and at
+        // `vision::VISION_DTYPE` (f32), never at the TE's probed store width.
         let vision = encoder_source
             .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
             .unwrap_or_default();
         conditioning = conditioning.saturating_add(component_bytes_or_no_signal(
-            gen_core::materialized_header_bytes(&vision, te_width, root),
+            gen_core::materialized_header_bytes(&vision, VISION_WIDTH, root),
         ));
     }
     let transformer = component_bytes_or_no_signal(match (convrot_dit, native_dit) {
         (Some(convrot), _) => dit_resident_bytes(convrot),
-        (None, Some(native)) => dit_resident_bytes(native),
+        (None, Some(native)) => native_dit_resident_bytes(
+            native,
+            crate::config::Krea2Config::from_snapshot(root)
+                .ok()
+                .as_ref(),
+            &native_pricing_residency(),
+        ),
         (None, None) => dit_resident_bytes(&root.join("transformer")),
     });
-    let decoder = component_bytes_or_no_signal(gen_core::materialized_path_bytes(
-        root.join("vae"),
-        VAE_WIDTH,
-    ));
+    let decoder = component_bytes_or_no_signal(vae_resident_bytes(root, provider_id));
     Ok(gen_core::MemoryAssetFacts {
         base_bytes: conditioning
             .saturating_add(transformer)
@@ -2197,11 +2363,13 @@ fn validated_krea_turbo_memory_strategy_contract(
     let (root, native_dit, convrot_dit, _, encoder_source) =
         validate_load_spec(spec, KREA_2_TURBO_ID)?;
     let mut contract = build_krea_turbo_memory_strategy_contract(spec);
-    let _ = &native_dit;
+    // The pin is the sealed identity this load validated; price its path, not `spec.weights`.
     contract.asset_facts = loaded_asset_facts(
         KREA_2_TURBO_ID,
         &root,
-        native_dit_path(spec),
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
         convrot_dit.as_deref(),
         &encoder_source,
     )?;
@@ -2301,12 +2469,13 @@ fn validated_krea_request_scoped_memory_strategy_contract(
     let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
     // SC-22667 (E1). This route's formula declares `MemoryFormulaVariable::AssetBytes`, so the
     // all-zero `compatibility_default` facts it inherited were a formula input that was never
-    // supplied.
-    let _ = &native_dit;
+    // supplied. The pin is the sealed identity this load validated; price its path.
     contract.asset_facts = loaded_asset_facts(
         provider_id,
         &root,
-        native_dit_path(spec),
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
         convrot_dit.as_deref(),
         &encoder_source,
     )?;
@@ -2917,10 +3086,47 @@ request_scoped_memory_registration!(
 fn build_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    let quant = actual_quant_tier(spec, "krea_2_turbo_control")?;
-    Ok(build_krea_control_memory_strategy_contract_for_tier(
-        quant, spec,
-    ))
+    let quant = actual_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
+    let mut contract = build_krea_control_memory_strategy_contract_for_tier(quant, spec);
+    // SC-22667 (E1, review round): this builder serves the registered contract and the real-load
+    // probe alike, and both used to publish `MemoryAssetFacts::default()` on a fully materialized
+    // control load. The weights-free surface keeps the zero facts by calling `_for_tier` directly.
+    contract.asset_facts = control_asset_facts(spec)?;
+    Ok(contract)
+}
+
+/// Load-exact per-component asset facts for a materialized **control** load (SC-22667 review).
+///
+/// The control route validates its own spec shape (`control_provider::load_with_spec`): the base is
+/// the runtime snapshot **directory** (a `File` base is rejected there), the ConvRot DiT arrives as
+/// `KREA_CONVROT_DIT_COMPONENT`, a native DiT only through runtime paths the spec cannot carry, and
+/// `spec.control` names the pose branch — an auxiliary overlay outside these base fields. The
+/// components it then materializes differ from the generation routes in two widths, both read off
+/// `control_provider.rs`: the text encoder opens f32 (`load_control_text`) and the autoencoder is
+/// built encoder-and-decoder (`load_control_heavy`: `load_vae` + `QwenVaeEncoder::new`).
+///
+/// A spec whose snapshot is not on disk — the registry's sentinel surface, a fixture — publishes
+/// the zero facts, exactly as the generation routes' weights-free builders do.
+fn control_asset_facts(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    if !root.is_dir() {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    }
+    let convrot_dit = convrot_selector(spec, KREA_2_TURBO_CONTROL_ID)?;
+    // The same encoder-contract resolution `resolve_control_text_encoder_source` performs; a source
+    // that does not validate is a load `Krea2Control::load` refuses, and contributes no signal here.
+    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, root) else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    loaded_asset_facts(
+        KREA_2_TURBO_CONTROL_ID,
+        root,
+        None,
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )
 }
 
 /// The control route runs the same Krea 2 DiT and Qwen-Image VAE as Turbo, so it reads the same
@@ -3491,7 +3697,7 @@ mod tests {
         let mut offset = 0_u64;
         for &(name, dtype, shape) in tensors {
             let width = match dtype {
-                "U8" => 1_u64,
+                "U8" | "F8_E4M3" => 1_u64,
                 "BF16" | "F16" => 2,
                 "F32" | "U32" => 4,
                 other => panic!("unhandled fixture dtype {other}"),
@@ -3615,6 +3821,344 @@ mod tests {
                 .unwrap()
                 .asset_facts,
             gen_core::MemoryAssetFacts::default()
+        );
+    }
+
+    /// The `vae/` shard every fixture below ships: the decode path (`post_quant_conv` + `decoder.*`,
+    /// 80 values) and the encoder half (`encoder.*` + `quant_conv`, 80 values), all bf16 on disk.
+    fn write_full_vae(root: &Path) {
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_out.weight", "BF16", &[8, 8]),
+                ("post_quant_conv.weight", "BF16", &[4, 4]),
+                ("encoder.conv_in.weight", "BF16", &[8, 8]),
+                ("quant_conv.weight", "BF16", &[4, 4]),
+            ],
+        );
+    }
+
+    /// Re-stamp the testkit fixture's `language_model.*` tensors from F16 to **BF16** — the dtype the
+    /// shipping Krea snapshot stores its TE in, and the one `TE_STORE_PROBE` halves the store for.
+    /// Without this every language tensor reads F16, `te_store_width` answers the f32 fail-safe (4),
+    /// and a vision tower priced at `te_width` is indistinguishable from one priced at `VISION_WIDTH`.
+    ///
+    /// Only the header changes (F16 and BF16 are both 2 bytes per element): the header is rewritten
+    /// at the front of the file, the sparse zero payload shifts by the header's growth, and the file
+    /// is extended by the same amount so every `data_offsets` range still lands inside it.
+    fn restamp_language_store_bf16(root: &Path) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = root.join("text_encoder").join("model.safetensors");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut len = [0_u8; 8];
+        file.read_exact(&mut len).unwrap();
+        let old_len = u64::from_le_bytes(len) as usize;
+        let mut encoded = vec![0_u8; old_len];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        for (name, entry) in header.iter_mut() {
+            if name.starts_with("language_model.")
+                && entry.get("dtype").and_then(|dtype| dtype.as_str()) == Some("F16")
+            {
+                entry["dtype"] = serde_json::json!("BF16");
+            }
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        assert!(
+            encoded.len() >= old_len,
+            "the re-stamp only grows the header"
+        );
+        let total = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(total + (encoded.len() - old_len) as u64)
+            .unwrap();
+    }
+
+    /// Feature-end review (SC-22667). Two width corrections on the generation routes:
+    ///
+    /// * the Qwen-Image autoencoder is priced **by name**, with the `encoder.*` / `quant_conv`
+    ///   subtree separated from the `post_quant_conv` / `decoder.*` decode path, and charged on the
+    ///   routes whose heavy loaders materialize it (`vae_encoder_materialized` — every route, see
+    ///   its doc for the four loader sites);
+    /// * the Edit-only Qwen3-VL vision tower is priced at `vision::VISION_DTYPE` (f32), not at the
+    ///   TE's probed store width: the Edit delta over Turbo is exactly 4 bytes per stored element.
+    ///
+    /// Mutations that fail this: charging the vision headers at `te_width` (the Edit delta halves
+    /// to 2 bytes per element); a `VISION_WIDTH` that drifts from `VISION_DTYPE`; and a
+    /// `vae_tensor_is_encoder_only` that matches `post_quant_conv` (the decode-only figure drops
+    /// to 64 values).
+    #[test]
+    fn the_vision_tower_is_priced_f32_and_the_autoencoder_by_name() {
+        assert_eq!(
+            VISION_WIDTH,
+            crate::vision::VISION_DTYPE.size_in_bytes() as u64,
+            "VISION_WIDTH must be the vision loader's own dtype"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        // The name split: the encoder half is exactly the tensors `QwenVaeEncoder::new` reads.
+        assert!(vae_tensor_is_encoder_only("encoder.conv_in.weight"));
+        assert!(vae_tensor_is_encoder_only("quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("post_quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("decoder.conv_out.weight"));
+        let vae_headers = gen_core::safetensors_path_tensor_headers(root.join("vae")).unwrap();
+        let decode_only = vae_headers
+            .iter()
+            .filter(|header| !vae_tensor_is_encoder_only(&header.name))
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert_eq!(decode_only, 64 + 16);
+
+        let turbo = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            turbo.asset_facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "the whole autoencoder, opened f32, on a route whose staged heavy twin builds the encoder"
+        );
+
+        // The Edit route adds the vision tower and nothing else to conditioning, at 4 B/element.
+        let edit =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, &spec).unwrap();
+        let encoder_source = ENCODER_CONTRACT.source_for_load(&spec, root).unwrap();
+        // The premise that makes the delta assertion discriminating: this snapshot's TE store is
+        // bf16, so the TE width is 2 and only a tower priced at its own f32 dtype reaches 4.
+        let language = encoder_source
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap();
+        let vision_elements = vision
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        let vision_stored = vision.iter().map(|header| header.data_bytes).sum::<u64>();
+        assert!(
+            vision_elements > 0,
+            "the multimodal fixture ships a vision tower"
+        );
+        assert_eq!(
+            vision_stored,
+            vision_elements * 2,
+            "the fixture stores the tower at a 2-byte width"
+        );
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - turbo.asset_facts.conditioning_bytes,
+            vision_elements * 4,
+            "the Edit delta is 4 bytes per stored element: VISION_DTYPE is f32"
+        );
+        assert_eq!(
+            edit.asset_facts.decoder_bytes,
+            turbo.asset_facts.decoder_bytes
+        );
+        assert_eq!(
+            edit.asset_facts.transformer_bytes,
+            turbo.asset_facts.transformer_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&edit)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+    }
+
+    /// Feature-end review (SC-22667). A planned single-file native import is priced from the
+    /// **compiled plan** under the loader's own residency, not from stored headers through the
+    /// `coerce_float` rule:
+    ///
+    /// * an `F8_E4M3` row takes the exact dense decode on every host (the fp8 leg is masked for this
+    ///   import) and lands as `DIT_DTYPE` — 2 bytes per element, where the stored header says 1;
+    /// * an NVFP4 row on a host below the `sm_120` floor decodes dense bf16 over its **logical**
+    ///   shape, and on an eligible host stays packed only where Krea's role table serves it W4A4 —
+    ///   the Kitchen fixture's block 0 is an edge block, so `Nvfp4Quant::Mixed` demotes it to dense
+    ///   bf16 even under a packed residency.
+    ///
+    /// Mutations that fail this: pricing the native leg with `dit_resident_bytes` (fp8 reads 256,
+    /// the NVFP4 nibbles read their stored 2_048 + scale planes); and pricing a Packed row at
+    /// `residency.resident_bytes` without consulting the role table (the packed-residency figure
+    /// drops below the dense one).
+    #[test]
+    fn a_planned_native_import_prices_fp8_and_nvfp4_rows_from_the_plan() {
+        use candle_gen::logical_weights::CandleCodecResidency;
+        use gen_core::checkpoint_codec::ResidencyMode;
+
+        let fixture = tempfile::tempdir().unwrap();
+
+        // ---- fp8: 256 stored bytes, 512 resident ------------------------------------------
+        let fp8 = fixture.path().join("kreamania_fp8.safetensors");
+        write_tensors(
+            &fp8,
+            &[(
+                "model.diffusion_model.blocks.0.attn.wq.weight",
+                "F8_E4M3",
+                &[16, 16],
+            )],
+        );
+        assert_eq!(
+            dit_resident_bytes(&fp8).unwrap(),
+            256,
+            "the stored-width rule (the figure under review)"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &CandleCodecResidency::DENSE).unwrap(),
+            256 * DIT_WIDTH,
+            "the plan's dense decode of an fp8 row lands bf16"
+        );
+        let masked = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: false,
+        }
+        .with_dense_fp8();
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &masked).unwrap(),
+            256 * DIT_WIDTH,
+            "the fp8 leg is masked for this import on every host"
+        );
+
+        // ---- NVFP4: dense fallback below the floor, role-table demotion above it ------------
+        let nvfp4 = fixture.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&nvfp4);
+        let cfg = crate::testfix::kitchen_nvfp4_config();
+        // `attn.wq` is `[q_dim = 64, hidden = 64]` logical; `first` is `[64, 16]` f32 on disk.
+        let dense_expected = (64 * 64 + 64 * 16) * DIT_WIDTH;
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &CandleCodecResidency::DENSE).unwrap(),
+            dense_expected
+        );
+        let stored = dit_resident_bytes(&nvfp4).unwrap();
+        assert!(
+            stored < dense_expected,
+            "the stored-width rule under-declares the dense fallback ({stored} < {dense_expected})"
+        );
+        let packed = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let prefix = crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
+        let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::for_config(prefix, &cfg);
+        let plan =
+            candle_gen::logical_weights::plan_logical_weights(&nvfp4, &mapping, &packed).unwrap();
+        assert!(
+            plan.tensors
+                .iter()
+                .any(|tensor| tensor.residency.mode == ResidencyMode::Packed),
+            "the premise: under the packed residency the plan prices the NVFP4 row Packed"
+        );
+        assert!(
+            plan.resident_bytes() < dense_expected,
+            "the plan's packed pricing is below the dense figure"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &packed).unwrap(),
+            dense_expected,
+            "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
+             contract prices what the role table builds rather than what the plan priced"
+        );
+    }
+
+    /// Feature-end review (SC-22667). `krea_2_turbo_control` is a registered memory provider whose
+    /// contract was built from `compatibility_default` with no `asset_facts` stamp — the one Krea
+    /// route still publishing all-zero component bytes on a materialized load. It now prices what
+    /// `control_provider.rs` materializes: the text encoder opened **f32** (`load_control_text`),
+    /// the snapshot (or ConvRot) DiT, and the autoencoder encoder-and-decoder (`load_control_heavy`).
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = control_asset_facts(spec)?`
+    /// stamp from `build_krea_control_memory_strategy_contract` (all four fields read 0), or pricing
+    /// the control TE at the probed store width (conditioning halves on a bf16 fixture).
+    #[test]
+    fn the_control_route_publishes_its_materialized_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        let facts = control.asset_facts;
+        let language = ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap()
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        let language_elements = language
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert!(language_elements > 0);
+        // The generation pipeline probes this bf16 store and opens it at 2 B; the control route's
+        // `load_control_text` opens `DType::F32` regardless.
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        assert_eq!(
+            validated_krea_turbo_memory_strategy_contract(&spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            language_elements * 2
+        );
+        assert_eq!(
+            facts.conditioning_bytes,
+            language_elements * CONTROL_TE_WIDTH,
+            "the control text encoder opens f32"
+        );
+        assert_eq!(facts.transformer_bytes, 64 * 64 * DIT_WIDTH);
+        assert_eq!(
+            facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "`load_control_heavy` builds the decoder and the encoder"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&control)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
+        );
+        assert_eq!(
+            build_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default(),
+            "a snapshot that is not on disk contributes no signal"
         );
     }
 

@@ -1410,14 +1410,16 @@ mod registry_tests {
         );
         let generation = memory_strategy::contract_rl(&spec).unwrap();
         let edit = memory_strategy::contract_edit(&spec).unwrap();
-        assert_eq!(generation.asset_facts.conditioning_bytes, 26);
+        // The language stack's final norm is one of the leaves `candle_gen_boogu::text_encoder`
+        // reads through `get_f32` (SC-22667 review), so its 13 elements price at 4 B, not 2.
+        assert_eq!(generation.asset_facts.conditioning_bytes, 4 * 13);
         // SC-22667: the Edit route's conditioning is the text encoder alone; the shared VAE is
         // charged once, in `decoder_bytes` (this assertion previously pinned 13 + 17 = 30, which
         // left `base_bytes` 41 short of its own 13 + 11 + 30 decomposition).
-        assert_eq!(edit.asset_facts.conditioning_bytes, 26);
+        assert_eq!(edit.asset_facts.conditioning_bytes, 4 * 13);
         assert_eq!(edit.asset_facts.decoder_bytes, 34);
-        assert_eq!(generation.asset_facts.base_bytes, 2 * 41);
-        assert_eq!(edit.asset_facts.base_bytes, 2 * 41);
+        assert_eq!(generation.asset_facts.base_bytes, 2 * 11 + 4 * 13 + 2 * 17);
+        assert_eq!(edit.asset_facts.base_bytes, 2 * 11 + 4 * 13 + 2 * 17);
     }
 
     /// Header-only bf16 safetensors of rank-1 tensors, for fixtures that only care about which
@@ -1479,9 +1481,10 @@ mod registry_tests {
         let contract = generator
             .memory_strategy_contract()
             .expect("fine-tuned load publishes exact admission facts");
-        // Materialized bf16 widths (SC-22667), not the on-disk file lengths: 2 * (23 + 13 + 17).
-        assert_eq!(contract.asset_facts.base_bytes, 2 * 53);
-        assert_eq!(contract.asset_facts.conditioning_bytes, 2 * 13);
+        // Materialized widths (SC-22667), not the on-disk file lengths: the DiT and VAE norms at
+        // bf16, the language stack's final norm at the f32 its loader reads it in (review round).
+        assert_eq!(contract.asset_facts.base_bytes, 2 * 23 + 4 * 13 + 2 * 17);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 4 * 13);
 
         let old_shape = LoadSpec::new(WeightsSource::Dir(root.path().join("missing")))
             .with_component(

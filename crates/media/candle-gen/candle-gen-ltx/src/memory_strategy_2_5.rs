@@ -134,24 +134,17 @@ fn collect_safetensors(path: &Path, files: &mut Vec<PathBuf>) -> gen_core::Resul
 /// Count the exact tensor payload a component materializes: floating tensors at the component's
 /// runtime width and packed integer codes at their physical stored width. This uses only headers;
 /// no model tensor is allocated while the generator publishes its loaded contract.
+///
+/// The per-tensor rule is the shared [`gen_core::materialized_header_bytes`] — one copy of the
+/// `is_float` / `materialized_bytes` / `data_bytes` split, not a local restatement (SC-22667
+/// review). What stays local is the file walk (`collect_safetensors`, which accepts a single file
+/// or a directory and sorts deterministically) and the zero-byte refusal below.
 fn required_component_bytes(path: &Path, float_width: u64, label: &str) -> gen_core::Result<u64> {
     let mut files = Vec::new();
     collect_safetensors(path, &mut files)?;
     let bytes = files.into_iter().try_fold(0_u64, |total, file| {
-        let file_bytes = gen_core::weightsmeta::safetensors_path_tensor_headers(&file)?
-            .into_iter()
-            .try_fold(0_u64, |sum, header| {
-                let bytes = if header.is_float() {
-                    header.materialized_bytes(float_width)?
-                } else {
-                    header.data_bytes
-                };
-                sum.checked_add(bytes).ok_or_else(|| {
-                    gen_core::Error::Msg(format!(
-                        "{LTX_2_5_DISTILLED_MODEL_ID}: {label} tensor byte total overflows u64"
-                    ))
-                })
-            })?;
+        let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&file)?;
+        let file_bytes = gen_core::materialized_header_bytes(&headers, float_width, &file)?;
         total.checked_add(file_bytes).ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{LTX_2_5_DISTILLED_MODEL_ID}: {label} file byte total overflows u64"
@@ -247,15 +240,36 @@ fn exact_load_receipt(
     // …`) and opens it at `VAE_DTYPE`. `LtxComponent::AudioVae` names one file carrying both the
     // `audio_vae` and `vocoder` config sections, which is true of the **bundle** layout and only
     // there — so charging that component alone left the whole vocoder resident and unpriced on
-    // every converted tier. Presence is the gate because it is the loader's own gate: a bundle has
-    // no such sibling file and contributes 0, with its vocoder already inside the audio-VAE file.
-    let vocoder_path = audio_path.with_file_name("vocoder.safetensors");
+    // every converted tier.
+    //
+    // The gate is the loader's own gate, `Ltx25Tier::detect(root).is_some()` — the exact predicate
+    // `lib.rs` branches on (`converted_tier.is_some()`) — and under it the term is **required**, as
+    // the loader requires the file (SC-22667 review): a converted tier missing the sibling errors
+    // here as it errors there, instead of silently pricing 0 for a load that will refuse, and a
+    // bundle with a stray sibling file is not charged for a vocoder it never opens.
+    let converted_tier = crate::tier::Ltx25Tier::detect(root)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    let vocoder_bytes = match converted_tier {
+        Some(_) => {
+            let vocoder_path = audio_path.with_file_name("vocoder.safetensors");
+            if !vocoder_path.is_file() {
+                // The loader's own refusal, word for word, so admission and load disagree on nothing.
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{LTX_2_5_DISTILLED_MODEL_ID}: converted tier is missing vocoder.safetensors \
+                     beside {}",
+                    audio_path.display()
+                )));
+            }
+            required_component_bytes(&vocoder_path, 4, "converted-tier vocoder")?
+        }
+        None => 0,
+    };
     let decoder_bytes = checked_sum(
         "decoder component",
         [
             required_component_bytes(video_path, 4, "selected video decoder")?,
             required_component_bytes(audio_path, 4, "audio VAE")?,
-            optional_component_bytes(&vocoder_path, 4, "converted-tier vocoder")?,
+            vocoder_bytes,
         ],
     )?;
     let overlay_bytes = spec.adapters.iter().try_fold(0_u64, |total, adapter| {
@@ -1216,6 +1230,13 @@ mod tests {
     ///
     /// Mutation that fails this: dropping the `optional_component_bytes(&vocoder_path, …)` term, so
     /// the sibling file reads as 0 and the decoder stays at the bundle figure.
+    ///
+    /// The gate is the loader's own converted-tier predicate, `Ltx25Tier::detect(root)`, not the
+    /// sibling file's presence (SC-22667 review): a bundle with a stray `vocoder.safetensors` is
+    /// not charged for a vocoder it never opens, and a converted tier missing the sibling errors
+    /// the way `lib.rs` errors, rather than pricing 0 for a load that will refuse. Mutations that
+    /// fail those two: gating on `vocoder_path.exists()` (the stray-sibling bundle prices 47 * 4 and
+    /// the missing-sibling tier prices 0 instead of erroring).
     #[test]
     fn a_converted_tiers_sibling_vocoder_is_charged_to_the_decoder() {
         let directory = tempfile::tempdir().unwrap();
@@ -1225,14 +1246,34 @@ mod tests {
         let bundle = memory_strategy_contract(&load).unwrap();
         assert_eq!(bundle.asset_facts.decoder_bytes, 68 + 76);
 
-        // The converted shape: the same components plus the split-out vocoder the loader requires.
+        // A stray sibling on a bundle (no converted-tier manifest) is not what the loader opens.
         write_safetensors(&directory.path().join("vocoder.safetensors"), &[], 47);
+        assert_eq!(
+            memory_strategy_contract(&load)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            68 + 76,
+            "a bundle never opens a sibling vocoder file"
+        );
+
+        // The converted shape: the tier manifest the loader branches on, plus the split-out vocoder
+        // the loader then requires. `physical_spec` selects Q4, so the manifest declares q4.
+        write_tier_manifest(directory.path(), "q4", true, 4);
         let converted = memory_strategy_contract(&load).unwrap();
         assert_eq!(
             converted.asset_facts.decoder_bytes,
             68 + 76 + 47 * 4,
             "the sibling vocoder is resident and must be charged"
         );
+
+        // A converted tier WITHOUT the sibling is a load `lib.rs` refuses; the receipt refuses too.
+        std::fs::remove_file(directory.path().join("vocoder.safetensors")).unwrap();
+        let missing = memory_strategy_contract(&load)
+            .expect_err("a converted tier missing vocoder.safetensors must not price")
+            .to_string();
+        assert!(missing.contains("vocoder"), "unexpected: {missing}");
+        write_safetensors(&directory.path().join("vocoder.safetensors"), &[], 47);
         // Nothing else moves, and `base_bytes` stays its own decomposition.
         assert_eq!(
             converted.asset_facts.conditioning_bytes,

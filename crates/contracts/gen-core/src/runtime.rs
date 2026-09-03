@@ -2189,23 +2189,32 @@ pub enum LoadPhase {
     Renderer,
 }
 
+/// Test support shared by this module's tests and `registry`'s prepared-file callback tests: the
+/// typed artifact-seal rejection every load / footprint / memory-contract callback boundary must
+/// surface when the sealed source is rebound underneath it.
+///
+/// One definition, `pub(crate)`, on purpose (SC-22667 review, blocker): a second private copy inside
+/// `registry`'s `mod tests` was deleted as dead code on Windows — where its only caller is
+/// `#[cfg(unix)]` — and that deletion was a hard `E0425` on every Unix lane. A single crate-visible
+/// helper has a caller on every host, so no lane can see it as dead and no lane can lose it.
+#[cfg(test)]
+pub(crate) fn assert_artifact_seal_mismatch(error: crate::Error) {
+    match error {
+        crate::Error::Unsupported(reason)
+            if reason.starts_with("artifact seal mismatch after load: ") => {}
+        crate::Error::Unsupported(reason) => {
+            panic!("expected the shared artifact-seal rejection, got: {reason}")
+        }
+        other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::io::Read;
     use std::sync::{Barrier, Mutex};
-
-    fn assert_artifact_seal_mismatch(error: crate::Error) {
-        match error {
-            crate::Error::Unsupported(reason)
-                if reason.starts_with("artifact seal mismatch after load: ") => {}
-            crate::Error::Unsupported(reason) => {
-                panic!("expected the shared artifact-seal rejection, got: {reason}")
-            }
-            other => panic!("expected a typed artifact-seal rejection, got: {other:?}"),
-        }
-    }
 
     #[test]
     fn load_shape_declaration_result_defaults_clones_hashes_and_validates() {

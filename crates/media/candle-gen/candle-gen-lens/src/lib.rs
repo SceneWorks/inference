@@ -995,6 +995,9 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
 const ENC_WIDTH: u64 = 2;
 const DIT_WIDTH: u64 = 2;
 const VAE_WIDTH: u64 = 4;
+/// The width `QLinear::fold` promotes a folded projection's `.bias` to (f32, for the post-matmul
+/// add) — the one DiT leaf a Q4/Q8 request moves *up* from [`DIT_WIDTH`] (SC-22667 review).
+const FOLDED_BIAS_WIDTH: u64 = 4;
 
 /// MLX affine group size the packed Lens tiers ship and the shared loaders assume
 /// (`guard_packed_group_size` rejects anything else at load).
@@ -1133,8 +1136,16 @@ fn transformer_component_bytes(dir: &Path, quant: Option<Quant>) -> gen_core::Re
         .iter()
         .map(|header| (header.name.as_str(), header))
         .collect::<std::collections::BTreeMap<_, _>>();
+    // A dense float projection in the fold surface: what `transformer.quantize(quant)` folds.
+    let folds_at_request = |header: &gen_core::SafetensorsTensorHeader| {
+        header.is_float()
+            && DIT_FOLDED_LEAVES
+                .iter()
+                .any(|leaf| header.name.ends_with(leaf))
+    };
     let mut total = 0_u64;
     let mut dense = Vec::new();
+    let mut promoted = Vec::new();
     for header in &headers {
         if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
             // Priced with the `.weight` they belong to; an orphan is caught there.
@@ -1149,18 +1160,27 @@ fn transformer_component_bytes(dir: &Path, quant: Option<Quant>) -> gen_core::Re
         });
         let bytes = match (triple, quant) {
             (Some((scales, biases)), _) => repacked_triple_bytes(header, scales, biases)?,
-            (None, Some(quant))
-                if header.is_float()
-                    && DIT_FOLDED_LEAVES
-                        .iter()
-                        .any(|leaf| header.name.ends_with(leaf)) =>
-            {
+            (None, Some(quant)) if folds_at_request(header) => {
                 let dtype = candle_gen::quant::ggml_dtype(quant)
                     .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
                 let elements = header
                     .element_count()
                     .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
                 ggml_bytes(elements, dtype, &header.name)?
+            }
+            // The `.bias` of a projection the request-time fold quantizes is promoted to f32 by
+            // that fold (`QLinear::fold`: "the bias follows the weight's device and is promoted to
+            // f32"), so it is priced at 4 B rather than at `DIT_WIDTH` (SC-22667 review). A packed
+            // tier's `.bias` stays at the store width: `fold` returns early on a quantized base.
+            (None, Some(_))
+                if header.name.strip_suffix(".bias").is_some_and(|base| {
+                    by_name
+                        .get(format!("{base}.weight").as_str())
+                        .is_some_and(|weight| folds_at_request(weight))
+                }) =>
+            {
+                promoted.push(header.clone());
+                continue;
             }
             _ => {
                 dense.push(header.clone());
@@ -1173,6 +1193,12 @@ fn transformer_component_bytes(dir: &Path, quant: Option<Quant>) -> gen_core::Re
     }
     total
         .checked_add(gen_core::materialized_header_bytes(&dense, DIT_WIDTH, dir)?)
+        .ok_or_else(|| gen_core::Error::Msg("lens: transformer byte overflow".into()))?
+        .checked_add(gen_core::materialized_header_bytes(
+            &promoted,
+            FOLDED_BIAS_WIDTH,
+            dir,
+        )?)
         .ok_or_else(|| gen_core::Error::Msg("lens: transformer byte overflow".into()))
 }
 
@@ -1264,12 +1290,28 @@ fn loaded_component_bytes(spec: &LoadSpec) -> gen_core::Result<gen_core::PerComp
     Ok(gen_core::PerComponentBytes {
         text_encoder: text_encoder_component_bytes(&root.join("text_encoder"), spec.quantize)?,
         dit: transformer_component_bytes(&root.join("transformer"), spec.quantize)?,
-        vae: gen_core::materialized_header_bytes(
-            &component_headers(&root.join("vae"))?,
-            VAE_WIDTH,
-            &root.join("vae"),
-        )?,
+        vae: vae_component_bytes(&root.join("vae"))?,
     })
+}
+
+/// The `vae/` tensors an **inference** construction of `Flux2Vae` leaves on disk (SC-22667 review).
+///
+/// Both inference sites (`LensBuilder::build` resident and streamed) call `Flux2Vae::new`, which is
+/// `build(vb, false)` — decode-only: the `encoder.*` subtree and its `quant_conv` are never read.
+/// Only `training.rs` calls `new_with_encoder`. `post_quant_conv` is part of the decode path and is
+/// kept; the prefix test is anchored so it cannot match it.
+fn vae_tensor_is_encoder_only(name: &str) -> bool {
+    name.starts_with("encoder.") || name.starts_with("quant_conv.")
+}
+
+/// Load-exact bytes of the `vae/` component (SC-22667, E1): the decode-only surface
+/// [`vae_tensor_is_encoder_only`] leaves behind, opened at [`VAE_WIDTH`].
+fn vae_component_bytes(dir: &Path) -> gen_core::Result<u64> {
+    let decode_only = component_headers(dir)?
+        .into_iter()
+        .filter(|header| !vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    gen_core::materialized_header_bytes(&decode_only, VAE_WIDTH, dir)
 }
 
 fn build_lens_memory_strategy_contract(
@@ -2473,13 +2515,24 @@ mod weights_free_behavior_tests {
             &[
                 ("img_in.weight", "BF16", &[64, 64]),
                 ("blocks.0.attn.img_qkv.weight", "BF16", &[64, 64]),
+                // The fused-QKV projection carries a bias; `QLinear::fold` promotes it to f32 when
+                // the weight folds and leaves it bf16 otherwise.
+                ("blocks.0.attn.img_qkv.bias", "BF16", &[64]),
                 // An AdaLN modulation: a plain `Linear`, outside the `QLinear` fold surface.
                 ("blocks.0.img_mod.1.weight", "BF16", &[64, 64]),
             ],
         );
         write_tensors(
             &root.join("vae/model.safetensors"),
-            &[("encoder.conv.weight", "BF16", &[8, 8])],
+            &[
+                // The decode path `Flux2Vae::new` materializes: 64 + 16 values.
+                ("decoder.conv_out.weight", "BF16", &[8, 8]),
+                ("post_quant_conv.weight", "BF16", &[4, 4]),
+                // The encoder half ships in the same shard and is never read by an inference
+                // construction (`build(vb, false)`); a decoder sum that includes it is wrong.
+                ("encoder.conv_in.weight", "BF16", &[8, 8]),
+                ("quant_conv.weight", "BF16", &[4, 4]),
+            ],
         );
     }
 
@@ -2496,29 +2549,34 @@ mod weights_free_behavior_tests {
         let root = temp.path().to_path_buf();
         dense_snapshot(&root);
 
+        // The decode path is 64 + 16 = 80 values, opened f32 from bf16: 320 B (the whole `vae/`
+        // shard weighs 320 B on disk, half of it the encoder the render never reads). Mutations
+        // that fail the decoder assertions: dropping `vae_tensor_is_encoder_only` from
+        // `vae_component_bytes` (640 B — the encoder charged), or pricing at `data_bytes` (160 B).
+        const DECODER_BYTES: u64 = (64 + 16) * 4;
         for (quant, encoder, dit) in [
-            // Dense: the MXFP4 experts dequantize to bf16 (4_096 logical values), and no DiT
-            // projection folds.
-            (None, 1_024 + 8_192, 3 * 8_192),
-            // Q4_0 is 18 B per 32 values; the modulation stays bf16 either way.
-            (Some(Quant::Q4), 1_024 + 2_304, 2_304 + 2_304 + 8_192),
+            // Dense: the MXFP4 experts dequantize to bf16 (4_096 logical values), no DiT
+            // projection folds, and the qkv bias stays bf16 (128 B).
+            (None, 1_024 + 8_192, 3 * 8_192 + 128),
+            // Q4_0 is 18 B per 32 values; the modulation stays bf16 either way, and the folded
+            // qkv's bias is promoted to f32 (256 B) — mutation that fails this: pricing `.bias`
+            // through the dense arm at `DIT_WIDTH`.
+            (Some(Quant::Q4), 1_024 + 2_304, 2_304 + 2_304 + 8_192 + 256),
             // Q8_0 is 34 B per 32 values.
-            (Some(Quant::Q8), 1_024 + 4_352, 4_352 + 4_352 + 8_192),
+            (Some(Quant::Q8), 1_024 + 4_352, 4_352 + 4_352 + 8_192 + 256),
         ] {
             let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
             spec.quantize = quant;
             let facts = loaded_component_bytes(&spec).unwrap();
             assert_eq!(facts.text_encoder, encoder, "{quant:?} text encoder");
             assert_eq!(facts.dit, dit, "{quant:?} transformer");
-            // `Flux2Vae` is opened f32 from a bf16 checkpoint: 64 values, 4 bytes each. The shards
-            // weigh 128 B.
-            assert_eq!(facts.vae, 256, "{quant:?} decoder");
+            assert_eq!(facts.vae, DECODER_BYTES, "{quant:?} decoder");
 
             let contract = build_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec);
-            assert_eq!(contract.asset_facts.decoder_bytes, 256);
+            assert_eq!(contract.asset_facts.decoder_bytes, DECODER_BYTES);
             assert_eq!(
                 contract.asset_facts.base_bytes,
-                encoder + dit + 256,
+                encoder + dit + DECODER_BYTES,
                 "{quant:?} base is its own decomposition"
             );
             gen_core_testkit::check_memory_contract_asset_facts(&contract)

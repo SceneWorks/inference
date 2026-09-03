@@ -1103,14 +1103,15 @@ fn physical_resident_bytes(
         (MemoryPhase::Conditioning, Some(quant))
             if backend == WanI2vBackend::Mlx && matches!(quant, Quant::Q4 | Quant::Q8) =>
         {
-            mlx_packed_text_encoder_bytes(path, MLX_TE_QUANT_BITS)
+            mlx_text_encoder_bytes(path, Some(MLX_TE_QUANT_BITS))
         }
-        // The UMT5 encoder is packed at load on every MLX-affine quantized tier (sc-12831): the
-        // seven attention/FFN projections per block go to the Q8 floor `model::effective_te_quant`
-        // resolves, while the token embedding, the per-block norms and position-bias tables and the
-        // final norm stay dense. Charging the dense bf16 projection stack here — which is what the
-        // `_` arm below did — over-declared the largest staged component of the 5B and 14B routes
-        // by the whole packing win (measured 11.83 -> 7.72 GiB on the 5B).
+        // The dense MLX tier keeps the seven projections bf16, but `Umt5Block::from_weights` and
+        // `assemble` upcast the same leaves on BOTH paths (`text_encoder.rs`: `norm1`, `norm2`, the
+        // per-layer `pos_embedding` table and the final `norm` are `as_dtype(Float32)` regardless of
+        // quant), so the dense arm prices those four leaves f32 too (SC-22667 review).
+        (MemoryPhase::Conditioning, None) if backend == WanI2vBackend::Mlx => {
+            mlx_text_encoder_bytes(path, None)
+        }
         (MemoryPhase::Decode, _) => projected_dense_bytes(
             path,
             if backend == WanI2vBackend::Candle && candle_decodes_f32(route) {
@@ -1143,24 +1144,30 @@ const MLX_TE_QUANT_BITS: u64 = 8;
 /// MLX affine group size, the same 64 [`packed_transformer_bytes`] assumes.
 const MLX_GROUP: u64 = 64;
 
-/// Bytes the MLX loader materializes for the UMT5 text encoder on a quantized tier.
+/// Bytes the MLX loader materializes for the UMT5 text encoder — packed to `packed_bits` on a
+/// quantized tier, dense bf16 projections on the dense tier (`None`).
 ///
 /// `mlx_gen_wan::text_encoder` packs exactly the seven bias-less projections of each block —
-/// `attn.{q,k,v,o}` and `ffn.{gate_proj,fc1,fc2}` — into an MLX affine triple, and leaves everything
-/// else dense. The two halves are priced separately because they materialize at different widths:
+/// `attn.{q,k,v,o}` and `ffn.{gate_proj,fc1,fc2}` — into an MLX affine triple on a quantized tier,
+/// and leaves everything else dense. The families are priced separately because they materialize at
+/// different widths, and the f32 family does so **on both tiers** (`Umt5Block::from_weights` and
+/// `assemble` upcast unconditionally, before `quantize` runs):
 ///
 /// * a packed `[out, in]` projection becomes `out * in * bits / 8` code bytes plus a `scales` and a
-///   `biases` plane of `out * in / group` elements each, at the source tensor's own width;
+///   `biases` plane of `out * in / group` elements each, at the source tensor's own width; on the
+///   dense tier the same projection is the shared `quant::lin` dense arm — its stored bf16 bytes;
 /// * the per-block norms, the position-bias tables and the final `norm.weight` are upcast to **f32**
 ///   by the loader (`as_dtype(Dtype::Float32)`), so they are priced at 4 bytes per element rather
-///   than at their stored bf16 width;
+///   than at their stored bf16 width — on the dense tier as much as on a packed one;
 /// * `token_embedding.weight` is cloned as stored — the loader never casts it — so it contributes
 ///   its stored bytes.
 ///
-/// Fails closed on any key outside those families, and on a projection whose input width is not a
-/// whole number of groups: either means the encoder layout moved and this pricing no longer
-/// describes what loads.
-fn mlx_packed_text_encoder_bytes(path: &Path, bits: u64) -> crate::Result<u64> {
+/// On a quantized tier this fails closed on any key outside those families, and on a packed
+/// projection whose input width is not a whole number of groups: either means the encoder layout
+/// moved and this pricing no longer describes what loads. The dense tier has no packing geometry to
+/// get wrong, so a leaf outside the families keeps the `projected_dense_bytes(path, 2)` treatment
+/// it always had (float at 2 B per element; packed/non-float storage refused).
+fn mlx_text_encoder_bytes(path: &Path, packed_bits: Option<u64>) -> crate::Result<u64> {
     const PACKED_LEAVES: [&str; 7] = [
         ".attn.q.weight",
         ".attn.k.weight",
@@ -1185,9 +1192,9 @@ fn mlx_packed_text_encoder_bytes(path: &Path, bits: u64) -> crate::Result<u64> {
     }
     headers.iter().try_fold(0_u64, |sum, header| {
         let name = header.name.as_str();
-        let bytes = if name.starts_with("blocks.")
-            && PACKED_LEAVES.iter().any(|leaf| name.ends_with(leaf))
-        {
+        let projection =
+            name.starts_with("blocks.") && PACKED_LEAVES.iter().any(|leaf| name.ends_with(leaf));
+        let bytes = if let (true, Some(bits)) = (projection, packed_bits) {
             let [out, input] = header.shape[..] else {
                 return Err(crate::Error::Unsupported(format!(
                     "{} packed projection {name} is not a 2-D weight",
@@ -1220,6 +1227,9 @@ fn mlx_packed_text_encoder_bytes(path: &Path, bits: u64) -> crate::Result<u64> {
             codes.checked_add(planes).ok_or_else(|| {
                 crate::Error::Msg("Wan packed encoder projection bytes overflow".to_owned())
             })?
+        } else if projection {
+            // The dense tier: `quant::lin`'s dense arm loads the projection as stored (bf16).
+            header.data_bytes
         } else if name == "norm.weight"
             || (name.starts_with("blocks.") && F32_LEAVES.iter().any(|leaf| name.ends_with(leaf)))
         {
@@ -1230,6 +1240,21 @@ fn mlx_packed_text_encoder_bytes(path: &Path, bits: u64) -> crate::Result<u64> {
                 })?
         } else if name == "token_embedding.weight" {
             header.data_bytes
+        } else if packed_bits.is_none() {
+            // The dense tier has no packing geometry to get wrong, so a leaf outside the named
+            // families is what `projected_dense_bytes(path, 2)` always made of it: a float tensor
+            // at 2 B per element, and a refusal for packed/non-float storage.
+            if !header.is_float() || name.ends_with(".scales") || name.ends_with(".biases") {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} dense tensor {name} has unsupported packed/non-float storage",
+                    path.display()
+                )));
+            }
+            tensor_elements(path, header)?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan projected tensor bytes overflow".to_owned())
+                })?
         } else {
             return Err(crate::Error::Unsupported(format!(
                 "{} encoder tensor {name} is outside the packed UMT5 key surface",
@@ -2781,7 +2806,7 @@ mod tests {
     /// The MLX loader packs exactly the seven bias-less projections of each block and leaves the
     /// token embedding, the per-block norms and position-bias tables and the final norm dense, so a
     /// fixture carrying a single tensor named `weight` cannot exercise
-    /// [`mlx_packed_text_encoder_bytes`] at all — every arm it distinguishes needs its own key.
+    /// [`mlx_text_encoder_bytes`] at all — every arm it distinguishes needs its own key.
     /// `dim` is a whole number of MLX affine groups, as the real encoder's is.
     fn write_umt5_encoder(path: &Path, blocks: usize, dim: usize) {
         let square = vec![dim, dim];
@@ -3729,9 +3754,11 @@ mod tests {
     /// built from — the largest staged component of both the 5B and 14B routes.
     ///
     /// The expected total is spelled out from the fixture's own geometry rather than captured, so
-    /// the test is an oracle and not a snapshot. Mutation that fails this: restoring the single
-    /// `_ => projected_dense_bytes(path, 2)` arm for `MemoryPhase::Conditioning`, which reports the
-    /// 439_680 B dense figure on the right-hand assertion and equal q4/dense bytes on the left.
+    /// the test is an oracle and not a snapshot. Mutations that fail this: restoring the single
+    /// `_ => projected_dense_bytes(path, 2)` arm for the quantized `MemoryPhase::Conditioning`
+    /// case, which reports the 439_680 B shard sum on the quantized assertions; and dropping the
+    /// dense-MLX conditioning arm (SC-22667 review), which reports that same 439_680 B on the dense
+    /// assertion instead of the 445_184 B the f32 leaf upcasts make it.
     #[test]
     fn the_mlx_encoder_is_charged_packed_on_every_quantized_tier() {
         // `write_umt5_encoder(_, blocks = 7, dim = 64)`, Q8 at MLX group 64:
@@ -3744,8 +3771,12 @@ mod tests {
         //               pos-bias [32, 8] upcast f32                        =  1_024
         //                                                       per block  = 32_000
         const PACKED_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * 32_000;
-        // The same surface priced dense bf16, which is what the receipt used to charge.
-        const DENSE_ENCODER_BYTES: u64 = 32_768 + 128 + 7 * 58_112;
+        // The dense tier (SC-22667 review): the seven projections stay bf16 as stored
+        // (7 * 4096 * 2 = 57_344 per block), but `Umt5Block::from_weights` / `assemble` upcast the
+        // same leaves on this path too — the final norm (256), the two block norms (512) and the
+        // pos-bias table (1_024) — so the dense figure is NOT the plain bf16 shard sum
+        // (32_768 + 128 + 7 * 58_112 = 439_680); it is 445_184.
+        const DENSE_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * (57_344 + 512 + 1_024);
 
         let mut dense_conditioning = 0;
         for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::I2v14b] {
