@@ -51,15 +51,28 @@ use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
 /// booleans, not a dimension — but the **config source is not**: `build_ltx25` never reads
 /// `embedded_config.json`. It resolves the split bundle and parses the transformer component's own
 /// `__metadata__` config section through `LtxConfig::from_bundle`, so that is the parse re-run here
-/// when `spec` names a materialized bundle. A spec whose bundle cannot be resolved, or whose
-/// transformer carries no config section, publishes the preset the shared derivation starts from —
-/// on the weights-free surface there is nothing to read.
+/// when `spec` names a materialized bundle.
+///
+/// Only the **weights-free** surface publishes the preset: there is nothing to read there, and the
+/// axes have to come from somewhere. A materialized bundle that cannot be resolved, or whose
+/// transformer carries no parseable config section, declares its trunk axes **absent** instead
+/// (SC-22667). `build_ltx25` reaches both of those through `?` — `resolve_split_bundle(spec)?` then
+/// `LtxConfig::from_bundle(&bundle)?` — so there is no load of such a tree to describe, and the
+/// preset here is the 2.3 shape that `LtxConfig::from_bundle`'s own doc forbids as a fall-through
+/// precisely because it would stand a 48-layer 2.3 DiT in for 2.5 weights.
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = mlx_gen::architecture_facts::materialized_root(spec)
-        .and_then(|_| crate::bundle::resolve_split_bundle(spec).ok())
-        .and_then(|bundle| crate::config::LtxConfig::from_bundle(&bundle).ok())
-        .unwrap_or_else(crate::config::LtxConfig::video_only_defaults);
-    crate::memory_strategy::architecture_facts_for(&dit, spec)
+    if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return crate::memory_strategy::architecture_facts_for(
+            &crate::config::LtxConfig::video_only_defaults(),
+            spec,
+        );
+    }
+    match crate::bundle::resolve_split_bundle(spec)
+        .and_then(|bundle| crate::config::LtxConfig::from_bundle(&bundle))
+    {
+        Ok(dit) => crate::memory_strategy::architecture_facts_for(&dit, spec),
+        Err(_) => crate::memory_strategy::unreadable_trunk_architecture_facts(spec),
+    }
 }
 
 /// The LTX-2.5 MLX engine id.
@@ -1004,13 +1017,20 @@ mod tests {
     /// `embedded_config.json` parse, and the activation width follows `spec.precision` exactly as
     /// `build_ltx25` selects the DiT precision from it.
     ///
+    /// SC-22667 review: a materialized root whose bundle does not resolve, or whose transformer
+    /// carries no parseable config section, declares its trunk axes ABSENT. `build_ltx25` reaches
+    /// both through `?`, so no load of such a tree exists — and the preset the old
+    /// `.ok().unwrap_or_else(video_only_defaults)` reached for is the 2.3 shape that
+    /// `LtxConfig::from_bundle`'s own doc forbids as a fall-through.
+    ///
     /// Mutations that fail this: reusing `crate::memory_strategy::architecture_facts(spec)` (the
     /// 2.3 parse, the shape under review) makes the `embedded_config.json` assertion publish 9
-    /// blocks; a literal `HALF_ACTIVATION_WIDTH` makes the `Fp32` assertion read 2.
+    /// blocks; restoring the preset fall-back makes it publish 48 and reds the `None` VAE-survival
+    /// arm's siblings; a literal `HALF_ACTIVATION_WIDTH` makes the `Fp32` assertion read 2.
     #[test]
     fn architecture_facts_come_from_the_bundle_parse_and_the_admitted_precision() {
         // A 2.3-style `embedded_config.json` beside a bundle root is NOT what the 2.5 loader reads:
-        // its depth must not surface.
+        // its depth must not surface, and it is not a 2.5 bundle either, so nothing is published.
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(
@@ -1023,10 +1043,24 @@ mod tests {
             .with_load_shape(LoadShape::EagerMaterialization);
         let facts = architecture_facts(&spec);
         assert_eq!(
-            facts.transformer_blocks,
-            Some(48),
-            "the 2.3 embedded config is not the 2.5 loader's source"
+            (
+                facts.attention_heads,
+                facts.head_dim,
+                facts.transformer_blocks
+            ),
+            (None, None, None),
+            "a materialized root with no parseable 2.5 transformer config publishes no trunk axis"
         );
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (Some(128), Some(32), Some(8)),
+            "the crate-constant VAE axes survive, so a declared axis remains"
+        );
+        assert!(facts.has_declared_architecture_axis());
         assert_eq!(
             crate::memory_strategy::architecture_facts(&spec).transformer_blocks,
             Some(9),
