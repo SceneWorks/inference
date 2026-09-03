@@ -606,12 +606,22 @@ fn source_tensor_bytes(path: &Path, float_width: u64) -> gen_core::Result<u64> {
         })
 }
 
+/// Every SDXL-family component is materialized at `DType::F16` — the registry generator pins
+/// `dtype: DType::F16` and each bespoke provider its own `const DTYPE: DType = DType::F16` — so one
+/// float element of any of them costs two bytes on device. Same width as [`ACTIVATION_DTYPE`].
+const FLOAT_WIDTH: u64 = 2;
+
+/// The `LoadSpec::components` id under which the IP-Adapter route stages its CLIP ViT-H/14 image
+/// encoder. `validate_ip_spec` pins it to `IpAdapterSdxlPaths::image_encoder`, which
+/// `ip_provider::load` materializes at [`FLOAT_WIDTH`] beside the IP bundle.
+const IP_IMAGE_ENCODER_COMPONENT: &str = "sdxl_ip_image_encoder";
+
 fn asset_facts(
     spec: &LoadSpec,
     root: &Path,
     tier: MemoryNumericTier,
 ) -> gen_core::Result<MemoryAssetFacts> {
-    let width = 2;
+    let width = FLOAT_WIDTH;
     let conditioning = source_tensor_bytes(&root.join("text_encoder"), width)?
         .saturating_add(source_tensor_bytes(&root.join("text_encoder_2"), width)?);
     let transformer = source_tensor_bytes(&root.join("unet"), width)?;
@@ -621,12 +631,42 @@ fn asset_facts(
         .get("vae_fp16_fix")
         .map(source_path)
         .unwrap_or(&fallback_decoder);
-    let decoder = source_tensor_bytes(decoder_source, 4)?;
+    // The fp16-fix VAE is loaded through `SdxlVaeDecoder::from_file(.., self.dtype, ..)` — f16,
+    // which is the entire point of that component: it is the checkpoint whose decode stays
+    // numerically stable at f16. Pricing it at four bytes charged twice the decoder this seal can
+    // admit. (The fused A1111 route, whose checkpoint VAE genuinely loads f32, never reaches here:
+    // `SdxlArtifactSeal::capture_for` requires a snapshot directory.) Epic SC-22657, E1.
+    let decoder = source_tensor_bytes(decoder_source, width)?;
+    // The PiD super-resolving decoder (epic 7840 / sc-7853). `LoadSpec::pid` makes the component
+    // build load `PidEngine::from_spec` once alongside the base model — unconditionally, not per
+    // request — and PiD runs on the Resident rung (`validate_context` refuses it only for the
+    // *optimized* rungs), so both of its files are resident for the whole render while no field
+    // charged either of them (epic SC-22657, E1).
+    //
+    // They are base components, not auxiliaries standing beside the base: one network, one field
+    // (`gen_core::MemoryAssetFacts`). The student IS a decoder, co-resident with the native VAE it
+    // decodes in place of, so it joins `decoder_bytes`; its Gemma caption encoder is a conditioning
+    // encoder, so it joins `conditioning_bytes`.
+    let (pid_conditioning, pid_decoder) = match spec.pid.as_ref() {
+        Some(pid) => (
+            source_tensor_bytes(source_path(&pid.gemma), width)?,
+            source_tensor_bytes(source_path(&pid.checkpoint), width)?,
+        ),
+        None => (0, 0),
+    };
+    let conditioning = conditioning.saturating_add(pid_conditioning);
+    let decoder = decoder.saturating_add(pid_decoder);
     let mut overlay = spec
         .control
         .iter()
         .chain(spec.extra_controls.iter())
         .chain(spec.ip_adapter.iter())
+        // The CLIP ViT-H/14 image encoder the IP-Adapter route loads beside its bundle
+        // (`ip_provider::load`, `Weights::from_file(.., DTYPE)`), staged as the
+        // `sdxl_ip_image_encoder` component and pinned by `validate_ip_spec`: ~1.3 GB of resident
+        // auxiliary weights that no field charged (epic SC-22657, E1). It joins the same aggregate
+        // the IP bundle beside it already uses, so it cannot flip an otherwise-empty overlay.
+        .chain(spec.components.get(IP_IMAGE_ENCODER_COMPONENT))
         .map(source_path)
         .try_fold(0_u64, |sum, path| {
             Ok::<_, gen_core::Error>(sum.saturating_add(source_tensor_bytes(path, width)?))
@@ -896,7 +936,7 @@ pub(crate) fn validate_ip_spec(
         spec.ip_adapter.as_ref(),
         &WeightsSource::File(paths.ip_adapter.clone()),
     ) || !same_source(
-        spec.components.get("sdxl_ip_image_encoder"),
+        spec.components.get(IP_IMAGE_ENCODER_COMPONENT),
         &WeightsSource::Dir(paths.image_encoder.clone()),
     ) || spec.control.is_some()
         || !spec.extra_controls.is_empty()
@@ -1430,6 +1470,112 @@ mod tests {
         (spec, root)
     }
 
+    /// AC (epic SC-22657, E1): every SDXL asset field prices what the loader materializes.
+    ///
+    /// Three defects are pinned:
+    ///
+    /// 1. **The fp16-fix VAE is loaded f16.** `SdxlVaeDecoder::from_file(.., self.dtype, ..)` with
+    ///    `dtype: DType::F16`; pricing it at four bytes charged twice the resident decoder.
+    ///    *Mutation that reds this:* `source_tensor_bytes(decoder_source, 4)`, the shape under
+    ///    review.
+    /// 2. **The IP-Adapter CLIP ViT-H image encoder is resident.** `ip_provider::load` materializes
+    ///    the `sdxl_ip_image_encoder` component beside the IP bundle; no field charged it.
+    ///    *Mutation that reds this:* dropping the `IP_IMAGE_ENCODER_COMPONENT` link from the
+    ///    overlay chain.
+    /// 3. **PiD is resident when staged.** `LoadSpec::pid` makes the component build load the
+    ///    student and its Gemma encoder once alongside the base model; the student is charged to
+    ///    `decoder_bytes` and its caption encoder to `conditioning_bytes` (one network, one field).
+    ///    *Mutation that reds this:* dropping the `pid_conditioning` / `pid_decoder` addends.
+    #[test]
+    fn asset_facts_price_the_f16_decoder_and_every_staged_auxiliary() {
+        let temp = tempfile::tempdir().unwrap();
+        let (spec, root) = dense_spec(&temp);
+        let base = provider_contract_for_spec(&spec).unwrap().asset_facts;
+        // The fixture's `vae_fp16_fix` is one f16 element: two resident bytes, not four.
+        assert_eq!(
+            base.decoder_bytes, 2,
+            "the fp16-fix VAE is materialized f16"
+        );
+        assert_eq!(
+            base.base_bytes,
+            base.conditioning_bytes + base.transformer_bytes + base.decoder_bytes
+        );
+        assert_eq!(base.overlay_bytes, 0, "a plain route stages no auxiliary");
+
+        // The IP-Adapter route stages its bundle AND its CLIP ViT-H image encoder.
+        let ip_bundle = root.join("ip-adapter-plus.safetensors");
+        let ip_encoder = root.join("ip-image-encoder.safetensors");
+        write_tensor(&ip_bundle, DType::F16);
+        let encoder_tensor = Tensor::zeros((16, 16), DType::F16, &Device::Cpu).unwrap();
+        safetensors::serialize_to_file(
+            vec![("x.weight".to_owned(), encoder_tensor)],
+            None,
+            &ip_encoder,
+        )
+        .unwrap();
+        let mut ip_spec = spec.clone();
+        ip_spec.ip_adapter = Some(WeightsSource::File(ip_bundle));
+        ip_spec = ip_spec.with_component(
+            IP_IMAGE_ENCODER_COMPONENT,
+            WeightsSource::File(ip_encoder.clone()),
+        );
+        assert_eq!(
+            provider_contract_for_spec(&ip_spec)
+                .unwrap()
+                .asset_facts
+                .overlay_bytes,
+            2 + 16 * 16 * 2,
+            "the IP bundle and the CLIP ViT-H image encoder it loads beside it are both resident"
+        );
+
+        // A PiD-bearing spec stages the student checkpoint and the Gemma caption encoder.
+        let pid_checkpoint = root.join("pid-student.safetensors");
+        let gemma = root.join("gemma");
+        std::fs::create_dir_all(&gemma).unwrap();
+        let student = Tensor::zeros((4, 4), DType::F16, &Device::Cpu).unwrap();
+        safetensors::serialize_to_file(
+            vec![("x.weight".to_owned(), student)],
+            None,
+            &pid_checkpoint,
+        )
+        .unwrap();
+        let gemma_tensor = Tensor::zeros((2, 4), DType::F16, &Device::Cpu).unwrap();
+        safetensors::serialize_to_file(
+            vec![("x.weight".to_owned(), gemma_tensor)],
+            None,
+            &gemma.join("model.safetensors"),
+        )
+        .unwrap();
+        let mut pid_spec = spec.clone();
+        pid_spec.pid = Some(gen_core::PidWeights {
+            checkpoint: WeightsSource::File(pid_checkpoint),
+            gemma: WeightsSource::Dir(gemma),
+        });
+        let pid_facts = provider_contract_for_spec(&pid_spec).unwrap().asset_facts;
+        assert_eq!(
+            pid_facts.decoder_bytes,
+            base.decoder_bytes + 4 * 4 * 2,
+            "the PiD student decodes in place of the native VAE and is resident beside it"
+        );
+        assert_eq!(
+            pid_facts.conditioning_bytes,
+            base.conditioning_bytes + 2 * 4 * 2,
+            "PiD's Gemma caption encoder is a resident conditioning encoder"
+        );
+        assert_eq!(
+            pid_facts.base_bytes,
+            pid_facts.conditioning_bytes + pid_facts.transformer_bytes + pid_facts.decoder_bytes
+        );
+        // Base components, not an aggregate overlay: PiD must not flip an otherwise-empty
+        // `overlay_bytes` non-zero, which this PhaseEnvelope contract cannot back with typed
+        // auxiliary components and which `MemoryProviderContract::conformance_errors` rejects.
+        assert_eq!(pid_facts.overlay_bytes, 0);
+        assert!(provider_contract_for_spec(&pid_spec)
+            .unwrap()
+            .conformance_errors()
+            .is_empty());
+    }
+
     /// AC (epic SC-22657, E2): a materialized SDXL snapshot publishes the axes of the vendored
     /// UNet + VAE configs the loader builds, declines the four a UNet denoiser structurally lacks,
     /// and the weights-free surface publishes none.
@@ -1437,12 +1583,20 @@ mod tests {
     fn architecture_facts_match_the_loader_config_and_pass_conformance() {
         let temp = tempfile::tempdir().unwrap();
         let (spec, root) = dense_spec(&temp);
-        // The shared fixture gives the encoders and the VAE the same byte total, which the
+        // The shared fixture gives every component the same one-element tensor, which the
         // conformance check reads as one component borrowing another's price. Widen the encoder
-        // shards so every component is priced from its own distinct bytes.
+        // shards AND the UNet so each is priced from its own distinct bytes. (Since SC-22667 the
+        // VAE is priced at the same f16 width as the rest, so a differing dtype no longer keeps
+        // the fixture's components apart by accident.)
         for component in ["text_encoder", "text_encoder_2"] {
             let path = root.join(component).join("model.fp16.safetensors");
             let tensor = Tensor::zeros((4, 4), DType::F16, &Device::Cpu).unwrap();
+            safetensors::serialize_to_file(vec![("x.weight".to_owned(), tensor)], None, &path)
+                .unwrap();
+        }
+        {
+            let path = root.join("unet/diffusion_pytorch_model.fp16.safetensors");
+            let tensor = Tensor::zeros((8, 8), DType::F16, &Device::Cpu).unwrap();
             safetensors::serialize_to_file(vec![("x.weight".to_owned(), tensor)], None, &path)
                 .unwrap();
         }
