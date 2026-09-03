@@ -14,11 +14,10 @@ use mlx_gen::gen_core::{
     LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
     MemoryBehaviorRoute, MemoryBudget, MemoryCacheState, MemoryCalibrationIdentity,
     MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryOptimizationAuthority, MemoryPhase, MemoryPrerequisiteScope,
-    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite, MemoryStrategySupport, Quant,
-    TransformerComponent,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
+    MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, Quant, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};

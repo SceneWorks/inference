@@ -251,12 +251,12 @@ pub fn load_ip_adapter(
         .iter()
         .map(|f| dir.join(f))
         .find(|p| p.exists())
-    .ok_or_else(|| {
-        Error::Msg(format!(
-            "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
-            dir.display()
-        ))
-    })?;
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
+                dir.display()
+            ))
+        })?;
     let mut ip_w = Weights::from_file(&ip_file)?;
     // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
     if !is_packed(&ip_w) {

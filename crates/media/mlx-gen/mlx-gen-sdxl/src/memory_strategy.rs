@@ -793,16 +793,15 @@ fn resident_overlay_components(spec: &LoadSpec) -> CoreResult<Vec<MemoryResident
     } else {
         AdapterResidencyMode::Folded
     };
-    let adapter_bytes = adapter_stack_resident_bytes(&spec.adapters, adapter_mode).ok_or_else(
-        || {
+    let adapter_bytes =
+        adapter_stack_resident_bytes(&spec.adapters, adapter_mode).ok_or_else(|| {
             CoreError::Unsupported(
                 "sdxl: an adapter stack was requested on a packed base but at least one source \
                  could not be sized; refusing to declare a zero the shared validator would wave \
                  through"
                     .to_owned(),
             )
-        },
-    )?;
+        })?;
     push_overlay(
         &mut components,
         ADAPTER_COMPONENT_ID,
@@ -2011,8 +2010,8 @@ mod tests {
         let root = tmp.path();
         let fused = root.join("sdxl.safetensors");
         write_fused_contract_fixture(&fused);
-        let clean = LoadSpec::new(WeightsSource::File(fused))
-            .with_offload_policy(OffloadPolicy::Resident);
+        let clean =
+            LoadSpec::new(WeightsSource::File(fused)).with_offload_policy(OffloadPolicy::Resident);
         let base = memory_strategy_contract(crate::MODEL_ID, &clean).unwrap();
         assert_eq!(base.asset_facts.overlay_bytes, 0);
         assert!(base.resident_components().is_empty());
@@ -2038,14 +2037,24 @@ mod tests {
             30,
             2,
         );
-        write_tensor(&ip.join(crate::loader::IP_ADAPTER_WEIGHT_FILES[1]), "F16", 20, 2);
+        write_tensor(
+            &ip.join(crate::loader::IP_ADAPTER_WEIGHT_FILES[1]),
+            "F16",
+            20,
+            2,
+        );
         // A PiD pair, loaded verbatim: the student file and a Gemma shard directory that carries no
         // merged single file, so `PidEngine::load` falls back to the directory.
         let pid = root.join("pid.safetensors");
         write_tensor(&pid, "BF16", 10, 2);
         let gemma = root.join("gemma");
         std::fs::create_dir_all(&gemma).unwrap();
-        write_tensor(&gemma.join("model-00001-of-00001.safetensors"), "BF16", 5, 2);
+        write_tensor(
+            &gemma.join("model-00001-of-00001.safetensors"),
+            "BF16",
+            5,
+            2,
+        );
         // A LoRA on a DENSE base is merged into the U-Net weight: folded, no independent residency.
         let lora = root.join("lora.safetensors");
         std::fs::write(&lora, vec![0_u8; 64]).unwrap();
