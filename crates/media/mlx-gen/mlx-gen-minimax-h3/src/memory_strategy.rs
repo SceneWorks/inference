@@ -1223,8 +1223,9 @@ pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProvider
 /// Catalog conformance uses this when the snapshot is unavailable. It must **not** require the
 /// snapshot to exist — no byte count is read off disk here — and it must not diverge from
 /// [`contract_for`] in anything but the byte counts. It does consult the spec's weights directory
-/// for the DiT config when one is materialized (see [`dit_config`]); that is not a byte count, and
-/// on the registry's never-created sentinel path it reads nothing and publishes the preset.
+/// for the DiT config when one is materialized (see the crate-private `dit_config`); that is not a
+/// byte count, and on the registry's never-created sentinel path it reads nothing and publishes
+/// the preset.
 pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(
         spec,
