@@ -147,10 +147,17 @@ impl CheckpointInventory {
     /// * `decoder_bytes` — zero, and honestly so: the FM head emits RGB patches, there is no VAE and
     ///   the contract declares no decode phase.
     ///
-    /// Sums tensor DATA bytes from the shard headers, so packed tiers count their `.scales` /
-    /// `.biases` alongside their codes, and an unrecognised key fails closed rather than being
-    /// silently folded into either path.
+    /// Prices each tensor at the width the loader MATERIALIZES it at, not at its stored width, and
+    /// an unrecognised key fails closed rather than being silently folded into either path. See
+    /// [`materialized_element_width`] — summing `data_bytes` under-priced every f32-widened leaf by
+    /// exactly half, and an under-price is the defect class this contract exists to exclude.
     pub(crate) fn asset_facts(&self) -> gen_core::Result<MemoryAssetFacts> {
+        // The width `backbone_vb` mmaps the bulk store at. `snapshot_store_dtype` is that function's
+        // own probe; its `None` (no probe tensor) maps to the same f32 `checkpoint_dtype` fallback
+        // the load path takes, so the pricing follows the load rather than guessing narrow.
+        let store_width = crate::snapshot_store_dtype(&self.root)
+            .and_then(candle_gen::architecture_facts::dtype_width)
+            .map_or(4_u64, u64::from);
         let mut conditioning_bytes = 0_u64;
         let mut transformer_bytes = 0_u64;
         for (path, _) in &self.files {
@@ -167,7 +174,15 @@ impl CheckpointInventory {
                         )));
                     }
                 };
-                *bucket = bucket.checked_add(header.data_bytes).ok_or_else(|| {
+                // Integer payloads (the packed `U32` codes) are read at their native dtype and so
+                // occupy exactly their stored bytes; every float leaf is priced by key class.
+                let bytes = if header.is_float() {
+                    header
+                        .materialized_bytes(materialized_element_width(&header.name, store_width))?
+                } else {
+                    header.data_bytes
+                };
+                *bucket = bucket.checked_add(bytes).ok_or_else(|| {
                     gen_core::Error::Unsupported(
                         "sensenova: component byte total overflows u64".to_owned(),
                     )
@@ -264,6 +279,64 @@ fn asset_component(name: &str) -> Option<AssetComponent> {
         Some(AssetComponent::Generation)
     } else {
         Some(AssetComponent::Understanding)
+    }
+}
+
+/// Bytes per logical element the loader materializes the float tensor `name` at.
+///
+/// The checkpoint's stored width is NOT what most of these leaves occupy: `quant::store_dtype_for`
+/// governs only the bulk store, and three key classes are read at `DType::F32` on top of it, so a
+/// `data_bytes` sum under-prices each of them by exactly half on a bf16 tier (and under-prices the
+/// whole checkpoint on any non-bf16 tier, whose store maps to f32). Mirrors the key-class split
+/// `gen_core`'s `mlx_text_encoder_bytes` already uses for the Wan UMT5 encoder.
+///
+/// The f32 classes, each read through `quant::get_f32` / an explicit `DType::F32` request:
+///
+/// * a packed projection's affine planes — `quant::detect_linear` requests `{base}.scales` and
+///   `{base}.biases` at `DType::F32` although every tier stores them BF16 (which
+///   [`detect_checkpoint_quantization`] asserts). On q4 these planes are ~11% of the packed
+///   projections' materialized bytes, so halving them is a real under-price;
+/// * `fm_modules.*` — the FM head, the timestep/noise-scale embedders and the generation-path
+///   vision embedder all load through `fm::load_linear_biased` / `NeoVisionEmbedder::from_weights`,
+///   both of which call `quant::get_f32`; likewise the understanding-path `vision_model.*` tower;
+/// * every norm vector — `q_norm`, `k_norm`, `q_norm_hw`, `k_norm_hw`, `input_layernorm`,
+///   `post_attention_layernorm` and the two final `model.norm{,_mot_gen}` — which `Qwen3Backbone`
+///   reads with `get_f32` because `rms_norm` multiplies them against an f32 hidden state.
+///
+/// Everything else — the bulk `{q,k,v,o}_proj` / `{gate,up,down}_proj` dense weights,
+/// `embed_tokens` and `lm_head` — rides the store width (`vb.get_unchecked`).
+///
+/// A projection's own `.bias` (distinct from the affine `.biases`) would load at f32 under the
+/// packed arm, but every call site passes `bias: false` (`qwen3.rs` `load_linear_no_bias`), so such
+/// a tensor is not loaded at all; charging it the store width over-declares rather than under.
+fn materialized_element_width(name: &str, store_width: u64) -> u64 {
+    if name.ends_with(".scales") || name.ends_with(".biases") {
+        return 4;
+    }
+    if name.starts_with("fm_modules.") || name.starts_with("vision_model.") {
+        return 4;
+    }
+    let Some(rest) = name.strip_prefix("language_model.") else {
+        return store_width;
+    };
+    // The module segment, i.e. the one before the `.weight` / `.bias` leaf.
+    let Some(module) = rest.rsplit('.').nth(1) else {
+        return store_width;
+    };
+    let module = module.strip_suffix("_mot_gen").unwrap_or(module);
+    if matches!(
+        module,
+        "norm"
+            | "q_norm"
+            | "k_norm"
+            | "q_norm_hw"
+            | "k_norm_hw"
+            | "input_layernorm"
+            | "post_attention_layernorm"
+    ) {
+        4
+    } else {
+        store_width
     }
 }
 
@@ -1148,9 +1221,12 @@ mod tests {
             .unwrap()
             .asset_facts()
             .unwrap();
+        // Rows that ride the bf16 STORE (`vb.get_unchecked`): the bulk projections, `embed_tokens`
+        // and `lm_head`. Rows the loader WIDENS to f32 (`quant::get_f32`) cost twice that: every
+        // norm vector, the `vision_model` tower and everything under `fm_modules`.
         let row = 64 * 2; // one bf16 row of 64
-        let understanding = (2 + 2 + 1 + 4 + 4 + 1 + 1) * row;
-        let generation = (2 + 2 + 1 + 1 + 3) * row;
+        let understanding = (2 + 2 + 4 + 4) * row + (1 + 1 + 1) * 2 * row;
+        let generation = (2 + 2) * row + (1 + 1 + 3) * 2 * row;
         assert_eq!(
             facts,
             MemoryAssetFacts {
@@ -1171,6 +1247,89 @@ mod tests {
             Some(AssetComponent::Generation)
         );
         assert_eq!(asset_component("unexpected.weight"), None);
+    }
+
+    /// AC (epic SC-22657, E1): the contract prices what the LOADER materializes, not what the shard
+    /// stores. A packed tier's `.scales` / `.biases` are stored BF16 but requested at `DType::F32`
+    /// (`quant::detect_linear`), so they must be priced at 4 B per element — pricing them at their
+    /// stored width halves ~11% of a q4 transformer's bytes, an under-price. The `U32` code tensor
+    /// is read at its native dtype and so stays at exactly its stored bytes.
+    #[test]
+    fn packed_affine_planes_are_priced_at_the_f32_width_the_loader_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let base = "language_model.model.layers.0.self_attn.k_proj";
+        // q4 over one 64-wide affine group: `[2, 64 * 4 / 32]` codes, `[2, 1]` planes.
+        let lanes = 64 * 4 / 32;
+        let tensors = HashMap::from([
+            (
+                format!("{base}.weight"),
+                Tensor::zeros((2, lanes), DType::U32, &device).unwrap(),
+            ),
+            (
+                format!("{base}.scales"),
+                Tensor::ones((2, 1), DType::BF16, &device).unwrap(),
+            ),
+            (
+                format!("{base}.biases"),
+                Tensor::zeros((2, 1), DType::BF16, &device).unwrap(),
+            ),
+            // The always-dense store probe `snapshot_store_dtype` reads: bf16 ⇒ a 2 B store.
+            (
+                "language_model.model.norm.weight".to_owned(),
+                Tensor::zeros((4,), DType::BF16, &device).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, root.path().join("model.safetensors"))
+            .unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+
+        let facts = CheckpointInventory::capture(root.path())
+            .unwrap()
+            .asset_facts()
+            .unwrap();
+        let plane_elements = 2_u64; // one `[2, 1]` plane
+        let codes = 2 * lanes as u64 * 4; // U32, read as stored
+        let planes = 2 * plane_elements * 4; // scales + biases, at f32
+        let norm = 4 * 4; // `get_f32`, not the 2 B store
+        assert_eq!(
+            facts,
+            MemoryAssetFacts {
+                base_bytes: codes + planes + norm,
+                conditioning_bytes: codes + planes + norm,
+                transformer_bytes: 0,
+                decoder_bytes: 0,
+                overlay_bytes: 0,
+            }
+        );
+        // Stated as the property rather than only as a total: the planes are charged strictly more
+        // than they occupy on disk, and by exactly the bf16 → f32 doubling.
+        let stored_planes = 2 * plane_elements * 2;
+        assert_eq!(planes, 2 * stored_planes);
+        assert!(facts.base_bytes > codes + stored_planes + 4 * 2);
+        // The class rule itself, independent of the fixture geometry.
+        assert_eq!(materialized_element_width(&format!("{base}.scales"), 2), 4);
+        assert_eq!(materialized_element_width(&format!("{base}.biases"), 2), 4);
+        assert_eq!(materialized_element_width(&format!("{base}.weight"), 2), 2);
+        assert_eq!(
+            materialized_element_width("language_model.model.layers.0.input_layernorm.weight", 2),
+            4
+        );
+        assert_eq!(
+            materialized_element_width(
+                "language_model.model.layers.0.self_attn.q_norm_hw_mot_gen.weight",
+                2
+            ),
+            4
+        );
+        assert_eq!(
+            materialized_element_width("fm_modules.fm_head.0.weight", 2),
+            4
+        );
+        assert_eq!(
+            materialized_element_width("language_model.model.embed_tokens.weight", 2),
+            2
+        );
     }
 
     /// A tensor outside the known layout fails closed instead of being folded into either path.

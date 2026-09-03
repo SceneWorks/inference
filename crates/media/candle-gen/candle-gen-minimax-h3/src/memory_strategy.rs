@@ -743,8 +743,10 @@ fn downsample_product(vae: Option<&serde_json::Value>, key: &str) -> Option<u32>
 ///
 /// The VAE ratios are computed from the parsed factor lists rather than restating
 /// [`crate::config::VAE_RATIO`] / [`crate::config::VAE_RATIO_T`], which are themselves documented as
-/// the products of those lists; the constants are the fallback for a snapshot that ships no VAE
-/// config.
+/// the products of those lists. Those constants are **not** a fallback here: a snapshot that ships
+/// no VAE config (or an unreadable factor list) leaves [`downsample_product`] returning `None` and
+/// both scale axes unpublished, per E2 — the pipeline's own canvas alignment still uses the
+/// constants, but this contract never presents them as a fact about a snapshot it could not read.
 ///
 /// A weights-free contract — no resolved snapshot directory — publishes
 /// `MemoryArchitectureFacts::default()`.
