@@ -677,6 +677,7 @@ fn build_contract(
         }
     };
     Ok(MemoryProviderContract {
+        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,

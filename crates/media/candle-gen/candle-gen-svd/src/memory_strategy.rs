@@ -360,6 +360,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

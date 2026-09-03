@@ -1561,6 +1561,7 @@ fn contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        architecture_facts: crate::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: backend.realization(),
         strategies: MemoryStrategy::ALL

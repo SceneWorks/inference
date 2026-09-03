@@ -922,6 +922,88 @@ pub struct MemoryAssetFacts {
     pub overlay_bytes: u64,
 }
 
+/// Provider-owned, snapshot-read model architecture facts used as activation-formula inputs.
+///
+/// Every axis is an `Option` on purpose. `None` means **not declared**, and a provider must use it
+/// for two distinct cases which both differ from `Some(0)`:
+///
+/// * the axis is *structurally absent* for this architecture (an image model has no temporal VAE
+///   scale), and
+/// * the provider could not read the axis (a weights-free contract built before the snapshot exists
+///   on disk).
+///
+/// A zero is never a legitimate value for any of these axes, so a defaulted `0` would silently
+/// poison any activation estimate that multiplied by it. Providers therefore read these from the
+/// component `config.json` files of the materialized snapshot, and publish `None` otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryArchitectureFacts {
+    /// Attention heads in one transformer block.
+    pub attention_heads: Option<u32>,
+    /// Per-head channel width (`hidden_dim / attention_heads` for a uniform-head architecture).
+    pub head_dim: Option<u32>,
+    /// Number of transformer blocks the denoiser stacks.
+    pub transformer_blocks: Option<u32>,
+    /// Spatial patchification factor applied to the latent before the transformer.
+    pub patch_size: Option<u32>,
+    /// Latent channel count produced by the encoder / consumed by the decoder.
+    pub latent_channels: Option<u32>,
+    /// Pixels per latent unit on each spatial axis (8 for a four-stage image VAE).
+    pub vae_spatial_scale: Option<u32>,
+    /// Frames per latent unit on the temporal axis. Structurally absent — and therefore `None` —
+    /// for image models.
+    pub vae_temporal_scale: Option<u32>,
+    /// Bytes per element of the activation dtype (2 for bf16/f16, 4 for f32).
+    pub activation_dtype_width: Option<u32>,
+}
+
+impl MemoryArchitectureFacts {
+    /// Whether no axis at all has been declared. A contract publishing a lifecycle-phase formula
+    /// with nothing declared cannot support an activation-aware estimate.
+    pub const fn is_empty(&self) -> bool {
+        self.attention_heads.is_none()
+            && self.head_dim.is_none()
+            && self.transformer_blocks.is_none()
+            && self.patch_size.is_none()
+            && self.latent_channels.is_none()
+            && self.vae_spatial_scale.is_none()
+            && self.vae_temporal_scale.is_none()
+            && self.activation_dtype_width.is_none()
+    }
+
+    /// Whether at least one axis actually *read from the snapshot* has been declared.
+    ///
+    /// [`Self::activation_dtype_width`] is deliberately excluded: an adopting provider emits it
+    /// from a compile-time dtype constant, so it is `Some` whenever the provider was compiled -
+    /// never evidence that the snapshot's component configs were found and parsed. A gate that
+    /// accepts it as "at least one architecture fact" is satisfied by a contract that read nothing.
+    pub const fn has_snapshot_read_axis(&self) -> bool {
+        self.attention_heads.is_some()
+            || self.head_dim.is_some()
+            || self.transformer_blocks.is_some()
+            || self.patch_size.is_some()
+            || self.latent_channels.is_some()
+            || self.vae_spatial_scale.is_some()
+            || self.vae_temporal_scale.is_some()
+    }
+
+    /// Axes declared as `Some(0)`. Zero is never legitimate for any axis: an absent axis is `None`.
+    pub fn zero_valued_axes(&self) -> Vec<&'static str> {
+        [
+            ("attention_heads", self.attention_heads),
+            ("head_dim", self.head_dim),
+            ("transformer_blocks", self.transformer_blocks),
+            ("patch_size", self.patch_size),
+            ("latent_channels", self.latent_channels),
+            ("vae_spatial_scale", self.vae_spatial_scale),
+            ("vae_temporal_scale", self.vae_temporal_scale),
+            ("activation_dtype_width", self.activation_dtype_width),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| (value == Some(0)).then_some(name))
+        .collect()
+    }
+}
+
 /// Immutable provider-owned facts for a narrowly pinned Resident route.
 ///
 /// This is intentionally separate from [`MemoryCalibrationIdentity`]: it proves what was loaded and
@@ -1185,6 +1267,10 @@ pub struct MemoryProviderContract {
     /// Such a provider can run its resident path but can never claim a verified optimized fit.
     pub calibration: Option<MemoryCalibrationIdentity>,
     pub asset_facts: MemoryAssetFacts,
+    /// Snapshot-read architecture axes. `MemoryArchitectureFacts::default()` (every axis `None`) is
+    /// the compatibility state for a provider that has not adopted the axis yet, and the honest
+    /// state for a weights-free contract built with no snapshot on disk.
+    pub architecture_facts: MemoryArchitectureFacts,
     pub runtime: MemoryRuntimeSemantics,
 }
 
@@ -1221,6 +1307,7 @@ impl MemoryProviderContract {
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
             asset_facts: MemoryAssetFacts::default(),
+            architecture_facts: MemoryArchitectureFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
     }
@@ -4113,6 +4200,7 @@ mod tests {
         strategies[3].parameters.attention_chunk_sizes = vec![256, 128];
         strategies[4].parameters.transformer_window_sizes = vec![2, 1];
         MemoryProviderContract {
+            architecture_facts: crate::MemoryArchitectureFacts::default(),
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,

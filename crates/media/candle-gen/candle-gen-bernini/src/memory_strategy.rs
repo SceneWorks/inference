@@ -1318,6 +1318,7 @@ fn contract(
         }
     };
     MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

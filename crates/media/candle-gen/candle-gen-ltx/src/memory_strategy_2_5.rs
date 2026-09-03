@@ -301,6 +301,7 @@ fn build_contract(
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     Ok(MemoryProviderContract {
+        architecture_facts: candle_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: LTX_2_5_DISTILLED_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,

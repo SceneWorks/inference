@@ -47,8 +47,92 @@ pub(crate) const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 15, 30];
 pub(crate) const DEFAULT_TRANSFORMER_WINDOW: usize = 1;
 pub(crate) const CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-staged-tiled-decode-bounded-attention-device-format-blocks-v2";
+/// Provider-local identity of the typed auxiliary control component. Stable across loads: the
+/// bespoke control routes hold exactly one control network.
+pub(crate) const CONTROL_COMPONENT_ID: &str = "z-image-control-branch";
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
+
+/// Activation dtype the loaded Z-Image pipeline computes in. `lib.rs` pins `DType::BF16`
+/// unconditionally ("Z-Image is a bf16 model; load at bf16 regardless of the CPU-default dtype"),
+/// so this is the provider's real activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Read one component `config.json` from a snapshot root. A missing or unparseable file is not an
+/// error: the contract is constructible before any asset exists on disk, and every architecture
+/// axis it feeds is `Option`.
+fn component_config(root: &std::path::Path, component: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(root.join(component).join("config.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Narrow a JSON number to a declared architecture axis. Zero and out-of-range values are rejected
+/// rather than published: no axis here has a legitimate zero, and `Some(0)` would silently zero any
+/// activation estimate that multiplied by it (E2).
+fn axis(value: Option<&serde_json::Value>) -> Option<u32> {
+    let value = u32::try_from(value?.as_u64()?).ok()?;
+    (value != 0).then_some(value)
+}
+
+/// Snapshot-read architecture facts for the Z-Image routes.
+///
+/// The DiT axes come from `<root>/transformer/config.json` (`n_heads`, `dim`, `n_layers`,
+/// `all_patch_size`) and the decoder axes from `<root>/vae/config.json` (`latent_channels`,
+/// `block_out_channels`); the DiT's `in_channels` is read only as the `latent_channels` fallback
+/// for a snapshot that ships no VAE config. Nothing is inferred from the model id, so a snapshot
+/// whose config disagrees with the reference Turbo config publishes what it actually says.
+///
+/// `vae_temporal_scale` stays `None`: Z-Image ships the FLUX.1 image AutoencoderKL, which has no
+/// temporal axis at all. A structurally absent axis is declared absent, never zero (E2).
+///
+/// A weights-free contract — no snapshot directory, or a single-file ComfyUI import that carries no
+/// component configs — publishes `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let dit = component_config(root, "transformer");
+    let vae = component_config(root, "vae");
+    if dit.is_none() && vae.is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let attention_heads = axis(dit.as_ref().and_then(|dit| dit.get("n_heads")));
+    let hidden_dim = axis(dit.as_ref().and_then(|dit| dit.get("dim")));
+    // Z-Image's DiT is uniform-head: `dim` is exactly `n_heads * head_dim`. Publishing the quotient
+    // only when it divides evenly keeps a non-uniform snapshot from claiming a head width it lacks.
+    let head_dim = match (hidden_dim, attention_heads) {
+        (Some(dim), Some(heads)) if dim % heads == 0 => Some(dim / heads),
+        _ => None,
+    };
+    let vae_spatial_scale = vae
+        .as_ref()
+        .and_then(|vae| vae.get("block_out_channels"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|stages| u32::try_from(stages.len()).ok())
+        // Each stage after the first halves both spatial axes: four stages give the x8 scale.
+        .and_then(|stages| stages.checked_sub(1))
+        // A pathological stage count has no honest scale to publish. Clamping the shift would
+        // invent one; declining the axis says what is actually known (E2).
+        .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples));
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        head_dim,
+        transformer_blocks: axis(dit.as_ref().and_then(|dit| dit.get("n_layers"))),
+        patch_size: axis(
+            dit.as_ref()
+                .and_then(|dit| dit.get("all_patch_size"))
+                .and_then(|patch| patch.get(0)),
+        ),
+        // `vae/config.json:latent_channels` is the authoritative key: it is the encoder's own
+        // declaration of what it produces. The DiT's `in_channels` is the *consumer's* view and is
+        // only the fallback for a snapshot that ships no VAE config.
+        latent_channels: axis(vae.as_ref().and_then(|vae| vae.get("latent_channels")))
+            .or_else(|| axis(dit.as_ref().and_then(|dit| dit.get("in_channels")))),
+        vae_spatial_scale,
+        vae_temporal_scale: None,
+        activation_dtype_width: u32::try_from(ACTIVATION_DTYPE.size_in_bytes()).ok(),
+    }
+}
 
 fn ordinary_streamable(spec: &LoadSpec) -> bool {
     spec.precision == Precision::Bf16
@@ -641,6 +725,7 @@ pub(crate) fn provider_contract(
             decoder_bytes: components.vae,
             overlay_bytes: 0,
         },
+        architecture_facts: architecture_facts(spec),
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
 }
@@ -662,19 +747,40 @@ pub(crate) fn control_contract(
             })?,
         None => 0,
     };
-    contract.asset_facts.base_bytes = contract
-        .asset_facts
-        .base_bytes
-        .saturating_add(overlay_bytes);
-    contract.asset_facts.transformer_bytes = contract
-        .asset_facts
-        .transformer_bytes
-        .saturating_add(overlay_bytes);
-    contract.asset_facts.conditioning_bytes = contract
-        .asset_facts
-        .conditioning_bytes
-        .max(contract.asset_facts.decoder_bytes);
+    // SC-22660 / E1: the control network is declared exactly **once**, in `overlay_bytes`, with a
+    // typed auxiliary `ControlBranch` component carrying the same total (mirroring the MLX Z-Image
+    // control contract). `base_bytes` stays the base-model sum identity
+    // `conditioning + transformer + decoder`, so it neither double-counts the overlay nor hides it
+    // inside `transformer_bytes`. Previously the same bytes were declared on three legs at once and
+    // `conditioning_bytes` was raised to `max(conditioning, decoder)` — a total borrowed from
+    // another component, which is the exact defect the facts check now rejects.
     contract.asset_facts.overlay_bytes = overlay_bytes;
+    if overlay_bytes > 0 {
+        let (phases, variables) = match &contract.formula {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
+                (phases.clone(), variables.clone())
+            }
+            other => {
+                return Err(gen_core::Error::Msg(format!(
+                    "{provider_id}: control contract expected a PhaseEnvelope base formula, got {other:?}"
+                )))
+            }
+        };
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![gen_core::MemoryResidentComponent {
+                id: CONTROL_COMPONENT_ID.to_owned(),
+                kind: gen_core::MemoryComponentKind::ControlBranch,
+                resident_bytes: overlay_bytes,
+                // The control stack's own blocks ride the selected transformer window whenever the
+                // base stack does; a non-streamable load bounds it by no rung at all.
+                bounded_by: control_streamable(spec)
+                    .then_some(MemoryStrategy::BoundedTransformerResidency),
+                residency: gen_core::MemoryComponentResidency::WholeRender,
+            }],
+        };
+    }
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         CONTROL_CALIBRATION_FINGERPRINT,
         spec.load_shape,
@@ -1626,10 +1732,214 @@ mod tests {
         scope.finish(gen_core::MemoryRunOutcome::Complete).unwrap();
     }
 
+    /// The DiT/VAE config fields exactly as the published `SceneWorks/z-image-turbo` snapshot ships
+    /// them (verified against the on-disk q4 snapshot). Only the keys the architecture facts read
+    /// are reproduced; the values are the snapshot's, and the assertions below derive nothing from
+    /// the model id.
+    fn write_snapshot_component_configs(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{
+                "_class_name": "ZImageTransformer2DModel",
+                "all_f_patch_size": [1],
+                "all_patch_size": [2],
+                "axes_dims": [32, 48, 48],
+                "cap_feat_dim": 2560,
+                "dim": 3840,
+                "in_channels": 16,
+                "n_heads": 30,
+                "n_kv_heads": 30,
+                "n_layers": 30,
+                "n_refiner_layers": 2
+            }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("vae")).unwrap();
+        std::fs::write(
+            root.join("vae/config.json"),
+            br#"{
+                "_class_name": "AutoencoderKL",
+                "block_out_channels": [128, 256, 512, 512],
+                "in_channels": 3,
+                "latent_channels": 16,
+                "layers_per_block": 2,
+                "out_channels": 3,
+                "sample_size": 1024
+            }"#,
+        )
+        .unwrap();
+    }
+
+    fn snapshot_spec(root: std::path::PathBuf) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.load_shape = LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    /// AC: both Z-Image providers publish architecture facts read from the snapshot's component
+    /// `config.json` files, and the resulting contract passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_are_read_from_the_snapshot_component_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-turbo");
+        write_snapshot_component_configs(&root);
+        let spec = snapshot_spec(root.clone());
+        for id in [crate::MODEL_ID, crate::base::MODEL_ID] {
+            let contract = provider_contract(id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(30),
+                    // 3840 / 30, read from `dim` and `n_heads` rather than declared.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(30),
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    // Four `block_out_channels` stages => three halvings => x8.
+                    vae_spatial_scale: Some(8),
+                    // Z-Image ships the FLUX.1 image VAE: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{id} architecture facts"
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // AC 1 is phrased in terms of the published `Generator::memory_strategy_contract()` surface,
+        // not the crate-internal builder. A real load over the same snapshot must expose the exact
+        // same facts, so the axis cannot be published on a contract nobody outside the crate sees.
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("valid encoder fixture");
+        let spec = snapshot_spec(root);
+        let expected = provider_contract(crate::MODEL_ID, &spec)
+            .unwrap()
+            .architecture_facts;
+        for (label, generator) in [
+            ("turbo", crate::load(&spec).unwrap()),
+            ("base", crate::base::load(&spec).unwrap()),
+        ] {
+            let published = generator
+                .memory_strategy_contract()
+                .expect("unit-test loads retain their memory contract");
+            assert_eq!(
+                published.architecture_facts, expected,
+                "{label}: memory_strategy_contract() must publish the snapshot-read facts"
+            );
+            assert!(published.architecture_facts.has_snapshot_read_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(published);
+        }
+    }
+
+    /// The facts are read, not asserted: a snapshot that disagrees with the reference Turbo config
+    /// publishes what it actually says, and an axis it cannot support stays absent.
+    #[test]
+    fn architecture_facts_follow_the_config_and_omit_unreadable_axes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-mutated");
+        write_snapshot_component_configs(&root);
+        let mut dit: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("transformer/config.json")).unwrap())
+                .unwrap();
+        dit["n_layers"] = serde_json::json!(24);
+        // 3840 does not divide evenly by 7, so no honest head width exists to publish.
+        dit["n_heads"] = serde_json::json!(7);
+        dit["all_patch_size"] = serde_json::json!([0]);
+        // The DiT's consumer-side view disagrees with the VAE's own declaration. `vae/config.json:
+        // latent_channels` is authoritative, so the VAE's 16 must win over the DiT's 4.
+        dit["in_channels"] = serde_json::json!(4);
+        std::fs::write(
+            root.join("transformer/config.json"),
+            serde_json::to_vec(&dit).unwrap(),
+        )
+        .unwrap();
+
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root.clone()))
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(facts.transformer_blocks, Some(24));
+        assert_eq!(facts.attention_heads, Some(7));
+        assert_eq!(facts.head_dim, None, "3840 / 7 is not a head width");
+        assert_eq!(facts.patch_size, None, "a zero axis is declared absent");
+        assert_eq!(facts.vae_spatial_scale, Some(8));
+        assert_eq!(
+            facts.latent_channels,
+            Some(16),
+            "vae/config.json:latent_channels outranks the DiT's in_channels"
+        );
+        assert!(facts.zero_valued_axes().is_empty());
+
+        // Only with no VAE config at all does the DiT's `in_channels` stand in for it.
+        std::fs::remove_file(root.join("vae/config.json")).unwrap();
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(facts.vae_spatial_scale, None, "no vae/config.json to read");
+        assert_eq!(
+            facts.latent_channels,
+            Some(4),
+            "the DiT is the fallback, not the primary"
+        );
+    }
+
+    /// A stage count no `u32` scale can express declines the axis rather than clamping the shift
+    /// into a fabricated scale.
+    #[test]
+    fn a_pathological_vae_stage_count_declines_the_spatial_scale_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-wide-vae");
+        write_snapshot_component_configs(&root);
+        let mut vae: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("vae/config.json")).unwrap()).unwrap();
+        // Seven stages => six halvings => x64, past the x32 the axis can honestly express.
+        vae["block_out_channels"] = serde_json::json!([1, 2, 3, 4, 5, 6, 7]);
+        std::fs::write(
+            root.join("vae/config.json"),
+            serde_json::to_vec(&vae).unwrap(),
+        )
+        .unwrap();
+
+        let facts = provider_contract(crate::MODEL_ID, &snapshot_spec(root))
+            .unwrap()
+            .architecture_facts;
+        assert_eq!(
+            facts.vae_spatial_scale, None,
+            "an out-of-range stage count has no honest scale to publish"
+        );
+        // The rest of the snapshot is still read: the decline is axis-local.
+        assert_eq!(facts.latent_channels, Some(16));
+        assert_eq!(facts.transformer_blocks, Some(30));
+    }
+
+    /// A contract built before any asset exists on disk declares every axis absent rather than
+    /// fabricating the reference architecture.
+    #[test]
+    fn weights_free_contracts_publish_absent_architecture_facts() {
+        for id in [crate::MODEL_ID, crate::base::MODEL_ID] {
+            let contract = provider_contract(id, &spec()).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts::default(),
+                "{id} weights-free facts"
+            );
+            assert!(contract.architecture_facts.is_empty());
+        }
+    }
+
     #[test]
     fn plain_contract_is_conformant_and_exposes_every_candidate_range() {
         for id in [crate::MODEL_ID, crate::base::MODEL_ID] {
             let contract = provider_contract(id, &spec()).unwrap();
+            // The weights-free contract cannot satisfy the E2 architecture gate — there is no
+            // config.json to read — but its byte decomposition is still a claim (E1). Checked
+            // first so this entry point, not the shared conformance walk, is what reports a
+            // dishonest decomposition here.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+            assert!(contract.architecture_facts.is_empty());
             assert!(contract.conformance_errors().is_empty());
             gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
             assert_eq!(
@@ -1986,12 +2296,163 @@ mod tests {
         ));
     }
 
+    /// A *materialized* control fixture: the base snapshot's component configs (so the architecture
+    /// facts are read rather than defaulted) plus a control directory holding a real
+    /// `.safetensors` file, so `safetensors_path_bytes` returns a non-zero overlay and every
+    /// overlay assertion below is load-bearing.
+    fn materialized_control_fixture(tmp: &tempfile::TempDir) -> (LoadSpec, u64) {
+        let root = tmp.path().join("z-image-control-snapshot");
+        write_snapshot_component_configs(&root);
+        // Distinct, non-zero base components: a decomposition check over three zeroes proves
+        // nothing, and a decoder total larger than the conditioning total is what makes a
+        // `conditioning.max(decoder)` fold observable.
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .expect("valid encoder fixture");
+        write_safetensors(
+            &root.join("transformer/diffusion_pytorch_model.safetensors"),
+            &[("blocks.0.weight", 8192)],
+        );
+        write_safetensors(
+            &root.join("vae/diffusion_pytorch_model.safetensors"),
+            &[("decoder.conv_in.weight", 1_000_000)],
+        );
+        let control = root.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        write_safetensors(
+            &control.join("diffusion_pytorch_model.safetensors"),
+            &[
+                ("control.block.0.weight", 4096),
+                ("control.embed.weight", 512),
+            ],
+        );
+        let overlay_bytes = gen_core::safetensors_path_bytes(&control);
+        assert!(
+            overlay_bytes > 0,
+            "the control fixture must be materialized; a nonexistent path makes every overlay \
+             assertion vacuous"
+        );
+        (
+            snapshot_spec(root).with_control(WeightsSource::Dir(control)),
+            overlay_bytes,
+        )
+    }
+
+    /// The control network is declared **once**, in `overlay_bytes` plus one typed auxiliary
+    /// `ControlBranch` component. `base_bytes` keeps the base-model sum identity, so the same bytes
+    /// are never counted on three legs at once (SC-22657 E1).
+    #[test]
+    fn control_contract_declares_the_control_network_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, overlay_bytes) = materialized_control_fixture(&tmp);
+        for id in ["z_image_turbo_control", "z_image_control"] {
+            let plain = provider_contract(id, &spec).unwrap();
+            let contract = control_contract(id, &spec).unwrap();
+            let facts = &contract.asset_facts;
+
+            // Non-vacuity: every base component is separately priced, so the decomposition
+            // assertions below are over three distinct non-zero totals rather than three zeroes.
+            assert!(facts.conditioning_bytes > 0, "{id} conditioning bytes");
+            assert!(facts.transformer_bytes > 0, "{id} transformer bytes");
+            assert!(facts.decoder_bytes > 0, "{id} decoder bytes");
+
+            assert_eq!(facts.overlay_bytes, overlay_bytes, "{id} overlay bytes");
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes,
+                "{id}: base_bytes must stay the base-model sum identity"
+            );
+            assert_eq!(
+                facts.base_bytes, plain.asset_facts.base_bytes,
+                "{id}: the overlay must not be folded into base_bytes"
+            );
+            assert_eq!(
+                facts.transformer_bytes, plain.asset_facts.transformer_bytes,
+                "{id}: the overlay must not be folded into transformer_bytes"
+            );
+            assert_eq!(
+                facts.conditioning_bytes, plain.asset_facts.conditioning_bytes,
+                "{id}: conditioning_bytes must stay the text-encoder total"
+            );
+
+            let components = contract.resident_components();
+            assert_eq!(components.len(), 1, "{id} resident components");
+            assert_eq!(components[0].id, CONTROL_COMPONENT_ID);
+            assert_eq!(
+                components[0].kind,
+                gen_core::MemoryComponentKind::ControlBranch
+            );
+            assert_eq!(components[0].resident_bytes, overlay_bytes);
+            assert_eq!(
+                components[0].bounded_by,
+                Some(MemoryStrategy::BoundedTransformerResidency)
+            );
+            assert_eq!(contract.auxiliary_resident_bytes(), overlay_bytes);
+            assert_eq!(
+                contract.total_resident_bytes(),
+                facts.base_bytes + overlay_bytes,
+                "{id}: a warm control provider holds the base model and the control network"
+            );
+
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{id}: {:?}",
+                contract.conformance_errors()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
+    /// `conditioning_bytes` is the **text-encoder** total, full stop. The retired shape raised it to
+    /// `max(conditioning, decoder)`, which on a snapshot whose decoder outweighs its conditioning
+    /// stack borrows the decoder's bytes for a component that does not hold them — the exact E1
+    /// defect the facts check exists to reject. This fixture ships a priced decoder and no text
+    /// encoder, so that fold is observable rather than the no-op it is on a full snapshot.
+    #[test]
+    fn control_conditioning_bytes_never_borrow_the_decoder_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-no-encoder");
+        write_snapshot_component_configs(&root);
+        write_safetensors(
+            &root.join("vae/diffusion_pytorch_model.safetensors"),
+            &[("decoder.conv_in.weight", 1_000_000)],
+        );
+        let control = root.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        write_safetensors(&control.join("control.safetensors"), &[("w", 4096)]);
+        let spec = snapshot_spec(root).with_control(WeightsSource::Dir(control));
+
+        for id in ["z_image_turbo_control", "z_image_control"] {
+            let contract = control_contract(id, &spec).unwrap();
+            let facts = &contract.asset_facts;
+            assert!(facts.decoder_bytes > 0, "{id}: the decoder must be priced");
+            assert_eq!(
+                facts.conditioning_bytes, 0,
+                "{id}: no text encoder is present, so no conditioning bytes exist to declare"
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{id}: {:?}",
+                contract.conformance_errors()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
     #[test]
     fn control_routes_publish_the_full_executable_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (spec, _) = materialized_control_fixture(&tmp);
         for id in ["z_image_turbo_control", "z_image_control"] {
-            let spec = spec().with_control(WeightsSource::Dir("/control".into()));
             let contract = control_contract(id, &spec).unwrap();
-            assert!(contract.conformance_errors().is_empty());
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{id}: {:?}",
+                contract.conformance_errors()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
                 CONTROL_CALIBRATION_FINGERPRINT

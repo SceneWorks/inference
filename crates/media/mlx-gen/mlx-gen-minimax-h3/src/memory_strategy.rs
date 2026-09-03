@@ -1000,6 +1000,7 @@ fn build_contract(
     streamable: bool,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
+        architecture_facts: mlx_gen::gen_core::MemoryArchitectureFacts::default(),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
