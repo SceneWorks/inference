@@ -571,8 +571,11 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 /// diffusers `transformer/config.json` at all: it builds [`TransformerConfig::ti2v_5b`] and
 /// [`crate::config::VaeConfig::ti2v_5b`] directly, and the A14B presets ([`TransformerConfig::t2v_14b`] /
 /// [`TransformerConfig::i2v_14b`], `Vae16Config`) belong to the `wan14b` / `vace` generators, which
-/// publish no [`MemoryProviderContract`] at all. Declaring the A14B geometry here would be a fact
-/// about a route this contract never describes.
+/// publish the **sealed I2V contract** from [`gen_core::wan_i2v_memory`] instead — prepared through
+/// [`crate::i2v_memory_strategy::prepare`] and returned from their own
+/// `memory_strategy_contract`, with their own architecture facts. Declaring the A14B geometry here
+/// would be a fact about a route *this* contract never describes, and one the route that does
+/// describe it already publishes for itself.
 ///
 /// The VAE scales come from the route's own load-bearing geometry constant,
 /// [`crate::Ti2vProviderVae::VAE_TILING`] (`VaeTiling::WAN22`, x16 spatial / x4 causal temporal) —
