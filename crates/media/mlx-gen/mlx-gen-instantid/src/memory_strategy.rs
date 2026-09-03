@@ -298,11 +298,14 @@ mod tests {
             100,
             2,
         );
-        // The VAE ships fp16 and is upcast to f32 on every load.
+        // The VAE ships fp16 and is upcast to f32 on every load. Every component below is given a
+        // DISTINCT byte total on purpose: the shared facts check refuses two base fields that carry
+        // the same number, because a component that cannot be priced separately must not borrow
+        // another's bytes.
         write_tensor(
             &base.join("vae/diffusion_pytorch_model.fp16.safetensors"),
             "F16",
-            50,
+            30,
             2,
         );
         write_tensor(
@@ -314,13 +317,13 @@ mod tests {
         write_tensor(
             &base.join("text_encoder_2/model.fp16.safetensors"),
             "F16",
-            30,
+            35,
             2,
         );
         let identitynet = tmp.path().join("identitynet.safetensors");
         write_tensor(&identitynet, "F16", 40, 2);
         let ip_adapter = tmp.path().join("ip-adapter.safetensors");
-        write_tensor(&ip_adapter, "F16", 60, 2);
+        write_tensor(&ip_adapter, "F16", 70, 2);
 
         let paths = crate::InstantIdPaths {
             sdxl_base: base,
@@ -330,21 +333,21 @@ mod tests {
         };
         let contract = provider_contract_for_paths(&paths, dense_numeric_tier());
 
-        assert_eq!(contract.asset_facts.conditioning_bytes, 20 * 2 + 30 * 2);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 20 * 2 + 35 * 2);
         assert_eq!(contract.asset_facts.transformer_bytes, 100 * 2);
         assert_eq!(
             contract.asset_facts.decoder_bytes,
-            50 * 4,
+            30 * 4,
             "the SDXL VAE is materialized f32 whatever it is stored as"
         );
         assert_eq!(
             contract.asset_facts.base_bytes,
-            100 + 200 + 200,
+            110 + 200 + 120,
             "base must be exactly its own three-way decomposition"
         );
         assert_eq!(
             contract.asset_facts.overlay_bytes,
-            40 * 2 + 60 * 2,
+            40 * 2 + 70 * 2,
             "the IdentityNet and the face IP bundle are auxiliary networks beside the base"
         );
         assert_eq!(
