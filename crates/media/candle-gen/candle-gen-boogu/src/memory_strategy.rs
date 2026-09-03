@@ -462,14 +462,52 @@ fn validate_native_vae(root: &Path) -> gen_core::Result<()> {
     Ok(())
 }
 
+/// The `mllm/` tensors the route's own loaders materialize, and the width each lands at.
+/// `None` means this route never builds that tensor, so it is not charged (epic SC-22657, E1).
+///
+/// * `model.language_model.*` — the Qwen3-VL text encoder every route loads
+///   (`pipeline::load_te_weights` feeds `BooguTextEncoder::load(.., "model.language_model", ..)`).
+///   Projections and the token table ride the **bf16** store (`pipeline::TE_STORE_DTYPE`, sc-12828);
+///   the RMSNorm weights are the exception, read through `Weights::get_f32` so `rmsnorm` runs
+///   f32-on-f32 under that store — they are resident at **four** bytes per element, not two.
+/// * `model.visual.*` — the Qwen3-VL vision tower. Only the **Edit** route constructs it
+///   (`pipeline::load_edit_components`, `Weights::from_dir(mllm, .., VAE_DTYPE)` = f32). Base/Turbo
+///   never do — their img2img surface loads the standalone VAE encoder alone (sc-11786) — so
+///   charging the tower there billed every plain request for a network no such load materializes.
+/// * Anything else sharing `mllm/` (an `lm_head` tail, a sibling head) is built by neither loader
+///   and is therefore not resident on any route.
+fn mllm_tensor_width(name: &str, route: Route) -> Option<u64> {
+    /// Leaves the text encoder reads with `Weights::get_f32` rather than at the bf16 store width:
+    /// the per-head q/k RMSNorms, both decoder-layer norms, and the final norm.
+    const F32_NORM_SUFFIXES: &[&str] = &[
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+    ];
+
+    if let Some(leaf) = name.strip_prefix("model.language_model.") {
+        let f32_norm = leaf == "norm.weight"
+            || F32_NORM_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(*suffix));
+        return Some(if f32_norm { 4 } else { 2 });
+    }
+    if name.starts_with("model.visual.") {
+        return (route == Route::Edit).then_some(4);
+    }
+    None
+}
+
 fn projected_facts(
     root: &Path,
     route: Route,
     tier: Option<Quant>,
 ) -> gen_core::Result<MemoryAssetFacts> {
-    let conditioning_bytes = projected_component(root, "mllm", 2, route == Route::Edit)?;
-    let transformer_bytes = projected_component(root, "transformer", 2, false)?;
-    let decoder_bytes = projected_component(root, "vae", 4, false)?;
+    let conditioning_bytes =
+        projected_component(root, "mllm", &|name| mllm_tensor_width(name, route))?;
+    let transformer_bytes = projected_component(root, "transformer", &|_| Some(2))?;
+    let decoder_bytes = projected_component(root, "vae", &|_| Some(4))?;
     // One network, one field (epic SC-22657, E1; feature-end ruling SC-22667). The reference
     // encoder every Edit request and the Base/Turbo img2img surface run during conditioning is
     // the same f32 VAE weights the decode phase runs, so those bytes are charged exactly once, in
@@ -481,7 +519,7 @@ fn projected_facts(
         .checked_add(transformer_bytes)
         .and_then(|v| v.checked_add(decoder_bytes))
         .ok_or_else(|| gen_core::Error::Msg("boogu: projected resident byte overflow".into()))?;
-    let _ = (route, tier);
+    let _ = tier;
     Ok(MemoryAssetFacts {
         base_bytes,
         conditioning_bytes,
@@ -491,11 +529,13 @@ fn projected_facts(
     })
 }
 
+/// Resident bytes for one component directory, priced per tensor by `width_of`: the dense
+/// materialization width this route's loader lands that tensor at, or `None` for a tensor the
+/// route never builds (which is therefore not charged at all).
 fn projected_component(
     root: &Path,
     component: &str,
-    dense_width: u64,
-    vision_f32: bool,
+    width_of: &dyn Fn(&str) -> Option<u64>,
 ) -> gen_core::Result<u64> {
     let headers = component_headers(root, component)?;
     let by_name = headers
@@ -507,6 +547,10 @@ fn projected_component(
             // MLX affine sidecars are transient pack inputs, not separately resident tensors.
             return Ok(total);
         }
+        let Some(dense_width) = width_of(&tensor.name) else {
+            // Not materialized by this route's loaders: a route never charges what it never loads.
+            return Ok(total);
+        };
         let base = tensor.name.strip_suffix(".weight");
         let scale_name = base.map(|base| format!("{base}.scales"));
         let bytes = if let Some(scales) = scale_name.as_deref().and_then(|name| by_name.get(name)) {
@@ -521,12 +565,7 @@ fn projected_component(
                 tensor, scales, biases, GROUP_SIZE,
             )?
         } else {
-            let width = if vision_f32 && tensor.name.starts_with("model.visual.") {
-                4
-            } else {
-                dense_width
-            };
-            tensor.materialized_bytes(width)?
+            tensor.materialized_bytes(dense_width)?
         };
         total
             .checked_add(bytes)
@@ -1587,11 +1626,20 @@ mod tests {
             .join(name);
         for component in ["transformer", "mllm"] {
             let path = root.join(component).join("model.safetensors");
+            // The `mllm/` component carries the REAL Qwen3-VL key namespaces, because which of
+            // them a route materializes — and at what width — is exactly what the pricing under
+            // test decides. MLX packs only `model.language_model.*` projections; the norms and the
+            // whole vision tower stay dense in every hosted tier (sc-9410).
+            let projection = if component == "mllm" {
+                "model.language_model.layers.0.self_attn.q_proj"
+            } else {
+                "layer"
+            };
             match quant {
                 None => write_tensors(
                     &path,
                     vec![(
-                        "layer.weight",
+                        format!("{projection}.weight").as_str(),
                         Tensor::zeros((2, 32), CandleDType::BF16, &Device::Cpu).unwrap(),
                     )],
                 ),
@@ -1601,20 +1649,37 @@ mod tests {
                         &path,
                         vec![
                             (
-                                "layer.weight",
+                                format!("{projection}.weight").as_str(),
                                 Tensor::zeros((2, lanes), CandleDType::U32, &Device::Cpu).unwrap(),
                             ),
                             (
-                                "layer.scales",
+                                format!("{projection}.scales").as_str(),
                                 Tensor::zeros((2, 1), CandleDType::BF16, &Device::Cpu).unwrap(),
                             ),
                             (
-                                "layer.biases",
+                                format!("{projection}.biases").as_str(),
                                 Tensor::zeros((2, 1), CandleDType::BF16, &Device::Cpu).unwrap(),
                             ),
                         ],
                     );
                 }
+            }
+            if component == "mllm" {
+                // Dense in every tier: the f32-read decoder-layer norm and the vision tower the
+                // Edit route alone constructs.
+                write_tensors(
+                    &root.join(component).join("model-extra.safetensors"),
+                    vec![
+                        (
+                            "model.language_model.layers.0.input_layernorm.weight",
+                            Tensor::zeros(64usize, CandleDType::BF16, &Device::Cpu).unwrap(),
+                        ),
+                        (
+                            "model.visual.blocks.0.attn.qkv.weight",
+                            Tensor::zeros((8, 16), CandleDType::BF16, &Device::Cpu).unwrap(),
+                        ),
+                    ],
+                );
             }
             let config = match quant {
                 Some(quant) => {
@@ -1831,7 +1896,11 @@ mod tests {
                 // again (the shape under review), which moves the field off the MLLM projection.
                 assert_eq!(
                     receipt.facts.conditioning_bytes,
-                    projected_component(&root, "mllm", 2, provider == BOOGU_IMAGE_EDIT_ID).unwrap(),
+                    projected_component(&root, "mllm", &|name| mllm_tensor_width(
+                        name,
+                        Route::for_provider(provider).unwrap()
+                    ))
+                    .unwrap(),
                     "{provider} {quant:?}: conditioning must be the MLLM alone"
                 );
                 assert_eq!(
@@ -1849,6 +1918,81 @@ mod tests {
                     .all(|(_, _, digest)| digest.len() == 64));
             }
         }
+    }
+
+    /// The conditioning field prices only what the route's own loaders materialize, at the width
+    /// they materialize it (epic SC-22657, E1).
+    ///
+    /// Two defects are pinned:
+    ///
+    /// 1. **The vision tower is Edit-only.** `pipeline::load_edit_components` is the sole
+    ///    constructor of `model.visual.*`; Base and Turbo never build it. Charging it on those
+    ///    routes billed every plain request for a tower it does not load.
+    ///    *Mutation that reds this:* `mllm_tensor_width` returning `Some(4)` for `model.visual.*`
+    ///    on every route (the pre-SC-22667 `projected_component(root, "mllm", 2, ..)` shape, which
+    ///    priced the tower on all three).
+    /// 2. **The TE norms are f32.** `text_encoder.rs` reads `input_layernorm` / `q_norm` / `k_norm`
+    ///    / the final `norm` with `Weights::get_f32`, not at the bf16 store width.
+    ///    *Mutation that reds this:* dropping the `F32_NORM_SUFFIXES` arm so norms price at 2.
+    #[test]
+    fn conditioning_prices_only_the_tensors_the_route_loads_at_their_loaded_width() {
+        let mut priced = std::collections::BTreeMap::new();
+        for provider in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
+            let (_temp, root) = artifact(provider, None);
+            let receipt =
+                ArtifactReceipt::capture(provider, &exact_spec(provider, root.clone(), None))
+                    .unwrap();
+            priced.insert(provider, receipt.facts.conditioning_bytes);
+        }
+        // `model.visual.blocks.0.attn.qkv.weight` is [8, 16] = 128 elements, materialized f32 by
+        // `load_edit_components` — the exact delta the Edit route alone carries.
+        let tower_f32_bytes = 8 * 16 * 4;
+        assert_eq!(
+            priced[BOOGU_IMAGE_ID], priced[BOOGU_IMAGE_TURBO_ID],
+            "the two plain routes load the same conditioning stack"
+        );
+        assert_eq!(
+            priced[BOOGU_IMAGE_EDIT_ID],
+            priced[BOOGU_IMAGE_ID] + tower_f32_bytes,
+            "only Edit may be charged the Qwen3-VL vision tower"
+        );
+
+        // The plain conditioning total is the bf16-stored projection plus the f32-read norm.
+        let projection_bf16_bytes = 2 * 32 * 2;
+        let norm_f32_bytes = 64 * 4;
+        assert_eq!(
+            priced[BOOGU_IMAGE_ID],
+            projection_bf16_bytes + norm_f32_bytes,
+            "the f32-read RMSNorm weights must not be priced at the bf16 store width"
+        );
+        assert_eq!(
+            mllm_tensor_width("model.visual.patch_embed.weight", Route::Base),
+            None
+        );
+        assert_eq!(
+            mllm_tensor_width("model.visual.patch_embed.weight", Route::Edit),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width("model.language_model.norm.weight", Route::Base),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width(
+                "model.language_model.layers.3.self_attn.k_norm.weight",
+                Route::Base
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width(
+                "model.language_model.layers.3.mlp.down_proj.weight",
+                Route::Base
+            ),
+            Some(2)
+        );
+        // Neither loader builds an `lm_head` tail, so no route charges one.
+        assert_eq!(mllm_tensor_width("lm_head.weight", Route::Edit), None);
     }
 
     #[test]
