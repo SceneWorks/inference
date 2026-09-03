@@ -1052,20 +1052,34 @@ pub fn streamable(spec: &LoadSpec) -> bool {
 /// unparseable no longer degrades into the preset. `MiniMaxH3Dit::load_dir` errors on exactly that
 /// file, so a preset published here would describe a model this load will never build. A provider
 /// falls back to a preset only where the LOADER falls back to it; otherwise the trunk axes are
-/// declared absent. The VAE axes survive the absent branch because they are their own config read
-/// with a crate-constant fallback, so the contract still declares a real architecture axis and the
-/// MLX weights-free gate stays satisfied.
+/// declared absent. The VAE axes are their own config read (see [`vae_config`]) and normally survive
+/// that branch, so the contract still declares a real architecture axis and the MLX weights-free
+/// gate stays satisfied.
 fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    // SC-22667 review: a `vae/config.json` that is present but does not parse declines the VAE axes
+    // rather than substituting the crate mirror — `vae.rs` reads that same file through the same
+    // `from_diffusers_json` and propagates the failure, so no load of this snapshot has the mirror's
+    // geometry. An ABSENT file keeps the mirror: that is the shape the weights-free surface and an
+    // unmaterialized VAE both have, and it is the only branch where there is nothing to contradict.
     let vae = vae_config(spec);
+    let latent_channels = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.latent_channels));
+    let vae_spatial_scale = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.patch_size));
+    let vae_temporal_scale = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.patch_size_t));
     let Some(dit) = dit_config(spec) else {
         return mlx_gen::gen_core::MemoryArchitectureFacts {
             attention_heads: None,
             head_dim: None,
             transformer_blocks: None,
             patch_size: None,
-            latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
-            vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
-            vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
+            latent_channels,
+            vae_spatial_scale,
+            vae_temporal_scale,
             activation_dtype_width: Some(if spec.precision == mlx_gen::Precision::Fp32 {
                 mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
             } else {
@@ -1083,9 +1097,9 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
         patch_size: (patch_h == patch_w)
             .then(|| mlx_gen::architecture_facts::axis(patch_h))
             .flatten(),
-        latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
-        vae_spatial_scale: mlx_gen::architecture_facts::axis(vae.patch_size),
-        vae_temporal_scale: mlx_gen::architecture_facts::axis(vae.patch_size_t),
+        latent_channels,
+        vae_spatial_scale,
+        vae_temporal_scale,
         // SC-22667: this hardcoded `HALF_ACTIVATION_WIDTH` while its own comment named the
         // exception. gen-core documents the axis as the DENOISE-phase width — explicitly not a
         // per-component byte fact — and `model.rs` selects `Dtype::Float32` for the DiT under
@@ -1148,16 +1162,28 @@ fn resolved_dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3D
 
 /// The video-VAE geometry a contract should describe: the materialized snapshot's own
 /// `vae/config.json` — the file `vae.rs` parses through this same
-/// `MiniMaxH3VaeConfig::from_diffusers_json` at load — when one exists and parses, else this
-/// crate's mirror of the shipped VAE. As with the DiT, a partial or variant file declines whole
-/// rather than half-defaulting.
-fn vae_config(spec: &LoadSpec) -> crate::config::MiniMaxH3VaeConfig {
-    mlx_gen::architecture_facts::materialized_root(spec)
-        .and_then(|root| {
-            let text = std::fs::read_to_string(root.join("vae").join("config.json")).ok()?;
-            crate::config::MiniMaxH3VaeConfig::from_diffusers_json(&text).ok()
-        })
-        .unwrap_or_default()
+/// `MiniMaxH3VaeConfig::from_diffusers_json` at load — when one exists and parses, this crate's
+/// mirror of the shipped VAE when there is no such file to read, and `None` when the file is there
+/// and does not parse.
+///
+/// That last arm is the SC-22667 review fix, and it mirrors [`dit_config`]: `from_diffusers_json`
+/// requires every key, so a partial or variant file declines whole rather than half-defaulting —
+/// but declining used to mean `unwrap_or_default()`, i.e. publishing the crate mirror's geometry
+/// for a snapshot whose own file says something else. `MiniMaxH3Vae::load` reads that exact path
+/// and propagates both the read and the parse failure, so a load of such a tree does not exist to
+/// describe, and E2 declares the axes absent instead.
+///
+/// An ABSENT file keeps the mirror deliberately: the weights-free registry surface has no snapshot
+/// at all, and a caller building a contract before the VAE component is materialized is in the same
+/// position — nothing there contradicts the shipped geometry.
+fn vae_config(spec: &LoadSpec) -> Option<crate::config::MiniMaxH3VaeConfig> {
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return Some(crate::config::MiniMaxH3VaeConfig::default());
+    };
+    let Ok(text) = std::fs::read_to_string(root.join("vae").join("config.json")) else {
+        return Some(crate::config::MiniMaxH3VaeConfig::default());
+    };
+    crate::config::MiniMaxH3VaeConfig::from_diffusers_json(&text).ok()
 }
 
 fn build_contract(
@@ -2057,6 +2083,65 @@ mod tests {
         assert_eq!(
             facts.transformer_blocks,
             architecture_facts(&weightless_spec()).transformer_blocks
+        );
+    }
+
+    /// SC-22667 review: the VAE branch now mirrors the DiT branch. `MiniMaxH3Vae::load` reads
+    /// `vae/config.json` and propagates both its read and its parse failure, so a file that is
+    /// PRESENT and unparseable describes no load — its axes are declared absent rather than filled
+    /// in from this crate's mirror. An ABSENT file keeps the mirror: that is the weights-free shape
+    /// and the shape of a snapshot whose VAE component is not materialized yet, and nothing there
+    /// contradicts the shipped geometry.
+    ///
+    /// Mutation that fails this: restoring `.unwrap_or_default()` in `vae_config` — the unparseable
+    /// leg then reads back the mirror's `latent_channels` instead of `None`.
+    #[test]
+    fn an_unparseable_vae_config_declines_the_vae_axes_instead_of_the_mirror() {
+        let preset_facts = architecture_facts(&weightless_spec());
+        let mirror_dit = |root: &std::path::Path| {
+            let transformer = root.join(crate::model::BASE_DIT_PARTITION);
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                dit_config_json(&crate::dit::config::MiniMaxH3DitConfig::default()).to_string(),
+            )
+            .unwrap();
+        };
+
+        // Present but missing a required key: `from_diffusers_json` declines it whole.
+        let broken = tempfile::tempdir().unwrap();
+        mirror_dit(broken.path());
+        std::fs::create_dir_all(broken.path().join("vae")).unwrap();
+        let mut partial = vae_config_json(&crate::config::MiniMaxH3VaeConfig::default());
+        partial.as_object_mut().unwrap().remove("latent_channels");
+        std::fs::write(broken.path().join("vae/config.json"), partial.to_string()).unwrap();
+        let facts = architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+            broken.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (None, None, None),
+            "an unparseable vae/config.json must not publish the crate mirror's geometry"
+        );
+        assert_eq!(
+            facts.transformer_blocks, preset_facts.transformer_blocks,
+            "the DiT read is independent and survives"
+        );
+        assert!(facts.has_declared_architecture_axis());
+
+        // Absent: the mirror still stands, which is what the weights-free surface publishes.
+        let absent = tempfile::tempdir().unwrap();
+        mirror_dit(absent.path());
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                absent.path().to_path_buf()
+            ))),
+            preset_facts,
+            "no vae/config.json to read keeps the shipped mirror"
         );
     }
 

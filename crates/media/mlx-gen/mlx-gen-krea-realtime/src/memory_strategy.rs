@@ -483,7 +483,11 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
     let (temporal_stride, spatial_stride, _) = wan.vae_stride;
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
-        head_dim: mlx_gen::architecture_facts::axis(wan.head_dim()),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667): `WanModelConfig::head_dim`
+        // is a plain `dim / num_heads`, so a snapshot `config.json` whose `num_heads` does not divide
+        // `dim` would publish a truncated width the loader cannot build, and `"num_heads": 0` divides
+        // by zero before `axis` can decline the value. This mirrors `mlx_gen_wan`'s own derivation.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
         transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
         // A single scalar can only describe a square patch; an anisotropic one has no honest value.
         patch_size: (patch_h == patch_w)
@@ -752,6 +756,50 @@ mod tests {
             architecture_facts(&bare_spec),
             architecture_facts(&weights_free_spec()),
             "the shipped config-less snapshot must publish the preset's axes"
+        );
+    }
+
+    /// SC-22667: the head width goes through the exactness-gated shared helper, not
+    /// `WanModelConfig::head_dim`'s integer division. A snapshot whose `num_heads` does not divide
+    /// `dim` has no single head width — publishing the truncated quotient would declare a geometry
+    /// the loader cannot build — and `"num_heads": 0` would divide by zero inside `head_dim()`
+    /// before `axis` could decline it, panicking a contract build rather than declining an axis.
+    ///
+    /// Mutation that fails this: restoring `axis(wan.head_dim())` publishes `Some(731)` for the
+    /// non-divisible fixture and panics on the zero fixture.
+    #[test]
+    fn a_non_uniform_head_stack_declines_the_head_width_instead_of_truncating_it() {
+        let preset = crate::config::KreaRealtimeConfig::krea_realtime_14b().wan;
+        assert_eq!(
+            preset.dim, 5120,
+            "fixture premise: the reused Wan-14B width"
+        );
+
+        let ragged_dir = tempfile::tempdir().unwrap();
+        let mut ragged = preset.to_json();
+        ragged["num_heads"] = serde_json::json!(7);
+        let ragged_facts = architecture_facts(&spec_for_config(ragged_dir.path(), &ragged));
+        assert_eq!(
+            (ragged_facts.attention_heads, ragged_facts.head_dim),
+            (Some(7), None),
+            "5120 / 7 is not a head width any load has"
+        );
+
+        let zero_dir = tempfile::tempdir().unwrap();
+        let mut zero = preset.to_json();
+        zero["num_heads"] = serde_json::json!(0);
+        let zero_facts = architecture_facts(&spec_for_config(zero_dir.path(), &zero));
+        assert_eq!(
+            (zero_facts.attention_heads, zero_facts.head_dim),
+            (None, None),
+            "a zero head count declines both axes rather than dividing by zero"
+        );
+
+        // The shipped geometry still publishes its exact quotient.
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &preset.to_json())).head_dim,
+            Some(128)
         );
     }
 

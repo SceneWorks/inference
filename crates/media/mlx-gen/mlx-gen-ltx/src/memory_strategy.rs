@@ -660,11 +660,48 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
 /// the preset is what `from_model_dir` itself falls back to. The 2.5 route parses a different
 /// source (its split bundle's transformer `__metadata__`) and goes through
 /// [`architecture_facts_for`] with that config instead.
+///
+/// The three snapshot outcomes are kept apart because the loader keeps them apart (SC-22667):
+///
+/// * **absent** `embedded_config.json` — `from_model_dir` returns the preset itself
+///   (`config.rs`'s early `Ok(Self::video_only_defaults())`), and `model.rs`'s `?` accepts it, so
+///   the preset is the geometry the loader will build and publishing it is honest;
+/// * **present and parseable** — the snapshot's own axes, as before;
+/// * **present and unparseable** (malformed JSON, no `transformer` section, an unimplemented
+///   `rope_type`) — `model.rs`'s `?` *errors*, so no load of this snapshot has the preset's
+///   geometry. Falling back to the preset would publish 48 blocks x 3072 channels for a tree the
+///   engine refuses to open. The trunk axes are declared **absent** instead; the VAE axes are
+///   crate constants that no snapshot config can move, so they stand and the weights-free gate
+///   still sees a declared axis.
 pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
-    let dit = mlx_gen::architecture_facts::materialized_root(spec)
-        .and_then(|root| crate::config::LtxConfig::from_model_dir(root).ok())
-        .unwrap_or_else(crate::config::LtxConfig::video_only_defaults);
-    architecture_facts_for(&dit, spec)
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return architecture_facts_for(&crate::config::LtxConfig::video_only_defaults(), spec);
+    };
+    match crate::config::LtxConfig::from_model_dir(root) {
+        Ok(dit) => architecture_facts_for(&dit, spec),
+        Err(_) => unreadable_trunk_architecture_facts(spec),
+    }
+}
+
+/// Axes for a materialized tree whose own transformer config the loader cannot parse.
+///
+/// Every trunk axis comes from that config, so none of them is knowable — and E2 declares an
+/// unknowable axis absent rather than substituting a preset the loader would never build. The VAE
+/// axes and the activation width are not config-derived (crate constants and [`LoadSpec`]'s own
+/// precision), so they remain declared.
+pub(crate) fn unreadable_trunk_architecture_facts(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: None,
+        head_dim: None,
+        transformer_blocks: None,
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::model::SPATIAL_SCALE),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::model::TEMPORAL_SCALE),
+        activation_dtype_width: Some(activation_dtype_width(spec)),
+    }
 }
 
 /// The shared LTX axis derivation over an already-resolved transformer config: the trunk axes off
@@ -1774,6 +1811,62 @@ mod tests {
             (Some(7), Some(64)),
             "the materialized path must publish the snapshot's geometry, not the preset's"
         );
+    }
+
+    /// SC-22667: the three snapshot outcomes are exactly the loader's. An ABSENT
+    /// `embedded_config.json` is the one case `LtxConfig::from_model_dir` itself answers with the
+    /// preset (and `model.rs`'s `?` accepts), so the preset is published there. A file that is
+    /// PRESENT and unparseable — malformed JSON, or no `transformer` section — errors at load, so
+    /// the trunk axes are declared absent instead of standing the preset in for a tree the engine
+    /// refuses to open. The VAE axes are crate constants no config can move, so they survive.
+    ///
+    /// Mutation that fails this: the `from_model_dir(root).ok().unwrap_or_else(video_only_defaults)`
+    /// shape under review — both unparseable fixtures then publish `Some(32)/Some(128)/Some(48)`.
+    #[test]
+    fn an_unparseable_embedded_config_declines_the_trunk_axes_instead_of_presetting() {
+        let absent = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                absent.path().to_path_buf()
+            ))),
+            architecture_facts(&fixture_spec()),
+            "an absent embedded_config.json is the loader's own preset fall-back"
+        );
+
+        for body in [
+            "{ this is not json".to_owned(),
+            serde_json::json!({ "vae": { "num_layers": 3 } }).to_string(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("embedded_config.json"), &body).unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+            assert!(
+                crate::config::LtxConfig::from_model_dir(dir.path()).is_err(),
+                "fixture premise: the loader's own parse must reject {body}"
+            );
+            let facts = architecture_facts(&spec);
+            assert_eq!(
+                (
+                    facts.attention_heads,
+                    facts.head_dim,
+                    facts.transformer_blocks,
+                    facts.patch_size
+                ),
+                (None, None, None, None),
+                "an unparseable {body} must not publish preset trunk axes"
+            );
+            assert_eq!(
+                (
+                    facts.latent_channels,
+                    facts.vae_spatial_scale,
+                    facts.vae_temporal_scale,
+                    facts.activation_dtype_width
+                ),
+                (Some(128), Some(32), Some(8), Some(2)),
+                "the VAE axes and the activation width are not config-derived"
+            );
+            assert!(facts.has_declared_architecture_axis());
+        }
     }
 
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the

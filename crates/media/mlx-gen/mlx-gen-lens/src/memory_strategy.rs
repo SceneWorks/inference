@@ -270,7 +270,14 @@ pub fn weights_free_memory_strategy_contract(
 /// which the DiT's own `out_channels` restates. `vae_temporal_scale` stays `None` — that
 /// autoencoder is an image autoencoder with no temporal axis, and a structurally absent axis is
 /// declared absent, never zero.
-fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+///
+/// The activation width follows the spec's precision because the loader does:
+/// `registry::resolve_root` maps `Precision::Bf16` to `Dtype::Bfloat16` and
+/// `Precision::Fp32` to `Dtype::Float32`, and every component of the tree is opened at that one
+/// dtype. `Precision::Fp32` is a served route — nothing on the load path refuses it — so publishing
+/// the half width unconditionally under-declared the f32 route's denoise activations by exactly 2x,
+/// and an under-price is the defect class epic SC-22657 forbids.
+fn architecture_facts(precision: Precision) -> mlx_gen::gen_core::MemoryArchitectureFacts {
     let dit = crate::dit::transformer::LensDitConfig::lens();
     mlx_gen::gen_core::MemoryArchitectureFacts {
         attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
@@ -281,8 +288,18 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
         latent_channels: mlx_gen::architecture_facts::axis(dit.out_channels),
         vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
         vae_temporal_scale: None,
-        // The dense route loads and computes bf16; `Precision::Fp32` is the separate tight gate.
-        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        activation_dtype_width: Some(activation_width(precision)),
+    }
+}
+
+/// Bytes per activation element the loader opens this tree at (`registry::resolve_root`).
+///
+/// Shared by the declared axis above and by `registry::component_footprint`, so the declared
+/// activation width and the declared asset bytes can never disagree about the same load.
+pub(crate) fn activation_width(precision: Precision) -> u32 {
+    match precision {
+        Precision::Bf16 => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+        Precision::Fp32 => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
     }
 }
 
@@ -323,7 +340,7 @@ fn memory_strategy_contract_with_surface_facts(
         },
     );
     contract.load_shape = spec.load_shape;
-    contract.architecture_facts = architecture_facts();
+    contract.architecture_facts = architecture_facts(spec.precision);
     let mut formula_variables = vec![
         MemoryFormulaVariable::AssetBytes,
         MemoryFormulaVariable::PixelCount,
@@ -964,6 +981,34 @@ mod tests {
             VAE_SPATIAL_SCALE * dit.patch_size as u32,
             crate::pipeline::VAE_SCALE_FACTOR
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The declared activation width is the dtype `registry::resolve_root` opens the tree at, so the
+    /// served `Precision::Fp32` route publishes the f32 width rather than the bf16 one.
+    ///
+    /// Mutation: restoring the unconditional `HALF_ACTIVATION_WIDTH` reds the `Some(4)` arm, and
+    /// swapping the two arms of `activation_width` reds the `Some(2)` arm.
+    #[test]
+    fn the_declared_activation_width_follows_the_loaded_precision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = fixture(&tmp, None);
+        for (precision, width) in [(Precision::Bf16, 2_u32), (Precision::Fp32, 4)] {
+            let mut spec = base.clone();
+            spec.precision = precision;
+            for provider_id in ["lens", "lens_turbo"] {
+                for contract in [
+                    memory_strategy_contract(provider_id, &spec).unwrap(),
+                    weights_free_memory_strategy_contract(provider_id, &spec).unwrap(),
+                ] {
+                    assert_eq!(
+                        contract.architecture_facts.activation_dtype_width,
+                        Some(width),
+                        "{provider_id} {precision:?} activation width"
+                    );
+                }
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
