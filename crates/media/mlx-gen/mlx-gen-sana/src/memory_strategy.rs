@@ -266,6 +266,42 @@ pub fn memory_strategy_contract(
     )
 }
 
+/// Architecture axes for one registered SANA route (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as
+/// [`SanaTransformerConfig`](crate::config::SanaTransformerConfig) and the reference DC-AE config as
+/// [`DcAeConfig`](crate::config::DcAeConfig); the Sprint variant differs only in guidance embedding
+/// and QK-norm, so both routes publish the same shape.
+///
+/// SANA's DC-AE is a **f32 deep-compression** autoencoder: its six `block_out_channels` stages give
+/// the x32 spatial scale, not the x8 an ordinary four-stage AutoencoderKL gives. `patch_size` is 1 —
+/// the DiT consumes the 32-channel latent token directly.
+///
+/// `vae_temporal_scale` stays `None`: SANA is an image model whose autoencoder has no temporal axis,
+/// and a structurally absent axis is declared absent, never zero.
+fn architecture_facts(provider_id: &str) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = if provider_id == crate::SPRINT_MODEL_ID {
+        crate::config::SanaTransformerConfig::sana_sprint_1600m()
+    } else {
+        crate::config::SanaTransformerConfig::sana_1600m()
+    };
+    let vae = crate::config::DcAeConfig::sana_f32c32();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(vae.latent_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::vae_spatial_scale_from_stages(
+            vae.num_stages(),
+        ),
+        vae_temporal_scale: None,
+        // The SANA transformer is dtype-preserving over an f32 latent, and its linear-attention
+        // Q/K/V and RMSNorm seams are pinned f32 outright (`transformer.rs`).
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
 pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -292,6 +328,7 @@ fn contract_with_asset_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(provider_id);
     let staged = matches!(spec.offload_policy, OffloadPolicy::Sequential);
     // Rung 4 needs BOTH load-time facts AND rung 1, whose own availability IS the `Sequential`
     // policy — declaring it on a Resident load would advertise a composition its own declared
@@ -662,6 +699,34 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir("/nonexistent/sana-contract".into()))
             .with_offload_policy(policy)
             .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    /// AC (SC-22662): both registered SANA routes publish the axes of the DiT and DC-AE this crate
+    /// declares, and each contract passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_and_dcae_configs() {
+        let spec = streamable_spec(OffloadPolicy::Sequential);
+        for provider_id in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(70),
+                    head_dim: Some(32),
+                    transformer_blocks: Some(20),
+                    // The DiT consumes the DC-AE latent token directly.
+                    patch_size: Some(1),
+                    latent_channels: Some(32),
+                    // Six DC-AE stages => five halvings => x32, not the x8 of a plain image VAE.
+                    vae_spatial_scale: Some(32),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(4),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
     }
 
     #[test]

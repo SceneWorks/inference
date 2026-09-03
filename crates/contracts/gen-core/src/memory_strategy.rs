@@ -911,15 +911,189 @@ impl MemoryPeakBreakdown {
 /// `base_bytes` is exactly the sum of the three base-model component fields. Auxiliary networks
 /// never belong in any of those four fields; they are declared once in `overlay_bytes` and, when
 /// non-zero alongside both formula variables, by typed resident components.
+///
+/// ## What "auxiliary" means (SC-22667)
+///
+/// **Auxiliary means outside the base model, not merely outside the usual three names.** The set is
+/// closed and enumerated by [`MemoryComponentKind::is_auxiliary`]: a control branch, an adapter
+/// stack, an IP-Adapter, an identity encoder — networks a *request* opts into, which a plain render
+/// of the same checkpoint does not load. Those are the ones `overlay_bytes` exists for, and the
+/// reason it is excluded from `base_bytes` is precisely that a fit decision for a request without
+/// them must not carry them.
+///
+/// A base-model network the route **always** loads is therefore charged in one of the three base
+/// fields even when it is none of "the text encoder", "the DiT" or "the image VAE" — LTX-2.5's
+/// latent upsamplers, audio VAE, vocoder and duration head are all of this kind. Each goes in the
+/// field naming the role it plays (a duration head conditions, an upsampler is part of the denoise
+/// stack, an audio decoder decodes), charged exactly once, under the *One network, one field* rule
+/// below. Moving them to `overlay_bytes` would be a byte-accounting **error**, not a stylistic
+/// choice: [`MemoryProviderContract::total_resident_bytes`] adds `overlay_bytes` only for a
+/// contract that also declares typed auxiliary components, so bytes parked there by a provider with
+/// no such component simply vanish from the total.
+///
+/// ## One network, one field
+///
+/// Every base-model network is charged in exactly **one** of the three component fields, even when
+/// the provider runs it in more than one [`MemoryPhase`]. The canonical case is an edit or img2img
+/// route that encodes its reference through the same autoencoder weights it later decodes with:
+/// those bytes belong to `decoder_bytes` alone, and `conditioning_bytes` stays the text/vision
+/// encoder stack. Folding the VAE into `conditioning_bytes` as well would either break
+/// `base_bytes == sum` or, if `base_bytes` were computed from the folded sum, charge one resident
+/// network twice against every fit decision.
+///
+/// The phase in which a shared network is *resident* is a lifecycle property, not a byte-count one.
+/// The contract has no per-phase residency declaration for base components today — only the
+/// typed auxiliary components in [`MemoryFormulaKind::ComponentPhaseEnvelope`] carry a
+/// [`MemoryComponentResidency`] — so a provider whose decoder is co-resident during conditioning
+/// documents that on its own contract builder and leaves these fields as the one-network-one-field
+/// decomposition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryAssetFacts {
     pub base_bytes: u64,
+    /// The conditioning encoder stack (text and/or vision encoders). A shared autoencoder used as
+    /// the reference encoder is **not** included here; see *One network, one field* above.
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
+    /// The autoencoder, charged once whether it only decodes or also encodes a reference during
+    /// conditioning.
     pub decoder_bytes: u64,
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
     pub overlay_bytes: u64,
+}
+
+/// Provider-owned model architecture facts used as activation-formula inputs.
+///
+/// An axis is *derived from a component config*: parsed out of the materialized snapshot by a
+/// provider whose loader parses it, or mirrored as a crate constant by a provider whose loader
+/// builds the same geometry in code. Which of the two a provider may use is a property of its
+/// backend, checked by the registry gate rather than expressible in this type.
+///
+/// Every axis is an `Option` on purpose. `None` means **not declared**, and a provider must use it
+/// for two distinct cases which both differ from `Some(0)`:
+///
+/// * the axis is *structurally absent* for this architecture (an image model has no temporal VAE
+///   scale), and
+/// * the provider could not read the axis (a weights-free contract built before the snapshot exists
+///   on disk).
+///
+/// A zero is never a legitimate value for any of these axes, so a defaulted `0` would silently
+/// poison any activation estimate that multiplied by it. Providers therefore derive these from the
+/// component config their own loader uses - the snapshot's `config.json` where it parses one, the
+/// crate's own model-config constructor where it builds the geometry in code - and publish `None`
+/// otherwise.
+///
+/// # The preset-fallback rule (SC-22667)
+///
+/// **Fall back to a preset only where the LOADER itself falls back to that preset; otherwise declare
+/// the axis `None`.** A contract that substitutes a crate preset for an axis the loader would have
+/// refused to load without is describing a render that cannot happen, and one that publishes `None`
+/// for an axis the loader supplies from a preset is withholding a fact the run will use.
+///
+/// The rule is per axis and per parse outcome, not per provider, because both backends' config
+/// readers mix the two behaviours:
+///
+/// * A reader that defaults **per key** (candle Krea's `Krea2Config::from_json` takes each missing
+///   key from `Krea2Config::turbo`) makes the preset the loaded value, so reading the axes back off
+///   the parsed struct is correct — including for keys the file omitted.
+/// * A reader that **requires** every key (candle Mage's `MageConfig::from_json`, MLX Mage's
+///   `MageFlowConfig::from_transformer_config_json`) fails the load on a partial file, so a partial
+///   file has no loadable geometry and every axis it would have supplied is `None`. Substituting
+///   the crate preset there — `.ok().unwrap_or_else(preset)` — publishes numbers no load will use.
+/// * An axis the loader **never** reads from a config, because it constructs that component from
+///   code (Mage's CoD decoder, Krea's reused Qwen-Image VAE), is a preset axis unconditionally: the
+///   crate constant *is* what the loader builds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryArchitectureFacts {
+    /// Attention heads in one transformer block.
+    pub attention_heads: Option<u32>,
+    /// Per-head channel width (`hidden_dim / attention_heads` for a uniform-head architecture).
+    pub head_dim: Option<u32>,
+    /// Number of transformer blocks the denoiser stacks.
+    pub transformer_blocks: Option<u32>,
+    /// Spatial patchification factor applied to the latent before the transformer.
+    pub patch_size: Option<u32>,
+    /// Latent channel count produced by the encoder / consumed by the decoder.
+    pub latent_channels: Option<u32>,
+    /// Pixels per latent unit on each spatial axis (8 for a four-stage image VAE).
+    pub vae_spatial_scale: Option<u32>,
+    /// Frames per latent unit on the temporal axis. Structurally absent — and therefore `None` —
+    /// for image models.
+    pub vae_temporal_scale: Option<u32>,
+    /// Bytes per element of the activation dtype (2 for bf16/f16, 4 for f32).
+    ///
+    /// **Which dtype, on a provider whose phases differ (SC-22667):** the width the **denoise**
+    /// phase computes in — the transformer's activation dtype. Almost every provider here runs its
+    /// DiT bf16 while opening the autoencoder f32, and some upcast conditioning per matmul, so
+    /// "the" activation width is only well defined once it is pinned to one phase.
+    ///
+    /// Denoise is the phase this names because it is the phase this axis is *for*: the other seven
+    /// axes are attention and latent geometry, and the estimate they feed multiplies out the
+    /// attention scores and per-block activations of the trunk. A VAE width published here would be
+    /// multiplied into an attention formula that never runs at that width.
+    ///
+    /// It follows that this axis is **not** a per-component byte fact and must never be used to
+    /// price one: the bytes a decoder or encoder materializes belong in
+    /// [`MemoryAssetFacts::decoder_bytes`] / [`MemoryAssetFacts::conditioning_bytes`], measured at
+    /// the width that component is actually opened in.
+    pub activation_dtype_width: Option<u32>,
+}
+
+impl MemoryArchitectureFacts {
+    /// Whether no axis at all has been declared. A contract publishing a lifecycle-phase formula
+    /// with nothing declared cannot support an activation-aware estimate.
+    pub const fn is_empty(&self) -> bool {
+        self.attention_heads.is_none()
+            && self.head_dim.is_none()
+            && self.transformer_blocks.is_none()
+            && self.patch_size.is_none()
+            && self.latent_channels.is_none()
+            && self.vae_spatial_scale.is_none()
+            && self.vae_temporal_scale.is_none()
+            && self.activation_dtype_width.is_none()
+    }
+
+    /// Whether at least one axis derived from a component config has been declared - whether that
+    /// config was parsed from the snapshot or mirrored as a crate constant.
+    ///
+    /// Both derivations count on purpose. A Candle provider that parses `transformer/config.json`
+    /// and an MLX provider that mirrors the same geometry as compile-time preset constants have
+    /// each stated the architecture the loader will build; only the *source* differs, and every
+    /// caller of this predicate cares that the geometry was stated at all. Which of the two a given
+    /// surface is *allowed* to use is a separate, backend-keyed rule that lives on the registry
+    /// gate, not here.
+    ///
+    /// [`Self::activation_dtype_width`] is deliberately excluded: an adopting provider emits it
+    /// from a compile-time dtype constant that is identical for every model the crate loads, so it
+    /// is `Some` whenever the provider was compiled - never evidence that any component geometry
+    /// was stated. A gate that accepts it as "at least one architecture fact" is satisfied by a
+    /// contract that declared nothing about the model.
+    pub const fn has_declared_architecture_axis(&self) -> bool {
+        self.attention_heads.is_some()
+            || self.head_dim.is_some()
+            || self.transformer_blocks.is_some()
+            || self.patch_size.is_some()
+            || self.latent_channels.is_some()
+            || self.vae_spatial_scale.is_some()
+            || self.vae_temporal_scale.is_some()
+    }
+
+    /// Axes declared as `Some(0)`. Zero is never legitimate for any axis: an absent axis is `None`.
+    pub fn zero_valued_axes(&self) -> Vec<&'static str> {
+        [
+            ("attention_heads", self.attention_heads),
+            ("head_dim", self.head_dim),
+            ("transformer_blocks", self.transformer_blocks),
+            ("patch_size", self.patch_size),
+            ("latent_channels", self.latent_channels),
+            ("vae_spatial_scale", self.vae_spatial_scale),
+            ("vae_temporal_scale", self.vae_temporal_scale),
+            ("activation_dtype_width", self.activation_dtype_width),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| (value == Some(0)).then_some(name))
+        .collect()
+    }
 }
 
 /// Immutable provider-owned facts for a narrowly pinned Resident route.
@@ -1185,6 +1359,10 @@ pub struct MemoryProviderContract {
     /// Such a provider can run its resident path but can never claim a verified optimized fit.
     pub calibration: Option<MemoryCalibrationIdentity>,
     pub asset_facts: MemoryAssetFacts,
+    /// Snapshot-read architecture axes. `MemoryArchitectureFacts::default()` (every axis `None`) is
+    /// the compatibility state for a provider that has not adopted the axis yet, and the honest
+    /// state for a weights-free contract built with no snapshot on disk.
+    pub architecture_facts: MemoryArchitectureFacts,
     pub runtime: MemoryRuntimeSemantics,
 }
 
@@ -1221,6 +1399,7 @@ impl MemoryProviderContract {
             formula: MemoryFormulaKind::AssetBytesPlusHeadroom,
             calibration: None,
             asset_facts: MemoryAssetFacts::default(),
+            architecture_facts: MemoryArchitectureFacts::default(),
             runtime: MemoryRuntimeSemantics::default(),
         }
     }
@@ -4113,6 +4292,7 @@ mod tests {
         strategies[3].parameters.attention_chunk_sizes = vec![256, 128];
         strategies[4].parameters.transformer_window_sizes = vec![2, 1];
         MemoryProviderContract {
+            architecture_facts: crate::MemoryArchitectureFacts::default(),
             provider_id: "test-provider".to_owned(),
             backend: mlx_backend(),
             strategies,

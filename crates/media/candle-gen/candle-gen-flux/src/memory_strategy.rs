@@ -101,6 +101,277 @@ pub(crate) fn provider_contract(
     )
 }
 
+/// Whether the snapshot at `root` loads through the **diffusers component layout**
+/// (`transformer/`, `vae/` subdirs) rather than the black-forest-labs single-file layout — the same
+/// discrimination `pipeline::FluxPipeline::uses_diffusers_layout` performs before it picks a
+/// loader, mirrored here so pricing and loading read the same component paths.
+///
+/// Best-effort by design: a `transformer/config.json` that is unreadable or malformed reads as
+/// "not packed" here, because this seam prices bytes and the loader itself is the one that must
+/// fail loudly on a corrupt snapshot.
+fn uses_diffusers_layout(root: &std::path::Path, variant: crate::Variant) -> bool {
+    let packed = std::fs::read_to_string(root.join("transformer").join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| candle_gen::quant::PackedConfig::from_config(&value))
+        .is_some();
+    // The BFL root checkpoint is checked FIRST for the non-packed case so a *full* black-forest-labs
+    // snapshot — which ships BOTH the root single-file AND the diffusers subdirs — is priced on the
+    // stock path it actually takes.
+    packed
+        || (!root.join(variant.transformer_file()).is_file() && root.join("transformer").is_dir())
+}
+
+/// The exact component paths this spec's loader resolves, priced as the bytes each component's
+/// loader leaves **resident** — read from the safetensors headers, never from the file size.
+///
+/// Both layouts read the text encoders from `text_encoder/` + `text_encoder_2/`, but they differ on
+/// the other two components, and naming only the diffusers subdirs published **zero** transformer
+/// and decoder bytes for every stock BFL snapshot — the layout `pipeline::load_stock_components`
+/// serves, which reads the DiT from the root `flux1-{dev,schnell}.safetensors` and the VAE from the
+/// root `ae.safetensors` (epic SC-22657, E1).
+///
+/// Every dense float tensor lands at [`ACTIVATION_DTYPE`] (`lib.rs` pins `DType::BF16` for every
+/// component), whatever width the file ships: the stock BFL `ae.safetensors` is **F32 on disk**
+/// (`flux1_load::vae` materializes it at `self.dtype`), so its file size is twice its residency,
+/// while the bf16 DiT / T5 / CLIP files price 1:1. An on-disk byte sum therefore over-declared the
+/// stock decoder 2x and — worse, E3 — under-declared the packed tiers.
+///
+/// The packed q4/q8 diffusers tiers ([`snapshot_quant_tier`], sc-9407) ship each projection as an
+/// MLX `.weight` U32 / `.scales` / `.biases` triple. `PackedFluxDit` / `PackedT5Encoder` /
+/// `PackedClipText` load every triple through `QLinear::linear_detect` / `QEmbedding::detect`,
+/// which repack it into one resident GGML `QTensor` — `Q4_1` at 20 B per 32 values (5 bits per
+/// element, not the 4.5 the file holds) or `Q8_0` at 34 B — so those are priced through
+/// [`candle_gen::quant::mlx_packed_qtensor_resident_bytes`] and the sidecars, transient pack
+/// inputs, at nothing. The VAE is the one exception: `pipeline::vae_vb_dequantized` dequantizes its
+/// eight packed mid-block attention projections to **dense** bf16 before the stock `AutoEncoderKL`
+/// reads them, so a packed VAE triple is priced as the dense `[out, in]` bf16 matrix it becomes.
+fn loaded_component_bytes(
+    spec: &LoadSpec,
+    variant: crate::Variant,
+) -> gen_core::Result<PerComponentBytes> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(PerComponentBytes::default());
+    };
+    const TEXT_ENCODERS: &[&str] = &["text_encoder", "text_encoder_2"];
+    let (dit, vae) = if uses_diffusers_layout(root, variant) {
+        ("transformer", "vae")
+    } else {
+        (variant.transformer_file(), "ae.safetensors")
+    };
+    let sum = |names: &[&str], packed: PackedResidency| -> gen_core::Result<u64> {
+        names.iter().try_fold(0_u64, |total, name| {
+            total
+                .checked_add(resident_component_bytes(&root.join(name), packed)?)
+                .ok_or_else(|| gen_core::Error::Msg("flux1: component byte sum overflow".into()))
+        })
+    };
+    Ok(PerComponentBytes {
+        text_encoder: sum(TEXT_ENCODERS, PackedResidency::Ggml)?,
+        dit: sum(&[dit], PackedResidency::Ggml)?,
+        vae: sum(&[vae], PackedResidency::DequantizedDense)?,
+    })
+}
+
+/// What one loader does with an MLX packed affine triple it finds in a component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedResidency {
+    /// Repacked into one resident GGML `QTensor` (`QLinear::linear_detect` / `QEmbedding::detect`):
+    /// the DiT and both text encoders.
+    Ggml,
+    /// Dequantized to a dense [`ACTIVATION_DTYPE`] matrix before the stock module reads it
+    /// (`pipeline::vae_vb_dequantized`): the VAE.
+    DequantizedDense,
+}
+
+/// Bytes one float element of any FLUX.1 component occupies once resident: [`ACTIVATION_DTYPE`]'s
+/// width, because every `VarBuilder` in `pipeline.rs` / `flux1_load.rs` is built at `self.dtype`.
+fn float_width() -> u64 {
+    ACTIVATION_DTYPE.size_in_bytes() as u64
+}
+
+/// Resident bytes of one component path (a subdir of shards or a flat file). An absent path
+/// contributes `0` — the weights-free contract surfaces name a sentinel root that is not on disk,
+/// and a partial tree's missing component is the loader's failure to report, not this seam's.
+fn resident_component_bytes(
+    path: &std::path::Path,
+    packed: PackedResidency,
+) -> gen_core::Result<u64> {
+    use std::collections::{HashMap, HashSet};
+
+    if gen_core::weightsmeta::safetensors_path_bytes(path) == 0 {
+        return Ok(0);
+    }
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let by_name: HashMap<&str, &gen_core::weightsmeta::SafetensorsTensorHeader> = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect();
+    let packed_bases: HashSet<&str> = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .collect();
+    headers.iter().try_fold(0_u64, |total, tensor| {
+        if tensor
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| tensor.name.strip_suffix(".biases"))
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            // Sidecars of a packed triple are inputs to the repack / dequant, never resident.
+            return Ok(total);
+        }
+        let packed_base = tensor
+            .name
+            .strip_suffix(".weight")
+            .filter(|base| packed_bases.contains(base));
+        let bytes = if let Some(base) = packed_base {
+            let sidecar = |suffix: &str| {
+                by_name
+                    .get(format!("{base}.{suffix}").as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        gen_core::Error::Unsupported(format!(
+                            "flux1: packed weight {:?} in {} is missing its .{suffix} sidecar",
+                            tensor.name,
+                            path.display()
+                        ))
+                    })
+            };
+            let (scales, biases) = (sidecar("scales")?, sidecar("biases")?);
+            match packed {
+                PackedResidency::Ggml => candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                    tensor,
+                    scales,
+                    biases,
+                    candle_gen::quant::MLX_GROUP_SIZE,
+                )?,
+                PackedResidency::DequantizedDense => dequantized_dense_bytes(tensor, scales)?,
+            }
+        } else if tensor.is_float() {
+            tensor.materialized_bytes(float_width())?
+        } else {
+            tensor.data_bytes
+        };
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| gen_core::Error::Msg("flux1: resident byte sum overflow".into()))
+    })
+}
+
+/// Bytes of the dense [`ACTIVATION_DTYPE`] `[out, in]` matrix an MLX packed triple dequantizes to
+/// (`crate::quant::dequant_packed_to_dense`): `out` rows from the packed weight, `in` = scale
+/// columns x the MLX group size.
+fn dequantized_dense_bytes(
+    weight: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    scales: &gen_core::weightsmeta::SafetensorsTensorHeader,
+) -> gen_core::Result<u64> {
+    let ([out, _], [_, groups]) = (weight.shape.as_slice(), scales.shape.as_slice()) else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "flux1: packed VAE triple {:?} must be rank 2 with rank-2 scales",
+            weight.name
+        )));
+    };
+    let overflow =
+        || gen_core::Error::Msg(format!("flux1: dense size overflow for {:?}", weight.name));
+    let input = u64::try_from(*groups)
+        .ok()
+        .and_then(|groups| groups.checked_mul(candle_gen::quant::MLX_GROUP_SIZE as u64))
+        .ok_or_else(overflow)?;
+    u64::try_from(*out)
+        .ok()
+        .and_then(|out| out.checked_mul(input))
+        .and_then(|elements| elements.checked_mul(float_width()))
+        .ok_or_else(overflow)
+}
+
+/// Activation dtype the loaded FLUX.1 pipeline computes in — `lib.rs` / `pipeline.rs` pin
+/// `DType::BF16` for the DiT trunk, so this is the provider's real activation width rather than a
+/// memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Architecture axes for the FLUX.1 reference backbone (epic SC-22657, E2).
+///
+/// The trunk geometry comes from the same `candle_transformers::models::flux::model::Config` the
+/// loader builds the DiT from — and from the *variant that provider id selects*, resolved through
+/// [`crate::Variant::from_model_id`] exactly as `candle-gen-flux2` threads its own variant. The two
+/// registered variants happen to be dimensionally identical today (`hidden_size 3072` /
+/// `num_heads 24` / `depth 19` / `depth_single_blocks 38`, differing only in `guidance_embed`), but
+/// pinning the dev preset for both would silently publish dev's geometry for schnell the moment
+/// that stopped being true, which is the class of defect these facts exist to remove.
+///
+/// Heads and head width come from that preset **only** — never from `<root>/transformer/config.json`.
+/// `pipeline.rs::dit_block_counts` threads exactly two keys of that file into the trunk
+/// (`num_layers` / `num_single_layers`); `num_attention_heads` / `attention_head_dim` are not
+/// read at load, so a snapshot declaring them differently still builds the preset's 24 x 128
+/// attention. Publishing the file's values (the shape the feature-end review caught) would describe
+/// a trunk this crate never constructs.
+///
+/// `transformer_blocks` is the **total** trunk depth: FLUX stacks the double-stream blocks and then
+/// the single-stream blocks in one sequence, and every one of them is a materialization unit for
+/// the block-window rung. The two counts are read from `<root>/transformer/config.json`
+/// (`num_layers` / `num_single_layers`) exactly as `pipeline.rs::dit_block_counts` does — and, like
+/// that function, **only on the diffusers layout that calls it**. The BFL single-file layout builds
+/// `IpFlux` straight from the preset, so it publishes the preset's counts even when a full BFL
+/// snapshot happens to ship a `transformer/` config alongside its root checkpoint: reading a
+/// different source than the loader would publish geometry the built model does not have.
+///
+/// `patch_size` has no config key on either component, so it is *derived* rather than asserted:
+/// FLUX packs 2x2 latent neighbourhoods outside the DiT, which is exactly why the trunk's
+/// `in_channels` is 64 = 16 latent channels x 2x2, and
+/// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
+/// pair. `vae_temporal_scale` stays `None` — FLUX.1 ships the image `AutoencoderKL`, which has no
+/// temporal axis at all, and a structurally absent axis is declared absent rather than zero (E2).
+fn architecture_facts(provider_id: &str, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    // The variant this provider id names, not a pinned `Dev`. A bespoke identity route built on
+    // this shared backbone (`reference_backbone_contract`) carries its own id and runs the dev
+    // trunk, which is what the fallback covers.
+    let variant = crate::Variant::from_model_id(provider_id).unwrap_or(crate::Variant::Dev);
+    let dit = crate::pipeline::flux_config(variant);
+    let vae = crate::vae::native::Config::dev();
+    // Read the block counts from `transformer/config.json` only on the layout whose loader reads
+    // them. `pipeline::dit_block_counts` is called from `load_diffusers_components` alone; the
+    // stock BFL path builds `IpFlux::new(&flux_config(variant), ..)`, whose depth comes from the
+    // preset. A *full* BFL snapshot ships both the root single file and the diffusers subdirs, so
+    // reading the file unconditionally published a trunk depth the stock loader never builds.
+    let transformer_config =
+        uses_diffusers_layout(root, variant).then(|| af::component_config(root, "transformer"));
+    let transformer_config = transformer_config.flatten();
+    let double = af::axis_of(transformer_config.as_ref(), &["num_layers"])
+        .or_else(|| af::declared(dit.depth));
+    let single = af::axis_of(transformer_config.as_ref(), &["num_single_layers"])
+        .or_else(|| af::declared(dit.depth_single_blocks));
+    let latent_channels = af::declared(vae.z_channels);
+    gen_core::MemoryArchitectureFacts {
+        // The preset the loader builds the trunk from; the config file's head keys are not threaded
+        // into the model, so they are not read here either.
+        attention_heads: af::declared(dit.num_heads),
+        // The preset's `hidden_size / num_heads`, published only because that quotient divides
+        // evenly.
+        head_dim: af::head_dim(af::declared(dit.hidden_size), af::declared(dit.num_heads)),
+        transformer_blocks: double.and_then(|double| double.checked_add(single?)),
+        // The packing edge the trunk's own input width implies: `in_channels 64 / 16 latent
+        // channels = 4`, a 2x2 neighbourhood.
+        patch_size: af::patch_size_from_channels(af::declared(dit.in_channels), latent_channels),
+        // `vae::native::Config::dev().z_channels`.
+        latent_channels,
+        // `ch_mult` is four stages, so three halvings: x8.
+        vae_spatial_scale: af::declared(vae.ch_mult.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
+        // Structurally absent: the FLUX.1 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 /// Build the shared FLUX.1 reference-backbone ladder for a bespoke provider that owns a resident
 /// conditioning stack. The caller supplies the exact resident components and a provider-specific
 /// calibration identity; this deliberately prevents a bespoke identity route from inheriting base
@@ -112,13 +383,10 @@ pub fn reference_backbone_contract(
     calibration_fingerprint: &str,
 ) -> gen_core::Result<MemoryProviderContract> {
     let streamable = streamable(spec);
-    let components = PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder", "text_encoder_2"],
-        &["transformer"],
-        &["vae"],
-    )
-    .unwrap_or_default();
+    // The variant this provider id names — the same selection `architecture_facts` makes, and the
+    // one that decides which root BFL checkpoint filename the stock layout carries.
+    let variant = crate::Variant::from_model_id(provider_id).unwrap_or(crate::Variant::Dev);
+    let components = loaded_component_bytes(spec, variant)?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -160,6 +428,7 @@ pub fn reference_backbone_contract(
         .collect();
 
     Ok(MemoryProviderContract {
+        architecture_facts: architecture_facts(provider_id, spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -571,6 +840,380 @@ pub(crate) fn registered_begin_request(
 mod tests {
     use super::*;
     use gen_core::{MemorySelection, MemoryStrategyParameters};
+
+    /// AC (epic SC-22657, E2): the FLUX.1 contract publishes the geometry the loader actually
+    /// builds — the `flux::model::Config` trunk, the snapshot's own double/single block counts, and
+    /// the native VAE's latent axes — passes the shared facts conformance check, and stays empty on
+    /// the weights-free surface whose sentinel root is not on disk.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        fn expected(transformer_blocks: u32) -> gen_core::MemoryArchitectureFacts {
+            gen_core::MemoryArchitectureFacts {
+                // `flux::model::Config::dev()`: `num_heads 24`, `hidden_size 3072 / 24 = 128`.
+                attention_heads: Some(24),
+                head_dim: Some(128),
+                transformer_blocks: Some(transformer_blocks),
+                // FLUX packs 2x2 outside the DiT (`in_channels 64 = 16 * 2 * 2`).
+                patch_size: Some(2),
+                // `vae::native::Config::dev().z_channels`.
+                latent_channels: Some(16),
+                // `ch_mult [1, 2, 4, 4]` — four stages, three halvings.
+                vae_spatial_scale: Some(8),
+                // Structurally absent: the FLUX.1 image autoencoder has no temporal axis.
+                vae_temporal_scale: None,
+                // `DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flux1-architecture-facts");
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        // No `transformer/config.json` at all: the block counts fall back to the reference
+        // constants, exactly as `pipeline.rs::dit_block_counts` does.
+        let bfl = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+        for id in ["flux1_dev", "flux1_schnell"] {
+            let contract = provider_contract(id, &bfl).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                expected(19 + 38),
+                "{id} BFL-layout architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The diffusers layout declares its own counts, and those are what the loader builds.
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 17, "num_single_layers": 33}"#,
+        )
+        .unwrap();
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(contract.architecture_facts, expected(17 + 33));
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // ...but NOT the heads or the head width (SC-22667): `dit_block_counts` threads only the
+        // two block counts into the trunk, so a config declaring a different attention shape still
+        // builds the preset's 24 x 128 and must be priced as such. Mutation that fails this:
+        // reading `num_attention_heads` / `attention_head_dim` back out of the config with the
+        // preset as a fallback (the shape under review).
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 19, "num_single_layers": 38,
+                 "num_attention_heads": 12, "attention_head_dim": 256}"#,
+        )
+        .unwrap();
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(contract.architecture_facts.attention_heads, Some(24));
+        assert_eq!(contract.architecture_facts.head_dim, Some(128));
+        assert_eq!(contract.architecture_facts, expected(19 + 38));
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        // Restore the layout the remaining assertions were written against.
+        std::fs::write(
+            root.join("transformer/config.json"),
+            br#"{"num_layers": 17, "num_single_layers": 33}"#,
+        )
+        .unwrap();
+
+        // `patch_size` is DERIVED, not asserted: the trunk's own `in_channels` over the latent
+        // channel count is the packing area, and the published axis is its square root.
+        let dit = crate::pipeline::flux_config(crate::Variant::Dev);
+        let vae = crate::vae::native::Config::dev();
+        let patch = contract.architecture_facts.patch_size.unwrap() as usize;
+        assert_eq!(
+            dit.in_channels,
+            vae.z_channels * patch * patch,
+            "the published patch size must be the one the trunk's input width implies"
+        );
+
+        // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        let contract = provider_contract("flux1_dev", &weights_free).unwrap();
+        assert!(contract.architecture_facts.is_empty());
+        // A weights-free contract legitimately declares nothing, so the E2 config-derived gate does
+        // not apply to it; the byte-decomposition half of the conformance walk still does.
+        gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+
+        // A FULL black-forest-labs snapshot ships the root single file AND the diffusers subdirs.
+        // `uses_diffusers_layout` keeps it on the stock loader, which builds `IpFlux` from the
+        // preset — so the config's counts must NOT be published for it (SC-22667).
+        // Mutation that reds this: reading `af::component_config` unconditionally, the shape under
+        // review.
+        write_control(&root.join("flux1-dev.safetensors"));
+        let contract = provider_contract("flux1_dev", &bfl).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            expected(19 + 38),
+            "a full BFL snapshot builds the preset trunk, not the diffusers config's 17 + 33"
+        );
+        // Schnell has its own root filename, so the same tree is still a diffusers snapshot for it.
+        assert_eq!(
+            provider_contract("flux1_schnell", &bfl)
+                .unwrap()
+                .architecture_facts,
+            expected(17 + 33)
+        );
+    }
+
+    /// AC (epic SC-22657, E1): the priced components are the ones this snapshot's loader resolves.
+    ///
+    /// The stock black-forest-labs layout reads the DiT from the root
+    /// `flux1-{dev,schnell}.safetensors` and the VAE from the root `ae.safetensors`
+    /// (`pipeline::load_stock_components` / `flux1_load::{dit_vb, vae}`), so naming only the
+    /// diffusers `transformer/` + `vae/` subdirs published **zero** transformer and decoder bytes
+    /// for every BFL snapshot — a base total made entirely of text encoders.
+    ///
+    /// *Mutation that reds this:* pricing through
+    /// `PerComponentBytes::from_spec_subdirs(spec, .., &["transformer"], &["vae"])` on both
+    /// layouts, the shape under review.
+    /// Write a valid safetensors file whose tensors are `(name, dtype, shape)`, zero-filled. Only
+    /// the header matters to the pricing seam, but the data region is real so the file parses.
+    fn write_typed(path: &std::path::Path, tensors: &[(&str, &str, &[usize])]) {
+        let width = |dtype: &str| match dtype {
+            "F16" | "BF16" => 2_usize,
+            "F32" | "U32" => 4,
+            other => panic!("unsupported fixture dtype {other}"),
+        };
+        let mut offset = 0_usize;
+        let entries = tensors
+            .iter()
+            .map(|(name, dtype, shape)| {
+                let bytes = shape.iter().product::<usize>() * width(dtype);
+                let entry = format!(
+                    r#""{name}":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+                    offset + bytes
+                );
+                offset += bytes;
+                entry
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut header = format!("{{{entries}}}").into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(std::iter::repeat_n(0_u8, offset));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn the_stock_bfl_layout_prices_its_root_dit_and_ae_checkpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("flux1-bfl-priced");
+        // Distinct sizes so a swapped component assignment cannot pass. The two CLIP/T5 files and
+        // the DiT ship bf16, exactly as the hosted snapshots do.
+        write_typed(
+            &root.join("text_encoder/model.safetensors"),
+            &[("text_model.w", "BF16", &[8, 4])],
+        );
+        write_typed(
+            &root.join("text_encoder_2/model.safetensors"),
+            &[("shared.weight", "BF16", &[16, 4])],
+        );
+        write_typed(
+            &root.join("flux1-dev.safetensors"),
+            &[("img_in.weight", "BF16", &[32, 64])],
+        );
+        // The stock BFL `ae.safetensors` is F32 on disk (335_304_388 B, 244 F32 tensors on both the
+        // dev and schnell snapshots) and is materialized at bf16: half its file size resident.
+        write_typed(
+            &root.join("ae.safetensors"),
+            &[("decoder.conv_in.weight", "F32", &[16, 8])],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        let facts = provider_contract("flux1_dev", &spec).unwrap().asset_facts;
+        assert_eq!(facts.conditioning_bytes, 8 * 4 * 2 + 16 * 4 * 2);
+        assert_eq!(
+            facts.transformer_bytes,
+            32 * 64 * 2,
+            "the root BFL DiT checkpoint is the transformer this layout loads"
+        );
+        assert!(
+            gen_core::weightsmeta::safetensors_path_bytes(root.join("ae.safetensors")) > 16 * 8 * 4,
+            "fixture sanity: the F32 file on disk (plus its header) is what the old sum priced"
+        );
+        assert_eq!(
+            facts.decoder_bytes,
+            16 * 8 * 2,
+            "the root ae.safetensors is the decoder this layout loads, resident at bf16, not at \
+             its F32 file size"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::assert_memory_contract_asset_facts_conform(
+            &provider_contract("flux1_dev", &spec).unwrap(),
+        );
+
+        // The diffusers layout still prices its component subdirs, at the same resident widths.
+        let diffusers = tmp.path().join("flux1-diffusers-priced");
+        write_typed(
+            &diffusers.join("text_encoder/model.safetensors"),
+            &[("text_model.w", "BF16", &[8, 4])],
+        );
+        write_typed(
+            &diffusers.join("text_encoder_2/model.safetensors"),
+            &[("shared.weight", "BF16", &[16, 4])],
+        );
+        write_typed(
+            &diffusers.join("transformer/model.safetensors"),
+            &[("x_embedder.weight", "BF16", &[32, 32])],
+        );
+        write_typed(
+            &diffusers.join("vae/model.safetensors"),
+            &[("decoder.conv_in.weight", "F32", &[8, 8])],
+        );
+        let facts = provider_contract(
+            "flux1_dev",
+            &LoadSpec::new(WeightsSource::Dir(diffusers))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        )
+        .unwrap()
+        .asset_facts;
+        assert_eq!(facts.transformer_bytes, 32 * 32 * 2);
+        assert_eq!(facts.decoder_bytes, 8 * 8 * 2);
+        assert_eq!(
+            facts.base_bytes,
+            8 * 4 * 2 + 16 * 4 * 2 + 32 * 32 * 2 + 8 * 8 * 2
+        );
+    }
+
+    /// AC (epic SC-22657, E3): the packed q4/q8 diffusers tiers `snapshot_quant_tier` admits are
+    /// priced at what their loaders leave resident, not at the on-disk sum of the MLX triples.
+    ///
+    /// A `[64, 128]` Q4 projection ships as `64 x 16` U32 codes + two `[64, 2]` f16 sidecars
+    /// (4_608 B); `QLinear::linear_detect` repacks it into one `Q4_1` `QTensor` of `64 * 128 / 32`
+    /// blocks x 20 B = 5_120 B (~11% more than the file). Q8 ships `64 x 32` codes (8_704 B on
+    /// disk with sidecars) and lands as `Q8_0`: 256 blocks x 34 B = 8_704 B. The VAE's packed
+    /// mid-block projection is dequantized to a dense bf16 `[64, 128]` matrix (16_384 B) by
+    /// `vae_vb_dequantized` before the stock `AutoEncoderKL` reads it.
+    ///
+    /// *Mutations that red this:* the raw `PerComponentBytes::from_root_subdirs` sum (the shape
+    /// under review); pricing a packed `.weight` at `header.data_bytes`; pricing the VAE's triple
+    /// as a GGML `QTensor` instead of the dense matrix it becomes.
+    #[test]
+    fn packed_diffusers_tiers_price_the_repacked_qtensors_and_the_dequantized_vae() {
+        for (bits, packed_columns, expected_projection, expected_quant) in [
+            (4_usize, 16_usize, 64 * 128 / 32 * 20_u64, Quant::Q4),
+            (8, 32, 64 * 128 / 32 * 34, Quant::Q8),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join(format!("flux1-packed-q{bits}"));
+            std::fs::create_dir_all(root.join("transformer")).unwrap();
+            std::fs::write(
+                root.join("transformer/config.json"),
+                format!(
+                    r#"{{"num_layers":19,"num_single_layers":38,"quantization":{{"bits":{bits},"group_size":64}}}}"#
+                ),
+            )
+            .unwrap();
+            // One `[64, 128]` MLX packed triple (`packed` = its base and U32 column count) plus
+            // dense bf16 tensors, written as one component file.
+            fn write_component(
+                root: &std::path::Path,
+                relative: &str,
+                packed: Option<(&str, usize)>,
+                dense: &[(&str, &str, &[usize])],
+            ) {
+                let mut tensors: Vec<(String, &str, Vec<usize>)> = Vec::new();
+                if let Some((base, packed_columns)) = packed {
+                    tensors.push((format!("{base}.weight"), "U32", vec![64, packed_columns]));
+                    tensors.push((format!("{base}.scales"), "F16", vec![64, 2]));
+                    tensors.push((format!("{base}.biases"), "F16", vec![64, 2]));
+                }
+                for (name, dtype, shape) in dense {
+                    tensors.push(((*name).to_owned(), dtype, shape.to_vec()));
+                }
+                let borrowed = tensors
+                    .iter()
+                    .map(|(name, dtype, shape)| (name.as_str(), *dtype, shape.as_slice()))
+                    .collect::<Vec<_>>();
+                write_typed(&root.join(relative), &borrowed);
+            }
+            write_component(
+                &root,
+                "transformer/model.safetensors",
+                Some(("x_embedder", packed_columns)),
+                &[("x_embedder.bias", "BF16", &[64])],
+            );
+            write_component(
+                &root,
+                "text_encoder_2/model.safetensors",
+                Some(("shared", packed_columns)),
+                &[("final_layer_norm.weight", "BF16", &[16])],
+            );
+            write_component(
+                &root,
+                "text_encoder/model.safetensors",
+                None,
+                &[("text_model.w", "BF16", &[4, 4])],
+            );
+            write_component(
+                &root,
+                "vae/model.safetensors",
+                Some(("decoder.mid_block.attentions.0.to_q", packed_columns)),
+                &[("decoder.conv_in.weight", "BF16", &[2, 2])],
+            );
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                .with_load_shape(LoadShape::DeferredMaterialization);
+            let (_, tier) = evidence_identity_and_tier(crate::FLUX1_DEV_ID, &spec).unwrap();
+            assert_eq!(
+                tier.quant,
+                Some(expected_quant),
+                "the tier this snapshot loads as"
+            );
+
+            let facts = provider_contract(crate::FLUX1_DEV_ID, &spec)
+                .unwrap()
+                .asset_facts;
+            assert_eq!(
+                facts.transformer_bytes,
+                expected_projection + 64 * 2,
+                "q{bits}: one repacked QTensor plus the dense bf16 bias"
+            );
+            assert_eq!(
+                facts.conditioning_bytes,
+                expected_projection + 16 * 2 + 4 * 4 * 2,
+                "q{bits}: the packed T5 embedding table is a resident QTensor; CLIP is dense bf16"
+            );
+            assert_eq!(
+                facts.decoder_bytes,
+                64 * 128 * 2 + 2 * 2 * 2,
+                "q{bits}: the VAE's packed projection is dequantized to a dense bf16 [64, 128]"
+            );
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+            );
+            let on_disk = PerComponentBytes::from_root_subdirs(
+                &root,
+                &["text_encoder", "text_encoder_2"],
+                &["transformer"],
+                &["vae"],
+            );
+            if bits == 4 {
+                // 5 bits per element resident vs 4.5 on disk: the under-declaration the raw
+                // file-size sum carried (Q8_0's 34 B / 32 happens to equal its file bytes).
+                assert!(
+                    facts.transformer_bytes > on_disk.dit,
+                    "q4: the resident Q4_1 QTensor is larger than the packed file it came from"
+                );
+            }
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(
+                &provider_contract(crate::FLUX1_DEV_ID, &spec).unwrap(),
+            );
+        }
+    }
 
     fn write_control(path: &std::path::Path) {
         let mut header =

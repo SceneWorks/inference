@@ -134,24 +134,17 @@ fn collect_safetensors(path: &Path, files: &mut Vec<PathBuf>) -> gen_core::Resul
 /// Count the exact tensor payload a component materializes: floating tensors at the component's
 /// runtime width and packed integer codes at their physical stored width. This uses only headers;
 /// no model tensor is allocated while the generator publishes its loaded contract.
+///
+/// The per-tensor rule is the shared [`gen_core::materialized_header_bytes`] — one copy of the
+/// `is_float` / `materialized_bytes` / `data_bytes` split, not a local restatement (SC-22667
+/// review). What stays local is the file walk (`collect_safetensors`, which accepts a single file
+/// or a directory and sorts deterministically) and the zero-byte refusal below.
 fn required_component_bytes(path: &Path, float_width: u64, label: &str) -> gen_core::Result<u64> {
     let mut files = Vec::new();
     collect_safetensors(path, &mut files)?;
     let bytes = files.into_iter().try_fold(0_u64, |total, file| {
-        let file_bytes = gen_core::weightsmeta::safetensors_path_tensor_headers(&file)?
-            .into_iter()
-            .try_fold(0_u64, |sum, header| {
-                let bytes = if header.is_float() {
-                    header.materialized_bytes(float_width)?
-                } else {
-                    header.data_bytes
-                };
-                sum.checked_add(bytes).ok_or_else(|| {
-                    gen_core::Error::Msg(format!(
-                        "{LTX_2_5_DISTILLED_MODEL_ID}: {label} tensor byte total overflows u64"
-                    ))
-                })
-            })?;
+        let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(&file)?;
+        let file_bytes = gen_core::materialized_header_bytes(&headers, float_width, &file)?;
         total.checked_add(file_bytes).ok_or_else(|| {
             gen_core::Error::Msg(format!(
                 "{LTX_2_5_DISTILLED_MODEL_ID}: {label} file byte total overflows u64"
@@ -241,15 +234,42 @@ fn exact_load_receipt(
             )?,
         ],
     )?;
+    let audio_path = component_path(LtxComponent::AudioVae)?;
+    // SC-22667 (E1): on a **converted** tier the vocoder is its own file beside the audio VAE.
+    // `lib.rs` requires it there (`ltx_2_5: converted tier is missing vocoder.safetensors beside
+    // …`) and opens it at `VAE_DTYPE`. `LtxComponent::AudioVae` names one file carrying both the
+    // `audio_vae` and `vocoder` config sections, which is true of the **bundle** layout and only
+    // there — so charging that component alone left the whole vocoder resident and unpriced on
+    // every converted tier.
+    //
+    // The gate is the loader's own gate, `Ltx25Tier::detect(root).is_some()` — the exact predicate
+    // `lib.rs` branches on (`converted_tier.is_some()`) — and under it the term is **required**, as
+    // the loader requires the file (SC-22667 review): a converted tier missing the sibling errors
+    // here as it errors there, instead of silently pricing 0 for a load that will refuse, and a
+    // bundle with a stray sibling file is not charged for a vocoder it never opens.
+    let converted_tier = crate::tier::Ltx25Tier::detect(root)
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+    let vocoder_bytes = match converted_tier {
+        Some(_) => {
+            let vocoder_path = audio_path.with_file_name("vocoder.safetensors");
+            if !vocoder_path.is_file() {
+                // The loader's own refusal, word for word, so admission and load disagree on nothing.
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{LTX_2_5_DISTILLED_MODEL_ID}: converted tier is missing vocoder.safetensors \
+                     beside {}",
+                    audio_path.display()
+                )));
+            }
+            required_component_bytes(&vocoder_path, 4, "converted-tier vocoder")?
+        }
+        None => 0,
+    };
     let decoder_bytes = checked_sum(
         "decoder component",
         [
             required_component_bytes(video_path, 4, "selected video decoder")?,
-            required_component_bytes(
-                component_path(LtxComponent::AudioVae)?,
-                4,
-                "audio VAE and vocoder",
-            )?,
+            required_component_bytes(audio_path, 4, "audio VAE")?,
+            vocoder_bytes,
         ],
     )?;
     let overlay_bytes = spec.adapters.iter().try_fold(0_u64, |total, adapter| {
@@ -277,10 +297,74 @@ fn exact_load_receipt(
 /// Build one LTX-2.5 Candle contract from an already resolved physical receipt. Rung 3 executes
 /// through `candle_gen::sdpa_budgeted_bhsd`; rung 4 executes through Candle's binding over
 /// `gen_core::block_window`; bounded decode is declared only for the convolutional VAE route.
+/// Snapshot-gated architecture facts for the LTX-2.5 route (epic SC-22657, E2).
+///
+/// Unlike LTX-2.3, this route's loader genuinely *reads* its geometry: `lib.rs` builds the DiT from
+/// [`crate::config::AvConfig::from_bundle`], which parses the transformer component's safetensors
+/// `__metadata__["config"]["transformer"]` section (`num_attention_heads`, `attention_head_dim`,
+/// `num_layers`) and keeps the [`crate::config::AvConfig::ltx_2_3`] value for any key the section
+/// omits. Passing the resolved bundle through means this publishes what the checkpoint actually
+/// says, not a dimension asserted from the model id; a bundle-free call falls back to
+/// [`crate::config::AvConfig::ltx_2_5`], which is the same 48/32/128 the loader would fall back to
+/// (that preset's video half IS [`crate::config::TransformerConfig::ltx_2_3`]'s, and `ltx_2_3` is
+/// the per-key fallback base `from_transformer_config` starts from).
+///
+/// A bundle that FAILS to parse publishes `None` for the three trunk axes (epic SC-22657, E2). It
+/// used to publish the 2.5 preset, which described a load that cannot happen: `lib.rs`'s
+/// `AvConfig::from_bundle(&bundle)?` refuses that bundle outright, so there is no geometry for a
+/// preset to stand in for — and the preset was not even what the loader would have fallen back to.
+/// Structurally unknowable is `None`, never a guess.
+///
+/// `patch_size` is `None` for the same structural reason as 2.3: LTX patchifies inside the causal
+/// video autoencoder, not in the DiT (`patchify_proj` is a per-token `Linear(128 -> 4096)` over the
+/// already flattened `[B, S, 128]` latent).
+///
+/// A weights-free contract (no bundle, and a sentinel weights path that is not on disk) publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(
+    spec: &LoadSpec,
+    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
+) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let video = match bundle {
+        // Parsed: the exact section the loader reads. Refused: no trunk axis is knowable.
+        Some(bundle) => crate::config::AvConfig::from_bundle(bundle)
+            .ok()
+            .map(|config| config.video),
+        // Not yet resolved to a bundle: the preset the loader's own per-key base agrees with.
+        None => Some(crate::config::AvConfig::ltx_2_5().video),
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: video
+            .as_ref()
+            .and_then(|video| af::declared(video.num_heads)),
+        // `attention_head_dim` is declared by the config section itself, never divided out of a
+        // hidden size.
+        head_dim: video
+            .as_ref()
+            .and_then(|video| af::declared(video.head_dim)),
+        transformer_blocks: video
+            .as_ref()
+            .and_then(|video| af::declared(video.num_layers)),
+        // Structurally absent: LTX patchifies inside the causal video autoencoder, not in the DiT.
+        patch_size: None,
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(crate::config::SPATIAL_SCALE),
+        vae_temporal_scale: af::declared(crate::config::TEMPORAL_SCALE),
+        // `lib.rs: DIT_DTYPE = DType::BF16`.
+        activation_dtype_width: af::dtype_width(crate::DIT_DTYPE),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     asset_facts: MemoryAssetFacts,
     calibration_fingerprint: &str,
+    bundle: Option<&gen_core::ltx_checkpoint::LtxBundle>,
 ) -> gen_core::Result<MemoryProviderContract> {
     let windowed = streamable(spec);
     let decode = bounded_decode(spec);
@@ -301,6 +385,7 @@ fn build_contract(
         variables.push(MemoryFormulaVariable::DecodeTileArea);
     }
     Ok(MemoryProviderContract {
+        architecture_facts: architecture_facts(spec, bundle),
         provider_id: LTX_2_5_DISTILLED_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -347,6 +432,7 @@ fn memory_strategy_contract_for_bundle(
         spec,
         exact_load_receipt(spec, bundle)?,
         CALIBRATION_FINGERPRINT,
+        Some(bundle),
     )
 }
 
@@ -358,6 +444,9 @@ fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
         spec,
         MemoryAssetFacts::default(),
         CANDLE_REGISTRY_CALIBRATION_FINGERPRINT,
+        // No bundle has been resolved for a registry surface, and none can be: the fixture spec's
+        // weights path is a sentinel that is not on disk.
+        None,
     )
 }
 
@@ -952,6 +1041,141 @@ mod tests {
             .clone()
     }
 
+    /// Rewrite the bundle's transformer component with an explicit `config.transformer` section,
+    /// so the test can prove the axes are *read* rather than asserted from the model id.
+    fn write_transformer_config(root: &Path, section: &str) {
+        write_safetensors(
+            &root.join("transformer.safetensors"),
+            &[
+                ("model_version", "2.5.0"),
+                ("config", &format!(r#"{{"transformer":{section}}}"#)),
+            ],
+            11,
+        );
+    }
+
+    /// AC (epic SC-22657, E2): the LTX-2.5 contract publishes the architecture axes its loader reads
+    /// out of the transformer component's own config section, and the weights-free surface publishes
+    /// none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let load = physical_spec(root, false, true);
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":32,
+                "attention_head_dim":128,"num_layers":48}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        let contract = build_contract(
+            &load,
+            MemoryAssetFacts::default(),
+            CALIBRATION_FINGERPRINT,
+            Some(&bundle),
+        )
+        .unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // Read from `config.transformer`'s own `num_attention_heads` / `attention_head_dim`
+                // / `num_layers` through `AvConfig::from_bundle`.
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // Structurally absent: LTX patchifies inside the causal video autoencoder, not in
+                // the DiT — `patchify_proj` is a per-token Linear(128 -> 4096) over the already
+                // flattened `[B, S, 128]` latent, so the denoiser applies no spatial patch factor.
+                patch_size: None,
+                // `config::LATENT_CHANNELS`.
+                latent_channels: Some(128),
+                // `config::SPATIAL_SCALE` / `config::TEMPORAL_SCALE`.
+                vae_spatial_scale: Some(32),
+                vae_temporal_scale: Some(8),
+                // `lib.rs: DIT_DTYPE = DType::BF16`.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The facts are read, not asserted: a checkpoint declaring a different depth publishes what
+        // it actually says.
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":16,
+                "attention_head_dim":64,"num_layers":24}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        let mutated = architecture_facts(&load, Some(&bundle));
+        assert_eq!(mutated.attention_heads, Some(16));
+        assert_eq!(mutated.head_dim, Some(64));
+        assert_eq!(mutated.transformer_blocks, Some(24));
+
+        // The registry fixture resolves no bundle and names a weights path that is not on disk.
+        let weights_free = weights_free_contract(&spec(
+            OffloadPolicy::Resident,
+            LoadShape::EagerMaterialization,
+        ))
+        .unwrap();
+        assert!(weights_free.architecture_facts.is_empty());
+    }
+
+    /// AC (epic SC-22657, E2): a bundle whose transformer config the LOADER REFUSES publishes no
+    /// trunk axis. `lib.rs` does `AvConfig::from_bundle(&bundle)?`, so this checkpoint never builds
+    /// a DiT at all — publishing the `ltx_2_5` preset here would be a geometry fact about a load
+    /// that cannot happen (and not even the value the loader's `ltx_2_3` per-key base would give).
+    #[test]
+    fn a_bundle_the_loader_refuses_publishes_no_trunk_axis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let load = physical_spec(root, false, true);
+        // All four `CAPTION_V2_EXPECTED_CONFIG` keys declared, one with the wrong value: upstream's
+        // strict rule (`gen_core::ltx_checkpoint::caption_feature_version`) rejects it, so
+        // `AvConfig::from_bundle` — and therefore the loader — errors on this exact bundle. The
+        // trunk keys are present and healthy, to prove the `None`s come from the refusal rather
+        // than from a missing section.
+        write_transformer_config(
+            root,
+            r#"{"_class_name":"AVTransformer3DModel","num_attention_heads":32,
+                "attention_head_dim":128,"num_layers":48,
+                "caption_proj_before_connector":false,
+                "caption_projection_first_linear":false,
+                "caption_proj_input_norm":false,
+                "caption_projection_second_linear":false}"#,
+        );
+        let bundle = crate::bundle::resolve_split_bundle(&load).unwrap();
+        assert!(
+            crate::config::AvConfig::from_bundle(&bundle).is_err(),
+            "fixture must be a bundle the loader itself refuses"
+        );
+
+        let facts = architecture_facts(&load, Some(&bundle));
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+        assert_eq!(facts.transformer_blocks, None);
+        // Specifically not the 2.5 preset this used to publish.
+        let preset = crate::config::AvConfig::ltx_2_5().video;
+        assert_ne!(facts.attention_heads, Some(preset.num_heads as u32));
+        assert_ne!(facts.head_dim, Some(preset.head_dim as u32));
+        assert_ne!(facts.transformer_blocks, Some(preset.num_layers as u32));
+        // The axes that do NOT come from the transformer config are unaffected: crate constants and
+        // the DiT dtype, knowable without parsing anything.
+        assert_eq!(facts.latent_channels, Some(128));
+        assert_eq!(facts.vae_spatial_scale, Some(32));
+        assert_eq!(facts.vae_temporal_scale, Some(8));
+        assert_eq!(facts.activation_dtype_width, Some(2));
+
+        let contract = build_contract(
+            &load,
+            MemoryAssetFacts::default(),
+            CALIBRATION_FINGERPRINT,
+            Some(&bundle),
+        )
+        .unwrap();
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
     #[test]
     fn registration_and_weights_free_surfaces_name_the_distilled_two_five_engine() {
         assert_eq!(
@@ -1068,6 +1292,76 @@ mod tests {
             ),
             MemorySafetyDecision::Reject { .. }
         ));
+    }
+
+    /// Feature-end review (SC-22667, E1). A converted 2.5 tier splits the vocoder out into its own
+    /// `vocoder.safetensors` beside the audio VAE — `lib.rs` refuses to load a converted tier
+    /// without it and opens it at `VAE_DTYPE` — while the bundle layout keeps both the `audio_vae`
+    /// and `vocoder` config sections inside one file. Charging `LtxComponent::AudioVae` alone was
+    /// therefore correct for a bundle and left the whole vocoder resident and unpriced on every
+    /// converted tier.
+    ///
+    /// Mutation that fails this: dropping the `optional_component_bytes(&vocoder_path, …)` term, so
+    /// the sibling file reads as 0 and the decoder stays at the bundle figure.
+    ///
+    /// The gate is the loader's own converted-tier predicate, `Ltx25Tier::detect(root)`, not the
+    /// sibling file's presence (SC-22667 review): a bundle with a stray `vocoder.safetensors` is
+    /// not charged for a vocoder it never opens, and a converted tier missing the sibling errors
+    /// the way `lib.rs` errors, rather than pricing 0 for a load that will refuse. Mutations that
+    /// fail those two: gating on `vocoder_path.exists()` (the stray-sibling bundle prices 47 * 4 and
+    /// the missing-sibling tier prices 0 instead of erroring).
+    #[test]
+    fn a_converted_tiers_sibling_vocoder_is_charged_to_the_decoder() {
+        let directory = tempfile::tempdir().unwrap();
+        let load = physical_spec(directory.path(), false, true);
+
+        // The bundle shape: the vocoder lives inside `audio_vae.safetensors`, with no sibling.
+        let bundle = memory_strategy_contract(&load).unwrap();
+        assert_eq!(bundle.asset_facts.decoder_bytes, 68 + 76);
+
+        // A stray sibling on a bundle (no converted-tier manifest) is not what the loader opens.
+        write_safetensors(&directory.path().join("vocoder.safetensors"), &[], 47);
+        assert_eq!(
+            memory_strategy_contract(&load)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            68 + 76,
+            "a bundle never opens a sibling vocoder file"
+        );
+
+        // The converted shape: the tier manifest the loader branches on, plus the split-out vocoder
+        // the loader then requires. `physical_spec` selects Q4, so the manifest declares q4.
+        write_tier_manifest(directory.path(), "q4", true, 4);
+        let converted = memory_strategy_contract(&load).unwrap();
+        assert_eq!(
+            converted.asset_facts.decoder_bytes,
+            68 + 76 + 47 * 4,
+            "the sibling vocoder is resident and must be charged"
+        );
+
+        // A converted tier WITHOUT the sibling is a load `lib.rs` refuses; the receipt refuses too.
+        std::fs::remove_file(directory.path().join("vocoder.safetensors")).unwrap();
+        let missing = memory_strategy_contract(&load)
+            .expect_err("a converted tier missing vocoder.safetensors must not price")
+            .to_string();
+        assert!(missing.contains("vocoder"), "unexpected: {missing}");
+        write_safetensors(&directory.path().join("vocoder.safetensors"), &[], 47);
+        // Nothing else moves, and `base_bytes` stays its own decomposition.
+        assert_eq!(
+            converted.asset_facts.conditioning_bytes,
+            bundle.asset_facts.conditioning_bytes
+        );
+        assert_eq!(
+            converted.asset_facts.transformer_bytes,
+            bundle.asset_facts.transformer_bytes
+        );
+        assert_eq!(
+            converted.asset_facts.base_bytes,
+            bundle.asset_facts.base_bytes + 47 * 4
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&converted)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
     }
 
     #[test]

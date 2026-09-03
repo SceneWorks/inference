@@ -49,6 +49,7 @@ pub mod memory_strategy;
 pub mod trainer;
 pub mod transcriber;
 pub mod voice_embedder;
+pub mod wan_i2v;
 
 pub use audio_embedder::{
     audio_embedder_conformance, check_audio_embed_joint, check_audio_embedder_registry,
@@ -70,9 +71,14 @@ pub use captioner::{
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
 };
 pub use memory_strategy::{
-    check_memory_contract_surface_registry, check_memory_strategy_contract,
-    check_memory_strategy_registry, memory_contract_surface_registry_conformance,
-    memory_strategy_conformance, memory_strategy_registry_conformance,
+    assert_memory_contract_asset_facts_conform, assert_memory_contract_facts_conform,
+    check_memory_contract_asset_facts, check_memory_contract_facts,
+    check_memory_contract_surface_registry, check_memory_contract_surface_registry_facts,
+    check_memory_strategy_contract, check_memory_strategy_registry,
+    memory_contract_surface_registry_conformance,
+    memory_contract_surface_registry_facts_conformance, memory_strategy_conformance,
+    memory_strategy_registry_conformance, MaterializedRootLookup,
+    MemoryContractSurfaceFactsCoverage,
 };
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,

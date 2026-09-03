@@ -669,6 +669,66 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
     gen_core::reject_unknown_components(spec, &[], PROVIDER_ID)
 }
 
+/// Architecture axes for the SCAIL-2 route (epic SC-22657, E2).
+///
+/// [`Scail2Config::scail2_14b`](crate::config::Scail2Config::scail2_14b) wraps
+/// `WanModelConfig::scail2_14b`, this workspace's mirror of the upstream `config-14b.json`, and
+/// `Scail2Config::from_model_dir` overlays a snapshot's own keys onto it at load.
+///
+/// `latent_channels` is `vae_z_dim` (16), NOT the DiT's `in_dim` (20): those four extra channels are
+/// the binary i2v mask concatenated onto the latent, which the autoencoder neither produces nor
+/// consumes. SCAIL-2 decodes through the Wan z16 **video** autoencoder, so `vae_temporal_scale` is a
+/// real value here.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `Scail2Config::from_model_dir`
+/// — the loader's own parse — so the published axes are the snapshot's rather than the preset's.
+/// On the weights-free surface there is no config to read and the preset is what the loader would
+/// itself start from.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    architecture_facts_with_compute(spec, crate::compute_bf16_opt_in())
+}
+
+/// The derivation with the denoiser's compute selection passed in, so both sides of the
+/// `SCAIL2_COMPUTE_BF16` hatch are reachable from a test without mutating process environment
+/// shared by every other test in the binary.
+fn architecture_facts_with_compute(
+    spec: &LoadSpec,
+    compute_bf16: bool,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::Scail2Config::from_model_dir(root).ok())
+        .unwrap_or_else(crate::config::Scail2Config::scail2_14b)
+        .wan;
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667). `head_dim()` is a
+        // plain `dim / num_heads`: `Scail2Config::from_model_dir` overlays snapshot keys with no
+        // validation, so a non-uniform stack published a rounded, fabricated width and a
+        // `"num_heads": 0` divided by zero before `axis` could decline anything.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // SCAIL-2 is the exception in this family: `generate.rs` sets the denoiser's compute dtype
+        // to `Dtype::Float32` unless `SCAIL2_COMPUTE_BF16=1` is set, because the bf16 quantized
+        // matmul overflows to NaN at this route's long sequences (sc-5681). SC-22667: this used to
+        // hardcode 4 while naming that hatch in its own comment, so an opted-in run published a 2x
+        // over-estimate of every activation. Both sides now read the same predicate.
+        activation_dtype_width: Some(if compute_bf16 {
+            mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+        } else {
+            mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+        }),
+    }
+}
+
 fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -676,6 +736,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: PROVIDER_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -901,6 +962,161 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, GenerationRequest, Image, ReplacementMode};
+
+    /// AC (SC-22662): the SCAIL-2 contract publishes the axes of the Wan-derived trunk and the
+    /// z16 video VAE this crate declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_scail2_14b_config() {
+        for surface in resident_surface_specs() {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(40),
+                    // 5120 / 40, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(40),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    // `vae_z_dim`, not the DiT's `in_dim` 20 — those four extra channels are the
+                    // binary i2v mask, which the autoencoder never sees.
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    // f32 by default; bf16 is the `SCAIL2_COMPUTE_BF16=1` opt-in (sc-5681).
+                    activation_dtype_width: Some(4),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair IS this provider's assigned VAE geometry.
+        let preset_facts = architecture_facts(&weights_free_spec());
+        assert_eq!(
+            crate::VAE_TILING.spatial_scale as u32,
+            preset_facts.vae_spatial_scale.unwrap()
+        );
+        assert_eq!(
+            crate::VAE_TILING.temporal_scale as u32,
+            preset_facts.vae_temporal_scale.unwrap()
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): `head_dim` must come from the exactness-gated helper.
+    /// `Scail2Config::from_model_dir` overlays snapshot keys with no validation, so the old
+    /// `axis(wan.head_dim())` published a rounded, fabricated per-head width for a non-uniform
+    /// stack — and divided by zero outright for `"num_heads": 0`.
+    ///
+    /// Mutation that fails this: restoring `axis(wan.head_dim())` — the first case then publishes
+    /// `Some(128)` for a hidden dimension no head count divides, and the second panics.
+    #[test]
+    fn head_width_is_declined_for_a_non_uniform_or_degenerate_head_stack() {
+        let preset = crate::config::Scail2Config::scail2_14b();
+
+        let uneven_dir = tempfile::tempdir().unwrap();
+        let mut uneven = scail2_config_json(&preset);
+        uneven["dim"] = serde_json::json!(5121);
+        let facts = architecture_facts(&spec_for_config(uneven_dir.path(), &uneven));
+        assert_eq!(facts.attention_heads, Some(40));
+        assert_eq!(
+            facts.head_dim, None,
+            "40 heads do not divide 5121; a rounded quotient would invent a width"
+        );
+
+        let headless_dir = tempfile::tempdir().unwrap();
+        let mut headless = scail2_config_json(&preset);
+        headless["num_heads"] = serde_json::json!(0);
+        let facts = architecture_facts(&spec_for_config(headless_dir.path(), &headless));
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+    }
+
+    /// Feature-end review (SC-22667, E2): the published activation width must track the dtype the
+    /// denoiser actually computes in. `generate` runs f32 by default and bf16 under
+    /// `SCAIL2_COMPUTE_BF16=1`; the contract used to hardcode 4 while its own comment named that
+    /// hatch, so an opted-in run published a 2x over-estimate.
+    ///
+    /// Mutation that fails this: hardcoding `FLOAT32_ACTIVATION_WIDTH` again — the bf16 leg then
+    /// reports 4.
+    #[test]
+    fn the_activation_width_follows_the_denoiser_compute_hatch() {
+        let spec = weights_free_spec();
+        assert_eq!(
+            architecture_facts_with_compute(&spec, false).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH)
+        );
+        assert_eq!(
+            architecture_facts_with_compute(&spec, true).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH)
+        );
+        // Nothing else on the axis set moves with it.
+        let f32_facts = architecture_facts_with_compute(&spec, false);
+        let bf16_facts = architecture_facts_with_compute(&spec, true);
+        assert_eq!(f32_facts.attention_heads, bf16_facts.attention_heads);
+        assert_eq!(f32_facts.head_dim, bf16_facts.head_dim);
+        assert_eq!(f32_facts.transformer_blocks, bf16_facts.transformer_blocks);
+    }
+
+    /// A spec whose weights directory is the registry's never-created contract-surface sentinel:
+    /// the weights-free path, where the preset is the only geometry there is.
+    fn weights_free_spec() -> LoadSpec {
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+    }
+
+    /// The upstream `config-14b.json` keys `Scail2Config::from_model_dir` actually reads.
+    fn scail2_config_json(cfg: &crate::config::Scail2Config) -> serde_json::Value {
+        serde_json::json!({
+            "in_dim": cfg.wan.in_dim,
+            "out_dim": cfg.wan.out_dim,
+            "dim": cfg.wan.dim,
+            "ffn_dim": cfg.wan.ffn_dim,
+            "num_heads": cfg.wan.num_heads,
+            "num_layers": cfg.wan.num_layers,
+            "mask_dim": cfg.mask_dim,
+        })
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the axes are the snapshot's
+    /// own, because `Scail2Config::from_model_dir` overlays that snapshot's `config.json` over the
+    /// preset. A fixture mirroring the reference config agrees with the weights-free preset path;
+    /// a fixture with mutated keys publishes the mutated axes — which is what the unconditional
+    /// `architecture_facts()` this function replaced would fail.
+    #[test]
+    fn materialized_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::Scail2Config::scail2_14b();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(
+                mirror.path(),
+                &scail2_config_json(&preset)
+            )),
+            architecture_facts(&weights_free_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = scail2_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        mutated["dim"] = serde_json::json!(2560);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            // 2560 / 40 heads.
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
 
     fn image(width: u32, height: u32) -> Image {
         tinted_image(width, height, 7)

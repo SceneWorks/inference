@@ -85,36 +85,103 @@ pub fn convert_vae_key(key: &str) -> String {
     }
 }
 
-/// Load the Qwen-Image VAE from Anima's single-file `qwen_image_vae.safetensors` on `device`. Run in
-/// f32 (the qwen-image golden convention): the denoised latents are f32 and this avoids a mixed-dtype
-/// conv, at a negligible memory cost for the small VAE.
+/// The dtype every Anima VAE tensor is materialized at: f32 (the qwen-image golden convention —
+/// the denoised latents are f32 and this avoids a mixed-dtype conv), **not** the DiT's bf16.
+///
+/// It is a named constant because `memory_strategy::VAE_FLOAT_WIDTH` prices the resident decoder
+/// against it; the two must not drift, and a unit test pins them together.
+pub const LOAD_DTYPE: DType = DType::F32;
+
+/// The on-disk key prefixes of the tensors [`load_vae`] materializes — the decode half, which is
+/// all `QwenVae::new` (decode-only) reads: `decoder.*` and the `conv2.*` post-quant conv, which
+/// [`convert_vae_key`] renames to `decoder.*` / `post_quant_conv.*` (a file already in diffusers
+/// naming keeps `post_quant_conv.*`). `encoder.*` and `conv1.*` (`quant_conv`) are the encoder
+/// half only [`load_vae_encoder`] — the training-time latent cache — opens. Named so
+/// `memory_strategy` prices exactly the tensors this loader lands on device (epic SC-22657, E1).
+pub const DECODER_KEY_PREFIXES: &[&str] = &["decoder.", "conv2.", "post_quant_conv."];
+
+/// Whether an on-disk VAE key belongs to the decode half [`load_vae`] materializes.
+pub fn is_decoder_key(key: &str) -> bool {
+    DECODER_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
+/// Load the **decode half** of the Qwen-Image VAE from Anima's single-file
+/// `qwen_image_vae.safetensors` on `device` at [`LOAD_DTYPE`].
+///
+/// Only [`DECODER_KEY_PREFIXES`] are read (a header-only mmap, `Weights::from_file_filtered`):
+/// `QwenVae` is decode-only, so materializing the encoder tower too — as the whole-file
+/// `Weights::from_file` did — put a transient it never read on the device and made the priced
+/// decoder disagree with the resident one.
 pub fn load_vae(path: impl AsRef<Path>, device: &Device) -> Result<QwenVae> {
-    // Load + cast every tensor to f32 (candle_gen::Weights coerces floats on load), then rename keys.
-    let src = candle_gen::Weights::from_file(path.as_ref(), device, DType::F32)?;
+    // Load + cast the decoder tensors to f32 (candle_gen::Weights coerces floats on load), then
+    // rename keys.
+    let src = candle_gen::Weights::from_file_filtered(
+        path.as_ref(),
+        device,
+        LOAD_DTYPE,
+        DECODER_KEY_PREFIXES,
+    )?;
     let keys: Vec<String> = src.keys().cloned().collect();
     let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
     for k in &keys {
         map.insert(convert_vae_key(k), src.require(k)?);
     }
-    let vb = VarBuilder::from_tensors(map, DType::F32, device);
+    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
     QwenVae::new(vb).map_err(Into::into)
 }
 
-/// Load only Anima's Qwen-Image VAE encoder for training-time image caching.
+/// Load only Anima's Qwen-Image VAE encoder for training-time image caching, at [`LOAD_DTYPE`].
 pub fn load_vae_encoder(path: impl AsRef<Path>, device: &Device) -> Result<QwenVaeEncoder> {
-    let src = candle_gen::Weights::from_file(path.as_ref(), device, DType::F32)?;
+    let src = candle_gen::Weights::from_file(path.as_ref(), device, LOAD_DTYPE)?;
     let keys: Vec<String> = src.keys().cloned().collect();
     let mut map: HashMap<String, _> = HashMap::with_capacity(keys.len());
     for k in &keys {
         map.insert(convert_vae_key(k), src.require(k)?);
     }
-    let vb = VarBuilder::from_tensors(map, DType::F32, device);
+    let vb = VarBuilder::from_tensors(map, LOAD_DTYPE, device);
     QwenVaeEncoder::new(vb).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load_vae` reads only [`DECODER_KEY_PREFIXES`]; every original-naming key that converts
+    /// into the `decoder.` / `post_quant_conv.` namespace `QwenVae::new` reads must be selected,
+    /// and every encoder-half key must not be. *Mutation that reds this:* dropping `conv2.` from
+    /// the prefix list (the post-quant conv would be missing from the build).
+    #[test]
+    fn decoder_key_prefixes_select_exactly_the_keys_qwen_vae_reads() {
+        for key in [
+            "conv2.weight",
+            "conv2.bias",
+            "decoder.conv1.weight",
+            "decoder.middle.0.residual.0.gamma",
+            "decoder.upsamples.3.resample.1.weight",
+            "decoder.head.0.gamma",
+            "decoder.head.2.weight",
+            "post_quant_conv.weight",
+        ] {
+            assert!(is_decoder_key(key), "{key} is read by the decoder");
+            let converted = convert_vae_key(key);
+            assert!(
+                converted.starts_with("decoder.") || converted.starts_with("post_quant_conv."),
+                "{key} -> {converted}"
+            );
+        }
+        for key in [
+            "conv1.weight",
+            "encoder.conv1.weight",
+            "encoder.downsamples.0.residual.0.gamma",
+            "encoder.middle.1.residual.0.gamma",
+            "encoder.head.2.weight",
+            "quant_conv.weight",
+        ] {
+            assert!(!is_decoder_key(key), "{key} is encoder-only");
+        }
+    }
 
     #[test]
     fn convert_vae_key_examples() {

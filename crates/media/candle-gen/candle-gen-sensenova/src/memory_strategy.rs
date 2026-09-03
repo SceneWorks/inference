@@ -147,10 +147,17 @@ impl CheckpointInventory {
     /// * `decoder_bytes` — zero, and honestly so: the FM head emits RGB patches, there is no VAE and
     ///   the contract declares no decode phase.
     ///
-    /// Sums tensor DATA bytes from the shard headers, so packed tiers count their `.scales` /
-    /// `.biases` alongside their codes, and an unrecognised key fails closed rather than being
-    /// silently folded into either path.
+    /// Prices each tensor at the width the loader MATERIALIZES it at, not at its stored width, and
+    /// an unrecognised key fails closed rather than being silently folded into either path. See
+    /// [`materialized_element_width`] — summing `data_bytes` under-priced every f32-widened leaf by
+    /// exactly half, and an under-price is the defect class this contract exists to exclude.
     pub(crate) fn asset_facts(&self) -> gen_core::Result<MemoryAssetFacts> {
+        // The width `backbone_vb` mmaps the bulk store at. `snapshot_store_dtype` is that function's
+        // own probe; its `None` (no probe tensor) maps to the same f32 `checkpoint_dtype` fallback
+        // the load path takes, so the pricing follows the load rather than guessing narrow.
+        let store_width = crate::snapshot_store_dtype(&self.root)
+            .and_then(candle_gen::architecture_facts::dtype_width)
+            .map_or(4_u64, u64::from);
         let mut conditioning_bytes = 0_u64;
         let mut transformer_bytes = 0_u64;
         for (path, _) in &self.files {
@@ -167,7 +174,15 @@ impl CheckpointInventory {
                         )));
                     }
                 };
-                *bucket = bucket.checked_add(header.data_bytes).ok_or_else(|| {
+                // Integer payloads (the packed `U32` codes) are read at their native dtype and so
+                // occupy exactly their stored bytes; every float leaf is priced by key class.
+                let bytes = if header.is_float() {
+                    header
+                        .materialized_bytes(materialized_element_width(&header.name, store_width))?
+                } else {
+                    header.data_bytes
+                };
+                *bucket = bucket.checked_add(bytes).ok_or_else(|| {
                     gen_core::Error::Unsupported(
                         "sensenova: component byte total overflows u64".to_owned(),
                     )
@@ -264,6 +279,64 @@ fn asset_component(name: &str) -> Option<AssetComponent> {
         Some(AssetComponent::Generation)
     } else {
         Some(AssetComponent::Understanding)
+    }
+}
+
+/// Bytes per logical element the loader materializes the float tensor `name` at.
+///
+/// The checkpoint's stored width is NOT what most of these leaves occupy: `quant::store_dtype_for`
+/// governs only the bulk store, and three key classes are read at `DType::F32` on top of it, so a
+/// `data_bytes` sum under-prices each of them by exactly half on a bf16 tier (and under-prices the
+/// whole checkpoint on any non-bf16 tier, whose store maps to f32). Mirrors the key-class split
+/// `gen_core`'s `mlx_text_encoder_bytes` already uses for the Wan UMT5 encoder.
+///
+/// The f32 classes, each read through `quant::get_f32` / an explicit `DType::F32` request:
+///
+/// * a packed projection's affine planes — `quant::detect_linear` requests `{base}.scales` and
+///   `{base}.biases` at `DType::F32` although every tier stores them BF16 (which
+///   [`detect_checkpoint_quantization`] asserts). On q4 these planes are ~11% of the packed
+///   projections' materialized bytes, so halving them is a real under-price;
+/// * `fm_modules.*` — the FM head, the timestep/noise-scale embedders and the generation-path
+///   vision embedder all load through `fm::load_linear_biased` / `NeoVisionEmbedder::from_weights`,
+///   both of which call `quant::get_f32`; likewise the understanding-path `vision_model.*` tower;
+/// * every norm vector — `q_norm`, `k_norm`, `q_norm_hw`, `k_norm_hw`, `input_layernorm`,
+///   `post_attention_layernorm` and the two final `model.norm{,_mot_gen}` — which `Qwen3Backbone`
+///   reads with `get_f32` because `rms_norm` multiplies them against an f32 hidden state.
+///
+/// Everything else — the bulk `{q,k,v,o}_proj` / `{gate,up,down}_proj` dense weights,
+/// `embed_tokens` and `lm_head` — rides the store width (`vb.get_unchecked`).
+///
+/// A projection's own `.bias` (distinct from the affine `.biases`) would load at f32 under the
+/// packed arm, but every call site passes `bias: false` (`qwen3.rs` `load_linear_no_bias`), so such
+/// a tensor is not loaded at all; charging it the store width over-declares rather than under.
+fn materialized_element_width(name: &str, store_width: u64) -> u64 {
+    if name.ends_with(".scales") || name.ends_with(".biases") {
+        return 4;
+    }
+    if name.starts_with("fm_modules.") || name.starts_with("vision_model.") {
+        return 4;
+    }
+    let Some(rest) = name.strip_prefix("language_model.") else {
+        return store_width;
+    };
+    // The module segment, i.e. the one before the `.weight` / `.bias` leaf.
+    let Some(module) = rest.rsplit('.').nth(1) else {
+        return store_width;
+    };
+    let module = module.strip_suffix("_mot_gen").unwrap_or(module);
+    if matches!(
+        module,
+        "norm"
+            | "q_norm"
+            | "k_norm"
+            | "q_norm_hw"
+            | "k_norm_hw"
+            | "input_layernorm"
+            | "post_attention_layernorm"
+    ) {
+        4
+    } else {
+        store_width
     }
 }
 
@@ -525,6 +598,64 @@ pub(crate) fn weights_free_contract(
     ))
 }
 
+/// Snapshot-read architecture axes for SenseNova-U1 (epic SC-22657, E2).
+///
+/// SenseNova is one of the few Candle providers whose loader genuinely parses JSON: the backbone is
+/// built from [`crate::config::NeoChatConfig::from_dir`], which reads `<root>/config.json`. These
+/// axes therefore read the *same* file and the *same* keys — `llm_config.num_attention_heads`,
+/// `llm_config.head_dim`, `llm_config.num_hidden_layers`, and the top-level `patch_size` — so a
+/// snapshot whose config disagrees with the published 8B-MoT values publishes what it actually
+/// says rather than what the reference checkpoint declares.
+///
+/// `head_dim` mirrors [`crate::config::NeoLlmConfig::head_dim`] exactly: the explicit key wins, and
+/// a config omitting it falls back to `hidden_size / num_attention_heads`.
+///
+/// Three axes are structurally absent and are declared absent, never zero (E2):
+///
+/// * `latent_channels` — SenseNova-U1 has no latent space at all; its flow-matching head emits RGB
+///   patches directly, so there are no latent channels to count.
+/// * `vae_spatial_scale` / `vae_temporal_scale` — the model ships no VAE (the same reason this
+///   contract declares `BoundedDecode` `StructurallyNotApplicable`), so neither scale exists.
+///
+/// `activation_dtype_width` is the one axis not read from a config, because the loader does not read
+/// it from one either: the store width is *probed from the checkpoint*. [`crate::snapshot_store_dtype`]
+/// is `backbone_vb`'s own pair of calls — the resolved tier's dense weight files through the
+/// always-dense RMSNorm probe, mapped by `quant::store_dtype_for` (bf16 stays bf16, anything else
+/// loads f32) — so the width published here is the width the load will use, on a packed q4/q8 tier
+/// as much as on `bf16/`. It stays `None` only when the snapshot ships no probe tensor: the load
+/// path falls back to f32 there so that it can still load, but a contract that inherited that
+/// fallback would be publishing a width it never observed.
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: no config has been resolved to read.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    // The exact file `NeoChatConfig::from_dir` parses.
+    let config = af::component_config(root, "");
+    let llm = config.as_ref().and_then(|config| config.get("llm_config"));
+    let attention_heads = af::axis_of(llm, &["num_attention_heads"]);
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        // `NeoLlmConfig::head_dim()`: the explicit key, else `hidden_size / num_attention_heads`.
+        head_dim: af::axis_of(llm, &["head_dim"])
+            .or_else(|| af::head_dim(af::axis_of(llm, &["hidden_size"]), attention_heads)),
+        transformer_blocks: af::axis_of(llm, &["num_hidden_layers"]),
+        patch_size: af::axis_of(config.as_ref(), &["patch_size"]),
+        // No latent space: the flow-matching head emits RGB patches directly.
+        latent_channels: None,
+        // SenseNova ships no VAE at all, so neither decode scale exists.
+        vae_spatial_scale: None,
+        vae_temporal_scale: None,
+        // The store dtype `backbone_vb` will load at, probed from this snapshot's own dense
+        // tensors; `None` only when there is no probe tensor to read.
+        activation_dtype_width: crate::snapshot_store_dtype(root).and_then(af::dtype_width),
+    }
+}
+
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -572,6 +703,7 @@ fn build_contract(
     // envelope used for admission accounting.
     let formula_phases = vec![MemoryPhase::Conditioning, MemoryPhase::Denoise];
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -919,6 +1051,107 @@ mod tests {
         std::fs::write(root.join("config.json"), config).unwrap();
     }
 
+    /// AC (epic SC-22657, E2): the architecture axes are READ from the same `<root>/config.json`
+    /// keys `NeoChatConfig::from_dir` parses — never asserted from the published 8B-MoT values —
+    /// the four SenseNova structurally lacks stay absent, and the weights-free surface is empty.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        fn config_spec(temp: &Path, heads: u64) -> LoadSpec {
+            std::fs::create_dir_all(temp).unwrap();
+            std::fs::write(
+                temp.join("config.json"),
+                format!(
+                    r#"{{"patch_size": 16,
+                        "llm_config": {{"model_type": "qwen3", "hidden_size": 4096,
+                                        "num_hidden_layers": 42, "num_attention_heads": {heads},
+                                        "num_key_value_heads": 8, "head_dim": 128}},
+                        "vision_config": {{"hidden_size": 1024, "llm_hidden_size": 4096,
+                                           "num_channels": 3, "patch_size": 16}}}}"#
+                ),
+            )
+            .unwrap();
+            LoadSpec::new(WeightsSource::Dir(temp.to_path_buf()))
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("published");
+        let contract =
+            weights_free_contract(crate::MODEL_ID, &config_spec(&published, 32)).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            gen_core::MemoryArchitectureFacts {
+                // `llm_config.{num_attention_heads,head_dim,num_hidden_layers}` + `patch_size`.
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(42),
+                patch_size: Some(16),
+                // No latent space at all: the flow-matching head emits RGB patches directly.
+                latent_channels: None,
+                // SenseNova ships no VAE, so neither decode scale exists to declare.
+                vae_spatial_scale: None,
+                vae_temporal_scale: None,
+                // This snapshot ships config.json but no shards, so there is no probe tensor and no
+                // observed store width; the load-path f32 fallback is not published as a fact.
+                activation_dtype_width: None,
+            }
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The activation width is PROBED from the tier's own dense tensors and mapped through
+        // `quant::store_dtype_for`, exactly as `backbone_vb` does: a bf16 checkpoint loads bf16
+        // (2 B), and anything else — an f32 store here — loads f32 (4 B). Reading the width off the
+        // config's `torch_dtype`, or pinning it to a crate constant, would disagree with a tier
+        // whose packer emitted something else.
+        for (label, probe, expected) in [
+            ("bf16 store", DType::BF16, Some(2)),
+            ("f32 store", DType::F32, Some(4)),
+        ] {
+            let root = temp.path().join(label.replace(' ', "-"));
+            let spec = config_spec(&root, 32);
+            candle_gen::candle_core::safetensors::save(
+                &HashMap::from([(
+                    "language_model.model.norm.weight".to_owned(),
+                    Tensor::zeros((4,), probe, &Device::Cpu).unwrap(),
+                )]),
+                root.join("model.safetensors"),
+            )
+            .unwrap();
+            let contract = weights_free_contract(crate::MODEL_ID, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts.activation_dtype_width, expected,
+                "{label}"
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The axes are READ, not asserted: a config declaring a different head count publishes it,
+        // and the omitted-`head_dim` fallback is `hidden_size / num_attention_heads` exactly as
+        // `NeoLlmConfig::head_dim()` computes it.
+        let other = temp.path().join("other");
+        let other = weights_free_contract(crate::MODEL_ID, &config_spec(&other, 16)).unwrap();
+        assert_eq!(other.architecture_facts.attention_heads, Some(16));
+        let derived = temp.path().join("derived");
+        std::fs::create_dir_all(&derived).unwrap();
+        std::fs::write(
+            derived.join("config.json"),
+            br#"{"llm_config": {"hidden_size": 4096, "num_attention_heads": 32}}"#,
+        )
+        .unwrap();
+        let derived =
+            weights_free_contract(crate::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(derived)))
+                .unwrap();
+        assert_eq!(derived.architecture_facts.head_dim, Some(128));
+
+        // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+        let surface = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(weights_free_contract(crate::MODEL_ID, &surface)
+            .unwrap()
+            .architecture_facts
+            .is_empty());
+    }
+
     /// The fused checkpoint is priced as TWO resident sets, split by the keys the loader routes,
     /// never as one number stamped into every field. The synthetic layout mirrors the real
     /// `SenseNova-U1-8B` header: understanding twins, `_mot_gen` twins, shared embeddings, the
@@ -988,9 +1221,12 @@ mod tests {
             .unwrap()
             .asset_facts()
             .unwrap();
+        // Rows that ride the bf16 STORE (`vb.get_unchecked`): the bulk projections, `embed_tokens`
+        // and `lm_head`. Rows the loader WIDENS to f32 (`quant::get_f32`) cost twice that: every
+        // norm vector, the `vision_model` tower and everything under `fm_modules`.
         let row = 64 * 2; // one bf16 row of 64
-        let understanding = (2 + 2 + 1 + 4 + 4 + 1 + 1) * row;
-        let generation = (2 + 2 + 1 + 1 + 3) * row;
+        let understanding = (2 + 2 + 4 + 4) * row + (1 + 1 + 1) * 2 * row;
+        let generation = (2 + 2) * row + (1 + 1 + 3) * 2 * row;
         assert_eq!(
             facts,
             MemoryAssetFacts {
@@ -1011,6 +1247,89 @@ mod tests {
             Some(AssetComponent::Generation)
         );
         assert_eq!(asset_component("unexpected.weight"), None);
+    }
+
+    /// AC (epic SC-22657, E1): the contract prices what the LOADER materializes, not what the shard
+    /// stores. A packed tier's `.scales` / `.biases` are stored BF16 but requested at `DType::F32`
+    /// (`quant::detect_linear`), so they must be priced at 4 B per element — pricing them at their
+    /// stored width halves ~11% of a q4 transformer's bytes, an under-price. The `U32` code tensor
+    /// is read at its native dtype and so stays at exactly its stored bytes.
+    #[test]
+    fn packed_affine_planes_are_priced_at_the_f32_width_the_loader_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let device = Device::Cpu;
+        let base = "language_model.model.layers.0.self_attn.k_proj";
+        // q4 over one 64-wide affine group: `[2, 64 * 4 / 32]` codes, `[2, 1]` planes.
+        let lanes = 64 * 4 / 32;
+        let tensors = HashMap::from([
+            (
+                format!("{base}.weight"),
+                Tensor::zeros((2, lanes), DType::U32, &device).unwrap(),
+            ),
+            (
+                format!("{base}.scales"),
+                Tensor::ones((2, 1), DType::BF16, &device).unwrap(),
+            ),
+            (
+                format!("{base}.biases"),
+                Tensor::zeros((2, 1), DType::BF16, &device).unwrap(),
+            ),
+            // The always-dense store probe `snapshot_store_dtype` reads: bf16 ⇒ a 2 B store.
+            (
+                "language_model.model.norm.weight".to_owned(),
+                Tensor::zeros((4,), DType::BF16, &device).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, root.path().join("model.safetensors"))
+            .unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+
+        let facts = CheckpointInventory::capture(root.path())
+            .unwrap()
+            .asset_facts()
+            .unwrap();
+        let plane_elements = 2_u64; // one `[2, 1]` plane
+        let codes = 2 * lanes as u64 * 4; // U32, read as stored
+        let planes = 2 * plane_elements * 4; // scales + biases, at f32
+        let norm = 4 * 4; // `get_f32`, not the 2 B store
+        assert_eq!(
+            facts,
+            MemoryAssetFacts {
+                base_bytes: codes + planes + norm,
+                conditioning_bytes: codes + planes + norm,
+                transformer_bytes: 0,
+                decoder_bytes: 0,
+                overlay_bytes: 0,
+            }
+        );
+        // Stated as the property rather than only as a total: the planes are charged strictly more
+        // than they occupy on disk, and by exactly the bf16 → f32 doubling.
+        let stored_planes = 2 * plane_elements * 2;
+        assert_eq!(planes, 2 * stored_planes);
+        assert!(facts.base_bytes > codes + stored_planes + 4 * 2);
+        // The class rule itself, independent of the fixture geometry.
+        assert_eq!(materialized_element_width(&format!("{base}.scales"), 2), 4);
+        assert_eq!(materialized_element_width(&format!("{base}.biases"), 2), 4);
+        assert_eq!(materialized_element_width(&format!("{base}.weight"), 2), 2);
+        assert_eq!(
+            materialized_element_width("language_model.model.layers.0.input_layernorm.weight", 2),
+            4
+        );
+        assert_eq!(
+            materialized_element_width(
+                "language_model.model.layers.0.self_attn.q_norm_hw_mot_gen.weight",
+                2
+            ),
+            4
+        );
+        assert_eq!(
+            materialized_element_width("fm_modules.fm_head.0.weight", 2),
+            4
+        );
+        assert_eq!(
+            materialized_element_width("language_model.model.embed_tokens.weight", 2),
+            2
+        );
     }
 
     /// A tensor outside the known layout fails closed instead of being folded into either path.

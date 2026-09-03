@@ -43,6 +43,7 @@ candle-gen-z-image = { path = "../candle-gen-z-image" }
 [dev-dependencies]
 gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../../contracts/gen-core-testkit" }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

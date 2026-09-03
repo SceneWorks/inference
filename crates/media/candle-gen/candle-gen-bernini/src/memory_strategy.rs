@@ -1273,6 +1273,53 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Activation dtype the Bernini denoiser computes in. `components.rs`'s `COMPONENT_PLAN` pins both
+/// A14B experts (`transformer` and `transformer_2`) to `DType::BF16`, so this is the real
+/// activation width rather than a memory-model literal. (The UMT5 encoder and the z16 VAE are
+/// pinned F32 there; the transformer is what the phase envelope's activation term describes.)
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes for the Bernini routes (epic SC-22657, E2).
+///
+/// Bernini's loader does **not** parse a `transformer/config.json`: `components.rs` hardcodes
+/// [`candle_gen_wan::config::TransformerConfig::t2v_14b`] and
+/// [`candle_gen_wan::config::Vae16Config::wan21`], so those Rust structs — not a JSON file the
+/// loader ignores — are the honest source for every geometry axis. They are read through
+/// `architecture_facts::declared`, which keeps the same no-zero rule the JSON readers apply.
+///
+/// `patch` is the `(temporal, height, width)` triple `(1, 2, 2)`; the published `patch_size` axis is
+/// the **spatial** entry, so `patch.1` is what is declared.
+///
+/// Bernini is a **video** model, so `vae_temporal_scale` is a real axis here: the z16 VAE
+/// compresses time by [`candle_gen_wan::config::VAE16_STRIDE_TEMPORAL`] (latent
+/// `T = (frames - 1) / 4 + 1`).
+///
+/// The snapshot root still gates the whole function. The geometry is compiled in, but a
+/// weights-free contract has resolved no pipeline at all, and claiming a shape for a surface with
+/// no snapshot behind it would make the registry's placeholder look like read evidence.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+    use candle_gen_wan::config::{
+        TransformerConfig, Vae16Config, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
+    };
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = TransformerConfig::t2v_14b();
+    let vae = Vae16Config::wan21();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        patch_size: af::declared(dit.patch.1),
+        latent_channels: af::declared(vae.z_dim),
+        vae_spatial_scale: af::declared(VAE16_STRIDE_SPATIAL as usize),
+        vae_temporal_scale: af::declared(VAE16_STRIDE_TEMPORAL as usize),
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -1318,6 +1365,7 @@ fn contract(
         }
     };
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -2359,6 +2407,46 @@ pub fn register_memory_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(fixture.path().to_path_buf()));
+        let expected = gen_core::MemoryArchitectureFacts {
+            // `TransformerConfig::t2v_14b()` — the hardcoded A14B expert geometry `components.rs`
+            // loads both experts with. Nothing here is read from a `config.json`, because the
+            // loader reads none.
+            attention_heads: Some(40),
+            head_dim: Some(128),
+            transformer_blocks: Some(40),
+            // The spatial entry of `patch = (1, 2, 2)` (temporal, height, width).
+            patch_size: Some(2),
+            // `Vae16Config::wan21().z_dim`, and the z16 VAE's declared strides.
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Bernini is a VIDEO model: `VAE16_STRIDE_TEMPORAL` is a real axis here, not an absent
+            // one (latent `T = (frames - 1) / 4 + 1`).
+            vae_temporal_scale: Some(4),
+            activation_dtype_width: Some(2),
+        };
+        for provider_id in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(contract.architecture_facts, expected, "{provider_id}");
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The registry's contract surface names a sentinel that is not on disk: no pipeline is
+        // resolved there, so no axis is knowable and every one stays undeclared.
+        let surface = LoadSpec::new(gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(
+            weights_free_memory_strategy_contract(crate::pipeline::MODEL_ID, &surface)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+    }
 
     fn write_tensor_file(
         path: &Path,

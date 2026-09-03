@@ -81,6 +81,9 @@ fn curated_samplers_preserve_identity() {
         adapters: Vec::new(),
         sdxl: SdxlComponents::from_spec(&sdxl_spec)
             .expect("stage SDXL components (IID_TOKENIZER_CLIP_L / _BIGG, IID_VAE_FP16_FIX)"),
+        openpose: None,
+        // Staged on the composition so it is priced; `with_face` below attaches it.
+        face_dir: Some(env_path("IID_FACE_DIR")),
     };
     let mut model = InstantId::load(&paths)
         .expect("load InstantID")

@@ -50,6 +50,161 @@ pub fn memory_strategy_conformance(contract: &MemoryProviderContract) {
     }
 }
 
+/// Check the **E1 asset-facts half** of [`check_memory_contract_facts`] on its own.
+///
+/// This is separately public because a weights-free contract cannot satisfy E2 — it has no
+/// `config.json` to read, so `MemoryArchitectureFacts::default()` is its honest state — while its
+/// byte decomposition is still a claim that must hold. Such a test calls this entry point and
+/// asserts `architecture_facts.is_empty()` alongside it.
+///
+/// Two defects are rejected:
+///
+/// 1. **A base total that is not its own decomposition.** `asset_facts.base_bytes` must equal
+///    `conditioning_bytes + transformer_bytes + decoder_bytes` exactly. Auxiliary residency is
+///    declared once in `overlay_bytes` and is never folded into `base_bytes` as well. A component
+///    sum that overflows `u64` is reported rather than saturated: saturation would let a broken
+///    `base_bytes` of `u64::MAX` match.
+/// 2. **One total repeated in two component fields.** A provider that cannot price a component
+///    separately must not paper over it by copying another component's byte count; a repeated
+///    non-zero total is a dishonest decomposition even when the sum happens to add up.
+pub fn check_memory_contract_asset_facts(
+    contract: &MemoryProviderContract,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let facts = &contract.asset_facts;
+
+    match facts
+        .conditioning_bytes
+        .checked_add(facts.transformer_bytes)
+        .and_then(|bytes| bytes.checked_add(facts.decoder_bytes))
+    {
+        Some(decomposed) if decomposed != facts.base_bytes => {
+            errors.push(format!(
+                "asset_facts.base_bytes ({}) must equal conditioning ({}) + transformer ({}) + decoder ({}) = {decomposed}",
+                facts.base_bytes, facts.conditioning_bytes, facts.transformer_bytes, facts.decoder_bytes
+            ));
+        }
+        None => errors.push("base component byte sum overflow".to_owned()),
+        _ => {}
+    }
+
+    for (left_name, left, right_name, right) in [
+        (
+            "conditioning_bytes",
+            facts.conditioning_bytes,
+            "transformer_bytes",
+            facts.transformer_bytes,
+        ),
+        (
+            "conditioning_bytes",
+            facts.conditioning_bytes,
+            "decoder_bytes",
+            facts.decoder_bytes,
+        ),
+        (
+            "transformer_bytes",
+            facts.transformer_bytes,
+            "decoder_bytes",
+            facts.decoder_bytes,
+        ),
+    ] {
+        if left != 0 && left == right {
+            errors.push(format!(
+                "asset_facts.{left_name} and asset_facts.{right_name} repeat the same total ({left}); \
+                 a component that cannot be priced separately must not borrow another component's bytes"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for [`check_memory_contract_asset_facts`].
+pub fn assert_memory_contract_asset_facts_conform(contract: &MemoryProviderContract) {
+    if let Err(errors) = check_memory_contract_asset_facts(contract) {
+        panic!(
+            "memory-contract asset-facts conformance FAILED for '{}':\n- {}",
+            contract.provider_id,
+            errors.join("\n- ")
+        );
+    }
+}
+
+/// Check that a contract's provider-owned *facts* are honest (epic SC-22657, E1 + E2).
+///
+/// This is deliberately a second, opt-in check rather than an addition to
+/// [`check_memory_strategy_contract`]: providers adopt the facts axes one at a time, and a provider
+/// which has not adopted them yet must keep passing the shared conformance walk unchanged.
+///
+/// The E1 byte-decomposition defects are delegated to [`check_memory_contract_asset_facts`]. On top
+/// of them this rejects:
+///
+/// **E2 — no declared architecture facts on a lifecycle-phase provider.** A provider publishing
+/// [`gen_core::MemoryFormulaKind::PhaseEnvelope`] or
+/// [`gen_core::MemoryFormulaKind::ComponentPhaseEnvelope`] claims per-phase activation behavior,
+/// which no caller can estimate from bytes alone. Such a contract must declare at least one axis
+/// derived from a component config — parsed from the snapshot, or mirrored as a crate constant.
+/// `activation_dtype_width` does not count: providers emit it from a crate-wide dtype constant, so
+/// it is present whether or not any geometry was stated — see
+/// [`gen_core::MemoryArchitectureFacts::has_declared_architecture_axis`].
+///
+/// A `Some(0)` on any architecture axis is rejected as well: an absent axis is `None`, and a zero
+/// silently zeroes any activation estimate that multiplies by it.
+///
+/// **Which contracts this applies to is backend-dependent, so it is not the registry-wide gate.**
+/// A Candle provider derives its axes only once a snapshot root exists, so its weights-free
+/// contract publishes `MemoryArchitectureFacts::default()` and the E2 arm here would flag it —
+/// call [`check_memory_contract_asset_facts`] and assert `architecture_facts.is_empty()` on that
+/// path instead, and run this only against a contract built for a materialized snapshot. An MLX
+/// provider mirrors compile-time presets, so its weights-free contract already carries axes and
+/// passes this unchanged. [`check_memory_contract_surface_registry_facts`] is where that split is
+/// resolved per backend for a whole registry.
+pub fn check_memory_contract_facts(contract: &MemoryProviderContract) -> Result<(), Vec<String>> {
+    let mut errors = check_memory_contract_asset_facts(contract)
+        .err()
+        .unwrap_or_default();
+
+    let phase_formula = matches!(
+        contract.formula,
+        gen_core::MemoryFormulaKind::PhaseEnvelope { .. }
+            | gen_core::MemoryFormulaKind::ComponentPhaseEnvelope { .. }
+    );
+    if phase_formula && !contract.architecture_facts.has_declared_architecture_axis() {
+        errors.push(
+            "a provider publishing a lifecycle-phase formula must declare at least one \
+             config-derived architecture fact; activation_dtype_width alone is a crate-wide \
+             compile-time constant, not evidence that any component geometry was stated"
+                .to_owned(),
+        );
+    }
+    for axis in contract.architecture_facts.zero_valued_axes() {
+        errors.push(format!(
+            "architecture_facts.{axis} is Some(0); a structurally absent axis is declared None, never zero"
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for [`check_memory_contract_facts`].
+pub fn assert_memory_contract_facts_conform(contract: &MemoryProviderContract) {
+    if let Err(errors) = check_memory_contract_facts(contract) {
+        panic!(
+            "memory-contract facts conformance FAILED for '{}':\n- {}",
+            contract.provider_id,
+            errors.join("\n- ")
+        );
+    }
+}
+
 /// Weights-free behavioral walk over every memory-strategy registration in an explicit catalog.
 ///
 /// Static contract conformance runs for every registration. A contract that declares native/PiD
@@ -137,6 +292,186 @@ pub fn memory_contract_surface_registry_conformance(registry: &ProviderRegistry)
             "memory-contract surface registry conformance FAILED:\n- {}",
             errors.join("\n- ")
         );
+    }
+}
+
+/// A materialized snapshot root to re-derive one provider's architecture facts against.
+///
+/// Supplied by the caller of [`check_memory_contract_surface_registry_facts`] for the providers
+/// whose own test fixtures can stand one up. Returning `None` for a provider means "this registry
+/// has no root to offer here", and that provider is checked on the weights-free arm only.
+pub type MaterializedRootLookup<'a> = &'a dyn Fn(&str) -> Option<std::path::PathBuf>;
+
+/// What a registry-wide facts walk actually covered, so its caller can refuse a vacuous run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryContractSurfaceFactsCoverage {
+    /// Contract surfaces walked on the weights-free arm.
+    pub surfaces_checked: usize,
+    /// Distinct providers re-derived against a caller-supplied materialized snapshot root and
+    /// required to declare an architecture axis.
+    pub materialized_providers_checked: usize,
+}
+
+/// Registry-wide facts walk over every registered contract surface (SC-22657, E1 + E2).
+///
+/// # What every surface is held to
+///
+/// The weights-free surface is built with no snapshot on disk, so [`check_memory_contract_facts`]
+/// would wrongly flag a lifecycle-phase provider on this path. Its byte decomposition still holds,
+/// so [`check_memory_contract_asset_facts`] runs on every surface, and a `Some(0)` on any axis is
+/// rejected everywhere: an absent axis is `None`.
+///
+/// # The weights-free architecture rule is keyed on the backend
+///
+/// Whether a weights-free surface may declare an architecture axis is **not** a single rule; it
+/// depends on where that backend's providers get their geometry, so
+/// [`gen_core::MemoryBackendRealization`] selects between two:
+///
+/// * **[`gen_core::MemoryBackendRealization::CandleCuda`] — must publish
+///   [`gen_core::MemoryArchitectureFacts::default`].** A Candle provider's axes are gated on
+///   `candle_gen::architecture_facts::snapshot_root`, which yields nothing for the sentinel path the
+///   registry builds surfaces against. An axis appearing here therefore did *not* come from a
+///   component config; it was fabricated from the provider id, and the estimate built on it would
+///   describe whatever model the id was assumed to name rather than the one on disk.
+/// * **[`gen_core::MemoryBackendRealization::MlxMetal`] — must declare at least one axis.** An MLX
+///   provider builds its geometry from compile-time preset constants that exist before any snapshot
+///   does, so there is no snapshot read to wait for and nothing is fabricated by stating them. The
+///   silent state worth catching on that backend is the opposite one: a surface that declares
+///   nothing has skipped facts it already holds, so the *absence* of an axis is the defect.
+///
+/// `activation_dtype_width` is exempt from both arms — see
+/// [`gen_core::MemoryArchitectureFacts::has_declared_architecture_axis`], which excludes it: it is a
+/// crate-wide dtype constant, so it neither proves a Candle surface read a config nor counts as an
+/// MLX surface having stated its geometry.
+///
+/// # The materialized arm
+///
+/// The weights-free walk alone cannot see whether a Candle provider *would* derive anything: a
+/// provider that returned `MemoryArchitectureFacts::default()` unconditionally passes it. When
+/// `materialized_root` yields a root for a provider, this rebuilds that provider's contract through
+/// its real [`gen_core::MemoryRegistration::contract`] factory against that root and requires
+/// [`gen_core::MemoryArchitectureFacts::has_declared_architecture_axis`] — which is exactly the
+/// assertion the unconditional-`default()` mutation fails.
+pub fn check_memory_contract_surface_registry_facts(
+    registry: &ProviderRegistry,
+    materialized_root: Option<MaterializedRootLookup<'_>>,
+) -> Result<MemoryContractSurfaceFactsCoverage, Vec<String>> {
+    let surfaces = registry
+        .memory_contract_surfaces()
+        .map_err(|error| vec![error.to_string()])?;
+    let mut errors = Vec::new();
+    let mut coverage = MemoryContractSurfaceFactsCoverage::default();
+    let mut materialized_seen = std::collections::BTreeSet::new();
+    for surface in surfaces {
+        coverage.surfaces_checked += 1;
+        let label = format!(
+            "{} [{}]",
+            surface.contract.provider_id,
+            surface.selector.id()
+        );
+        if let Err(contract_errors) = check_memory_contract_asset_facts(&surface.contract) {
+            errors.extend(
+                contract_errors
+                    .into_iter()
+                    .map(|error| format!("{label}: {error}")),
+            );
+        }
+        let declares = surface
+            .contract
+            .architecture_facts
+            .has_declared_architecture_axis();
+        match surface.contract.backend {
+            gen_core::MemoryBackendRealization::CandleCuda { .. } if declares => {
+                errors.push(format!(
+                    "{label}: a Candle weights-free contract surface must publish \
+                     MemoryArchitectureFacts::default(), but this one declares an architecture \
+                     axis; Candle axes are gated on a materialized snapshot root, so an axis here \
+                     was inferred from the provider id rather than from a component config"
+                ));
+            }
+            gen_core::MemoryBackendRealization::MlxMetal { .. } if !declares => {
+                errors.push(format!(
+                    "{label}: an MLX weights-free contract surface must declare at least one \
+                     architecture axis; MLX geometry is mirrored from compile-time preset \
+                     constants that exist before any snapshot does, so declaring nothing withholds \
+                     facts the provider already holds (activation_dtype_width does not count)"
+                ));
+            }
+            _ => {}
+        }
+        for axis in surface.contract.architecture_facts.zero_valued_axes() {
+            errors.push(format!(
+                "{label}: architecture_facts.{axis} is Some(0); a structurally absent axis is \
+                 declared None, never zero"
+            ));
+        }
+
+        let Some(lookup) = materialized_root else {
+            continue;
+        };
+        if !materialized_seen.insert(surface.contract.provider_id.clone()) {
+            continue;
+        }
+        let Some(root) = lookup(&surface.contract.provider_id) else {
+            continue;
+        };
+        let Some(registration) = registry
+            .memory_strategy_registrations()
+            .find(|registration| registration.provider_id == surface.contract.provider_id)
+        else {
+            errors.push(format!(
+                "{label}: a materialized root was supplied, but the registry has no \
+                 memory-strategy registration to rebuild the contract through"
+            ));
+            continue;
+        };
+        let mut spec = surface.spec.clone();
+        spec.weights = gen_core::WeightsSource::Dir(root.clone());
+        match (registration.contract)(&spec) {
+            Ok(contract) => {
+                coverage.materialized_providers_checked += 1;
+                if !contract.architecture_facts.has_declared_architecture_axis() {
+                    errors.push(format!(
+                        "{label}: rebuilt against the materialized snapshot root {}, the contract \
+                         still declares no architecture axis; the provider derives none of the \
+                         geometry its loader builds (activation_dtype_width does not count)",
+                        root.display()
+                    ));
+                }
+                for axis in contract.architecture_facts.zero_valued_axes() {
+                    errors.push(format!(
+                        "{label}: rebuilt against a materialized root, architecture_facts.{axis} \
+                         is Some(0); a structurally absent axis is declared None, never zero"
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "{label}: a materialized root was supplied, but the provider's own contract \
+                 factory rejected {}: {error}",
+                root.display()
+            )),
+        }
+    }
+    if errors.is_empty() {
+        Ok(coverage)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Panic-on-failure entry point for [`check_memory_contract_surface_registry_facts`].
+///
+/// Returns what the walk covered so the caller can assert it was not vacuous.
+pub fn memory_contract_surface_registry_facts_conformance(
+    registry: &ProviderRegistry,
+    materialized_root: Option<MaterializedRootLookup<'_>>,
+) -> MemoryContractSurfaceFactsCoverage {
+    match check_memory_contract_surface_registry_facts(registry, materialized_root) {
+        Ok(coverage) => coverage,
+        Err(errors) => panic!(
+            "memory-contract surface registry facts conformance FAILED:\n- {}",
+            errors.join("\n- ")
+        ),
     }
 }
 
@@ -673,6 +1008,408 @@ mod tests {
             explicit_evaluation_and_synchronization: true,
             cache_eviction: true,
         }
+    }
+
+    /// Honest baseline for the facts check: a decomposable base total, three distinct component
+    /// totals, a lifecycle-phase formula, and one declared architecture axis.
+    fn facts_contract() -> MemoryProviderContract {
+        let mut contract = MemoryProviderContract::compatibility_default("facts", backend());
+        contract.asset_facts = gen_core::MemoryAssetFacts {
+            base_bytes: 60,
+            conditioning_bytes: 10,
+            transformer_bytes: 20,
+            decoder_bytes: 30,
+            overlay_bytes: 0,
+        };
+        contract.formula = gen_core::MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![MemoryPhase::Denoise],
+            variables: vec![gen_core::MemoryFormulaVariable::AssetBytes],
+        };
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(30),
+            head_dim: Some(128),
+            transformer_blocks: Some(30),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        contract
+    }
+
+    #[test]
+    fn honest_contract_facts_conform() {
+        let contract = facts_contract();
+        check_memory_contract_facts(&contract).unwrap();
+        assert_memory_contract_facts_conform(&contract);
+    }
+
+    #[test]
+    fn base_bytes_that_is_not_its_own_decomposition_is_rejected() {
+        let mut contract = facts_contract();
+        // The classic dishonest shape: an overlay folded into the total but into no component.
+        contract.asset_facts.base_bytes += 5;
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must equal conditioning")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn one_total_repeated_in_two_component_fields_is_rejected() {
+        let mut contract = facts_contract();
+        // Decoder bytes borrowed for the conditioning phase: the sum still adds up, the
+        // decomposition is still a lie.
+        contract.asset_facts.conditioning_bytes = 30;
+        contract.asset_facts.base_bytes = 30 + 20 + 30;
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors.iter().any(|error| error
+                .contains("asset_facts.conditioning_bytes and asset_facts.decoder_bytes repeat")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_component_pair_is_not_treated_as_a_repeat() {
+        let mut contract = facts_contract();
+        contract.asset_facts.conditioning_bytes = 0;
+        contract.asset_facts.decoder_bytes = 0;
+        contract.asset_facts.base_bytes = contract.asset_facts.transformer_bytes;
+        check_memory_contract_facts(&contract).unwrap();
+    }
+
+    #[test]
+    fn all_absent_architecture_facts_on_a_phase_provider_are_rejected() {
+        for formula in [
+            gen_core::MemoryFormulaKind::PhaseEnvelope {
+                phases: vec![MemoryPhase::Denoise],
+                variables: vec![gen_core::MemoryFormulaVariable::AssetBytes],
+            },
+            gen_core::MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases: vec![MemoryPhase::Denoise],
+                variables: vec![gen_core::MemoryFormulaVariable::AssetBytes],
+                resident_components: Vec::new(),
+            },
+        ] {
+            let mut contract = facts_contract();
+            contract.formula = formula;
+            contract.architecture_facts = gen_core::MemoryArchitectureFacts::default();
+            let errors = check_memory_contract_facts(&contract).unwrap_err();
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("must declare at least one config-derived architecture fact")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    /// The E2 gate must not be satisfiable by a compile-time constant. `activation_dtype_width` is
+    /// emitted from the provider's pinned dtype whether or not a single component `config.json` was
+    /// found, so a contract carrying only that axis has read nothing and must still be rejected.
+    #[test]
+    fn activation_dtype_width_alone_does_not_satisfy_the_architecture_gate() {
+        let mut contract = facts_contract();
+        contract.formula = gen_core::MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![MemoryPhase::Denoise],
+            variables: vec![gen_core::MemoryFormulaVariable::AssetBytes],
+        };
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts {
+            activation_dtype_width: Some(2),
+            ..Default::default()
+        };
+        assert!(!contract.architecture_facts.is_empty());
+        assert!(!contract.architecture_facts.has_declared_architecture_axis());
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must declare at least one config-derived")),
+            "{errors:?}"
+        );
+        // One genuinely config-derived axis alongside it is accepted.
+        contract.architecture_facts.transformer_blocks = Some(30);
+        check_memory_contract_facts(&contract).unwrap();
+    }
+
+    // ---- the backend-keyed weights-free architecture rule (SC-22661 reconciliation) ------------
+
+    const CANDLE_BACKEND: MemoryBackendRealization = MemoryBackendRealization::CandleCuda {
+        device_residency: true,
+        host_backed_weights: false,
+        host_to_device_block_materialization: true,
+        block_materialization: gen_core::MemoryWindowMaterialization::DeviceFormatTransfer,
+    };
+
+    /// One config-derived axis set, the shape either backend publishes once geometry is known.
+    fn declared_axes() -> gen_core::MemoryArchitectureFacts {
+        gen_core::MemoryArchitectureFacts {
+            transformer_blocks: Some(30),
+            activation_dtype_width: Some(2),
+            ..Default::default()
+        }
+    }
+
+    /// `activation_dtype_width` only — the crate-wide constant that must satisfy neither arm.
+    fn dtype_only_axes() -> gen_core::MemoryArchitectureFacts {
+        gen_core::MemoryArchitectureFacts {
+            activation_dtype_width: Some(2),
+            ..Default::default()
+        }
+    }
+
+    fn surface_contract(
+        provider_id: &str,
+        backend: MemoryBackendRealization,
+        facts: gen_core::MemoryArchitectureFacts,
+    ) -> gen_core::Result<MemoryProviderContract> {
+        let mut contract = MemoryProviderContract::compatibility_default(provider_id, backend);
+        contract.architecture_facts = facts;
+        Ok(contract)
+    }
+
+    /// The honest Candle shape: axes appear only once the snapshot root exists on disk, exactly
+    /// like `candle_gen::architecture_facts::snapshot_root` gates them.
+    fn candle_honest(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let materialized = matches!(&spec.weights, WeightsSource::Dir(root) if root.is_dir());
+        surface_contract(
+            "candle_route",
+            CANDLE_BACKEND,
+            if materialized {
+                declared_axes()
+            } else {
+                Default::default()
+            },
+        )
+    }
+
+    /// The Candle defect the weights-free arm exists to catch: geometry with nothing to read it
+    /// from, so it came from the provider id.
+    fn candle_fabricating(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("candle_route", CANDLE_BACKEND, declared_axes())
+    }
+
+    /// The Candle defect only the materialized arm can catch: `default()` unconditionally, which
+    /// the weights-free walk cannot distinguish from honesty.
+    fn candle_never_derives(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("candle_route", CANDLE_BACKEND, Default::default())
+    }
+
+    /// A Candle route that publishes only the crate-wide dtype constant on a materialized root has
+    /// still derived no geometry.
+    fn candle_dtype_only(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("candle_route", CANDLE_BACKEND, dtype_only_axes())
+    }
+
+    /// The honest MLX shape: preset constants exist before any snapshot does.
+    fn mlx_preset(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("mlx_route", backend(), declared_axes())
+    }
+
+    /// The MLX defect: a weights-free surface withholding geometry the crate already holds.
+    fn mlx_silent(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("mlx_route", backend(), Default::default())
+    }
+
+    /// ...and the constant that must not be mistaken for it.
+    fn mlx_dtype_only(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+        let _ = spec;
+        surface_contract("mlx_route", backend(), dtype_only_axes())
+    }
+
+    fn registry_of(
+        provider_id: &'static str,
+        contract: fn(&LoadSpec) -> gen_core::Result<MemoryProviderContract>,
+    ) -> ProviderRegistry {
+        gen_core::ProviderRegistryBuilder::new()
+            .register_composed_memory_strategy(MemoryRegistration {
+                provider_id,
+                contract,
+                safety_check: gen_core::default_registered_memory_strategy_safety_check,
+            })
+            .register_memory_contract_fixture(MemoryContractFixtureRegistration {
+                provider_id,
+                contract,
+                surface_specs: gen_core::mlx_memory_contract_surface_specs,
+            })
+            .build()
+            .expect("a single paired memory route builds")
+    }
+
+    /// AC (SC-22661 reconciliation, arm 1): a **Candle** weights-free surface must publish
+    /// `MemoryArchitectureFacts::default()`. Its axes are gated on a materialized snapshot root the
+    /// registry deliberately does not create, so an axis here was inferred from the provider id.
+    #[test]
+    fn a_candle_weights_free_surface_may_not_declare_an_architecture_axis() {
+        let honest = registry_of("candle_route", candle_honest);
+        let coverage = memory_contract_surface_registry_facts_conformance(&honest, None);
+        assert!(
+            coverage.surfaces_checked > 0,
+            "the walk had nothing to check"
+        );
+        assert_eq!(coverage.materialized_providers_checked, 0);
+
+        let errors = check_memory_contract_surface_registry_facts(
+            &registry_of("candle_route", candle_fabricating),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Candle weights-free contract surface must publish")),
+            "{errors:?}"
+        );
+        // The crate-wide dtype constant is not an axis, so publishing only it is still honest here.
+        check_memory_contract_surface_registry_facts(
+            &registry_of("candle_route", candle_dtype_only),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// AC (SC-22661 reconciliation, arm 2): an **MLX** weights-free surface must declare at least
+    /// one axis. MLX geometry is mirrored from compile-time presets that exist before a snapshot
+    /// does, so declaring nothing withholds facts the crate already holds.
+    #[test]
+    fn an_mlx_weights_free_surface_must_declare_an_architecture_axis() {
+        memory_contract_surface_registry_facts_conformance(
+            &registry_of("mlx_route", mlx_preset),
+            None,
+        );
+
+        for (label, contract) in [
+            ("nothing at all", mlx_silent as fn(&LoadSpec) -> _),
+            ("only the dtype constant", mlx_dtype_only),
+        ] {
+            let errors = check_memory_contract_surface_registry_facts(
+                &registry_of("mlx_route", contract),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("MLX weights-free contract surface must declare at least one")),
+                "{label}: {errors:?}"
+            );
+        }
+    }
+
+    /// AC (SC-22661): the materialized arm is what makes the registry walk non-vacuous for E2. A
+    /// provider that returns `MemoryArchitectureFacts::default()` unconditionally passes every
+    /// weights-free assertion and fails only here.
+    #[test]
+    fn a_provider_that_never_derives_an_axis_fails_only_the_materialized_arm() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let lookup = |_: &str| Some(path.clone());
+
+        // Honest: the same root yields geometry, and the walk records that it checked it.
+        let coverage = memory_contract_surface_registry_facts_conformance(
+            &registry_of("candle_route", candle_honest),
+            Some(&lookup),
+        );
+        assert_eq!(coverage.materialized_providers_checked, 1);
+
+        // The `::default()` mutation: invisible weights-free, rejected here.
+        let never = registry_of("candle_route", candle_never_derives);
+        check_memory_contract_surface_registry_facts(&never, None)
+            .expect("the weights-free walk cannot see this defect");
+        let errors =
+            check_memory_contract_surface_registry_facts(&never, Some(&lookup)).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("still declares no architecture axis")),
+            "{errors:?}"
+        );
+
+        // A provider the lookup declines is checked on the weights-free arm only.
+        let none = |_: &str| None;
+        let coverage = memory_contract_surface_registry_facts_conformance(&never, Some(&none));
+        assert_eq!(coverage.materialized_providers_checked, 0);
+    }
+
+    /// A component sum that overflows `u64` must be reported, not saturated into agreement with a
+    /// `base_bytes` of `u64::MAX`.
+    #[test]
+    fn an_overflowing_base_component_sum_is_rejected_rather_than_saturated() {
+        let mut contract = facts_contract();
+        contract.asset_facts.conditioning_bytes = u64::MAX;
+        contract.asset_facts.transformer_bytes = 1;
+        contract.asset_facts.decoder_bytes = 2;
+        contract.asset_facts.base_bytes = u64::MAX;
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "base component byte sum overflow"),
+            "{errors:?}"
+        );
+    }
+
+    /// The E1 half stands alone for the weights-free path, and the E2 gate is *not* applied there.
+    #[test]
+    fn the_asset_facts_entry_point_checks_e1_without_the_architecture_gate() {
+        let mut contract = facts_contract();
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts::default();
+        check_memory_contract_asset_facts(&contract).unwrap();
+        assert_memory_contract_asset_facts_conform(&contract);
+        // ...and it still rejects a dishonest decomposition.
+        contract.asset_facts.base_bytes += 5;
+        let errors = check_memory_contract_asset_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must equal conditioning")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "memory-contract asset-facts conformance FAILED for 'facts'")]
+    fn the_panicking_asset_facts_entry_point_names_the_provider() {
+        let mut contract = facts_contract();
+        contract.asset_facts.base_bytes += 1;
+        assert_memory_contract_asset_facts_conform(&contract);
+    }
+
+    #[test]
+    fn a_provider_without_a_phase_formula_may_still_declare_no_architecture_facts() {
+        let mut contract = facts_contract();
+        contract.formula = gen_core::MemoryFormulaKind::AssetBytesPlusHeadroom;
+        contract.architecture_facts = gen_core::MemoryArchitectureFacts::default();
+        check_memory_contract_facts(&contract).unwrap();
+    }
+
+    #[test]
+    fn a_zero_valued_architecture_axis_is_rejected() {
+        let mut contract = facts_contract();
+        contract.architecture_facts.vae_temporal_scale = Some(0);
+        let errors = check_memory_contract_facts(&contract).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("architecture_facts.vae_temporal_scale is Some(0)")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "memory-contract facts conformance FAILED for 'facts'")]
+    fn the_panicking_entry_point_names_the_provider() {
+        let mut contract = facts_contract();
+        contract.asset_facts.base_bytes += 1;
+        assert_memory_contract_facts_conform(&contract);
     }
 
     #[test]

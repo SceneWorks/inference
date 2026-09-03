@@ -57,7 +57,7 @@ use crate::restore;
 
 /// The InstantID compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the face stack runs f32 inside [`candle_gen_face`]).
-const DTYPE: DType = DType::F16;
+pub(crate) const DTYPE: DType = DType::F16;
 
 /// ArcFace embedding width.
 const EMBEDDING_DIM: usize = 512;
@@ -237,6 +237,22 @@ pub struct InstantIdPaths {
     /// from a caller-staged [`LoadSpec::components`](candle_gen::gen_core::LoadSpec::components), so a
     /// missing or unknown component is a load-time contract error — never a mid-render self-fetch.
     pub sdxl: SdxlComponents,
+    /// The OpenPose SDXL ControlNet (`xinsir/controlnet-openpose-sdxl-1.0`) pose mode holds resident
+    /// alongside IdentityNet, or `None` for the identity/angle routes that never load it.
+    ///
+    /// This lives on the priced composition rather than only on the builder because
+    /// [`InstantId::with_openpose`] loads a **whole second SDXL ControlNet** — a network the memory
+    /// contract has to charge in `overlay_bytes` (epic SC-22657, E1). Setting it here prices it at
+    /// [`InstantId::load_with_memory_context`]; calling `with_openpose` afterwards re-seals the
+    /// contract onto the same composition.
+    pub openpose: Option<WeightsSource>,
+    /// Dir holding the [`candle_gen_face`] SCRFD + ArcFace stack (`candle_gen_face::load_on`), or
+    /// `None` when the caller supplies its own face embedding.
+    ///
+    /// Priced for the same reason as [`openpose`](Self::openpose): the stack is resident for the
+    /// whole request and loads at **f32**, so leaving it off the composition under-declared it
+    /// entirely.
+    pub face_dir: Option<PathBuf>,
 }
 
 /// One InstantID generation request.
@@ -436,9 +452,10 @@ impl MemoryRequestScope for MemoryScopeHandle {
 
 #[derive(Clone)]
 struct InstantIdReload {
+    /// The priced composition. The OpenPose ControlNet and the face-stack dir live HERE rather than
+    /// beside it: they used to be reload-only fields, which meant a staged reload re-materialized
+    /// two networks the memory contract had never been shown (epic SC-22657, E1).
     paths: InstantIdPaths,
-    openpose: Option<WeightsSource>,
-    face_dir: Option<PathBuf>,
     pid: Option<PidWeights>,
 }
 
@@ -446,8 +463,6 @@ impl InstantIdReload {
     fn new(paths: &InstantIdPaths) -> Self {
         Self {
             paths: paths.clone(),
-            openpose: None,
-            face_dir: None,
             pid: None,
         }
     }
@@ -487,7 +502,7 @@ impl InstantId {
         })?;
         let resampler =
             Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::instantid_face())?;
-        let face = match &self.reload.face_dir {
+        let face = match &self.reload.paths.face_dir {
             Some(dir) => Some(candle_gen_face::load_on(dir, &self.device)?),
             None => None,
         };
@@ -516,7 +531,7 @@ impl InstantId {
             ))
         })?;
         unet.install_ip_adapter(load_ip_kv_pairs(&ipa)?)?;
-        let openpose = match &self.reload.openpose {
+        let openpose = match &self.reload.paths.openpose {
             Some(source) => Some(load_sdxl_controlnet(source, &self.device, DTYPE)?),
             None => None,
         };
@@ -800,19 +815,46 @@ impl InstantId {
     /// Attach the OpenPose ControlNet for pose mode (sc-3117) — a stock diffusers SDXL ControlNet
     /// (`xinsir/controlnet-openpose-sdxl-1.0`), loaded via the same [`load_sdxl_controlnet`] as
     /// IdentityNet. Required by [`generate_pose`](Self::generate_pose).
+    ///
+    /// Attaching it CHANGES the priced composition, so the sealed memory contract is re-priced over
+    /// the new [`InstantIdPaths`] (epic SC-22657, E1) — a second SDXL ControlNet resident on the
+    /// admitted route must not be charged in no field. Nothing else about the seal moves: only
+    /// the contract's `asset_facts` are replaced, so the calibration identity and every
+    /// declared capability stay byte-identical to what [`load_with_memory_context`](Self::load_with_memory_context)
+    /// admitted.
     pub fn with_openpose(mut self, openpose: &WeightsSource) -> Result<Self> {
-        self.reload.openpose = Some(openpose.clone());
+        self.reload.paths.openpose = Some(openpose.clone());
+        self.reprice_sealed_contract()?;
         if !self.staged_residency {
             self.openpose = Some(load_sdxl_controlnet(openpose, &self.device, DTYPE)?);
         }
         Ok(self)
     }
 
+    /// Re-price the sealed contract's [`MemoryAssetFacts`] after the composition gained a network.
+    ///
+    /// A no-op on a model loaded without a memory context (nothing was sealed). Every other field of
+    /// the sealed contract — calibration fingerprint, strategies, formula, lifecycle — is left
+    /// exactly as admitted, so re-pricing cannot silently move the contract's identity; only the
+    /// bytes it declares grow to cover what is now resident.
+    fn reprice_sealed_contract(&mut self) -> Result<()> {
+        let Some(contract) = self.memory_contract.as_mut() else {
+            return Ok(());
+        };
+        contract.asset_facts = crate::memory_strategy::asset_facts(&self.reload.paths)
+            .map_err(|error| CandleError::Msg(error.to_string()))?;
+        Ok(())
+    }
+
     /// Attach the native face-analysis stack (SCRFD detector + ArcFace embedder) so `generate` can
     /// take a raw reference image. `dir` holds `scrfd_10g.safetensors` + `arcface_iresnet100.safetensors`
     /// (the [`candle_gen_face`] layout). The stack loads onto this model's device.
+    ///
+    /// Like [`with_openpose`](Self::with_openpose), this changes the priced composition and re-prices
+    /// the sealed contract's asset facts (and nothing else) over the new [`InstantIdPaths`].
     pub fn with_face(mut self, dir: &Path) -> Result<Self> {
-        self.reload.face_dir = Some(dir.to_path_buf());
+        self.reload.paths.face_dir = Some(dir.to_path_buf());
+        self.reprice_sealed_contract()?;
         if !self.staged_residency {
             self.face = Some(candle_gen_face::load_on(dir, &self.device)?);
         }
@@ -1231,7 +1273,7 @@ impl InstantId {
         if let Some(kps) = face_kps {
             validate_kps(kps)?;
         }
-        if self.reload.openpose.is_none() && self.openpose.is_none() {
+        if self.reload.paths.openpose.is_none() && self.openpose.is_none() {
             return Err(CandleError::Msg(
                 "instantid: pose mode needs the OpenPose ControlNet (with_openpose)".into(),
             ));
@@ -1652,6 +1694,86 @@ mod tests {
         assert!(error.is_err(), "resident switch must attempt a real reload");
         assert!(model.staged_residency, "failed switch rolls back strategy");
         assert!(model.conditioner.is_none() && model.unet.is_none() && model.vae.is_none());
+    }
+
+    /// AC (epic SC-22657, E1): `with_openpose` / `with_face` change what the served generator holds
+    /// resident, so the sealed contract is re-priced to cover them — and NOTHING else about the seal
+    /// moves. A contract that kept its load-time asset facts here would let the pose route render
+    /// with two networks charged in no field.
+    #[test]
+    fn attaching_openpose_and_the_face_stack_reseals_the_contract_without_moving_its_identity() {
+        use candle_gen::gen_core::{MemoryBehaviorRoute, MemoryMode, MemoryProviderContract};
+
+        let identity = crate::memory_strategy::InstantIdMemoryIdentity {
+            route: crate::memory_strategy::InstantIdRoute::Pose,
+            adapter_count: 0,
+            use_pid: false,
+            face_restore: false,
+            artifact_fingerprint: "fixture".into(),
+        };
+        let contract = crate::memory_strategy::provider_contract();
+        let mut context = candle_gen::gen_core::standard_memory_behavior_context(
+            &contract,
+            MemoryStrategy::StagedResidency,
+            crate::memory_strategy::resolved_numeric_tier(),
+            MemoryBehaviorRoute {
+                mode: MemoryMode::Other("character_image".into()),
+                reference_count: 1,
+                use_pid: false,
+                has_phases: false,
+                overlay: Some(identity.overlay_key()),
+            },
+        )
+        .unwrap();
+        context.evidence_revision = crate::memory_strategy::REQUEST_EVIDENCE_REVISION.into();
+
+        let temp = tempfile::tempdir().unwrap();
+        let (paths, ..) = crate::memory_strategy::tests::priced_paths(&temp);
+        let (openpose, face, openpose_bytes, face_bytes) =
+            crate::memory_strategy::tests::priced_extras(&temp);
+        // Staged construction touches no weights, so `with_*` below re-prices without loading.
+        let model = InstantId::load_with_memory_context(&paths, identity.clone(), context).unwrap();
+        let sealed = model.memory_contract.clone().unwrap();
+
+        let model = model.with_openpose(&openpose).unwrap();
+        let after_pose = model.memory_contract.clone().unwrap();
+        assert_eq!(
+            after_pose.asset_facts.overlay_bytes,
+            sealed.asset_facts.overlay_bytes + openpose_bytes,
+            "the second SDXL ControlNet must be charged the moment it joins the composition"
+        );
+
+        let model = model.with_face(&face).unwrap();
+        let after_face = model.memory_contract.clone().unwrap();
+        assert_eq!(
+            after_face.asset_facts.overlay_bytes,
+            sealed.asset_facts.overlay_bytes + openpose_bytes + face_bytes
+        );
+        assert_eq!(
+            after_face.asset_facts,
+            crate::memory_strategy::asset_facts(&model.reload.paths).unwrap()
+        );
+        // The base trunk is untouched: re-pricing adds overlays, it does not restate the model.
+        assert_eq!(
+            after_face.asset_facts.base_bytes,
+            sealed.asset_facts.base_bytes
+        );
+
+        // Seal invariants: only the asset facts moved. Identity, capabilities and formula are the
+        // ones admission validated.
+        assert_eq!(after_face.calibration, sealed.calibration);
+        assert_eq!(after_face.strategies, sealed.strategies);
+        assert_eq!(after_face.formula, sealed.formula);
+        assert_eq!(after_face.lifecycle, sealed.lifecycle);
+        assert_eq!(after_face.architecture_facts, sealed.architecture_facts);
+        assert_eq!(
+            MemoryProviderContract {
+                asset_facts: sealed.asset_facts,
+                ..after_face
+            },
+            sealed,
+            "re-pricing must move NOTHING but the declared asset facts"
+        );
     }
 
     #[test]

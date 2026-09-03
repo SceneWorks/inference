@@ -223,8 +223,9 @@ fn should_tile_tail(out_px_max: usize, force_tile: bool) -> bool {
 }
 
 /// Tail-decode tiling geometry (sc-10023): the decoder tail upsamples ×8 spatially, an image VAE has no
-/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`.
-const TAIL_TILING: VaeTiling = VaeTiling {
+/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`. `pub(crate)` so the memory
+/// contract publishes `vae_spatial_scale` from this geometry rather than from a literal.
+pub(crate) const TAIL_TILING: VaeTiling = VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
     causal_temporal: false,

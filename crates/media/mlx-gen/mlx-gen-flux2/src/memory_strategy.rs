@@ -10,13 +10,14 @@
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
-    standard_memory_strategy_safety_check, Error as CoreError, LoadShape, LoadSpec,
-    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget,
-    MemoryCacheState, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    standard_memory_strategy_safety_check, AdapterResidencyMode, Error as CoreError, LoadShape,
+    LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
+    MemoryBehaviorRoute, MemoryBudget, MemoryCacheState, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryOptimizationAuthority,
     MemoryPhase, MemoryPrerequisiteScope, MemoryProviderContract, MemoryRequestScope,
-    MemoryRunContext, MemorySafetyDecision, MemoryStrategy, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, Quant, TransformerComponent,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, Quant, TransformerComponent,
 };
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{GenerationRequest, OffloadPolicy, WeightsSource};
@@ -26,6 +27,50 @@ use crate::config::{Flux2Variant, FLUX2_DEV_CONTROL_ID, FLUX2_DEV_EDIT_ID, FLUX2
 pub const CALIBRATION_FINGERPRINT: &str = "sc-16593-flux2-dev-edit-evidence-v2";
 pub const DEV_T2I_CALIBRATION_FINGERPRINT: &str = "sc-18218-flux2-dev-t2i-resident-evidence-v1";
 pub const DEV_CONTROL_OVERLAY: &str = "control";
+
+/// Architecture axes for one FLUX.2 variant (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as `Flux2Config`, with
+/// `Flux2Config::klein_9b` behind the three Klein routes and `Flux2Config::dev` behind the three Dev
+/// routes. A route's overlay (edit references, KV edit, the control branch) changes what is
+/// resident, never the trunk's shape, so a variant's routes publish one set of axes.
+///
+/// `transformer_blocks` is the **sum** of the double and single stacks: the denoiser traverses both
+/// on every step. `patch_size` is derived rather than declared — `Flux2Config` has no `patch_size`
+/// field; it encodes the packing as `in_channels = num_latent_channels * patch²`.
+///
+/// `vae_temporal_scale` stays `None`: FLUX.2's autoencoder is an image autoencoder with no temporal
+/// axis, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts(
+    config: &crate::config::Flux2Config,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(config.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(config.head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            config
+                .num_double_layers
+                .saturating_add(config.num_single_layers),
+        ),
+        patch_size: latent_patch_size(config),
+        latent_channels: mlx_gen::architecture_facts::axis(config.num_latent_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(config.vae_scale_factor),
+        vae_temporal_scale: None,
+        // Weights are bf16, but the transformer runs f32 activations over them (`model.rs`), so f32
+        // is the width an activation estimate must use.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
+}
+
+/// The square patch edge implied by `in_channels = num_latent_channels * patch²`.
+///
+/// A config whose ratio is not a small perfect square declines the axis rather than rounding one
+/// into existence.
+fn latent_patch_size(config: &crate::config::Flux2Config) -> Option<u32> {
+    let packed = mlx_gen::architecture_facts::axis(config.in_channels)?;
+    let latent = mlx_gen::architecture_facts::axis(config.num_latent_channels)?;
+    (1_u32..=8).find(|edge| edge * edge * latent == packed)
+}
 
 pub fn contract_for_variant(
     variant: Flux2Variant,
@@ -46,6 +91,75 @@ pub fn contract_for_variant(
     Ok(None)
 }
 
+/// The per-component asset bytes a Dev / Dev-Edit load materializes (SC-22667, E1).
+///
+/// Both Dev contracts published `MemoryAssetFacts::default()` — five zeros — on every path,
+/// including the loaded one: `contract_for_variant` builds the contract the generator carries from
+/// load onward, and nothing ever filled the facts in. All-zero facts pass the shared conformance
+/// walk vacuously (`base == cond + trans + dec` holds at `0 == 0`), so the omission never failed; it
+/// handed the fit gate a contract whose `total_resident_bytes()` was 0 for a load that holds the
+/// whole DiT, the Mistral-3 tower with its Pixtral surface, and the VAE.
+///
+/// The split is `crate::model::dev_component_footprint_for` — the registry footprint callback this
+/// crate already exposes for exactly these providers, which resolves the selected language tower
+/// through the same `EncoderContract` gate the load applies (including a pre-packed base selected
+/// without `LoadSpec::quantize`) and prices the DiT and VAE from the snapshot subdirs the load
+/// opens. It is used verbatim rather than re-derived, so the contract and the registry can never
+/// disagree about the base split.
+///
+/// On a spec that names no materialized snapshot — the registry's contract-surface sentinel, or a
+/// placeholder path — there is nothing to read and the declaration stays empty, exactly as the
+/// weights-free Klein contract does. A snapshot the footprint refuses also publishes the empty
+/// declaration; see [`dev_asset_facts_with`] for why that is not a contract refusal here.
+///
+/// The Fun-ControlNet route is deliberately not routed through here: its contract documents why its
+/// facts stay empty (the registry fallback prices the base split and its consumer adds the control
+/// checkpoint), and a fused control branch has no honest home in this decomposition without a typed
+/// component the route's `Affine` formula cannot carry.
+fn dev_asset_facts(provider_id: &str, spec: &LoadSpec) -> MemoryAssetFacts {
+    dev_asset_facts_with(crate::model::dev_component_footprint_for, provider_id, spec)
+}
+
+/// [`dev_asset_facts`] with the footprint derivation passed in, so the mapping and both of its
+/// empty-declaration legs are reachable from a test without a full Dev snapshot on disk.
+///
+/// A footprint **error** publishes the empty declaration rather than refusing the contract. The
+/// registered contract callback is consulted *before* any load — the requested-vs-packed tier
+/// rejection and every other registered safety check read the contract first — on snapshots that
+/// may carry only their transformer tier evidence, and the Dev registry footprint fails closed on
+/// anything short of a complete snapshot. Turning that into a contract refusal would mask the
+/// actionable tier rejection behind an I/O error. The empty declaration is the pre-existing
+/// shape and errs large: `total_resident_bytes()` is 0, so the fit gate credits nothing as already
+/// resident.
+///
+/// The error is swallowed silently rather than logged: this crate carries no `tracing` or `log`
+/// dependency, and the reachable case — a snapshot short of a complete Dev layout, read before any
+/// load — is expected rather than exceptional. What keeps the `Ok` arm from silently becoming
+/// unreachable is a positive test against the real footprint and a complete snapshot, not a log
+/// line: see `the_production_dev_footprint_is_accepted_and_published_for_a_complete_snapshot`.
+fn dev_asset_facts_with(
+    footprint: impl Fn(&str, &LoadSpec) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes>,
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> MemoryAssetFacts {
+    if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return MemoryAssetFacts::default();
+    }
+    let Ok(footprint) = footprint(provider_id, spec) else {
+        return MemoryAssetFacts::default();
+    };
+    MemoryAssetFacts {
+        base_bytes: footprint
+            .text_encoder
+            .saturating_add(footprint.dit)
+            .saturating_add(footprint.vae),
+        conditioning_bytes: footprint.text_encoder,
+        transformer_bytes: footprint.dit,
+        decoder_bytes: footprint.vae,
+        overlay_bytes: 0,
+    }
+}
+
 fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_EDIT_ID,
@@ -56,6 +170,7 @@ fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // The only base/edit calibration receipts are eager-load captures.  A sequential lifecycle
     // releases phases after that eager assembly; it is not deferred-materialization evidence.
     contract.load_shape = LoadShape::EagerMaterialization;
@@ -69,6 +184,7 @@ fn build_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
         CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_EDIT_ID, spec);
     configure_dev_staged_residency(&mut contract, spec, true);
     contract
 }
@@ -83,6 +199,7 @@ fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     // See the edit contract above: this fingerprint remains bound to the measured eager load.
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.formula = MemoryFormulaKind::Affine {
@@ -95,6 +212,7 @@ fn build_dev_t2i_contract_for_spec(spec: &LoadSpec) -> MemoryProviderContract {
         DEV_T2I_CALIBRATION_FINGERPRINT,
         LoadShape::EagerMaterialization,
     ));
+    contract.asset_facts = dev_asset_facts(FLUX2_DEV_ID, spec);
     configure_dev_staged_residency(&mut contract, spec, true);
     contract
 }
@@ -146,10 +264,23 @@ fn configure_dev_staged_residency(
 /// The provider has a real resident execution path, a request-selectable sequential lifecycle, and
 /// a registered component-footprint fallback. It has no control-specific calibration evidence, so
 /// its staged strategy remains estimate-authorized only; the route/tier safety gate below remains
-/// fully load-exact. Asset facts deliberately remain empty: the registry fallback prices the base split,
-/// while its consumer adds the control checkpoint. Relabelling that estimate as provider load-exact
-/// facts would hide the runtime distinction between an effective packed base and a dense control
-/// branch when no explicit quantization request was made.
+/// fully load-exact.
+///
+/// SC-22667 review: the asset facts no longer sit on the all-zero registry fallback. The base
+/// split — the selected language tower, the transformer and the VAE — is the same load-exact
+/// derivation the T2I and Edit routes publish, one call away through
+/// [`crate::model::dev_control_component_footprint`], which is the very callback this route's
+/// registration already declares. Publishing it means the fit gate credits the bytes that are
+/// genuinely resident instead of crediting nothing.
+///
+/// What is deliberately **omitted** is the control BRANCH itself. It has no typed home under this
+/// contract's `Affine` formula (no `MemoryResidentComponent` list, and `overlay_bytes` names an
+/// adapter stack, which a Fun-Controlnet checkpoint is not), and its resident width depends on a
+/// runtime distinction — an effective packed base against a dense control branch — that the
+/// pre-calibration evidence cannot settle. So `overlay_bytes` stays 0 and the branch remains the
+/// consumer's addition on top of these base facts, exactly as before. That errs SMALL against the
+/// branch alone, which is why the route's staged rung stays estimate-authorized and its load-exact
+/// route/tier gate is unchanged.
 fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         FLUX2_DEV_CONTROL_ID,
@@ -160,7 +291,13 @@ fn build_dev_control_contract(spec: &LoadSpec) -> MemoryProviderContract {
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::dev());
     contract.load_shape = spec.load_shape;
+    contract.asset_facts = dev_asset_facts_with(
+        |_, spec| crate::model::dev_control_component_footprint(spec),
+        FLUX2_DEV_CONTROL_ID,
+        spec,
+    );
     // Unlike base/edit, this route is not complete without its separately-addressed control
     // artifact.  Do not publish a selectable staged rung for a bare base `LoadSpec`.
     configure_dev_staged_residency(&mut contract, spec, spec.control.is_some());
@@ -304,9 +441,9 @@ pub fn dev_control_safety_check(
 }
 
 pub fn registered_dev_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_contract_for_spec(_spec))
+    Ok(build_contract_for_spec(spec))
 }
 
 pub fn registered_dev_safety_check(
@@ -323,9 +460,9 @@ pub fn registered_dev_safety_check(
 }
 
 pub fn registered_dev_t2i_contract(
-    _spec: &LoadSpec,
+    spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    Ok(build_dev_t2i_contract_for_spec(_spec))
+    Ok(build_dev_t2i_contract_for_spec(spec))
 }
 
 pub fn registered_dev_t2i_safety_check(
@@ -637,12 +774,34 @@ fn klein_calibration_fingerprint(
     ))
 }
 
+/// Provider-local identity of Klein's resident LoRA/LoKr factor stack.
+const KLEIN_ADAPTER_COMPONENT_ID: &str = "flux2_klein.adapters.forward_residuals";
+
+/// Load-exact bytes of the adapter stack a Klein load keeps resident.
+///
+/// `apply_flux2_adapters` routes into the shared `apply_adapters_strict`, which installs
+/// `AdaptableLinear` residuals evaluated as `base(x) + sum(adapter.residual(x))` and never mutates
+/// the packed base — [`AdapterResidencyMode::Additive`]. `None` from the shared helper means an
+/// additive stack was requested and at least one source could not be sized; fail closed on it
+/// rather than declare a zero the shared validator would wave through.
+fn klein_adapter_bytes(spec: &LoadSpec) -> mlx_gen::gen_core::Result<u64> {
+    mlx_gen::gen_core::adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive)
+        .ok_or_else(|| {
+            mlx_gen::gen_core::Error::Unsupported(
+                "flux2_klein: an adapter stack was requested but at least one source could not be \
+                 sized; refusing to declare a zero the shared validator would wave through"
+                    .to_owned(),
+            )
+        })
+}
+
 fn build_klein_contract(
     provider_id: &str,
     spec: &LoadSpec,
     footprint: mlx_gen::PerComponentBytes,
     streamable: bool,
     calibration: Option<MemoryCalibrationIdentity>,
+    adapter_bytes: u64,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
     let staged = spec.offload_policy == OffloadPolicy::Sequential;
     let clean = klein_overlay(spec).is_none();
@@ -657,23 +816,48 @@ fn build_klein_contract(
             cache_eviction: true,
         },
     );
+    contract.architecture_facts = architecture_facts(&crate::config::Flux2Config::klein_9b());
     contract.load_shape = spec.load_shape;
     contract.calibration = calibration;
-    contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![
-            MemoryPhase::Conditioning,
-            MemoryPhase::Denoise,
-            MemoryPhase::Decode,
-        ],
-        variables: vec![
-            MemoryFormulaVariable::AssetBytes,
-            MemoryFormulaVariable::PixelCount,
-            MemoryFormulaVariable::BatchCount,
-            MemoryFormulaVariable::ConditioningTokenCount,
-            MemoryFormulaVariable::OverlayBytes,
-            MemoryFormulaVariable::DecodeTileArea,
-            MemoryFormulaVariable::TransformerWindowSize,
-        ],
+    let phases = vec![
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ];
+    let variables = vec![
+        MemoryFormulaVariable::AssetBytes,
+        MemoryFormulaVariable::PixelCount,
+        MemoryFormulaVariable::BatchCount,
+        MemoryFormulaVariable::ConditioningTokenCount,
+        MemoryFormulaVariable::OverlayBytes,
+        MemoryFormulaVariable::DecodeTileArea,
+        MemoryFormulaVariable::TransformerWindowSize,
+    ];
+    // SC-22667 (E1): `klein_overlay` lists `adapters` as a live Klein axis and
+    // `validate_klein_load_axes` deliberately does NOT reject it, so an adapted Klein load is a
+    // reachable composition. `load_flux2_heavy` then installs the stack as forward-time residuals
+    // over the (possibly quantized) transformer — the crate's own comment says so — i.e. genuinely
+    // extra resident bytes, never folded into the base. Adapter files live outside the snapshot
+    // tree `from_spec_subdirs` walks, so `overlay_bytes` stayed 0 while the contract already
+    // declared `OverlayBytes` as a formula input. The component axis is claimed only where there
+    // IS an overlay: the shared validator refuses a zero-byte component declaration.
+    contract.asset_facts.overlay_bytes = adapter_bytes;
+    contract.formula = if adapter_bytes == 0 {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables }
+    } else {
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: vec![MemoryResidentComponent {
+                id: KLEIN_ADAPTER_COMPONENT_ID.to_owned(),
+                kind: MemoryComponentKind::AdapterStack,
+                resident_bytes: adapter_bytes,
+                // No published Klein rung bounds the adapter factors: rung 4's window covers the
+                // transformer blocks, and an adapted load withdraws rungs 2-4 anyway.
+                bounded_by: None,
+                residency: MemoryComponentResidency::WholeRender,
+            }],
+        }
     };
     contract.asset_facts.base_bytes = footprint
         .text_encoder
@@ -780,6 +964,7 @@ pub fn klein_contract_for(
         },
         streamable,
         calibration,
+        klein_adapter_bytes(spec)?,
     )
 }
 
@@ -803,6 +988,9 @@ pub(crate) fn weights_free_klein_contract(
             ),
             spec.load_shape,
         )),
+        // No adapter overlay either: sizing one means opening its checkpoint, and this path exists
+        // to produce the declaration without touching a weight file.
+        0,
     )
 }
 
@@ -878,6 +1066,7 @@ pub(crate) fn weights_free_klein_surface_contract(
             ),
             surface.spec.load_shape,
         )),
+        0,
     )
 }
 
@@ -1193,6 +1382,61 @@ mod tests {
         MemoryBudget, MemoryCacheState, MemoryGeometry, MemoryNumericTier, MemorySelection,
     };
     use mlx_gen::{Precision, Quant};
+
+    /// AC (SC-22662): every registered FLUX.2 route publishes the axes of the trunk it runs — the
+    /// three Klein routes the 9B config, the three Dev routes the Dev config — and every contract
+    /// passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_each_variants_own_config() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let klein = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(32),
+            head_dim: Some(128),
+            // 8 double + 24 single blocks.
+            transformer_blocks: Some(32),
+            // `in_channels` 128 = `num_latent_channels` 32 x 2².
+            patch_size: Some(2),
+            latent_channels: Some(32),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            // f32 activations over bf16 weights.
+            activation_dtype_width: Some(4),
+        };
+        let dev = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            // 8 double + 48 single blocks.
+            transformer_blocks: Some(56),
+            ..klein
+        };
+        assert_eq!(
+            architecture_facts(&crate::config::Flux2Config::klein_9b()),
+            klein
+        );
+        assert_eq!(architecture_facts(&crate::config::Flux2Config::dev()), dev);
+
+        for provider_id in [
+            crate::config::FLUX2_KLEIN_9B_ID,
+            crate::config::FLUX2_KLEIN_9B_EDIT_ID,
+            crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ] {
+            let contract = weights_free_klein_contract(provider_id, &spec).unwrap();
+            assert_eq!(contract.architecture_facts, klein, "{provider_id}");
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        for contract in [
+            registered_dev_contract(&spec).unwrap(),
+            registered_dev_t2i_contract(&spec).unwrap(),
+            registered_dev_control_contract(&spec).unwrap(),
+        ] {
+            assert_eq!(
+                contract.architecture_facts, dev,
+                "{} architecture facts",
+                contract.provider_id
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
 
     fn context(total_gb: f64) -> MemoryRunContext {
         let contract = build_contract();
@@ -1624,6 +1868,275 @@ mod tests {
         assert!(reason.contains("Lower the output resolution"), "{reason}");
     }
 
+    /// Feature-end review (SC-22667, E1): the Dev and Dev-Edit contracts published
+    /// `MemoryAssetFacts::default()` on every path, the loaded one included, while the load holds the
+    /// whole DiT, the Mistral-3 tower and the VAE. They now publish the loader's own registry
+    /// footprint whenever the spec names a materialized snapshot the footprint can price, and stay
+    /// empty where there is nothing to read or the footprint refuses the snapshot.
+    ///
+    /// The mapping is exercised through the injectable seam because the production footprint needs
+    /// a complete Dev snapshot on disk. Mutations that fail this: dropping the `materialized_root`
+    /// gate publishes the stub's 12 bytes for the placeholder path; mis-wiring any of the three
+    /// fields or `base_bytes` reds the materialized leg; turning a footprint error into a refusal
+    /// (or into non-zero facts) reds the third leg; and passing `Default::default()` instead of
+    /// `dev_asset_facts(..)` at either production builder reds the registered-contract leg.
+    #[test]
+    fn dev_contracts_publish_the_footprint_only_for_a_materialized_snapshot() {
+        let priced = |_: &str, _: &LoadSpec| {
+            Ok(mlx_gen::PerComponentBytes {
+                text_encoder: 3,
+                dit: 5,
+                vae: 4,
+            })
+        };
+        let refused = |provider_id: &str, _: &LoadSpec| {
+            Err(CoreError::Unsupported(format!(
+                "{provider_id}: fixture snapshot refused"
+            )))
+        };
+
+        // No materialized snapshot — the registry's contract surface and every placeholder-path
+        // caller. Nothing to read, so the declaration stays empty whatever a footprint would say.
+        let placeholder = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert_eq!(
+            dev_asset_facts_with(priced, FLUX2_DEV_ID, &placeholder),
+            MemoryAssetFacts::default()
+        );
+
+        // A materialized snapshot the footprint prices publishes exactly that split, base included.
+        let materialized = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(materialized.path().to_path_buf()));
+        assert_eq!(
+            dev_asset_facts_with(priced, FLUX2_DEV_ID, &spec),
+            MemoryAssetFacts {
+                base_bytes: 12,
+                conditioning_bytes: 3,
+                transformer_bytes: 5,
+                decoder_bytes: 4,
+                overlay_bytes: 0,
+            }
+        );
+
+        // A materialized snapshot the footprint refuses keeps the empty declaration: the registered
+        // contract is read before any load, and the tier rejection behind it must stay reachable.
+        assert_eq!(
+            dev_asset_facts_with(refused, FLUX2_DEV_ID, &spec),
+            MemoryAssetFacts::default()
+        );
+
+        // The production builders are wired to the derivation: an empty materialized directory is
+        // exactly the refused shape (the Dev footprint fails closed short of a complete snapshot),
+        // so both registered contracts still build and still declare nothing.
+        assert!(crate::model::dev_component_footprint(&spec).is_err());
+        for contract in [
+            registered_dev_contract(&spec).unwrap(),
+            registered_dev_t2i_contract(&spec).unwrap(),
+            registered_dev_contract(&placeholder).unwrap(),
+            registered_dev_t2i_contract(&placeholder).unwrap(),
+        ] {
+            assert_eq!(
+                contract.asset_facts,
+                MemoryAssetFacts::default(),
+                "{}",
+                contract.provider_id
+            );
+            assert!(contract.conformance_errors().is_empty());
+        }
+    }
+
+    /// A complete Dev snapshot the **production** `dev_component_footprint_for` accepts, written
+    /// against the real encoder contracts. The weight payload is a sparse `set_len` hole, so a
+    /// logically multi-gigabyte tower costs no disk: the footprint reads safetensors HEADERS and
+    /// never the payload. `write_typed_safetensors` is the same tiny-component trick `model.rs`
+    /// uses for the generic transformer/VAE accounting.
+    fn complete_dev_snapshot(fixture: &std::path::Path) -> LoadSpec {
+        let root = fixture.join("base");
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::config::DEV_ENCODER_CONTRACT,
+            crate::config::DEV_VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        for component in ["transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            let header = br#"{"probe":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            bytes.extend([0_u8; 2]);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        }
+        // No `quantization` section: the base tier is dense, so the selected language tower is
+        // admitted dense and `effective_base_quant` resolves to `None`.
+        std::fs::write(root.join("transformer/config.json"), "{}").unwrap();
+        LoadSpec::new(WeightsSource::Dir(root))
+    }
+
+    /// Feature-end review (SC-22667, E1): the injected-seam test above proves the MAPPING, but
+    /// every leg it drives through a production builder lands on the empty declaration, so nothing
+    /// proved the production footprint can be ACCEPTED at all — a `dev_asset_facts` permanently
+    /// stuck on its `Err` arm would have passed the whole file. This is the positive leg: a
+    /// complete snapshot, the real `dev_component_footprint_for`, non-zero facts out of the
+    /// registered contract.
+    ///
+    /// It also pins issue 3 of the same review: Dev-Control was left on the all-zero fallback while
+    /// its own registered footprint callback sat one call away. Its conditioning must be the
+    /// language tower ALONE — `dev_control_component_footprint` passes
+    /// `include_builtin_multimodal: false` — so it is strictly smaller than T2I's, which proves the
+    /// control route is wired to its OWN footprint rather than borrowing Dev's.
+    ///
+    /// Mutations that fail this:
+    /// * returning `MemoryAssetFacts::default()` from `dev_asset_facts_with`'s `Ok` arm — every
+    ///   `assert!(.. > 0)` reds;
+    /// * dropping the `contract.asset_facts = dev_asset_facts_with(..)` line from
+    ///   `build_dev_control_contract` — the control legs red back to zero;
+    /// * wiring Dev-Control to `dev_component_footprint_for` instead of
+    ///   `dev_control_component_footprint` — the builtin multimodal surface is charged and the
+    ///   strict inequality reds;
+    /// * mis-summing `base_bytes` — the three equality legs red.
+    #[test]
+    fn the_production_dev_footprint_is_accepted_and_published_for_a_complete_snapshot() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = complete_dev_snapshot(fixture.path());
+
+        for (provider_id, contract) in [
+            (FLUX2_DEV_ID, registered_dev_t2i_contract(&spec).unwrap()),
+            (FLUX2_DEV_EDIT_ID, registered_dev_contract(&spec).unwrap()),
+            (
+                FLUX2_DEV_CONTROL_ID,
+                registered_dev_control_contract(&spec).unwrap(),
+            ),
+        ] {
+            let footprint = if provider_id == FLUX2_DEV_CONTROL_ID {
+                crate::model::dev_control_component_footprint(&spec)
+            } else {
+                crate::model::dev_component_footprint_for(provider_id, &spec)
+            }
+            .unwrap_or_else(|error| {
+                panic!("{provider_id}: the production footprint must accept a complete Dev snapshot: {error}")
+            });
+
+            let facts = contract.asset_facts;
+            assert!(
+                facts.conditioning_bytes > 0
+                    && facts.transformer_bytes > 0
+                    && facts.decoder_bytes > 0,
+                "{provider_id}: every phase of a complete snapshot is priced"
+            );
+            assert_eq!(
+                facts.conditioning_bytes, footprint.text_encoder,
+                "{provider_id}"
+            );
+            assert_eq!(facts.transformer_bytes, footprint.dit, "{provider_id}");
+            assert_eq!(facts.decoder_bytes, footprint.vae, "{provider_id}");
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes,
+                "{provider_id}: base_bytes is the split's sum"
+            );
+            assert_eq!(
+                facts.overlay_bytes, 0,
+                "{provider_id}: no adapter stack is configured"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{provider_id}");
+        }
+
+        // The control route omits the builtin Pixtral + projector surface that Dev and Dev-Edit
+        // retain for caption upsampling, so it must price a STRICTLY smaller conditioning phase.
+        assert!(
+            registered_dev_control_contract(&spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes
+                < registered_dev_t2i_contract(&spec)
+                    .unwrap()
+                    .asset_facts
+                    .conditioning_bytes,
+            "the control route must publish its own multimodal-free footprint"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1): `klein_overlay` lists `adapters` as a live Klein axis and
+    /// `validate_klein_load_axes` deliberately does not reject it, so an adapted Klein load is a
+    /// reachable composition. `load_flux2_heavy` installs the stack as forward-time residuals over
+    /// the (possibly quantized) transformer — never folded — and those files sit outside the
+    /// snapshot subtree the footprint walks, so `overlay_bytes` stayed 0 while the contract already
+    /// declared `OverlayBytes` as a formula input.
+    ///
+    /// Mutation that fails this: passing `0` instead of `klein_adapter_bytes(spec)?` at the
+    /// production call site — `overlay_bytes` drops to 0, no component is declared, and the formula
+    /// falls back to `PhaseEnvelope`.
+    #[test]
+    fn a_klein_adapter_stack_is_priced_as_a_resident_overlay() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::DeferredMaterialization);
+
+        let clean = build_klein_contract(
+            crate::FLUX2_KLEIN_9B_ID,
+            &spec,
+            Default::default(),
+            true,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(clean.asset_facts.overlay_bytes, 0);
+        assert!(clean.resident_components().is_empty());
+        assert!(matches!(
+            clean.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
+
+        let adapted = build_klein_contract(
+            crate::FLUX2_KLEIN_9B_ID,
+            &spec,
+            Default::default(),
+            true,
+            None,
+            2048,
+        )
+        .unwrap();
+        assert_eq!(adapted.asset_facts.overlay_bytes, 2048);
+        assert_eq!(adapted.auxiliary_resident_bytes(), 2048);
+        assert_eq!(
+            adapted.asset_facts.base_bytes, clean.asset_facts.base_bytes,
+            "an adapter is auxiliary: it must never move the base decomposition"
+        );
+        let components = adapted.resident_components();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].id, KLEIN_ADAPTER_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::AdapterStack);
+        assert_eq!(components[0].resident_bytes, 2048);
+        assert!(
+            adapted.conformance_errors().is_empty(),
+            "{:?}",
+            adapted.conformance_errors()
+        );
+
+        // The sizing helper prices an additive stack at its on-disk length and fails closed on a
+        // source it cannot size, rather than declaring a zero the shared validator would accept.
+        let tmp = tempfile::tempdir().unwrap();
+        let lora = tmp.path().join("lora.safetensors");
+        std::fs::write(&lora, vec![0_u8; 2048]).unwrap();
+        let mut sized = spec.clone();
+        sized.adapters.push(mlx_gen::AdapterSpec::new(
+            lora,
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert_eq!(klein_adapter_bytes(&sized).unwrap(), 2048);
+        assert_eq!(klein_adapter_bytes(&spec).unwrap(), 0);
+
+        let mut unsizable = spec;
+        unsizable.adapters.push(mlx_gen::AdapterSpec::new(
+            tmp.path().join("absent.safetensors"),
+            1.0,
+            mlx_gen::AdapterKind::Lora,
+        ));
+        assert!(klein_adapter_bytes(&unsizable).is_err());
+    }
+
     #[test]
     fn klein_contract_declares_every_shared_rung_for_the_exact_structural_route() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
@@ -1638,6 +2151,7 @@ mod tests {
                 "fixture-v1",
                 spec.load_shape,
             )),
+            0,
         )
         .unwrap();
         assert!(
@@ -1699,6 +2213,7 @@ mod tests {
                 Default::default(),
                 klein_streamable(&spec),
                 None,
+                0,
             )
             .unwrap();
             assert_eq!(
@@ -1823,6 +2338,7 @@ mod tests {
                     ),
                     spec.load_shape,
                 )),
+                0,
             )
             .unwrap();
             let fixtures = registered_klein_fixture(

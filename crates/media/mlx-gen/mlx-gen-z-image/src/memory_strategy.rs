@@ -143,6 +143,7 @@
 //! [`MEMORY_CALIBRATION_FINGERPRINT`]; the worker owns live-budget accounting and least-cost
 //! selection. The scope below is defense in depth: it can reject a selection, never substitute one.
 
+use mlx_gen::architecture_facts as arch;
 use mlx_gen::asset_facts::{
     projected_safetensors_bytes, projected_safetensors_tensors, projected_tensor_headers_bytes,
     ResidentProjection,
@@ -161,6 +162,42 @@ use mlx_gen::gen_core::{GenerationMemory, MemoryGeometry, MemoryRunOutcome};
 #[cfg(test)]
 use mlx_gen::GenerationRequest;
 use mlx_gen::{Quant, WeightsSource};
+
+/// Architecture axes shared by all four registered Z-Image routes (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as
+/// [`ZImageTransformerConfig::turbo`](crate::transformer::ZImageTransformerConfig::turbo) and the
+/// reference `vae/config.json` as
+/// [`VaeDecoderConfig::default_z_image`](crate::vae::VaeDecoderConfig::default_z_image), and the
+/// loader builds every route from those constants — so they are the config this provider parses,
+/// and the axes are available before any snapshot is materialized.
+///
+/// `latent_channels` comes from the DiT's `in_channels` because this crate's VAE config carries the
+/// decoder's block shape rather than a channel count; the two agree at 16 on the reference
+/// snapshot. `vae_temporal_scale` stays `None`: Z-Image ships the FLUX.1 *image* autoencoder, which
+/// has no temporal axis at all, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::transformer::ZImageTransformerConfig::turbo();
+    let vae = crate::vae::VaeDecoderConfig::default_z_image();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: arch::axis(dit.n_heads),
+        head_dim: arch::head_dim(dit.dim, dit.n_heads),
+        transformer_blocks: arch::axis(dit.n_layers),
+        patch_size: arch::axis(dit.patch_size),
+        latent_channels: arch::axis(dit.in_channels),
+        // Three of the four decoder up-blocks upsample, so the decoder is x8 on each spatial axis.
+        vae_spatial_scale: arch::vae_spatial_scale_from_downsamples(
+            vae.up_blocks
+                .iter()
+                .filter(|(_, upsamples)| *upsamples)
+                .count(),
+        ),
+        vae_temporal_scale: None,
+        // `pipeline.rs` seeds the latent at `Dtype::Bfloat16` and the DiT computes there; only the
+        // decoded image is cast back to f32.
+        activation_dtype_width: Some(arch::HALF_ACTIVATION_WIDTH),
+    }
+}
 
 /// The **default** decode tile edge for the native VAE — the calibrated 512 px policy point
 /// (sc-13571). SC-19753 preserves full-activation GroupNorm statistics at every admitted edge.
@@ -503,6 +540,7 @@ fn memory_strategy_contract_with_asset_facts(
         }
     };
     Ok(MemoryProviderContract {
+        architecture_facts: architecture_facts(),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // Unified memory: the wired-residency budget is what the staged phases release, weights
@@ -1798,12 +1836,45 @@ mod tests {
         context_for(strategy, false)
     }
 
+    /// AC (SC-22662): every registered Z-Image route publishes the architecture axes read from this
+    /// crate's own config constants, and the resulting contract passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_config_constants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(30),
+            // `dim` 3840 / `n_heads` 30, derived rather than declared.
+            head_dim: Some(128),
+            transformer_blocks: Some(30),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider_id in [
+            crate::model::MODEL_ID,
+            crate::model_base::MODEL_ID,
+            crate::model_control::MODEL_ID,
+            crate::model_base_control::MODEL_ID,
+        ] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec(&tmp)).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
     #[test]
     fn contract_is_internally_conformant() {
         let tmp = tempfile::tempdir().unwrap();
         let contract = contract(&tmp);
         assert_eq!(contract.conformance_errors(), Vec::<String>::new());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         // SC-15775: the PiD-eligible half of the same conformance obligation, run on the DECLARATION
         // INPUTS so the failure lands here with a named message rather than as a load-time `Err` from
         // `decode_routes`. The shared check refuses a native ladder that reaches into the PiD student's

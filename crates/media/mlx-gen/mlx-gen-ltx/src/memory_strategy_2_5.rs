@@ -45,6 +45,36 @@ use mlx_gen::gen_core;
 use crate::memory_strategy::{decode_tile_edges, DECODE_OVERLAP};
 use mlx_gen::gen_core::ltx_checkpoint::LtxComponent;
 
+/// Architecture axes for the LTX-2.5 route (epic SC-22657, E2; SC-22667 follow-up).
+///
+/// The axis derivation is shared with the 2.3 route — the measured 2.3 to 2.5 delta is two
+/// booleans, not a dimension — but the **config source is not**: `build_ltx25` never reads
+/// `embedded_config.json`. It resolves the split bundle and parses the transformer component's own
+/// `__metadata__` config section through `LtxConfig::from_bundle`, so that is the parse re-run here
+/// when `spec` names a materialized bundle.
+///
+/// Only the **weights-free** surface publishes the preset: there is nothing to read there, and the
+/// axes have to come from somewhere. A materialized bundle that cannot be resolved, or whose
+/// transformer carries no parseable config section, declares its trunk axes **absent** instead
+/// (SC-22667). `build_ltx25` reaches both of those through `?` — `resolve_split_bundle(spec)?` then
+/// `LtxConfig::from_bundle(&bundle)?` — so there is no load of such a tree to describe, and the
+/// preset here is the 2.3 shape that `LtxConfig::from_bundle`'s own doc forbids as a fall-through
+/// precisely because it would stand a 48-layer 2.3 DiT in for 2.5 weights.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return crate::memory_strategy::architecture_facts_for(
+            &crate::config::LtxConfig::video_only_defaults(),
+            spec,
+        );
+    }
+    match crate::bundle::resolve_split_bundle(spec)
+        .and_then(|bundle| crate::config::LtxConfig::from_bundle(&bundle))
+    {
+        Ok(dit) => crate::memory_strategy::architecture_facts_for(&dit, spec),
+        Err(_) => crate::memory_strategy::unreadable_trunk_architecture_facts(spec),
+    }
+}
+
 /// The LTX-2.5 MLX engine id.
 ///
 /// A distinct id from [`crate::MODEL_ID`] (`ltx_2_3`) rather than a route overlay on it: the two
@@ -265,6 +295,14 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
         .path()
         .to_path_buf();
     let connector_path = transformer_path.with_file_name("connector.safetensors");
+    // `build_ltx25` resolves the converted vocoder as an unclaimed secondary sibling beside the
+    // audio VAE that owns the merged upstream audio/vocoder configuration. Same derivation here,
+    // so the contract cannot price a different file from the one the load opens.
+    let vocoder_path = bundle
+        .require(LtxComponent::AudioVae)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+        .path()
+        .with_file_name("vocoder.safetensors");
     let enhancer_path = crate::model::ltx25_enhancer_dir(spec)
         .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
 
@@ -287,6 +325,16 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
                 "audio/video connector",
                 ResidentProjection::Stored,
             )?,
+            // SC-22667: a converted 2.5 tier splits the VAE encoder into its own
+            // `vae_encoder.safetensors`; `ltx25_encoder_path` falls back to the DECODER file for a
+            // raw split bundle that keeps the encoder beside its decoder. That fallback is charged
+            // here unconditionally, because it is a genuine SECOND residency rather than a double
+            // count of one network: `LtxVideoVae::encode` takes the lazy path, and
+            // `Weights::from_file` followed by `Weights::materialize` evaluates EVERY tensor in the
+            // named file — so on a raw bundle the whole decoder file is materialized a second time
+            // while the built decoder is still resident. Skipping the charge when the two paths
+            // coincide would violate E3 (never predict a fit that OOMs) on exactly the raw bundles
+            // this fallback exists for.
             required_projected_bytes(
                 &encoder_path,
                 "selected video VAE encoder",
@@ -345,9 +393,17 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
                     .require(LtxComponent::AudioVae)
                     .map_err(|error| gen_core::Error::Msg(error.to_string()))?
                     .path(),
-                "audio VAE and vocoder",
+                "audio VAE",
                 ResidentProjection::Float32,
             )?,
+            // SC-22667: the vocoder was never priced. `LtxComponent::AudioVae` carries the merged
+            // audio/vocoder CONFIG — which is what `VocoderConfig::from_bundle` reads out of it,
+            // and why the label here used to claim both — but the vocoder WEIGHTS are a separate
+            // sibling file that `build_ltx25` resolves, opens, materializes and builds
+            // unconditionally on every 2.5 load, with no route gate. The 2.3 registration in this
+            // same crate already charges `vocoder.safetensors` at `Float32`, so this was an
+            // omission in the 2.5 port rather than a family design choice.
+            required_projected_bytes(&vocoder_path, "vocoder", ResidentProjection::Float32)?,
         ],
     )?;
     if !adapters_have_load_exact_additive_accounting(spec)? {
@@ -445,6 +501,7 @@ fn build_contract(
         ));
     }
     Ok(MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: LTX_2_5_MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -924,6 +981,106 @@ mod tests {
         std::fs::write(path, file).unwrap();
     }
 
+    /// AC (SC-22662): the LTX-2.5 route publishes the same axes as the 2.3 route — the measured
+    /// delta between them is two booleans, not a dimension — and passes the shared facts check.
+    #[test]
+    fn architecture_facts_match_the_shared_ltx_derivation() {
+        let contract =
+            weights_free_memory_strategy_contract(&spec(LoadShape::EagerMaterialization)).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // The AvDiT has no patchify: `patchify_proj` is a plain Linear over the
+                // 128-channel latent token, and every patch factor lives inside the VAE.
+                patch_size: None,
+                latent_channels: Some(128),
+                vae_spatial_scale: Some(32),
+                // A video autoencoder: eight frames per latent unit.
+                vae_temporal_scale: Some(8),
+                activation_dtype_width: Some(2),
+            },
+            "ltx_2_5 architecture facts"
+        );
+        assert_eq!(
+            contract.architecture_facts,
+            crate::memory_strategy::architecture_facts(&spec(LoadShape::EagerMaterialization))
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// SC-22667: the 2.5 axes are re-parsed through the 2.5 loader's own source — the split
+    /// bundle's transformer `__metadata__` via `LtxConfig::from_bundle` — never through the 2.3
+    /// `embedded_config.json` parse, and the activation width follows `spec.precision` exactly as
+    /// `build_ltx25` selects the DiT precision from it.
+    ///
+    /// SC-22667 review: a materialized root whose bundle does not resolve, or whose transformer
+    /// carries no parseable config section, declares its trunk axes ABSENT. `build_ltx25` reaches
+    /// both through `?`, so no load of such a tree exists — and the preset the old
+    /// `.ok().unwrap_or_else(video_only_defaults)` reached for is the 2.3 shape that
+    /// `LtxConfig::from_bundle`'s own doc forbids as a fall-through.
+    ///
+    /// Mutations that fail this: reusing `crate::memory_strategy::architecture_facts(spec)` (the
+    /// 2.3 parse, the shape under review) makes the `embedded_config.json` assertion publish 9
+    /// blocks; restoring the preset fall-back makes it publish 48 and reds the `None` VAE-survival
+    /// arm's siblings; a literal `HALF_ACTIVATION_WIDTH` makes the `Fp32` assertion read 2.
+    #[test]
+    fn architecture_facts_come_from_the_bundle_parse_and_the_admitted_precision() {
+        // A 2.3-style `embedded_config.json` beside a bundle root is NOT what the 2.5 loader reads:
+        // its depth must not surface, and it is not a 2.5 bundle either, so nothing is published.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(
+            root.join("embedded_config.json"),
+            r#"{"transformer":{"num_layers":9,"rope_type":"split"}}"#,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Sequential)
+            .with_load_shape(LoadShape::EagerMaterialization);
+        let facts = architecture_facts(&spec);
+        assert_eq!(
+            (
+                facts.attention_heads,
+                facts.head_dim,
+                facts.transformer_blocks
+            ),
+            (None, None, None),
+            "a materialized root with no parseable 2.5 transformer config publishes no trunk axis"
+        );
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (Some(128), Some(32), Some(8)),
+            "the crate-constant VAE axes survive, so a declared axis remains"
+        );
+        assert!(facts.has_declared_architecture_axis());
+        assert_eq!(
+            crate::memory_strategy::architecture_facts(&spec).transformer_blocks,
+            Some(9),
+            "(the 2.3 derivation does read it, which is exactly why 2.5 must not share it)"
+        );
+
+        // Width follows the precision the loader will run: bf16 by default, f32 on the opt-in path.
+        assert_eq!(facts.activation_dtype_width, Some(2));
+        let mut fp32 = spec.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        assert_eq!(architecture_facts(&fp32).activation_dtype_width, Some(4));
+        assert_eq!(
+            weights_free_memory_strategy_contract(&fp32)
+                .unwrap()
+                .architecture_facts
+                .activation_dtype_width,
+            Some(4)
+        );
+    }
+
     #[test]
     fn production_contract_prices_every_loaded_component() {
         let temp = tempfile::tempdir().unwrap();
@@ -935,6 +1092,9 @@ mod tests {
             "vae_decoder.safetensors",
             "vae_encoder.safetensors",
             "audio_vae.safetensors",
+            // The vocoder: a separate sibling file `build_ltx25` opens, materializes and builds on
+            // every 2.5 load. This fixture did not carry it, which is how it went unpriced.
+            "vocoder.safetensors",
             "duration.safetensors",
             "spatial.safetensors",
             "temporal.safetensors",
@@ -973,15 +1133,35 @@ mod tests {
         let contract = memory_strategy_contract(&spec).unwrap();
         assert_eq!(contract.asset_facts.conditioning_bytes, 16);
         assert_eq!(contract.asset_facts.transformer_bytes, 12);
-        assert_eq!(contract.asset_facts.decoder_bytes, 8);
-        assert_eq!(contract.asset_facts.base_bytes, 36);
+        assert_eq!(
+            contract.asset_facts.decoder_bytes, 12,
+            "SC-22667: the decode phase is the video VAE, the audio VAE AND the vocoder"
+        );
+        assert_eq!(contract.asset_facts.base_bytes, 40);
         assert_eq!(contract.asset_facts.overlay_bytes, 0);
+
+        // SC-22667: a RAW split bundle keeps the VAE encoder inside its decoder file, and
+        // `ltx25_encoder_path` falls back to that file. The conditioning phase still charges it,
+        // because `LtxVideoVae::encode` re-opens that path and `Weights::materialize` evaluates
+        // every tensor in it — a second full residency of the decoder file, alongside the built
+        // decoder. So the totals are UNCHANGED from the converted-tier layout above: dropping the
+        // separate `vae_encoder.safetensors` must not move a single field.
+        //
+        // Mutation that fails this: re-introducing an `if encoder_path == video_path { 0 }` guard
+        // in the conditioning sum — conditioning reads back 12 and `base_bytes` 36, under-pricing
+        // the peak the loader actually reaches and violating E3.
+        std::fs::remove_file(root.join("vae_encoder.safetensors")).unwrap();
+        let shared = memory_strategy_contract(&spec).unwrap();
+        assert_eq!(shared.asset_facts.conditioning_bytes, 16);
+        assert_eq!(shared.asset_facts.decoder_bytes, 12);
+        assert_eq!(shared.asset_facts.base_bytes, 40);
+        write_one_tensor(&root.join("vae_encoder.safetensors"));
 
         std::fs::create_dir_all(root.join("enhancer")).unwrap();
         write_one_tensor(&root.join("enhancer/model.safetensors"));
         let enhanced_contract = memory_strategy_contract(&spec).unwrap();
         assert_eq!(enhanced_contract.asset_facts.conditioning_bytes, 18);
-        assert_eq!(enhanced_contract.asset_facts.base_bytes, 38);
+        assert_eq!(enhanced_contract.asset_facts.base_bytes, 42);
 
         write_one_tensor(&root.join("adapter.safetensors"));
         let adapter_bytes = std::fs::metadata(root.join("adapter.safetensors"))
@@ -994,7 +1174,7 @@ mod tests {
             AdapterKind::Lora,
         ));
         let adapted_contract = memory_strategy_contract(&adapted).unwrap();
-        assert_eq!(adapted_contract.asset_facts.base_bytes, 38);
+        assert_eq!(adapted_contract.asset_facts.base_bytes, 42);
         assert_eq!(adapted_contract.asset_facts.overlay_bytes, adapter_bytes);
         let MemoryFormulaKind::ComponentPhaseEnvelope {
             resident_components,

@@ -172,6 +172,11 @@ fn ggml_projection_bytes(
 /// casts each decoded dense tensor to this dtype before it lands on the device.
 const COMPUTE_DTYPE_BYTES: u64 = 4;
 
+/// The same compute dtype as a `DType`, so the published activation width and
+/// [`COMPUTE_DTYPE_BYTES`] cannot drift apart: `lib.rs` pins `dtype: DType::F32` for every FLUX.2
+/// component.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
 /// The residency policy the klein fit gate prices against: the SAME probe
 /// [`Flux2Pipeline::load_klein_planned_dit`](Pipeline::load_klein_planned_dit) runs, on the same
 /// process-default device the concrete loader selects
@@ -282,6 +287,21 @@ fn klein_planned_dit_bytes(
             .ok_or_else(overflow)?;
     }
     Ok(total)
+}
+
+/// [`f32_or_packed_component_bytes`] for a snapshot component that a partial tree may simply not
+/// have: an absent (or tensor-free) component contributes `0`, as the raw directory sum it replaced
+/// did, instead of failing a contract that the loader would only fail later and more precisely.
+fn snapshot_component_bytes(
+    path: &std::path::Path,
+    quant: Option<Quant>,
+    component: &str,
+    keep_embedding_dense: bool,
+) -> gen_core::Result<u64> {
+    if gen_core::weightsmeta::safetensors_path_bytes(path) == 0 {
+        return Ok(0);
+    }
+    f32_or_packed_component_bytes(path, quant, component, keep_embedding_dense, false)
 }
 
 fn f32_or_packed_component_bytes(
@@ -462,6 +482,103 @@ fn resident_components(
     Ok(out)
 }
 
+/// Architecture axes for one FLUX.2 variant (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: the transformer is constructed from the
+/// hardcoded [`crate::config::Flux2Config`] the variant selects, so those same fields are what the
+/// built model actually has. Selecting the variant here mirrors the loader's own selection, which
+/// is why dev (48 heads, 8 + 48 blocks) and klein-9b (32 heads, 8 + 24 blocks) publish different
+/// geometry from one function.
+///
+/// `transformer_blocks` is the **total** trunk depth: FLUX.2 stacks the double-stream blocks and
+/// then the single-stream blocks in one sequence, and every one of them is a block-window
+/// materialization unit. `patch_size` has no config field of its own, so it is *derived* from the
+/// pair that implies it — `in_channels 128 / num_latent_channels 32 = 4`, a 2x2 neighbourhood —
+/// through [`candle_gen::architecture_facts::patch_size_from_channels`], rather than written as a
+/// literal that would keep saying 2 if a variant ever repacked. `vae_temporal_scale` stays `None`: the FLUX.2
+/// `AutoencoderKLFlux2` is an **image** autoencoder with no temporal axis, and a structurally
+/// absent axis is declared absent rather than zero (E2).
+fn architecture_facts(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let config = variant.config();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_heads),
+        head_dim: af::declared(config.head_dim),
+        transformer_blocks: af::declared(config.num_double_layers + config.num_single_layers),
+        // The packing edge the trunk's own input width implies: `in_channels / num_latent_channels`
+        // is the neighbourhood area, and its square root is the axis.
+        patch_size: af::patch_size_from_channels(
+            af::declared(config.in_channels),
+            af::declared(config.num_latent_channels),
+        ),
+        latent_channels: af::declared(config.num_latent_channels),
+        vae_spatial_scale: af::declared(config.vae_scale_factor),
+        // Structurally absent: the FLUX.2 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
+/// Bytes of the conditioning stack's **vision** half — the Pixtral vision tower
+/// (`vision_tower.*`) and the Mistral3 multimodal projector (`multi_modal_projector.*`) that
+/// [`crate::caption_upsample::CaptionUpsampler::new`] builds when `include_vision` is set.
+///
+/// Only FLUX.2-**dev** has one: `Pipeline::load_caption_upsampler` returns `None` for klein, so
+/// klein is charged nothing here. On dev, the edit surface is the caller of
+/// `load_caption_upsampler(true)` (`edit_provider.rs`, both the warm and the staged encode legs),
+/// so those weights are genuinely resident for the edit route while the plain t2i route builds the
+/// upsampler with `include_vision = false`.
+///
+/// `MemoryAssetFacts::conditioning_bytes` is documented as *the conditioning encoder stack (text
+/// and/or vision encoders)*, and this is that stack's vision half; it is not an auxiliary standing
+/// beside the base model. It is charged unconditionally on dev because a
+/// [`MemoryProviderContract`] carries no route discriminator — the edit provider composes the very
+/// same contract as t2i — and of the two available errors, over-declaring by a ~2 GB tower on t2i
+/// is a conservative fit, while omitting it on edit is a false admit. `ValidatedEncoderSource`'s
+/// `materialized_language_tensor_headers` deliberately excludes these names, which is why they had
+/// to be added back here rather than being covered by the language sum.
+///
+/// The tower is never quantized (`vision.rs`: "The tower remains dense f32 even when the language
+/// model is quantized"), so it is priced with `quant = None`. `source` is the very
+/// [`WeightsSource`] `Pipeline::component_vb_on("text_encoder", ..)` loads the tower through, so a
+/// caller-authored encoder is read from the file the loader will read.
+fn selected_vision_tower_bytes(
+    variant: Flux2Variant,
+    source: &WeightsSource,
+) -> gen_core::Result<u64> {
+    if !variant.is_dev() {
+        return Ok(0);
+    }
+    let path = match source {
+        WeightsSource::Dir(path) | WeightsSource::File(path) => path,
+    };
+    let vision_prefix = format!("{}.", crate::vision::VISION_PREFIX);
+    let projector_prefix = format!("{}.", crate::vision::PROJECTOR_PREFIX);
+    let vision: Vec<_> = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
+        .into_iter()
+        .filter(|header| {
+            header.name.starts_with(&vision_prefix) || header.name.starts_with(&projector_prefix)
+        })
+        .collect();
+    if vision.is_empty() {
+        return Ok(0);
+    }
+    f32_or_packed_tensor_headers(
+        &vision,
+        None,
+        "selected vision tower",
+        false,
+        false,
+        "selected direct-shard inventory",
+    )
+}
+
 pub(crate) fn composed_provider_contract_for(
     provider_id: &str,
     spec: &LoadSpec,
@@ -474,13 +591,40 @@ pub(crate) fn composed_provider_contract_for(
     // same specs with the same message.
     let streamable = streamable(spec);
     let mut components = match &spec.weights {
-        WeightsSource::Dir(_) => PerComponentBytes::from_spec_subdirs(
-            spec,
-            &["text_encoder"],
-            &["transformer"],
-            &["vae"],
-        )
-        .unwrap_or_default(),
+        WeightsSource::Dir(root) => {
+            // Every snapshot component is priced the way the File arm below already prices its
+            // own: at the width this pipeline MATERIALIZES it, not at its on-disk encoding.
+            // `lib.rs` pins `dtype: DType::F32` for every FLUX.2 component
+            // ([`COMPUTE_DTYPE_BYTES`]), so a bf16 snapshot DiT and VAE cost twice their on-disk
+            // bytes once resident; the raw `PerComponentBytes::from_spec_subdirs` sum this
+            // replaced under-priced both by exactly 2x while the text encoder beside them was
+            // already f32/quant-priced — one contract, two different bases (epic SC-22657, E1).
+            let quant = resolved_quant(spec)?;
+            let text_encoder_quant = (provider_id == FLUX2_DEV_ID).then_some(quant).flatten();
+            PerComponentBytes {
+                text_encoder: snapshot_component_bytes(
+                    &root.join("text_encoder"),
+                    text_encoder_quant,
+                    "snapshot text encoder",
+                    true,
+                )?,
+                dit: snapshot_component_bytes(
+                    &root.join("transformer"),
+                    quant,
+                    "snapshot transformer",
+                    false,
+                )?,
+                // The WHOLE `vae/` component, encoder half included, on both ids. `Flux2Vae::new`
+                // (t2i, `load_heavy_seq` / the resident load) is decode-only, but the edit and
+                // control providers that compose this very same contract — `edit_provider.rs` for
+                // dev AND klein, `control_provider.rs` for dev — build `Flux2Vae::new_with_encoder`
+                // (`encoder.*` + `quant_conv`) from the same source, and a `MemoryProviderContract`
+                // carries no route discriminator. Same policy as `selected_vision_tower_bytes`: of
+                // the two available errors, over-declaring the encoder half on t2i is a
+                // conservative fit while omitting it on edit / control is a false admit (E3).
+                vae: snapshot_component_bytes(&root.join("vae"), None, "snapshot VAE", false)?,
+            }
+        }
         WeightsSource::File(dit) => {
             let base = gen_core::require_base_snapshot(spec, provider_id)?;
             let quant = resolved_quant(spec)?;
@@ -508,6 +652,7 @@ pub(crate) fn composed_provider_contract_for(
                         f32_or_packed_component_bytes(p, quant, "imported DiT", false, true)
                     }
                 })?,
+                // Whole component, encoder half included — see the Dir arm above.
                 vae: f32_or_packed_component_bytes(
                     &base.join("vae"),
                     None,
@@ -523,18 +668,20 @@ pub(crate) fn composed_provider_contract_for(
     // include a complete alternate snapshot's unused visual tower, unloaded decoder tail, or other
     // unrelated tensors and would make the fit gate disagree with the admitted runtime.
     let base = gen_core::require_base_snapshot(spec, provider_id)?;
+    // The same variant selection the loader makes: it picks the `Flux2Config` the transformer is
+    // built from, so it also picks the geometry this contract is allowed to publish.
+    let variant = match provider_id {
+        FLUX2_DEV_ID => Flux2Variant::Dev,
+        FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        _ => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 memory provider {provider_id}"
+            )))
+        }
+    };
     let has_authored_encoder =
         spec.text_encoder.is_some() || base.join("text_encoder/config.json").is_file();
     if has_authored_encoder {
-        let variant = match provider_id {
-            FLUX2_DEV_ID => Flux2Variant::Dev,
-            FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
-            _ => {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "unknown FLUX.2 memory provider {provider_id}"
-                )))
-            }
-        };
         let builtin = WeightsSource::Dir(base.join("text_encoder"));
         let source = spec.text_encoder.as_ref().unwrap_or(&builtin);
         let roots = selected_encoder_discovery_roots(source)?;
@@ -546,7 +693,7 @@ pub(crate) fn composed_provider_contract_for(
             .then(|| resolved_quant(spec))
             .transpose()?
             .flatten();
-        components.text_encoder = f32_or_packed_tensor_headers(
+        let language_bytes = f32_or_packed_tensor_headers(
             headers,
             text_encoder_quant,
             "selected text encoder",
@@ -554,6 +701,11 @@ pub(crate) fn composed_provider_contract_for(
             false,
             "selected direct-shard inventory",
         )?;
+        components.text_encoder = language_bytes
+            .checked_add(selected_vision_tower_bytes(variant, source)?)
+            .ok_or_else(|| {
+                gen_core::Error::Msg("FLUX.2 conditioning byte sum overflow".to_owned())
+            })?;
     }
     let resident_components = resident_components(provider_id, spec)?;
     let overlay_bytes = resident_components
@@ -597,6 +749,7 @@ pub(crate) fn composed_provider_contract_for(
         .collect();
 
     Ok(MemoryProviderContract {
+        architecture_facts: architecture_facts(variant, spec),
         provider_id: profile.provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1375,6 +1528,65 @@ mod tests {
         spec
     }
 
+    /// AC (epic SC-22657, E2): each FLUX.2 provider publishes the geometry of the `Flux2Config`
+    /// its own loader builds — dev and klein-9b differ, and neither is inferred from a config the
+    /// loader ignores — the contract passes the shared facts conformance check, and the weights-free
+    /// surface (whose sentinel root is not on disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        snapshot.load_shape = LoadShape::DeferredMaterialization;
+        for (id, attention_heads, transformer_blocks) in [
+            // `Flux2Config::dev()`: 48 heads, 8 double + 48 single blocks.
+            (FLUX2_DEV_ID, 48, 8 + 48),
+            // `Flux2Config::klein_9b()`: 32 heads, 8 double + 24 single blocks.
+            (FLUX2_KLEIN_9B_ID, 32, 8 + 24),
+        ] {
+            let contract = composed_provider_contract_for(id, &snapshot).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(attention_heads),
+                    // `Flux2Config::head_dim` — constant across variants.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(transformer_blocks),
+                    // The 2x2 packing outside the trunk (`in_channels 128 = 32 * 2 * 2`).
+                    patch_size: Some(2),
+                    // `Flux2Config::num_latent_channels`.
+                    latent_channels: Some(32),
+                    // `Flux2Config::vae_scale_factor`.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: `AutoencoderKLFlux2` is an image autoencoder.
+                    vae_temporal_scale: None,
+                    // `lib.rs: dtype: DType::F32`, the same width as `COMPUTE_DTYPE_BYTES`.
+                    activation_dtype_width: Some(4),
+                },
+                "{id} architecture facts"
+            );
+            assert_eq!(
+                u64::from(contract.architecture_facts.activation_dtype_width.unwrap()),
+                COMPUTE_DTYPE_BYTES,
+                "{id}: the published activation width and the pricing width must not drift"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = composed_provider_contract_for(id, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{id} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
+    }
+
     fn write_typed_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0_usize;
         let mut header = serde_json::Map::new();
@@ -1677,6 +1889,102 @@ mod tests {
                 provider_contract(&spec).is_ok(),
                 "File loader/contract validation drift for {name}"
             );
+        }
+    }
+
+    /// AC (epic SC-22657, E1): a Dir snapshot's DiT and VAE are priced at the width the pipeline
+    /// materializes them (`lib.rs`: `dtype: DType::F32`), the same basis the text encoder beside
+    /// them already used — not at their bf16 on-disk encoding.
+    ///
+    /// *Mutation that reds this:* pricing the Dir arm through
+    /// `PerComponentBytes::from_spec_subdirs(spec, .., &["transformer"], &["vae"])`, the raw
+    /// on-disk sum under review, which returns half of each of these.
+    #[test]
+    fn a_directory_snapshot_prices_the_dit_and_vae_at_the_materialized_f32_width() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("base");
+            // Deliberately distinct element counts, so a swapped component cannot pass.
+            for (component, elements) in [("transformer", 32_usize), ("vae", 8)] {
+                std::fs::create_dir_all(root.join(component)).unwrap();
+                write_typed_safetensors(
+                    &root.join(component).join("model.safetensors"),
+                    &[("probe", "BF16", &[elements], elements * 2)],
+                );
+            }
+            gen_core_testkit::write_encoder_contract_fixture(
+                &root.join("text_encoder"),
+                variant.encoder_contract(),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let facts = provider_contract_for(variant.id(), &spec)
+                .unwrap()
+                .asset_facts;
+            assert_eq!(
+                facts.transformer_bytes,
+                32 * COMPUTE_DTYPE_BYTES,
+                "{}: the bf16 snapshot DiT is materialized f32",
+                variant.id()
+            );
+            assert_eq!(
+                facts.decoder_bytes,
+                8 * COMPUTE_DTYPE_BYTES,
+                "{}: the bf16 snapshot VAE is materialized f32",
+                variant.id()
+            );
+            assert_eq!(
+                facts.base_bytes,
+                facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+            );
+        }
+    }
+
+    /// AC (epic SC-22657, E1): FLUX.2-dev's conditioning stack includes the Pixtral vision tower
+    /// and the Mistral3 projector that `load_caption_upsampler(true)` builds for the edit route;
+    /// klein, whose `load_caption_upsampler` returns `None`, is charged nothing for one.
+    ///
+    /// *Mutation that reds this:* dropping the `selected_vision_tower_bytes` addend, the shape
+    /// under review, which left ~2 GB of resident conditioning weights unpriced because
+    /// `materialized_language_tensor_headers` deliberately excludes those names.
+    #[test]
+    fn dev_conditioning_prices_the_vision_tower_the_edit_route_loads() {
+        for variant in [Flux2Variant::Dev, Flux2Variant::Klein9b] {
+            for selection in [EncoderSelection::Builtin, EncoderSelection::OverrideDir] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (spec, selected) = directory_spec_with_encoder(&tmp, variant, selection);
+                let conditioning = || {
+                    provider_contract_for(variant.id(), &spec)
+                        .unwrap()
+                        .asset_facts
+                        .conditioning_bytes
+                };
+                let baseline = conditioning();
+                for (name, shape) in [
+                    (
+                        format!("{}.patch_conv.weight", crate::vision::VISION_PREFIX),
+                        vec![4_usize, 3],
+                    ),
+                    (
+                        format!("{}.linear_1.weight", crate::vision::PROJECTOR_PREFIX),
+                        vec![5_usize, 2],
+                    ),
+                ] {
+                    append_sparse_f16_tensor(&selected.join("model.safetensors"), &name, &shape);
+                }
+                let expected = if variant.is_dev() {
+                    // f32-materialized: the tower is never quantized.
+                    baseline + (4 * 3 + 5 * 2) * COMPUTE_DTYPE_BYTES
+                } else {
+                    baseline
+                };
+                assert_eq!(
+                    conditioning(),
+                    expected,
+                    "{} {selection:?}: vision-tower residency",
+                    variant.id()
+                );
+            }
         }
     }
 
