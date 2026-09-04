@@ -10,9 +10,11 @@ use std::sync::Mutex;
 use candle_core::{Device, Tensor};
 use serde_json::Value;
 
+use crate::decode::stream::default_seed;
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
 use crate::models::StarVectorModel;
+use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 use crate::primitives::{input_ids, Weights};
 
 /// The only snapshot family this provider admits.
@@ -43,20 +45,38 @@ fn concatenate_conditioning_embeddings(vision: &Tensor, text: &Tensor) -> Result
     Ok(Tensor::cat(&[&vision, text], 1)?)
 }
 
-/// Select the one token produced by this single-image provider.
-fn next_token_id(logits: &Tensor) -> Result<i32> {
-    let selected = logits.argmax(candle_core::D::Minus1)?;
-    let cardinality = selected.elem_count();
-    if cardinality != 1 {
+/// Sample one vocabulary row, preserving the provider's single-image shape contract.
+fn next_token_id(
+    logits: &Tensor,
+    history: &[i32],
+    sampling: &core_llm::Sampling,
+    rng: &mut SplitMix64,
+) -> Result<i32> {
+    let dims = logits.dims();
+    let vocabulary = dims.last().copied().unwrap_or(0);
+    if vocabulary == 0
+        || dims[..dims.len().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            != 1
+    {
         return Err(Error::Msg(format!(
-            "starvector token selection produced {cardinality} tokens from logits {:?}; expected exactly one",
-            logits.dims()
+            "starvector token selection requires one nonempty vocabulary row; got {dims:?}"
         )));
     }
-    // Last-axis argmax preserves all leading axes, so the real single-image provider returns
-    // `[1]` for its `[1, vocab]` logits in both prefill and cached decode. Validate cardinality
-    // before removing that provider batch axis; blindly squeezing would accept an invalid batch.
-    Ok(selected.reshape(())?.to_scalar::<u32>()? as i32)
+    sample(
+        logits,
+        history,
+        &SamplingParams {
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            top_k: sampling.top_k,
+            repetition_penalty: sampling.repetition_penalty,
+            repetition_context: sampling.repetition_context,
+        },
+        rng,
+        None,
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,7 +131,7 @@ fn push_decoded_svg_token(
     index: u32,
     events: &mut dyn FnMut(core_llm::StarVectorStreamEvent),
 ) -> core_llm::Result<core_llm::StarVectorStreamStatus> {
-    match decoded {
+    let status = match decoded {
         DecodedSvgToken::Eos => stream.finish_eos(),
         DecodedSvgToken::Hidden => stream.push("", elapsed),
         DecodedSvgToken::Source(text) => {
@@ -127,7 +147,11 @@ fn push_decoded_svg_token(
             }
             Ok(status)
         }
-    }
+    }?;
+    events(core_llm::StarVectorStreamEvent::Progress {
+        generated_tokens: stream.generated_tokens(),
+    });
+    Ok(status)
 }
 
 fn emit_done(
@@ -516,13 +540,17 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                     return Ok(emit_done(stream.output()?, events));
                 }
             }
+            let mut history = self.prompt.clone();
+            let mut rng = SplitMix64::new(req.text_request.seed.unwrap_or_else(default_seed));
             let mut generated_ids = Vec::new();
             let mut detok = core_llm::IncrementalDetok::new();
             for index in 0..req.text_request.max_new_tokens {
                 if req.text_request.cancel.is_cancelled() {
                     break;
                 }
-                let id = next_token_id(&logits).map_err(to_core)?;
+                let id = next_token_id(&logits, &history, &req.text_request.sampling, &mut rng)
+                    .map_err(to_core)?;
+                history.push(id);
                 let decoded = decode_generated_svg_token(
                     &self.tokenizer,
                     &mut generated_ids,
@@ -660,8 +688,20 @@ mod tests {
 
         assert_eq!(
             (
-                next_token_id(&prefill).unwrap(),
-                next_token_id(&cached_decode).unwrap()
+                next_token_id(
+                    &prefill,
+                    &[],
+                    &core_llm::Sampling::default(),
+                    &mut SplitMix64::new(0)
+                )
+                .unwrap(),
+                next_token_id(
+                    &cached_decode,
+                    &[],
+                    &core_llm::Sampling::default(),
+                    &mut SplitMix64::new(0)
+                )
+                .unwrap()
             ),
             (2, 0)
         );
@@ -673,13 +713,60 @@ mod tests {
         let batched =
             Tensor::from_vec(vec![0.0f32, 5.0, 1.0, 7.0, 0.0, 2.0], (2, 3), &device).unwrap();
 
-        match next_token_id(&batched) {
+        match next_token_id(
+            &batched,
+            &[],
+            &core_llm::Sampling::default(),
+            &mut SplitMix64::new(0),
+        ) {
             Err(Error::Msg(message)) => assert_eq!(
                 message,
-                "starvector token selection produced 2 tokens from logits [2, 3]; expected exactly one"
+                "starvector token selection requires one nonempty vocabulary row; got [2, 3]"
             ),
             other => panic!("expected a classified model-output error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn starvector_sampling_honors_seed_temperature_filters_and_repetition_window() {
+        let logits = Tensor::from_vec(vec![1.0f32, 1.1, 1.2, 0.9], (1, 4), &Device::Cpu).unwrap();
+        let mut sampling = core_llm::Sampling {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let sequence = |seed, params: &core_llm::Sampling| {
+            let mut rng = SplitMix64::new(seed);
+            (0..32)
+                .map(|_| next_token_id(&logits, &[], params, &mut rng).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sequence(42, &sampling), sequence(42, &sampling));
+        assert_ne!(sequence(42, &sampling), sequence(43, &sampling));
+        sampling.temperature = 0.0;
+        assert!(sequence(42, &sampling).iter().all(|id| *id == 2));
+        sampling.temperature = 1.0;
+        sampling.top_k = 1;
+        assert!(sequence(42, &sampling).iter().all(|id| *id == 2));
+        sampling.top_k = 0;
+        sampling.top_p = 0.1;
+        assert!(sequence(42, &sampling).iter().all(|id| *id == 2));
+        sampling.temperature = 0.0;
+        sampling.top_p = 1.0;
+        sampling.repetition_penalty = 2.0;
+        sampling.repetition_context = 1;
+        assert_eq!(
+            next_token_id(&logits, &[2], &sampling, &mut SplitMix64::new(0)).unwrap(),
+            1
+        );
+        assert_eq!(
+            next_token_id(&logits, &[2, 0], &sampling, &mut SplitMix64::new(0)).unwrap(),
+            2
+        );
+        sampling.repetition_context = 2;
+        assert_eq!(
+            next_token_id(&logits, &[2, 0], &sampling, &mut SplitMix64::new(0)).unwrap(),
+            1
+        );
     }
 
     fn source_tokenizer() -> core_llm::Tokenizer {
@@ -796,14 +883,23 @@ mod tests {
                     text: SVG_PROMPT.into(),
                     index: 0
                 },
+                StarVectorStreamEvent::Progress {
+                    generated_tokens: 1
+                },
                 StarVectorStreamEvent::Source {
                     text: ">".into(),
                     index: 2
                 },
+                StarVectorStreamEvent::Progress {
+                    generated_tokens: 2
+                },
                 StarVectorStreamEvent::Source {
                     text: "</svg>".into(),
                     index: 3
-                }
+                },
+                StarVectorStreamEvent::Progress {
+                    generated_tokens: 3
+                },
             ]
         );
     }
@@ -892,6 +988,9 @@ mod tests {
                 events(StarVectorStreamEvent::Source {
                     text: (*fragment).into(),
                     index: index as u32,
+                });
+                events(StarVectorStreamEvent::Progress {
+                    generated_tokens: stream.generated_tokens(),
                 });
                 if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
                     break;

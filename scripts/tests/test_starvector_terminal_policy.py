@@ -291,7 +291,13 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         )
         self.assertEqual(schema["$defs"]["decimal_id"]["maxLength"], 16)
         self.assertEqual(schema["$defs"]["canonical_path"]["maxLength"], 1024)
+        self.assertEqual(schema["$defs"]["sized_hash"]["properties"]["size"]["minimum"], 1)
         self.assertEqual(schema["$defs"]["sized_hash"]["properties"]["size"]["maximum"], 9007199254740991)
+        self.assertEqual(schema["$defs"]["quarantine_entry"]["properties"]["size"]["minimum"], 0)
+        self.assertEqual(
+            schema["$defs"]["quarantine"]["properties"]["entries"]["items"]["$ref"],
+            "#/$defs/quarantine_entry",
+        )
         self.assertEqual(schema["$defs"]["artifact_manifest"]["properties"]["entries"]["maxItems"], 100000)
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:

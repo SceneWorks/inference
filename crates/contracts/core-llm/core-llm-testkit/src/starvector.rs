@@ -158,6 +158,7 @@ pub fn check_starvector_streaming(
     let request = profile.request();
     let mut source = String::new();
     let mut indices = Vec::new();
+    let mut progress = Vec::new();
     let mut done = None;
     let output = p
         .generate_svg(&request, &mut |event| match event {
@@ -165,6 +166,7 @@ pub fn check_starvector_streaming(
                 source.push_str(&text);
                 indices.push(index);
             }
+            StarVectorStreamEvent::Progress { generated_tokens } => progress.push(generated_tokens),
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,
@@ -175,13 +177,23 @@ pub fn check_starvector_streaming(
     let (reason, tokens, bytes) =
         done.ok_or_else(|| "check_starvector_streaming: no terminal Done event".to_string())?;
     if indices.is_empty()
-        || indices
-            .iter()
-            .enumerate()
-            .any(|(index, got)| *got != index as u32)
+        || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || indices.last().is_some_and(|index| *index > tokens)
     {
         return Err(
             "check_starvector_streaming: source indices are missing or non-monotonic".into(),
+        );
+    }
+    // Source indices describe visible fragments, so hidden tokenizer output can leave gaps.
+    // Progress is the accepted decoder-token count, including those hidden tokens.
+    if progress.len() != tokens as usize
+        || progress
+            .iter()
+            .enumerate()
+            .any(|(index, count)| *count != index as u32 + 1)
+    {
+        return Err(
+            "check_starvector_streaming: Progress omits tokens or disagrees with Done".into(),
         );
     }
     if output.finish_reason != reason
@@ -276,6 +288,10 @@ mod tests {
     struct Stub {
         text: TextLlmDescriptor,
         star: StarVectorDescriptor,
+        hidden_token: bool,
+        bad_indices: bool,
+        progress_offset: u32,
+        omit_progress: bool,
     }
 
     fn stub() -> Stub {
@@ -312,7 +328,14 @@ mod tests {
             max_svg_bytes: 1024,
             max_wall_time: Some(Duration::from_secs(1)),
         };
-        Stub { text, star }
+        Stub {
+            text,
+            star,
+            hidden_token: false,
+            bad_indices: false,
+            progress_offset: 0,
+            omit_progress: false,
+        }
     }
 
     impl core_llm::TextLlm for Stub {
@@ -375,11 +398,28 @@ mod tests {
             let fixture = deterministic_svg_fixture();
             let mut stream = StarVectorBoundedStream::new(request);
             for (index, fragment) in fixture.fragments.iter().enumerate() {
+                if index == 1 && self.hidden_token {
+                    stream.push("", Duration::ZERO)?;
+                    if !self.omit_progress {
+                        on_event(StarVectorStreamEvent::Progress {
+                            generated_tokens: stream.generated_tokens() + self.progress_offset,
+                        });
+                    }
+                }
                 let status = stream.push(fragment, Duration::ZERO)?;
                 on_event(StarVectorStreamEvent::Source {
                     text: (*fragment).to_string(),
-                    index: index as u32,
+                    index: if self.bad_indices {
+                        0
+                    } else {
+                        index as u32 + u32::from(index > 0 && self.hidden_token)
+                    },
                 });
+                if !self.omit_progress {
+                    on_event(StarVectorStreamEvent::Progress {
+                        generated_tokens: stream.generated_tokens() + self.progress_offset,
+                    });
+                }
                 if matches!(status, StarVectorStreamStatus::Stop(_)) {
                     break;
                 }
@@ -397,6 +437,28 @@ mod tests {
     #[test]
     fn good_stub_satisfies_shared_starvector_conformance() {
         starvector_conformance(|| Box::new(stub()), &StarVectorProfile::cheap());
+    }
+
+    #[test]
+    fn streaming_accepts_hidden_token_gaps_and_rejects_false_progress() {
+        let profile = StarVectorProfile::cheap();
+        let mut provider = stub();
+        provider.hidden_token = true;
+        check_starvector_streaming(&provider, &profile).unwrap();
+        provider.progress_offset = 1;
+        assert!(check_starvector_streaming(&provider, &profile)
+            .unwrap_err()
+            .contains("Progress"));
+        provider.progress_offset = 0;
+        provider.omit_progress = true;
+        assert!(check_starvector_streaming(&provider, &profile)
+            .unwrap_err()
+            .contains("Progress"));
+        provider.omit_progress = false;
+        provider.bad_indices = true;
+        assert!(check_starvector_streaming(&provider, &profile)
+            .unwrap_err()
+            .contains("non-monotonic"));
     }
 
     #[test]
