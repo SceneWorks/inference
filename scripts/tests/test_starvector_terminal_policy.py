@@ -16,6 +16,7 @@ WORKFLOW = ROOT / ".github/workflows/real-weights.yml"
 MODELS = ROOT / "release/real-weight-models.toml"
 CORPUS = ROOT / "release/starvector-terminal-corpus-v1.json"
 SCHEMA = ROOT / "release/starvector-terminal-receipt-v1.schema.json"
+V2_SCHEMA = ROOT / "release/starvector-terminal-receipt-v2.schema.json"
 HARNESS = ROOT / "scripts/release/starvector_terminal_evidence.mjs"
 PREFLIGHT_ASSEMBLER = ROOT / "scripts/release/starvector_terminal_preflight.mjs"
 
@@ -199,6 +200,10 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             self.assertIn("required non-empty regular file is missing", failed.stderr)
 
     def test_schema_and_corpus_bind_all_required_counts_and_boundary(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(SCHEMA.read_bytes()).hexdigest(),
+            "0a2a9f2f3a0cd1e22e5679e1aa8fea75363beaea6866037954d17e1ad0d4720c",
+        )
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
         self.assertEqual(schema["properties"]["runs"]["maxItems"], 4)
@@ -226,6 +231,68 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         self.assertRegex(corpus["sceneworks_owned_suites"]["hostile_sanitizer"]["content_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(corpus["sceneworks_owned_suites"]["prompt_composition"]["content_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(corpus["upstream_image_quality_cases"]["sources"]), 4)
+
+    def test_v2_schema_adds_closed_failed_campaign_lineage_without_mutating_v1(self) -> None:
+        schema = json.loads(V2_SCHEMA.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        self.assertIn("campaign_lineage", schema["required"])
+        producer = schema["$defs"]["producer"]
+        self.assertIn("campaign_lineage_sha256", producer["required"])
+        lineage = schema["$defs"]["campaign_lineage"]
+        self.assertIn("current_workflow", lineage["required"])
+        self.assertEqual(lineage["properties"]["failed_predecessors"]["maxItems"], 32)
+        self.assertEqual(lineage["properties"]["supersession_records"]["maxItems"], 32)
+        self.assertEqual(
+            lineage["properties"]["kind"]["enum"],
+            ["clean", "failed_campaign_supersession"],
+        )
+        predecessor = schema["$defs"]["failed_predecessor"]
+        self.assertEqual(
+            set(predecessor["required"]),
+            {
+                "campaign_id",
+                "inference_revision",
+                "sceneworks_revision",
+                "workflow",
+                "failure",
+                "markers",
+                "source_artifacts",
+                "quarantine",
+                "superseded_by",
+            },
+        )
+        self.assertEqual(
+            schema["$defs"]["workflow_run"]["properties"]["conclusion"]["enum"],
+            ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"],
+        )
+        self.assertEqual(
+            schema["$defs"]["source_artifact"]["properties"]["digest"]["pattern"],
+            "^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            set(schema["$defs"]["source_artifact"]["required"]),
+            {
+                "role",
+                "repository",
+                "workflow_run_id",
+                "workflow_run_attempt",
+                "head_sha",
+                "api_workflow_run",
+                "id",
+                "name",
+                "size",
+                "digest",
+                "content_inventory",
+            },
+        )
+        self.assertEqual(
+            schema["$defs"]["source_artifact"]["properties"]["content_inventory"]["maxItems"],
+            20000,
+        )
+        self.assertEqual(schema["$defs"]["decimal_id"]["maxLength"], 16)
+        self.assertEqual(schema["$defs"]["canonical_path"]["maxLength"], 1024)
+        self.assertEqual(schema["$defs"]["sized_hash"]["properties"]["size"]["maximum"], 9007199254740991)
+        self.assertEqual(schema["$defs"]["artifact_manifest"]["properties"]["entries"]["maxItems"], 100000)
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
