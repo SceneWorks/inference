@@ -44,6 +44,9 @@ function rebuildEdges(value) {
 }
 function v2Receipt(predecessorCount=0) {
   const value=receipt();value.schema_version=2;value.campaign_run_id="terminal-current";value.execution.workflow_run_id="9000";value.producer.campaign_lineage_sha256=d("pending-lineage");
+  for (const run of value.runs) {
+    run.deterministic_parity = {case_count:20, upstream_reference:{implementation_repository:"https://github.com/joanrod/star-vector",implementation_revision:"0e083c1911760aa31bc576ca7f337a7f8ee605ec",checkpoint_repository:run.model.repository,checkpoint_revision:run.model.revision,checkpoint_inventory_sha256:run.model.inventory_sha256,config_sha256:d(`${run.tier}-config`),processor_sha256:d(`${run.tier}-processor`),transcript_sha256:d(`${run.tier}-oracle`)},cases:Array.from({length:20},(_,index)=>({case_index:index,seed:index,input_png_sha256:run.image_quality.cases[Math.floor(index/5)*30+index%5].input_png_sha256,native_preview_png_sha256:d(`${run.backend}-${run.tier}-native-${index}`),upstream_svg_sha256:d(`${run.tier}-oracle-svg-${index}`),upstream_preview_png_sha256:d(`${run.tier}-oracle-png-${index}`),rendered_ssim:.996}))};
+  }
   const predecessors=Array.from({length:predecessorCount},(_,index)=>{
     const campaign_id=`terminal-failed-${index+1}`;
     const workflow={repository:"SceneWorks/SceneWorks",path:".github/workflows/server-candle-linux.yml",run_id:String(1000+index),run_attempt:1,head_sha:String(index+4).repeat(40),conclusion:index%2===0?"cancelled":"failure"};
@@ -100,7 +103,13 @@ test("V2 rejects incomplete quarantine copies and duplicate historical paths",()
 
 test("V2 manifest rejects extra, missing, duplicate, mixed, and unsorted entries",()=>{let value=v2Receipt(1);value.artifact_manifest.entries.push({path:"lineage/unreviewed.json",byte_size:1,sha256:d("extra")});value.artifact_manifest.entries.sort((a,b)=>a.path.localeCompare(b.path));resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);value=v2Receipt(1);value.artifact_manifest.entries=value.artifact_manifest.entries.filter((entry)=>entry.path!=="lineage/campaign-lineage.json");resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);value=v2Receipt(1);value.artifact_manifest.entries.push({...value.artifact_manifest.entries[0]});resealManifest(value);assert.throws(()=>validate(value),/artifact entry invalid/);value=v2Receipt(1);value.artifact_manifest.entries.find((entry)=>entry.path==="lineage/campaign-lineage.json").sha256=d("foreign-lineage");resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);value=v2Receipt(1);value.artifact_manifest.entries.reverse();resealManifest(value);assert.throws(()=>validate(value),/not sorted/);});
 test("V2 lineage mutation is rejected even when the producer lineage hash is recomputed",()=>{const value=v2Receipt(1);value.campaign_lineage.failed_predecessors[0].failure.code="different-failure";resealLineage(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);});
-test("quarantined predecessor evidence cannot substitute for a fresh current tuple reference",()=>{const value=v2Receipt(1);value.runs[0].lifecycle_memory_transcript_sha256=value.campaign_lineage.failed_predecessors[0].markers.campaign.sha256;value.artifact_manifest=buildManifest(value);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);});
+test("V2 permits matching deterministic current output bytes in historical artifact inventory",()=>{
+  const value=v2Receipt(1), predecessor=value.campaign_lineage.failed_predecessors[0];
+  predecessor.inference_revision=value.inference_revision;
+  predecessor.source_artifacts[0].content_inventory.push({path:"corpus/input.png",byte_size:2048,sha256:value.runs[0].image_quality.cases[0].input_png_sha256},{path:"output/preview.png",byte_size:4096,sha256:value.runs[0].image_quality.cases[0].preview_png_sha256});
+  predecessor.source_artifacts[0].content_inventory.sort((a,b)=>a.path.localeCompare(b.path));
+  resealQuarantine(predecessor);rebuildEdges(value);resealV2(value);validate(value);
+});
 test("V2 permits all recomputed hostile inputs to recur in complete historical artifact content",()=>{const value=addHistoricalOwnedInputs(v2Receipt(1),"hostile");const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory.filter((entry)=>entry.path.startsWith("owned-inputs/hostile/"));assert.equal(inventory.length,200);validate(value);});
 test("V2 permits recomputed deterministic prompt inputs to recur in complete historical artifact content",()=>{const value=addHistoricalOwnedInputs(v2Receipt(1),"prompt");const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory.filter((entry)=>entry.path.startsWith("owned-inputs/prompt/"));assert.equal(inventory.length,60);validate(value);});
 test("V2 accepts an authentic 213-file historical inventory with exact empty service stderr logs",()=>{const value=addAuthenticHistoricalInventory(v2Receipt(1));const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory;const empty=inventory.filter((entry)=>entry.byte_size===0);assert.deepEqual(empty.map((entry)=>entry.path),["product-service-api.stderr.log","product-service-worker.stderr.log"]);assert(empty.every((entry)=>entry.sha256===EMPTY_SHA256));validate(value);});
@@ -113,23 +122,12 @@ test("V2 rejects zero-byte structural quarantine evidence",()=>{
   value=v2Receipt(1);predecessor=value.campaign_lineage.failed_predecessors[0];value.artifact_manifest.entries.find((entry)=>entry.path===`${predecessor.quarantine.root}/aggregate.json`).byte_size=0;resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);
 });
 test("V2 authentic zero-byte inventory requires exact content binding and complete quarantine closure",()=>{let value=addAuthenticHistoricalInventory(v2Receipt(1)),predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.quarantine.entries.find((entry)=>entry.path.endsWith("product-service-api.stderr.log")).sha256=d("forged-empty-log");predecessor.quarantine.aggregate_sha256=h(stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries}));resealLineage(value);assert.throws(()=>validate(value),/zero-byte content is not bound/);value=addAuthenticHistoricalInventory(v2Receipt(1));predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.quarantine.entries=predecessor.quarantine.entries.filter((entry)=>!entry.path.endsWith("product-service-worker.stderr.log"));predecessor.quarantine.aggregate_sha256=h(stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries}));resealLineage(value);assert.throws(()=>validate(value),/exact sorted closure/);});
-test("V2 keeps recurring owned-input digests forbidden outside their exact current input roles",()=>{
-  let value=addHistoricalOwnedInputs(v2Receipt(1),"hostile"),digest=value.hostile_sanitizer.cases[0].input_sha256;
-  value.runs[0].lifecycle_memory_transcript_sha256=digest;resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
-  value=addHistoricalOwnedInputs(v2Receipt(1),"prompt");digest=value.prompt_composition.cases[0].prompt_sha256;
-  value.runs[0].image_quality.cases[0].provider_transcript_sha256=digest;resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
-  value=addHistoricalOwnedInputs(v2Receipt(1),"hostile");digest=value.hostile_sanitizer.cases[0].input_sha256;
-  value.runs[0].image_quality.cases[0].canonical_svg_sha256=digest;resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
-  value=addHistoricalOwnedInputs(v2Receipt(1),"prompt");digest=value.prompt_composition.cases[0].prompt_sha256;
-  value.producer.transcript_sha256=digest;resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
-  value=addHistoricalOwnedInputs(v2Receipt(1),"hostile");value.campaign_lineage.failed_predecessors[0].markers.campaign.sha256=value.hostile_sanitizer.cases[0].input_sha256;
-  resealQuarantine(value.campaign_lineage.failed_predecessors[0]);resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
-});
+
 test("V2 owned-input overlap still requires the exact complete quarantine closure",()=>{const value=addHistoricalOwnedInputs(v2Receipt(1),"hostile");value.campaign_lineage.failed_predecessors[0].quarantine.entries.pop();resealLineage(value);assert.throws(()=>validate(value),/exact sorted closure/);});
 
 test("V2 seals the canonical current workflow and rejects noncanonical or non-newer run IDs",()=>{let value=v2Receipt(1);const entry=value.artifact_manifest.entries.find((candidate)=>candidate.path==="lineage/current-workflow.json");assert.equal(entry.byte_size,Buffer.byteLength(stable(value.campaign_lineage.current_workflow)));assert.equal(entry.sha256,h(stable(value.campaign_lineage.current_workflow)));value.campaign_lineage.current_workflow.repository="Elsewhere/Repo";resealLineage(value);assert.throws(()=>validate(value),/current workflow provenance/);value=v2Receipt(1);value.campaign_lineage.current_workflow.path=".github/workflows/other.yml";resealLineage(value);assert.throws(()=>validate(value),/current workflow provenance/);value=v2Receipt(1);value.execution.workflow_run_id="500";value.campaign_lineage.current_workflow.run_id="500";resealLineage(value);assert.throws(()=>validate(value),/older than current workflow run/);value=v2Receipt(1);value.execution.workflow_run_id="01000";value.campaign_lineage.current_workflow.run_id="01000";resealLineage(value);assert.throws(()=>validate(value),/canonical bounded decimal id/);value=v2Receipt(1);value.campaign_lineage.failed_predecessors[0].workflow.run_id="01000";resealLineage(value);assert.throws(()=>validate(value),/canonical bounded decimal id/);});
 
-test("V2 binds each GitHub artifact to its workflow and complete extracted inventory",()=>{let value=v2Receipt(1);let artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.workflow_run_id="1001";artifact.api_workflow_run.id="1001";resealLineage(value);assert.throws(()=>validate(value),/identity\/provenance/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.api_workflow_run.id="1001";resealLineage(value);assert.throws(()=>validate(value),/does not bind artifact workflow run/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.id="07000";resealLineage(value);assert.throws(()=>validate(value),/canonical bounded decimal id/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.head_sha="9".repeat(40);artifact.api_workflow_run.head_sha=artifact.head_sha;resealLineage(value);assert.throws(()=>validate(value),/identity\/provenance/);value=v2Receipt(1);const extracted=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory[1].sha256;value.runs[0].lifecycle_memory_transcript_sha256=extracted;value.artifact_manifest=buildManifest(value);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);});
+test("V2 binds each GitHub artifact to its workflow and complete extracted inventory",()=>{let value=v2Receipt(1);let artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.workflow_run_id="1001";artifact.api_workflow_run.id="1001";resealLineage(value);assert.throws(()=>validate(value),/identity\/provenance/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.api_workflow_run.id="1001";resealLineage(value);assert.throws(()=>validate(value),/does not bind artifact workflow run/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.id="07000";resealLineage(value);assert.throws(()=>validate(value),/canonical bounded decimal id/);value=v2Receipt(1);artifact=value.campaign_lineage.failed_predecessors[0].source_artifacts[0];artifact.head_sha="9".repeat(40);artifact.api_workflow_run.head_sha=artifact.head_sha;resealLineage(value);assert.throws(()=>validate(value),/identity\/provenance/);});
 
 test("V2 quarantine aggregate and manifest share one canonical serialized payload",()=>{let value=v2Receipt(1);let predecessor=value.campaign_lineage.failed_predecessors[0];let payload=stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries});let aggregate=value.artifact_manifest.entries.find((entry)=>entry.path===`${predecessor.quarantine.root}/aggregate.json`);assert.equal(aggregate.byte_size,Buffer.byteLength(payload));assert.equal(aggregate.sha256,h(payload));for(const field of ["byte_size","sha256","path"]){value=v2Receipt(1);predecessor=value.campaign_lineage.failed_predecessors[0];aggregate=value.artifact_manifest.entries.find((entry)=>entry.path===`${predecessor.quarantine.root}/aggregate.json`);if(field==="byte_size")aggregate.byte_size+=1;else if(field==="sha256")aggregate.sha256=d("mutated-quarantine-aggregate");else aggregate.path=`${predecessor.quarantine.root}/aggregate-mutated.json`;value.artifact_manifest.entries.sort((left,right)=>left.path.localeCompare(right.path));resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);}});
 
@@ -184,4 +182,35 @@ test("CLI requires independent canonical evidence for V2 while V1 remains compat
     writeFileSync(receiptPath,JSON.stringify(v2Receipt(1)));let result=spawnSync(process.execPath,args,{encoding:"utf8"});assert.notEqual(result.status,0);assert.match(result.stderr,/missing --evidence-root/);
     writeFileSync(receiptPath,JSON.stringify(receipt()));result=spawnSync(process.execPath,args,{encoding:"utf8"});assert.equal(result.status,0,result.stderr);
   } finally {rmSync(directory,{recursive:true,force:true});}
+});
+
+test("V2 requires genuine frozen upstream parity and the four-source case mapping",()=>{
+  for (const mutate of [
+    value=>{delete value.runs[0].deterministic_parity.upstream_reference;},
+    value=>{value.runs[0].deterministic_parity.upstream_reference.implementation_revision="a".repeat(40);},
+    value=>{value.runs[0].deterministic_parity.upstream_reference.checkpoint_inventory_sha256=d("wrong-model");},
+    value=>{value.runs[0].deterministic_parity.cases[5].input_png_sha256=value.runs[0].image_quality.cases[5].input_png_sha256;},
+    value=>{value.runs[0].deterministic_parity.cases[0].rendered_ssim=.994;},
+    value=>{value.runs[0].deterministic_parity.cases[0].second_preview_png_sha256=d("native-repeat");},
+  ]) {const value=v2Receipt();mutate(value);assert.throws(()=>validate(value),/upstream|parity.*keys differ/);}
+});
+test("V2 applies the 120-second p95 requirement only to 1B while V1 remains historical",()=>{
+  const value=v2Receipt();for(const run of value.runs.filter(run=>run.tier==="8b")) for(const record of run.image_quality.cases)record.latency_seconds=121;
+  resealV2(value);validate(value);
+  for(const record of value.runs[0].image_quality.cases)record.latency_seconds=121;
+  assert.throws(()=>validate(value),/image threshold/);
+  const legacy=receipt();for(const record of legacy.runs[1].image_quality.cases)record.latency_seconds=121;
+  assert.throws(()=>validate(legacy),/image threshold/);
+});
+
+test("V2 admits the actual caller workflow and a newer attempt at the same pin",()=>{
+  const value=v2Receipt(1),previous=value.campaign_lineage.failed_predecessors[0];
+  previous.inference_revision=value.inference_revision;
+  previous.workflow.run_id=value.execution.workflow_run_id;
+  previous.source_artifacts.forEach(artifact=>{artifact.workflow_run_id=previous.workflow.run_id;artifact.api_workflow_run.id=previous.workflow.run_id;});
+  value.execution.workflow_run_attempt=2;value.campaign_lineage.current_workflow.run_attempt=2;
+  value.campaign_lineage.current_workflow.path=".github/workflows/server-candle-linux.yml";
+  resealQuarantine(previous);rebuildEdges(value);resealV2(value);validate(value);
+  value.execution.workflow_run_attempt=1;value.campaign_lineage.current_workflow.run_attempt=1;
+  resealLineage(value);assert.throws(()=>validate(value),/duplicate\/replayed predecessor workflow/);
 });

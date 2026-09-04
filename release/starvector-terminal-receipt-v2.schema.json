@@ -55,7 +55,7 @@
       "type": "array",
       "minItems": 4,
       "maxItems": 4,
-      "items": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/run" }
+      "items": { "$ref": "#/$defs/run" }
     },
     "hostile_sanitizer": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hostile" },
     "prompt_composition": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/prompt" },
@@ -63,6 +63,168 @@
     "artifact_manifest": { "$ref": "#/$defs/artifact_manifest" }
   },
   "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "provider_id",
+        "tier",
+        "device",
+        "model",
+        "hardware",
+        "image_quality",
+        "deterministic_parity",
+        "lifecycle",
+        "limits",
+        "lifecycle_memory_transcript_sha256"
+      ],
+      "properties": {
+        "backend": {
+          "enum": [
+            "mlx",
+            "candle-cuda"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "tier": {
+          "enum": [
+            "1b",
+            "8b"
+          ]
+        },
+        "device": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/model"
+        },
+        "hardware": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hardware"
+        },
+        "image_quality": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/image_quality"
+        },
+        "deterministic_parity": {
+          "$ref": "#/$defs/upstream_parity"
+        },
+        "lifecycle": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/lifecycle"
+        },
+        "limits": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/limits"
+        },
+        "lifecycle_memory_transcript_sha256": {
+          "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+        }
+      }
+    },
+    "upstream_parity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_count",
+        "upstream_reference",
+        "cases"
+      ],
+      "properties": {
+        "case_count": {
+          "const": 20
+        },
+        "upstream_reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "implementation_repository",
+            "implementation_revision",
+            "checkpoint_repository",
+            "checkpoint_revision",
+            "checkpoint_inventory_sha256",
+            "config_sha256",
+            "processor_sha256",
+            "transcript_sha256"
+          ],
+          "properties": {
+            "implementation_repository": {
+              "const": "https://github.com/joanrod/star-vector"
+            },
+            "implementation_revision": {
+              "const": "0e083c1911760aa31bc576ca7f337a7f8ee605ec"
+            },
+            "checkpoint_repository": {
+              "enum": [
+                "starvector/starvector-1b-im2svg",
+                "starvector/starvector-8b-im2svg"
+              ]
+            },
+            "checkpoint_revision": {
+              "$ref": "#/$defs/rev"
+            },
+            "checkpoint_inventory_sha256": {
+              "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+            },
+            "config_sha256": {
+              "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+            },
+            "processor_sha256": {
+              "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+            },
+            "transcript_sha256": {
+              "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+            }
+          }
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 20,
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "case_index",
+              "seed",
+              "input_png_sha256",
+              "native_preview_png_sha256",
+              "upstream_svg_sha256",
+              "upstream_preview_png_sha256",
+              "rendered_ssim"
+            ],
+            "properties": {
+              "case_index": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 19
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 19
+              },
+              "input_png_sha256": {
+                "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+              },
+              "native_preview_png_sha256": {
+                "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+              },
+              "upstream_svg_sha256": {
+                "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+              },
+              "upstream_preview_png_sha256": {
+                "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha"
+              },
+              "rendered_ssim": {
+                "type": "number",
+                "minimum": 0.995,
+                "maximum": 1
+              }
+            }
+          }
+        }
+      }
+    },
     "rev": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "decimal_id": {
       "type": "string",
@@ -146,7 +308,7 @@
         "inference_revision": { "$ref": "#/$defs/rev" },
         "sceneworks_revision": { "$ref": "#/$defs/rev" },
         "repository": { "const": "SceneWorks/SceneWorks" },
-        "path": { "const": ".github/workflows/starvector-terminal.yml" },
+        "path": { "enum": [".github/workflows/starvector-terminal.yml", ".github/workflows/server-candle-linux.yml"] },
         "run_id": { "$ref": "#/$defs/decimal_id" },
         "run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 },
         "head_sha": { "$ref": "#/$defs/rev" }
