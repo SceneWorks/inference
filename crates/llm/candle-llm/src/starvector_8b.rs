@@ -20,7 +20,7 @@ use core_llm::{
 };
 
 use crate::decode::{
-    generate_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
+    generate_from_prefill_with_stop, FinishReason as DecodeFinish, GenerationConfig,
     StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
@@ -252,7 +252,7 @@ impl CandleStarVector8bProvider {
                 }
             }
         };
-        let generated = generate_from_prefill(
+        let generated = generate_from_prefill_with_stop(
             &self.model.decoder,
             cache.as_mut(),
             first,
@@ -261,6 +261,7 @@ impl CandleStarVector8bProvider {
             &request.text_request.cancel,
             &mut decode,
             None,
+            Some(&|| stopped.get()),
         )
         .map_err(to_core)?;
         if let Some(error) = failure.into_inner() {
@@ -271,7 +272,7 @@ impl CandleStarVector8bProvider {
                 DecodeFinish::StopToken => {
                     stream.finish_eos()?;
                 }
-                DecodeFinish::MaxTokens | DecodeFinish::Cancelled => {
+                DecodeFinish::MaxTokens | DecodeFinish::Stopped | DecodeFinish::Cancelled => {
                     let _ = stream.push("", began.elapsed())?;
                 }
             }

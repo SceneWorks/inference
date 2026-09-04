@@ -637,7 +637,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
 
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
-        FinishReason::StopToken => CoreFinish::Stop,
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
     }
