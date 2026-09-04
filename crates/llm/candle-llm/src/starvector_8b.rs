@@ -219,26 +219,34 @@ impl CandleStarVector8bProvider {
                     return;
                 }
                 tokens.borrow_mut().push(id as u32);
-                let Ok(text) = tokenizer.decode(&tokens.borrow(), true) else {
-                    return;
+                let text = match tokenizer.decode(&tokens.borrow(), true) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        *failure.borrow_mut() = Some(error);
+                        stopped.set(true);
+                        return;
+                    }
                 };
-                let Some(delta) = detok.push(&text) else {
-                    return;
-                };
+                let delta = detok.push(&text).unwrap_or("");
                 match stream.push(delta, began.elapsed()) {
                     Ok(status @ StarVectorStreamStatus::Continue)
                     | Ok(
                         status @ StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot),
                     ) => {
-                        on_event(StarVectorStreamEvent::Source {
-                            text: delta.to_owned(),
-                            index: step as u32 + 1,
-                        });
+                        if !delta.is_empty() {
+                            on_event(StarVectorStreamEvent::Source {
+                                text: delta.to_owned(),
+                                index: step as u32 + 1,
+                            });
+                        }
                         stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
                     }
                     Ok(StarVectorStreamStatus::Stop(_)) => stopped.set(true),
                     Err(error) => *failure.borrow_mut() = Some(error),
                 }
+                on_event(StarVectorStreamEvent::Progress {
+                    generated_tokens: stream.generated_tokens(),
+                });
                 if failure.borrow().is_some() {
                     stopped.set(true);
                 }
@@ -312,6 +320,7 @@ impl TextLlm for CandleStarVector8bProvider {
                 index: index as usize,
                 channel: Channel::Content,
             }),
+            StarVectorStreamEvent::Progress { .. } => {}
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,

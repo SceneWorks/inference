@@ -165,6 +165,7 @@ pub fn check_starvector_streaming(
                 source.push_str(&text);
                 indices.push(index);
             }
+            StarVectorStreamEvent::Progress { .. } => {}
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,

@@ -203,7 +203,7 @@ pub enum StarVectorFinishReason {
     Cancelled,
 }
 
-/// A streamed UTF-8 source fragment or a terminal event.
+/// A streamed UTF-8 source fragment, token progress, or a terminal event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StarVectorStreamEvent {
     /// A complete UTF-8 source fragment for one generated token.
@@ -212,6 +212,11 @@ pub enum StarVectorStreamEvent {
         text: String,
         /// Zero-based decoder token index.
         index: u32,
+    },
+    /// Accepted decoder-token progress, including tokens without a visible UTF-8 delta.
+    Progress {
+        /// Count excludes the static SVG prefix and EOS, matching the final output counter.
+        generated_tokens: u32,
     },
     /// The deterministic terminal result and counters.
     Done {
@@ -331,6 +336,11 @@ impl<'a> StarVectorBoundedStream<'a> {
             SvgRootState::Incomplete => Ok(StarVectorStreamStatus::Continue),
             SvgRootState::Complete => Ok(self.stop(StarVectorFinishReason::CompleteRoot)),
         }
+    }
+
+    /// Accepted decoder tokens so far, including hidden tokens passed as empty fragments.
+    pub fn generated_tokens(&self) -> u32 {
+        self.generated_tokens
     }
 
     /// Record EOS. EOS is publishable only after the source already forms exactly one complete root.

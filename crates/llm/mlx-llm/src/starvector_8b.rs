@@ -235,12 +235,15 @@ impl StarVector8bProvider {
         let mut decode_event = |event: DecodeEvent| {
             if let DecodeEvent::Token { id, step } = event {
                 tokens.push(id as u32);
-                let Ok(text) = tokenizer.decode(&tokens, true) else {
-                    return;
+                let text = match tokenizer.decode(&tokens, true) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        *stream_error.borrow_mut() = Some(error);
+                        stopped.set(true);
+                        return;
+                    }
                 };
-                let Some(delta) = detok.push(&text) else {
-                    return;
-                };
+                let delta = detok.push(&text).unwrap_or("");
                 let status = match guard.push(delta, began.elapsed()) {
                     Ok(status) => status,
                     Err(error) => {
@@ -249,13 +252,18 @@ impl StarVector8bProvider {
                         return;
                     }
                 };
+                on_event(StarVectorStreamEvent::Progress {
+                    generated_tokens: guard.generated_tokens(),
+                });
                 match status {
                     StarVectorStreamStatus::Continue
                     | StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot) => {
-                        on_event(StarVectorStreamEvent::Source {
-                            text: delta.to_owned(),
-                            index: step as u32 + 1,
-                        });
+                        if !delta.is_empty() {
+                            on_event(StarVectorStreamEvent::Source {
+                                text: delta.to_owned(),
+                                index: step as u32 + 1,
+                            });
+                        }
                     }
                     StarVectorStreamStatus::Stop(_) => {}
                 }
@@ -360,6 +368,7 @@ impl TextLlm for StarVector8bProvider {
                     channel: Channel::Content,
                 });
             }
+            StarVectorStreamEvent::Progress { .. } => {}
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,

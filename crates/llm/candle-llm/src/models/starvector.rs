@@ -18,6 +18,11 @@ fn tensor(w: &Weights, prefix: &str, leaf: &str) -> Result<Tensor> {
     Ok(w.require(&format!("{prefix}.{leaf}"))?.clone())
 }
 
+// OpenAI CLIP uses QuickGELU; GPTBigCode below retains its distinct GELU activation.
+fn clip_quick_gelu(value: &Tensor) -> Result<Tensor> {
+    Ok((value * candle_nn::ops::sigmoid(&(value * 1.702)?)?)?)
+}
+
 struct ClipBlock {
     ln1w: Tensor,
     ln1b: Tensor,
@@ -75,7 +80,7 @@ impl ClipBlock {
         .contiguous()?
         .reshape((batch, seq, CLIP_WIDTH))?;
         let residual = (input + linear(&attn, &self.outw, Some(&self.outb))?)?;
-        let mlp = gelu(&linear(
+        let mlp = clip_quick_gelu(&linear(
             &layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5)?,
             &self.fcw,
             Some(&self.fcb),
@@ -395,6 +400,40 @@ mod tests {
     use super::*;
     use candle_core::Device;
     use std::collections::HashMap;
+
+    #[test]
+    fn clip_quick_gelu_matches_upstream_numeric_fixture() {
+        let values = [-2.0f32, -1.0, 0.0, 1.0, 2.0];
+        let input = Tensor::from_slice(&values, (1, 5), &Device::Cpu).unwrap();
+        let actual = clip_quick_gelu(&input)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Frozen scalar outputs from x * sigmoid(1.702 * x), including both tails.
+        let expected = [
+            -0.06434137685579186f64,
+            -0.1542042340671787,
+            0.0,
+            0.8457957659328212,
+            1.9356586231442083,
+        ];
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((*actual as f64 - expected).abs() < 2e-7);
+        }
+        assert!(
+            (gelu(&input)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[4]
+                - actual[4])
+                .abs()
+                > 0.01
+        );
+    }
 
     #[test]
     fn clip_aligns_f32_preprocessing_with_f16_checkpoint_weights() {
