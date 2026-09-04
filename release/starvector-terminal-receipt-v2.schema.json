@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v2.json",
+  "title": "SC-22261 StarVector terminal receipt V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "campaign_run_id",
+    "inference_revision",
+    "sceneworks_revision",
+    "corpus_sha256",
+    "execution",
+    "producer",
+    "metric_identity",
+    "inference_preflight",
+    "runs",
+    "hostile_sanitizer",
+    "prompt_composition",
+    "campaign_lineage",
+    "artifact_manifest"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "campaign_run_id": { "$ref": "#/$defs/campaign_id" },
+    "inference_revision": { "$ref": "#/$defs/rev" },
+    "sceneworks_revision": { "$ref": "#/$defs/rev" },
+    "corpus_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
+    "execution": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/execution" },
+    "producer": { "$ref": "#/$defs/producer" },
+    "metric_identity": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/metric_identity" },
+    "inference_preflight": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/preflight" },
+    "runs": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/run" }
+    },
+    "hostile_sanitizer": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hostile" },
+    "prompt_composition": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/prompt" },
+    "campaign_lineage": { "$ref": "#/$defs/campaign_lineage" },
+    "artifact_manifest": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/artifacts" }
+  },
+  "$defs": {
+    "rev": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+    },
+    "canonical_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?!.*\\\\)(?:[A-Za-z0-9._:-]+/)*[A-Za-z0-9._:-]+$"
+    },
+    "sized_hash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/canonical_path" },
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "artifact_name", "transcript_sha256", "artifact_manifest_sha256", "campaign_lineage_sha256"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "artifact_name": { "type": "string", "minLength": 1 },
+        "transcript_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
+        "artifact_manifest_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
+        "campaign_lineage_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
+      }
+    },
+    "workflow_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "path", "run_id", "run_attempt", "head_sha", "conclusion"],
+      "properties": {
+        "repository": { "const": "SceneWorks/SceneWorks" },
+        "path": { "$ref": "#/$defs/canonical_path" },
+        "run_id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "run_attempt": { "type": "integer", "minimum": 1 },
+        "head_sha": { "$ref": "#/$defs/rev" },
+        "conclusion": { "enum": ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"] }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "phase", "tuple"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+        "phase": { "enum": ["admission", "setup", "provisioning", "execution", "collection", "validation", "publication", "cleanup", "workflow"] },
+        "tuple": { "enum": ["mlx:1b", "mlx:8b", "candle-cuda:1b", "candle-cuda:8b"] }
+      }
+    },
+    "source_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "id", "name", "size", "digest"],
+      "properties": {
+        "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$" },
+        "size": { "type": "integer", "minimum": 1 },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "quarantine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "entries", "aggregate_sha256"],
+      "properties": {
+        "root": { "$ref": "#/$defs/canonical_path" },
+        "entries": {
+          "type": "array",
+          "minItems": 4,
+          "items": { "$ref": "#/$defs/sized_hash" }
+        },
+        "aggregate_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
+      }
+    },
+    "failed_predecessor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "inference_revision", "sceneworks_revision", "workflow", "failure", "markers", "source_artifacts", "quarantine", "superseded_by"],
+      "properties": {
+        "campaign_id": { "$ref": "#/$defs/campaign_id" },
+        "inference_revision": { "$ref": "#/$defs/rev" },
+        "sceneworks_revision": { "$ref": "#/$defs/rev" },
+        "workflow": { "$ref": "#/$defs/workflow_run" },
+        "failure": { "$ref": "#/$defs/failure" },
+        "markers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["campaign", "tuple"],
+          "properties": {
+            "campaign": { "$ref": "#/$defs/sized_hash" },
+            "tuple": { "$ref": "#/$defs/sized_hash" }
+          }
+        },
+        "source_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/source_artifact" }
+        },
+        "quarantine": { "$ref": "#/$defs/quarantine" },
+        "superseded_by": { "$ref": "#/$defs/campaign_id" }
+      }
+    },
+    "supersession_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["predecessor_campaign_id", "successor_campaign_id", "predecessor_inference_revision", "predecessor_sceneworks_revision", "successor_inference_revision", "successor_sceneworks_revision", "authority"],
+      "properties": {
+        "predecessor_campaign_id": { "$ref": "#/$defs/campaign_id" },
+        "successor_campaign_id": { "$ref": "#/$defs/campaign_id" },
+        "predecessor_inference_revision": { "$ref": "#/$defs/rev" },
+        "predecessor_sceneworks_revision": { "$ref": "#/$defs/rev" },
+        "successor_inference_revision": { "$ref": "#/$defs/rev" },
+        "successor_sceneworks_revision": { "$ref": "#/$defs/rev" },
+        "authority": { "$ref": "#/$defs/sized_hash" }
+      }
+    },
+    "campaign_lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "current_campaign_id", "failed_predecessors", "supersession_records"],
+      "properties": {
+        "kind": { "enum": ["clean", "failed_campaign_supersession"] },
+        "current_campaign_id": { "$ref": "#/$defs/campaign_id" },
+        "failed_predecessors": { "type": "array", "items": { "$ref": "#/$defs/failed_predecessor" } },
+        "supersession_records": { "type": "array", "items": { "$ref": "#/$defs/supersession_record" } }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "clean" } }, "required": ["kind"] },
+          "then": {
+            "properties": {
+              "failed_predecessors": { "maxItems": 0 },
+              "supersession_records": { "maxItems": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "failed_predecessors": { "minItems": 1 },
+              "supersession_records": { "minItems": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

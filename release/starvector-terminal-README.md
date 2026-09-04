@@ -45,3 +45,50 @@ and validity may fall by no more than 0.02. The lower bound is a deterministic o
 bootstrap: 10,000 full-size resamples, Numerical Recipes LCG seed `0x5a17c0de`, statistic
 `(median(1B) - median(8B)) / median(1B)`, and the sorted sample at index 499. The bound must be
 strictly positive; no producer-supplied bootstrap, median, validity, or p95 field is trusted.
+
+## Failed-campaign lineage (receipt V2)
+
+`starvector-terminal-receipt-v2.schema.json` keeps every V1 current-campaign requirement and adds
+an explicit `campaign_lineage` closure. V1 remains accepted unchanged for historical clean receipts;
+its schema and validator semantics are not retroactively tightened. New receipts use V2, including a
+clean first attempt (`kind: clean` with both lineage arrays empty).
+
+A replacement campaign uses `kind: failed_campaign_supersession`. `failed_predecessors` is ordered
+oldest to newest by strictly increasing GitHub workflow run ID. Every predecessor records its safe
+campaign ID, exact historical inference pin and SceneWorks head, non-successful SceneWorks workflow
+repository/path/run/attempt/head/conclusion, typed failure code/phase/four-tuple identity, exact
+campaign- and tuple-marker copies, and one or more exact GitHub source artifacts. GitHub artifact IDs
+are decimal strings and digests use the API's `sha256:<hex>` representation. Cross-pin predecessors
+are valid: history binds each pin rather than pretending that old evidence ran at the current pin.
+
+The predecessor's quarantine root is exactly `quarantine/<campaign-id>`. Its entries are the sorted,
+complete copies under these namespaces:
+
+- `quarantine/<campaign-id>/markers/campaign/...`
+- `quarantine/<campaign-id>/markers/tuple/...`
+- `quarantine/<campaign-id>/source-artifacts/<role>/<artifact-id>/<artifact-name>`
+- `quarantine/<campaign-id>/workflow-run.json`
+
+The quarantine aggregate is SHA-256 over canonical key-sorted JSON containing exactly `{root,
+entries}`. The workflow-run entry likewise hashes canonical key-sorted JSON for the workflow object.
+Paths are relative, slash-separated, traversal-free canonical paths; copy and authority byte sizes
+are positive integers.
+
+There is exactly one append-only supersession record per failed predecessor. The records follow the
+same order and form a single chain from each predecessor to the next predecessor, then to the current
+campaign. Each record binds both campaign IDs, both SceneWorks heads, both inference pins, and an
+authority at
+`lineage/supersession-records/<old-campaign>-to-<new-campaign>.json`. Duplicate campaign IDs,
+workflow executions, GitHub artifacts, quarantine paths/digests, or authority paths/digests are
+replay failures. Forks, cycles, reordering, a current campaign among its own predecessors, and a
+successful predecessor are also rejected.
+
+The producer stores SHA-256 of canonical key-sorted `campaign_lineage` JSON in
+`producer.campaign_lineage_sha256`. That digest appears at `lineage/campaign-lineage.json` in the
+artifact manifest. The manifest also contains every quarantine entry and aggregate plus every
+append-only supersession authority. Unlike V1 containment validation, V2 requires the complete entry
+list to be sorted and to have exact path-and-digest equality with the recomputed closure: extra,
+missing, duplicate, mixed-run, or mutated lineage entries fail closed. Quarantine digests are
+disjoint from current metric, preflight, producer-transcript, run, hostile-suite, and prompt-suite
+references, and all four fresh current tuple records remain mandatory. Failed evidence is retained
+for provenance only; it can never satisfy current acceptance.
