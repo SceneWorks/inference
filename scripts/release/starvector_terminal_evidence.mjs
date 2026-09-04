@@ -1,14 +1,23 @@
 #!/usr/bin/env node
 // SC-22261 terminal evidence validator. CI-only; shipping providers stay native Rust.
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 const SHA = /^[0-9a-f]{64}$/;
 const REV = /^[0-9a-f]{40}$/;
 const CAMPAIGN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
-const DECIMAL_ID = /^[1-9][0-9]*$/;
+const DECIMAL_ID = /^[1-9][0-9]{0,15}$/;
 const ARTIFACT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
 const GITHUB_DIGEST = /^sha256:([0-9a-f]{64})$/;
+const CURRENT_WORKFLOW_PATH = ".github/workflows/starvector-terminal.yml";
+const MAX_SAFE_SIZE = Number.MAX_SAFE_INTEGER;
+const MAX_ATTEMPT = 1000;
+const MAX_LINEAGE_PREDECESSORS = 32;
+const MAX_SOURCE_ARTIFACTS = 32;
+const MAX_CONTENT_INVENTORY_ENTRIES = 20000;
+const MAX_MANIFEST_ENTRIES = 100000;
+export const MAX_RECEIPT_BYTES = 8 * 1024 * 1024;
+const MAX_CORPUS_BYTES = 1024 * 1024;
 const FAILURE_PHASES = new Set(["admission", "setup", "provisioning", "execution", "collection", "validation", "publication", "cleanup", "workflow"]);
 const FAILURE_TUPLES = new Set(["mlx:1b", "mlx:8b", "candle-cuda:1b", "candle-cuda:8b"]);
 const NON_SUCCESS_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"]);
@@ -40,16 +49,20 @@ function owned(kind) { if (!OWNED_CASES.has(kind)) { const count = kind === "hos
 const ownedHash = (kind) => hash(owned(kind).map((entry) => entry.input_sha256).join("\n"));
 const sourceFor = (index) => ({ dataset: SOURCES[Math.floor(index / 30)][0], revision: SOURCES[Math.floor(index / 30)][1], row_index: index % 30 });
 function ref(refs, path, digest) { sha(digest, path); refs.push({ path, sha256: digest }); }
+function boundedString(value, label, maximum) { if (typeof value !== "string" || value.length < 1 || value.length > maximum) fail(`${label} length invalid`); return value; }
+function boundedInteger(value, label, minimum = 0, maximum = MAX_SAFE_SIZE) { if (!Number.isSafeInteger(value) || value < minimum || value > maximum) fail(`${label} must be bounded safe integer`); return value; }
+function decimalId(value, label) { if (typeof value !== "string" || !DECIMAL_ID.test(value) || BigInt(value) > BigInt(Number.MAX_SAFE_INTEGER)) fail(`${label} must be canonical bounded decimal id`); return value; }
 function campaignId(value, label) { if (typeof value !== "string" || !CAMPAIGN.test(value)) fail(`${label} must be safe campaign id`); return value; }
 function canonicalPath(value, label) {
-  if (typeof value !== "string" || !value || value.startsWith("/") || value.endsWith("/") || value.includes("\\") || value.includes("//")) fail(`${label} must be safe canonical path`);
+  if (typeof value !== "string" || !value || value.length > 1024 || value.startsWith("/") || value.endsWith("/") || value.includes("\\") || value.includes("//")) fail(`${label} must be safe canonical path`);
   const segments = value.split("/");
-  if (segments.some((segment) => segment === "." || segment === ".." || !/^[A-Za-z0-9._:-]+$/.test(segment))) fail(`${label} must be safe canonical path`);
+  if (segments.some((segment) => segment.length > 255 || segment === "." || segment === ".." || !/^[A-Za-z0-9._:-]+$/.test(segment))) fail(`${label} must be safe canonical path`);
   return value;
 }
-function sizedHash(value, label) { keys(value, ["path", "size", "sha256"], label); canonicalPath(value.path, `${label} path`); positive(value.size, `${label} size`); sha(value.sha256, `${label} digest`); return value; }
+function sizedHash(value, label) { keys(value, ["path", "size", "sha256"], label); canonicalPath(value.path, `${label} path`); boundedInteger(value.size, `${label} size`, 1); sha(value.sha256, `${label} digest`); return value; }
+function contentEntry(value, label) { keys(value, ["path", "byte_size", "sha256"], label); canonicalPath(value.path, `${label} path`); boundedInteger(value.byte_size, `${label} byte size`); sha(value.sha256, `${label} digest`); return value; }
 function sortedEntries(entries) { return [...entries].sort((left, right) => left.path.localeCompare(right.path)); }
-function samePathDigest(left, right) { return JSON.stringify(left.map(({ path, sha256 }) => ({ path, sha256 }))) === JSON.stringify(right.map(({ path, sha256 }) => ({ path, sha256 }))); }
+function sameEntries(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
 export function campaignLineageSha256(value) { return hash(stable(value)); }
 export function pairedBootstrapLowerBound(pairs) { let state = 0x5a17c0de; const stats = []; for (let i = 0; i < 10000; i += 1) { const one = [], eight = []; for (let draw = 0; draw < pairs.length; draw += 1) { state = (Math.imul(1664525, state) + 1013904223) >>> 0; const pair = pairs[state % pairs.length]; one.push(pair.one); eight.push(pair.eight); } const base = median(one); if (base <= 0) fail("bootstrap baseline invalid"); stats.push((base - median(eight)) / base); } return stats.sort((a, b) => a - b)[499]; }
 
@@ -76,29 +89,46 @@ function metric(value, refs) { keys(value, ["rasterizer", "canvas", "ssim", "lpi
 function preflight(value, revision, refs) { keys(value, ["workflow_run_id", "workflow_run_attempt", "head_sha", "inventory_artifacts", "hook_logs"], "preflight"); if (value.head_sha !== revision || !REV.test(value.head_sha) || typeof value.workflow_run_id !== "string" || !value.workflow_run_id || !Number.isInteger(value.workflow_run_attempt) || value.workflow_run_attempt < 1 || !Array.isArray(value.inventory_artifacts) || value.inventory_artifacts.length !== 2 || !Array.isArray(value.hook_logs) || value.hook_logs.length !== 4) fail("preflight invalid"); const tiers = new Set(), hooks = new Set(); value.inventory_artifacts.forEach((entry) => { keys(entry, ["tier", "sha256"], "inventory artifact"); if (!MODELS.has(entry.tier) || tiers.has(entry.tier)) fail("inventory artifact tier"); tiers.add(entry.tier); ref(refs, `preflight/inventory/${entry.tier}`, entry.sha256); }); value.hook_logs.forEach((entry) => { keys(entry, ["backend", "tier", "sha256"], "hook log"); const key = `${entry.backend}:${entry.tier}`; if (!RUNS.has(key) || hooks.has(key)) fail("hook log identity"); hooks.add(key); ref(refs, `preflight/hook/${key}`, entry.sha256); }); }
 function manifest(value, id, refs) { keys(value, ["campaign_run_id", "entries", "aggregate_sha256"], "artifact manifest"); if (value.campaign_run_id !== id || !Array.isArray(value.entries)) fail("artifact manifest mixed run"); const entries = new Map(); value.entries.forEach((entry) => { keys(entry, ["path", "byte_size", "sha256"], "artifact entry"); if (typeof entry.path !== "string" || !entry.path || !Number.isInteger(entry.byte_size) || entry.byte_size < 0 || entries.has(entry.path)) fail("artifact entry invalid"); sha(entry.sha256, "artifact checksum"); entries.set(entry.path, entry.sha256); }); if (value.aggregate_sha256 !== hash(stable({ campaign_run_id: value.campaign_run_id, entries: value.entries }))) fail("artifact manifest checksum"); refs.forEach((entry) => { if (entries.get(entry.path) !== entry.sha256) fail(`artifact manifest missing/mixed ${entry.path}`); }); return value.aggregate_sha256; }
 function currentEvidenceRefs(receipt, corpus) { const refs = []; metric(receipt.metric_identity, refs); preflight(receipt.inference_preflight, receipt.inference_revision, refs); ref(refs, "producer/transcript", receipt.producer.transcript_sha256); receipt.runs.forEach((entry) => run(entry, refs)); hostile(receipt.hostile_sanitizer, corpus, refs); prompt(receipt.prompt_composition, corpus, refs); return refs; }
-function githubArtifact(value, label) {
-  keys(value, ["role", "id", "name", "size", "digest"], label);
-  if (typeof value.role !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(value.role) || typeof value.id !== "string" || !DECIMAL_ID.test(value.id) || typeof value.name !== "string" || !ARTIFACT_NAME.test(value.name)) fail(`${label} identity invalid`);
-  positive(value.size, `${label} size`);
+function artifactWorkflowRun(value, artifact, label) {
+  keys(value, ["id", "head_sha"], label);
+  if (decimalId(value.id, `${label} id`) !== artifact.workflow_run_id || value.head_sha !== artifact.head_sha) fail(`${label} does not bind artifact workflow run`);
+}
+function githubArtifact(value, predecessor, label) {
+  keys(value, ["role", "repository", "workflow_run_id", "workflow_run_attempt", "head_sha", "api_workflow_run", "id", "name", "size", "digest", "content_inventory"], label);
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(boundedString(value.role, `${label} role`, 64)) || value.repository !== predecessor.workflow.repository || decimalId(value.workflow_run_id, `${label} workflow run id`) !== predecessor.workflow.run_id || boundedInteger(value.workflow_run_attempt, `${label} workflow attempt`, 1, MAX_ATTEMPT) !== predecessor.workflow.run_attempt || value.head_sha !== predecessor.workflow.head_sha || !ARTIFACT_NAME.test(boundedString(value.name, `${label} name`, 255))) fail(`${label} identity/provenance invalid`);
+  decimalId(value.id, `${label} id`);
+  boundedInteger(value.size, `${label} size`, 1);
   const digest = typeof value.digest === "string" ? GITHUB_DIGEST.exec(value.digest) : null;
   if (!digest) fail(`${label} digest invalid`);
-  return { ...value, sha256: digest[1] };
+  artifactWorkflowRun(value.api_workflow_run, value, `${label} API workflow run`);
+  if (!Array.isArray(value.content_inventory) || value.content_inventory.length < 1 || value.content_inventory.length > MAX_CONTENT_INVENTORY_ENTRIES) fail(`${label} content inventory count invalid`);
+  const inventory = value.content_inventory.map((entry, index) => contentEntry(entry, `${label} content ${index}`));
+  if (!sameEntries(inventory, sortedEntries(inventory)) || new Set(inventory.map((entry) => entry.path)).size !== inventory.length) fail(`${label} content inventory must be complete, sorted, and unique`);
+  return { ...value, content_inventory: inventory, sha256: digest[1] };
 }
 function workflowRun(value, predecessor) {
   keys(value, ["repository", "path", "run_id", "run_attempt", "head_sha", "conclusion"], "predecessor workflow");
-  if (value.repository !== "SceneWorks/SceneWorks" || canonicalPath(value.path, "predecessor workflow path") !== value.path || typeof value.run_id !== "string" || !DECIMAL_ID.test(value.run_id) || !Number.isInteger(value.run_attempt) || value.run_attempt < 1 || value.head_sha !== predecessor.sceneworks_revision || !REV.test(value.head_sha) || !NON_SUCCESS_CONCLUSIONS.has(value.conclusion)) fail("predecessor workflow provenance invalid");
+  if (value.repository !== "SceneWorks/SceneWorks" || canonicalPath(value.path, "predecessor workflow path") !== value.path || decimalId(value.run_id, "predecessor workflow run id") !== value.run_id || boundedInteger(value.run_attempt, "predecessor workflow attempt", 1, MAX_ATTEMPT) !== value.run_attempt || value.head_sha !== predecessor.sceneworks_revision || !REV.test(value.head_sha) || !NON_SUCCESS_CONCLUSIONS.has(value.conclusion)) fail("predecessor workflow provenance invalid");
+  return value;
+}
+function currentWorkflow(value, receipt) {
+  keys(value, ["campaign_id", "inference_revision", "sceneworks_revision", "repository", "path", "run_id", "run_attempt", "head_sha"], "current workflow");
+  if (campaignId(value.campaign_id, "current workflow campaign id") !== receipt.campaign_run_id || value.inference_revision !== receipt.inference_revision || value.sceneworks_revision !== receipt.sceneworks_revision || value.repository !== "SceneWorks/SceneWorks" || value.repository !== receipt.execution.repository || canonicalPath(value.path, "current workflow path") !== CURRENT_WORKFLOW_PATH || decimalId(value.run_id, "current workflow run id") !== receipt.execution.workflow_run_id || boundedInteger(value.run_attempt, "current workflow attempt", 1, MAX_ATTEMPT) !== receipt.execution.workflow_run_attempt || value.head_sha !== receipt.execution.head_sha || value.head_sha !== receipt.sceneworks_revision) fail("current workflow provenance invalid");
   return value;
 }
 function failureIdentity(value) {
   keys(value, ["code", "phase", "tuple"], "predecessor failure");
-  if (typeof value.code !== "string" || !/^[a-z][a-z0-9._-]{0,127}$/.test(value.code) || !FAILURE_PHASES.has(value.phase) || !FAILURE_TUPLES.has(value.tuple)) fail("predecessor failure identity invalid");
+  if (!/^[a-z][a-z0-9._-]{0,127}$/.test(boundedString(value.code, "predecessor failure code", 128)) || !FAILURE_PHASES.has(value.phase) || !FAILURE_TUPLES.has(value.tuple)) fail("predecessor failure identity invalid");
 }
 function expectedQuarantineEntries(predecessor, artifacts) {
   const root = `quarantine/${predecessor.campaign_id}`;
   const entries = [
     { path: `${root}/markers/campaign/${predecessor.markers.campaign.path}`, size: predecessor.markers.campaign.size, sha256: predecessor.markers.campaign.sha256 },
     { path: `${root}/markers/tuple/${predecessor.markers.tuple.path}`, size: predecessor.markers.tuple.size, sha256: predecessor.markers.tuple.sha256 },
-    ...artifacts.map((artifact) => ({ path: `${root}/source-artifacts/${artifact.role}/${artifact.id}/${artifact.name}`, size: artifact.size, sha256: artifact.sha256 })),
+    ...artifacts.flatMap((artifact) => [
+      { path: `${root}/source-artifacts/${artifact.role}/${artifact.id}/${artifact.name}`, size: artifact.size, sha256: artifact.sha256 },
+      ...artifact.content_inventory.map((entry) => ({ path: `${root}/source-artifacts/${artifact.role}/${artifact.id}/extracted/${entry.path}`, size: entry.byte_size, sha256: entry.sha256 })),
+    ]),
   ];
   const workflow = stable(predecessor.workflow);
   entries.push({ path: `${root}/workflow-run.json`, size: Buffer.byteLength(workflow), sha256: hash(workflow) });
@@ -106,11 +136,16 @@ function expectedQuarantineEntries(predecessor, artifacts) {
 }
 function validateCampaignLineage(receipt) {
   const lineage = receipt.campaign_lineage;
-  keys(lineage, ["kind", "current_campaign_id", "failed_predecessors", "supersession_records"], "campaign lineage");
-  if (!new Set(["clean", "failed_campaign_supersession"]).has(lineage.kind) || campaignId(lineage.current_campaign_id, "current campaign id") !== receipt.campaign_run_id || !Array.isArray(lineage.failed_predecessors) || !Array.isArray(lineage.supersession_records)) fail("campaign lineage identity invalid");
+  keys(lineage, ["kind", "current_campaign_id", "current_workflow", "failed_predecessors", "supersession_records"], "campaign lineage");
+  if (!new Set(["clean", "failed_campaign_supersession"]).has(lineage.kind) || campaignId(lineage.current_campaign_id, "current campaign id") !== receipt.campaign_run_id || !Array.isArray(lineage.failed_predecessors) || lineage.failed_predecessors.length > MAX_LINEAGE_PREDECESSORS || !Array.isArray(lineage.supersession_records) || lineage.supersession_records.length > MAX_LINEAGE_PREDECESSORS) fail("campaign lineage identity/count invalid");
+  currentWorkflow(lineage.current_workflow, receipt);
   const lineageDigest = campaignLineageSha256(lineage);
   if (receipt.producer.campaign_lineage_sha256 !== lineageDigest) fail("producer lineage hash mismatch");
-  const refs = [{ path: "lineage/campaign-lineage.json", byte_size: Buffer.byteLength(stable(lineage)), sha256: lineageDigest }];
+  const currentWorkflowPayload = stable(lineage.current_workflow);
+  const refs = [
+    { path: "lineage/campaign-lineage.json", byte_size: Buffer.byteLength(stable(lineage)), sha256: lineageDigest },
+    { path: "lineage/current-workflow.json", byte_size: Buffer.byteLength(currentWorkflowPayload), sha256: hash(currentWorkflowPayload) },
+  ];
   if (lineage.kind === "clean") {
     if (lineage.failed_predecessors.length !== 0 || lineage.supersession_records.length !== 0) fail("clean lineage must have empty history");
     return { refs, quarantinedDigests: new Set() };
@@ -120,6 +155,7 @@ function validateCampaignLineage(receipt) {
   const workflowRuns = new Set([`${receipt.execution.repository}:${receipt.execution.workflow_run_id}:${receipt.execution.workflow_run_attempt}`]);
   const artifactIds = new Set(), paths = new Set(refs.map((entry) => entry.path)), historicalDigests = new Set(), authorityDigests = new Set();
   let previousRunId = null;
+  const currentRunId = BigInt(lineage.current_workflow.run_id);
   const predecessors = lineage.failed_predecessors;
   predecessors.forEach((predecessor, index) => {
     keys(predecessor, ["campaign_id", "inference_revision", "sceneworks_revision", "workflow", "failure", "markers", "source_artifacts", "quarantine", "superseded_by"], `failed predecessor ${index}`);
@@ -138,27 +174,28 @@ function validateCampaignLineage(receipt) {
     keys(predecessor.markers, ["campaign", "tuple"], "predecessor markers");
     sizedHash(predecessor.markers.campaign, "campaign marker");
     sizedHash(predecessor.markers.tuple, "tuple marker");
-    if (!Array.isArray(predecessor.source_artifacts) || predecessor.source_artifacts.length === 0) fail("predecessor source artifacts missing");
-    const artifacts = predecessor.source_artifacts.map((artifact, artifactIndex) => githubArtifact(artifact, `source artifact ${artifactIndex}`));
+    if (!Array.isArray(predecessor.source_artifacts) || predecessor.source_artifacts.length === 0 || predecessor.source_artifacts.length > MAX_SOURCE_ARTIFACTS) fail("predecessor source artifact count invalid");
+    const artifacts = predecessor.source_artifacts.map((artifact, artifactIndex) => githubArtifact(artifact, predecessor, `source artifact ${artifactIndex}`));
     for (const artifact of artifacts) {
       if (artifactIds.has(artifact.id)) fail("duplicate/replayed source artifact");
       artifactIds.add(artifact.id);
     }
     const expectedEntries = expectedQuarantineEntries(predecessor, artifacts);
     keys(predecessor.quarantine, ["root", "entries", "aggregate_sha256"], "predecessor quarantine");
-    if (predecessor.quarantine.root !== `quarantine/${predecessor.campaign_id}` || !Array.isArray(predecessor.quarantine.entries)) fail("quarantine root/entries invalid");
+    if (predecessor.quarantine.root !== `quarantine/${predecessor.campaign_id}` || !Array.isArray(predecessor.quarantine.entries) || predecessor.quarantine.entries.length > MAX_MANIFEST_ENTRIES) fail("quarantine root/entries invalid");
     const actualEntries = predecessor.quarantine.entries.map((entry, entryIndex) => sizedHash(entry, `quarantine entry ${entryIndex}`));
     if (JSON.stringify(actualEntries) !== JSON.stringify(expectedEntries)) fail("quarantine entries are not the exact sorted closure");
     const quarantineAggregate = hash(stable({ root: predecessor.quarantine.root, entries: actualEntries }));
     if (predecessor.quarantine.aggregate_sha256 !== quarantineAggregate) fail("quarantine aggregate invalid");
     for (const entry of actualEntries) {
-      if (paths.has(entry.path) || historicalDigests.has(entry.sha256)) fail("duplicate/replayed quarantine path or digest");
+      if (paths.has(entry.path)) fail("duplicate/replayed quarantine path");
       paths.add(entry.path); historicalDigests.add(entry.sha256); refs.push({ path: entry.path, byte_size: entry.size, sha256: entry.sha256 });
     }
     const aggregatePath = `${predecessor.quarantine.root}/aggregate.json`;
-    if (paths.has(aggregatePath) || historicalDigests.has(quarantineAggregate)) fail("duplicate/replayed quarantine aggregate");
+    if (paths.has(aggregatePath)) fail("duplicate/replayed quarantine aggregate path");
     paths.add(aggregatePath); historicalDigests.add(quarantineAggregate);
-    refs.push({ path: aggregatePath, byte_size: Buffer.byteLength(stable(predecessor.quarantine)), sha256: quarantineAggregate });
+    const quarantinePayload = stable({ root: predecessor.quarantine.root, entries: actualEntries });
+    refs.push({ path: aggregatePath, byte_size: Buffer.byteLength(quarantinePayload), sha256: hash(quarantinePayload) });
 
     const successor = index + 1 < predecessors.length ? predecessors[index + 1] : receipt;
     const record = lineage.supersession_records[index];
@@ -170,15 +207,16 @@ function validateCampaignLineage(receipt) {
     paths.add(record.authority.path); authorityDigests.add(record.authority.sha256); historicalDigests.add(record.authority.sha256);
     refs.push({ path: record.authority.path, byte_size: record.authority.size, sha256: record.authority.sha256 });
   });
+  if (previousRunId >= currentRunId) fail("last predecessor workflow run must be older than current workflow run");
   return { refs, quarantinedDigests: historicalDigests };
 }
 function strictV2Manifest(value, expected) {
   keys(value, ["campaign_run_id", "entries", "aggregate_sha256"], "artifact manifest");
-  if (value.campaign_run_id !== expected.campaign_run_id || !Array.isArray(value.entries)) fail("artifact manifest mixed run");
+  if (value.campaign_run_id !== expected.campaign_run_id || !Array.isArray(value.entries) || value.entries.length > MAX_MANIFEST_ENTRIES) fail("artifact manifest mixed run/count");
   const seen = new Set();
-  value.entries.forEach((entry) => { keys(entry, ["path", "byte_size", "sha256"], "artifact entry"); canonicalPath(entry.path, "artifact entry path"); if (!Number.isInteger(entry.byte_size) || entry.byte_size < 0 || seen.has(entry.path)) fail("artifact entry invalid"); seen.add(entry.path); sha(entry.sha256, "artifact checksum"); });
+  value.entries.forEach((entry) => { contentEntry(entry, "artifact entry"); if (seen.has(entry.path)) fail("artifact entry invalid"); seen.add(entry.path); });
   if (JSON.stringify(value.entries) !== JSON.stringify(sortedEntries(value.entries))) fail("artifact manifest entries are not sorted");
-  if (!samePathDigest(value.entries, expected.entries)) fail("artifact manifest is not exact V2 path/digest closure");
+  if (!sameEntries(value.entries, expected.entries)) fail("artifact manifest is not exact V2 path/size/digest closure");
   if (value.aggregate_sha256 !== hash(stable({ campaign_run_id: value.campaign_run_id, entries: value.entries }))) fail("artifact manifest checksum");
   return value.aggregate_sha256;
 }
@@ -198,7 +236,12 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
   keys(receipt, ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "execution", "producer", "metric_identity", "inference_preflight", "runs", "hostile_sanitizer", "prompt_composition", "campaign_lineage", "artifact_manifest"], "receipt");
   campaignId(receipt.campaign_run_id, "receipt campaign id");
   keys(receipt.producer, ["command", "artifact_name", "transcript_sha256", "artifact_manifest_sha256", "campaign_lineage_sha256"], "producer");
+  boundedString(receipt.producer.command, "producer command", 4096);
+  boundedString(receipt.producer.artifact_name, "producer artifact name", 255);
   sha(receipt.producer.campaign_lineage_sha256, "producer lineage");
+  if (!Array.isArray(receipt.artifact_manifest?.entries) || receipt.artifact_manifest.entries.length > MAX_MANIFEST_ENTRIES) fail("artifact manifest mixed run/count");
+  decimalId(receipt.inference_preflight?.workflow_run_id, "preflight workflow run id");
+  boundedInteger(receipt.inference_preflight?.workflow_run_attempt, "preflight workflow attempt", 1, MAX_ATTEMPT);
   const lineage = validateCampaignLineage(receipt);
   const legacy = { ...receipt, schema_version: 1, producer: { command: receipt.producer.command, artifact_name: receipt.producer.artifact_name, transcript_sha256: receipt.producer.transcript_sha256, artifact_manifest_sha256: receipt.producer.artifact_manifest_sha256 } };
   delete legacy.campaign_lineage;
@@ -210,5 +253,6 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
   if (receipt.producer.artifact_manifest_sha256 !== strictV2Manifest(receipt.artifact_manifest, expected)) fail("producer manifest does not bind receipt");
 }
 function option(name) { const index = process.argv.indexOf(name); if (index < 0 || !process.argv[index + 1]) fail(`missing ${name}`); return process.argv[index + 1]; }
-function main() { const command = process.argv[2]; if (command === "validate-plan") { console.log(`corpus_sha256=${validatePlan(JSON.parse(readFileSync(option("--corpus"), "utf8")))}`); return; } if (command === "validate-receipt") { const corpus = JSON.parse(readFileSync(option("--corpus"), "utf8")); validateReceipt(JSON.parse(readFileSync(option("--receipt"), "utf8")), validatePlan(corpus), option("--inference-revision"), option("--sceneworks-revision"), corpus); console.log("starvector terminal receipt: OK"); return; } fail("usage: validate-plan|validate-receipt"); }
+function readBoundedJson(path, label, maximumBytes) { const info = statSync(path); if (!info.isFile() || info.size > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); const bytes = readFileSync(path); if (bytes.byteLength > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); return JSON.parse(bytes.toString("utf8")); }
+function main() { const command = process.argv[2]; if (command === "validate-plan") { console.log(`corpus_sha256=${validatePlan(readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES))}`); return; } if (command === "validate-receipt") { const corpus = readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES); validateReceipt(readBoundedJson(option("--receipt"), "receipt", MAX_RECEIPT_BYTES), validatePlan(corpus), option("--inference-revision"), option("--sceneworks-revision"), corpus); console.log("starvector terminal receipt: OK"); return; } fail("usage: validate-plan|validate-receipt"); }
 if (import.meta.url === `file://${process.argv[1]}`) { try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; } }

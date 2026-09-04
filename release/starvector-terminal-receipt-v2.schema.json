@@ -26,10 +26,31 @@
     "inference_revision": { "$ref": "#/$defs/rev" },
     "sceneworks_revision": { "$ref": "#/$defs/rev" },
     "corpus_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
-    "execution": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/execution" },
+    "execution": {
+      "allOf": [
+        { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/execution" },
+        {
+          "properties": {
+            "repository": { "const": "SceneWorks/SceneWorks" },
+            "workflow_run_id": { "$ref": "#/$defs/decimal_id" },
+            "workflow_run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 }
+          }
+        }
+      ]
+    },
     "producer": { "$ref": "#/$defs/producer" },
     "metric_identity": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/metric_identity" },
-    "inference_preflight": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/preflight" },
+    "inference_preflight": {
+      "allOf": [
+        { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/preflight" },
+        {
+          "properties": {
+            "workflow_run_id": { "$ref": "#/$defs/decimal_id" },
+            "workflow_run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 }
+          }
+        }
+      ]
+    },
     "runs": {
       "type": "array",
       "minItems": 4,
@@ -39,17 +60,27 @@
     "hostile_sanitizer": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/hostile" },
     "prompt_composition": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/prompt" },
     "campaign_lineage": { "$ref": "#/$defs/campaign_lineage" },
-    "artifact_manifest": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/artifacts" }
+    "artifact_manifest": { "$ref": "#/$defs/artifact_manifest" }
   },
   "$defs": {
     "rev": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "decimal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16,
+      "pattern": "^[1-9][0-9]{0,15}$"
+    },
     "campaign_id": {
       "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
       "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
     },
     "canonical_path": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?!.*\\\\)(?:[A-Za-z0-9._:-]+/)*[A-Za-z0-9._:-]+$"
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?!.*\\\\)(?:[A-Za-z0-9._:-]{1,255}/)*[A-Za-z0-9._:-]{1,255}$"
     },
     "sized_hash": {
       "type": "object",
@@ -57,7 +88,17 @@
       "required": ["path", "size", "sha256"],
       "properties": {
         "path": { "$ref": "#/$defs/canonical_path" },
-        "size": { "type": "integer", "minimum": 1 },
+        "size": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
+      }
+    },
+    "content_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "byte_size", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/canonical_path" },
+        "byte_size": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
       }
     },
@@ -66,8 +107,8 @@
       "additionalProperties": false,
       "required": ["command", "artifact_name", "transcript_sha256", "artifact_manifest_sha256", "campaign_lineage_sha256"],
       "properties": {
-        "command": { "type": "string", "minLength": 1 },
-        "artifact_name": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "artifact_name": { "type": "string", "minLength": 1, "maxLength": 255 },
         "transcript_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
         "artifact_manifest_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" },
         "campaign_lineage_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
@@ -80,10 +121,25 @@
       "properties": {
         "repository": { "const": "SceneWorks/SceneWorks" },
         "path": { "$ref": "#/$defs/canonical_path" },
-        "run_id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "run_attempt": { "type": "integer", "minimum": 1 },
+        "run_id": { "$ref": "#/$defs/decimal_id" },
+        "run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 },
         "head_sha": { "$ref": "#/$defs/rev" },
         "conclusion": { "enum": ["failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure"] }
+      }
+    },
+    "current_workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_id", "inference_revision", "sceneworks_revision", "repository", "path", "run_id", "run_attempt", "head_sha"],
+      "properties": {
+        "campaign_id": { "$ref": "#/$defs/campaign_id" },
+        "inference_revision": { "$ref": "#/$defs/rev" },
+        "sceneworks_revision": { "$ref": "#/$defs/rev" },
+        "repository": { "const": "SceneWorks/SceneWorks" },
+        "path": { "const": ".github/workflows/starvector-terminal.yml" },
+        "run_id": { "$ref": "#/$defs/decimal_id" },
+        "run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "head_sha": { "$ref": "#/$defs/rev" }
       }
     },
     "failure": {
@@ -91,21 +147,41 @@
       "additionalProperties": false,
       "required": ["code", "phase", "tuple"],
       "properties": {
-        "code": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
         "phase": { "enum": ["admission", "setup", "provisioning", "execution", "collection", "validation", "publication", "cleanup", "workflow"] },
         "tuple": { "enum": ["mlx:1b", "mlx:8b", "candle-cuda:1b", "candle-cuda:8b"] }
+      }
+    },
+    "artifact_api_workflow_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "head_sha"],
+      "properties": {
+        "id": { "$ref": "#/$defs/decimal_id" },
+        "head_sha": { "$ref": "#/$defs/rev" }
       }
     },
     "source_artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["role", "id", "name", "size", "digest"],
+      "required": ["role", "repository", "workflow_run_id", "workflow_run_attempt", "head_sha", "api_workflow_run", "id", "name", "size", "digest", "content_inventory"],
       "properties": {
-        "role": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
-        "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
-        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$" },
-        "size": { "type": "integer", "minimum": 1 },
-        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        "role": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "repository": { "const": "SceneWorks/SceneWorks" },
+        "workflow_run_id": { "$ref": "#/$defs/decimal_id" },
+        "workflow_run_attempt": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "head_sha": { "$ref": "#/$defs/rev" },
+        "api_workflow_run": { "$ref": "#/$defs/artifact_api_workflow_run" },
+        "id": { "$ref": "#/$defs/decimal_id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "content_inventory": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20000,
+          "items": { "$ref": "#/$defs/content_entry" }
+        }
       }
     },
     "quarantine": {
@@ -116,7 +192,8 @@
         "root": { "$ref": "#/$defs/canonical_path" },
         "entries": {
           "type": "array",
-          "minItems": 4,
+          "minItems": 5,
+          "maxItems": 100000,
           "items": { "$ref": "#/$defs/sized_hash" }
         },
         "aggregate_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
@@ -144,6 +221,7 @@
         "source_artifacts": {
           "type": "array",
           "minItems": 1,
+          "maxItems": 32,
           "items": { "$ref": "#/$defs/source_artifact" }
         },
         "quarantine": { "$ref": "#/$defs/quarantine" },
@@ -167,12 +245,13 @@
     "campaign_lineage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "current_campaign_id", "failed_predecessors", "supersession_records"],
+      "required": ["kind", "current_campaign_id", "current_workflow", "failed_predecessors", "supersession_records"],
       "properties": {
         "kind": { "enum": ["clean", "failed_campaign_supersession"] },
         "current_campaign_id": { "$ref": "#/$defs/campaign_id" },
-        "failed_predecessors": { "type": "array", "items": { "$ref": "#/$defs/failed_predecessor" } },
-        "supersession_records": { "type": "array", "items": { "$ref": "#/$defs/supersession_record" } }
+        "current_workflow": { "$ref": "#/$defs/current_workflow" },
+        "failed_predecessors": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/failed_predecessor" } },
+        "supersession_records": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/supersession_record" } }
       },
       "allOf": [
         {
@@ -191,6 +270,20 @@
           }
         }
       ]
+    },
+    "artifact_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["campaign_run_id", "entries", "aggregate_sha256"],
+      "properties": {
+        "campaign_run_id": { "$ref": "#/$defs/campaign_id" },
+        "entries": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/content_entry" }
+        },
+        "aggregate_sha256": { "$ref": "https://sceneworks.dev/schemas/starvector-terminal-receipt-v1.json#/$defs/sha" }
+      }
     }
   }
 }

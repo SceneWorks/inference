@@ -239,6 +239,9 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         producer = schema["$defs"]["producer"]
         self.assertIn("campaign_lineage_sha256", producer["required"])
         lineage = schema["$defs"]["campaign_lineage"]
+        self.assertIn("current_workflow", lineage["required"])
+        self.assertEqual(lineage["properties"]["failed_predecessors"]["maxItems"], 32)
+        self.assertEqual(lineage["properties"]["supersession_records"]["maxItems"], 32)
         self.assertEqual(
             lineage["properties"]["kind"]["enum"],
             ["clean", "failed_campaign_supersession"],
@@ -266,6 +269,30 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             schema["$defs"]["source_artifact"]["properties"]["digest"]["pattern"],
             "^sha256:[0-9a-f]{64}$",
         )
+        self.assertEqual(
+            set(schema["$defs"]["source_artifact"]["required"]),
+            {
+                "role",
+                "repository",
+                "workflow_run_id",
+                "workflow_run_attempt",
+                "head_sha",
+                "api_workflow_run",
+                "id",
+                "name",
+                "size",
+                "digest",
+                "content_inventory",
+            },
+        )
+        self.assertEqual(
+            schema["$defs"]["source_artifact"]["properties"]["content_inventory"]["maxItems"],
+            20000,
+        )
+        self.assertEqual(schema["$defs"]["decimal_id"]["maxLength"], 16)
+        self.assertEqual(schema["$defs"]["canonical_path"]["maxLength"], 1024)
+        self.assertEqual(schema["$defs"]["sized_hash"]["properties"]["size"]["maximum"], 9007199254740991)
+        self.assertEqual(schema["$defs"]["artifact_manifest"]["properties"]["entries"]["maxItems"], 100000)
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
