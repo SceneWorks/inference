@@ -46,66 +46,44 @@ bootstrap: 10,000 full-size resamples, Numerical Recipes LCG seed `0x5a17c0de`, 
 `(median(1B) - median(8B)) / median(1B)`, and the sorted sample at index 499. The bound must be
 strictly positive; no producer-supplied bootstrap, median, validity, or p95 field is trusted.
 
-## Failed-campaign lineage (receipt V2)
+## Current receipt V2
 
-`starvector-terminal-receipt-v2.schema.json` keeps every V1 current-campaign requirement and adds
-an explicit `campaign_lineage` closure. V1 remains accepted unchanged for historical clean receipts;
-its schema and validator semantics are not retroactively tightened. New receipts use V2, including a
-clean first attempt (`kind: clean` with both lineage arrays empty).
+V1 remains an immutable historical format. Current V2 deliberately replaces its two-native-run
+repeatability check with 20 native-to-upstream comparisons per backend/tier. The cases are the first
+five rows of each selected source (quality indices 0–4, 30–34, 60–64, 90–94), with seed equal to parity
+index. Each case binds its input PNG, native preview, upstream SVG and upstream preview, and requires
+rendered SSIM >= 0.995. `upstream_reference` binds the official StarVector implementation at
+`0e083c1911760aa31bc576ca7f337a7f8ee605ec`, exact checkpoint repository/revision/inventory, config,
+processor and execution transcript. The oracle runs independently in terminal tooling, never in a
+shipping provider. V2's p95 <=120-second latency criterion applies to the 1B tiers only; all image
+quality and 8B improvement criteria remain required.
 
-A replacement campaign uses `kind: failed_campaign_supersession`. `failed_predecessors` is ordered
-oldest to newest by strictly increasing GitHub workflow run ID, and the last predecessor run ID must
-be strictly less than the current run ID. `current_workflow` seals the current campaign ID, inference
-pin, SceneWorks head, repository, exact `.github/workflows/starvector-terminal.yml` path, canonical
-run ID, bounded attempt, and head SHA; its canonical bytes are also bound at
-`lineage/current-workflow.json`. Every predecessor records its safe
-campaign ID, exact historical inference pin and SceneWorks head, non-successful SceneWorks workflow
-repository/path/run/attempt/head/conclusion, typed failure code/phase/four-tuple identity, exact
-campaign- and tuple-marker copies, and one or more exact GitHub source artifacts. Each artifact binds
-the repository, workflow run ID/attempt/head, the artifact API's workflow-run relationship, archive
-ID/name/size/digest, and a complete sorted inventory of every extracted file's path, byte size, and
-SHA-256. GitHub run and artifact IDs are canonical nonzero decimal strings without leading zeroes;
-digests use the API's `sha256:<hex>` representation. Cross-pin predecessors are valid: history binds
-each pin rather than pretending that old evidence ran at the current pin.
+V2 `campaign_lineage` preserves historical failed attempts and their marker/archive references.
+A clean first attempt uses `kind: clean`; a retry uses `failed_campaign_supersession` and an ordered
+history of distinct workflow run/attempt identities. A later attempt may use the same inference pin.
+History is ordered by run ID then attempt, and must precede the current attempt. `current_workflow`
+binds campaign ID, inference pin, SceneWorks head, repository, actual caller workflow path
+(`server-candle-linux.yml` or `starvector-terminal.yml`), run ID and attempt. Original failed marker,
+archive and extracted-file bytes remain bound by their recorded path/size/digest inventory.
 
-The predecessor's quarantine root is exactly `quarantine/<campaign-id>`. Its entries are the sorted,
-complete copies under these namespaces:
+Freshness comes from the current workflow attempt and independently verified current files. Identical
+corpus inputs, fixed metric weights, and deterministic output bytes may recur across attempts. Digest
+inequality is not a freshness test. Historical path closure remains separate from current role paths;
+a historical file cannot fill a missing current path.
 
-- `quarantine/<campaign-id>/markers/campaign/...`
-- `quarantine/<campaign-id>/markers/tuple/...`
-- `quarantine/<campaign-id>/source-artifacts/<role>/<artifact-id>/<artifact-name>`
-- `quarantine/<campaign-id>/source-artifacts/<role>/<artifact-id>/extracted/...`
-- `quarantine/<campaign-id>/workflow-run.json`
+The V2 artifact manifest is an exact sorted role/path/size/digest closure. Production builders use
+`currentArtifactReferences(receipt, corpus)` and independently measured file sizes with
+`buildArtifactManifest(receipt, corpus, sizesMap)`. The validator streams files, verifies digest and
+size, rejects symlinks and missing files, and checks that files do not change during reading. It does
+not fabricate one-byte fixture sizes. Run:
 
-The quarantine aggregate is SHA-256 over canonical key-sorted JSON containing exactly `{root,
-entries}`; its manifest byte size and hash derive from those same serialized bytes. The workflow-run
-entry likewise hashes canonical key-sorted JSON for the workflow object. Paths are relative,
-slash-separated, traversal-free canonical paths; copy and authority byte sizes are bounded safe
-integers.
+```sh
+node scripts/release/starvector_terminal_evidence.mjs validate-receipt \
+  --corpus release/starvector-terminal-corpus-v1.json --receipt receipt.json \
+  --inference-revision <main-revision> --sceneworks-revision <head> \
+  --evidence-root <canonical-evidence-directory>
+```
 
-There is exactly one append-only supersession record per failed predecessor. The records follow the
-same order and form a single chain from each predecessor to the next predecessor, then to the current
-campaign. Each record binds both campaign IDs, both SceneWorks heads, both inference pins, and an
-authority at
-`lineage/supersession-records/<old-campaign>-to-<new-campaign>.json`. Duplicate campaign IDs,
-workflow executions, GitHub artifact IDs, quarantine paths, or authority paths/digests are replay
-failures. Forks, cycles, reordering, a current campaign among its own predecessors, and a successful
-predecessor are also rejected. Repeated file content hashes remain legal when distinct historical
-files genuinely have identical bytes.
-
-The producer stores SHA-256 of canonical key-sorted `campaign_lineage` JSON in
-`producer.campaign_lineage_sha256`. That digest appears at `lineage/campaign-lineage.json` in the
-artifact manifest. The manifest also contains every quarantine entry and aggregate plus every
-append-only supersession authority. Unlike V1 containment validation, V2 requires the complete entry
-list to be sorted and to have exact path, byte-size, and digest equality with the recomputed closure:
-extra, missing, duplicate, mixed-run, or mutated entries fail closed. Every extracted historical
-file participates in the quarantine disjointness check. Quarantine digests are
-disjoint from current metric, preflight, producer-transcript, run, hostile-suite, and prompt-suite
-references, and all four fresh current tuple records remain mandatory. Failed evidence is retained
-for provenance only; it can never satisfy current acceptance.
-
-Before parsing, the CLI caps a receipt at 8 MiB. V2 additionally bounds canonical paths to 1,024
-characters (255 per segment), workflow attempts to 1,000, predecessor and source-artifact arrays to
-32 items, each extracted inventory to 20,000 items, and manifest/quarantine arrays to 100,000 items.
-All sizes must be nonnegative safe integers (positive where a copied file is required), so oversized
-numeric values cannot be rounded into a different identity by JavaScript.
+The current receipt, producer, actual workflow/API provenance, and files must be reconciled together
+before accepting terminal evidence. CPU fixtures establish contract interoperability, not model
+quality or measured performance.

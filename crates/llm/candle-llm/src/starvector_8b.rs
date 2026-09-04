@@ -20,7 +20,7 @@ use core_llm::{
 };
 
 use crate::decode::{
-    generate_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
+    generate_from_prefill_with_stop, FinishReason as DecodeFinish, GenerationConfig,
     StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
@@ -219,32 +219,40 @@ impl CandleStarVector8bProvider {
                     return;
                 }
                 tokens.borrow_mut().push(id as u32);
-                let Ok(text) = tokenizer.decode(&tokens.borrow(), true) else {
-                    return;
+                let text = match tokenizer.decode(&tokens.borrow(), true) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        *failure.borrow_mut() = Some(error);
+                        stopped.set(true);
+                        return;
+                    }
                 };
-                let Some(delta) = detok.push(&text) else {
-                    return;
-                };
+                let delta = detok.push(&text).unwrap_or("");
                 match stream.push(delta, began.elapsed()) {
                     Ok(status @ StarVectorStreamStatus::Continue)
                     | Ok(
                         status @ StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot),
                     ) => {
-                        on_event(StarVectorStreamEvent::Source {
-                            text: delta.to_owned(),
-                            index: step as u32 + 1,
-                        });
+                        if !delta.is_empty() {
+                            on_event(StarVectorStreamEvent::Source {
+                                text: delta.to_owned(),
+                                index: step as u32 + 1,
+                            });
+                        }
                         stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
                     }
                     Ok(StarVectorStreamStatus::Stop(_)) => stopped.set(true),
                     Err(error) => *failure.borrow_mut() = Some(error),
                 }
+                on_event(StarVectorStreamEvent::Progress {
+                    generated_tokens: stream.generated_tokens(),
+                });
                 if failure.borrow().is_some() {
                     stopped.set(true);
                 }
             }
         };
-        let generated = generate_from_prefill(
+        let generated = generate_from_prefill_with_stop(
             &self.model.decoder,
             cache.as_mut(),
             first,
@@ -253,6 +261,7 @@ impl CandleStarVector8bProvider {
             &request.text_request.cancel,
             &mut decode,
             None,
+            Some(&|| stopped.get()),
         )
         .map_err(to_core)?;
         if let Some(error) = failure.into_inner() {
@@ -263,7 +272,7 @@ impl CandleStarVector8bProvider {
                 DecodeFinish::StopToken => {
                     stream.finish_eos()?;
                 }
-                DecodeFinish::MaxTokens | DecodeFinish::Cancelled => {
+                DecodeFinish::MaxTokens | DecodeFinish::Stopped | DecodeFinish::Cancelled => {
                     let _ = stream.push("", began.elapsed())?;
                 }
             }
@@ -312,6 +321,7 @@ impl TextLlm for CandleStarVector8bProvider {
                 index: index as usize,
                 channel: Channel::Content,
             }),
+            StarVectorStreamEvent::Progress { .. } => {}
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,
