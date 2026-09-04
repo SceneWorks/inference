@@ -989,6 +989,9 @@ mod tests {
                     text: (*fragment).into(),
                     index: index as u32,
                 });
+                events(StarVectorStreamEvent::Progress {
+                    generated_tokens: stream.generated_tokens(),
+                });
                 if matches!(status, core_llm::StarVectorStreamStatus::Stop(_)) {
                     break;
                 }

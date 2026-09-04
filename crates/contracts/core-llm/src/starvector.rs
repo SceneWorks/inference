@@ -210,7 +210,7 @@ pub enum StarVectorStreamEvent {
     Source {
         /// Source delta. It is a Rust [`String`], and is therefore always valid UTF-8.
         text: String,
-        /// Zero-based decoder token index.
+        /// Source index. Hidden tokens may leave gaps; a static prefix can occupy index zero.
         index: u32,
     },
     /// Accepted decoder-token progress, including tokens without a visible UTF-8 delta.
