@@ -61,6 +61,12 @@ function canonicalPath(value, label) {
 }
 function sizedHash(value, label) { keys(value, ["path", "size", "sha256"], label); canonicalPath(value.path, `${label} path`); boundedInteger(value.size, `${label} size`, 1); sha(value.sha256, `${label} digest`); return value; }
 function contentEntry(value, label) { keys(value, ["path", "byte_size", "sha256"], label); canonicalPath(value.path, `${label} path`); boundedInteger(value.byte_size, `${label} byte size`); sha(value.sha256, `${label} digest`); return value; }
+function quarantineEntry(value, label, extractedContent) {
+  keys(value, ["path", "size", "sha256"], label); canonicalPath(value.path, `${label} path`); boundedInteger(value.size, `${label} size`); sha(value.sha256, `${label} digest`);
+  const selected = extractedContent.get(value.path);
+  if (value.size === 0 && (!selected || selected.size !== 0 || selected.sha256 !== value.sha256)) fail(`${label} zero-byte content is not bound to an extracted source artifact file`);
+  return value;
+}
 function sortedEntries(entries) { return [...entries].sort((left, right) => left.path.localeCompare(right.path)); }
 function sameEntries(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
 export function campaignLineageSha256(value) { return hash(stable(value)); }
@@ -189,16 +195,19 @@ function validateCampaignLineage(receipt) {
       artifactIds.add(artifact.id);
     }
     const expectedEntries = expectedQuarantineEntries(predecessor, artifacts);
-    const extractedContentPaths = new Set(artifacts.flatMap((artifact) => artifact.content_inventory.map((entry) => `${predecessor.quarantine.root}/source-artifacts/${artifact.role}/${artifact.id}/extracted/${entry.path}`)));
+    const extractedContent = new Map(artifacts.flatMap((artifact) => artifact.content_inventory.map((entry) => {
+      const path = `${predecessor.quarantine.root}/source-artifacts/${artifact.role}/${artifact.id}/extracted/${entry.path}`;
+      return [path, { size: entry.byte_size, sha256: entry.sha256 }];
+    })));
     keys(predecessor.quarantine, ["root", "entries", "aggregate_sha256"], "predecessor quarantine");
     if (predecessor.quarantine.root !== `quarantine/${predecessor.campaign_id}` || !Array.isArray(predecessor.quarantine.entries) || predecessor.quarantine.entries.length > MAX_MANIFEST_ENTRIES) fail("quarantine root/entries invalid");
-    const actualEntries = predecessor.quarantine.entries.map((entry, entryIndex) => sizedHash(entry, `quarantine entry ${entryIndex}`));
+    const actualEntries = predecessor.quarantine.entries.map((entry, entryIndex) => quarantineEntry(entry, `quarantine entry ${entryIndex}`, extractedContent));
     if (JSON.stringify(actualEntries) !== JSON.stringify(expectedEntries)) fail("quarantine entries are not the exact sorted closure");
     const quarantineAggregate = hash(stable({ root: predecessor.quarantine.root, entries: actualEntries }));
     if (predecessor.quarantine.aggregate_sha256 !== quarantineAggregate) fail("quarantine aggregate invalid");
     for (const entry of actualEntries) {
       if (paths.has(entry.path)) fail("duplicate/replayed quarantine path");
-      paths.add(entry.path); historicalDigests.add(entry.sha256); if (!extractedContentPaths.has(entry.path)) historicalNonContentDigests.add(entry.sha256); refs.push({ path: entry.path, byte_size: entry.size, sha256: entry.sha256 });
+      paths.add(entry.path); historicalDigests.add(entry.sha256); if (!extractedContent.has(entry.path)) historicalNonContentDigests.add(entry.sha256); refs.push({ path: entry.path, byte_size: entry.size, sha256: entry.sha256 });
     }
     const aggregatePath = `${predecessor.quarantine.root}/aggregate.json`;
     if (paths.has(aggregatePath)) fail("duplicate/replayed quarantine aggregate path");

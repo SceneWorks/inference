@@ -81,7 +81,10 @@ The quarantine aggregate is SHA-256 over canonical key-sorted JSON containing ex
 entries}`; its manifest byte size and hash derive from those same serialized bytes. The workflow-run
 entry likewise hashes canonical key-sorted JSON for the workflow object. Paths are relative,
 slash-separated, traversal-free canonical paths; copy and authority byte sizes are bounded safe
-integers.
+integers. A zero-byte quarantine entry is valid only when its path, zero size, and empty-file digest
+exactly match a file in a selected source artifact's extracted content inventory. Marker copies,
+source archives, workflow provenance, quarantine aggregates, and supersession authorities remain
+strictly non-empty.
 
 There is exactly one append-only supersession record per failed predecessor. The records follow the
 same order and form a single chain from each predecessor to the next predecessor, then to the current

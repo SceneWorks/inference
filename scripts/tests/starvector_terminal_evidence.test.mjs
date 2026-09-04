@@ -8,7 +8,7 @@ import test from "node:test";
 import { buildArtifactManifest, campaignLineageSha256, hostilePayload, MAX_RECEIPT_BYTES, pairedBootstrapLowerBound, validatePlan, validateReceipt } from "../release/starvector_terminal_evidence.mjs";
 
 const corpus = JSON.parse(readFileSync("release/starvector-terminal-corpus-v1.json", "utf8"));
-const INFERENCE = "1".repeat(40), SCENEWORKS = "2".repeat(40), h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
+const INFERENCE = "1".repeat(40), SCENEWORKS = "2".repeat(40), EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", h = (value) => createHash("sha256").update(value).digest("hex"), d = (label) => h(`fixture:${label}`);
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(",")}]` : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}` : JSON.stringify(value);
 const source = (index) => [["starvector/svg-stack-simple","1d2a96a17cc0c4c1f337b7631adc8c5885bc72ea"],["starvector/svg-icons-simple","e1918a27ba6649e856e5db0710d8a6c7046762c1"],["starvector/svg-emoji-simple","fa75b3617872ae57e6f3cb450aee65dbccbd69e0"],["starvector/svg-fonts-simple","453c739ea13ad2685127f721c333f14d99485299"]][Math.floor(index / 30)];
 const prompts = ["geometric badge","isometric folder","rounded calendar","minimal rocket","layered landscape","abstract flower"];
@@ -63,6 +63,19 @@ function addHistoricalOwnedInputs(value, kind) {
   resealQuarantine(predecessor);
   return resealV2(value);
 }
+function addAuthenticHistoricalInventory(value) {
+  const predecessor=value.campaign_lineage.failed_predecessors[0],artifact=predecessor.source_artifacts[0];
+  artifact.content_inventory.push(
+    ...value.hostile_sanitizer.cases.map((record,index)=>({path:`owned-inputs/hostile/${String(index).padStart(3,"0")}.svg`,byte_size:Buffer.byteLength(hostilePayload(index)),sha256:record.input_sha256})),
+    ...["controller-failure.json","controller-transcript.sha256","preflight-provenance.json","product-service-api.stdout.log","product-service-worker.stdout.log","product-service-logs.json","product-service-logs.sha256","route-command-transcript.json","tuple-controller.json"].map((path,index)=>({path,byte_size:100+index,sha256:d(`authentic-history-${path}`)})),
+    {path:"product-service-api.stderr.log",byte_size:0,sha256:EMPTY_SHA256},
+    {path:"product-service-worker.stderr.log",byte_size:0,sha256:EMPTY_SHA256},
+  );
+  artifact.content_inventory.sort((left,right)=>left.path.localeCompare(right.path));
+  assert.equal(artifact.content_inventory.length,213);
+  resealQuarantine(predecessor);
+  return resealV2(value);
+}
 const validate = (value)=>validateReceipt(value,validatePlan(corpus),INFERENCE,SCENEWORKS,corpus);
 test("checked-in corpus carries exact selected and generated content identities",()=>assert.match(validatePlan(corpus),/^[0-9a-f]{64}$/));
 test("coordinate/dimension hostile variants cover all terminal bounds",()=>{const variants=Array.from({length:10},(_,offset)=>hostilePayload(190+offset));assert(variants.some((value)=>value.includes("width=")));assert(variants.some((value)=>value.includes("height=")));assert(variants.some((value)=>value.includes("viewBox=\"0 0 ")));assert(variants.some((value)=>value.includes("<path d=\"M100000")));assert(variants.some((value)=>value.includes("viewBox=\"100000")));});
@@ -88,6 +101,16 @@ test("V2 lineage mutation is rejected even when the producer lineage hash is rec
 test("quarantined predecessor evidence cannot substitute for a fresh current tuple reference",()=>{const value=v2Receipt(1);value.runs[0].lifecycle_memory_transcript_sha256=value.campaign_lineage.failed_predecessors[0].markers.campaign.sha256;value.artifact_manifest=buildArtifactManifest(value,corpus);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);});
 test("V2 permits all recomputed hostile inputs to recur in complete historical artifact content",()=>{const value=addHistoricalOwnedInputs(v2Receipt(1),"hostile");const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory.filter((entry)=>entry.path.startsWith("owned-inputs/hostile/"));assert.equal(inventory.length,200);validate(value);});
 test("V2 permits recomputed deterministic prompt inputs to recur in complete historical artifact content",()=>{const value=addHistoricalOwnedInputs(v2Receipt(1),"prompt");const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory.filter((entry)=>entry.path.startsWith("owned-inputs/prompt/"));assert.equal(inventory.length,60);validate(value);});
+test("V2 accepts an authentic 213-file historical inventory with exact empty service stderr logs",()=>{const value=addAuthenticHistoricalInventory(v2Receipt(1));const inventory=value.campaign_lineage.failed_predecessors[0].source_artifacts[0].content_inventory;const empty=inventory.filter((entry)=>entry.byte_size===0);assert.deepEqual(empty.map((entry)=>entry.path),["product-service-api.stderr.log","product-service-worker.stderr.log"]);assert(empty.every((entry)=>entry.sha256===EMPTY_SHA256));validate(value);});
+test("V2 rejects zero-byte structural quarantine evidence",()=>{
+  let value=v2Receipt(1),predecessor=value.campaign_lineage.failed_predecessors[0];
+  predecessor.markers.campaign.size=0;resealQuarantine(predecessor);resealLineage(value);assert.throws(()=>validate(value),/bounded safe integer/);
+  value=v2Receipt(1);predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.source_artifacts[0].size=0;resealQuarantine(predecessor);resealLineage(value);assert.throws(()=>validate(value),/bounded safe integer/);
+  value=v2Receipt(1);predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.quarantine.entries.find((entry)=>entry.path.endsWith("/workflow-run.json")).size=0;predecessor.quarantine.aggregate_sha256=h(stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries}));resealLineage(value);assert.throws(()=>validate(value),/zero-byte content is not bound/);
+  value=v2Receipt(1);value.campaign_lineage.supersession_records[0].authority.size=0;resealLineage(value);assert.throws(()=>validate(value),/bounded safe integer/);
+  value=v2Receipt(1);predecessor=value.campaign_lineage.failed_predecessors[0];value.artifact_manifest.entries.find((entry)=>entry.path===`${predecessor.quarantine.root}/aggregate.json`).byte_size=0;resealManifest(value);assert.throws(()=>validate(value),/exact V2 path\/size\/digest closure/);
+});
+test("V2 authentic zero-byte inventory requires exact content binding and complete quarantine closure",()=>{let value=addAuthenticHistoricalInventory(v2Receipt(1)),predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.quarantine.entries.find((entry)=>entry.path.endsWith("product-service-api.stderr.log")).sha256=d("forged-empty-log");predecessor.quarantine.aggregate_sha256=h(stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries}));resealLineage(value);assert.throws(()=>validate(value),/zero-byte content is not bound/);value=addAuthenticHistoricalInventory(v2Receipt(1));predecessor=value.campaign_lineage.failed_predecessors[0];predecessor.quarantine.entries=predecessor.quarantine.entries.filter((entry)=>!entry.path.endsWith("product-service-worker.stderr.log"));predecessor.quarantine.aggregate_sha256=h(stable({root:predecessor.quarantine.root,entries:predecessor.quarantine.entries}));resealLineage(value);assert.throws(()=>validate(value),/exact sorted closure/);});
 test("V2 keeps recurring owned-input digests forbidden outside their exact current input roles",()=>{
   let value=addHistoricalOwnedInputs(v2Receipt(1),"hostile"),digest=value.hostile_sanitizer.cases[0].input_sha256;
   value.runs[0].lifecycle_memory_transcript_sha256=digest;resealV2(value);assert.throws(()=>validate(value),/quarantined evidence cannot satisfy current/);
