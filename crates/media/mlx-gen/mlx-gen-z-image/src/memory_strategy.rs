@@ -1454,16 +1454,28 @@ mod tests {
         )
     }
 
+    /// The per-route byte expectations of [`assert_all_route_asset_facts`].
+    struct ExpectedRouteFacts {
+        conditioning: u64,
+        transformer: u64,
+        decoder: u64,
+        reference_encoder: u64,
+        control: u64,
+    }
+
     fn assert_all_route_asset_facts(
         spec: &LoadSpec,
         control: &std::path::Path,
-        expected_conditioning: u64,
-        expected_transformer: u64,
-        expected_decoder: u64,
-        expected_reference_encoder: u64,
-        expected_control: u64,
+        expected: ExpectedRouteFacts,
         label: &str,
     ) {
+        let ExpectedRouteFacts {
+            conditioning: expected_conditioning,
+            transformer: expected_transformer,
+            decoder: expected_decoder,
+            reference_encoder: expected_reference_encoder,
+            control: expected_control,
+        } = expected;
         for registration in memory_registrations() {
             let control_route = is_control_registration(&registration);
             let mut route_spec = spec.clone();
@@ -1566,11 +1578,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                    quantizable_probe_bytes(bits),
-                    256,
-                    256,
-                    392,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            None,
+                            Some(bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(bits),
+                        decoder: 256,
+                        reference_encoder: 256,
+                        control: 392,
+                    },
                     &format!("prepacked Q{bits} + dense {selection:?}"),
                 );
             }
@@ -1592,16 +1611,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(
-                        Some(base_bits),
-                        Some(base_bits),
-                        crate::model::MODEL_ID,
-                    )
-                    .unwrap(),
-                    quantizable_probe_bytes(base_bits),
-                    256,
-                    256,
-                    392,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            Some(base_bits),
+                            Some(base_bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(base_bits),
+                        decoder: 256,
+                        reference_encoder: 256,
+                        control: 392,
+                    },
                     &format!("matching prepacked Q{base_bits} {selection:?}"),
                 );
 
@@ -1648,11 +1669,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                    quantizable_probe_bytes(bits),
-                    quantizable_probe_bytes(bits),
-                    quantizable_probe_bytes(bits),
-                    quantizable_probe_bytes(bits) + 136,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            None,
+                            Some(bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(bits),
+                        decoder: quantizable_probe_bytes(bits),
+                        reference_encoder: quantizable_probe_bytes(bits),
+                        control: quantizable_probe_bytes(bits) + 136,
+                    },
                     &format!("dense + requested Q{bits} {selection:?}"),
                 );
             }
@@ -1674,11 +1702,18 @@ mod tests {
             assert_all_route_asset_facts(
                 &spec,
                 &control,
-                bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                quantizable_probe_bytes(bits),
-                quantizable_probe_bytes(bits),
-                quantizable_probe_bytes(bits),
-                quantizable_probe_bytes(bits) + 136,
+                ExpectedRouteFacts {
+                    conditioning: bounded_conditioning_bytes(
+                        None,
+                        Some(bits),
+                        crate::model::MODEL_ID,
+                    )
+                    .unwrap(),
+                    transformer: quantizable_probe_bytes(bits),
+                    decoder: quantizable_probe_bytes(bits),
+                    reference_encoder: quantizable_probe_bytes(bits),
+                    control: quantizable_probe_bytes(bits) + 136,
+                },
                 &format!("matching Q{bits} request over prepacked base"),
             );
         }
