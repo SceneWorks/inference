@@ -405,30 +405,28 @@ mod tests {
 
     #[test]
     fn starvector_guard_stops_before_next_decoder_step_and_preserves_reason() {
-        for (fragment, bytes, elapsed, expected) in [
+        // Inject fixed clock-free ticks: this tests control flow, never host scheduling.
+        const START: Duration = Duration::ZERO;
+        const DEADLINE: Duration = Duration::from_secs(1);
+        for (fragment, bytes, tick, expected) in [
             (
                 "<svg></svg>",
                 128,
-                Duration::ZERO,
+                START,
                 StarVectorFinishReason::CompleteRoot,
             ),
-            (
-                "<svg></svg>",
-                5,
-                Duration::ZERO,
-                StarVectorFinishReason::ByteLimit,
-            ),
+            ("<svg></svg>", 5, START, StarVectorFinishReason::ByteLimit),
             (
                 "<svg>",
                 128,
-                Duration::from_secs(1),
+                DEADLINE,
                 StarVectorFinishReason::WallTimeLimit,
             ),
         ] {
             let req = StarVectorRequest::new(
                 TextLlmRequest::new(vec![Message::user("vector")], 64),
                 bytes,
-                Duration::from_secs(1),
+                DEADLINE,
             );
             let mut guard = StarVectorBoundedStream::new(&req);
             let decoder = CountedDecoder {
@@ -449,7 +447,7 @@ mod tests {
                 &req.text_request.cancel,
                 &mut |event| match event {
                     StreamEvent::Token { .. } => {
-                        let status = guard.push(fragment, elapsed).unwrap();
+                        let status = guard.push(fragment, tick).unwrap();
                         assert_eq!(status, StarVectorStreamStatus::Stop(expected));
                         stopped.set(true);
                     }
