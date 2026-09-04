@@ -89,6 +89,14 @@ function metric(value, refs) { keys(value, ["rasterizer", "canvas", "ssim", "lpi
 function preflight(value, revision, refs) { keys(value, ["workflow_run_id", "workflow_run_attempt", "head_sha", "inventory_artifacts", "hook_logs"], "preflight"); if (value.head_sha !== revision || !REV.test(value.head_sha) || typeof value.workflow_run_id !== "string" || !value.workflow_run_id || !Number.isInteger(value.workflow_run_attempt) || value.workflow_run_attempt < 1 || !Array.isArray(value.inventory_artifacts) || value.inventory_artifacts.length !== 2 || !Array.isArray(value.hook_logs) || value.hook_logs.length !== 4) fail("preflight invalid"); const tiers = new Set(), hooks = new Set(); value.inventory_artifacts.forEach((entry) => { keys(entry, ["tier", "sha256"], "inventory artifact"); if (!MODELS.has(entry.tier) || tiers.has(entry.tier)) fail("inventory artifact tier"); tiers.add(entry.tier); ref(refs, `preflight/inventory/${entry.tier}`, entry.sha256); }); value.hook_logs.forEach((entry) => { keys(entry, ["backend", "tier", "sha256"], "hook log"); const key = `${entry.backend}:${entry.tier}`; if (!RUNS.has(key) || hooks.has(key)) fail("hook log identity"); hooks.add(key); ref(refs, `preflight/hook/${key}`, entry.sha256); }); }
 function manifest(value, id, refs) { keys(value, ["campaign_run_id", "entries", "aggregate_sha256"], "artifact manifest"); if (value.campaign_run_id !== id || !Array.isArray(value.entries)) fail("artifact manifest mixed run"); const entries = new Map(); value.entries.forEach((entry) => { keys(entry, ["path", "byte_size", "sha256"], "artifact entry"); if (typeof entry.path !== "string" || !entry.path || !Number.isInteger(entry.byte_size) || entry.byte_size < 0 || entries.has(entry.path)) fail("artifact entry invalid"); sha(entry.sha256, "artifact checksum"); entries.set(entry.path, entry.sha256); }); if (value.aggregate_sha256 !== hash(stable({ campaign_run_id: value.campaign_run_id, entries: value.entries }))) fail("artifact manifest checksum"); refs.forEach((entry) => { if (entries.get(entry.path) !== entry.sha256) fail(`artifact manifest missing/mixed ${entry.path}`); }); return value.aggregate_sha256; }
 function currentEvidenceRefs(receipt, corpus) { const refs = []; metric(receipt.metric_identity, refs); preflight(receipt.inference_preflight, receipt.inference_revision, refs); ref(refs, "producer/transcript", receipt.producer.transcript_sha256); receipt.runs.forEach((entry) => run(entry, refs)); hostile(receipt.hostile_sanitizer, corpus, refs); prompt(receipt.prompt_composition, corpus, refs); return refs; }
+function validatedOwnedInputRef(entry) {
+  const match = /^(hostile|prompt)\/(0|[1-9][0-9]{0,2})\/(input|prompt_sha256)$/.exec(entry.path);
+  if (!match) return false;
+  const [, kind, rawIndex, role] = match;
+  if (role !== (kind === "hostile" ? "input" : "prompt_sha256")) return false;
+  const index = Number(rawIndex), expected = owned(kind)[index];
+  return expected?.case_index === index && expected.input_sha256 === entry.sha256;
+}
 function artifactWorkflowRun(value, artifact, label) {
   keys(value, ["id", "head_sha"], label);
   if (decimalId(value.id, `${label} id`) !== artifact.workflow_run_id || value.head_sha !== artifact.head_sha) fail(`${label} does not bind artifact workflow run`);
@@ -148,12 +156,12 @@ function validateCampaignLineage(receipt) {
   ];
   if (lineage.kind === "clean") {
     if (lineage.failed_predecessors.length !== 0 || lineage.supersession_records.length !== 0) fail("clean lineage must have empty history");
-    return { refs, quarantinedDigests: new Set() };
+    return { refs, quarantinedDigests: new Set(), quarantinedNonContentDigests: new Set() };
   }
   if (lineage.failed_predecessors.length === 0 || lineage.supersession_records.length !== lineage.failed_predecessors.length) fail("failed-campaign lineage chain is incomplete");
   const campaignIds = new Set([receipt.campaign_run_id]);
   const workflowRuns = new Set([`${receipt.execution.repository}:${receipt.execution.workflow_run_id}:${receipt.execution.workflow_run_attempt}`]);
-  const artifactIds = new Set(), paths = new Set(refs.map((entry) => entry.path)), historicalDigests = new Set(), authorityDigests = new Set();
+  const artifactIds = new Set(), paths = new Set(refs.map((entry) => entry.path)), historicalDigests = new Set(), historicalNonContentDigests = new Set(), authorityDigests = new Set();
   let previousRunId = null;
   const currentRunId = BigInt(lineage.current_workflow.run_id);
   const predecessors = lineage.failed_predecessors;
@@ -181,6 +189,7 @@ function validateCampaignLineage(receipt) {
       artifactIds.add(artifact.id);
     }
     const expectedEntries = expectedQuarantineEntries(predecessor, artifacts);
+    const extractedContentPaths = new Set(artifacts.flatMap((artifact) => artifact.content_inventory.map((entry) => `${predecessor.quarantine.root}/source-artifacts/${artifact.role}/${artifact.id}/extracted/${entry.path}`)));
     keys(predecessor.quarantine, ["root", "entries", "aggregate_sha256"], "predecessor quarantine");
     if (predecessor.quarantine.root !== `quarantine/${predecessor.campaign_id}` || !Array.isArray(predecessor.quarantine.entries) || predecessor.quarantine.entries.length > MAX_MANIFEST_ENTRIES) fail("quarantine root/entries invalid");
     const actualEntries = predecessor.quarantine.entries.map((entry, entryIndex) => sizedHash(entry, `quarantine entry ${entryIndex}`));
@@ -189,11 +198,11 @@ function validateCampaignLineage(receipt) {
     if (predecessor.quarantine.aggregate_sha256 !== quarantineAggregate) fail("quarantine aggregate invalid");
     for (const entry of actualEntries) {
       if (paths.has(entry.path)) fail("duplicate/replayed quarantine path");
-      paths.add(entry.path); historicalDigests.add(entry.sha256); refs.push({ path: entry.path, byte_size: entry.size, sha256: entry.sha256 });
+      paths.add(entry.path); historicalDigests.add(entry.sha256); if (!extractedContentPaths.has(entry.path)) historicalNonContentDigests.add(entry.sha256); refs.push({ path: entry.path, byte_size: entry.size, sha256: entry.sha256 });
     }
     const aggregatePath = `${predecessor.quarantine.root}/aggregate.json`;
     if (paths.has(aggregatePath)) fail("duplicate/replayed quarantine aggregate path");
-    paths.add(aggregatePath); historicalDigests.add(quarantineAggregate);
+    paths.add(aggregatePath); historicalDigests.add(quarantineAggregate); historicalNonContentDigests.add(quarantineAggregate);
     const quarantinePayload = stable({ root: predecessor.quarantine.root, entries: actualEntries });
     refs.push({ path: aggregatePath, byte_size: Buffer.byteLength(quarantinePayload), sha256: hash(quarantinePayload) });
 
@@ -204,11 +213,11 @@ function validateCampaignLineage(receipt) {
     const expectedAuthorityPath = `lineage/supersession-records/${predecessor.campaign_id}-to-${successor.campaign_run_id ?? successor.campaign_id}.json`;
     if (predecessor.superseded_by !== (successor.campaign_run_id ?? successor.campaign_id) || record.predecessor_campaign_id !== predecessor.campaign_id || record.successor_campaign_id !== predecessor.superseded_by || record.predecessor_inference_revision !== predecessor.inference_revision || record.predecessor_sceneworks_revision !== predecessor.sceneworks_revision || record.successor_inference_revision !== successor.inference_revision || record.successor_sceneworks_revision !== successor.sceneworks_revision || record.authority.path !== expectedAuthorityPath) fail("supersession chain fork/head/pin mismatch");
     if (paths.has(record.authority.path) || authorityDigests.has(record.authority.sha256) || historicalDigests.has(record.authority.sha256)) fail("duplicate/replayed supersession authority");
-    paths.add(record.authority.path); authorityDigests.add(record.authority.sha256); historicalDigests.add(record.authority.sha256);
+    paths.add(record.authority.path); authorityDigests.add(record.authority.sha256); historicalDigests.add(record.authority.sha256); historicalNonContentDigests.add(record.authority.sha256);
     refs.push({ path: record.authority.path, byte_size: record.authority.size, sha256: record.authority.sha256 });
   });
   if (previousRunId >= currentRunId) fail("last predecessor workflow run must be older than current workflow run");
-  return { refs, quarantinedDigests: historicalDigests };
+  return { refs, quarantinedDigests: historicalDigests, quarantinedNonContentDigests: historicalNonContentDigests };
 }
 function strictV2Manifest(value, expected) {
   keys(value, ["campaign_run_id", "entries", "aggregate_sha256"], "artifact manifest");
@@ -248,7 +257,7 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
   validateReceiptV1(legacy, corpusHash, inferenceRevision, sceneworksRevision, corpus);
   const current = currentEvidenceRefs(receipt, corpus);
   const producerDigests = [receipt.producer.artifact_manifest_sha256, receipt.producer.campaign_lineage_sha256];
-  if (current.some((entry) => lineage.quarantinedDigests.has(entry.sha256)) || producerDigests.some((digest) => lineage.quarantinedDigests.has(digest))) fail("quarantined evidence cannot satisfy current campaign references");
+  if (current.some((entry) => lineage.quarantinedDigests.has(entry.sha256) && (!validatedOwnedInputRef(entry) || lineage.quarantinedNonContentDigests.has(entry.sha256))) || producerDigests.some((digest) => lineage.quarantinedDigests.has(digest))) fail("quarantined evidence cannot satisfy current campaign references");
   const expected = buildArtifactManifest(receipt, corpus);
   if (receipt.producer.artifact_manifest_sha256 !== strictV2Manifest(receipt.artifact_manifest, expected)) fail("producer manifest does not bind receipt");
 }
