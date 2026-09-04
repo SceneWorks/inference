@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // SC-22261 terminal evidence validator. CI-only; shipping providers stay native Rust.
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { join } from "node:path";
 
 const SHA = /^[0-9a-f]{64}$/;
 const REV = /^[0-9a-f]{40}$/;
@@ -238,18 +239,56 @@ function strictV2Manifest(value, expected) {
   if (value.aggregate_sha256 !== hash(stable({ campaign_run_id: value.campaign_run_id, entries: value.entries }))) fail("artifact manifest checksum");
   return value.aggregate_sha256;
 }
-export function buildArtifactManifest(receipt, corpus) {
-  const refs = currentEvidenceRefs(receipt, corpus);
+// Measure the canonical files independently of receipt-supplied sizes. Stream large
+// metric weights and retired archives rather than loading them into memory.
+export function artifactByteSizesFromFiles(evidenceRoot, refs) {
+  const root = realpathSync(evidenceRoot), sizes = new Map(), buffer = Buffer.alloc(64 * 1024);
+  if (!statSync(root).isDirectory()) fail("evidence root must be a directory");
+  for (const entry of refs) {
+    canonicalPath(entry.path, "artifact file path");
+    sha(entry.sha256, "artifact file digest");
+    const segments = entry.path.split("/");
+    let file = root;
+    for (const [index, segment] of segments.entries()) {
+      file = join(file, segment);
+      const info = lstatSync(file);
+      if (info.isSymbolicLink() || (index < segments.length - 1 ? !info.isDirectory() : !info.isFile())) fail(`artifact is not a regular contained file: ${entry.path}`);
+    }
+    const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const before = fstatSync(fd), digest = createHash("sha256");
+      if (!before.isFile()) fail(`artifact is not a regular file: ${entry.path}`);
+      let size = 0, count;
+      while ((count = readSync(fd, buffer, 0, buffer.length, null)) !== 0) { size += count; digest.update(buffer.subarray(0, count)); }
+      const after = fstatSync(fd);
+      if (size !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) fail(`artifact changed while reading: ${entry.path}`);
+      if (digest.digest("hex") !== entry.sha256) fail(`artifact file digest mismatch: ${entry.path}`);
+      if (entry.byte_size !== undefined && entry.byte_size !== size) fail(`artifact file byte size mismatch: ${entry.path}`);
+      sizes.set(entry.path, boundedInteger(size, `artifact file ${entry.path} byte size`));
+    } finally { closeSync(fd); }
+  }
+  return sizes;
+}
+function currentArtifactByteSize(byteSizes, path) {
+  const value = typeof byteSizes === "function" ? byteSizes(path) : byteSizes instanceof Map ? byteSizes.get(path) : byteSizes?.[path];
+  return boundedInteger(value, `current artifact ${path} byte size`);
+}
+export function currentArtifactReferences(receipt, corpus) {
+  return currentEvidenceRefs(receipt, corpus).map(({ path, sha256 }) => ({ path, sha256 }));
+}
+export function buildArtifactManifest(receipt, corpus, currentArtifactByteSizes) {
+  const refs = currentArtifactReferences(receipt, corpus);
   if (receipt.schema_version === 1) { const entries = refs.map((entry) => ({ ...entry, byte_size: 1 })); return { campaign_run_id: receipt.campaign_run_id, entries, aggregate_sha256: hash(stable({ campaign_run_id: receipt.campaign_run_id, entries })) }; }
   if (receipt.schema_version !== 2) fail("unsupported receipt schema version");
+  if (currentArtifactByteSizes === undefined) fail("V2 artifact manifest requires actual current artifact byte sizes");
   const lineage = validateCampaignLineage(receipt);
-  const entries = sortedEntries([...refs.map((entry) => ({ ...entry, byte_size: 1 })), ...lineage.refs]);
+  const entries = sortedEntries([...refs.map((entry) => ({ ...entry, byte_size: currentArtifactByteSize(currentArtifactByteSizes, entry.path) })), ...lineage.refs]);
   return { campaign_run_id: receipt.campaign_run_id, entries, aggregate_sha256: hash(stable({ campaign_run_id: receipt.campaign_run_id, entries })) };
 }
 function validateReceiptV1(receipt, corpusHash, inferenceRevision, sceneworksRevision, corpus) {
   keys(receipt, ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "execution", "producer", "metric_identity", "inference_preflight", "runs", "hostile_sanitizer", "prompt_composition", "artifact_manifest"], "receipt"); if (receipt.schema_version !== 1 || typeof receipt.campaign_run_id !== "string" || !receipt.campaign_run_id || receipt.inference_revision !== inferenceRevision || receipt.sceneworks_revision !== sceneworksRevision || !REV.test(receipt.inference_revision) || !REV.test(receipt.sceneworks_revision) || receipt.corpus_sha256 !== corpusHash) fail("receipt identity invalid"); keys(receipt.execution, ["repository", "workflow_run_id", "workflow_run_attempt", "head_sha", "started_at", "completed_at", "clean_tree"], "execution"); if (receipt.execution.repository !== "SceneWorks/SceneWorks" || receipt.execution.head_sha !== sceneworksRevision || !REV.test(receipt.execution.head_sha) || typeof receipt.execution.workflow_run_id !== "string" || !receipt.execution.workflow_run_id || !Number.isInteger(receipt.execution.workflow_run_attempt) || receipt.execution.workflow_run_attempt < 1 || receipt.execution.clean_tree !== true || Number.isNaN(Date.parse(receipt.execution.started_at)) || Number.isNaN(Date.parse(receipt.execution.completed_at)) || Date.parse(receipt.execution.completed_at) < Date.parse(receipt.execution.started_at)) fail("execution provenance invalid"); keys(receipt.producer, ["command", "artifact_name", "transcript_sha256", "artifact_manifest_sha256"], "producer"); if (typeof receipt.producer.command !== "string" || !receipt.producer.command || typeof receipt.producer.artifact_name !== "string" || !receipt.producer.artifact_name) fail("producer identity invalid"); sha(receipt.producer.transcript_sha256, "producer transcript"); sha(receipt.producer.artifact_manifest_sha256, "producer manifest"); const refs = []; metric(receipt.metric_identity, refs); preflight(receipt.inference_preflight, inferenceRevision, refs); ref(refs, "producer/transcript", receipt.producer.transcript_sha256); if (!Array.isArray(receipt.runs) || receipt.runs.length !== 4) fail("run count"); const seen = new Set(), inventory = new Map(), analysis = new Map(); receipt.runs.forEach((entry) => { const result = run(entry, refs); if (seen.has(result.runKey)) fail("duplicate run"); seen.add(result.runKey); if (inventory.has(entry.tier) && inventory.get(entry.tier) !== result.inventory) fail("mixed snapshot inventory"); inventory.set(entry.tier, result.inventory); analysis.set(result.runKey, result); }); if ([...RUNS.keys()].some((key) => !seen.has(key))) fail("required run missing"); hostile(receipt.hostile_sanitizer, corpus, refs); prompt(receipt.prompt_composition, corpus, refs); if (receipt.producer.artifact_manifest_sha256 !== manifest(receipt.artifact_manifest, receipt.campaign_run_id, refs)) fail("producer manifest does not bind receipt"); ["mlx", "candle-cuda"].forEach((backend) => { const one = analysis.get(`${backend}:1b`), eight = analysis.get(`${backend}:8b`); const improvement = (one.median_lpips - eight.median_lpips) / one.median_lpips; const pairs = one.cases.flatMap((entry, index) => entry.accepted && eight.cases[index].accepted ? [{ one: entry.lpips, eight: eight.cases[index].lpips }] : []); if (one.median_lpips <= 0 || pairs.length < 114 || improvement < .10 || eight.validity - one.validity < -.02 || pairedBootstrapLowerBound(pairs) <= 0) fail(`8B ${backend} threshold failed`); });
 }
-export function validateReceipt(receipt, corpusHash, inferenceRevision, sceneworksRevision, corpus) {
+export function validateReceipt(receipt, corpusHash, inferenceRevision, sceneworksRevision, corpus, currentArtifactByteSizes) {
   if (receipt?.schema_version !== 2) return validateReceiptV1(receipt, corpusHash, inferenceRevision, sceneworksRevision, corpus);
   keys(receipt, ["schema_version", "campaign_run_id", "inference_revision", "sceneworks_revision", "corpus_sha256", "execution", "producer", "metric_identity", "inference_preflight", "runs", "hostile_sanitizer", "prompt_composition", "campaign_lineage", "artifact_manifest"], "receipt");
   campaignId(receipt.campaign_run_id, "receipt campaign id");
@@ -267,10 +306,23 @@ export function validateReceipt(receipt, corpusHash, inferenceRevision, scenewor
   const current = currentEvidenceRefs(receipt, corpus);
   const producerDigests = [receipt.producer.artifact_manifest_sha256, receipt.producer.campaign_lineage_sha256];
   if (current.some((entry) => lineage.quarantinedDigests.has(entry.sha256) && (!validatedOwnedInputRef(entry) || lineage.quarantinedNonContentDigests.has(entry.sha256))) || producerDigests.some((digest) => lineage.quarantinedDigests.has(digest))) fail("quarantined evidence cannot satisfy current campaign references");
-  const expected = buildArtifactManifest(receipt, corpus);
+  const expected = buildArtifactManifest(receipt, corpus, currentArtifactByteSizes);
   if (receipt.producer.artifact_manifest_sha256 !== strictV2Manifest(receipt.artifact_manifest, expected)) fail("producer manifest does not bind receipt");
 }
 function option(name) { const index = process.argv.indexOf(name); if (index < 0 || !process.argv[index + 1]) fail(`missing ${name}`); return process.argv[index + 1]; }
 function readBoundedJson(path, label, maximumBytes) { const info = statSync(path); if (!info.isFile() || info.size > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); const bytes = readFileSync(path); if (bytes.byteLength > maximumBytes) fail(`${label} exceeds ${maximumBytes} byte input limit`); return JSON.parse(bytes.toString("utf8")); }
-function main() { const command = process.argv[2]; if (command === "validate-plan") { console.log(`corpus_sha256=${validatePlan(readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES))}`); return; } if (command === "validate-receipt") { const corpus = readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES); validateReceipt(readBoundedJson(option("--receipt"), "receipt", MAX_RECEIPT_BYTES), validatePlan(corpus), option("--inference-revision"), option("--sceneworks-revision"), corpus); console.log("starvector terminal receipt: OK"); return; } fail("usage: validate-plan|validate-receipt"); }
+function main() {
+  const command = process.argv[2];
+  if (command === "validate-plan") { console.log(`corpus_sha256=${validatePlan(readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES))}`); return; }
+  if (command === "validate-receipt") {
+    const corpus = readBoundedJson(option("--corpus"), "corpus", MAX_CORPUS_BYTES);
+    const receipt = readBoundedJson(option("--receipt"), "receipt", MAX_RECEIPT_BYTES);
+    const evidenceRoot = receipt.schema_version === 2 ? option("--evidence-root") : undefined;
+    const sizes = evidenceRoot === undefined ? undefined : artifactByteSizesFromFiles(evidenceRoot, currentArtifactReferences(receipt, corpus));
+    validateReceipt(receipt, validatePlan(corpus), option("--inference-revision"), option("--sceneworks-revision"), corpus, sizes);
+    if (evidenceRoot !== undefined) artifactByteSizesFromFiles(evidenceRoot, validateCampaignLineage(receipt).refs);
+    console.log("starvector terminal receipt: OK"); return;
+  }
+  fail("usage: validate-plan|validate-receipt (V2 requires --evidence-root)");
+}
 if (import.meta.url === `file://${process.argv[1]}`) { try { main(); } catch (error) { console.error(error.message); process.exitCode = 1; } }

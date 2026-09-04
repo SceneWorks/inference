@@ -112,3 +112,11 @@ characters (255 per segment), workflow attempts to 1,000, predecessor and source
 32 items, each extracted inventory to 20,000 items, and manifest/quarantine arrays to 100,000 items.
 All sizes must be nonnegative safe integers (positive where a copied file is required), so oversized
 numeric values cannot be rounded into a different identity by JavaScript.
+
+V2 current-file sizes are measured independently: callers enumerate
+`currentArtifactReferences(receipt, corpus)`, read and verify those files, then pass a path-to-size
+map (or resolver) to `buildArtifactManifest` and `validateReceipt`. Missing or invalid sizes fail
+closed. The CLI requires `--evidence-root <canonical-evidence-directory>` for V2 and streams each
+current file to verify its digest and byte size; it also verifies all lineage/quarantine files.
+Canonical files and parent directories must not be symbolic links. V1's historical CLI interface
+and containment semantics remain unchanged.
