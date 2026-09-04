@@ -214,3 +214,14 @@ test("V2 admits the actual caller workflow and a newer attempt at the same pin",
   value.execution.workflow_run_attempt=1;value.campaign_lineage.current_workflow.run_attempt=1;
   resealLineage(value);assert.throws(()=>validate(value),/duplicate\/replayed predecessor workflow/);
 });
+
+test("V2 canonical JSON key order is independent of producer object insertion order",()=>{
+  const value=v2Receipt(1);
+  // Recovery persists stable canonical JSON, while JS builders insert path/size/hash keys.
+  // Parse those exact canonical bytes to exercise the production serialization boundary.
+  validate(JSON.parse(stable(value)));
+  const reordered=JSON.parse(stable(value));
+  reordered.campaign_lineage.failed_predecessors[0].quarantine.entries.reverse();
+  resealLineage(reordered);
+  assert.throws(()=>validate(reordered),/exact sorted closure/);
+});

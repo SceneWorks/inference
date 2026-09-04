@@ -69,7 +69,7 @@ function quarantineEntry(value, label, extractedContent) {
   return value;
 }
 function sortedEntries(entries) { return [...entries].sort((left, right) => left.path.localeCompare(right.path)); }
-function sameEntries(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+function sameEntries(left, right) { return stable(left) === stable(right); }
 export function campaignLineageSha256(value) { return hash(stable(value)); }
 export function pairedBootstrapLowerBound(pairs) { let state = 0x5a17c0de; const stats = []; for (let i = 0; i < 10000; i += 1) { const one = [], eight = []; for (let draw = 0; draw < pairs.length; draw += 1) { state = (Math.imul(1664525, state) + 1013904223) >>> 0; const pair = pairs[state % pairs.length]; one.push(pair.one); eight.push(pair.eight); } const base = median(one); if (base <= 0) fail("bootstrap baseline invalid"); stats.push((base - median(eight)) / base); } return stats.sort((a, b) => a - b)[499]; }
 
@@ -214,7 +214,7 @@ function validateCampaignLineage(receipt) {
     keys(predecessor.quarantine, ["root", "entries", "aggregate_sha256"], "predecessor quarantine");
     if (predecessor.quarantine.root !== `quarantine/${predecessor.campaign_id}` || !Array.isArray(predecessor.quarantine.entries) || predecessor.quarantine.entries.length > MAX_MANIFEST_ENTRIES) fail("quarantine root/entries invalid");
     const actualEntries = predecessor.quarantine.entries.map((entry, entryIndex) => quarantineEntry(entry, `quarantine entry ${entryIndex}`, extractedContent));
-    if (JSON.stringify(actualEntries) !== JSON.stringify(expectedEntries)) fail("quarantine entries are not the exact sorted closure");
+    if (!sameEntries(actualEntries, expectedEntries)) fail("quarantine entries are not the exact sorted closure");
     const quarantineAggregate = hash(stable({ root: predecessor.quarantine.root, entries: actualEntries }));
     if (predecessor.quarantine.aggregate_sha256 !== quarantineAggregate) fail("quarantine aggregate invalid");
     for (const entry of actualEntries) {
@@ -245,7 +245,7 @@ function strictV2Manifest(value, expected) {
   if (value.campaign_run_id !== expected.campaign_run_id || !Array.isArray(value.entries) || value.entries.length > MAX_MANIFEST_ENTRIES) fail("artifact manifest mixed run/count");
   const seen = new Set();
   value.entries.forEach((entry) => { contentEntry(entry, "artifact entry"); if (seen.has(entry.path)) fail("artifact entry invalid"); seen.add(entry.path); });
-  if (JSON.stringify(value.entries) !== JSON.stringify(sortedEntries(value.entries))) fail("artifact manifest entries are not sorted");
+  if (!sameEntries(value.entries, sortedEntries(value.entries))) fail("artifact manifest entries are not sorted");
   if (!sameEntries(value.entries, expected.entries)) fail("artifact manifest is not exact V2 path/size/digest closure");
   if (value.aggregate_sha256 !== hash(stable({ campaign_run_id: value.campaign_run_id, entries: value.entries }))) fail("artifact manifest checksum");
   return value.aggregate_sha256;
