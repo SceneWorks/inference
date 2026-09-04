@@ -620,13 +620,16 @@ fn memory_strategy_contract_with_asset_facts(
 
 /// Component `.safetensors` sums for the spec's snapshot root. A [`WeightsSource::File`] base source
 /// has no component tree, so its base-model fields stay `0` (the truthful "unknown", not a guess);
-/// a separately addressed control checkpoint remains independently countable.
+/// a separately addressed control checkpoint remains independently countable. The `vae/` inventory
+/// is split by key prefix: `decoder_bytes` is the render-resident half, and the `encoder.*` half a
+/// `Reference` request opts into is the typed [`MemoryComponentKind::ReferenceEncoder`] component
+/// this returns alongside the control components (SC-22667).
 fn asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
     streamable: bool,
 ) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
-    let (mut components, effective_quant) = match &spec.weights {
+    let (mut components, reference_encoder_bytes, effective_quant) = match &spec.weights {
         WeightsSource::Dir(root) => {
             // This is the same resolver every concrete loader captures for its safety gate and
             // selected-encoder policy. Besides naming a packed turnkey when no override was
@@ -638,27 +641,35 @@ fn asset_facts(
             // the model policy for a dense selected text encoder, but it does *not* implicitly pack a
             // separately dense VAE or ControlNet. Existing affine triples are preserved by the shared
             // header projector in either case.
-            let project = |path: &std::path::Path| {
-                projected_safetensors_bytes(path, |_| match spec.quantize {
-                    Some(quant) => ResidentProjection::GroupQuantized {
-                        bits: quant.bits(),
-                        group_size: crate::quant::GROUP_SIZE as usize,
-                    },
-                    None => ResidentProjection::Stored,
-                })
+            let projection = |_: &mlx_gen::gen_core::SafetensorsTensorHeader| match spec.quantize {
+                Some(quant) => ResidentProjection::GroupQuantized {
+                    bits: quant.bits(),
+                    group_size: crate::quant::GROUP_SIZE as usize,
+                },
+                None => ResidentProjection::Stored,
             };
+            // SC-22667 / E1: `load_vae` builds the decoder and attaches the `encoder.*` tree, but a
+            // text-to-image render evaluates only the decoder — the SC-22667 T2I anchor measures
+            // its resident level 58.6 MB *below* the whole-`vae/` sum, which is the encoder's
+            // bytes. Only a `Conditioning::Reference` request materializes the encoder, so it is
+            // declared as an auxiliary `ReferenceEncoder`, not folded into `decoder_bytes`.
+            let vae = VaeProjection::from_tensors(&projected_safetensors_tensors(
+                root.join("vae"),
+                projection,
+            )?);
             (
                 mlx_gen::PerComponentBytes {
                     text_encoder: 0,
-                    dit: project(&root.join("transformer"))?,
-                    vae: project(&root.join("vae"))?,
+                    dit: projected_safetensors_bytes(root.join("transformer"), projection)?,
+                    vae: vae.decoder,
                 },
+                vae.reference_encoder,
                 effective_quant,
             )
         }
         // A combined single-file checkpoint cannot be split into the three contract components.
         // Zero remains the truthful unknown; the independently addressed control is still exact.
-        WeightsSource::File(_) => (mlx_gen::PerComponentBytes::default(), None),
+        WeightsSource::File(_) => (mlx_gen::PerComponentBytes::default(), 0, None),
     };
     if let WeightsSource::Dir(root) = &spec.weights {
         let encoder_contract = crate::active_encoder_contract();
@@ -674,17 +685,65 @@ fn asset_facts(
             load_time_quant_bits,
         )?;
     }
-    let resident_components = match &spec.control {
+    let control_components = match &spec.control {
         Some(source) => control_resident_components(source, spec.quantize, streamable)?,
         None => Vec::new(),
     };
-    let control_bytes = resident_components.iter().fold(0_u64, |total, component| {
+    let control_bytes = control_components.iter().fold(0_u64, |total, component| {
         total.saturating_add(component.resident_bytes)
     });
+    let resident_components = reference_encoder_component(reference_encoder_bytes)
+        .into_iter()
+        .chain(control_components)
+        .collect();
     Ok((
-        component_asset_facts(components, control_bytes),
+        component_asset_facts(components, control_bytes, reference_encoder_bytes),
         resident_components,
     ))
+}
+
+/// Stable id of the typed [`MemoryComponentKind::ReferenceEncoder`] declaration (SC-22667).
+pub(crate) const REFERENCE_ENCODER_COMPONENT_ID: &str = "z-image-vae-reference-encoder";
+/// Key prefix of the autoencoder's encoder half in the diffusers `vae/` layout
+/// (`crate::loader::remap_vae_encoder` keeps it).
+const VAE_ENCODER_PREFIX: &str = "encoder.";
+
+/// The projected `vae/` inventory split by key prefix: `encoder.*` is the reference encoder a
+/// request opts into; everything else (`decoder.*` and any prefixless conv) is what a plain render
+/// keeps resident and is charged as `decoder_bytes`. Both halves ride the same projection, so a
+/// quantize request that packs the decoder's mid-block Linear packs the encoder's identically —
+/// exactly what `Vae::quantize` does once the encoder is attached.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VaeProjection {
+    decoder: u64,
+    reference_encoder: u64,
+}
+
+impl VaeProjection {
+    fn from_tensors(tensors: &[mlx_gen::asset_facts::ResidentTensorBytes]) -> Self {
+        tensors.iter().fold(Self::default(), |mut split, tensor| {
+            if tensor.name.starts_with(VAE_ENCODER_PREFIX) {
+                split.reference_encoder = split
+                    .reference_encoder
+                    .saturating_add(tensor.resident_bytes);
+            } else {
+                split.decoder = split.decoder.saturating_add(tensor.resident_bytes);
+            }
+            split
+        })
+    }
+}
+
+/// The typed declaration of a non-zero reference encoder; `None` for a source with no
+/// `encoder.*` rows (a decoder-only fixture, or the File arm's truthful unknown).
+fn reference_encoder_component(bytes: u64) -> Option<MemoryResidentComponent> {
+    (bytes > 0).then(|| MemoryResidentComponent {
+        id: REFERENCE_ENCODER_COMPONENT_ID.to_owned(),
+        kind: MemoryComponentKind::ReferenceEncoder,
+        resident_bytes: bytes,
+        bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
+    })
 }
 
 /// Project an already validated encoder inventory through the same load-time quantization policy
@@ -706,6 +765,7 @@ fn projected_conditioning_headers(
 fn component_asset_facts(
     components: mlx_gen::PerComponentBytes,
     control_bytes: u64,
+    reference_encoder_bytes: u64,
 ) -> MemoryAssetFacts {
     MemoryAssetFacts {
         base_bytes: components
@@ -716,9 +776,11 @@ fn component_asset_facts(
         transformer_bytes: components.dit,
         decoder_bytes: components.vae,
         // The load-time control checkpoint is resident for every request made by a control-provider
-        // instance. A request-selected PiD decoder remains excluded: availability on `LoadSpec` does
-        // not mean the request selected it, so pricing it here would overstate the ordinary path.
-        overlay_bytes: control_bytes,
+        // instance, and the VAE encoder for every `Reference` request (SC-22667); each is declared
+        // once here and once as a typed component. A request-selected PiD decoder remains
+        // excluded: availability on `LoadSpec` does not mean the request selected it, so pricing
+        // it here would overstate the ordinary path.
+        overlay_bytes: control_bytes.saturating_add(reference_encoder_bytes),
     }
 }
 
@@ -1097,12 +1159,18 @@ mod tests {
                 );
             }
         }
+        // Both autoencoder halves, so every registry-wide facts walk exercises the prefix split:
+        // the decoder probe is `decoder_bytes`, the identical encoder probe is the reference
+        // encoder (SC-22667).
         assert_eq!(
-            write_dense_quantizable_probe(
+            write_typed_sparse_safetensors(
                 &vae.join("model.safetensors"),
-                "decoder.attn.to_q.weight",
+                &[
+                    ("decoder.attn.to_q.weight".to_owned(), "BF16", vec![2, 64]),
+                    ("encoder.attn.to_q.weight".to_owned(), "BF16", vec![2, 64]),
+                ],
             ),
-            256
+            512
         );
     }
 
@@ -1386,15 +1454,28 @@ mod tests {
         )
     }
 
+    /// The per-route byte expectations of [`assert_all_route_asset_facts`].
+    struct ExpectedRouteFacts {
+        conditioning: u64,
+        transformer: u64,
+        decoder: u64,
+        reference_encoder: u64,
+        control: u64,
+    }
+
     fn assert_all_route_asset_facts(
         spec: &LoadSpec,
         control: &std::path::Path,
-        expected_conditioning: u64,
-        expected_transformer: u64,
-        expected_decoder: u64,
-        expected_control: u64,
+        expected: ExpectedRouteFacts,
         label: &str,
     ) {
+        let ExpectedRouteFacts {
+            conditioning: expected_conditioning,
+            transformer: expected_transformer,
+            decoder: expected_decoder,
+            reference_encoder: expected_reference_encoder,
+            control: expected_control,
+        } = expected;
         for registration in memory_registrations() {
             let control_route = is_control_registration(&registration);
             let mut route_spec = spec.clone();
@@ -1431,8 +1512,8 @@ mod tests {
             );
             assert_eq!(
                 facts.overlay_bytes,
-                if control_route { expected_control } else { 0 },
-                "{} {label}: control",
+                expected_reference_encoder + if control_route { expected_control } else { 0 },
+                "{} {label}: overlay = reference encoder + control",
                 registration.provider_id
             );
             assert_eq!(
@@ -1442,8 +1523,43 @@ mod tests {
                     .map(|component| component.resident_bytes)
                     .sum::<u64>(),
                 facts.overlay_bytes,
-                "{} {label}: decomposed control facts",
+                "{} {label}: decomposed auxiliary facts",
                 registration.provider_id
+            );
+            let reference_encoder = contract
+                .resident_components()
+                .iter()
+                .find(|component| component.id == REFERENCE_ENCODER_COMPONENT_ID)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} {label}: the encoder half must be declared as a typed component",
+                        registration.provider_id
+                    )
+                });
+            assert_eq!(
+                reference_encoder.kind,
+                MemoryComponentKind::ReferenceEncoder,
+                "{} {label}",
+                registration.provider_id
+            );
+            assert_eq!(
+                reference_encoder.resident_bytes, expected_reference_encoder,
+                "{} {label}: reference encoder",
+                registration.provider_id
+            );
+            assert!(
+                matches!(
+                    contract.formula,
+                    MemoryFormulaKind::ComponentPhaseEnvelope { .. }
+                ),
+                "{} {label}: a typed auxiliary declaration needs the component formula",
+                registration.provider_id
+            );
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{} {label}: {:?}",
+                registration.provider_id,
+                contract.conformance_errors()
             );
         }
     }
@@ -1462,10 +1578,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                    quantizable_probe_bytes(bits),
-                    256,
-                    392,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            None,
+                            Some(bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(bits),
+                        decoder: 256,
+                        reference_encoder: 256,
+                        control: 392,
+                    },
                     &format!("prepacked Q{bits} + dense {selection:?}"),
                 );
             }
@@ -1487,15 +1611,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(
-                        Some(base_bits),
-                        Some(base_bits),
-                        crate::model::MODEL_ID,
-                    )
-                    .unwrap(),
-                    quantizable_probe_bytes(base_bits),
-                    256,
-                    392,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            Some(base_bits),
+                            Some(base_bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(base_bits),
+                        decoder: 256,
+                        reference_encoder: 256,
+                        control: 392,
+                    },
                     &format!("matching prepacked Q{base_bits} {selection:?}"),
                 );
 
@@ -1542,10 +1669,18 @@ mod tests {
                 assert_all_route_asset_facts(
                     &spec,
                     &control,
-                    bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                    quantizable_probe_bytes(bits),
-                    quantizable_probe_bytes(bits),
-                    quantizable_probe_bytes(bits) + 136,
+                    ExpectedRouteFacts {
+                        conditioning: bounded_conditioning_bytes(
+                            None,
+                            Some(bits),
+                            crate::model::MODEL_ID,
+                        )
+                        .unwrap(),
+                        transformer: quantizable_probe_bytes(bits),
+                        decoder: quantizable_probe_bytes(bits),
+                        reference_encoder: quantizable_probe_bytes(bits),
+                        control: quantizable_probe_bytes(bits) + 136,
+                    },
                     &format!("dense + requested Q{bits} {selection:?}"),
                 );
             }
@@ -1567,10 +1702,18 @@ mod tests {
             assert_all_route_asset_facts(
                 &spec,
                 &control,
-                bounded_conditioning_bytes(None, Some(bits), crate::model::MODEL_ID).unwrap(),
-                quantizable_probe_bytes(bits),
-                quantizable_probe_bytes(bits),
-                quantizable_probe_bytes(bits) + 136,
+                ExpectedRouteFacts {
+                    conditioning: bounded_conditioning_bytes(
+                        None,
+                        Some(bits),
+                        crate::model::MODEL_ID,
+                    )
+                    .unwrap(),
+                    transformer: quantizable_probe_bytes(bits),
+                    decoder: quantizable_probe_bytes(bits),
+                    reference_encoder: quantizable_probe_bytes(bits),
+                    control: quantizable_probe_bytes(bits) + 136,
+                },
                 &format!("matching Q{bits} request over prepacked base"),
             );
         }
@@ -1979,6 +2122,7 @@ mod tests {
                     .iter()
                     .map(|component| component.resident_bytes)
                     .sum(),
+                0,
             ),
             resident_components,
         )
@@ -2034,6 +2178,90 @@ mod tests {
         );
         assert_eq!(prediction.unattributed_bytes, BASE_PEAK);
         assert_eq!(prediction.components, contract.resident_components());
+    }
+
+    /// SC-22667 / E1: the `vae/` projection is split by key prefix — `encoder.*` is the reference
+    /// encoder, everything else (including a prefixless conv) stays render-resident. A wrong
+    /// prefix (splitting on `decoder.`, or on nothing) moves bytes across the seam and reds here.
+    #[test]
+    fn vae_projection_splits_the_reference_encoder_by_key_prefix() {
+        let projected =
+            |name: &str, resident_bytes: u64| mlx_gen::asset_facts::ResidentTensorBytes {
+                name: name.to_owned(),
+                resident_bytes,
+            };
+        let split = VaeProjection::from_tensors(&[
+            projected("decoder.conv_in.weight", 300),
+            projected("decoder.mid_block.attentions.0.to_q.weight", 72),
+            projected("encoder.conv_in.weight", 200),
+            projected("encoder.mid_block.attentions.0.to_q.weight", 72),
+            projected("quant_conv.weight", 8),
+        ]);
+        assert_eq!(
+            split,
+            VaeProjection {
+                decoder: 300 + 72 + 8,
+                reference_encoder: 200 + 72,
+            }
+        );
+        assert!(reference_encoder_component(0).is_none());
+        let component = reference_encoder_component(split.reference_encoder).unwrap();
+        assert_eq!(component.id, REFERENCE_ENCODER_COMPONENT_ID);
+        assert_eq!(component.kind, MemoryComponentKind::ReferenceEncoder);
+        assert!(component.kind.is_auxiliary());
+        assert_eq!(component.resident_bytes, 272);
+        assert_eq!(component.bounded_by, None);
+    }
+
+    /// The T2I anchor witness (SC-22667): the resident sum a fit decision compares a plain render
+    /// against is `base_bytes` = TE + DiT + **decoder**; the encoder half is declared beside it as
+    /// an auxiliary so it is neither dropped nor charged to a request that never encodes.
+    #[test]
+    fn text_to_image_base_facts_exclude_the_reference_encoder_and_declare_it_once() {
+        let _guard = crate::scoped_bounded_encoder_contract();
+        let tmp = tempfile::tempdir().unwrap();
+        // A prepacked Q4 base, so the three base totals are pairwise distinct and the facts
+        // conformance below cannot mistake the split for a borrowed total.
+        let (spec, _control) =
+            tiered_asset_spec(&tmp, Some(4), None, EncoderSelection::Builtin, None);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        let facts = contract.asset_facts;
+        assert_eq!(facts.transformer_bytes, quantizable_probe_bytes(4));
+        assert_eq!(facts.decoder_bytes, 256, "the decoder probe alone");
+        assert_eq!(facts.overlay_bytes, 256, "the encoder probe, declared once");
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + quantizable_probe_bytes(4) + 256
+        );
+        assert_eq!(contract.total_resident_bytes(), facts.base_bytes + 256);
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 1, "{components:?}");
+        assert_eq!(components[0].id, REFERENCE_ENCODER_COMPONENT_ID);
+        assert_eq!(components[0].kind, MemoryComponentKind::ReferenceEncoder);
+        assert_eq!(components[0].resident_bytes, 256);
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // A decoder-only snapshot has nothing to declare and keeps the plain formula shape.
+        let decoder_only = tempfile::tempdir().unwrap();
+        let (root, spec, _) =
+            snapshot_spec_with_encoder(&decoder_only, None, EncoderSelection::Builtin);
+        let contract = memory_strategy_contract(crate::model::MODEL_ID, &spec).unwrap();
+        assert_eq!(
+            contract.asset_facts.decoder_bytes,
+            projected_safetensors_bytes(root.join("vae"), |_| ResidentProjection::Stored).unwrap()
+        );
+        assert_eq!(contract.asset_facts.overlay_bytes, 0);
+        assert!(contract.resident_components().is_empty());
+        assert!(matches!(
+            contract.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
     }
 
     /// SC-15775: the route domains are disjoint **by construction**, not by the current numbers

@@ -734,6 +734,16 @@ pub enum MemoryComponentKind {
     AdapterStack,
     IpAdapter,
     IdentityEncoder,
+    /// The autoencoder's **encoder** half, materialized only when a request carries a reference
+    /// image to encode (img2img / `ConditioningKind::Reference`) — never by a plain text-to-image
+    /// render of the same checkpoint (SC-22667).
+    ///
+    /// It is auxiliary for exactly the reason a control branch is: a request opts into it, so a
+    /// fit decision for a request without one must not carry it. [`MemoryAssetFacts::decoder_bytes`]
+    /// stays the autoencoder weights the render always holds. A loader whose resident autoencoder
+    /// object *does* build both halves at load charges those in `decoder_bytes` and declares here
+    /// only the encoder copy it builds lazily on the first reference.
+    ReferenceEncoder,
 }
 
 /// How long one declared component's bytes stay resident within a single render (SC-18665).
@@ -834,7 +844,11 @@ impl MemoryComponentKind {
     pub const fn is_auxiliary(self) -> bool {
         matches!(
             self,
-            Self::ControlBranch | Self::AdapterStack | Self::IpAdapter | Self::IdentityEncoder
+            Self::ControlBranch
+                | Self::AdapterStack
+                | Self::IpAdapter
+                | Self::IdentityEncoder
+                | Self::ReferenceEncoder
         )
     }
 }
@@ -916,10 +930,10 @@ impl MemoryPeakBreakdown {
 ///
 /// **Auxiliary means outside the base model, not merely outside the usual three names.** The set is
 /// closed and enumerated by [`MemoryComponentKind::is_auxiliary`]: a control branch, an adapter
-/// stack, an IP-Adapter, an identity encoder — networks a *request* opts into, which a plain render
-/// of the same checkpoint does not load. Those are the ones `overlay_bytes` exists for, and the
-/// reason it is excluded from `base_bytes` is precisely that a fit decision for a request without
-/// them must not carry them.
+/// stack, an IP-Adapter, an identity encoder, a reference (VAE) encoder — networks a *request* opts
+/// into, which a plain render of the same checkpoint does not load. Those are the ones
+/// `overlay_bytes` exists for, and the reason it is excluded from `base_bytes` is precisely that a
+/// fit decision for a request without them must not carry them.
 ///
 /// A base-model network the route **always** loads is therefore charged in one of the three base
 /// fields even when it is none of "the text encoder", "the DiT" or "the image VAE" — LTX-2.5's
@@ -941,6 +955,14 @@ impl MemoryPeakBreakdown {
 /// `base_bytes == sum` or, if `base_bytes` were computed from the folded sum, charge one resident
 /// network twice against every fit decision.
 ///
+/// The autoencoder's two halves are **not** one network for this rule (SC-22667). A text-to-image
+/// render decodes and never encodes, so a loader that builds the `encoder.*` half only when a
+/// reference arrives declares that half as a [`MemoryComponentKind::ReferenceEncoder`] auxiliary
+/// component in `overlay_bytes`, and `decoder_bytes` holds only what the plain render keeps
+/// resident. Pricing the whole `vae/` file into `decoder_bytes` put the MLX Z-Image resident sum
+/// 58.6 MB *above* the measured resident level of a text-to-image anchor, which the fit domain
+/// guard rightly refused.
+///
 /// The phase in which a shared network is *resident* is a lifecycle property, not a byte-count one.
 /// The contract has no per-phase residency declaration for base components today — only the
 /// typed auxiliary components in [`MemoryFormulaKind::ComponentPhaseEnvelope`] carry a
@@ -954,8 +976,10 @@ pub struct MemoryAssetFacts {
     /// the reference encoder is **not** included here; see *One network, one field* above.
     pub conditioning_bytes: u64,
     pub transformer_bytes: u64,
-    /// The autoencoder, charged once whether it only decodes or also encodes a reference during
-    /// conditioning.
+    /// The autoencoder weights a plain render keeps resident, charged once whether they only
+    /// decode or also encode a reference during conditioning. An encoder half the loader
+    /// materializes only for a reference request is a [`MemoryComponentKind::ReferenceEncoder`]
+    /// auxiliary component instead.
     pub decoder_bytes: u64,
     /// Compatibility aggregate for auxiliary resident networks. An adopting provider declares the
     /// corresponding typed contributions in [`MemoryFormulaKind::ComponentPhaseEnvelope`].
@@ -5500,6 +5524,7 @@ mod tests {
             MemoryComponentKind::AdapterStack,
             MemoryComponentKind::IpAdapter,
             MemoryComponentKind::IdentityEncoder,
+            MemoryComponentKind::ReferenceEncoder,
         ] {
             assert!(
                 auxiliary.is_auxiliary(),
