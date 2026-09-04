@@ -106,8 +106,59 @@ fn imported_dit_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
     })
 }
 
-fn f32_component_bytes(path: &std::path::Path, component: &str) -> gen_core::Result<u64> {
-    cast_component_bytes(path, 4, component, |_| Ok(()))
+/// On-disk key prefixes of the Qwen-Image VAE's **decode half** — everything the decode-only
+/// `QwenVae::new` reads: `post_quant_conv` + `decoder.*` in diffusers naming (the snapshot `vae/`),
+/// `conv2.*` + `decoder.*` in the native WAN naming a ComfyUI single file ships before
+/// `comfyui::remap_vae_wan_to_diffusers` renames it.
+const VAE_DECODER_PREFIXES: &[&str] = &["decoder.", "post_quant_conv.", "conv2."];
+
+/// The encoder half — `quant_conv` + `encoder.*` (diffusers) / `conv1.*` + `encoder.*` (WAN) —
+/// which only `QwenVaeEncoder::new` reads.
+const VAE_ENCODER_PREFIXES: &[&str] = &["encoder.", "quant_conv.", "conv1."];
+
+/// Whether `provider_id`'s loaders build `QwenVaeEncoder` beside the decoder: the edit route
+/// (`edit.rs`, both the warm and the staged legs, for the reference encode) and the Fun-Control
+/// route (`control_fun.rs`, for the control-image encode). `qwen_image` builds nothing but
+/// `QwenVae` (`load_vae_seq` / the resident load).
+fn builds_vae_encoder(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "qwen_image_edit" | "qwen_image_2512_fun_control"
+    )
+}
+
+/// f32 resident bytes of the VAE tensors `provider_id`'s loaders actually materialize: the decode
+/// half on every route, plus the encoder half where [`builds_vae_encoder`]. Both loaders read
+/// through an mmap-backed `VarBuilder` (or, for the ComfyUI file, a host map the device copy is
+/// drawn from key by key), so a tensor neither constructor names never reaches the device —
+/// charging the whole file billed the t2i route for an encoder it never builds (epic SC-22657,
+/// E1). A source with no decoder tensors is refused rather than priced at zero: `QwenVae::new`
+/// fails on it too.
+fn vae_component_bytes(
+    path: &std::path::Path,
+    provider_id: &str,
+    component: &str,
+) -> gen_core::Result<u64> {
+    let with_encoder = builds_vae_encoder(provider_id);
+    let starts_with_any =
+        |name: &str, prefixes: &[&str]| prefixes.iter().any(|prefix| name.starts_with(prefix));
+    let loaded = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?
+        .into_iter()
+        .filter(|tensor| {
+            starts_with_any(&tensor.name, VAE_DECODER_PREFIXES)
+                || (with_encoder && starts_with_any(&tensor.name, VAE_ENCODER_PREFIXES))
+        })
+        .collect::<Vec<_>>();
+    if !loaded
+        .iter()
+        .any(|tensor| starts_with_any(&tensor.name, VAE_DECODER_PREFIXES))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "qwen-image {component} {} has no `decoder.` / `post_quant_conv` tensors for `QwenVae` to load",
+            path.display()
+        )));
+    }
+    cast_tensor_headers_bytes(&loaded, 4, component, |_| Ok(()))
 }
 
 fn selected_language_encoder_bytes(
@@ -166,7 +217,7 @@ pub(crate) fn provider_contract(
     let streamable = streamable(spec);
     let base = gen_core::require_base_snapshot(spec, provider_id)?;
     let components = match &spec.weights {
-        WeightsSource::Dir(_) => {
+        WeightsSource::Dir(root) => {
             let mut components = PerComponentBytes::from_spec_subdirs(
                 spec,
                 &["text_encoder"],
@@ -175,15 +226,32 @@ pub(crate) fn provider_contract(
             )
             .unwrap_or_default();
             components.text_encoder = conditioning_encoder_bytes(provider_id, spec, base)?;
+            // The VAE is materialized at `lib.rs`'s `ENC_DTYPE` (f32) on EVERY route —
+            // `load_vae_seq` builds `QwenVae` from `component_vb("vae", ENC_DTYPE)` for a snapshot
+            // exactly as the ComfyUI arm below does for an imported file — so the snapshot's bf16
+            // on-disk sum under-priced the resident decoder by 2x while the imported route beside
+            // it was already f32-priced (epic SC-22657, E1). Only the tensors this route's
+            // constructors read are priced (`vae_component_bytes`): the decode half, plus the
+            // encoder half on the edit route that builds `QwenVaeEncoder`. The DiT stays an on-disk
+            // sum: it is materialized at `DIT_DTYPE` (bf16), the width the hosted tiers ship.
+            let vae_dir = root.join("vae");
+            components.vae = if gen_core::weightsmeta::safetensors_path_bytes(&vae_dir) == 0 {
+                // A partial tree with no `vae/` component contributed `0` through the directory
+                // sum this replaced; keep that, and let the loader be the seam that fails on it.
+                0
+            } else {
+                vae_component_bytes(&vae_dir, provider_id, "snapshot VAE")?
+            };
             components
         }
         WeightsSource::File(path) => {
             let vae = match spec.components.get(gen_core::COMFYUI_VAE_COMPONENT) {
-                Some(WeightsSource::Dir(path)) => f32_component_bytes(path, "VAE")?,
-                Some(WeightsSource::File(path)) => {
-                    spec.read_file_unchanged_if_prepared(path, |p| f32_component_bytes(p, "VAE"))?
-                }
-                None => f32_component_bytes(&base.join("vae"), "base VAE")?,
+                Some(WeightsSource::Dir(path)) => vae_component_bytes(path, provider_id, "VAE")?,
+                Some(WeightsSource::File(path)) => spec
+                    .read_file_unchanged_if_prepared(path, |p| {
+                        vae_component_bytes(p, provider_id, "VAE")
+                    })?,
+                None => vae_component_bytes(&base.join("vae"), provider_id, "base VAE")?,
             };
             PerComponentBytes {
                 text_encoder: conditioning_encoder_bytes(provider_id, spec, base)?,
@@ -249,6 +317,65 @@ pub(crate) fn weights_free_memory_strategy_contract(
     ))
 }
 
+/// Activation dtype the loaded Qwen-Image denoise trunk computes in. `lib.rs` pins
+/// `DIT_DTYPE = DType::BF16` for the 20B transformer — the bottleneck this contract's phase
+/// envelope prices — so this is the provider's real activation width, not a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Architecture axes for the Qwen-Image base and edit routes (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `QwenTransformer` is constructed from the
+/// hardcoded [`crate::config::TransformerConfig::qwen_image`] (the 2512 refresh is a verbatim
+/// drop-in of it), and the latent/patch axes are the `crate::config` constants the packing path
+/// executes against. Reading those same declarations keeps the published geometry identical to the
+/// model actually built.
+///
+/// `vae_temporal_scale` stays `None`. Qwen-Image decodes through `AutoencoderKLQwenImage`, a
+/// causal-Conv3d **video** autoencoder — but this crate runs it collapsed to a single frame
+/// (`src/vae.rs`: each `[O, I, kD, kH, kW]` weight reduces to its last depth tap and a plain
+/// `causal_conv2d`, and the upsamplers' `time_conv` is skipped entirely). On that image path no
+/// frames-per-latent axis exists to declare, so the axis is absent rather than zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    //
+    // A ComfyUI single-file import IS a resolved pipeline, so it declares the same axes as a
+    // snapshot. `architecture_facts::snapshot_root` answers `None` for every `WeightsSource::File`,
+    // which left the loaded imported route publishing `MemoryArchitectureFacts::default()` — no
+    // axis at all under a lifecycle-phase formula, which the E2 conformance gate rejects and which
+    // no caller could estimate an activation from. None of these axes come from the snapshot
+    // anyway: the loader builds `QwenTransformer` from the hardcoded
+    // `config::TransformerConfig::qwen_image()` and packs against the `config` constants on both
+    // source shapes (epic SC-22657, E2).
+    let resolved = match &spec.weights {
+        WeightsSource::Dir(root) => root.is_dir(),
+        WeightsSource::File(path) => path.is_file(),
+    };
+    if !resolved {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = crate::config::TransformerConfig::qwen_image();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        // `config::PATCH` — the DiT's 2x2 packing (`in_channels = LATENT_CHANNELS * PATCH²`).
+        patch_size: af::declared(crate::config::PATCH),
+        latent_channels: af::declared(crate::config::LATENT_CHANNELS),
+        // The decoder tail's own x8 (`vae::TAIL_TILING.spatial_scale`, the geometry the tiled
+        // decode executes against), not a literal restating it. `config::SIZE_MULTIPLE` is that
+        // scale times `config::PATCH`, which the tests pin.
+        vae_spatial_scale: u32::try_from(crate::vae::TAIL_TILING.spatial_scale)
+            .ok()
+            .filter(|scale| *scale != 0),
+        // Structurally absent on the image path — see the doc comment above.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_provider_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -293,6 +420,7 @@ fn build_provider_contract(
         .collect();
 
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -860,6 +988,73 @@ mod tests {
         }
     }
 
+    /// AC (epic SC-22657, E2): both Qwen-Image routes publish the geometry the loader actually
+    /// builds — the `TransformerConfig::qwen_image` trunk plus the `crate::config` latent/patch
+    /// constants — the contract passes the shared facts conformance check, and the weights-free
+    /// surface (whose sentinel root is not on disk) publishes nothing at all.
+    ///
+    /// The contract is driven through the shared builder rather than [`provider_contract`]: the
+    /// production entry point admits exact encoder and component byte inventories, which a
+    /// synthetic snapshot cannot supply, and both entry points reach the identical facts.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
+        snapshot.load_shape = LoadShape::DeferredMaterialization;
+        for provider_id in [crate::MODEL_ID, "qwen_image_edit"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &snapshot).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `TransformerConfig::qwen_image()`: num_heads / head_dim / num_layers.
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(60),
+                    // `config::PATCH`.
+                    patch_size: Some(2),
+                    // `config::LATENT_CHANNELS`.
+                    latent_channels: Some(16),
+                    // `config::SIZE_MULTIPLE 16` = x8 VAE downscale then the 2x2 DiT patch.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: `AutoencoderKLQwenImage` is a 3-D autoencoder run
+                    // collapsed to a single frame here, so the image path has no temporal axis.
+                    vae_temporal_scale: None,
+                    // `lib.rs: DIT_DTYPE = DType::BF16`.
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+            // SC-22667: the scale is the decoder tail's own tiling geometry, and together with the
+            // DiT patch it IS the enforced size multiple. Mutation that fails this: a bare literal
+            // that drifts from `vae::TAIL_TILING.spatial_scale` (the shape under review).
+            assert_eq!(
+                contract.architecture_facts.vae_spatial_scale,
+                Some(crate::vae::TAIL_TILING.spatial_scale as u32)
+            );
+            assert_eq!(
+                contract.architecture_facts.vae_spatial_scale.unwrap()
+                    * contract.architecture_facts.patch_size.unwrap(),
+                crate::config::SIZE_MULTIPLE
+            );
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract =
+                weights_free_memory_strategy_contract(provider_id, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{provider_id} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
+    }
+
     fn write_control(path: &std::path::Path) {
         let mut header =
             br#"{"control.weight":{"dtype":"BF16","shape":[2,64],"data_offsets":[0,256]}}"#
@@ -1038,15 +1233,99 @@ mod tests {
             crate::VISION_ENCODER_CONTRACT,
         )
         .unwrap();
-        for component in ["transformer", "vae"] {
-            let dir = root.join(component);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_control(&dir.join("model.safetensors"));
-        }
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        write_control(&root.join("transformer/model.safetensors"));
+        // One BF16 [2, 64] decoder tensor beside one BF16 [2, 64] encoder tensor: only the edit
+        // route, which builds `QwenVaeEncoder`, materializes the second.
+        std::fs::create_dir_all(root.join("vae")).unwrap();
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_in.weight", "BF16", &[2, 64], 256),
+                ("encoder.conv_in.weight", "BF16", &[2, 64], 256),
+            ],
+        );
         LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(gen_core::OffloadPolicy::Sequential)
             .with_load_shape(LoadShape::DeferredMaterialization)
             .with_resolved_route(crate::edit::EDIT_2511_BASE_ROUTE)
+    }
+
+    /// AC (epic SC-22657, E1): a snapshot's VAE is priced at the f32 width `load_vae_seq`
+    /// materializes it at (`lib.rs`: `component_vb("vae", ENC_DTYPE)`), not at its bf16 on-disk
+    /// encoding — the same basis the imported-file arm beside it already used — and over the
+    /// tensors the route's constructors read: `QwenVae` is decode-only, so the t2i route is charged
+    /// the decoder namespace alone, while edit and Fun-Control, which also build
+    /// `QwenVaeEncoder`, are charged both halves.
+    ///
+    /// *Mutations that red this:* leaving `components.vae` as the raw
+    /// `PerComponentBytes::from_spec_subdirs` directory sum (the shape under review); pricing the
+    /// whole file at f32 on every route (`f32`-width `cast_component_bytes` without the namespace
+    /// filter — the t2i figure doubles).
+    #[test]
+    fn a_snapshot_vae_is_priced_at_the_f32_width_its_loader_materializes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec(&tmp);
+        let root = gen_core::require_base_snapshot(&spec, "qwen_image")
+            .unwrap()
+            .to_path_buf();
+        let on_disk = gen_core::weightsmeta::safetensors_path_bytes(root.join("vae"));
+        let contract = provider_contract("qwen_image_edit", &spec).unwrap();
+        // The fixture's decoder AND encoder tensors, BF16 [2, 64] each, f32-materialized: the edit
+        // route builds `QwenVaeEncoder` beside `QwenVae`.
+        assert_eq!(contract.asset_facts.decoder_bytes, 2 * (2 * 64 * 4));
+        assert_eq!(
+            provider_contract("qwen_image_2512_fun_control", &spec)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            2 * (2 * 64 * 4),
+            "Fun-Control encodes its control image through `QwenVaeEncoder` too"
+        );
+        assert_eq!(
+            provider_contract("qwen_image", &spec)
+                .unwrap()
+                .asset_facts
+                .decoder_bytes,
+            2 * 64 * 4,
+            "the t2i route builds the decode-only `QwenVae`: the encoder tensor is not charged"
+        );
+        assert_ne!(
+            contract.asset_facts.decoder_bytes, on_disk,
+            "the resident f32 decoder is not the bf16 file the snapshot ships"
+        );
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes
+        );
+    }
+
+    /// AC (epic SC-22657, E2): the ComfyUI single-file route is a RESOLVED pipeline, so its loaded
+    /// contract declares the same hardcoded geometry a snapshot load does. It previously published
+    /// `MemoryArchitectureFacts::default()` — no axis at all under a lifecycle-phase formula —
+    /// because `architecture_facts::snapshot_root` answers `None` for every `WeightsSource::File`.
+    ///
+    /// *Mutation that reds this:* restoring the `af::snapshot_root(spec).is_none()` gate, the shape
+    /// under review.
+    #[test]
+    fn an_imported_single_file_route_declares_the_geometry_its_loader_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = file_spec(&tmp);
+        let contract = provider_contract("qwen_image", &spec).unwrap();
+        assert!(
+            contract.architecture_facts.has_declared_architecture_axis(),
+            "a loaded imported route must declare the axes its trunk is built from"
+        );
+        assert_eq!(contract.architecture_facts.attention_heads, Some(24));
+        assert_eq!(contract.architecture_facts.transformer_blocks, Some(60));
+        assert_eq!(contract.architecture_facts.vae_temporal_scale, None);
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // An unresolved single file (no such path) still declares nothing.
+        let unresolved = LoadSpec::new(WeightsSource::File(tmp.path().join("absent.safetensors")));
+        assert!(architecture_facts(&unresolved).is_empty());
     }
 
     #[test]

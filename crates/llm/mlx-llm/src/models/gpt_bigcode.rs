@@ -4,7 +4,7 @@
 //! absolute positions and multi-query attention, and treating it as a Llama alias would load the
 //! checkpoint while producing numerically unrelated SVG source.
 
-use mlx_rs::ops::{add, matmul, split_sections};
+use mlx_rs::ops::{add, split_sections};
 use mlx_rs::Array;
 
 use crate::decode::Decode;
@@ -55,6 +55,9 @@ impl GptBigCode {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: GptBigCodeConfig) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
         let token_embedding = w.require(&key("transformer.wte.weight"))?.clone();
+        // GPTBigCode ties the output projection to the token embedding. The published
+        // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
+        let lm_head = token_embedding.clone();
         let position_embedding = w.require(&key("transformer.wpe.weight"))?.clone();
         let mut layers = Vec::with_capacity(cfg.layers);
         for index in 0..cfg.layers {
@@ -64,15 +67,17 @@ impl GptBigCode {
                 cfg,
             )?);
         }
-        Ok(Self {
+        let model = Self {
             token_embedding,
             position_embedding,
             layers,
             final_norm_weight: w.require(&key("transformer.ln_f.weight"))?.clone(),
             final_norm_bias: w.require(&key("transformer.ln_f.bias"))?.clone(),
-            lm_head: w.require(&format!("{prefix}.lm_head.weight"))?.clone(),
+            lm_head,
             cfg,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Token embeddings with learned absolute position rows for a cache offset.
@@ -184,10 +189,11 @@ impl GptBigCodeLayer {
             Some(&self.ln_2_bias),
             1e-5,
         )?;
-        // GPTBigCode uses HF Conv1D weights `[in, out]`, unlike the `[out, in]` linear helper.
-        let mlp = add(&matmul(&normed, &self.fc_weight)?, &self.fc_bias)?;
+        // The published StarVector safetensors store every GPTBigCode projection in ordinary
+        // `[out, in]` layout, matching the shared linear helper.
+        let mlp = linear(&normed, &self.fc_weight, Some(&self.fc_bias))?;
         let mlp = gelu_tanh(&mlp)?;
-        let mlp = add(&matmul(&mlp, &self.proj_weight)?, &self.proj_bias)?;
+        let mlp = linear(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
         Ok(add(&hidden, &mlp)?)
     }
 }
@@ -214,7 +220,7 @@ impl GptBigCodeAttention {
     fn forward(&self, hidden: &Array, cache: &mut dyn KvCache, index: usize) -> Result<Array> {
         let shape = hidden.shape();
         let (batch, sequence) = (shape[0], shape[1]);
-        let qkv = add(&matmul(hidden, &self.qkv_weight)?, &self.qkv_bias)?;
+        let qkv = linear(hidden, &self.qkv_weight, Some(&self.qkv_bias))?;
         let head_dim = self.cfg.head_dim();
         // StarCoderBase-1B is `multi_query=true`: one K and one V head.
         let parts = split_sections(
@@ -235,7 +241,7 @@ impl GptBigCodeAttention {
         let attended = sdpa_causal(&query, &keys, &values, 1.0 / (head_dim as f32).sqrt())?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, sequence, self.cfg.hidden_size])?;
-        Ok(add(&matmul(&attended, &self.out_weight)?, &self.out_bias)?)
+        linear(&attended, &self.out_weight, Some(&self.out_bias))
     }
 }
 
@@ -268,7 +274,7 @@ mod tests {
         put(
             &mut map,
             "fixture.transformer.wte.weight",
-            &[0.0; 12],
+            &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             &[3, 4],
         );
         put(
@@ -291,12 +297,13 @@ mod tests {
         ] {
             put(&mut map, key, &[0.0; 4], &[4]);
         }
-        // Q is 4 wide and K/V are one 2-wide MQA head each: 8 total output columns.
+        // Q is 4 wide and K/V are one 2-wide MQA head each: 8 total output rows in the
+        // checkpoint's published `[out, in]` projection layout.
         put(
             &mut map,
             "fixture.transformer.h.0.attn.c_attn.weight",
             &[0.0; 32],
-            &[4, 8],
+            &[8, 4],
         );
         put(
             &mut map,
@@ -320,7 +327,7 @@ mod tests {
             &mut map,
             "fixture.transformer.h.0.mlp.c_fc.weight",
             &[0.0; 32],
-            &[4, 8],
+            &[8, 4],
         );
         put(
             &mut map,
@@ -332,7 +339,7 @@ mod tests {
             &mut map,
             "fixture.transformer.h.0.mlp.c_proj.weight",
             &[0.0; 32],
-            &[8, 4],
+            &[4, 8],
         );
         put(
             &mut map,
@@ -340,8 +347,25 @@ mod tests {
             &[0.0; 4],
             &[4],
         );
-        put(&mut map, "fixture.lm_head.weight", &[0.0; 12], &[3, 4]);
         GptBigCode::from_weights(&Weights::from_map(map), prefix, cfg).unwrap()
+    }
+
+    #[test]
+    fn tiny_decoder_loads_and_projects_with_tied_token_embeddings() {
+        let model = tiny_decoder();
+        assert_eq!(
+            model.lm_head.as_slice::<f32>(),
+            model.token_embedding.as_slice::<f32>()
+        );
+
+        let mut cache = model.cache();
+        let logits = model
+            .logits_from_embeds(&model.embed_at(&input_ids(&[1]), 0).unwrap(), &mut cache)
+            .unwrap();
+        assert_eq!(logits.shape(), &[1, 3]);
+        let logits = logits.as_slice::<f32>();
+        assert!(logits[1] > logits[0]);
+        assert!(logits[1] > logits[2]);
     }
 
     #[test]

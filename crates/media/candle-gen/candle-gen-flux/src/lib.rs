@@ -155,6 +155,17 @@ impl Variant {
         }
     }
 
+    /// The variant a registry / engine id names — the exact inverse of [`Self::model_id`].
+    ///
+    /// `None` for any other id rather than a defaulted variant: a caller holding an unknown id has
+    /// not selected a FLUX variant at all, and silently answering `Dev` is how a schnell route ends
+    /// up described by dev's geometry.
+    pub fn from_model_id(model_id: &str) -> Option<Self> {
+        [Variant::Schnell, Variant::Dev]
+            .into_iter()
+            .find(|variant| variant.model_id() == model_id)
+    }
+
     /// Distilled default step count (mlx parity): schnell 4, dev 25.
     pub const fn default_steps(self) -> u32 {
         match self {
@@ -598,6 +609,18 @@ mod explicit_registry_tests {
 mod tests {
     use super::*;
     use candle_gen::gen_core::{Conditioning, ConditioningKind, Image, LoadSpec, WeightsSource};
+
+    /// `from_model_id` is the exact inverse of `model_id`, and answers nothing for an id it does
+    /// not own. The memory contract selects its trunk geometry through it (sc-22661), so a version
+    /// that defaulted to `Dev` would publish dev's geometry for schnell.
+    #[test]
+    fn a_model_id_resolves_to_its_own_variant_and_no_other() {
+        for variant in [Variant::Schnell, Variant::Dev] {
+            assert_eq!(Variant::from_model_id(variant.model_id()), Some(variant));
+        }
+        assert_eq!(Variant::from_model_id("flux2_dev"), None);
+        assert_eq!(Variant::from_model_id(""), None);
+    }
 
     /// Both variants resolve as candle generators through the family registry. `load` is lazy, so a nonexistent
     /// weights dir still resolves (no file I/O until `generate`).

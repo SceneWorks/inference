@@ -45,7 +45,7 @@ impl StarVectorClipVision {
                 &visual(&format!("transformer.resblocks.{index}")),
             )?);
         }
-        Ok(Self {
+        let model = Self {
             patch: w
                 .require(&visual("conv1.weight"))?
                 .transpose_axes(&[0, 2, 3, 1])?,
@@ -56,7 +56,9 @@ impl StarVectorClipVision {
             layers,
             ln_vision_weight: w.require(&format!("{prefix}.ln_vision.weight"))?.clone(),
             ln_vision_bias: w.require(&format!("{prefix}.ln_vision.bias"))?.clone(),
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Encode preprocessed NHWC `[B,224,224,3]` pixels into the 257 CLIP token rows.
@@ -181,7 +183,7 @@ impl StarVectorAdapter {
     /// Load `model.image_projection` from the published checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let key = |suffix: &str| format!("{prefix}.{suffix}");
-        Ok(Self {
+        let model = Self {
             fc_weight: w.require(&key("c_fc.weight"))?.clone(),
             fc_bias: w.require(&key("c_fc.bias"))?.clone(),
             proj_weight: w.require(&key("c_proj.weight"))?.clone(),
@@ -190,7 +192,9 @@ impl StarVectorAdapter {
             norm_bias: w.require(&key("norm.bias"))?.clone(),
             running_mean: w.require(&key("norm.running_mean"))?.clone(),
             running_var: w.require(&key("norm.running_var"))?.clone(),
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Map CLIP rows `[B,257,1024]` into decoder rows `[B,257,2048]`.

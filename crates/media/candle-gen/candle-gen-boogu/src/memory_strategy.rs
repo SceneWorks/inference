@@ -462,28 +462,75 @@ fn validate_native_vae(root: &Path) -> gen_core::Result<()> {
     Ok(())
 }
 
+/// The `mllm/` tensors the route's own loaders materialize, and the width each lands at.
+/// `None` means this route never builds that tensor, so it is not charged (epic SC-22657, E1).
+///
+/// * `model.language_model.*` — the Qwen3-VL text encoder every route loads
+///   (`pipeline::load_te_weights` feeds `BooguTextEncoder::load(.., "model.language_model", ..)`).
+///   Projections and the token table ride the **bf16** store (`pipeline::TE_STORE_DTYPE`, sc-12828);
+///   the RMSNorm weights are the exception, read through `Weights::get_f32` so `rmsnorm` runs
+///   f32-on-f32 under that store — they are resident at **four** bytes per element, not two.
+/// * `model.visual.*` — the Qwen3-VL vision tower. Only the **Edit** route constructs it
+///   (`pipeline::load_edit_components`, `Weights::from_dir(mllm, .., VAE_DTYPE)` = f32). Base/Turbo
+///   never do — their img2img surface loads the standalone VAE encoder alone (sc-11786) — so
+///   charging the tower there billed every plain request for a network no such load *retains*.
+/// * Anything else sharing `mllm/` (an `lm_head` tail, a sibling head) is built by neither loader
+///   and is therefore not resident on any route.
+///
+/// This field prices **post-load residency**, not the load transient. `pipeline::load_te_weights`
+/// runs `Weights::from_dir(mllm, .., bf16)`, which eagerly materializes *every* `mllm/` tensor on
+/// the device — the vision tower and any `lm_head` included — and, when its norm probe finds a
+/// non-bf16 store, reads the whole directory again at f32 with the bf16 map still alive;
+/// `BooguTextEncoder::load` then retains only `model.language_model.*` and the map is dropped.
+/// That spike lasts for the duration of the encoder build on every route, exceeds the bytes
+/// declared here by the non-`language_model` remainder of `mllm/` at the store width, and is
+/// bounded on the Edit route by the same directory's f32 materialization of the tower, which IS
+/// charged there. A consumer estimating the TE *load* rather than the resident encoder must add
+/// that remainder; the resident fields are for the render that follows.
+fn mllm_tensor_width(name: &str, route: Route) -> Option<u64> {
+    /// Leaves the text encoder reads with `Weights::get_f32` rather than at the bf16 store width:
+    /// the per-head q/k RMSNorms, both decoder-layer norms, and the final norm.
+    const F32_NORM_SUFFIXES: &[&str] = &[
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+    ];
+
+    if let Some(leaf) = name.strip_prefix("model.language_model.") {
+        let f32_norm = leaf == "norm.weight"
+            || F32_NORM_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(*suffix));
+        return Some(if f32_norm { 4 } else { 2 });
+    }
+    if name.starts_with("model.visual.") {
+        return (route == Route::Edit).then_some(4);
+    }
+    None
+}
+
 fn projected_facts(
     root: &Path,
     route: Route,
     tier: Option<Quant>,
 ) -> gen_core::Result<MemoryAssetFacts> {
-    let conditioning_bytes = projected_component(root, "mllm", 2, route == Route::Edit)?;
-    let transformer_bytes = projected_component(root, "transformer", 2, false)?;
-    let decoder_bytes = projected_component(root, "vae", 4, false)?;
-    // The standalone reference encoder materializes a second f32 VAE view on every Edit request and
-    // on the Base/Turbo img2img surface. Until the receipt splits encoder/decoder keys, charge the
-    // complete VAE again: conservative logical tensor bytes, never container bytes.
-    let reference_encoder_bytes = decoder_bytes;
-    let conditioning_bytes = conditioning_bytes
-        .checked_add(reference_encoder_bytes)
-        .ok_or_else(|| {
-            gen_core::Error::Msg("boogu: conditioning byte projection overflow".into())
-        })?;
+    let conditioning_bytes =
+        projected_component(root, "mllm", &|name| mllm_tensor_width(name, route))?;
+    let transformer_bytes = projected_component(root, "transformer", &|_| Some(2))?;
+    let decoder_bytes = projected_component(root, "vae", &|_| Some(4))?;
+    // One network, one field (epic SC-22657, E1; feature-end ruling SC-22667). The reference
+    // encoder every Edit request and the Base/Turbo img2img surface run during conditioning is
+    // the same f32 VAE weights the decode phase runs, so those bytes are charged exactly once, in
+    // `decoder_bytes`. They used to be folded into `conditioning_bytes` as well, which charged one
+    // resident network twice against every fit decision. That the VAE is *resident during
+    // conditioning* on those routes is a lifecycle fact the contract cannot yet state per base
+    // component — see `MemoryAssetFacts` — and is recorded on this crate's contract doc instead.
     let base_bytes = conditioning_bytes
         .checked_add(transformer_bytes)
         .and_then(|v| v.checked_add(decoder_bytes))
         .ok_or_else(|| gen_core::Error::Msg("boogu: projected resident byte overflow".into()))?;
-    let _ = (route, tier);
+    let _ = tier;
     Ok(MemoryAssetFacts {
         base_bytes,
         conditioning_bytes,
@@ -493,11 +540,13 @@ fn projected_facts(
     })
 }
 
+/// Resident bytes for one component directory, priced per tensor by `width_of`: the dense
+/// materialization width this route's loader lands that tensor at, or `None` for a tensor the
+/// route never builds (which is therefore not charged at all).
 fn projected_component(
     root: &Path,
     component: &str,
-    dense_width: u64,
-    vision_f32: bool,
+    width_of: &dyn Fn(&str) -> Option<u64>,
 ) -> gen_core::Result<u64> {
     let headers = component_headers(root, component)?;
     let by_name = headers
@@ -509,6 +558,10 @@ fn projected_component(
             // MLX affine sidecars are transient pack inputs, not separately resident tensors.
             return Ok(total);
         }
+        let Some(dense_width) = width_of(&tensor.name) else {
+            // Not materialized by this route's loaders: a route never charges what it never loads.
+            return Ok(total);
+        };
         let base = tensor.name.strip_suffix(".weight");
         let scale_name = base.map(|base| format!("{base}.scales"));
         let bytes = if let Some(scales) = scale_name.as_deref().and_then(|name| by_name.get(name)) {
@@ -523,12 +576,7 @@ fn projected_component(
                 tensor, scales, biases, GROUP_SIZE,
             )?
         } else {
-            let width = if vision_f32 && tensor.name.starts_with("model.visual.") {
-                4
-            } else {
-                dense_width
-            };
-            tensor.materialized_bytes(width)?
+            tensor.materialized_bytes(dense_width)?
         };
         total
             .checked_add(bytes)
@@ -619,6 +667,72 @@ fn estimated_behavior_context(
     })
 }
 
+/// Activation dtype the Boogu DiT computes in. `pipeline.rs` pins `DIT_DTYPE = DType::BF16`
+/// (candle's native CUDA width for the 10 B trunk), so this is the provider's real activation
+/// width rather than a memory-model literal. The FLUX.1 VAE runs f32, but the phase envelope's
+/// activation term describes the denoiser.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes for the three Boogu routes (epic SC-22657, E2).
+///
+/// The DiT axes come from the **same** configuration the loader builds its model from:
+/// `pipeline::load_components` calls [`crate::config::BooguConfig::from_snapshot`], which parses
+/// `<root>/transformer/config.json` (`num_attention_heads`, `hidden_size`, `num_layers`,
+/// `patch_size`, …) and falls back per field to the published [`config::BooguConfig::base`]
+/// reference. Reading the axes back off the returned struct publishes what the pipeline will
+/// actually construct; a snapshot whose config disagrees with the reference publishes what it says.
+///
+/// `head_dim` is `hidden_size / num_attention_heads` (3360 / 28 = 120) and is published only when
+/// the division is exact, so a non-uniform-head snapshot claims no head width it does not have.
+///
+/// `transformer_blocks` is `num_layers`, the **total** trunk: the config's
+/// `num_double_stream_layers` (8) is the double-stream prefix already counted inside it, not an
+/// addend.
+///
+/// The decoder axes come from the `VaeConfig::z_image()` the loader constructs at
+/// `pipeline.rs` — `latent_channels = 16`, and a four-entry `block_out_channels` whose three
+/// downsampling stages give the ×8 spatial scale — rather than from a `vae/config.json` the loader
+/// never reads.
+///
+/// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
+/// snapshot whose transformer config cannot be parsed — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = af::snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::BooguConfig::from_snapshot(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let vae = candle_transformers::models::z_image::vae::VaeConfig::z_image();
+    let attention_heads = af::declared(config.num_attention_heads);
+    gen_core::MemoryArchitectureFacts {
+        attention_heads,
+        head_dim: af::head_dim(af::declared(config.hidden_size), attention_heads),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        latent_channels: af::declared(vae.latent_channels),
+        vae_spatial_scale: af::spatial_scale_from_stages(
+            Some(&serde_json::json!({ "block_out_channels": vae.block_out_channels })),
+            &["block_out_channels"],
+        ),
+        // Structurally absent: the FLUX.1 16-channel AutoencoderKL is an image VAE with no
+        // temporal axis at all (absent is `None`, never `Some(0)`).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
+/// Assemble the Boogu contract over sealed asset facts.
+///
+/// **Decoder residency during conditioning.** On the Edit route and the Base/Turbo img2img
+/// surface the reference image is encoded through the same f32 VAE that later decodes, so the
+/// decoder is resident during the `Conditioning` phase as well as `Decode`. `asset_facts` charges
+/// those bytes once, in `decoder_bytes` (one network, one field — `MemoryAssetFacts`); the
+/// contract has no per-phase residency declaration for a base component, so this note is where
+/// that co-residency is stated until it does.
 fn build_contract(
     provider: &str,
     spec: &LoadSpec,
@@ -631,6 +745,7 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: provider.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1419,6 +1534,83 @@ mod tests {
         safetensors as candle_safetensors, DType as CandleDType, Tensor,
     };
 
+    /// A snapshot whose `transformer/config.json` carries the published Boogu-Image-0.1 axes the
+    /// loader reads through [`config::BooguConfig::from_snapshot`]. `num_layers` is a parameter so
+    /// a drifting snapshot can be exercised.
+    fn architecture_spec(root: &Path, num_layers: u64) -> LoadSpec {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "patch_size": 2,
+                "in_channels": 16,
+                "out_channels": 16,
+                "hidden_size": 3360,
+                "num_layers": num_layers,
+                "num_double_stream_layers": 8,
+                "num_refiner_layers": 2,
+                "num_attention_heads": 28,
+                "num_kv_heads": 7,
+                "axes_dim_rope": [40, 40, 40],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let spec = architecture_spec(fixture.path(), 40);
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(28),
+            // hidden_size 3360 / 28 heads, published only because it divides exactly.
+            head_dim: Some(120),
+            // `num_layers` is the TOTAL trunk; the 8 `num_double_stream_layers` are its
+            // double-stream prefix, already counted inside it.
+            transformer_blocks: Some(40),
+            patch_size: Some(2),
+            // `VaeConfig::z_image()` — the FLUX.1 16-channel AutoencoderKL the loader constructs,
+            // whose four `block_out_channels` stages give the x8 spatial scale.
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: an image VAE has no temporal axis at all.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
+            let contract = build_contract(provider, &spec, true, MemoryAssetFacts::default());
+            assert_eq!(contract.architecture_facts, expected, "{provider}");
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        let drifted = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_contract(
+                BOOGU_IMAGE_ID,
+                &architecture_spec(drifted.path(), 32),
+                true,
+                MemoryAssetFacts::default(),
+            )
+            .architecture_facts
+            .transformer_blocks,
+            Some(32)
+        );
+
+        // The registry's contract surface names a sentinel that is not on disk: nothing about the
+        // pipeline is resolved there, so every axis stays undeclared.
+        let surface = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(
+            build_contract(BOOGU_IMAGE_ID, &surface, true, MemoryAssetFacts::default())
+                .architecture_facts
+                .is_empty()
+        );
+    }
+
     fn write_tensors(path: &Path, tensors: Vec<(&str, Tensor)>) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let tensors = tensors
@@ -1445,11 +1637,20 @@ mod tests {
             .join(name);
         for component in ["transformer", "mllm"] {
             let path = root.join(component).join("model.safetensors");
+            // The `mllm/` component carries the REAL Qwen3-VL key namespaces, because which of
+            // them a route materializes — and at what width — is exactly what the pricing under
+            // test decides. MLX packs only `model.language_model.*` projections; the norms and the
+            // whole vision tower stay dense in every hosted tier (sc-9410).
+            let projection = if component == "mllm" {
+                "model.language_model.layers.0.self_attn.q_proj"
+            } else {
+                "layer"
+            };
             match quant {
                 None => write_tensors(
                     &path,
                     vec![(
-                        "layer.weight",
+                        format!("{projection}.weight").as_str(),
                         Tensor::zeros((2, 32), CandleDType::BF16, &Device::Cpu).unwrap(),
                     )],
                 ),
@@ -1459,20 +1660,37 @@ mod tests {
                         &path,
                         vec![
                             (
-                                "layer.weight",
+                                format!("{projection}.weight").as_str(),
                                 Tensor::zeros((2, lanes), CandleDType::U32, &Device::Cpu).unwrap(),
                             ),
                             (
-                                "layer.scales",
+                                format!("{projection}.scales").as_str(),
                                 Tensor::zeros((2, 1), CandleDType::BF16, &Device::Cpu).unwrap(),
                             ),
                             (
-                                "layer.biases",
+                                format!("{projection}.biases").as_str(),
                                 Tensor::zeros((2, 1), CandleDType::BF16, &Device::Cpu).unwrap(),
                             ),
                         ],
                     );
                 }
+            }
+            if component == "mllm" {
+                // Dense in every tier: the f32-read decoder-layer norm and the vision tower the
+                // Edit route alone constructs.
+                write_tensors(
+                    &root.join(component).join("model-extra.safetensors"),
+                    vec![
+                        (
+                            "model.language_model.layers.0.input_layernorm.weight",
+                            Tensor::zeros(64usize, CandleDType::BF16, &Device::Cpu).unwrap(),
+                        ),
+                        (
+                            "model.visual.blocks.0.attn.qkv.weight",
+                            Tensor::zeros((8, 16), CandleDType::BF16, &Device::Cpu).unwrap(),
+                        ),
+                    ],
+                );
             }
             let config = match quant {
                 Some(quant) => {
@@ -1676,17 +1894,116 @@ mod tests {
             for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
                 let (_temp, root) = artifact(provider, quant);
                 let receipt =
-                    ArtifactReceipt::capture(provider, &exact_spec(provider, root, quant)).unwrap();
+                    ArtifactReceipt::capture(provider, &exact_spec(provider, root.clone(), quant))
+                        .unwrap();
                 assert!(receipt.canonical);
                 assert_eq!(receipt.tier, quant);
                 assert!(receipt.facts.decoder_bytes > 400_000);
                 assert!(receipt.facts.base_bytes > receipt.facts.decoder_bytes);
+                // One network, one field (SC-22667): the conditioning field is the MLLM alone —
+                // the VAE the reference encoder shares with decode is charged once, in
+                // `decoder_bytes` — and the base total is exactly its own decomposition.
+                // Mutation that fails this: folding `decoder_bytes` into `conditioning_bytes`
+                // again (the shape under review), which moves the field off the MLLM projection.
+                assert_eq!(
+                    receipt.facts.conditioning_bytes,
+                    projected_component(&root, "mllm", &|name| mllm_tensor_width(
+                        name,
+                        Route::for_provider(provider).unwrap()
+                    ))
+                    .unwrap(),
+                    "{provider} {quant:?}: conditioning must be the MLLM alone"
+                );
+                assert_eq!(
+                    receipt.facts.base_bytes,
+                    receipt.facts.conditioning_bytes
+                        + receipt.facts.transformer_bytes
+                        + receipt.facts.decoder_bytes
+                );
+                // (The shared `check_memory_contract_asset_facts` is not run here: the synthetic
+                // artifact gives the MLLM and the transformer identical tensor bytes, which trips
+                // its repeated-total rule for a reason that is the fixture's, not the provider's.)
                 assert!(receipt
                     .inventory
                     .iter()
                     .all(|(_, _, digest)| digest.len() == 64));
             }
         }
+    }
+
+    /// The conditioning field prices only what the route's own loaders materialize, at the width
+    /// they materialize it (epic SC-22657, E1).
+    ///
+    /// Two defects are pinned:
+    ///
+    /// 1. **The vision tower is Edit-only.** `pipeline::load_edit_components` is the sole
+    ///    constructor of `model.visual.*`; Base and Turbo never build it. Charging it on those
+    ///    routes billed every plain request for a tower it does not load.
+    ///    *Mutation that reds this:* `mllm_tensor_width` returning `Some(4)` for `model.visual.*`
+    ///    on every route (the pre-SC-22667 `projected_component(root, "mllm", 2, ..)` shape, which
+    ///    priced the tower on all three).
+    /// 2. **The TE norms are f32.** `text_encoder.rs` reads `input_layernorm` / `q_norm` / `k_norm`
+    ///    / the final `norm` with `Weights::get_f32`, not at the bf16 store width.
+    ///    *Mutation that reds this:* dropping the `F32_NORM_SUFFIXES` arm so norms price at 2.
+    #[test]
+    fn conditioning_prices_only_the_tensors_the_route_loads_at_their_loaded_width() {
+        let mut priced = std::collections::BTreeMap::new();
+        for provider in [BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID, BOOGU_IMAGE_EDIT_ID] {
+            let (_temp, root) = artifact(provider, None);
+            let receipt =
+                ArtifactReceipt::capture(provider, &exact_spec(provider, root.clone(), None))
+                    .unwrap();
+            priced.insert(provider, receipt.facts.conditioning_bytes);
+        }
+        // `model.visual.blocks.0.attn.qkv.weight` is [8, 16] = 128 elements, materialized f32 by
+        // `load_edit_components` — the exact delta the Edit route alone carries.
+        let tower_f32_bytes = 8 * 16 * 4;
+        assert_eq!(
+            priced[BOOGU_IMAGE_ID], priced[BOOGU_IMAGE_TURBO_ID],
+            "the two plain routes load the same conditioning stack"
+        );
+        assert_eq!(
+            priced[BOOGU_IMAGE_EDIT_ID],
+            priced[BOOGU_IMAGE_ID] + tower_f32_bytes,
+            "only Edit may be charged the Qwen3-VL vision tower"
+        );
+
+        // The plain conditioning total is the bf16-stored projection plus the f32-read norm.
+        let projection_bf16_bytes = 2 * 32 * 2;
+        let norm_f32_bytes = 64 * 4;
+        assert_eq!(
+            priced[BOOGU_IMAGE_ID],
+            projection_bf16_bytes + norm_f32_bytes,
+            "the f32-read RMSNorm weights must not be priced at the bf16 store width"
+        );
+        assert_eq!(
+            mllm_tensor_width("model.visual.patch_embed.weight", Route::Base),
+            None
+        );
+        assert_eq!(
+            mllm_tensor_width("model.visual.patch_embed.weight", Route::Edit),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width("model.language_model.norm.weight", Route::Base),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width(
+                "model.language_model.layers.3.self_attn.k_norm.weight",
+                Route::Base
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            mllm_tensor_width(
+                "model.language_model.layers.3.mlp.down_proj.weight",
+                Route::Base
+            ),
+            Some(2)
+        );
+        // Neither loader builds an `lm_head` tail, so no route charges one.
+        assert_eq!(mllm_tensor_width("lm_head.weight", Route::Edit), None);
     }
 
     #[test]

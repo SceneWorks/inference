@@ -6,14 +6,23 @@ NVFP4 remain fail-closed while `accepted_quant_receipts.allowlist` is empty.
 
 ## Physical matrix and immutable inputs
 
-The active CUDA pool is consumer Blackwell `sm_120`, so the immutable matrix has nine rows:
+The active CUDA pool is consumer Blackwell `sm_120`, and the campaign measures exactly what the
+public release ships, so the immutable matrix has six rows:
 
-- distilled: bf16, packed q4, packed q8, INT8-ConvRot, NVFP4;
-- dev: bf16, packed q4, packed q8, INT8-ConvRot.
+- distilled: bf16, packed q4, packed q8;
+- dev: bf16, packed q4, packed q8.
 
-There is no dev NVFP4 row because the upstream NVFP4 transformer is distilled-only. Ada,
-datacenter Blackwell, unknown CUDA generations, and non-CUDA devices remain explicitly classified
-and refused.
+sc-18791: the public `SceneWorks/ltx-2.5-mlx` release contains `distilled/{bf16,q4,q8}`,
+`dev/{bf16,q4,q8}`, `enhancer/`, `distilled_lora/`, and `licenses/` — it has **no `bundles/`
+tree**. The INT8-ConvRot and NVFP4 candidate rows named `bundles/**` paths that were never
+published, so the terminal campaign hard-failed on `canonicalize selected LTX-2.5 bundle` after the
+earlier serial cases had already run. Those rows are removed from both the Python case table and
+the mirrored `TERMINAL_MEASUREMENT_CASES` table. `Ltx25QuantMode::Int8ConvRot` and `::Nvfp4` remain
+classified selectors and are still refused — now because no terminal case covers them rather than
+because the receipt allowlist is empty. Publishing an advanced bundle is what restores the rows.
+
+Ada, datacenter Blackwell, unknown CUDA generations, and non-CUDA devices remain explicitly
+classified and refused.
 
 Each manifest row binds an exact transformer variant separately from the weight bytes. Current
 upstream LTX-2.5 transformer headers do not contain `variant`; do not rewrite or hand-stamp those
@@ -21,10 +30,10 @@ headers. The controller uses the reviewed `transformerVariant` only when metadat
 fails if present metadata disagrees. This preserves the upstream object IDs while preventing a dev
 transformer from silently taking the distilled schedule.
 
-Every advanced row (distilled INT8-ConvRot, distilled NVFP4, and dev INT8-ConvRot) must also name
-the same upstream all-BF16 Gemma text-encoder file through `bf16TextEncoderSubpath`. The controller
-inspects every safetensors tensor dtype before CUDA loading and refuses a directory, mixed dtype, or
-Comfy/I8 encoder. Packed and BF16 comparison rows must not declare this field.
+`bf16TextEncoderSubpath` existed for the advanced rows, which had to bind the same upstream all-BF16
+Gemma text-encoder file. No published row is advanced, so **no row may declare that field** and the
+controller refuses a manifest that does. The dtype inspection (refusing a directory, mixed dtype, or
+Comfy/I8 encoder) stays in place for the day an advanced bundle is published.
 
 ## Autonomous campaign materialization and workflow
 
@@ -52,14 +61,13 @@ the expanded readback. Every available LFS SHA-256 is recomputed from the resolv
 symlink is accepted only when it resolves inside that repository's canonical `blobs` directory;
 missing, extra, mutated, special, parent-symlinked, or escaping entries fail before measurement.
 
-The helper generates all nine v1 rows from a fixed table. BF16/packed rows use the public
-`distilled/{bf16,q4,q8}` and `dev/{bf16,q4,q8}` bundles. Advanced rows use the three
-`bundles/**` directories and bind the all-BF16 Gemma file by its snapshot-relative path inside the
-same selected bundle. Every row retains the complete public snapshot as its inventory boundary.
+The helper generates all six v1 rows from a fixed table, using the public `distilled/{bf16,q4,q8}`
+and `dev/{bf16,q4,q8}` bundles. Every row retains the complete public snapshot as its inventory
+boundary.
 
 Dispatch `.github/workflows/ltx25-quant-campaign.yml` at the exact committed inference ref with
 only `public_revision` and one numeric `physical_gpu`. The workflow checks exact `sm_120`, builds
-once, runs both BF16 references before all seven candidates in one serial process, and preserves:
+once, runs both BF16 references before all four candidates in one serial process, and preserves:
 
 ```text
 controller/ltx25-quant-measure.exe
@@ -73,6 +81,14 @@ promotion, and `real-weights.yml` share the repository-wide
 
 ## Reviewed public promotion and real replay
 
+> **Currently inert (sc-18791).** Promotion only ever moved an INT8-ConvRot or NVFP4 winner into
+> production, and the public release ships neither bundle. Both the Python `PROMOTABLE_CASES` map
+> and the Rust promotable set are empty, so `.github/workflows/ltx25-quant-promotion.yml` fails
+> closed on any selection — `no terminal case is promotable` in the helper,
+> `promotion selection contains non-promotable cases` in the controller — before any replay is
+> attempted. Everything below describes the apparatus that becomes reachable again once an advanced
+> bundle is published and its case rows are restored.
+
 Upload only to the canonical public repository `SceneWorks/ltx-2.5-mlx`. The promotion workflow
 re-materializes that same exact revision anonymously into the persistent canonical cache and
 captures the raw `?blobs=true` API response itself. The validator requires the canonical ID, exact
@@ -81,7 +97,7 @@ SHA-256 values where supplied. A private/gated repository, wrong cache layout, p
 local mutation, or stale readback fails before replay.
 
 A reviewer chooses only the passing production winner(s). Selection is explicit, may contain one
-winner per transformer variant, and is not forced to promote all three advanced candidates. Supply
+winner per transformer variant, and is not forced to promote every advanced candidate. Supply
 this compact reviewed selection JSON; the workflow constructs the path-bearing v2 document only
 after it knows the runner's canonical snapshot and raw-readback paths:
 

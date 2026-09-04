@@ -290,6 +290,63 @@ pub(crate) fn weights_free_memory_strategy_surface_contract(
     )
 }
 
+/// Architecture axes shared by every registered Krea 2 route (epic SC-22657, E2).
+///
+/// [`Krea2Config::turbo`](crate::config::Krea2Config::turbo) is this crate's mirror of the published
+/// `transformer/config.json`, and `Krea2Config::from_snapshot` parses that same file (falling back
+/// to `turbo()` per key) at load; the five routes — Turbo, Raw, the two edit routes and the control
+/// route — run one DiT and one VAE, so they publish one set of axes.
+///
+/// `latent_channels` is [`crate::vae::VAE_CHANNELS`], the decoder's own width; the DiT's
+/// `in_channels` 64 is the 2x2-packed view of it. `vae_temporal_scale` stays `None`: Krea 2 is an
+/// image model whose autoencoder has no temporal axis, and a structurally absent axis is declared
+/// absent, never zero.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `Krea2Config::from_snapshot` —
+/// the loader's own `transformer/config.json` parse — so the published trunk axes are the
+/// snapshot's rather than the preset's. On the weights-free surface there is nothing to read and
+/// the preset, which that parser itself falls back to per key, is the honest answer.
+///
+/// SC-22667: the two cases are now separated. A *missing* key degrades to the preset because
+/// `Krea2Config::from_snapshot` itself degrades per key, so the loader builds exactly that
+/// geometry. An `Err` — an unreadable file, malformed JSON, or a config that fails `validate` —
+/// does NOT: `load_transformer_with_stream` propagates it and refuses the load, so publishing the
+/// turbo preset would describe a model this snapshot cannot produce. The trunk axes are declared
+/// absent there instead, which is the rule this very file already states 250 lines down for the
+/// sibling base-config projection ("a config that IS present but unreadable or invalid propagates
+/// as an error — it is never degraded into `None`", and by the same token never into a preset).
+pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = match mlx_gen::architecture_facts::materialized_root(spec) {
+        None => Some(crate::config::Krea2Config::turbo()),
+        Some(root) => crate::config::Krea2Config::from_snapshot(root).ok(),
+    };
+    let Some(dit) = dit else {
+        return mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: None,
+            head_dim: None,
+            transformer_blocks: None,
+            patch_size: None,
+            // The latent axes are the decoder's own crate constants, not config reads, so they
+            // survive a refused trunk parse and the contract still declares a real axis.
+            latent_channels: mlx_gen::architecture_facts::axis(crate::vae::VAE_CHANNELS),
+            vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::vae::VAE_COMPRESSION),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        };
+    };
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::vae::VAE_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::vae::VAE_COMPRESSION),
+        vae_temporal_scale: None,
+        // The loader gates on `Precision::Bf16` and the DiT computes there.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn memory_strategy_contract_with_components(
     provider_id: &str,
     spec: &LoadSpec,
@@ -307,6 +364,7 @@ fn memory_strategy_contract_with_components(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(spec);
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![
             MemoryPhase::Conditioning,
@@ -1590,6 +1648,181 @@ mod tests {
             [TransformerComponent::Dit]
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// AC (SC-22662): every registered Krea 2 route — the four base routes here and the control
+    /// route in `memory_strategy` — publishes the axes of the one DiT and VAE they share, derived
+    /// from this crate's own config constants, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let expected = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider_id in [
+            crate::model::KREA_2_TURBO_ID,
+            crate::model::KREA_2_RAW_ID,
+            crate::model::KREA_2_EDIT_ID,
+            crate::model::KREA_2_TURBO_EDIT_ID,
+        ] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        let control = crate::memory_strategy::weights_free_memory_strategy_contract(
+            crate::model_control::KREA_2_TURBO_CONTROL_ID,
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(control.architecture_facts, expected, "control route");
+        gen_core_testkit::assert_memory_contract_facts_conform(&control);
+
+        // The DiT's packed input width IS `latent x patch²`, so the two published axes cannot drift
+        // apart from the config they came from.
+        let dit = crate::config::Krea2Config::turbo();
+        assert_eq!(
+            crate::vae::VAE_CHANNELS as usize * dit.patch_size * dit.patch_size,
+            dit.in_channels
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The `transformer/config.json` keys `Krea2Config::from_json` reads, emitted from a config
+    /// value so the fixture cannot drift from the struct it mirrors.
+    fn krea_transformer_config_json(cfg: &crate::config::Krea2Config) -> serde_json::Value {
+        serde_json::json!({
+            "in_channels": cfg.in_channels,
+            "num_attention_heads": cfg.num_attention_heads,
+            "num_key_value_heads": cfg.num_kv_heads,
+            "attention_head_dim": cfg.attention_head_dim,
+            "num_layers": cfg.num_layers,
+            "intermediate_size": cfg.intermediate_size,
+            "norm_eps": cfg.norm_eps,
+            "axes_dims_rope": cfg.axes_dims_rope,
+            "rope_theta": cfg.rope_theta,
+            "timestep_embed_dim": cfg.timestep_embed_dim,
+            "num_text_layers": cfg.num_text_layers,
+            "num_layerwise_text_blocks": cfg.num_layerwise_text_blocks,
+            "num_refiner_text_blocks": cfg.num_refiner_text_blocks,
+            "text_hidden_dim": cfg.text_hidden_dim,
+            "text_intermediate_size": cfg.text_intermediate_size,
+            "text_num_attention_heads": cfg.text_num_attention_heads,
+            "text_num_key_value_heads": cfg.text_num_kv_heads,
+        })
+    }
+
+    fn spec_for_transformer_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the DiT axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `Krea2Config::from_snapshot` parses
+    /// at load — rather than published from the compile-time preset. The mirror fixture agrees
+    /// with the weights-free path; a fixture whose `num_layers` is mutated publishes the mutated
+    /// depth, which is what the unconditional `architecture_facts()` this replaced would fail.
+    ///
+    /// `num_layers` is the mutated key because it is the only trunk axis a snapshot can move on
+    /// its own: `Krea2Config::validate` ties `attention_head_dim` to `sum(axes_dims_rope)` and to
+    /// `text_hidden_dim`, so mutating the head width alone is rejected by the parser rather than
+    /// published.
+    #[test]
+    fn materialized_dit_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::Krea2Config::turbo();
+        let weights_free = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_transformer_config(
+                mirror.path(),
+                &krea_transformer_config_json(&preset)
+            )),
+            architecture_facts(&weights_free),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = krea_transformer_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        let mutated_facts =
+            architecture_facts(&spec_for_transformer_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            mutated_facts.transformer_blocks,
+            Some(7),
+            "the materialized path must publish the snapshot's depth, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): a materialized snapshot whose `transformer/config.json`
+    /// is present but **unparseable or invalid** must declare its trunk axes absent rather than
+    /// degrade into the turbo preset. `load_transformer_with_stream` propagates that same
+    /// `Krea2Config::from_snapshot` error and refuses the load, so a preset published here would
+    /// describe a model this snapshot cannot produce. A *missing key* is the other case and keeps
+    /// the preset, because the parser itself defaults per key and the loader builds exactly that.
+    ///
+    /// This is the rule the same file already states for the sibling base-config projection: a
+    /// present-but-unreadable config is never degraded.
+    ///
+    /// Mutation that fails this: restoring `.unwrap_or_else(crate::config::Krea2Config::turbo)` —
+    /// the malformed fixture then publishes the preset's trunk axes as if they had been read off
+    /// the snapshot.
+    #[test]
+    fn an_invalid_snapshot_config_declares_the_trunk_axes_absent() {
+        let preset = crate::config::Krea2Config::turbo();
+        let weights_free = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        let declared = architecture_facts(&weights_free);
+
+        let malformed = tempfile::tempdir().unwrap();
+        let transformer = malformed.path().join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), b"{not json").unwrap();
+        let spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            malformed.path().to_path_buf(),
+        ));
+        let facts = architecture_facts(&spec);
+        assert_eq!(facts.attention_heads, None);
+        assert_eq!(facts.head_dim, None);
+        assert_eq!(facts.transformer_blocks, None);
+        assert_eq!(facts.patch_size, None);
+        assert_ne!(
+            facts, declared,
+            "an unreadable trunk config must not publish the preset"
+        );
+        // The decoder's own crate constants survive, so a real architecture axis is still declared.
+        assert_eq!(facts.latent_channels, declared.latent_channels);
+        assert_eq!(facts.vae_spatial_scale, declared.vae_spatial_scale);
+        assert!(facts.has_declared_architecture_axis());
+        assert!(facts.zero_valued_axes().is_empty());
+
+        // A snapshot that merely OMITS a key keeps the preset for it: `from_snapshot` defaults per
+        // key and the loader builds exactly that geometry.
+        let partial_dir = tempfile::tempdir().unwrap();
+        let mut partial = krea_transformer_config_json(&preset);
+        partial.as_object_mut().unwrap().remove("num_layers");
+        assert_eq!(
+            architecture_facts(&spec_for_transformer_config(partial_dir.path(), &partial))
+                .transformer_blocks,
+            declared.transformer_blocks,
+            "an omitted key degrades to the preset in the loader too"
+        );
     }
 
     #[test]

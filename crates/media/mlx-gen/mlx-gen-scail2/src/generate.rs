@@ -405,7 +405,7 @@ pub fn generate(
     let cfg_disabled = job.guidance <= 1.0;
     // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
     // per-segment NaN guard (F-096) keys off the same flag.
-    let compute_bf16 = std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|v| v == "1");
+    let compute_bf16 = crate::compute_bf16_opt_in();
 
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic)?; // [3,H,W]

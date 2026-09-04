@@ -214,6 +214,17 @@ pub fn load_controlnet(
     crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
 }
 
+/// The ViT-H image encoder inside an `h94/IP-Adapter`-layout snapshot, relative to its root.
+pub(crate) const IP_ADAPTER_IMAGE_ENCODER_FILE: &str = "models/image_encoder/model.safetensors";
+
+/// The IP weights [`load_ip_adapter`] opens, in preference order: plus-face first, plus as the
+/// fallback (they share the Resampler architecture). Shared with the memory contract (SC-22667)
+/// so the overlay it prices is the file this loader materializes and never a third candidate.
+pub(crate) const IP_ADAPTER_WEIGHT_FILES: [&str; 2] = [
+    "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
+    "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
+];
+
 /// Load the **IP-Adapter** (sc-3059) from an `h94/IP-Adapter`-layout snapshot directory: the ViT-H
 /// image encoder at `models/image_encoder/model.safetensors` and the IP weights (Resampler +
 /// decoupled-attn K/V pairs) at `sdxl_models/ip-adapter-plus[-face]_sdxl_vit-h.safetensors`
@@ -229,26 +240,23 @@ pub fn load_ip_adapter(
     use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
-    let mut enc_w = Weights::from_file(dir.join("models/image_encoder/model.safetensors"))?;
+    let mut enc_w = Weights::from_file(dir.join(IP_ADAPTER_IMAGE_ENCODER_FILE))?;
     // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
     if !is_packed(&enc_w) {
         enc_w.cast_all(dtype)?;
     }
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
 
-    let ip_file = [
-        "sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
-        "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
-    ]
-    .iter()
-    .map(|f| dir.join(f))
-    .find(|p| p.exists())
-    .ok_or_else(|| {
-        Error::Msg(format!(
-            "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
-            dir.display()
-        ))
-    })?;
+    let ip_file = IP_ADAPTER_WEIGHT_FILES
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "ip-adapter: no plus/plus-face sdxl_vit-h weights under {}/sdxl_models",
+                dir.display()
+            ))
+        })?;
     let mut ip_w = Weights::from_file(&ip_file)?;
     // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
     if !is_packed(&ip_w) {

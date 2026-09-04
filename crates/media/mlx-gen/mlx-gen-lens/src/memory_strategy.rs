@@ -260,6 +260,53 @@ pub fn weights_free_memory_strategy_contract(
     )
 }
 
+/// Architecture axes shared by the two registered Lens routes (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as
+/// [`LensDitConfig::lens`](crate::dit::transformer::LensDitConfig::lens); `lens` and `lens_turbo`
+/// run the same DiT and differ only in steps and guidance, so they publish one set of axes.
+///
+/// The decoder is the FLUX.2 autoencoder Lens reuses: 32 latent channels over a x8 spatial scale,
+/// which the DiT's own `out_channels` restates. `vae_temporal_scale` stays `None` — that
+/// autoencoder is an image autoencoder with no temporal axis, and a structurally absent axis is
+/// declared absent, never zero.
+///
+/// The activation width follows the spec's precision because the loader does:
+/// `registry::resolve_root` maps `Precision::Bf16` to `Dtype::Bfloat16` and
+/// `Precision::Fp32` to `Dtype::Float32`, and every component of the tree is opened at that one
+/// dtype. `Precision::Fp32` is a served route — nothing on the load path refuses it — so publishing
+/// the half width unconditionally under-declared the f32 route's denoise activations by exactly 2x,
+/// and an under-price is the defect class epic SC-22657 forbids.
+fn architecture_facts(precision: Precision) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::dit::transformer::LensDitConfig::lens();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        // `out_channels` is the decoder-side width; `in_channels` 128 is the 2x2-packed view.
+        latent_channels: mlx_gen::architecture_facts::axis(dit.out_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
+        vae_temporal_scale: None,
+        activation_dtype_width: Some(activation_width(precision)),
+    }
+}
+
+/// Bytes per activation element the loader opens this tree at (`registry::resolve_root`).
+///
+/// Shared by the declared axis above and by `registry::component_footprint`, so the declared
+/// activation width and the declared asset bytes can never disagree about the same load.
+pub(crate) fn activation_width(precision: Precision) -> u32 {
+    match precision {
+        Precision::Bf16 => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+        Precision::Fp32 => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
+    }
+}
+
+/// Pixels per latent unit on each spatial axis for the FLUX.2 autoencoder Lens decodes through.
+/// `pipeline::VAE_SCALE_FACTOR` is this times the DiT's 2x2 latent patch, which the tests pin.
+const VAE_SPATIAL_SCALE: u32 = 8;
+
 fn memory_strategy_contract_with_surface_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -293,6 +340,7 @@ fn memory_strategy_contract_with_surface_facts(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(spec.precision);
     let mut formula_variables = vec![
         MemoryFormulaVariable::AssetBytes,
         MemoryFormulaVariable::PixelCount,
@@ -899,6 +947,69 @@ mod tests {
         // The two measured surfaces are `lens` q4 resident/sequential deferred and `lens_turbo`
         // dense sequential deferred, so every other (provider, selector) pair is static.
         assert_eq!(seen.len(), 2 * 12 - 3);
+    }
+
+    /// AC (SC-22662): both registered Lens routes publish the axes of the one DiT they share,
+    /// derived from this crate's own config constants, and pass the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp, None);
+        for provider_id in ["lens", "lens_turbo"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    head_dim: Some(64),
+                    transformer_blocks: Some(48),
+                    patch_size: Some(2),
+                    latent_channels: Some(32),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair reconstructs the pipeline's enforced stride, so neither axis can drift
+        // alone: VAE scale x DiT patch IS `pipeline::VAE_SCALE_FACTOR`.
+        let dit = crate::dit::transformer::LensDitConfig::lens();
+        assert_eq!(
+            VAE_SPATIAL_SCALE * dit.patch_size as u32,
+            crate::pipeline::VAE_SCALE_FACTOR
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The declared activation width is the dtype `registry::resolve_root` opens the tree at, so the
+    /// served `Precision::Fp32` route publishes the f32 width rather than the bf16 one.
+    ///
+    /// Mutation: restoring the unconditional `HALF_ACTIVATION_WIDTH` reds the `Some(4)` arm, and
+    /// swapping the two arms of `activation_width` reds the `Some(2)` arm.
+    #[test]
+    fn the_declared_activation_width_follows_the_loaded_precision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = fixture(&tmp, None);
+        for (precision, width) in [(Precision::Bf16, 2_u32), (Precision::Fp32, 4)] {
+            let mut spec = base.clone();
+            spec.precision = precision;
+            for provider_id in ["lens", "lens_turbo"] {
+                for contract in [
+                    memory_strategy_contract(provider_id, &spec).unwrap(),
+                    weights_free_memory_strategy_contract(provider_id, &spec).unwrap(),
+                ] {
+                    assert_eq!(
+                        contract.architecture_facts.activation_dtype_width,
+                        Some(width),
+                        "{provider_id} {precision:?} activation width"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

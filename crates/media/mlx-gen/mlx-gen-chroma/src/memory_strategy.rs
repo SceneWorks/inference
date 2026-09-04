@@ -526,6 +526,7 @@ fn build_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts();
     contract.calibration = calibration;
     contract.asset_facts.overlay_bytes = overlays
         .iter()
@@ -674,6 +675,38 @@ pub fn contract_for(
         crate::model::component_footprint(spec)?,
         resident_overlay_components(spec)?,
     )
+}
+
+/// Architecture axes shared by all three registered Chroma routes (epic SC-22657, E2).
+///
+/// [`ChromaTransformerConfig`](crate::config::ChromaTransformerConfig) is this crate's mirror of the
+/// reference `transformer/config.json` and is identical across HD, Base and Flash — only the weights
+/// and the sampling profile differ — so one derivation serves all three.
+///
+/// The latent axes are the **loader's** constants, not a second copy of them (SC-22667): Chroma
+/// unpacks DiT tokens through `mlx_gen_flux::unpack_latents`, whose `LATENT_CHANNELS` /
+/// `LATENT_PATCH_SIZE` are the reshape it executes, and decodes through the FLUX.1 autoencoder
+/// `mlx_gen_flux::load_vae` builds, whose up-block count is where
+/// [`mlx_gen_flux::memory_strategy::vae_spatial_scale`] reads the x8 from.
+///
+/// `transformer_blocks` is the **sum** of the joint and single stacks (19 + 38): the denoiser
+/// traverses both on every step. `vae_temporal_scale` stays `None` — the FLUX.1 image autoencoder
+/// has no temporal axis, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = crate::config::ChromaTransformerConfig::default();
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            dit.num_layers.saturating_add(dit.num_single_layers),
+        ),
+        patch_size: mlx_gen::architecture_facts::axis(mlx_gen_flux::LATENT_PATCH_SIZE),
+        latent_channels: mlx_gen::architecture_facts::axis(mlx_gen_flux::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen_flux::memory_strategy::vae_spatial_scale(),
+        vae_temporal_scale: None,
+        // The DiT runs f32 activations over its bf16 (or quantized) weights (`transformer.rs`).
+        activation_dtype_width: Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH),
+    }
 }
 
 /// Declaration-equivalent, zero-filesystem contract used only by registry conformance.
@@ -1116,6 +1149,70 @@ mod tests {
     fn tier_spec(root: &std::path::Path) -> LoadSpec {
         LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
             .with_offload_policy(OffloadPolicy::Sequential)
+    }
+
+    /// AC (SC-22662): every registered Chroma route publishes the axes of the one DiT they share,
+    /// derived from this crate's own config constants, and passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_config() {
+        let spec = sequential_spec();
+        for provider in [
+            crate::CHROMA1_HD_ID,
+            crate::CHROMA1_BASE_ID,
+            crate::CHROMA1_FLASH_ID,
+        ] {
+            let contract = weights_free_contract(provider, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    // 19 joint + 38 single blocks.
+                    transformer_blocks: Some(57),
+                    patch_size: Some(2),
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(4),
+                },
+                "{provider} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
+    /// The published latent geometry is the loader's, not a second copy of it (SC-22667): the
+    /// DiT's packed `in_channels` IS `mlx_gen_flux`'s `LATENT_CHANNELS * LATENT_PATCH_SIZE²` — the
+    /// reshape `unpack_latents` executes — and the VAE scale is read off the decoder config
+    /// `mlx_gen_flux::load_vae` builds.
+    ///
+    /// Mutation that fails this: a local `LATENT_CHANNELS` / `VAE_SPATIAL_SCALE` /
+    /// `LATENT_PATCH_SIZE` literal triple (the shape under review) that drifts from either loader
+    /// constant.
+    #[test]
+    fn the_published_latent_geometry_reconstructs_the_dit_input_width() {
+        let dit = crate::config::ChromaTransformerConfig::default();
+        let facts = architecture_facts();
+        assert_eq!(
+            facts.latent_channels.unwrap() * facts.patch_size.unwrap() * facts.patch_size.unwrap(),
+            dit.in_channels as u32
+        );
+        assert_eq!(
+            facts.latent_channels.unwrap() * facts.patch_size.unwrap() * facts.patch_size.unwrap(),
+            mlx_gen_flux::PACKED_TOKEN_WIDTH as u32
+        );
+        // The VAE scale is not a free constant: `SIZE_MULTIPLE` is what the sampler rounds a
+        // request to, and it is exactly `vae_scale * patch`. Deriving the pin from those two keeps
+        // the published axis tied to the geometry the sampler already enforces.
+        assert_eq!(
+            facts.vae_spatial_scale.unwrap(),
+            crate::model::SIZE_MULTIPLE / facts.patch_size.unwrap()
+        );
+        assert_eq!(
+            facts.vae_spatial_scale,
+            mlx_gen_flux::memory_strategy::vae_spatial_scale()
+        );
     }
 
     #[test]

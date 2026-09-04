@@ -667,6 +667,65 @@ pub(crate) fn memory_strategy_contract_with_artifact(
     build_memory_strategy_contract(provider_id, spec, footprint, streamable, calibration)
 }
 
+/// Architecture axes shared by both registered SenseNova-U1 routes (epic SC-22657, E2).
+///
+/// SenseNova has no separate DiT: generation runs through the dense Qwen3 MoT backbone plus a
+/// shallow flow-matching head, so the attention axes are the backbone's.
+/// [`NeoLlmConfig::default`](crate::config::NeoLlmConfig) is the shipped 8B-MoT `config.json`
+/// resolved through the very parser `NeoChatConfig::from_dir` uses at load, so the two cannot drift.
+/// The quality and fast routes share that backbone and differ only in the sampling profile.
+///
+/// `patch_size` is the flow-matching head's pixel patch — the top-level `patch_size` key of the
+/// same `config.json`, which `NeoChatConfig` parses and `unpatchify` reshapes by. It is a real
+/// config axis on both backends (the Candle sibling publishes the same key), so it is published
+/// here rather than declared absent; on the weights-free surface it is the parser's own default,
+/// [`DEFAULT_PATCH_SIZE`](crate::config::DEFAULT_PATCH_SIZE).
+///
+/// Three axes are declared structurally absent, all for one reason: **this provider has no VAE and
+/// no latent at all.** The FM head emits RGB patches which `unpatchify` only reshapes, so there is
+/// no latent channel count and no autoencoder scale — spatial or temporal — to declare. A
+/// structurally absent axis is `None`, never zero.
+///
+/// `activation_dtype_width` is the store width the load will actually use, derived from the spec
+/// the way `model.rs` admits it: only dense bf16 is wired (`spec.precision == Bf16`), so the width
+/// is the half-precision one for an admitted spec and `None` for a precision the loader refuses —
+/// a literal `2` would describe a load that never happens.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `NeoChatConfig::from_dir` —
+/// the loader's own parse — so the published backbone axes are the snapshot's rather than the
+/// preset's. On the weights-free surface there is no `config.json` to read and the preset, which
+/// resolves through that same parser, is the honest answer.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let chat = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::NeoChatConfig::from_dir(root).ok());
+    let llm = chat
+        .as_ref()
+        .map(|chat| chat.llm.clone())
+        .unwrap_or_default();
+    let patch_size = chat
+        .as_ref()
+        .map_or(crate::config::DEFAULT_PATCH_SIZE, |chat| chat.patch_size);
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(llm.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(llm.head_dim()),
+        transformer_blocks: mlx_gen::architecture_facts::axis(llm.num_hidden_layers),
+        patch_size: mlx_gen::architecture_facts::axis(patch_size),
+        latent_channels: None,
+        vae_spatial_scale: None,
+        vae_temporal_scale: None,
+        activation_dtype_width: store_dtype_width(spec),
+    }
+}
+
+/// Bytes per element of the store dtype `model.rs` loads `spec` at: bf16 for the only precision it
+/// admits, and nothing for one it refuses.
+fn store_dtype_width(spec: &LoadSpec) -> Option<u32> {
+    match spec.precision {
+        mlx_gen::Precision::Bf16 => Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        mlx_gen::Precision::Fp32 => None,
+    }
+}
+
 fn build_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -684,6 +743,7 @@ fn build_memory_strategy_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(spec);
     contract.calibration = calibration;
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
         phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
@@ -1634,6 +1694,118 @@ mod tests {
         }
         // Per provider: 12 bounded-attention surfaces + 6 deferred rung-4 surfaces, two routes each.
         assert_eq!(executed, 2 * (12 + 6) * 2);
+    }
+
+    /// AC (SC-22662): both registered SenseNova routes publish the axes of the Qwen3 MoT backbone
+    /// they generate through, and pass the shared facts conformance check.
+    ///
+    /// The three latent/VAE axes stay absent for one structural reason: this provider has no
+    /// autoencoder — the FM head emits RGB patches directly. `patch_size` is that head's pixel
+    /// patch, a real `config.json` key, published on both backends (SC-22667 parity).
+    #[test]
+    fn architecture_facts_follow_the_backbone_config_and_declare_no_latent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture_spec(&tmp);
+        for provider_id in [crate::MODEL_ID, crate::MODEL_ID_FAST] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(32),
+                    head_dim: Some(128),
+                    transformer_blocks: Some(42),
+                    // The FM head's 16 px patch: `config.json:patch_size`, here the parser's
+                    // `DEFAULT_PATCH_SIZE` because the fixture ships no config.
+                    patch_size: Some(16),
+                    latent_channels: None,
+                    vae_spatial_scale: None,
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+            .with_load_shape(LoadShape::DeferredMaterialization)
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the backbone axes come from
+    /// the snapshot's own `config.json` — the file `NeoChatConfig::from_dir` parses at load —
+    /// rather than from the compile-time preset. The shipped 8B-MoT fixture agrees with the
+    /// weights-free path; a fixture with mutated `llm_config` keys publishes the mutated axes,
+    /// which is the assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_backbone_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let shipped: serde_json::Value =
+            serde_json::from_str(crate::config::MOT_8B_CONFIG).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, weights_free) = fixture_spec(&tmp);
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &shipped)),
+            architecture_facts(&weights_free),
+            "the shipped 8B-MoT config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = shipped.clone();
+        mutated["llm_config"]["num_hidden_layers"] = serde_json::json!(7);
+        mutated["llm_config"]["head_dim"] = serde_json::json!(64);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, cross-story parity): the FM head's `patch_size` is a real
+    /// top-level `config.json` key this crate parses, so it is published from the snapshot like the
+    /// Candle sibling does, and the activation width follows the store dtype the loader admits
+    /// rather than a literal.
+    ///
+    /// Mutations that fail this: `patch_size: None` (the shape under review) fails the first two
+    /// assertions; `activation_dtype_width: Some(HALF_ACTIVATION_WIDTH)` unconditionally (the other
+    /// shape under review) fails the `Fp32` assertion, because `model.rs` refuses that precision
+    /// and no bf16 store is ever loaded for it.
+    #[test]
+    fn fm_head_patch_and_store_width_follow_the_snapshot_and_the_admitted_precision() {
+        let shipped: serde_json::Value =
+            serde_json::from_str(crate::config::MOT_8B_CONFIG).unwrap();
+        let mirror = tempfile::tempdir().unwrap();
+        let facts = architecture_facts(&spec_for_config(mirror.path(), &shipped));
+        assert_eq!(
+            facts.patch_size,
+            Some(crate::config::DEFAULT_PATCH_SIZE as u32),
+            "the shipped config's patch_size is the parser default"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = shipped.clone();
+        mutated["patch_size"] = serde_json::json!(8);
+        assert_eq!(
+            architecture_facts(&spec_for_config(mutated_dir.path(), &mutated)).patch_size,
+            Some(8),
+            "the materialized path must publish the snapshot's patch, not the default"
+        );
+
+        let bf16 = spec_for_config(mirror.path(), &shipped);
+        assert_eq!(architecture_facts(&bf16).activation_dtype_width, Some(2));
+        let mut fp32 = bf16.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        assert_eq!(
+            architecture_facts(&fp32).activation_dtype_width,
+            None,
+            "a precision the loader refuses has no store width to publish"
+        );
     }
 
     /// A phase-bearing context must be refused, not silently admitted against single-phase

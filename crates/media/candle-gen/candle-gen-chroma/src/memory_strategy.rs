@@ -1063,6 +1063,59 @@ pub(crate) fn weights_free_surface_contract(
     ))
 }
 
+/// Activation dtype the loaded Chroma DiT computes in. `pipeline.rs` builds the transformer's
+/// `VarBuilder` at `DType::F32` (`load_denoise_components`), so this is the provider's real
+/// activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
+/// Architecture axes for the Chroma1 routes (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `ChromaTransformer::new_gs` is handed the
+/// hardcoded [`crate::config::ChromaTransformerConfig::default`] (HD, Base and Flash are one
+/// architecture — only the weights and the sampling profile differ), and the decoder is built from
+/// `crate::vae`'s own constants. Reading those same declarations keeps the published geometry
+/// identical to the model actually built.
+///
+/// `transformer_blocks` is the **total** trunk depth: Chroma stacks the 19 double-stream blocks and
+/// then the 38 single-stream blocks in one sequence. `patch_size` has no config field, so it is
+/// *derived* from the pair that implies it: the FLUX-style packing outside the trunk is what makes
+/// `in_channels` 64 = 16 latent channels x 2x2, and
+/// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
+/// ratio rather than restating it as a literal that would survive a repack.
+/// `vae_temporal_scale` stays `None`: Chroma decodes through the FLUX.1 image `AutoencoderKL`,
+/// which has no temporal axis at all, and a structurally absent axis is declared absent, never
+/// zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`. Chroma's
+    // real snapshot root is a tier subdirectory (`q4` / `q8` / `bf16`); the gate is the same.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = crate::config::ChromaTransformerConfig::default();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_attention_heads),
+        head_dim: af::declared(dit.attention_head_dim),
+        transformer_blocks: af::declared(dit.num_layers + dit.num_single_layers),
+        // The packing edge the trunk's own input width implies: `in_channels / LATENT_CHANNELS` is
+        // the neighbourhood area, and its square root is the axis.
+        patch_size: af::patch_size_from_channels(
+            af::declared(dit.in_channels),
+            af::declared(crate::vae::LATENT_CHANNELS),
+        ),
+        latent_channels: af::declared(crate::vae::LATENT_CHANNELS),
+        // `vae::BLOCK_OUT` is four stages, so three halvings: x8.
+        vae_spatial_scale: af::declared(crate::vae::BLOCK_OUT.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
+        // Structurally absent: the FLUX.1 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -1089,6 +1142,7 @@ fn build_contract(
         })
         .collect();
     MemoryProviderContract {
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1816,6 +1870,60 @@ mod tests {
         spec.load_shape = LoadShape::DeferredMaterialization;
         spec.offload_policy = OffloadPolicy::Sequential;
         spec
+    }
+
+    /// AC (epic SC-22657, E2): every Chroma route publishes the geometry the loader actually builds
+    /// — the `ChromaTransformerConfig::default` trunk and the `crate::vae` decoder constants — the
+    /// contract passes the shared facts conformance check, and the weights-free surface (whose
+    /// sentinel root is not on disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Chroma's real snapshot root is a tier subdirectory; the gate only asks that it exists.
+        let root = tmp.path().join("bf16");
+        std::fs::create_dir_all(&root).unwrap();
+        for route in ROUTES {
+            let contract =
+                uncalibrated_contract(route.provider, &spec(root.clone(), route.provider)).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `ChromaTransformerConfig::default()`.
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    // 19 double-stream + 38 single-stream blocks in one trunk.
+                    transformer_blocks: Some(57),
+                    // The 2x2 packing outside the trunk (`in_channels 64 = 16 * 2 * 2`).
+                    patch_size: Some(2),
+                    // `vae::LATENT_CHANNELS`.
+                    latent_channels: Some(16),
+                    // `vae::BLOCK_OUT` is four stages, so three halvings.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: the FLUX.1 image autoencoder has no temporal axis.
+                    vae_temporal_scale: None,
+                    // `pipeline.rs` builds the DiT `VarBuilder` at `DType::F32`.
+                    activation_dtype_width: Some(4),
+                },
+                "{} architecture facts",
+                route.provider
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = weights_free_contract(route.provider, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{} weights-free facts must be empty",
+                route.provider
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
     }
 
     #[test]

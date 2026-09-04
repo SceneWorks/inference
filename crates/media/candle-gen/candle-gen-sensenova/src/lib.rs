@@ -571,13 +571,34 @@ fn backbone_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 /// the `U32` code tensors sitting next to it. Anything unreadable falls back to `F32`, the
 /// pre-sc-14249 behavior. Mirrors `candle-gen-ideogram`'s `te_store_dtype` (sc-12828).
 fn checkpoint_dtype(files: &[PathBuf]) -> DType {
+    probe_checkpoint_dtype(files).unwrap_or(DType::F32)
+}
+
+/// The same probe, distinguishing "no probe tensor" from the `F32` fallback.
+///
+/// The load path wants the fallback: an unreadable probe must still load, and `F32` never truncates.
+/// The memory contract wants the opposite — an axis it could not derive is `None`, never a guess —
+/// so it reads this and maps the result through [`quant::store_dtype_for`] exactly as `backbone_vb`
+/// does, rather than publishing an activation width for a snapshot it never looked into.
+pub(crate) fn probe_checkpoint_dtype(files: &[PathBuf]) -> Option<DType> {
     const PROBE_KEY: &str = "language_model.model.norm.weight";
     // SAFETY: read-only mmap of weight files; the standard candle loading path.
     unsafe { candle_gen::candle_core::safetensors::MmapedSafetensors::multi(files) }
         .ok()
         .and_then(|st| st.load(PROBE_KEY, &Device::Cpu).ok())
         .map(|t| t.dtype())
-        .unwrap_or(DType::F32)
+}
+
+/// The store dtype a snapshot at `root` would be loaded at, or `None` when it ships no probe tensor.
+///
+/// This is `backbone_vb`'s own pair of calls — [`backbone_files`] then
+/// [`quant::store_dtype_for`] over the probe — so the width the contract publishes is the width the
+/// load will actually use, on a packed q4/q8 tier as much as on `bf16/`.
+pub(crate) fn snapshot_store_dtype(root: &Path) -> Option<DType> {
+    let files = backbone_files(root).ok()?;
+    Some(crate::quant::store_dtype_for(probe_checkpoint_dtype(
+        &files,
+    )?))
 }
 
 /// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT
@@ -1095,11 +1116,25 @@ mod tests {
         }
     }
 
+    /// One dense bf16 projection plus the always-dense final RMSNorm.
+    ///
+    /// The norm is not decoration: it is the tensor [`probe_checkpoint_dtype`] reads, so a fixture
+    /// without it describes a checkpoint whose store dtype is unknowable and whose load therefore
+    /// takes `backbone_vb`'s f32 fallback — a doubled resident width no shipped tier has.
     fn write_minimal_dense_checkpoint(root: &Path) {
-        let key = "language_model.model.layers.0.self_attn.k_proj.weight".to_owned();
-        let tensor = Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap();
+        let projection = "language_model.model.layers.0.self_attn.k_proj.weight".to_owned();
+        let norm = "language_model.model.norm.weight".to_owned();
         candle_gen::candle_core::safetensors::save(
-            &HashMap::from([(key, tensor)]),
+            &HashMap::from([
+                (
+                    projection,
+                    Tensor::zeros((2, 64), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+                (
+                    norm,
+                    Tensor::zeros((64,), DType::BF16, &Device::Cpu).unwrap(),
+                ),
+            ]),
             root.join("model.safetensors"),
         )
         .unwrap();
@@ -1239,9 +1274,23 @@ mod tests {
         };
         let eager_facts = facts(&eager);
         let deferred_facts = facts(&deferred);
-        assert_eq!(eager_facts.base_bytes, on_disk);
-        assert_eq!(eager_facts.transformer_bytes, on_disk);
-        assert_eq!(eager_facts.conditioning_bytes, on_disk);
+        // The fixture holds only understanding-path tensors, so the whole payload is conditioning
+        // and the generation path is empty. The total is what the LOADER materializes, not what the
+        // shards store: the bf16 projection rides the bf16 store (`vb.get_unchecked`) at its stored
+        // width, while the RMSNorm is widened to f32 by `quant::get_f32` and so costs twice its
+        // stored bytes. Still strictly below the file length, which also carries the header.
+        let stored: u64 =
+            gen_core::weightsmeta::safetensors_path_tensor_headers(root.join("model.safetensors"))
+                .unwrap()
+                .iter()
+                .map(|header| header.data_bytes)
+                .sum();
+        let materialized = stored + 64 * 2; // the [64] norm's bf16 -> f32 widening
+        assert!(materialized > stored && materialized < on_disk);
+        assert_eq!(eager_facts.base_bytes, materialized);
+        assert_eq!(eager_facts.conditioning_bytes, materialized);
+        assert_eq!(eager_facts.transformer_bytes, 0);
+        assert_eq!(eager_facts.decoder_bytes, 0);
         assert_eq!(eager_facts, deferred_facts);
         // ...and the registry's own answer for the same spec is that same number.
         assert_eq!(

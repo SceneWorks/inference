@@ -96,6 +96,10 @@ pub struct StarVectorClip {
     ln_out_b: Tensor,
 }
 
+fn align_clip_pixels(pixels: &Tensor, convolution: &Tensor) -> Result<Tensor> {
+    Ok(pixels.to_dtype(convolution.dtype())?)
+}
+
 impl StarVectorClip {
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let p = "model.image_encoder.visual_encoder";
@@ -114,7 +118,8 @@ impl StarVectorClip {
     }
 
     pub fn forward(&self, pixels: &Tensor) -> Result<Tensor> {
-        let patches = conv2d(pixels, &self.conv, None, CLIP_PATCH, 0)?;
+        let pixels = align_clip_pixels(pixels, &self.conv)?;
+        let patches = conv2d(&pixels, &self.conv, None, CLIP_PATCH, 0)?;
         let (batch, _, height, width) = patches.dims4()?;
         if (height, width) != (16, 16) {
             return Err(Error::Msg(format!(
@@ -223,15 +228,15 @@ impl BigCodeBlock {
         Ok(Self {
             ln1w: tensor(w, p, "ln_1.weight")?,
             ln1b: tensor(w, p, "ln_1.bias")?,
-            qkvw: tensor(w, p, "attn.c_attn.weight")?.transpose(0, 1)?,
+            qkvw: decoder_projection(w, p, "attn.c_attn.weight")?,
             qkvb: tensor(w, p, "attn.c_attn.bias")?,
-            outw: tensor(w, p, "attn.c_proj.weight")?.transpose(0, 1)?,
+            outw: decoder_projection(w, p, "attn.c_proj.weight")?,
             outb: tensor(w, p, "attn.c_proj.bias")?,
             ln2w: tensor(w, p, "ln_2.weight")?,
             ln2b: tensor(w, p, "ln_2.bias")?,
-            fcw: tensor(w, p, "mlp.c_fc.weight")?.transpose(0, 1)?,
+            fcw: decoder_projection(w, p, "mlp.c_fc.weight")?,
             fcb: tensor(w, p, "mlp.c_fc.bias")?,
-            projw: tensor(w, p, "mlp.c_proj.weight")?.transpose(0, 1)?,
+            projw: decoder_projection(w, p, "mlp.c_proj.weight")?,
             projb: tensor(w, p, "mlp.c_proj.bias")?,
             cache: None,
         })
@@ -251,22 +256,7 @@ impl BigCodeBlock {
             kv = Tensor::cat(&[old, &kv], 1)?;
         }
         self.cache = Some(kv.clone());
-        let keys = kv.narrow(2, 0, 128)?.transpose(1, 2)?;
-        let values = kv.narrow(2, 128, 128)?;
-        let scores = (q.matmul(&keys.contiguous()?)? * (128f64).powf(-0.5))?;
-        let total = past + s;
-        let mut allow = vec![0u8; s * total];
-        for row in 0..s {
-            for col in 0..=past + row {
-                allow[row * total + col] = 1;
-            }
-        }
-        let allow = Tensor::from_vec(allow, (1, s, 1, total), scores.device())?
-            .broadcast_as(scores.dims())?;
-        let neg = Tensor::new(f32::NEG_INFINITY, scores.device())?.broadcast_as(scores.dims())?;
-        let attn = softmax_last_dim(&allow.where_cond(&scores, &neg)?)?
-            .matmul(&values)?
-            .reshape((b, s, STARVECTOR_HIDDEN))?;
+        let attn = multi_query_attention(&q, &kv, past)?;
         let residual = (input + linear(&attn, &self.outw, Some(&self.outb))?)?;
         let mlp = gelu(&linear(
             &layer_norm(&residual, &self.ln2w, &self.ln2b, 1e-5)?,
@@ -276,18 +266,78 @@ impl BigCodeBlock {
         Ok((&residual + linear(&mlp, &self.projw, Some(&self.projb))?)?)
     }
 }
+
+fn multi_query_attention(q: &Tensor, kv: &Tensor, past: usize) -> Result<Tensor> {
+    let (b, s, heads, head) = q.dims4()?;
+    let (kv_batch, total, kv_width) = kv.dims3()?;
+    if kv_batch != b || total != past + s || kv_width != head * 2 {
+        return Err(Error::Msg(format!(
+            "starvector MQA shape mismatch: query={:?}, kv={:?}, past={past}",
+            q.dims(),
+            kv.dims()
+        )));
+    }
+
+    // GPTBigCode's multi-query attention shares one K/V head across all query heads. Fold the
+    // query-head axis into the row axis for both matrix products so the shared K/V tensors are
+    // consumed once without materializing sixteen copies. Restore `[batch, tokens, hidden]` only
+    // after the per-head value product.
+    let query = q
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((b, heads * s, head))?;
+    let keys = kv.narrow(2, 0, head)?.transpose(1, 2)?;
+    // The V half has a `2 * head` row stride after `narrow`; CUDA GEMM only accepts a dense
+    // minor matrix, so materialize this view just as we do for the transposed K half.
+    let values = kv.narrow(2, head, head)?.contiguous()?;
+    let scores = (query.matmul(&keys.contiguous()?)? * (head as f64).powf(-0.5))?
+        .reshape((b, heads, s, total))?;
+    let mut allow = vec![0u8; s * total];
+    for row in 0..s {
+        for col in 0..=past + row {
+            allow[row * total + col] = 1;
+        }
+    }
+    let allow =
+        Tensor::from_vec(allow, (1, 1, s, total), scores.device())?.broadcast_as(scores.dims())?;
+    let neg = Tensor::new(f32::NEG_INFINITY, scores.device())?.broadcast_as(scores.dims())?;
+    Ok(softmax_last_dim(&allow.where_cond(&scores, &neg)?)?
+        .reshape((b, heads * s, total))?
+        .matmul(&values)?
+        .reshape((b, heads, s, head))?
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((b, s, heads * head))?)
+}
+
+/// The published StarVector GPTBigCode tensors are already `[out, in]`, exactly as Candle's
+/// shared `linear` leaf expects. Keeping this boundary explicit prevents accidentally applying
+/// the older Transformers `Conv1D` `[in, out]` convention to these safetensors.
+fn decoder_projection(w: &Weights, prefix: &str, suffix: &str) -> Result<Tensor> {
+    tensor(w, prefix, suffix)
+}
+
+fn tied_token_embedding(w: &Weights, prefix: &str) -> Result<(Tensor, Tensor)> {
+    let wte = tensor(w, prefix, "wte.weight")?;
+    // GPTBigCode ties the output projection to the token embedding. The published
+    // StarVector-1B snapshot therefore intentionally has no separate `lm_head.weight`.
+    let head = wte.clone();
+    Ok((wte, head))
+}
+
 impl StarVectorDecoder {
     pub fn from_weights(w: &Weights) -> Result<Self> {
         let p = "model.svg_transformer.transformer.transformer";
+        let (wte, head) = tied_token_embedding(w, p)?;
         Ok(Self {
-            wte: tensor(w, p, "wte.weight")?,
+            wte,
             wpe: tensor(w, p, "wpe.weight")?,
             layers: (0..24)
                 .map(|i| BigCodeBlock::load(w, &format!("{p}.h.{i}")))
                 .collect::<Result<Vec<_>>>()?,
             lnw: tensor(w, p, "ln_f.weight")?,
             lnb: tensor(w, p, "ln_f.bias")?,
-            head: tensor(w, "model.svg_transformer.transformer", "lm_head.weight")?,
+            head,
         })
     }
     pub fn reset(&mut self) {
@@ -337,5 +387,161 @@ impl StarVectorModel {
     }
     pub fn reset(&mut self) {
         self.decoder.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+    use std::collections::HashMap;
+
+    #[test]
+    fn clip_aligns_f32_preprocessing_with_f16_checkpoint_weights() {
+        let device = Device::Cpu;
+        let pixels = Tensor::zeros((1,), DType::F32, &device).unwrap();
+        let conv = Tensor::zeros((1,), DType::F16, &device).unwrap();
+
+        let aligned = align_clip_pixels(&pixels, &conv).unwrap();
+
+        assert_eq!(aligned.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn multi_query_attention_preserves_head_and_token_axes() {
+        let device = Device::Cpu;
+        let query = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 1.0],
+            (1, 2, 2, 2),
+            &device,
+        )
+        .unwrap();
+        let kv = Tensor::from_vec(
+            vec![1.0f32, 0.0, 10.0, 20.0, 0.0, 1.0, 30.0, 40.0],
+            (1, 2, 4),
+            &device,
+        )
+        .unwrap();
+
+        let output = multi_query_attention(&query, &kv, 0).unwrap();
+
+        assert_eq!(output.dims(), &[1, 2, 4]);
+        let output = output.to_vec3::<f32>().unwrap();
+        assert_eq!(output[0][0], vec![10.0, 20.0, 10.0, 20.0]);
+        assert!((output[0][1][0] - 20.0).abs() < 1e-5);
+        assert!((output[0][1][1] - 30.0).abs() < 1e-5);
+        assert!((output[0][1][2] - 26.088594).abs() < 1e-4);
+        assert!((output[0][1][3] - 36.088596).abs() < 1e-4);
+    }
+
+    #[test]
+    fn starvector_1b_prefill_mqa_accepts_the_native_axis_contract() {
+        let device = Device::Cpu;
+        let query = Tensor::zeros((1, 259, 16, 128), DType::F32, &device).unwrap();
+        let kv = Tensor::zeros((1, 259, 256), DType::F32, &device).unwrap();
+
+        let output = multi_query_attention(&query, &kv, 0).unwrap();
+
+        assert_eq!(output.dims(), &[1, 259, STARVECTOR_HIDDEN]);
+        assert_eq!(output.sum_all().unwrap().to_scalar::<f32>().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn multi_query_attention_decode_reads_the_complete_shared_cache() {
+        let device = Device::Cpu;
+        let query = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (1, 1, 2, 2), &device).unwrap();
+        let kv = Tensor::from_vec(
+            vec![
+                1.0f32, 0.0, 10.0, 20.0, 0.0, 1.0, 30.0, 40.0, 1.0, 1.0, 50.0, 60.0,
+            ],
+            (1, 3, 4),
+            &device,
+        )
+        .unwrap();
+
+        let output = multi_query_attention(&query, &kv, 2)
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+
+        let exp_scaled = (1.0f32 / 2.0f32.sqrt()).exp();
+        let high = exp_scaled / (2.0 * exp_scaled + 1.0);
+        let low = 1.0 / (2.0 * exp_scaled + 1.0);
+        let expected = [
+            60.0 * high + 30.0 * low,
+            80.0 * high + 40.0 * low,
+            80.0 * high + 10.0 * low,
+            100.0 * high + 20.0 * low,
+        ];
+        for (actual, expected) in output[0][0].iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn multi_query_attention_rejects_cache_geometry_that_disagrees_with_past() {
+        let device = Device::Cpu;
+        let query = Tensor::zeros((1, 1, 2, 2), DType::F32, &device).unwrap();
+        let short_cache = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+
+        let error = multi_query_attention(&query, &short_cache, 2).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("query=[1, 1, 2, 2], kv=[1, 2, 4], past=2"));
+    }
+
+    #[test]
+    fn decoder_projection_preserves_published_out_in_layout() {
+        let device = Device::Cpu;
+        let projection =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), &device).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("fixture.attn.c_attn.weight".into(), projection);
+        let weights = Weights::from_map(tensors, device.clone());
+
+        let projection = decoder_projection(&weights, "fixture", "attn.c_attn.weight").unwrap();
+        assert_eq!(projection.dims(), &[3, 2]);
+        let input = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
+        assert_eq!(
+            linear(&input, &projection, None)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![1.0, 3.0, 5.0]]
+        );
+    }
+
+    #[test]
+    fn tied_token_embedding_projects_without_a_separate_lm_head() {
+        let device = Device::Cpu;
+        let values = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let wte = Tensor::from_vec(values.clone(), (3, 2), &device).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.svg_transformer.transformer.transformer.wte.weight".into(),
+            wte,
+        );
+        let weights = Weights::from_map(tensors, device.clone());
+
+        let (wte, head) =
+            tied_token_embedding(&weights, "model.svg_transformer.transformer.transformer")
+                .unwrap();
+        assert_eq!(
+            head.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            values
+        );
+        assert_eq!(
+            wte.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            head.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        let hidden = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device).unwrap();
+        assert_eq!(
+            linear(&hidden, &head, None)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![1.0, 3.0, 5.0]]
+        );
     }
 }

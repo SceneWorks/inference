@@ -544,6 +544,159 @@ fn host(t: &Tensor) -> Vec<f32> {
         .unwrap()
 }
 
+fn pack_mlx_affine_q8(weight: &Tensor, group_size: usize) -> (Tensor, Tensor, Tensor) {
+    let (out, inn) = weight.dims2().unwrap();
+    assert!(inn.is_multiple_of(group_size));
+    let source = weight.to_vec2::<f32>().unwrap();
+    let groups_per_row = inn / group_size;
+    let mut words = Vec::with_capacity(out * inn / 4);
+    let mut scales = Vec::with_capacity(out * groups_per_row);
+    let mut biases = Vec::with_capacity(out * groups_per_row);
+    for row in source {
+        let mut codes = Vec::with_capacity(inn);
+        for group in row.chunks_exact(group_size) {
+            let lo = group.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let scale = (hi - lo) / 255.0;
+            scales.push(scale);
+            biases.push(lo);
+            codes.extend(group.iter().map(|value| {
+                if scale == 0.0 {
+                    0
+                } else {
+                    ((value - lo) / scale).round().clamp(0.0, 255.0) as u8
+                }
+            }));
+        }
+        words.extend(codes.chunks_exact(4).map(|chunk| {
+            chunk.iter().enumerate().fold(0u32, |word, (index, code)| {
+                word | ((*code as u32) << (index * 8))
+            })
+        }));
+    }
+    (
+        Tensor::from_vec(words, (out, inn / 4), &Device::Cpu).unwrap(),
+        Tensor::from_vec(scales, (out, groups_per_row), &Device::Cpu).unwrap(),
+        Tensor::from_vec(biases, (out, groups_per_row), &Device::Cpu).unwrap(),
+    )
+}
+
+/// A stored MLX-affine Q8 decoder must reconstruct each projection's logical input width from its
+/// sidecars. Treating the shortened U32 matrix as dense reproduces the terminal LTX-2.5 failure:
+/// an activation with the real hidden width contracts against `hidden / 4` instead.
+#[test]
+fn mlx_affine_q8_decoder_uses_logical_projection_widths() {
+    const GROUP: usize = 32;
+    let mut case = llama();
+    let dense_cfg = ModelConfig::from_json(&case.config).unwrap();
+    let dense_model = CausalLm::from_weights(
+        &Weights::from_map(case.weights.clone(), Device::Cpu),
+        "",
+        dense_cfg,
+    )
+    .unwrap();
+    let dense_logits = dense_model
+        .decode_logits(
+            &input_ids(&PROMPT, &Device::Cpu).unwrap(),
+            &mut dense_model.new_cache(),
+            0,
+        )
+        .unwrap();
+
+    case.config["quantization"] = json!({
+        "bits": 8,
+        "group_size": GROUP,
+        "mode": "affine"
+    });
+    let projection_keys = case
+        .weights
+        .keys()
+        .filter(|key| key.ends_with("_proj.weight"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!projection_keys.is_empty());
+    for key in projection_keys {
+        let weight = case.weights.remove(&key).unwrap();
+        let (packed, scales, biases) = pack_mlx_affine_q8(&weight, GROUP);
+        let stem = key.strip_suffix(".weight").unwrap().to_owned();
+        case.weights.insert(key, packed);
+        case.weights.insert(format!("{stem}.scales"), scales);
+        case.weights.insert(format!("{stem}.biases"), biases);
+    }
+
+    let cfg = ModelConfig::from_json(&case.config).unwrap();
+    let stored_quant = cfg.quantization;
+    let model = CausalLm::from_weights_with(
+        &Weights::from_map(case.weights, Device::Cpu),
+        "",
+        cfg,
+        stored_quant,
+    )
+    .expect("packed Q8 projections load by logical, not stored, width");
+    let mut cache = model.new_cache();
+    let logits = model
+        .decode_logits(&input_ids(&PROMPT, &Device::Cpu).unwrap(), &mut cache, 0)
+        .unwrap();
+    assert_eq!(logits.dims(), &[1, VOCAB]);
+    let dense = host(&dense_logits);
+    let packed = host(&logits);
+    let max_abs = dense
+        .iter()
+        .zip(&packed)
+        .map(|(dense, packed)| (dense - packed).abs())
+        .fold(0f32, f32::max);
+    assert!(max_abs < 0.05, "packed decoder drifted by {max_abs}");
+}
+
+#[test]
+fn packed_u32_projection_without_sidecars_is_refused() {
+    let mut case = llama();
+    let key = "model.layers.0.self_attn.q_proj.weight";
+    let shape = case.weights[key].shape().clone();
+    case.weights.insert(
+        key.into(),
+        Tensor::zeros(shape, DType::U32, &Device::Cpu).unwrap(),
+    );
+    let cfg = ModelConfig::from_json(&case.config).unwrap();
+    let error = CausalLm::from_weights(&Weights::from_map(case.weights, Device::Cpu), "", cfg)
+        .err()
+        .expect("U32 projection without affine sidecars must fail closed")
+        .to_string();
+    assert!(error.contains("packed U32 tensor"), "{error}");
+    assert!(error.contains(key), "{error}");
+}
+
+#[test]
+fn packed_fused_projection_is_refused_before_dense_cast() {
+    const GROUP: usize = 32;
+    let mut case = phi3();
+    case.config["quantization"] = json!({
+        "bits": 8,
+        "group_size": GROUP,
+        "mode": "affine"
+    });
+    let key = "model.layers.0.self_attn.qkv_proj.weight";
+    let dense = case.weights.remove(key).unwrap();
+    let (packed, scales, biases) = pack_mlx_affine_q8(&dense, GROUP);
+    let stem = key.strip_suffix(".weight").unwrap();
+    case.weights.insert(key.into(), packed);
+    case.weights.insert(format!("{stem}.scales"), scales);
+    case.weights.insert(format!("{stem}.biases"), biases);
+    let cfg = ModelConfig::from_json(&case.config).unwrap();
+    let stored_quant = cfg.quantization;
+    let error = CausalLm::from_weights_with(
+        &Weights::from_map(case.weights, Device::Cpu),
+        "",
+        cfg,
+        stored_quant,
+    )
+    .err()
+    .expect("packed fused projection must fail before a U32 dense cast")
+    .to_string();
+    assert!(error.contains("packed fused projection"), "{error}");
+    assert!(error.contains("qkv_proj"), "{error}");
+}
+
 /// **The regression gate.** Every architecture's full forward output, exactly as the base branch
 /// produced it.
 #[test]

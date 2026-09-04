@@ -61,20 +61,28 @@ pub fn register_text_providers(
         .register(starvector::REGISTRATION)
 }
 
-/// Add every locally loadable Candle LLM provider to an explicit registry builder.
-///
-/// StarVector-8B is intentionally present here but absent from [`register_text_providers`]: the
-/// native implementation can be structurally exercised against an explicit local snapshot, while
-/// shipped catalog admission waits for SC-22261's one terminal quality receipt.
-pub fn register_local_text_providers(
+/// Add providers admitted to the shipped CUDA runtime catalog.
+pub fn register_cuda_text_providers(
     registry: core_llm::TextLlmRegistryBuilder,
 ) -> core_llm::TextLlmRegistryBuilder {
     register_text_providers(registry).register(starvector_8b::REGISTRATION)
 }
 
+/// Add every locally loadable Candle LLM provider to an explicit registry builder.
+pub fn register_local_text_providers(
+    registry: core_llm::TextLlmRegistryBuilder,
+) -> core_llm::TextLlmRegistryBuilder {
+    register_cuda_text_providers(registry)
+}
+
 /// Build the complete, explicit Candle LLM provider catalog.
 pub fn text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
     register_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
+}
+
+/// Build the explicit Candle registry admitted for the CUDA runtime.
+pub fn cuda_text_registry() -> core_llm::Result<core_llm::TextLlmRegistry> {
+    register_cuda_text_providers(core_llm::TextLlmRegistryBuilder::new()).build()
 }
 
 /// Build the explicit local registry, including capabilities still fail-closed from shipping.
@@ -132,6 +140,21 @@ mod explicit_registry_tests {
         assert_eq!(
             explicit,
             ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
+
+        let cuda: Vec<String> = super::cuda_text_registry()
+            .unwrap()
+            .registrations()
+            .map(|registration| (registration.descriptor)().id)
+            .collect();
+        assert_eq!(
+            cuda,
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
         );
 
         let local: Vec<String> = super::local_text_registry()

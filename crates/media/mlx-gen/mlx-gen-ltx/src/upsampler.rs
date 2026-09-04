@@ -344,6 +344,7 @@ impl LatentUpsampler {
     pub fn from_checkpoint(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
         let w = Weights::from_file(path)?;
+        w.materialize()?;
         let up = Self::from_weights(&w)?;
         let meta = LtxCheckpointMetadata::from_file(path)?;
         if meta.config().is_some() {

@@ -61,4 +61,7 @@ path = "src/bin/mlx_perf_bench.rs"
 required-features = ["perf-bench"]
 
 [dev-dependencies]
+# The shared weights-free conformance suite (epic SC-22657): this bundle owns the registry-wide
+# memory-contract facts assertion over every provider the macOS composition registers.
+sceneworks-gen-core-testkit = { workspace = true }
 tempfile = { workspace = true }

@@ -2,7 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from scripts.release import verify_model_snapshot as snapshot_verifier
 from scripts.release.ensure_model_snapshot import (
     _managed_staging_paths,
     ensure_snapshot,
@@ -70,6 +72,45 @@ class ModelSnapshotTests(unittest.TestCase):
             (snapshot / "weights/model.safetensors").write_bytes(b"mutated")
             second = snapshot_inventory(MODEL, snapshot)
             self.assertNotEqual(first["inventory_sha256"], second["inventory_sha256"])
+
+    def test_inventories_sort_normalized_paths_independently_of_platform_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = self.make_snapshot(Path(temporary), MODEL["revision"])
+            (snapshot / "README.md").write_text("fixture", encoding="utf-8")
+
+            def windows_native_sorted(values, *, key=None):
+                entries = list(values)
+                if key is None and entries and isinstance(entries[0], Path):
+                    return sorted(
+                        entries,
+                        key=lambda path: path.relative_to(snapshot).as_posix().casefold(),
+                    )
+                return sorted(entries, key=key)
+
+            with mock.patch.object(
+                snapshot_verifier,
+                "sorted",
+                side_effect=windows_native_sorted,
+                create=True,
+            ):
+                inventory = snapshot_inventory(MODEL, snapshot)
+                receipt = completed_materialization_receipt(
+                    {
+                        **MIRRORED_MODEL,
+                        "materialization_expected_files": [
+                            "README.md",
+                            "config.json",
+                            "weights/model.safetensors",
+                        ],
+                    },
+                    snapshot,
+                )
+
+            expected = ["README.md", "config.json", "weights/model.safetensors"]
+            self.assertEqual([item["path"] for item in inventory["files"]], expected)
+            self.assertEqual(
+                [item["path"] for item in receipt["materialization_files"]], expected
+            )
 
     def test_inventory_hashes_symlink_target_content_and_rejects_broken_links(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

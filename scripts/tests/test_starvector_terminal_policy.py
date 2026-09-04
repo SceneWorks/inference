@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ MODELS = ROOT / "release/real-weight-models.toml"
 CORPUS = ROOT / "release/starvector-terminal-corpus-v1.json"
 SCHEMA = ROOT / "release/starvector-terminal-receipt-v1.schema.json"
 HARNESS = ROOT / "scripts/release/starvector_terminal_evidence.mjs"
+PREFLIGHT_ASSEMBLER = ROOT / "scripts/release/starvector_terminal_preflight.mjs"
 
 
 def terminal_workflow_errors(workflow: str) -> list[str]:
@@ -28,6 +30,14 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
     mlx = workflow[start:end]
     if "github.event_name == 'workflow_dispatch'" not in mlx or "inputs.profile == 'starvector-terminal'" not in mlx:
         errors.append("MLX terminal lane is not dispatch-only")
+    if "runs-on: [self-hosted, macOS, ARM64, rw-starvector]" not in mlx:
+        errors.append("MLX terminal lane does not target the provisioned StarVector weight set")
+    for snapshot in (
+        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-1b",
+        "/Users/Shared/SceneWorks/starvector-terminal/weights/models/starvector-8b",
+    ):
+        if snapshot not in mlx:
+            errors.append(f"MLX terminal snapshot path missing {snapshot}")
     for name in (
         "starvector_1b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
@@ -38,6 +48,16 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"MLX terminal command missing {name}")
     if mlx.count("--exact --ignored --nocapture") != 2:
         errors.append("MLX terminal command missing exact filters")
+    for artifact in (
+        "inventory/starvector-1b-inventory.json",
+        "inventory/starvector-8b-inventory.json",
+        "hooks/mlx-starvector-1b.log",
+        "hooks/mlx-starvector-8b.log",
+        "github.run_id",
+        "github.run_attempt",
+    ):
+        if artifact not in mlx:
+            errors.append(f"MLX terminal provenance missing {artifact}")
     candle_start = workflow.find("  starvector-terminal-candle:")
     candle_end = workflow.find("\n  mlx-llm:", candle_start)
     candle = workflow[candle_start:candle_end]
@@ -45,15 +65,35 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
         errors.append("Candle lane no longer serializes after MLX")
     if "runs-on: [self-hosted, windows, cuda, real-weights]" not in candle:
         errors.append("Candle lane no longer uses authoritative CUDA")
+    for snapshot in (
+        r"D:\\sceneworks-terminal\\weights\\models\\starvector-1b",
+        r"D:\\sceneworks-terminal\\weights\\models\\starvector-8b",
+    ):
+        if snapshot not in candle:
+            errors.append(f"Candle terminal snapshot path missing {snapshot}")
     for name in (
         "starvector::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector_8b::tests::real_weight_provider_satisfies_shared_starvector_conformance",
         "starvector-terminal-mlx-${{ github.sha }}",
+        "Compare MLX and Candle snapshot inventories",
+        "compare_model_snapshot_inventories.py",
     ):
         if name not in candle:
             errors.append(f"Candle terminal command missing {name}")
     if candle.count("--exact --ignored --nocapture") != 2:
         errors.append("Candle terminal command missing exact filters")
+    for artifact in (
+        "candle-cuda-starvector-1b.log",
+        "candle-cuda-starvector-8b.log",
+        "starvector_terminal_preflight.mjs assemble",
+        '--head-sha "%GITHUB_SHA%"',
+        '--workflow-run-id "%GITHUB_RUN_ID%"',
+        '--workflow-run-attempt "%GITHUB_RUN_ATTEMPT%"',
+        "starvector-terminal-preflight-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+        "Upload complete terminal preflight provenance",
+    ):
+        if artifact not in candle:
+            errors.append(f"Candle terminal provenance missing {artifact}")
     return errors
 
 
@@ -106,10 +146,57 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             (mutate(candle_start, candle_end, "needs: starvector-terminal-mlx"), "serializes"),
             (mutate(mlx_start, candle_start, "--exact --ignored --nocapture"), "MLX terminal command missing exact filters"),
             (mutate(mlx_start, candle_start, "inputs.profile == 'starvector-terminal'"), "MLX terminal lane is not dispatch-only"),
+            (mutate(candle_start, candle_end, ' --workflow-run-attempt "%GITHUB_RUN_ATTEMPT%"'), "workflow-run-attempt"),
         )
         for mutated, expected in cases:
             with self.subTest(expected=expected):
                 self.assertTrue(any(expected in error for error in terminal_workflow_errors(mutated)))
+
+    def test_preflight_assembler_binds_exact_relative_sources_and_is_deterministic(self) -> None:
+        contents = {
+            "inventory/starvector-1b-inventory.json": b"one inventory\n",
+            "inventory/starvector-8b-inventory.json": b"eight inventory\n",
+            "hooks/mlx-starvector-1b.log": b"mlx one\n",
+            "hooks/mlx-starvector-8b.log": b"mlx eight\n",
+            "hooks/candle-cuda-starvector-1b.log": b"candle one\n",
+            "hooks/candle-cuda-starvector-8b.log": b"candle eight\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative, payload in contents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+            command = [
+                "node",
+                str(PREFLIGHT_ASSEMBLER),
+                "assemble",
+                "--root",
+                str(root),
+                "--head-sha",
+                "a" * 40,
+                "--workflow-run-id",
+                "12345",
+                "--workflow-run-attempt",
+                "2",
+            ]
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8")
+            output = root / "starvector-terminal-preflight.json"
+            first = output.read_bytes()
+            value = json.loads(first)
+            self.assertEqual(value["workflow_run_id"], "12345")
+            self.assertEqual(value["workflow_run_attempt"], 2)
+            self.assertEqual(value["head_sha"], "a" * 40)
+            records = value["inventory_artifacts"] + value["hook_logs"]
+            self.assertEqual({record["path"] for record in records}, set(contents))
+            for record in records:
+                self.assertEqual(record["sha256"], hashlib.sha256(contents[record["path"]]).hexdigest())
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(output.read_bytes(), first)
+            (root / "hooks/candle-cuda-starvector-8b.log").unlink()
+            failed = subprocess.run(command, check=False, capture_output=True, text=True, encoding="utf-8")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("required non-empty regular file is missing", failed.stderr)
 
     def test_schema_and_corpus_bind_all_required_counts_and_boundary(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))

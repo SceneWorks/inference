@@ -14,6 +14,7 @@
 //! (story 7169) slots in behind without touching decoders.
 
 pub mod attention;
+pub mod coherence;
 pub mod gated_delta;
 pub mod kv_cache;
 pub mod nn;
@@ -25,6 +26,7 @@ pub mod sampler;
 pub mod weights;
 
 pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_mask, AttnMask};
+pub use coherence::verify_gpu_view;
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };

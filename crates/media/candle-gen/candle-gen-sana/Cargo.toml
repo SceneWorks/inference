@@ -36,6 +36,10 @@ tempfile = { workspace = true }
 # pre-downloaded snapshot dir (--snapshot / SANA_SNAPSHOT); inference never self-fetches (epic 13657).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Shared memory-contract conformance assertions (epic SC-22657): the architecture-facts honesty
+# rules live once in gen-core-testkit, so this crate's published axes are checked by the same gate
+# every other adopting provider runs.
+sceneworks-gen-core-testkit = { workspace = true }
 # sc-16959 preview provenance: hash each snapshot's `vae/` file and walk the two DC-AE containers
 # tensor by tensor. Base and Sprint reuse two DIFFERENT epic-16624 fits, and the two autoencoders are
 # the same architecture at exactly the same byte size — so the reuse is grounded in tensor bytes

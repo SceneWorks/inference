@@ -26,8 +26,10 @@ pub struct StarCoder2Config {
 }
 
 impl StarCoder2Config {
+    /// The published config records the 49,152-token base vocabulary, but the checkpoint adds five
+    /// StarVector tokens and resizes its tied embedding/head to 49,157 rows.
     pub const STARVECTOR_8B: Self = Self {
-        vocab_size: 49_152,
+        vocab_size: 49_157,
         hidden_size: 4_608,
         intermediate_size: 18_432,
         layers: 32,
@@ -57,13 +59,21 @@ impl StarCoder2 {
         let dtype = crate::device::compute_dtype(w.device());
         let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
         let key = |suffix: &str| join(prefix, suffix);
+        let embed_tokens = req(key("model.embed_tokens.weight"))?;
+        let expected_embedding_shape = [cfg.vocab_size, cfg.hidden_size];
+        if embed_tokens.dims() != expected_embedding_shape {
+            return Err(crate::error::Error::Config(format!(
+                "StarCoder2 tied embedding/head must be {expected_embedding_shape:?}, got {:?}",
+                embed_tokens.dims()
+            )));
+        }
         let layers = (0..cfg.layers)
             .map(|index| {
                 StarCoder2Layer::from_weights(w, &key(&format!("model.layers.{index}")), cfg, dtype)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            embed_tokens: req(key("model.embed_tokens.weight"))?,
+            embed_tokens,
             layers,
             final_norm_weight: req(key("model.norm.weight"))?,
             final_norm_bias: req(key("model.norm.bias"))?,
@@ -414,5 +424,41 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn starvector_8b_runtime_vocab_includes_checkpoint_added_tokens() {
+        assert_eq!(StarCoder2Config::STARVECTOR_8B.vocab_size, 49_157);
+    }
+
+    #[test]
+    fn rejects_tied_embedding_shape_that_disagrees_with_runtime_vocab() {
+        let cfg = StarCoder2Config {
+            vocab_size: 3,
+            hidden_size: 4,
+            intermediate_size: 8,
+            layers: 1,
+            heads: 2,
+            kv_heads: 1,
+            rope_theta: 10_000.0,
+            layer_norm_eps: 1e-5,
+        };
+        let mut map = HashMap::new();
+        put(
+            &mut map,
+            "fixture.model.embed_tokens.weight",
+            vec![0.; 16],
+            (4, 4),
+        );
+        let error =
+            match StarCoder2::from_weights(&Weights::from_map(map, Device::Cpu), "fixture", cfg) {
+                Ok(_) => panic!("mismatched tied embedding/head shape must fail closed"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            crate::error::Error::Config(message)
+                if message.contains("must be [3, 4]") && message.contains("got [4, 4]")
+        ));
     }
 }

@@ -814,8 +814,15 @@ mod tests {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             let mut m = std::collections::HashMap::new();
+            // The VAE is priced over the decode half `vae::load_vae` reads, so the fixture's one
+            // tensor must live in that namespace.
+            let key = if relative == loader::VAE_FILE {
+                "decoder.head.2.weight"
+            } else {
+                "x.weight"
+            };
             m.insert(
-                "x.weight".to_string(),
+                key.to_string(),
                 Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
             );
             candle_gen::candle_core::safetensors::save(&m, &path).unwrap();

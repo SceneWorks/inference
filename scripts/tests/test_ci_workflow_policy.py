@@ -1606,6 +1606,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('"campaign-manifest.json"', campaign)
         self.assertIn('"campaign-public-readback.json"', campaign)
         self.assertIn("attempt${{ github.run_attempt }}", campaign)
+        self.assertNotIn("dtolnay/rust-toolchain@", campaign)
+        self.assertIn("rustup toolchain install 1.96.0 --profile minimal", campaign)
+        self.assertIn("rustup override set 1.96.0", campaign)
+        self.assertIn("$rustc -notmatch '^rustc 1\\.96\\.0 '", campaign)
 
         for retired in ("inputs.campaign_manifest", "inputs.evidence_root", "inputs.promotion_input", "inputs.output_dir"):
             self.assertNotIn(retired, promotion)

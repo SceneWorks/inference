@@ -1096,7 +1096,7 @@ impl Qwen35Model {
         }
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
-        Ok(Self {
+        let model = Self {
             embed_tokens,
             layers,
             norm,
@@ -1105,7 +1105,9 @@ impl Qwen35Model {
             eps,
             cfg,
             quantized: quant.is_some() || saw_stored.get(),
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 }
 

@@ -207,6 +207,12 @@ pub mod cuda_arch;
 pub mod block_window;
 pub use block_window::BlockPlan;
 
+// Snapshot-read architecture axes shared by every provider's `MemoryArchitectureFacts` (epic
+// SC-22657, E2). The honesty rules — no zero-valued axis, no scale invented from a stage count no
+// VAE could ship, a missing config that is absent rather than an error — live here once instead of
+// being re-derived in twenty provider crates.
+pub mod architecture_facts;
+
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, and GPU
 // peak-VRAM helpers that had been hand-copied — and had drifted — across ~16 `#[cfg(test)]`
 // validation modules in the provider crates. Weight snapshots are not resolved here: inference never

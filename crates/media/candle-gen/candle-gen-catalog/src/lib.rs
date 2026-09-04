@@ -2290,6 +2290,24 @@ mod preview_advertising {
         ModuleTree { shipped, test_only }
     }
 
+    /// Whether one source file declares a `#[test] fn architecture_facts_*`.
+    ///
+    /// Deliberately reads the raw file rather than a stripped module tree: the declaration lives
+    /// inside `#[cfg(test)]`, which the shipped-code scan removes by design. Requiring the `#[test]`
+    /// attribute between the previous item and the name is what keeps a plain helper named
+    /// `architecture_facts_for(...)` from passing for a test that runs.
+    fn has_architecture_facts_test(path: &Path) -> bool {
+        let source = std::fs::read_to_string(path).unwrap_or_default();
+        source
+            .match_indices("fn architecture_facts_")
+            .any(|(index, _)| {
+                let window = &source[index.saturating_sub(200)..index];
+                window
+                    .rfind("#[test]")
+                    .is_some_and(|attribute| !window[attribute..].contains(" fn "))
+            })
+    }
+
     /// Every `.rs` file under `dir`, in a deterministic order.
     fn rust_sources(dir: &Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -3562,6 +3580,8 @@ mod preview_advertising {
         // --- What the sources say ------------------------------------------------------------
         let mut owns_memory_route = BTreeSet::new();
         let mut publishes_surfaces = BTreeSet::new();
+        let mut derives_architecture_facts = BTreeSet::new();
+        let mut tests_architecture_facts = BTreeSet::new();
         let mut crate_dirs: Vec<String> = std::fs::read_dir(candle_gen_root())
             .expect("crates/media/candle-gen is readable")
             .map(|entry| entry.expect("readable directory entry").path())
@@ -3591,10 +3611,49 @@ mod preview_advertising {
             if code.contains("fn register_memory_contract_surfaces") {
                 publishes_surfaces.insert(dir.clone());
             }
+            // The derivation itself is shipped code, so the stripped tree is the right source: a
+            // crate that only *mentions* `architecture_facts` in prose does not enrol.
+            if code.contains("fn architecture_facts") {
+                derives_architecture_facts.insert(dir.clone());
+            }
+            // Its test is not shipped code, so this reads the raw files — and requires the `#[test]`
+            // attribute right in front of the name, so a helper called `architecture_facts_for`
+            // cannot stand in for a test that runs.
+            if rust_sources(&src)
+                .iter()
+                .any(|path| has_architecture_facts_test(path))
+            {
+                tests_architecture_facts.insert(dir.clone());
+            }
         }
         assert!(
             !owns_memory_route.is_empty(),
             "no crate registers a memory route; the table comparison below would be vacuous"
+        );
+
+        // --- ...and every one of them must derive and test its architecture facts -------------
+        //
+        // AC (sc-22661 / epic SC-22657 E2). The registry-wide surface walk cannot see this: it
+        // requires `MemoryArchitectureFacts::default()` on every Candle weights-free surface, which
+        // is exactly what a crate with no derivation at all publishes. Scanning the sources instead
+        // catches the crate that never wrote one — and, because `catalog_ids == expected_ids` below
+        // pins `owns_memory_route` to precisely the crates behind the catalog's
+        // `memory_strategy_registrations()`, this is that provider set stated in crate terms.
+        assert_eq!(
+            owns_memory_route
+                .difference(&derives_architecture_facts)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            "every crate contributing a memory registration must derive its architecture facts \
+             (`fn architecture_facts`); these contribute one and derive nothing"
+        );
+        assert_eq!(
+            owns_memory_route
+                .difference(&tests_architecture_facts)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            "every crate contributing a memory registration must own a `#[test] fn \
+             architecture_facts_*` over that derivation; these derive facts nothing asserts"
         );
 
         // --- The wiring table must match them ------------------------------------------------
@@ -5067,6 +5126,162 @@ mod tests {
             );
         }
     }
+
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every registered contract surface in the composed media
+    /// catalog publishes an honest byte decomposition and no fabricated architecture axis.
+    ///
+    /// This is the registry-wide half of the story's acceptance test. The surfaces are built
+    /// **weights-free** — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so every provider here
+    /// lands on the walk's Candle arm: `check_memory_contract_asset_facts` is the byte half that
+    /// must hold, and `MemoryArchitectureFacts::default()` is the required E2 state. That second
+    /// rule catches the converse defect — a provider that published an architecture axis on a
+    /// contract built with nothing to read would have hardcoded it from its own provider id.
+    ///
+    /// It cannot, on its own, catch a provider that derives *nothing* — `default()` is exactly what
+    /// that provider publishes here too. `every_materializable_provider_derives_geometry_from_a_snapshot_root`
+    /// is the arm that does, and the two run over the same composed registry.
+    ///
+    /// `runtime-cuda` runs this walk over the CUDA bundle's registry; this one keeps the
+    /// composition root itself covered on a lane that needs no accelerator.
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        // Non-vacuous: the walk must have had surfaces to reject.
+        assert!(
+            !registry.memory_contract_surfaces().unwrap().is_empty(),
+            "the composed catalog must publish contract surfaces for the facts walk to check"
+        );
+    }
+
+    /// The providers whose admission accepts a synthetic snapshot root, and which must therefore
+    /// derive at least one architecture axis from it (sc-22661).
+    ///
+    /// This is the non-vacuous half of the E2 story. A provider that returned
+    /// `MemoryArchitectureFacts::default()` unconditionally satisfies every weights-free assertion
+    /// in `every_registered_contract_surface_publishes_honest_facts` — that walk *requires*
+    /// `default()` on the Candle arm — so only rebuilding the contract against a materialized root
+    /// can separate "derives nothing" from "has nothing to derive yet". Reverting any one of these
+    /// crates' `architecture_facts` to `::default()` turns the assertion below red.
+    ///
+    /// The catalog's remaining providers are absent for one reason in four shapes, each a
+    /// *pre-existing admission rule* rather than anything about facts: the route demands an exact
+    /// resolved catalog route (chroma, sd3, sdxl, qwen-image-edit), an exact immutable turnkey
+    /// repo/revision (boogu, sana, ideogram, kolors' base tier), a specific tier subdirectory or
+    /// component file on disk (scail2's `dit.safetensors`, ltx-2.5's video VAE, anima's
+    /// `diffusion_models/`, sensenova's shards, svd's unquantized surface, ltx-2.3's plain split q4
+    /// tier), or a whole snapshot layout to walk (krea, bernini, qwen-image). Standing those up is
+    /// building each provider's own load fixture — which is exactly what each crate's own
+    /// `architecture_facts_*` test does, and which `every_memory_route_crate_reaches_the_catalog`
+    /// proves every memory-route crate has.
+    const MATERIALIZED_ROOT_PROVIDERS: &[&str] = &[
+        "candle_kolors_control",
+        "candle_kolors_ipadapter",
+        "flux1_dev",
+        "flux1_schnell",
+        "flux2_dev",
+        "flux2_klein_9b",
+        "krea_2_turbo_control",
+        "lens",
+        "lens_turbo",
+        "mage_flow",
+        "mage_flow_base",
+        "mage_flow_edit",
+        "mage_flow_edit_base",
+        "mage_flow_edit_turbo",
+        "mage_flow_turbo",
+        "minimax_h3",
+        "z_image",
+        "z_image_control",
+        "z_image_turbo",
+        "z_image_turbo_control",
+    ];
+
+    /// AC (sc-22661 / epic SC-22657 E2): the registry-level walk is non-vacuous. Every provider
+    /// that can be handed a materialized snapshot root must derive geometry from it — the assertion
+    /// an unconditional `MemoryArchitectureFacts::default()` fails, and the one the weights-free
+    /// walk structurally cannot make.
+    #[test]
+    fn every_materializable_provider_derives_geometry_from_a_snapshot_root() {
+        use std::collections::BTreeSet;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = synthetic_snapshot_root(tmp.path());
+        let expected = MATERIALIZED_ROOT_PROVIDERS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expected.len(),
+            MATERIALIZED_ROOT_PROVIDERS.len(),
+            "the materialized-root list must not repeat a provider"
+        );
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let registered = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            expected.is_subset(&registered),
+            "the materialized-root list names providers this catalog does not register: {:?}",
+            expected.difference(&registered).collect::<Vec<_>>()
+        );
+
+        let lookup = |provider_id: &str| expected.contains(provider_id).then(|| root.clone());
+        let coverage = gen_core_testkit::memory_contract_surface_registry_facts_conformance(
+            &registry,
+            Some(&lookup),
+        );
+        assert_eq!(
+            coverage.materialized_providers_checked,
+            MATERIALIZED_ROOT_PROVIDERS.len(),
+            "every listed provider must have been rebuilt against the synthetic root"
+        );
+    }
+
+    /// A synthetic snapshot root carrying the component layouts and config keys the catalog's
+    /// providers read.
+    fn synthetic_snapshot_root(base: &std::path::Path) -> std::path::PathBuf {
+        let root = base.join("sc22661-synthetic-snapshot");
+        for (component, config) in SYNTHETIC_COMPONENT_CONFIGS {
+            let dir = if component.is_empty() {
+                root.clone()
+            } else {
+                root.join(component)
+            };
+            std::fs::create_dir_all(&dir).expect("synthetic component dir");
+            std::fs::write(dir.join("config.json"), config).expect("synthetic component config");
+        }
+        root
+    }
+
+    const SYNTHETIC_COMPONENT_CONFIGS: &[(&str, &str)] = &[
+        (
+            "",
+            r#"{"patch_size": 2, "llm_config": {"hidden_size": 4096, "num_hidden_layers": 32,
+                "num_attention_heads": 32, "head_dim": 128}}"#,
+        ),
+        (
+            "transformer",
+            r#"{"in_channels": 64, "out_channels": 64, "hidden_size": 3072, "num_heads": 24,
+                "num_attention_heads": 24, "attention_head_dim": 128, "depth": 12,
+                "num_layers": 19, "num_single_layers": 38, "patch_size": 2, "caption_channels": 2304,
+                "num_key_value_heads": 8, "cross_attention_dim": 2048, "context_in_dim": 2560,
+                "axes_dim": [16, 56, 56], "checkpoint": false}"#,
+        ),
+        (
+            "unet",
+            r#"{"in_channels": 4, "block_out_channels": [320, 640, 1280],
+                "attention_head_dim": [5, 10, 20], "layers_per_block": 2, "num_attention_heads": 20}"#,
+        ),
+        (
+            "vae",
+            r#"{"latent_channels": 16, "z_channels": 16, "block_out_channels": [128, 256, 512, 512],
+                "scale_factor_spatial": 8, "temperal_downsample": [false, true, true],
+                "patch_size": [1, 2, 2], "dim_mult": [1, 2, 4, 4]}"#,
+        ),
+    ];
 
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {

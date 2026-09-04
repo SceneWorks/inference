@@ -275,6 +275,42 @@ fn memory_strategy_contract_with_asset_facts(
     )
 }
 
+/// Pixels per latent unit on each spatial axis — the four-stage Qwen-Image autoencoder, whose
+/// declared tiling geometry (`VaeTiling::QWEN_IMAGE`) pins the same x8.
+const VAE_SPATIAL_SCALE: u32 = 8;
+
+/// Architecture axes for one registered Qwen-Image route (epic SC-22657, E2).
+///
+/// This crate mirrors the reference `transformer/config.json` as
+/// [`QwenTransformerConfig`](crate::transformer::QwenTransformerConfig); the edit variant differs
+/// only by the `zero_cond_t` modulation flag, so all three routes publish the same shape. The
+/// control route adds a five-block branch beside the trunk — an overlay, not a change to the trunk's
+/// own depth — so `transformer_blocks` stays the base `num_layers`.
+///
+/// `latent_channels` is the DiT's `out_channels`, which is what the decoder consumes;
+/// `in_channels` is the *packed* width (`out_channels * patch²`) and would overstate the axis by 4x.
+///
+/// `vae_temporal_scale` stays `None`: Qwen-Image decodes a singleton frame through an image
+/// autoencoder, and a structurally absent axis is declared absent, never zero.
+fn architecture_facts(provider_id: &str) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let dit = if provider_id == "qwen_image_edit" {
+        crate::transformer::QwenTransformerConfig::qwen_image_edit()
+    } else {
+        crate::transformer::QwenTransformerConfig::qwen_image()
+    };
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(dit.out_channels),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(VAE_SPATIAL_SCALE),
+        vae_temporal_scale: None,
+        // The pipeline casts the text embeddings and drives the DiT at `Dtype::Bfloat16`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn contract_with_asset_facts_and_streamability(
     provider_id: &str,
@@ -300,6 +336,7 @@ fn contract_with_asset_facts_and_streamability(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(provider_id);
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -661,6 +698,46 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         assert!(projected_component_bytes(&root.join("transformer"), spec.quantize).is_err());
         assert!(weights_free_memory_strategy_contract("qwen_image", &spec).is_ok());
+    }
+
+    /// AC (SC-22662): every registered Qwen-Image route publishes the axes of the trunk it runs,
+    /// derived from this crate's own transformer config, and passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(24),
+            head_dim: Some(128),
+            transformer_blocks: Some(60),
+            patch_size: Some(2),
+            // `out_channels`, the decoder-side width; `in_channels` 64 is the 2x2-packed view.
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+        for provider_id in ["qwen_image", "qwen_image_edit", "qwen_image_control"] {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec(&tmp)).unwrap();
+            assert_eq!(
+                contract.architecture_facts, expected,
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The packed DiT input width the loader consumes is exactly `latent x patch²`, so the two
+        // published axes cannot drift apart from the config they came from.
+        let dit = crate::transformer::QwenTransformerConfig::qwen_image();
+        assert_eq!(
+            dit.out_channels * dit.patch_size * dit.patch_size,
+            dit.in_channels
+        );
+        // The constant's doc claims it is the same x8 `VaeTiling::QWEN_IMAGE` pins; assert that pin
+        // rather than leaving the two free to drift.
+        assert_eq!(
+            VAE_SPATIAL_SCALE,
+            mlx_gen::gen_core::tiling::VaeTiling::QWEN_IMAGE.spatial_scale as u32
+        );
     }
 
     #[test]

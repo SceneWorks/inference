@@ -42,6 +42,63 @@ use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
 use crate::primitives::{repeat_kv, ContiguousKvCache, PagedKvCache, Weights};
 
+fn dense_tensor(
+    w: &Weights,
+    key: &str,
+    dtype: DType,
+    target_device: Option<&Device>,
+) -> Result<Tensor> {
+    let source = w.require(key)?;
+    if source.dtype() == DType::U32 {
+        return Err(Error::Config(format!(
+            "packed U32 tensor `{key}` cannot be interpreted as a dense weight; its affine .scales/.biases sidecars are missing or this packed layout is unsupported"
+        )));
+    }
+    let target = target_device.unwrap_or_else(|| source.device());
+    Ok(source.to_device(target)?.to_dtype(dtype)?)
+}
+
+fn projection_from_weights(
+    w: &Weights,
+    wkey: &str,
+    with_bias: bool,
+    dtype: DType,
+    quant: Option<QuantSpec>,
+    target_device: Option<&Device>,
+) -> Result<Projection> {
+    let stem = wkey.strip_suffix(".weight").unwrap_or(wkey);
+    let scales_key = format!("{stem}.scales");
+    let source = w.require(wkey)?;
+    let target = target_device.unwrap_or_else(|| source.device());
+    let bias = if with_bias {
+        let bias_key = format!("{stem}.bias");
+        w.contains(&bias_key)
+            .then(|| dense_tensor(w, &bias_key, dtype, Some(target)))
+            .transpose()?
+    } else {
+        None
+    };
+
+    if w.contains(&scales_key) {
+        let quant = quant.ok_or_else(|| {
+            Error::Config(format!(
+                "packed projection `{stem}` has affine sidecars but the model config has no quantization block"
+            ))
+        })?;
+        let biases_key = format!("{stem}.biases");
+        Projection::load_mlx_affine_q8(
+            source,
+            w.require(&scales_key)?,
+            w.require(&biases_key)?,
+            bias,
+            quant,
+            target,
+        )
+    } else {
+        Projection::load_with_bias(dense_tensor(w, wkey, dtype, Some(target))?, bias, quant)
+    }
+}
+
 /// A loaded causal decoder.
 pub struct CausalLm {
     embed_tokens: Tensor,
@@ -90,6 +147,22 @@ impl CausalLm {
         Self::from_weights_dtype(w, prefix, cfg, quant, compute_dtype(w.device()))
     }
 
+    /// Build from host-staged weights while materializing the resulting decoder on `device`.
+    ///
+    /// Packed MLX-affine checkpoints use this path so their source triples never occupy device
+    /// memory alongside the resident QTensor representation. Dense tensors are copied to `device`
+    /// once as they are installed; packed triples remain on their source device (normally CPU) and
+    /// are repacked directly onto `device`.
+    pub fn from_weights_on_device(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::from_weights_dtype_impl(w, prefix, cfg, quant, compute_dtype(device), Some(device))
+    }
+
     /// Like [`CausalLm::from_weights_with`] but with an explicit dense compute `dtype` — the
     /// f16-vs-bf16 knob for CUDA dtype perf tuning (story 7263). Dequantized projections accumulate in
     /// this dtype too. Passing a dtype the backend can't run (e.g. f16 on CPU) surfaces at forward time.
@@ -100,7 +173,18 @@ impl CausalLm {
         quant: Option<QuantSpec>,
         dtype: DType,
     ) -> Result<Self> {
-        let device = w.device().clone();
+        Self::from_weights_dtype_impl(w, prefix, cfg, quant, dtype, None)
+    }
+
+    fn from_weights_dtype_impl(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+        dtype: DType,
+        target_device: Option<&Device>,
+    ) -> Result<Self> {
+        let device = target_device.cloned().unwrap_or_else(|| w.device().clone());
         // The Qwen3-VL VLM wrapper nests the decoder under `model.language_model.*` (embeddings,
         // norm, `layers.{i}.*`) with the untied `lm_head.weight` at the checkpoint root; a plain
         // `*ForCausalLM` keeps the historical `[{prefix}.]model.*` / `[{prefix}.]lm_head.weight`
@@ -120,19 +204,14 @@ impl CausalLm {
             join(prefix, "model")
         };
         let p = |suffix: &str| join(&decoder_root, suffix);
-        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
-        let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
+        let proj = |key: String| -> Result<Projection> {
+            projection_from_weights(w, &key, false, dtype, quant, target_device)
+        };
         // Like `proj`, but also loads a sibling `.bias` when present (Qwen2 attention carries q/k/v
         // bias; Llama / Qwen3 / Phi-3 do not).
-        let proj_b = |wkey: String| -> Result<Projection> {
-            let stem = wkey.strip_suffix(".weight").unwrap_or(&wkey);
-            let bkey = format!("{stem}.bias");
-            let bias = if w.contains(&bkey) {
-                Some(req(bkey)?)
-            } else {
-                None
-            };
-            Projection::load_with_bias(req(wkey)?, bias, quant)
+        let proj_b = |key: String| -> Result<Projection> {
+            projection_from_weights(w, &key, true, dtype, quant, target_device)
         };
         // **Gemma-2's** norms are `(1 + weight)`; fold the +1 into the stored weight so the standard
         // `rms_norm` applies it. (Llama / Qwen3 norm weights are used verbatim — and so are
@@ -204,7 +283,14 @@ impl CausalLm {
             // Attention: Multi-head Latent Attention (DeepSeek-V2) or grouped-query attention. MLA's
             // low-rank q/kv projections are wholly distinct from GQA's q/k/v, so it is its own path.
             let attn = if cfg.architecture.is_mla() {
-                Attention::Mla(MlaAttention::load(w, lp, &cfg, dtype, quant)?)
+                Attention::Mla(MlaAttention::load(
+                    w,
+                    lp,
+                    &cfg,
+                    dtype,
+                    quant,
+                    target_device,
+                )?)
             } else {
                 let q_norm = qk_norm
                     .then(|| req(lp("self_attn.q_norm.weight")))
@@ -222,6 +308,12 @@ impl CausalLm {
                 let (q, kv) = {
                     let packed = lp("self_attn.qkv_proj.weight");
                     if w.contains(&packed) {
+                        let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
+                        if w.contains(&format!("{stem}.scales")) {
+                            return Err(Error::Config(format!(
+                                "packed fused projection `{stem}` cannot be split safely; provide separate q_proj/k_proj/v_proj tensors"
+                            )));
+                        }
                         let qkv = req(packed)?; // [qd + 2*kvd, hidden]
                         (
                             Projection::load(qkv.narrow(0, 0, qd)?.contiguous()?, quant)?,
@@ -327,6 +419,12 @@ impl CausalLm {
                 let (gate, up) = {
                     let packed = lp("mlp.gate_up_proj.weight");
                     if w.contains(&packed) {
+                        let stem = packed.strip_suffix(".weight").unwrap_or(&packed);
+                        if w.contains(&format!("{stem}.scales")) {
+                            return Err(Error::Config(format!(
+                                "packed fused projection `{stem}` cannot be split safely; provide separate gate_proj/up_proj tensors"
+                            )));
+                        }
                         let gu = req(packed)?; // [2*inter, hidden]
                         (
                             Projection::load(gu.narrow(0, 0, inter)?.contiguous()?, quant)?,
@@ -1794,12 +1892,15 @@ impl MlaAttention {
         cfg: &ModelConfig,
         dtype: DType,
         quant: Option<QuantSpec>,
+        target_device: Option<&Device>,
     ) -> Result<Self> {
         let mla = cfg.mla.ok_or_else(|| {
             Error::Config("DeepSeek-V2 config missing integer `kv_lora_rank`".into())
         })?;
-        let req = |key: String| -> Result<Tensor> { Ok(w.require(&key)?.to_dtype(dtype)?) };
-        let proj = |key: String| -> Result<Projection> { Projection::load(req(key)?, quant) };
+        let req = |key: String| -> Result<Tensor> { dense_tensor(w, &key, dtype, target_device) };
+        let proj = |key: String| -> Result<Projection> {
+            projection_from_weights(w, &key, false, dtype, quant, target_device)
+        };
 
         // Query: a low-rank `q_a → norm → q_b` when the model has a query LoRA, else a full `q_proj`.
         let (q_proj, q_a_proj, q_a_layernorm, q_b_proj) =

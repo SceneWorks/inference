@@ -106,7 +106,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
             audio_lane(),
         )
@@ -119,7 +119,7 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
             PLATFORM,
             BACKEND,
             media_registry(),
-            candle_llm::text_registry(),
+            candle_llm::cuda_text_registry(),
             candle_llm::snapshot_preparer_registry(),
         )
     }
@@ -127,6 +127,34 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every generator registered in the CUDA bundle publishes
+    /// a contract surface whose byte decomposition is honest and whose architecture axes are not
+    /// fabricated.
+    ///
+    /// This is the epic's registry-wide acceptance skeleton on the shipped CUDA registry. Surfaces
+    /// are built weights-free — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so every provider here
+    /// lands on the walk's Candle arm, where `MemoryArchitectureFacts::default()` is the required
+    /// state and an axis declared with no component config to read was inferred from the provider
+    /// id.
+    ///
+    /// The walk's **materialized** arm is deliberately not driven here: it needs a per-provider
+    /// snapshot fixture, `candle-gen-catalog` owns those and runs that half over the same
+    /// composition on a lane that needs no accelerator. This bundle's job is to prove the *shipped
+    /// CUDA* set is composed and honest, not to rebuild fixtures.
+    #[cfg(feature = "media")]
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry()
+            .expect("the CUDA bundle composes a contract-surface registry");
+        let coverage =
+            gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        assert!(
+            coverage.surfaces_checked > 0,
+            "the CUDA bundle must publish contract surfaces for the facts walk to check"
+        );
+    }
+
     #[cfg(feature = "media")]
     #[test]
     fn bundle_exposes_engine_id_vae_geometry() {
@@ -165,7 +193,12 @@ mod tests {
         assert!(snapshot.generator_ids.is_empty());
         assert_eq!(
             snapshot.text_llm_ids,
-            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b",
+            ]
         );
         assert_eq!(snapshot.snapshot_preparer_backends, ["candle"]);
         // The audio lane is Candle-native (sc-12901) and matches this bundle's own backend. Its
@@ -275,7 +308,7 @@ mod tests {
             super::PLATFORM,
             super::BACKEND,
             super::media_registry(),
-            super::llm::text_registry(),
+            super::llm::cuda_text_registry(),
             super::llm::snapshot_preparer_registry(),
             runtime_catalog::AudioLane {
                 backend: super::AUDIO_BACKEND,
