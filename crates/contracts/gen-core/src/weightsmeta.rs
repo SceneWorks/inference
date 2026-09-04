@@ -177,6 +177,28 @@ pub fn is_hidden_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// The hidden directory Candle writes its content-addressed **device-format weight cache** into,
+/// beside the source component it was derived from (`<component>/.candle-device-format-v1/`,
+/// SC-16096). Every packed q4/q8 component that has ever been opened for block streaming carries
+/// one, holding a GGML `*.q4_1.safetensors` / `*.q8_0.safetensors` sidecar per projection —
+/// **derived** bytes of the same tensors the source file already stores, never a second component.
+///
+/// Owned here rather than in candle-gen so the tensor-free walkers below
+/// ([`safetensors_dir_bytes`], [`safetensors_path_tensor_headers`]) and the writer agree on the
+/// name by construction: the cache lives inside the component tree those walkers recurse, and
+/// summing it alongside the source file it was derived from priced the Z-Image q4 transformer at
+/// 2.1x its loaded size (SC-22667, E1).
+pub const CANDLE_DEVICE_FORMAT_CACHE_DIR: &str = ".candle-device-format-v1";
+
+/// Whether a directory entry is a **hidden directory** the weight walkers must not descend into:
+/// the Candle device-format cache ([`CANDLE_DEVICE_FORMAT_CACHE_DIR`]) and any other dot-directory
+/// (`.cache`, `.locks`, `.git`). A snapshot's component tree never names a component with a leading
+/// dot, so nothing a loader opens as a shard lives under one; what does live there is derived or
+/// bookkeeping data whose `.safetensors` files would double-count the source they were made from.
+pub fn is_hidden_dir(path: &Path) -> bool {
+    is_hidden_file(path)
+}
+
 /// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
 /// no whole-file buffer.
 ///
@@ -460,8 +482,9 @@ impl SafetensorsTensorHeader {
 /// Read tensor shapes/dtypes/byte ranges from one safetensors file or one recursively sharded
 /// directory without reading tensor data. Directory duplicate-key semantics match
 /// [`CheckpointMeta::from_dir`]: files are sorted and the later shard wins. File symlinks are
-/// followed (as required by the Hugging Face cache), directory symlinks are skipped, and malformed
-/// or unreadable trees fail closed instead of silently producing partial facts.
+/// followed (as required by the Hugging Face cache), directory symlinks and hidden directories
+/// ([`is_hidden_dir`] — the Candle device-format cache) are skipped, and malformed or unreadable
+/// trees fail closed instead of silently producing partial facts.
 pub fn safetensors_path_tensor_headers(
     path: impl AsRef<Path>,
 ) -> Result<Vec<SafetensorsTensorHeader>> {
@@ -479,7 +502,11 @@ pub fn safetensors_path_tensor_headers(
             let path = entry.path();
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                collect_files(&path, files)?;
+                // Same rule as `safetensors_dir_bytes`: a hidden directory is derived data (the
+                // Candle device-format cache) or bookkeeping, never a shard the loader opens.
+                if !is_hidden_dir(&path) {
+                    collect_files(&path, files)?;
+                }
                 continue;
             }
             let metadata = std::fs::metadata(&path)?;
@@ -791,7 +818,10 @@ pub fn read_safetensors_tensor_payloads(
 /// File symlinks are followed (the HF cache stores each shard as a symlink into `blobs/`), while
 /// directory symlinks are skipped to prevent a malformed snapshot from creating a recursive cycle.
 /// AppleDouble `._*` sidecars and other hidden entries are skipped ([`is_hidden_file`]) — a
-/// `._model.safetensors` masquerades as a shard and would double-count. Returns `0` when `dir` is
+/// `._model.safetensors` masquerades as a shard and would double-count. Hidden **directories** are
+/// skipped for the same reason ([`is_hidden_dir`]): the Candle device-format cache
+/// ([`CANDLE_DEVICE_FORMAT_CACHE_DIR`]) sits inside the component it was derived from and holds a
+/// GGML copy of every packed projection the sibling source file already stores. Returns `0` when `dir` is
 /// missing or holds no weights, so an absent component contributes nothing. This is the same
 /// accounting the worker's whole-model sum uses, so a component's bytes and the whole-model total
 /// stay directly comparable (`rest = total − text_encoder`).
@@ -808,7 +838,11 @@ pub fn safetensors_dir_bytes(dir: impl AsRef<Path>) -> u64 {
                 continue;
             };
             if file_type.is_dir() {
-                walk(&path, total);
+                // A hidden directory is never a component: it is the Candle device-format cache
+                // (derived copies of the sibling source file) or snapshot bookkeeping.
+                if !is_hidden_dir(&path) {
+                    walk(&path, total);
+                }
                 continue;
             }
             let Ok(meta) = std::fs::metadata(&path) else {
@@ -2277,6 +2311,67 @@ mod tests {
         assert_eq!(safetensors_dir_bytes(root.join("transformer")), 2000);
         // Missing dir ⇒ 0 (no signal).
         assert_eq!(safetensors_dir_bytes(root.join("nope")), 0);
+    }
+
+    /// SC-22667 (epic SC-22657, E1): a packed component that has been opened for block streaming
+    /// carries `.candle-device-format-v1/` beside its source file, holding a GGML copy of every
+    /// packed projection. Both tensor-free walkers must price the **source** alone — summing the
+    /// cache too priced the Z-Image q4 transformer at 7.31 GB against a 3.47 GB checkpoint.
+    #[test]
+    fn weight_walkers_skip_the_candle_device_format_cache_beside_the_source_file() {
+        let tmp = fixture_dir("gencore_devfmt_cache_");
+        let transformer = tmp.path().join("transformer");
+        let cache = transformer.join(CANDLE_DEVICE_FORMAT_CACHE_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        write_single_tensor_file(&transformer.join("model.safetensors"), "layers.0.w", 3000);
+        write_single_tensor_file(
+            &cache.join(
+                "0104af902ed702222b65c9b031dfe9f905e5335d7c1a624200a66e2ea7718102.q4_1.safetensors",
+            ),
+            "weight",
+            4000,
+        );
+        write_single_tensor_file(
+            &cache.join("3b0cf731d8d1de876e28323e1463c44.q8_0.safetensors"),
+            "weight",
+            500,
+        );
+        // Sanity: the cache really is populated, so the assertions below are not vacuous.
+        assert!(safetensors_dir_bytes(&cache) > 4500);
+
+        let source_len = std::fs::metadata(transformer.join("model.safetensors"))
+            .unwrap()
+            .len();
+        assert_eq!(safetensors_dir_bytes(&transformer), source_len);
+        assert_eq!(safetensors_path_bytes(&transformer), source_len);
+        let headers = safetensors_path_tensor_headers(&transformer).unwrap();
+        assert_eq!(
+            headers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["layers.0.w"],
+            "the cache's `weight` payloads must not enter the header inventory"
+        );
+        // A legitimately nested (non-hidden) shard directory still counts.
+        let nested = transformer.join("shards");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_single_tensor_file(&nested.join("part.safetensors"), "layers.1.w", 100);
+        assert!(safetensors_dir_bytes(&transformer) > source_len);
+        assert!(is_hidden_dir(&cache));
+        assert!(!is_hidden_dir(&nested));
+    }
+
+    /// One U8 tensor of `bytes` payload bytes, so a walker that reads headers sees a real shard.
+    fn write_single_tensor_file(path: &Path, name: &str, bytes: usize) {
+        let header = format!(
+            r#"{{"{name}":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#
+        );
+        let mut header = header.into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend(vec![0_u8; bytes]);
+        std::fs::write(path, file).unwrap();
     }
 
     #[cfg(unix)]
