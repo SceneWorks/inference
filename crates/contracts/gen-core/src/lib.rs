@@ -232,7 +232,7 @@ pub use weightsmeta::{
     safetensors_dir_bytes, safetensors_file_metadata, safetensors_file_tensor_locations,
     safetensors_path_bytes, safetensors_path_quantization_metadata,
     safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
-    SafetensorsTensorLocation,
+    SafetensorsTensorLocation, CANDLE_DEVICE_FORMAT_CACHE_DIR,
 };
 // The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
 // candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the

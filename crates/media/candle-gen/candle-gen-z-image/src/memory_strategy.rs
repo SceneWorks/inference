@@ -12,8 +12,9 @@ use candle_gen::gen_core::{
 use candle_gen::gen_core::{
     LoadShape, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
     MemoryFormulaKind, MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges,
-    MemoryPrerequisiteScope, MemoryStrategyCapability, MemoryStrategyPrerequisite,
-    MemoryStrategySupport, MemoryWindowMaterialization, PerComponentBytes,
+    MemoryPrerequisiteScope, MemoryResidentComponent, MemoryStrategyCapability,
+    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
+    PerComponentBytes,
 };
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::VaeConfig;
@@ -52,6 +53,17 @@ pub(crate) const CALIBRATION_FINGERPRINT: &str =
 /// Provider-local identity of the typed auxiliary control component. Stable across loads: the
 /// bespoke control routes hold exactly one control network.
 pub(crate) const CONTROL_COMPONENT_ID: &str = "z-image-control-branch";
+/// The lazily built f32 `VaeEncoder` a `Reference` request opts into (SC-22667). It is a **second**
+/// copy of the `encoder.*` weights: the resident `AutoEncoderKL` already holds both halves at the
+/// pipeline dtype (those bytes are in `decoder_bytes`), and img2img builds this one on its first
+/// request at [`crate::common::ENC_DTYPE`].
+pub(crate) const REFERENCE_ENCODER_COMPONENT_ID: &str = "z-image-vae-reference-encoder";
+/// Key prefix of the autoencoder's encoder half in both the diffusers and the LDM/ComfyUI layouts.
+const VAE_ENCODER_PREFIX: &str = "encoder.";
+/// Element width of the resident bf16 pipeline dtype every Dir/File component is opened at.
+const PIPELINE_FLOAT_WIDTH: u64 = 2;
+/// Element width of [`crate::common::ENC_DTYPE`], the lazily built reference encoder's dtype.
+const REFERENCE_ENCODER_FLOAT_WIDTH: u64 = 4;
 pub(crate) const CONTROL_CALIBRATION_FINGERPRINT: &str =
     "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2";
 
@@ -214,16 +226,28 @@ fn imported_tensor_bytes(
     loaded_name: &str,
     component: &str,
 ) -> gen_core::Result<u64> {
+    imported_tensor_bytes_at(tensor, loaded_name, component, PIPELINE_FLOAT_WIDTH)
+}
+
+/// [`imported_tensor_bytes`] at an explicit float width: the resident pipeline opens every
+/// component bf16 (`2`), while the lazily built reference encoder opens the same `encoder.*` rows
+/// at [`crate::common::ENC_DTYPE`] (`4`).
+fn imported_tensor_bytes_at(
+    tensor: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    loaded_name: &str,
+    component: &str,
+    float_width: u64,
+) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
 
     // `candle_core::safetensors::load` first materializes every source tensor. U16 is promoted to
     // Candle's U32 storage; the remaining accepted integer widths stay native. Every float then
-    // passes through `normalize_fp8_map(..., BF16)`, including dense f32/f64 and plain/scaled fp8.
+    // passes through `normalize_fp8_map(..., dtype)`, including dense f32/f64 and plain/scaled fp8.
     let loaded = match tensor.dtype {
         Dtype::U8 | Dtype::U32 | Dtype::I16 | Dtype::I32 | Dtype::I64 => tensor.data_bytes,
         Dtype::U16 => tensor.materialized_bytes(4)?,
         Dtype::F8_E4M3 | Dtype::F16 | Dtype::BF16 | Dtype::F32 | Dtype::F64 => {
-            tensor.materialized_bytes(2)?
+            tensor.materialized_bytes(float_width)?
         }
         dtype => {
             return Err(gen_core::Error::Unsupported(format!(
@@ -252,6 +276,299 @@ fn single_file_tensor_bytes(path: &std::path::Path, component: &str) -> gen_core
     imported_tensor_headers_bytes(&headers, component, &path.display().to_string())
 }
 
+/// How one packed MLX affine triple (`{base}.weight` u32 codes + `.scales` + `.biases`) lands on
+/// the device for a given component — the two things this loader does with one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedResidency {
+    /// Repacked **once** into a GGML `Q4_1`/`Q8_0` [`candle_gen::candle_core::quantized::QTensor`]
+    /// — the transformer (`PackedDit`, whether resident or block-streamed from the device-format
+    /// cache) and the text encoder (`PackedTe`). The source triple is a transient host input and
+    /// the cache sidecar is a file-backed copy of the same bytes, so neither is priced beside it.
+    Qtensor,
+    /// Dequantized to a **dense** float matrix at `float_width` — the VAE's eight mid-block
+    /// attention projections (`Pipeline::vae_vb_dequantized_on`), which the stock `AutoEncoderKL`
+    /// reads as ordinary Linear weights.
+    Dense { float_width: u64 },
+}
+
+/// Resident bytes of one packed triple after [`PackedResidency::Dense`] dequantization:
+/// `out × in × float_width`, with `in = scale_columns × group_size` exactly as
+/// [`candle_gen::quant::mlx_packed_qtensor_resident_bytes`] recovers it.
+fn packed_triple_dense_bytes(
+    weight: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    scales: &gen_core::weightsmeta::SafetensorsTensorHeader,
+    group_size: usize,
+    float_width: u64,
+) -> gen_core::Result<u64> {
+    let [out, _] = weight.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed weight {:?} must be rank 2, got {:?}",
+            weight.name, weight.shape
+        )));
+    };
+    let [_, scale_columns] = scales.shape.as_slice() else {
+        return Err(gen_core::Error::Unsupported(format!(
+            "packed scales {:?} must be rank 2, got {:?}",
+            scales.name, scales.shape
+        )));
+    };
+    u64::try_from(*out)
+        .ok()
+        .zip(u64::try_from(*scale_columns).ok())
+        .zip(u64::try_from(group_size).ok())
+        .and_then(|((out, scale_columns), group_size)| {
+            out.checked_mul(scale_columns)?
+                .checked_mul(group_size)?
+                .checked_mul(float_width)
+        })
+        .ok_or_else(|| {
+            gen_core::Error::Msg(format!("packed dense byte overflow for {:?}", weight.name))
+        })
+}
+
+/// Price a header inventory the way the Candle loader materializes it: every packed affine triple
+/// is charged **once** per `residency` (its `.scales`/`.biases` siblings are transient inputs and
+/// contribute nothing), and every other tensor is priced by `dense`.
+fn packed_aware_headers_bytes(
+    headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+    group_size: usize,
+    residency: PackedResidency,
+    component: &str,
+    dense: impl Fn(&gen_core::weightsmeta::SafetensorsTensorHeader) -> gen_core::Result<u64>,
+) -> gen_core::Result<u64> {
+    use std::collections::{HashMap, HashSet};
+
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<HashMap<_, _>>();
+    let packed_bases = headers
+        .iter()
+        .filter_map(|header| header.name.strip_suffix(".scales"))
+        .collect::<HashSet<_>>();
+    headers.iter().try_fold(0_u64, |total, header| {
+        if header
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| header.name.strip_suffix(".biases"))
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            return Ok(total);
+        }
+        let resident = if let Some(base) = header
+            .name
+            .strip_suffix(".weight")
+            .filter(|base| packed_bases.contains(base))
+        {
+            let scales_name = format!("{base}.scales");
+            let biases_name = format!("{base}.biases");
+            let scales = by_name.get(scales_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "z-image packed {component} weight {:?} is missing {scales_name:?}",
+                    header.name
+                ))
+            })?;
+            let biases = by_name.get(biases_name.as_str()).ok_or_else(|| {
+                gen_core::Error::Unsupported(format!(
+                    "z-image packed {component} weight {:?} is missing {biases_name:?}",
+                    header.name
+                ))
+            })?;
+            match residency {
+                PackedResidency::Qtensor => candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                    header, scales, biases, group_size,
+                )?,
+                PackedResidency::Dense { float_width } => {
+                    packed_triple_dense_bytes(header, scales, group_size, float_width)?
+                }
+            }
+        } else {
+            dense(header)?
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            gen_core::Error::Msg(format!("z-image {component} resident byte sum overflow"))
+        })
+    })
+}
+
+/// The autoencoder priced the way this loader holds it (SC-22667).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VaeBytes {
+    /// Every VAE tensor at the pipeline dtype. The stock `AutoEncoderKL` constructor builds **both**
+    /// `encoder.*` and `decoder.*` from the same `VarBuilder` (`Pipeline::load_vae`), so a plain
+    /// text-to-image render keeps both halves resident; that whole object is `decoder_bytes`.
+    resident: u64,
+    /// The `encoder.*` rows again, at [`crate::common::ENC_DTYPE`]: the separate `VaeEncoder` that
+    /// `ZImageBaseGenerator::vae_encoder` builds on the first `Reference` request and never for a
+    /// text-to-image workload. Declared as a [`gen_core::MemoryComponentKind::ReferenceEncoder`]
+    /// auxiliary component, not folded into any base field.
+    reference_encoder: u64,
+}
+
+impl VaeBytes {
+    /// `name_of` yields the key the loader sees (a combined checkpoint strips its component prefix
+    /// first, so `first_stage_model.encoder.*` and `vae.encoder.*` both test as `encoder.*`).
+    fn from_headers(
+        headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
+        group_size: usize,
+    ) -> gen_core::Result<Self> {
+        let resident = packed_aware_headers_bytes(
+            headers,
+            group_size,
+            PackedResidency::Dense {
+                float_width: PIPELINE_FLOAT_WIDTH,
+            },
+            "VAE",
+            |header| imported_tensor_bytes(header, &header.name, "VAE"),
+        )?;
+        let encoder_headers = headers
+            .iter()
+            .filter(|header| header.name.starts_with(VAE_ENCODER_PREFIX))
+            .cloned()
+            .collect::<Vec<_>>();
+        let reference_encoder = packed_aware_headers_bytes(
+            &encoder_headers,
+            group_size,
+            PackedResidency::Dense {
+                float_width: REFERENCE_ENCODER_FLOAT_WIDTH,
+            },
+            "VAE reference encoder",
+            |header| {
+                imported_tensor_bytes_at(
+                    header,
+                    &header.name,
+                    "VAE reference encoder",
+                    REFERENCE_ENCODER_FLOAT_WIDTH,
+                )
+            },
+        )?;
+        Ok(Self {
+            resident,
+            reference_encoder,
+        })
+    }
+
+    fn from_file(path: &std::path::Path) -> gen_core::Result<Self> {
+        let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+        let vae = Self::from_headers(&headers, candle_gen::quant::MLX_GROUP_SIZE)?;
+        if vae.resident == 0 {
+            return Err(gen_core::Error::Msg(format!(
+                "z-image imported VAE '{}' contains no tensor bytes",
+                path.display()
+            )));
+        }
+        Ok(vae)
+    }
+}
+
+/// The base-model split plus the request-opted reference encoder, for every source shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MaterializedComponents {
+    base: PerComponentBytes,
+    reference_encoder: u64,
+}
+
+/// Tensor headers of the snapshot component `sub/`, or `None` for a weights-free declaration seam
+/// (no `.safetensors` under it). The header walk skips the hidden device-format cache a streamed
+/// packed component leaves beside its source file, so a snapshot that has been loaded on a packed
+/// tier prices exactly the tensors the loader opens (SC-22667, E1).
+fn snapshot_component_headers(
+    root: &std::path::Path,
+    sub: &str,
+) -> gen_core::Result<Option<Vec<gen_core::weightsmeta::SafetensorsTensorHeader>>> {
+    let dir = root.join(sub);
+    if gen_core::safetensors_path_bytes(&dir) == 0 {
+        return Ok(None);
+    }
+    gen_core::weightsmeta::safetensors_path_tensor_headers(&dir).map(Some)
+}
+
+/// The packed group size `sub/config.json` declares, or MLX's default when the component carries no
+/// `quantization` block — which is also how the loader reads it (`PackedConfig::from_config`).
+fn snapshot_component_group_size(root: &std::path::Path, sub: &str) -> gen_core::Result<usize> {
+    Ok(crate::pipeline::packed_config_at(root, sub)
+        .map_err(gen_core::Error::backend)?
+        .and_then(|packed| usize::try_from(packed.group_size).ok())
+        .filter(|group_size| *group_size > 0)
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE))
+}
+
+/// Bytes the transformer occupies once loaded from `root/transformer/`: a dense tier at the
+/// pipeline dtype; a packed tier as one GGML `Q4_1`/`Q8_0` QTensor per projection plus its dense
+/// residual (norms, embeddings, modulation) at the pipeline dtype. This is what both the resident
+/// `PackedDit::new` build and the block-streamed build hold on the device — the streamed build
+/// copies the same GGML bytes out of the device-format cache instead of repacking, so the cache is
+/// **not** a second copy to price. Before this, the on-disk sum recursed into that cache and priced
+/// the q4 transformer at 7.31 GB against a 3.47 GB checkpoint (SC-22667).
+fn snapshot_transformer_bytes(root: &std::path::Path) -> gen_core::Result<u64> {
+    let Some(headers) = snapshot_component_headers(root, "transformer")? else {
+        return Ok(0);
+    };
+    packed_aware_headers_bytes(
+        &headers,
+        snapshot_component_group_size(root, "transformer")?,
+        PackedResidency::Qtensor,
+        "transformer",
+        |header| imported_tensor_bytes(header, &header.name, "transformer"),
+    )
+}
+
+fn snapshot_vae_bytes(root: &std::path::Path) -> gen_core::Result<VaeBytes> {
+    let Some(headers) = snapshot_component_headers(root, "vae")? else {
+        return Ok(VaeBytes::default());
+    };
+    VaeBytes::from_headers(&headers, snapshot_component_group_size(root, "vae")?)
+}
+
+/// The typed declaration of a non-zero reference encoder (`None` when the source has no
+/// `encoder.*` rows, e.g. a decoder-only fixture).
+fn reference_encoder_component(bytes: u64) -> Option<MemoryResidentComponent> {
+    (bytes > 0).then(|| MemoryResidentComponent {
+        id: REFERENCE_ENCODER_COMPONENT_ID.to_owned(),
+        kind: gen_core::MemoryComponentKind::ReferenceEncoder,
+        resident_bytes: bytes,
+        bounded_by: None,
+        residency: gen_core::MemoryComponentResidency::WholeRender,
+    })
+}
+
+/// Append typed auxiliary components to a phase formula, promoting a `PhaseEnvelope` to a
+/// `ComponentPhaseEnvelope` the first time one is declared. A formula with nothing to append is
+/// returned unchanged, so a source with no auxiliary network keeps its historical shape.
+fn with_resident_components(
+    formula: MemoryFormulaKind,
+    extra: Vec<MemoryResidentComponent>,
+    provider_id: &str,
+) -> gen_core::Result<MemoryFormulaKind> {
+    if extra.is_empty() {
+        return Ok(formula);
+    }
+    match formula {
+        MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
+            Ok(MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases,
+                variables,
+                resident_components: extra,
+            })
+        }
+        MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            mut resident_components,
+        } => {
+            resident_components.extend(extra);
+            Ok(MemoryFormulaKind::ComponentPhaseEnvelope {
+                phases,
+                variables,
+                resident_components,
+            })
+        }
+        other => Err(gen_core::Error::Msg(format!(
+            "{provider_id}: expected a phase-envelope base formula, got {other:?}"
+        ))),
+    }
+}
+
 fn imported_tensor_headers_bytes(
     headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
     component: &str,
@@ -277,58 +594,17 @@ fn imported_tensor_headers_bytes(
 fn materialized_text_encoder_headers_bytes(
     headers: &[gen_core::weightsmeta::SafetensorsTensorHeader],
 ) -> gen_core::Result<u64> {
-    use std::collections::{HashMap, HashSet};
-
-    let by_name = headers
-        .iter()
-        .map(|header| (header.name.as_str(), header))
-        .collect::<HashMap<_, _>>();
-    let packed_bases = headers
-        .iter()
-        .filter_map(|header| header.name.strip_suffix(".scales"))
-        .collect::<HashSet<_>>();
     let group_size = crate::ENCODER_CONTRACT
         .packing
         .expect("Z-Image's executable encoder contract is packable")
         .group_size;
-    let bytes = headers.iter().try_fold(0_u64, |total, header| {
-        if header
-            .name
-            .strip_suffix(".scales")
-            .or_else(|| header.name.strip_suffix(".biases"))
-            .is_some_and(|base| packed_bases.contains(base))
-        {
-            return Ok(total);
-        }
-        let resident = if let Some(base) = header
-            .name
-            .strip_suffix(".weight")
-            .filter(|base| packed_bases.contains(base))
-        {
-            let scales_name = format!("{base}.scales");
-            let biases_name = format!("{base}.biases");
-            let scales = by_name.get(scales_name.as_str()).ok_or_else(|| {
-                gen_core::Error::Unsupported(format!(
-                    "z-image packed text-encoder weight {:?} is missing {scales_name:?}",
-                    header.name
-                ))
-            })?;
-            let biases = by_name.get(biases_name.as_str()).ok_or_else(|| {
-                gen_core::Error::Unsupported(format!(
-                    "z-image packed text-encoder weight {:?} is missing {biases_name:?}",
-                    header.name
-                ))
-            })?;
-            candle_gen::quant::mlx_packed_qtensor_resident_bytes(
-                header, scales, biases, group_size,
-            )?
-        } else {
-            imported_tensor_bytes(header, &header.name, "text encoder")?
-        };
-        total.checked_add(resident).ok_or_else(|| {
-            gen_core::Error::Msg("z-image text-encoder resident byte sum overflow".into())
-        })
-    })?;
+    let bytes = packed_aware_headers_bytes(
+        headers,
+        group_size,
+        PackedResidency::Qtensor,
+        "text encoder",
+        |header| imported_tensor_bytes(header, &header.name, "text encoder"),
+    )?;
     if bytes == 0 {
         return Err(gen_core::Error::Msg(
             "z-image validated text encoder contains no materialized tensor bytes".into(),
@@ -382,9 +658,10 @@ fn validated_materialized_text_encoder_bytes(
         .map(Some)
 }
 
-fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerComponentBytes> {
+fn combined_file_components(path: &std::path::Path) -> gen_core::Result<MaterializedComponents> {
     let mut components = PerComponentBytes::default();
     let mut mapped_text_encoder_headers = Vec::new();
+    let mut mapped_vae_headers = Vec::new();
     let mut mapped_keys = [
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
@@ -430,13 +707,15 @@ fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerCompo
                 });
             }
             crate::comfyui::CombinedComponent::Vae => {
-                let resident_bytes = imported_tensor_bytes(&tensor, mapped, component_name)?;
-                components.vae = components.vae.checked_add(resident_bytes).ok_or_else(|| {
-                    gen_core::Error::Msg("z-image combined VAE resident byte sum overflow".into())
-                })?
+                mapped_vae_headers.push(gen_core::weightsmeta::SafetensorsTensorHeader {
+                    name: mapped.to_owned(),
+                    ..tensor
+                });
             }
         }
     }
+    let vae = VaeBytes::from_headers(&mapped_vae_headers, candle_gen::quant::MLX_GROUP_SIZE)?;
+    components.vae = vae.resident;
     components.text_encoder = if mapped_text_encoder_headers
         .iter()
         .any(|header| header.name == "model.embed_tokens.weight")
@@ -465,14 +744,17 @@ fn combined_file_components(path: &std::path::Path) -> gen_core::Result<PerCompo
             )));
         }
     }
-    Ok(components)
+    Ok(MaterializedComponents {
+        base: components,
+        reference_encoder: vae.reference_encoder,
+    })
 }
 
 fn imported_file_components(
     spec: &LoadSpec,
     primary: &std::path::Path,
     provider_id: &str,
-) -> gen_core::Result<PerComponentBytes> {
+) -> gen_core::Result<MaterializedComponents> {
     let _ = gen_core::require_base_snapshot(spec, provider_id)?;
     let legacy_text_encoder = spec
         .components
@@ -504,20 +786,22 @@ fn imported_file_components(
             spec.read_file_unchanged_if_prepared(primary, combined_file_components)
         }
         (Some(text_encoder), Some(WeightsSource::File(vae))) => {
-            Ok(PerComponentBytes {
-                text_encoder: text_encoder_bytes(text_encoder)?,
-                dit: spec.read_file_unchanged_if_prepared(primary, |p| {
-                    single_file_tensor_bytes(p, "transformer")
-                })?,
-                vae: spec.read_file_unchanged_if_prepared(vae, |p| {
-                    single_file_tensor_bytes(p, "VAE")
-                })?,
+            let vae = spec.read_file_unchanged_if_prepared(vae, VaeBytes::from_file)?;
+            Ok(MaterializedComponents {
+                base: PerComponentBytes {
+                    text_encoder: text_encoder_bytes(text_encoder)?,
+                    dit: spec.read_file_unchanged_if_prepared(primary, |p| {
+                        single_file_tensor_bytes(p, "transformer")
+                    })?,
+                    vae: vae.resident,
+                },
+                reference_encoder: vae.reference_encoder,
             })
         }
         (Some(text_encoder), None) => {
             let mut components =
                 spec.read_file_unchanged_if_prepared(primary, combined_file_components)?;
-            components.text_encoder = text_encoder_bytes(text_encoder)?;
+            components.base.text_encoder = text_encoder_bytes(text_encoder)?;
             Ok(components)
         }
         (_, Some(WeightsSource::Dir(path))) => Err(gen_core::Error::Msg(format!(
@@ -567,20 +851,28 @@ pub(crate) fn provider_contract(
     let selected_text_encoder = explicit_text_encoder.or(legacy_text_encoder);
     let components = match &spec.weights {
         gen_core::WeightsSource::Dir(root) => {
-            let mut components = PerComponentBytes::from_spec_subdirs(
-                spec,
-                &["text_encoder"],
-                &["transformer"],
-                &["vae"],
-            )
-            .unwrap_or_default();
+            // E1: the transformer and VAE are priced from the headers of the files the loader
+            // opens, at the dtype/format it materializes them in — not from the on-disk sum of
+            // `transformer/` and `vae/`, which recursed into the device-format cache and counted
+            // the whole autoencoder as the render-resident decoder.
+            let vae = snapshot_vae_bytes(root)?;
+            let mut components = MaterializedComponents {
+                base: PerComponentBytes {
+                    // The weights-free fallback for an unauthored encoder; the validated
+                    // materialization below replaces it whenever a config exists.
+                    text_encoder: gen_core::safetensors_path_bytes(root.join("text_encoder")),
+                    dit: snapshot_transformer_bytes(root)?,
+                    vae: vae.resident,
+                },
+                reference_encoder: vae.reference_encoder,
+            };
             let builtin = WeightsSource::Dir(root.join("text_encoder"));
             let effective = selected_text_encoder.unwrap_or(&builtin);
             if let Some(bytes) = validated_materialized_text_encoder_bytes(effective, false)? {
-                components.text_encoder = bytes;
+                components.base.text_encoder = bytes;
             } else if selected_text_encoder.is_some() {
                 let roots = selected_encoder_discovery_roots(effective)?;
-                components.text_encoder =
+                components.base.text_encoder =
                     gen_core::encoder_contract::text_encoder_source_inventory_for_discovery(
                         effective, &roots,
                     )?
@@ -590,6 +882,33 @@ pub(crate) fn provider_contract(
         }
         gen_core::WeightsSource::File(path) => imported_file_components(spec, path, provider_id)?,
     };
+    let MaterializedComponents {
+        base: components,
+        reference_encoder,
+    } = components;
+    let formula = with_resident_components(
+        MemoryFormulaKind::PhaseEnvelope {
+            phases: vec![
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ],
+            variables: vec![
+                MemoryFormulaVariable::AssetBytes,
+                MemoryFormulaVariable::PixelCount,
+                MemoryFormulaVariable::BatchCount,
+                MemoryFormulaVariable::ConditioningTokenCount,
+                MemoryFormulaVariable::OverlayBytes,
+                MemoryFormulaVariable::DecodeTileArea,
+                MemoryFormulaVariable::AttentionChunkSize,
+                MemoryFormulaVariable::TransformerWindowSize,
+            ],
+        },
+        reference_encoder_component(reference_encoder)
+            .into_iter()
+            .collect(),
+        provider_id,
+    )?;
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -662,29 +981,20 @@ pub(crate) fn provider_contract(
         default_engagement_exclusions: Vec::new(),
         resident_request_memory: gen_core::ResidentRequestMemory::PreserveLoadDefaults,
         lifecycle: MemoryLifecycleCapabilities {
-            phases: phases.clone(),
+            phases,
             synchronized_phase_release: true,
             decode_tiling: true,
             attention_chunking: true,
             transformer_window_materialization: streamable,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
-            phases,
-            variables: vec![
-                MemoryFormulaVariable::AssetBytes,
-                MemoryFormulaVariable::PixelCount,
-                MemoryFormulaVariable::BatchCount,
-                MemoryFormulaVariable::ConditioningTokenCount,
-                MemoryFormulaVariable::OverlayBytes,
-                MemoryFormulaVariable::DecodeTileArea,
-                MemoryFormulaVariable::AttentionChunkSize,
-                MemoryFormulaVariable::TransformerWindowSize,
-            ],
-        },
+        formula,
         calibration: Some(MemoryCalibrationIdentity::new(
             CALIBRATION_FINGERPRINT,
             spec.load_shape,
         )),
+        // SC-22667 / E1: `base_bytes` is the text encoder + transformer + the render-resident
+        // autoencoder; the lazily built f32 reference encoder is the one auxiliary network a plain
+        // render never materializes, declared once in `overlay_bytes` with its typed component.
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -693,7 +1003,7 @@ pub(crate) fn provider_contract(
             conditioning_bytes: components.text_encoder,
             transformer_bytes: components.dit,
             decoder_bytes: components.vae,
-            overlay_bytes: 0,
+            overlay_bytes: reference_encoder,
         },
         architecture_facts: architecture_facts(spec),
         runtime: gen_core::MemoryRuntimeSemantics::default(),
@@ -723,33 +1033,34 @@ pub(crate) fn control_contract(
     // `conditioning + transformer + decoder`, so it neither double-counts the overlay nor hides it
     // inside `transformer_bytes`. Previously the same bytes were declared on three legs at once and
     // `conditioning_bytes` was raised to `max(conditioning, decoder)` — a total borrowed from
-    // another component, which is the exact defect the facts check now rejects.
-    contract.asset_facts.overlay_bytes = overlay_bytes;
+    // another component, which is the exact defect the facts check now rejects. The overlay is
+    // **added** to the base contract's, which already carries the reference encoder (SC-22667).
+    contract.asset_facts.overlay_bytes = contract
+        .asset_facts
+        .overlay_bytes
+        .saturating_add(overlay_bytes);
     if overlay_bytes > 0 {
-        let (phases, variables) = match &contract.formula {
-            MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
-                (phases.clone(), variables.clone())
-            }
-            other => {
-                return Err(gen_core::Error::Msg(format!(
-                    "{provider_id}: control contract expected a PhaseEnvelope base formula, got {other:?}"
-                )))
-            }
+        let control = gen_core::MemoryResidentComponent {
+            id: CONTROL_COMPONENT_ID.to_owned(),
+            kind: gen_core::MemoryComponentKind::ControlBranch,
+            resident_bytes: overlay_bytes,
+            // The control stack's own blocks ride the selected transformer window whenever the
+            // base stack does; a non-streamable load bounds it by no rung at all.
+            bounded_by: control_streamable(spec)
+                .then_some(MemoryStrategy::BoundedTransformerResidency),
+            residency: gen_core::MemoryComponentResidency::WholeRender,
         };
-        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
-            phases,
-            variables,
-            resident_components: vec![gen_core::MemoryResidentComponent {
-                id: CONTROL_COMPONENT_ID.to_owned(),
-                kind: gen_core::MemoryComponentKind::ControlBranch,
-                resident_bytes: overlay_bytes,
-                // The control stack's own blocks ride the selected transformer window whenever the
-                // base stack does; a non-streamable load bounds it by no rung at all.
-                bounded_by: control_streamable(spec)
-                    .then_some(MemoryStrategy::BoundedTransformerResidency),
-                residency: gen_core::MemoryComponentResidency::WholeRender,
-            }],
-        };
+        contract.formula = with_resident_components(
+            std::mem::replace(
+                &mut contract.formula,
+                MemoryFormulaKind::PhaseEnvelope {
+                    phases: Vec::new(),
+                    variables: Vec::new(),
+                },
+            ),
+            vec![control],
+            provider_id,
+        )?;
     }
     contract.calibration = Some(MemoryCalibrationIdentity::new(
         CONTROL_CALIBRATION_FINGERPRINT,
@@ -2411,6 +2722,234 @@ mod tests {
             );
             gen_core_testkit::assert_memory_contract_facts_conform(&contract);
         }
+    }
+
+    /// SC-22667 / E1 (DEFECT 1): a packed transformer that has been block-streamed carries the
+    /// device-format cache beside its source file. `transformer_bytes` is the set the loader
+    /// holds — one GGML `Q4_1`/`Q8_0` QTensor per packed projection plus the dense residual at
+    /// bf16 — and that set is the same whether the bytes are repacked from the source or copied
+    /// out of the cache. Summing the two files priced the real q4 snapshot at 7.31 GB against a
+    /// 3.47 GB checkpoint, and the resident rung's measured level then sat *below* the contract.
+    #[test]
+    fn transformer_bytes_price_the_loaded_checkpoint_not_the_device_format_cache() {
+        for (bits, packed_columns, bytes_per_block) in [(4_i32, 8_usize, 20_u64), (8, 16, 34)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join(format!("packed-q{bits}-streamed"));
+            let transformer = root.join("transformer");
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            )
+            .unwrap();
+            let code_bytes = 2 * packed_columns * 4;
+            write_typed_safetensors(
+                &transformer.join("model.safetensors"),
+                &[
+                    (
+                        "layers.0.attention.qkv.weight",
+                        "U32",
+                        &[2, packed_columns],
+                        code_bytes,
+                    ),
+                    ("layers.0.attention.qkv.scales", "BF16", &[2, 1], 4),
+                    ("layers.0.attention.qkv.biases", "BF16", &[2, 1], 4),
+                    ("x_embedder.weight", "BF16", &[3], 6),
+                ],
+            );
+            std::fs::create_dir_all(root.join("vae")).unwrap();
+            write_typed_safetensors(
+                &root.join("vae/model.safetensors"),
+                &[("decoder.conv_in.weight", "BF16", &[1], 2)],
+            );
+            gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                &root.join("text_encoder"),
+                crate::ENCODER_CONTRACT,
+                Some(bits),
+            )
+            .unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            // 2 x 64 elements = 4 GGML blocks, plus the 3-element bf16 residual.
+            let expected = 4 * bytes_per_block + 6;
+            let cold = provider_contract(crate::MODEL_ID, &spec).unwrap();
+            assert_eq!(
+                cold.asset_facts.transformer_bytes, expected,
+                "Q{bits}: a never-streamed snapshot prices the GGML set from the source header"
+            );
+
+            // A prior block-streamed load left the content-addressed GGML sidecars behind.
+            let cache = transformer.join(gen_core::CANDLE_DEVICE_FORMAT_CACHE_DIR);
+            std::fs::create_dir_all(&cache).unwrap();
+            write_typed_safetensors(
+                &cache.join(format!(
+                    "0104af902ed702222b65c9b031dfe9f905e5335d7c1a624200a66e2ea7718102.q{bits}_{}.safetensors",
+                    if bits == 4 { 1 } else { 0 }
+                )),
+                &[("weight", "U8", &[4096], 4096)],
+            );
+            assert!(
+                gen_core::safetensors_path_bytes(&cache) > 4096,
+                "the cache fixture must be a real weight file or the assertion below is vacuous"
+            );
+            let warm = provider_contract(crate::MODEL_ID, &spec).unwrap();
+            assert_eq!(
+                warm.asset_facts.transformer_bytes, expected,
+                "Q{bits}: the device-format cache is a copy of the same bytes, never a second component"
+            );
+            assert_eq!(
+                warm.asset_facts, cold.asset_facts,
+                "Q{bits}: the cache changes no fact"
+            );
+            assert_eq!(
+                gen_core::safetensors_dir_bytes(&transformer),
+                std::fs::metadata(transformer.join("model.safetensors"))
+                    .unwrap()
+                    .len(),
+                "Q{bits}: the shared on-disk walker must skip the cache too"
+            );
+        }
+    }
+
+    /// SC-22667 / E1 (DEFECT 2): the stock `AutoEncoderKL` builds both halves at the pipeline
+    /// dtype, so the render-resident `decoder_bytes` is the whole `vae/` file at bf16 (packed
+    /// mid-block triples dequantized dense). The f32 `VaeEncoder` that img2img builds on its first
+    /// `Reference` request is a second, lazily materialized network: declared once as a
+    /// `ReferenceEncoder` auxiliary component in `overlay_bytes`, never in a base field.
+    #[test]
+    fn decoder_bytes_hold_the_resident_autoencoder_and_declare_the_lazy_reference_encoder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("z-image-vae-split");
+        write_snapshot_component_configs(&root);
+        gen_core_testkit::write_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            crate::ENCODER_CONTRACT,
+        )
+        .unwrap();
+        write_typed_safetensors(
+            &root.join("transformer/model.safetensors"),
+            &[("layers.0.w", "BF16", &[16], 32)],
+        );
+        write_typed_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_in.weight", "BF16", &[100], 200),
+                ("encoder.conv_in.weight", "BF16", &[40], 80),
+                (
+                    "encoder.mid_block.attentions.0.to_q.weight",
+                    "U32",
+                    &[2, 8],
+                    64,
+                ),
+                (
+                    "encoder.mid_block.attentions.0.to_q.scales",
+                    "BF16",
+                    &[2, 1],
+                    4,
+                ),
+                (
+                    "encoder.mid_block.attentions.0.to_q.biases",
+                    "BF16",
+                    &[2, 1],
+                    4,
+                ),
+            ],
+        );
+        // Resident (bf16): decoder 100 el + encoder 40 el + the dequantized 2x64 triple.
+        const RESIDENT_VAE_BYTES: u64 = 200 + 80 + 2 * 64 * 2;
+        // Lazy f32 encoder: the 40 el + the same 2x64 triple dequantized at 4 bytes.
+        const REFERENCE_ENCODER_BYTES: u64 = 40 * 4 + 2 * 64 * 4;
+        let spec = snapshot_spec(root.clone());
+
+        let contract = provider_contract(crate::MODEL_ID, &spec).unwrap();
+        let facts = contract.asset_facts;
+        assert_eq!(facts.decoder_bytes, RESIDENT_VAE_BYTES);
+        assert_eq!(facts.transformer_bytes, 32);
+        assert_eq!(facts.overlay_bytes, REFERENCE_ENCODER_BYTES);
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + 32 + RESIDENT_VAE_BYTES,
+            "base_bytes excludes the request-opted encoder copy"
+        );
+        let components = contract.resident_components();
+        assert_eq!(components.len(), 1, "{components:?}");
+        assert_eq!(components[0].id, REFERENCE_ENCODER_COMPONENT_ID);
+        assert_eq!(
+            components[0].kind,
+            gen_core::MemoryComponentKind::ReferenceEncoder
+        );
+        assert_eq!(components[0].resident_bytes, REFERENCE_ENCODER_BYTES);
+        assert_eq!(components[0].bounded_by, None);
+        assert_eq!(contract.auxiliary_resident_bytes(), REFERENCE_ENCODER_BYTES);
+        assert_eq!(
+            contract.total_resident_bytes(),
+            facts.base_bytes + REFERENCE_ENCODER_BYTES
+        );
+        assert!(
+            matches!(
+                contract.formula,
+                MemoryFormulaKind::ComponentPhaseEnvelope { .. }
+            ),
+            "a declared auxiliary component needs the typed listing"
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The control route stacks its branch beside the reference encoder: two typed auxiliary
+        // components, one `overlay_bytes` equal to their sum, base facts untouched.
+        let control = root.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        write_safetensors(&control.join("control.safetensors"), &[("w", 4096)]);
+        let control_bytes = gen_core::safetensors_path_bytes(&control);
+        assert!(control_bytes > 0);
+        let control_contract = control_contract(
+            "z_image_turbo_control",
+            &spec.with_control(WeightsSource::Dir(control)),
+        )
+        .unwrap();
+        assert_eq!(
+            control_contract.asset_facts.overlay_bytes,
+            REFERENCE_ENCODER_BYTES + control_bytes
+        );
+        assert_eq!(control_contract.asset_facts.base_bytes, facts.base_bytes);
+        let ids = control_contract
+            .resident_components()
+            .iter()
+            .map(|component| component.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![REFERENCE_ENCODER_COMPONENT_ID, CONTROL_COMPONENT_ID]
+        );
+        assert_eq!(
+            control_contract.auxiliary_resident_bytes(),
+            REFERENCE_ENCODER_BYTES + control_bytes
+        );
+        assert!(
+            control_contract.conformance_errors().is_empty(),
+            "{:?}",
+            control_contract.conformance_errors()
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&control_contract);
+
+        // A decoder-only source has no reference encoder to declare and keeps the plain shape.
+        let decoder_only = tmp.path().join("z-image-decoder-only");
+        write_snapshot_component_configs(&decoder_only);
+        write_typed_safetensors(
+            &decoder_only.join("vae/model.safetensors"),
+            &[("decoder.conv_in.weight", "BF16", &[100], 200)],
+        );
+        let plain = provider_contract(crate::MODEL_ID, &snapshot_spec(decoder_only)).unwrap();
+        assert_eq!(plain.asset_facts.decoder_bytes, 200);
+        assert_eq!(plain.asset_facts.overlay_bytes, 0);
+        assert!(plain.resident_components().is_empty());
+        assert!(matches!(
+            plain.formula,
+            MemoryFormulaKind::PhaseEnvelope { .. }
+        ));
     }
 
     #[test]
