@@ -2400,12 +2400,13 @@ pub fn krea_turbo_production_calibration_fingerprint(tier: Option<Quant>) -> Opt
 /// declaration walk down with it, which is exactly what `raw_and_edit_catalog_surfaces_are_exact…`
 /// caught. Before sc-22735 every one of these surfaces published the MEASURED q4 string instead.
 fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String> {
+    // Deliberately exhaustive over `Quant`: the declared surface covers every tier, so a new
+    // variant must fail to compile here rather than silently fall into a "no declaration" refusal.
     let tier = match tier {
         None => "bf16",
         Some(Quant::Q4) => "q4",
         Some(Quant::Q8) => "q8",
         Some(Quant::Nvfp4) => "nvfp4",
-        Some(_) => return None,
     };
     Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
 }
