@@ -275,6 +275,10 @@ fn loader_config(
 
     let preset = match route {
         WanI2vRoute::Ti2v5b => crate::config::WanModelConfig::wan22_ti2v_5b(),
+        // The A14B trunk shape is one preset; `wan22_t2v_14b` and `wan22_i2v_14b` differ only in
+        // `model_type` and `in_dim`, and the axes this publishes are shared. A materialized root
+        // below overlays the snapshot's own `config.json` anyway.
+        WanI2vRoute::T2v14b => crate::config::WanModelConfig::wan22_t2v_14b(),
         WanI2vRoute::I2v14b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => {
             crate::config::WanModelConfig::wan22_i2v_14b()
         }
@@ -285,7 +289,7 @@ fn loader_config(
     let parsed = match route {
         // `model.rs`: `WanModelConfig::from_model_dir(&root)`. Its absent-file fallback is the
         // TI2V-5B preset regardless of route, so only an actually-present `config.json` counts.
-        WanI2vRoute::Ti2v5b | WanI2vRoute::I2v14b => root
+        WanI2vRoute::Ti2v5b | WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => root
             .join("config.json")
             .is_file()
             .then(|| crate::config::WanModelConfig::from_model_dir(root).ok())

@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
     MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
@@ -24,6 +24,65 @@ pub const PUBLIC_BUCKETS: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 704),
 pub const PUBLIC_FRAMES: &[u32] = &[45, 61, 77];
 /// Domain separator for the provider-side animation-carrier content digest.
 const CARRIER_DIGEST_DOMAIN: &str = "scail2-candle-carrier-v1";
+
+/// Backend token for every identity and receipt this module mints (sc-22736).
+///
+/// It is load-bearing for a reason peculiar to SCAIL-2: the manifest ships **one** repository
+/// (`SceneWorks/scail2-mlx`) to both lanes, so the MLX and Candle providers seal receipts over
+/// *byte-identical* bf16 roots. Without this token the two lanes' `receipt_sha256` collide and a
+/// measurement taken on one lane reads as evidence for the other, even though the Candle route
+/// loads the DiT at F32 and the MLX route does not.
+const CALIBRATION_BACKEND: &str = "candle";
+
+/// The one composition this provider runs: Resident residency, eager materialization.
+///
+/// It is named in the identity rather than left implicit because `MemoryCalibrationIdentity`
+/// carries the load shape as a separate field, and a reader comparing two strings should not have
+/// to consult that field to know they name different compositions.
+const CALIBRATION_LOAD_COMPOSITION: &str = "resident-eager";
+
+/// The one load shape [`CALIBRATION_LOAD_COMPOSITION`] names.
+const CALIBRATION_LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
+
+/// The weights-free conformance witness, deliberately **not** a production string: a catalog walk
+/// reads no artifact, so it can never prove a tier and must never publish a measurable identity.
+const WEIGHTS_FREE_CALIBRATION_FINGERPRINT: &str = "scail2-14b-candle-weights-free-conformance-v1";
+
+/// The production calibration identity for a Candle SCAIL-2 load of `artifact_tier`.
+///
+/// `None` for every tier but dense bf16 — and that is a *routing* fact, not an omission:
+/// `PreparedMemory::prepare` refuses `config.packed_quant.is_some() || spec.quantize.is_some()`
+/// (see the `accepts dense bf16 only` refusal) and `is_bf16_tier` requires the snapshot's own
+/// `bf16` directory, so the Candle lane has no q4 or q8 cell to name. If the engine ever grows
+/// one, this function is where its string is minted.
+pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> Option<String> {
+    if artifact_tier.quant.is_some() {
+        return None;
+    }
+    Some(format!(
+        "scail2-14b-bf16-{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}-v1"
+    ))
+}
+
+/// The identity a **sealed** receipt publishes, or `None` when the cell cannot be proven.
+///
+/// Withheld — never a load failure — when:
+///
+/// * an adapter overlays the sealed tier, because the overlaid run is not the cell a measurement
+///   was taken on;
+/// * the spec's load shape is not [`CALIBRATION_LOAD_SHAPE`], because the published composition
+///   would then disagree with the one that actually ran.
+fn production_calibration_identity(
+    spec: &LoadSpec,
+    tier: MemoryNumericTier,
+    adapters_present: bool,
+) -> Option<MemoryCalibrationIdentity> {
+    if adapters_present || spec.load_shape != CALIBRATION_LOAD_SHAPE {
+        return None;
+    }
+    production_calibration_fingerprint(tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdapterRealization {
@@ -345,7 +404,11 @@ impl PreparedMemory {
                 "{PROVIDER_ID}: weights must be the canonical {CANONICAL_REPOSITORY}@{CANONICAL_REVISION}/bf16 artifact"
             )));
         }
-        let contract = build_contract(spec, artifact.facts);
+        let contract = build_contract(
+            spec,
+            artifact.facts,
+            production_calibration_identity(spec, tier, !adapters.is_empty()),
+        );
         let structural_evidence = build_structural_evidence(&artifact, &adapters, tier);
         structural_evidence.validate()?;
         Ok(Self {
@@ -579,6 +642,9 @@ fn build_structural_evidence(
     let mut hasher = Sha256::new();
     hasher.update(CANONICAL_REPOSITORY);
     hasher.update(CANONICAL_REVISION);
+    // sc-22736: both lanes seal the same `SceneWorks/scail2-mlx` bf16 root, so without a backend
+    // token the two receipts are the same 64 hex characters.
+    hasher.update(CALIBRATION_BACKEND);
     hasher.update("bf16");
     for pin in &artifact.pins {
         hasher.update(format!("{pin:?}"));
@@ -685,7 +751,11 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     }
 }
 
-fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
+fn build_contract(
+    spec: &LoadSpec,
+    facts: MemoryAssetFacts,
+    calibration: Option<MemoryCalibrationIdentity>,
+) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -735,7 +805,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
                 MemoryFormulaVariable::OverlayBytes,
             ],
         },
-        calibration: None,
+        calibration,
         asset_facts: facts,
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     }
@@ -749,7 +819,16 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
 /// still require the immutable canonical receipt in [`PreparedMemory::prepare`].
 fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     validate_load_spec(spec)?;
-    Ok(build_contract(spec, MemoryAssetFacts::default()))
+    // A weights-free witness proves no tier, so it publishes the conformance string and never a
+    // production one. `assert_ne!` in the tests below is what keeps the two apart.
+    Ok(build_contract(
+        spec,
+        MemoryAssetFacts::default(),
+        Some(MemoryCalibrationIdentity::new(
+            WEIGHTS_FREE_CALIBRATION_FINGERPRINT.to_owned(),
+            spec.load_shape,
+        )),
+    ))
 }
 
 fn resident_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
@@ -969,7 +1048,7 @@ pub(crate) mod tests {
             }
         }
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/unread")));
-        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        let contract = build_contract(&spec, MemoryAssetFacts::default(), None);
         for strategy in MemoryStrategy::ALL {
             let expected = if strategy == MemoryStrategy::Resident {
                 MemoryStrategySupport::Implemented
@@ -1003,7 +1082,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
-        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        let contract = build_contract(&spec, MemoryAssetFacts::default(), None);
         assert_eq!(
             contract.architecture_facts,
             gen_core::MemoryArchitectureFacts {
@@ -1162,7 +1241,19 @@ pub(crate) mod tests {
         ] {
             let (_temp, spec) = candle_fixture(adapter);
             let prepared = PreparedMemory::prepare(&spec).unwrap();
-            assert_eq!(prepared.contract.calibration, None);
+            // sc-22736: the dense-bf16 cell publishes its production identity, and an adapter
+            // overlay withholds it — an overlaid run is not the cell a measurement was taken on.
+            assert_eq!(
+                prepared
+                    .contract
+                    .calibration
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                adapter
+                    .is_none()
+                    .then_some("scail2-14b-bf16-candle-resident-eager-v1"),
+                "{adapter:?}"
+            );
             assert!(prepared.contract.asset_facts.base_bytes > 0);
             assert_eq!(prepared.contract.asset_facts.overlay_bytes, 0);
             assert_eq!(
@@ -1191,7 +1282,13 @@ pub(crate) mod tests {
             selection,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Resident,
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: String::new(),
+            // Handshake against whatever the sealed contract publishes (sc-22736).
+            calibration_fingerprint: prepared
+                .contract
+                .calibration
+                .as_ref()
+                .map(|identity| identity.fingerprint.clone())
+                .unwrap_or_default(),
             load_shape: prepared.contract.load_shape,
             mode: gen_core::MemoryMode::Other(mode.to_owned()),
             has_reference: true,
@@ -1361,5 +1458,83 @@ pub(crate) mod tests {
         };
         std::fs::write(root.join("dit.safetensors"), b"mutated").unwrap();
         assert!(base_prepared.ensure_unchanged(&base_spec.adapters).is_err());
+    }
+
+    /// The MLX peer's bf16 production string, repeated here as a literal on purpose.
+    ///
+    /// `mlx-gen-scail2` is not a dependency of this crate (and cannot be — it does not build off
+    /// macOS), so the only way to prove the two lanes do not collide is to name the peer's string
+    /// and assert the inequality. If the peer's string ever changes, this literal must be updated
+    /// in the same commit, which is exactly the review the collision deserves.
+    const MLX_PEER_BF16_FINGERPRINT: &str = "scail2-14b-bf16-mlx-resident-eager-v1";
+
+    /// The Candle bf16 cell names its own lane, and never the MLX peer's.
+    ///
+    /// Both lanes seal receipts over the *same* `SceneWorks/scail2-mlx@<rev>/bf16` snapshot, so a
+    /// backend-free identity would let a Candle measurement be read as MLX evidence.
+    #[test]
+    fn the_candle_bf16_identity_names_its_lane_and_never_collides_with_the_mlx_peer() {
+        let bf16 = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: None,
+            component_precision_floors: &[],
+        };
+        let published = production_calibration_fingerprint(bf16).unwrap();
+        assert_eq!(published, "scail2-14b-bf16-candle-resident-eager-v1");
+        assert_ne!(published, MLX_PEER_BF16_FINGERPRINT);
+        assert!(published.contains(CALIBRATION_BACKEND));
+
+        // A weights-free witness reads no artifact, so it must not be able to publish a production
+        // string.
+        let (_temp, spec) = candle_fixture(None);
+        let free = weights_free_resident_contract(&spec).unwrap();
+        let free_fingerprint = free.calibration.as_ref().unwrap().fingerprint.clone();
+        assert_eq!(free_fingerprint, WEIGHTS_FREE_CALIBRATION_FINGERPRINT);
+        assert_ne!(free_fingerprint, published);
+        assert_ne!(free_fingerprint, MLX_PEER_BF16_FINGERPRINT);
+    }
+
+    /// The Candle lane routes **no** packed tier, and this test goes red the day it does.
+    ///
+    /// `PreparedMemory::prepare` refuses `config.packed_quant.is_some() || spec.quantize.is_some()`
+    /// with `accepts dense bf16 only`, and the canonical-artifact check requires the snapshot's own
+    /// `bf16` directory. That is why `production_calibration_fingerprint` mints nothing for q4/q8:
+    /// there is no Candle cell to name. If either refusal is relaxed without minting the
+    /// corresponding string, this fails.
+    #[test]
+    fn the_candle_lane_routes_no_packed_tier_so_it_mints_no_packed_identity() {
+        for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: Some(quant),
+                component_precision_floors: &[],
+            };
+            assert_eq!(production_calibration_fingerprint(tier), None);
+
+            let (_temp, mut spec) = candle_fixture(None);
+            spec.quantize = Some(quant);
+            let error = PreparedMemory::prepare(&spec)
+                .expect_err("the Candle SCAIL-2 surface is dense bf16 only")
+                .to_string();
+            assert!(
+                error.contains("dense-bf16 public animation surface")
+                    || error.contains("dense bf16 only"),
+                "{quant:?}: {error}"
+            );
+        }
+
+        // A packed root is refused by name as well: the canonical tier directory is `bf16`.
+        let (temp, _spec) = candle_fixture(None);
+        let bf16 = temp
+            .path()
+            .join("models--SceneWorks--scail2-mlx")
+            .join("snapshots")
+            .join(CANONICAL_REVISION)
+            .join("bf16");
+        let q4 = bf16.with_file_name("q4");
+        std::fs::rename(&bf16, &q4).unwrap();
+        let mut spec = LoadSpec::new(WeightsSource::Dir(q4));
+        spec.resolved_route = Some(PROVIDER_ID.to_owned());
+        assert!(PreparedMemory::prepare(&spec).is_err());
     }
 }

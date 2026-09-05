@@ -218,7 +218,10 @@ pub fn architecture_facts(
             crate::config::VaeConfig::ti2v_5b().z_dim,
             crate::WAN_Z48_VAE_TILING,
         ),
-        gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
+        // T2V and I2V A14B share `wan14b.rs` and therefore one transformer preset; the routes
+        // differ in their carrier, not in their trunk shape.
+        gen_core::wan_i2v_memory::WanI2vRoute::T2v14b
+        | gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
         | gen_core::wan_i2v_memory::WanI2vRoute::Vace
         | gen_core::wan_i2v_memory::WanI2vRoute::VaceFun => (
             crate::config::TransformerConfig::i2v_14b(),
