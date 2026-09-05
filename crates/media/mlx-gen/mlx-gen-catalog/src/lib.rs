@@ -1076,9 +1076,28 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
+                // sc-22733: a weights-free surface publishes the conformance family for ITS
+                // resolved tier — never the single pre-sc-22733 string, and never a production
+                // `mage-flow-<route>-<tier>-mlx-shared-ladder-v1` cell, which only a loaded
+                // artifact may name.
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => None,
+                    MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
+                    MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
+                    MemoryContractSurfaceTier::Nvfp4 => Some(mlx_gen::Quant::Nvfp4),
+                };
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT
+                    *fingerprint,
+                    mlx_gen_mage::model::weights_free_calibration_fingerprint(provider_id, tier)
+                        .unwrap(),
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                assert_ne!(
+                    *fingerprint,
+                    mlx_gen_mage::model::production_calibration_fingerprint(provider_id, tier)
+                        .unwrap()
                 );
             }
             assert_eq!(

@@ -69,7 +69,11 @@ const ASSET_FILES: &[&str] = &[
 /// stay dense, matching [`crate::qwen3::Qwen3Backbone::quantize`] exactly. The suffix quirk (the
 /// `_mot_gen` marker attaches to the *proj* segment for attention but the *mlp* segment for the MLP)
 /// is handled by matching the un-suffixed proj name at the end.
-fn is_backbone_linear(base: &str) -> bool {
+/// The decoder-stack Linears the converter packs — and therefore the exact key set that carries the
+/// numeric tier. [`crate::memory_strategy::resolved_artifact_tier`] reads the artifact's tier off
+/// these bases, and the Candle sibling's `is_backbone_linear` scans the same set, so the converter,
+/// the two admission seams, and the loader cannot drift apart about what "the backbone" is.
+pub(crate) fn is_backbone_linear(base: &str) -> bool {
     // Only the language-model decoder stack; skip vision / fm_modules / top-level heads.
     let Some(rest) = base.strip_prefix("language_model.model.layers.") else {
         return false;
