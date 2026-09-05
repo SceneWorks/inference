@@ -67,14 +67,14 @@ pub const SDXL_ROUTES: &[SdxlRoute] = &[
     SdxlRoute {
         id: "illustrious_xl_v1",
         repository: "SceneWorks/illustrious-xl-v1-mlx",
-        revision: "c5a92a902dd4e6ee99c2a57981ecf66209905dd1",
+        revision: "778c3f02b7703b0c2755d0c0447592897193c6b5",
         edit: true,
         lightning: false,
     },
     SdxlRoute {
         id: "illustrious_xl_v2",
         repository: "SceneWorks/illustrious-xl-v2-mlx",
-        revision: "7c5c8b2bb75a8f38a7365e70bdf84d38d6204473",
+        revision: "672e9851ede4dc856fa945649b6691975c9d74a3",
         edit: true,
         lightning: false,
     },
@@ -1666,11 +1666,29 @@ mod tests {
     }
 
     fn dense_spec(temp: &tempfile::TempDir) -> (LoadSpec, PathBuf) {
-        let route = SDXL_ROUTES[0];
+        dense_spec_for(temp, SDXL_ROUTES[0], SDXL_ROUTES[0].revision)
+    }
+
+    /// The `dense_spec` fixture for an arbitrary route, resolved from an arbitrary revision.
+    ///
+    /// `revision` is a separate parameter rather than `route.revision` on purpose: the drift this
+    /// crate shipped (sc-22729) was invisible to every fixture that built its snapshot path out of
+    /// the very constant under test. The shipped-catalog test passes the manifest's revision here,
+    /// so a route whose constant does not equal the shipped revision fails to seal.
+    fn dense_spec_for(
+        temp: &tempfile::TempDir,
+        route: SdxlRoute,
+        revision: &str,
+    ) -> (LoadSpec, PathBuf) {
+        let name = route
+            .repository
+            .rsplit('/')
+            .next()
+            .unwrap_or(route.repository);
         let root = temp
             .path()
-            .join("SceneWorks__sdxl-base-mlx")
-            .join(route.revision)
+            .join(format!("SceneWorks__{name}"))
+            .join(revision)
             .join("bf16");
         for component in ["unet", "text_encoder", "text_encoder_2"] {
             std::fs::create_dir_all(root.join(component)).unwrap();
@@ -1710,11 +1728,141 @@ mod tests {
         std::fs::write(&clip_g, b"{}").unwrap();
         write_vae(&vae);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
-            .with_resolved_route("sdxl")
+            .with_resolved_route(route.id)
             .with_component("tokenizer_clip_l", WeightsSource::File(clip_l))
             .with_component("tokenizer_clip_bigg", WeightsSource::File(clip_g))
             .with_component("vae_fp16_fix", WeightsSource::File(vae));
         (spec, root)
+    }
+
+    /// The five route revisions the SceneWorks catalog actually ships, transcribed from
+    /// `config/manifests/builtin.models.jsonc` — the `downloads[].revision` of the `sdxl`,
+    /// `realvisxl`, `realvisxl_lightning`, `illustrious_xl_v1` and `illustrious_xl_v2` entries.
+    ///
+    /// This is deliberately a SECOND declaration of the same fact rather than a read of
+    /// [`SDXL_ROUTES`]. The two Illustrious routes shipped pinned to revisions the catalog had
+    /// already moved past (SceneWorks `0f2b7d1`, 2026-08-23, re-published both turnkeys with
+    /// reviewed authorities), and because [`SdxlArtifactSeal::capture`] matches the *engine's own*
+    /// literal through `path_has_snapshot`, every candle-lane load of those two models refused for
+    /// every user — `candle_gen_sdxl::load` propagates the seal error. Every fixture that builds
+    /// its snapshot path out of `route.revision` is blind to that class of drift by construction;
+    /// this table is not. Update it and [`SDXL_ROUTES`] together, from the manifest.
+    const SHIPPED_ROUTE_REVISIONS: &[(&str, &str, &str)] = &[
+        (
+            "sdxl",
+            "SceneWorks/sdxl-base-mlx",
+            "36699bb8a6353e61c920e3bf19f0e6f8e4151c55",
+        ),
+        (
+            "realvisxl",
+            "SceneWorks/realvisxl-mlx",
+            "e40202d63baef826c7df95a639a811698c1178d2",
+        ),
+        (
+            "realvisxl_lightning",
+            "SceneWorks/realvisxl-lightning-mlx",
+            "c09fd586989bdc3c658d4acd03e8ae81677ade8e",
+        ),
+        (
+            "illustrious_xl_v1",
+            "SceneWorks/illustrious-xl-v1-mlx",
+            "778c3f02b7703b0c2755d0c0447592897193c6b5",
+        ),
+        (
+            "illustrious_xl_v2",
+            "SceneWorks/illustrious-xl-v2-mlx",
+            "672e9851ede4dc856fa945649b6691975c9d74a3",
+        ),
+    ];
+
+    /// sc-22729: every route resolves from the revision the catalog ships, in every tier, in each
+    /// of the three snapshot layouts `path_has_snapshot` accepts — and refuses any other revision.
+    ///
+    /// *Mutations that red this:* restoring either Illustrious route's pre-`0f2b7d1` revision;
+    /// dropping any one of the three layout arms of `path_has_snapshot`; comparing the revision
+    /// by prefix instead of by whole path component.
+    #[test]
+    fn every_route_seals_from_the_shipped_catalog_revision() {
+        assert_eq!(
+            SDXL_ROUTES.len(),
+            SHIPPED_ROUTE_REVISIONS.len(),
+            "the shipped-revision table must name every route"
+        );
+        for (route, &(id, repository, revision)) in SDXL_ROUTES.iter().zip(SHIPPED_ROUTE_REVISIONS)
+        {
+            assert_eq!(route.id, id, "route order must match the shipped table");
+            assert_eq!(route.repository, repository);
+            assert_eq!(
+                route.revision, revision,
+                "route {id} is pinned to a revision the SceneWorks catalog does not ship; \
+                 every load of it refuses at the artifact seal"
+            );
+        }
+
+        // Path-level: each accepted snapshot layout, at each tier, for each route.
+        let stale = "0".repeat(40);
+        for route in SDXL_ROUTES.iter().copied() {
+            let name = route
+                .repository
+                .rsplit('/')
+                .next()
+                .unwrap_or(route.repository);
+            let marker = format!("models--{}", route.repository.replace('/', "--"));
+            for tier in ["q4", "q8", "bf16"] {
+                for shape in [
+                    Path::new("/cache")
+                        .join(&marker)
+                        .join("snapshots")
+                        .join(route.revision)
+                        .join(tier),
+                    Path::new("/cache")
+                        .join(name)
+                        .join(route.revision)
+                        .join(tier),
+                    Path::new("/cache")
+                        .join(format!("SceneWorks__{name}"))
+                        .join(route.revision)
+                        .join(tier),
+                ] {
+                    assert!(
+                        path_has_snapshot(&shape, route, tier),
+                        "{} must resolve from {}",
+                        route.id,
+                        shape.display()
+                    );
+                }
+                assert!(
+                    !path_has_snapshot(
+                        &Path::new("/cache").join(name).join(&stale).join(tier),
+                        route,
+                        tier
+                    ),
+                    "{} must refuse a snapshot that is not its pinned revision",
+                    route.id
+                );
+            }
+        }
+
+        // Seal-level, weights-free: a complete dense fixture rooted at the SHIPPED revision.
+        for &(id, _, revision) in SHIPPED_ROUTE_REVISIONS {
+            let route = SDXL_ROUTES
+                .iter()
+                .copied()
+                .find(|route| route.id == id)
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let (spec, _) = dense_spec_for(&temp, route, revision);
+            let seal = SdxlArtifactSeal::capture(&spec).unwrap_or_else(|error| {
+                panic!("{id} must seal from the shipped snapshot {revision}: {error}")
+            });
+            assert!(seal.contract().conformance_errors().is_empty());
+
+            let (drifted, _) = dense_spec_for(&temp, route, &stale);
+            assert!(
+                SdxlArtifactSeal::capture(&drifted).is_err(),
+                "{id} must refuse a snapshot directory that is not the pinned revision"
+            );
+        }
     }
 
     /// AC (epic SC-22657, E1): every SDXL asset field prices what the loader materializes.
