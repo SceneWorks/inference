@@ -542,6 +542,31 @@ pub(crate) fn streamable_spec(provider_id: &str, spec: &LoadSpec) -> bool {
             && root.join(crate::DISTILL_MERGED_MARKER).is_file())
 }
 
+/// Is this `_fast` spec the PRE-MERGED turnkey shape a campaign anchor actually measures?
+///
+/// `validate_load_spec` deliberately admits a `distill_lora` component on `MODEL_ID_FAST`, and
+/// `lib.rs`'s loader merges a LoRA into the dense base at load whenever the turnkey's
+/// [`crate::DISTILL_MERGED_MARKER`] is absent. That is a *different resident shape* from the
+/// pre-merged turnkey: the merge holds the dense base and the LoRA tensors live at once, so its
+/// peak is not the peak the packaged anchor prices. Publishing
+/// `sensenova-u1-fast-<tier>-candle-request-memory-ladder-v1` for it would file one load's
+/// measurement under another load's identity, which is exactly the collision epic 22723 exists to
+/// remove. The MLX sibling already refuses it (`mlx-gen-sensenova`'s
+/// `production_calibration_identity`); this is the Candle half of the same rule.
+///
+/// The quality id has no distill path at all, so it is unconditionally the measured shape.
+fn fast_spec_is_the_premerged_turnkey(provider_id: &str, spec: &LoadSpec) -> bool {
+    if provider_id != crate::MODEL_ID_FAST {
+        return true;
+    }
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return false;
+    };
+    // A caller-supplied `distill_lora` component means a merge at load even when the marker IS
+    // present, so both conditions gate — not just the marker.
+    spec.components.is_empty() && root.join(crate::DISTILL_MERGED_MARKER).is_file()
+}
+
 /// Bind the declared numeric tier to the turnkey's converter-written provenance before any model
 /// tensor reaches CUDA. Candle does not quantize at load time: q4/q8 must already be packed, while a
 /// bf16 declaration must not point at a packed directory.
@@ -583,9 +608,11 @@ pub(crate) fn provider_contract(
             inventory.validate_numeric_tier(spec)?;
             (
                 inventory.asset_facts()?,
-                production_calibration_fingerprint(provider_id, spec).map(|fingerprint| {
-                    MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)
-                }),
+                production_calibration_fingerprint(provider_id, spec)
+                    .filter(|_| fast_spec_is_the_premerged_turnkey(provider_id, spec))
+                    .map(|fingerprint| {
+                        MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)
+                    }),
             )
         }
         None => (MemoryAssetFacts::default(), None),
@@ -1352,6 +1379,86 @@ mod tests {
                 .unwrap()
                 .fingerprint
                 .contains("weights-free-conformance"));
+        }
+    }
+
+    /// **The `_fast` route publishes an identity ONLY for the pre-merged turnkey shape** (sc-22734
+    /// review). `validate_load_spec` admits a `distill_lora` component on `MODEL_ID_FAST`, and
+    /// `lib.rs` merges a LoRA into the dense base at load whenever `DISTILL_MERGED_MARKER` is
+    /// absent — a different resident shape from the pre-merged turnkey the campaign measures. Both
+    /// marker-less and component-bearing `_fast` loads must therefore withhold the identity, while
+    /// the marker-bearing turnkey still publishes and the QUALITY id (which has no distill path at
+    /// all) is untouched by the guard.
+    ///
+    /// Mutation that fails this: removing the `fast_spec_is_the_premerged_turnkey` filter in
+    /// `provider_contract` — a load-time LoRA merge is filed under the turnkey's anchor key.
+    #[test]
+    fn a_fast_load_that_would_merge_a_lora_publishes_no_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        for route in FAST_ROUTES {
+            let provider = crate::MODEL_ID_FAST;
+            // The turnkey shape `tier_root` mints (marker present, no components) still publishes.
+            let turnkey = tier_root(tmp.path(), route, None);
+            assert!(turnkey.join(crate::DISTILL_MERGED_MARKER).is_file());
+            let published = provider_contract(provider, &tier_spec(&turnkey, route, None))
+                .unwrap()
+                .calibration
+                .expect("the pre-merged turnkey publishes");
+            assert_eq!(
+                published.fingerprint,
+                format!(
+                    "sensenova-u1-{}-bf16-candle-request-memory-ladder-v1",
+                    route_label(route).unwrap()
+                ),
+                "{route}"
+            );
+
+            // (a) The SAME root with the marker removed: `lib.rs` would resolve and merge the
+            // co-located distill LoRA at load, so no identity may be published.
+            let markerless = tmp
+                .path()
+                .join(format!("{route}-markerless"))
+                .join(format!("SceneWorks__{}-mlx", route.replace('_', "-")));
+            write_tier_fixture(&markerless, None);
+            assert!(!markerless.join(crate::DISTILL_MERGED_MARKER).exists());
+            assert!(
+                provider_contract(provider, &tier_spec(&markerless, route, None))
+                    .unwrap()
+                    .calibration
+                    .is_none(),
+                "{route}: a marker-less _fast root published a turnkey identity"
+            );
+
+            // (b) A caller-supplied `distill_lora` component merges at load even over the
+            // marker-bearing turnkey, so that spec must withhold too.
+            let mut with_component = tier_spec(&turnkey, route, None);
+            with_component.components.insert(
+                "distill_lora".to_owned(),
+                WeightsSource::File(turnkey.join(crate::distill::DISTILL_LORA_FILE)),
+            );
+            assert!(
+                validate_load_spec(provider, &with_component).is_ok(),
+                "{route}: the component is admitted by validation — the guard is what refuses it"
+            );
+            assert!(
+                provider_contract(provider, &with_component)
+                    .unwrap()
+                    .calibration
+                    .is_none(),
+                "{route}: a component-bearing _fast spec published a turnkey identity"
+            );
+        }
+
+        // The quality id has no distill path, so the guard never withholds there.
+        for route in QUALITY_ROUTES {
+            let root = tier_root(tmp.path(), route, None);
+            assert!(
+                provider_contract(crate::MODEL_ID, &tier_spec(&root, route, None))
+                    .unwrap()
+                    .calibration
+                    .is_some(),
+                "{route}: the guard withheld a quality identity"
+            );
         }
     }
 
