@@ -13,7 +13,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Result, WeightsSource};
+use mlx_gen::{LoadSpec, Result, WeightsSource};
 
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
@@ -87,14 +87,39 @@ pub(crate) fn load_validated_tokenizer(
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree
 /// under the `"model"` prefix — no remap needed. Manifest-aware: a pre-quantized klein snapshot
 /// (sc-5917 convert) loads packed; a stock dense snapshot loads dense (no `quantization` block).
+/// A pinned SceneWorks turnkey whose q4/q8 `text_encoder/config.json` carries the stale packed
+/// marker over dense shards (sc-22727) is validated through the artifact inventory and loads dense.
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
-    let selected = crate::config::KLEIN_ENCODER_CONTRACT
-        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
-    selected.read_unchanged(load_text_encoder_from_source)
+    let selected = crate::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load(
+        crate::config::KLEIN_ENCODER_CONTRACT,
+        crate::config::FLUX2_KLEIN_9B_ID,
+        &LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+        root,
+    )?;
+    let quant = validated_text_encoder_quant(&selected);
+    selected.read_unchanged(|source| load_text_encoder_from_source(source, quant))
 }
 
-pub(crate) fn load_text_encoder_from_source(source: &WeightsSource) -> Result<Qwen3TextEncoder> {
-    let quant = read_source_quant(source)?;
+/// The packed parts the concrete Qwen3 load must build from, derived from the **validated** source.
+///
+/// Never re-read the on-disk `quantization` block here: a pinned SceneWorks turnkey carries a stale
+/// q4/q8 marker over dense shards (sc-22727), which the contract verifies and then discards —
+/// [`ValidatedEncoderSource::packed_quant_bits`] reports `None` for it. Re-reading the block would
+/// hand `Some(Flux2Quant{4,64})` to `from_weights_quant` and survive only because `lin()` and
+/// `load_embed()` silently fall back to dense when `.scales` is absent.
+pub(crate) fn validated_text_encoder_quant(
+    selected: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Option<Flux2Quant> {
+    selected.packed_quant_bits().map(|bits| Flux2Quant {
+        bits,
+        group_size: selected.packed_quant_group_size().unwrap_or(64),
+    })
+}
+
+pub(crate) fn load_text_encoder_from_source(
+    source: &WeightsSource,
+    quant: Option<Flux2Quant>,
+) -> Result<Qwen3TextEncoder> {
     let w = weights_from_source(source)?;
     let encoder = Qwen3TextEncoder::from_weights_quant(
         &w,
