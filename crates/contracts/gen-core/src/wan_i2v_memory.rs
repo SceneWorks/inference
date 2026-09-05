@@ -437,10 +437,13 @@ fn tier(spec: &LoadSpec, backend: WanI2vBackend) -> crate::Result<MemoryNumericT
 /// concrete snapshot id it found, which the artifact identity hashes — so the seal stays bound to
 /// exact content. What it does not do is demand one *particular* id the manifest never promised.
 ///
-/// Only `wan2_2_t2v_14b`'s Candle bf16 leg uses it today. `wan2_2_i2v_14b`'s equivalent leg
-/// (`Wan-AI/Wan2.2-I2V-A14B-Diffusers`) is *also* unpinned in the manifest yet carries a hard
-/// revision here; that pin predates this mechanism and is left exactly as it is, because loosening
-/// a pin that already holds would widen an admitted surface for no measurement reason.
+/// Every Candle dense leg uses it (sc-22736 review): the manifest ships all three `Wan-AI/…-Diffusers`
+/// bf16 downloads (`Wan2.2-TI2V-5B`, `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`) with NO `revision` key
+/// and the SceneWorks resolver binds whichever snapshot is staged, so a hard pin here is a promise
+/// the manifest never made: the cell reports `runnable` and then fails inside
+/// [`repository_revision`] mid-campaign the moment the staged snapshot is any other commit. The
+/// content pin is the snapshot id the receipt hashes, exactly as on the T2V leg. The MLX legs and
+/// every packed `SceneWorks/…-candle` tier keep their hard revisions: those the manifest DOES pin.
 const UNPINNED_UPSTREAM_REVISION: &str = "unpinned-upstream-snapshot";
 
 /// The concrete 40-hex snapshot id a synthetic fixture tree must use for a route whose policy
@@ -701,17 +704,17 @@ fn repository_policy(
             "SceneWorks/wan2.2-t2v-a14b-candle",
             "da1909b66b360e1ea8cdeb3e39e40dca172cfa32",
         ),
+        // The manifest pins no revision for any of the three upstream dense snapshots, so the
+        // policy names the repository and lets the snapshot id itself be the content pin — see
+        // [`UNPINNED_UPSTREAM_REVISION`].
         (WanI2vBackend::Candle, WanI2vRoute::Ti2v5b, None) => (
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-            "b8fff7315c768468a5333511427288870b2e9635",
+            UNPINNED_UPSTREAM_REVISION,
         ),
         (WanI2vBackend::Candle, WanI2vRoute::I2v14b, None) => (
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-            "596658fd9ca6b7b71d5057529bbf319ecbc61d74",
+            UNPINNED_UPSTREAM_REVISION,
         ),
-        // The manifest pins no revision for this upstream dense snapshot, so the policy names the
-        // repository and lets the snapshot id itself be the content pin — see
-        // [`UNPINNED_UPSTREAM_REVISION`].
         (WanI2vBackend::Candle, WanI2vRoute::T2v14b, None) => (
             "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             UNPINNED_UPSTREAM_REVISION,
@@ -4091,6 +4094,79 @@ mod tests {
         )
         .unwrap();
         assert!(validate_request(&prepared, &ti2v_extend_request()).is_err());
+    }
+
+    /// Every Candle dense leg is bound to the snapshot it is STAGED at, not to a revision the
+    /// manifest never pinned (sc-22736 review): a well-formed snapshot id other than the fixture's
+    /// prepares and is the receipt's revision, and a malformed one is still refused. Mutation that
+    /// reds this: restoring a hard revision on any of the three `(Candle, route, None)` arms of
+    /// `repository_policy`.
+    #[test]
+    fn every_candle_dense_leg_accepts_the_staged_snapshot_and_refuses_a_malformed_one() {
+        const STAGED: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        for route in [
+            WanI2vRoute::Ti2v5b,
+            WanI2vRoute::T2v14b,
+            WanI2vRoute::I2v14b,
+        ] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            };
+            let (repository, policy_revision) =
+                repository_policy(WanI2vBackend::Candle, route, tier);
+            assert_eq!(policy_revision, UNPINNED_UPSTREAM_REVISION, "{route:?}");
+            let (tmp, _spec) = candle_fixture(route, None);
+            let snapshots = tmp.path().join(repo_dir(repository)).join("snapshots");
+            for (staged, expected) in [
+                (STAGED, Ok(STAGED)),
+                (
+                    "FEDCBA9876543210FEDCBA9876543210FEDCBA98",
+                    Err("upper-case"),
+                ),
+                ("fedcba9876543210fedcba9876543210fedcba9", Err("39 chars")),
+            ] {
+                let root = snapshots.join(staged);
+                if root.exists() {
+                    std::fs::remove_dir_all(&root).unwrap();
+                }
+                std::fs::rename(snapshots.join(FIXTURE_UNPINNED_REVISION), &root).unwrap();
+                // A fresh spec over the moved root: the fixture's own pins name absolute paths
+                // under the directory that was just renamed away.
+                let mut moved = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_resolved_route(route.provider_id());
+                moved.quantize = None;
+                let prepared =
+                    prepare_load_spec(&mut moved, WanI2vBackend::Candle, route.provider_id())
+                        .and_then(|()| {
+                            PreparedWanI2vMemory::prepare(
+                                &moved,
+                                WanI2vBackend::Candle,
+                                route.provider_id(),
+                            )
+                        });
+                match expected {
+                    Ok(revision) => {
+                        let prepared = prepared
+                            .unwrap_or_else(|error| panic!("{route:?} at {staged}: {error}"));
+                        assert_eq!(prepared.revision, revision, "{route:?}");
+                        assert_eq!(prepared.repository, repository, "{route:?}");
+                    }
+                    Err(why) => {
+                        let error = prepared
+                            .err()
+                            .unwrap_or_else(|| panic!("{route:?}: {why} must be refused"))
+                            .to_string();
+                        assert!(
+                            error.contains("does not match immutable"),
+                            "{route:?} {why}: {error}"
+                        );
+                    }
+                }
+                std::fs::rename(&root, snapshots.join(FIXTURE_UNPINNED_REVISION)).unwrap();
+            }
+        }
     }
 
     #[test]
