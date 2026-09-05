@@ -321,6 +321,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "while MLX names the Metal base/Eros I2V cell. Sharing a fingerprint would cross the "
         "physical artifact and backend evidence domains."
     ),
+    ("ltx", "CALIBRATED_TIER"): (
+        "the companion of the CALIBRATION_FINGERPRINT exemption above, one level down: this names "
+        "WHICH tier that backend-specific identity was measured on, so it is backend-specific for "
+        "exactly the same reason. Candle's released cell is the CUDA q4 I2V one; MLX's is the Metal "
+        "q8 base cell its retained anchor is filed under. Making the two agree would either "
+        "relabel a measured record or claim a cell that lane never swept (sc-22737)."
+    ),
     ("ltx", "MEMORY_REGISTRATION"): (
         "the registration is structurally identical but resolves its provider id through each "
         "backend's distinct MODEL_ID; the companion MODEL_ID exemption records the released "
