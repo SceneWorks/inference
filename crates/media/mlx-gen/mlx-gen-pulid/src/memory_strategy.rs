@@ -58,12 +58,16 @@ const STATIC_CALIBRATION: &str = "pulid-flux-static-registry-behavior-v2";
 /// `character_image` load is `Resident + EagerMaterialization`. `None` only when the backbone
 /// itself has no base cell (a non-bf16 precision, a foreign tier, or an extra overlay beside the
 /// identity stack).
+///
+/// This is the (tier) table for the request knob; `adapt` publishes it only when the backbone's
+/// production contract published its own identity, which is where the tier is proven against the
+/// loaded snapshot's markers and packed content (a dense snapshot requantized at load time gets
+/// no backbone identity and therefore no PuLID identity either).
 pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
     let base = backbone_spec(spec);
-    mlx_gen_flux::memory_strategy::production_calibration_fingerprint(
-        mlx_gen_flux::FLUX1_DEV_ID,
-        &base,
-    )?;
+    if !mlx_gen_flux::memory_strategy::has_base_cell(mlx_gen_flux::FLUX1_DEV_ID, &base) {
+        return None;
+    }
     let tier = mlx_gen_flux::memory_strategy::calibration_tier_label(&base)?;
     Some(if tier == "q4" {
         MEMORY_CALIBRATION_FINGERPRINT.to_owned()
@@ -925,6 +929,85 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Write a multi-tensor safetensors file with zeroed payload; `(name, dtype, shape)` per tensor.
+    fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        let mut offset = 0_usize;
+        let mut entries = Vec::new();
+        for (name, dtype, shape) in tensors {
+            let width = match *dtype {
+                "U32" => 4,
+                "BF16" => 2,
+                other => panic!("unexpected fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() * width;
+            let shape = shape
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{}]}}",
+                offset + bytes
+            ));
+            offset += bytes;
+        }
+        let mut header = format!("{{{}}}", entries.join(",")).into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A FLUX.1-dev backbone snapshot whose four components all encode `quant`: a packed Q4/Q8
+    /// triple under a `{"quantization":{"bits":..,"group_size":64}}` marker, or one dense bf16
+    /// weight under an empty config. Header-valid, so the backbone's production contract can prove
+    /// the artifact tier the way it does for the worker's resident load.
+    fn write_backbone_snapshot(root: &Path, quant: Option<Quant>) {
+        for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            let base = if component == "vae" {
+                "probe.attn.to_q"
+            } else {
+                "probe"
+            };
+            let weight = format!("{base}.weight");
+            let scales = format!("{base}.scales");
+            let biases = format!("{base}.biases");
+            match quant {
+                Some(quant) => {
+                    let packed = [2, quant.bits() as usize * 2];
+                    write_safetensors(
+                        &dir.join("model.safetensors"),
+                        &[
+                            (weight.as_str(), "U32", &packed),
+                            (scales.as_str(), "BF16", &[2, 1]),
+                            (biases.as_str(), "BF16", &[2, 1]),
+                        ],
+                    );
+                    std::fs::write(
+                        dir.join("config.json"),
+                        format!(
+                            r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                            quant.bits()
+                        ),
+                    )
+                    .unwrap();
+                }
+                None => {
+                    write_safetensors(
+                        &dir.join("model.safetensors"),
+                        &[(weight.as_str(), "BF16", &[2, 64])],
+                    );
+                    std::fs::write(dir.join("config.json"), "{}").unwrap();
+                }
+            }
+        }
+    }
+
     /// Element counts and stored dtypes for the five identity artifacts, in `identity_paths` order.
     /// The encoder and the EVA tower ship at half precision — exactly the case that used to be
     /// underpriced.
@@ -1118,19 +1201,11 @@ mod tests {
     /// Mutation that fails this: restoring `Some(MemoryCalibrationIdentity::new(
     /// MEMORY_CALIBRATION_FINGERPRINT, ..))` in `adapt` (q8/bf16 then collide with the q4 key), or
     /// the backbone's old `Sequential + DeferredMaterialization + exact composite` gate (every
-    /// resident cell and every non-q4 cell drop to `None`).
+    /// resident cell and every non-q4 cell drop to `None`), or deleting the backbone's
+    /// `artifact_tier != spec.quantize` refusal (the requantized dense snapshot below publishes
+    /// the measured q4 key).
     #[test]
     fn loaded_route_publishes_its_per_tier_identity_for_every_worker_load_shape() {
-        let root_tmp = tempfile::tempdir().unwrap();
-        let root = root_tmp.path().to_path_buf();
-        for (component, bytes) in [("text_encoder", 3_u8), ("transformer", 5), ("vae", 4)] {
-            std::fs::create_dir_all(root.join(component)).unwrap();
-            std::fs::write(
-                root.join(component).join("model.safetensors"),
-                vec![0_u8; usize::from(bytes)],
-            )
-            .unwrap();
-        }
         let exact = IdentityArtifactInventory {
             files: Vec::new(),
             bytes: 4096,
@@ -1150,6 +1225,9 @@ mod tests {
                     LoadShape::DeferredMaterialization,
                 ),
             ] {
+                let root_tmp = tempfile::tempdir().unwrap();
+                let root = root_tmp.path().to_path_buf();
+                write_backbone_snapshot(&root, quant);
                 let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
                     .with_offload_policy(offload_policy)
                     .with_load_shape(load_shape);
@@ -1179,6 +1257,26 @@ mod tests {
                 );
                 let fixture = weights_free_contract(&spec).unwrap();
                 assert_ne!(fixture.calibration.unwrap().fingerprint, fingerprint);
+                // The identity is bound to the backbone artifact, not the request knob: the same
+                // route over a dense snapshot the loader would requantize to `quant` publishes
+                // nothing, even though the tier table still answers for the knob.
+                if let Some(quant) = quant {
+                    let dense_tmp = tempfile::tempdir().unwrap();
+                    let dense_root = dense_tmp.path().to_path_buf();
+                    write_backbone_snapshot(&dense_root, None);
+                    let mut requantized = spec.clone();
+                    requantized.weights = WeightsSource::Dir(dense_root);
+                    assert_eq!(
+                        production_calibration_fingerprint(&requantized).as_deref(),
+                        Some(fingerprint)
+                    );
+                    let contract = contract_with_inventory(&requantized, &exact).unwrap();
+                    assert!(
+                        contract.calibration.is_none(),
+                        "{quant:?} {offload_policy:?} {load_shape:?} over a dense snapshot published {:?}",
+                        contract.calibration
+                    );
+                }
             }
             published.insert(fingerprint);
         }
