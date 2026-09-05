@@ -1006,6 +1006,79 @@ pub(crate) fn provider_contract(
     Ok(contract_from_receipt(provider_id, spec, &receipt))
 }
 
+/// Production calibration identity TABLE of the Ideogram 4 Candle routes, keyed on (route, proven
+/// artifact tier) — sc-22732, epic sc-22723 E1/E4.
+///
+/// This is the table, not the binding: only [`production_calibration_identity`], which is reachable
+/// only from a sealed [`IdeogramLoadReceipt`], may turn one of these strings into a contract
+/// identity.
+///
+/// # Why these strings, and why the manifest has to change
+///
+/// The SceneWorks manifest (`config/manifests/builtin.models.jsonc`) currently declares
+/// `ideogram4-candle-request-scoped-staged-residency-static-v1-base` and `...-static-v1-turbo`
+/// under `candle.memoryStrategyContract` for all three tiers of each route. **Those two literals
+/// exist nowhere in this repository.** The engine has always published `calibration: None` — the
+/// `build_contract` struct literal hard-assigned it — so the manifest named an identity the loaded
+/// contract could never return, and a memory anchor had nothing to bind: the SceneWorks capture arm
+/// reads `contract.calibration` off the loaded generator and refuses a contract without one.
+///
+/// The names below drop the `-static-` token, because these are PRODUCTION identities rather than
+/// registry-conformance ones (the weights-free paths here publish no identity at all), and they add
+/// the tier, because the three tiers of one route are three different resident sets and one anchor
+/// cannot price all three. Updating the manifest to these six strings is SceneWorks-side
+/// follow-through and is not done here.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// [`gen_core::MemoryCalibrationIdentity::load_shape`] carries the materialization axis separately.
+fn production_calibration_fingerprint(provider_id: &str, tier: Option<Quant>) -> Option<String> {
+    let route = match provider_id {
+        MODEL_ID => "base",
+        MODEL_ID_TURBO => "turbo",
+        _ => return None,
+    };
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
+        Some(Quant::Nvfp4) => return None,
+    };
+    Some(format!(
+        "ideogram4-candle-request-scoped-staged-residency-v1-{route}-{tier}"
+    ))
+}
+
+/// The production calibration identity a loaded Ideogram route publishes, bound to the artifact the
+/// receipt admitted (sc-22732).
+///
+/// An [`IdeogramLoadReceipt`] only exists for a snapshot that passed [`validate_snapshot_binding`]
+/// (the canonical, non-symlinked `SceneWorks/<repository>@<revision>/<tier>` path for THIS route)
+/// and whose per-component packed geometry was read off the safetensors headers by
+/// [`inspect_component_tier`] and cross-checked against `route.tier`, so the tier in the identity is
+/// the tier on disk. There is no request knob that could outrank it either: [`validate_load_shape`]
+/// refuses `LoadSpec::quantize` outright on these routes, along with every external-component
+/// composition, before a receipt is ever captured.
+///
+/// Two withholdings, both fail-closed:
+///
+/// * a **loaded user adapter stack** — `capture_adapters` charges it as its own resident component,
+///   so it is a different resident set than the clean base cell an anchor prices; and
+/// * a **PiD overlay**, for the same reason.
+///
+/// `receipt.turbo_adapter` deliberately does NOT withhold: the bundled TurboTime LoRA is the turbo
+/// route's own identity, and [`validate_route`] already refuses a turbo contract that lacks it.
+fn production_calibration_identity(
+    spec: &LoadSpec,
+    receipt: &IdeogramLoadReceipt,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    if !receipt.adapters.is_empty() || receipt.pid.is_some() {
+        return None;
+    }
+    production_calibration_fingerprint(receipt.route.provider, receipt.route.tier)
+        .map(|fingerprint| gen_core::MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
 pub(crate) fn contract_from_receipt(
     provider_id: &str,
     spec: &LoadSpec,
@@ -1058,7 +1131,7 @@ pub(crate) fn contract_from_receipt(
     build_contract(
         provider_id,
         spec,
-        receipt.route.tier,
+        production_calibration_identity(spec, receipt),
         receipt.components,
         resident_components,
     )
@@ -1077,7 +1150,8 @@ pub(crate) fn uncalibrated_contract(
     Ok(build_contract(
         provider_id,
         spec,
-        physical_tier_hint(spec),
+        // A hand-built contract proves no artifact, so it publishes no production identity.
+        None,
         ComponentBytes::default(),
         Vec::new(),
     ))
@@ -1092,16 +1166,14 @@ pub(crate) fn weights_free_contract(
             "unknown Ideogram provider {provider_id}"
         )));
     }
-    let tier = match spec.quantize {
-        None => None,
-        Some(Quant::Q4) => Some(Quant::Q4),
-        Some(Quant::Q8) => Some(Quant::Q8),
-        Some(Quant::Nvfp4) => {
-            return Err(gen_core::Error::Unsupported(
-                "Ideogram has no NVFP4 tier".into(),
-            ))
-        }
-    };
+    // Ideogram ships q4, q8 and bf16 and nothing else. The refusal stays even though no tier is
+    // threaded into the contract any more: a witness built for a tier this family cannot ship would
+    // describe a route that does not exist.
+    if spec.quantize == Some(Quant::Nvfp4) {
+        return Err(gen_core::Error::Unsupported(
+            "Ideogram has no NVFP4 tier".into(),
+        ));
+    }
     let mut normalized = spec.clone();
     normalized.resolved_route = Some(provider_id.to_owned());
     normalized.quantize = None;
@@ -1112,7 +1184,10 @@ pub(crate) fn weights_free_contract(
     Ok(build_contract(
         provider_id,
         &normalized,
-        tier,
+        // Weights-free: no snapshot was opened, so no artifact tier was proven and no production
+        // identity may be published. `validate_context`'s structural-estimate clause depends on
+        // exactly this — see [`candle_gen_sd3`]'s `weights_free_contract`, the same shape.
+        None,
         ComponentBytes::default(),
         Vec::new(),
     ))
@@ -1122,23 +1197,21 @@ pub(crate) fn weights_free_surface_contract(
     provider_id: &str,
     surface: &gen_core::MemoryContractSurfaceSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let tier = match surface.resolved_artifact_tier() {
-        gen_core::MemoryContractSurfaceTier::Bf16 => None,
-        gen_core::MemoryContractSurfaceTier::Q4 => Some(Quant::Q4),
-        gen_core::MemoryContractSurfaceTier::Q8 => Some(Quant::Q8),
-        gen_core::MemoryContractSurfaceTier::Nvfp4 => {
-            return Err(gen_core::Error::Unsupported(
-                "Ideogram has no NVFP4 tier".into(),
-            ))
-        }
-    };
+    // The selector NAMES a resolved tier, it does not prove one on disk — but a selector naming a
+    // tier this family does not ship still describes a route that does not exist, so it is refused.
+    if surface.resolved_artifact_tier() == gen_core::MemoryContractSurfaceTier::Nvfp4 {
+        return Err(gen_core::Error::Unsupported(
+            "Ideogram has no NVFP4 tier".into(),
+        ));
+    }
     let mut spec = surface.spec.clone();
     spec.resolved_route = Some(provider_id.to_owned());
     spec.quantize = None;
     Ok(build_contract(
         provider_id,
         &spec,
-        tier,
+        // Weights-free, as above: a named tier is not a proven one.
+        None,
         ComponentBytes::default(),
         Vec::new(),
     ))
@@ -1184,10 +1257,16 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     }
 }
 
+/// Assemble the provider contract.
+///
+/// `calibration` is decided by the CALLER, never here (sc-22732): only [`contract_from_receipt`]
+/// passes a production identity, because only a sealed [`IdeogramLoadReceipt`] proves the artifact
+/// it names. Every weights-free path passes `None`, which is the structural-estimate handshake
+/// [`validate_context`] holds those contracts to.
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
-    _tier: Option<Quant>,
+    calibration: Option<gen_core::MemoryCalibrationIdentity>,
     components: ComponentBytes,
     resident_components: Vec<MemoryResidentComponent>,
 ) -> MemoryProviderContract {
@@ -1287,7 +1366,7 @@ fn build_contract(
             ],
             resident_components: resident_components.clone(),
         },
-        calibration: None,
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -1454,6 +1533,35 @@ pub(crate) fn registered_safety_check(
             reason: error.to_string(),
         },
     }
+}
+
+/// The calibration ABI a context must claim to satisfy `contract` — `0` when the contract publishes
+/// no identity, which is the structural-estimate handshake [`validate_context`] requires.
+fn calibration_abi(contract: &MemoryProviderContract) -> u32 {
+    contract
+        .calibration
+        .as_ref()
+        .map_or(0, |identity| identity.abi)
+}
+
+/// The calibration fingerprint a context must claim to satisfy `contract` — empty when it publishes
+/// no identity.
+fn calibration_fingerprint(contract: &MemoryProviderContract) -> String {
+    contract
+        .calibration
+        .as_ref()
+        .map_or_else(String::new, |identity| identity.fingerprint.clone())
+}
+
+/// The load shape a context must claim. A published identity carries its own materialization axis,
+/// and `standard_memory_strategy_safety_check` compares the context against THAT, not against
+/// `contract.load_shape`; the two agree on every route this crate builds, and reading the identity
+/// keeps them from silently diverging if one ever moves.
+fn declared_load_shape(contract: &MemoryProviderContract) -> gen_core::LoadShape {
+    contract
+        .calibration
+        .as_ref()
+        .map_or(contract.load_shape, |identity| identity.load_shape)
 }
 
 fn physical_tier_hint(spec: &LoadSpec) -> Option<Quant> {
@@ -1978,9 +2086,13 @@ fn estimated_behavior_context(
     Ok(MemoryRunContext {
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
-        calibration_abi: 0,
-        calibration_fingerprint: String::new(),
-        load_shape: contract.load_shape,
+        // The handshake is READ OFF the contract rather than stamped empty (sc-22732). A
+        // receipt-backed contract now publishes a production calibration identity, and
+        // `validate_context` holds a context to whichever handshake its contract declares: empty
+        // for the weights-free surfaces, the published identity for a loaded route.
+        calibration_abi: calibration_abi(contract),
+        calibration_fingerprint: calibration_fingerprint(contract),
+        load_shape: declared_load_shape(contract),
         mode: route.mode,
         has_reference: route.reference_count > 0,
         use_pid: route.use_pid,
@@ -2238,9 +2350,12 @@ mod tests {
                 },
             },
             optimization_authority: gen_core::MemoryOptimizationAuthority::Estimated,
-            calibration_abi: 0,
-            calibration_fingerprint: String::new(),
-            load_shape: contract.load_shape,
+            // Same three readers as `estimated_behavior_context` (sc-22732): a test context echoes
+            // whatever handshake its contract declares instead of hard-stamping the empty one, so a
+            // receipt-backed contract's context is accepted and a crossed one is still rejected.
+            calibration_abi: calibration_abi(contract),
+            calibration_fingerprint: calibration_fingerprint(contract),
+            load_shape: declared_load_shape(contract),
             geometry: MemoryGeometry {
                 width: 1024,
                 height: 1024,
@@ -2647,5 +2762,281 @@ mod tests {
             .unwrap(),
         );
         admission.approve(&context).unwrap();
+    }
+
+    /// sc-22732 (epic sc-22723, E1 measurable / E4 production loader): every (route, tier) cell the
+    /// worker can load publishes its own production calibration identity through the seam the
+    /// loader itself calls — `IdeogramLoadReceipt::capture` -> [`contract_from_receipt`] — under
+    /// both materialization shapes, so a memory anchor has something to bind. All six cells
+    /// published `calibration: None` before this story, because `build_contract` hard-assigned it.
+    ///
+    /// *Mutations this kills:* restoring `calibration: None` in [`build_contract`] (every cell goes
+    /// back to unmeasurable); dropping the `{tier}` token from
+    /// [`production_calibration_fingerprint`] (the six strings collapse to two and `published`
+    /// rejects the repeat); dropping the `{route}` token (they collapse to three); keying the string
+    /// on the offload policy or the load shape (the two specs per cell would disagree).
+    ///
+    /// The MLX crate's "wrong quant" loop has no analogue here and needs none:
+    /// [`validate_load_shape`] refuses `LoadSpec::quantize` outright on these routes, so no request
+    /// knob can reach a receipt at all. What is asserted instead is the artifact crossing that
+    /// remains reachable — a tier's own bytes placed under a sibling tier's path, and one route's
+    /// snapshot presented as the other's — both of which must fail `capture` rather than publish.
+    #[test]
+    fn every_route_and_tier_publishes_its_own_production_identity() {
+        // The six strings verbatim. The SceneWorks manifest's `candle.memoryStrategyContract` rows
+        // must name exactly these, so a rename here is a breaking change on both sides.
+        const CELLS: [(&str, &str, &str); 6] = [
+            (
+                MODEL_ID,
+                "bf16",
+                "ideogram4-candle-request-scoped-staged-residency-v1-base-bf16",
+            ),
+            (
+                MODEL_ID,
+                "q4",
+                "ideogram4-candle-request-scoped-staged-residency-v1-base-q4",
+            ),
+            (
+                MODEL_ID,
+                "q8",
+                "ideogram4-candle-request-scoped-staged-residency-v1-base-q8",
+            ),
+            (
+                MODEL_ID_TURBO,
+                "bf16",
+                "ideogram4-candle-request-scoped-staged-residency-v1-turbo-bf16",
+            ),
+            (
+                MODEL_ID_TURBO,
+                "q4",
+                "ideogram4-candle-request-scoped-staged-residency-v1-turbo-q4",
+            ),
+            (
+                MODEL_ID_TURBO,
+                "q8",
+                "ideogram4-candle-request-scoped-staged-residency-v1-turbo-q8",
+            ),
+        ];
+
+        let mut published = BTreeSet::new();
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            for (tier, quant) in [
+                ("bf16", None),
+                ("q4", Some(Quant::Q4)),
+                ("q8", Some(Quant::Q8)),
+            ] {
+                let expected = production_calibration_fingerprint(provider, quant).unwrap();
+                assert!(expected.contains(tier), "{provider} {tier}: {expected}");
+                assert_eq!(
+                    expected,
+                    CELLS
+                        .iter()
+                        .find(|(id, label, _)| *id == provider && *label == tier)
+                        .unwrap()
+                        .2,
+                    "{provider} {tier} renamed its published cell key"
+                );
+                let tmp = tempfile::tempdir().unwrap();
+                let root = fixture_root(tmp.path(), provider, tier);
+                for (offload, load_shape) in [
+                    (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                    (
+                        OffloadPolicy::Sequential,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let mut load = spec(root.clone(), provider);
+                    load.offload_policy = offload;
+                    load.load_shape = load_shape;
+                    let receipt = IdeogramLoadReceipt::capture(provider, &load).unwrap();
+                    assert_eq!(receipt.route.tier, quant);
+                    let contract = contract_from_receipt(provider, &load, &receipt);
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {load_shape:?} publishes no identity")
+                    });
+                    assert_eq!(identity.fingerprint, expected, "{provider} {tier}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(
+                        contract.conformance_errors().is_empty(),
+                        "{provider} {tier}: {:?}",
+                        contract.conformance_errors()
+                    );
+                    // The weights-free witness of the same route publishes NOTHING, which is the
+                    // structural-estimate handshake `validate_context` holds it to.
+                    assert!(weights_free_contract(provider, &load)
+                        .unwrap()
+                        .calibration
+                        .is_none());
+                }
+
+                // The other route's snapshot is not this route's cell: the base route needs an
+                // unconditional DiT the turbo snapshot does not ship, and the turbo route refuses
+                // one that does.
+                let other = if provider == MODEL_ID {
+                    MODEL_ID_TURBO
+                } else {
+                    MODEL_ID
+                };
+                assert!(
+                    IdeogramLoadReceipt::capture(other, &spec(root.clone(), other)).is_err(),
+                    "{other} must not claim {provider}'s {tier} snapshot"
+                );
+                assert!(published.insert(expected.clone()), "{provider} {tier}");
+            }
+        }
+        // Six distinct strings: two routes x three tiers. A route-only or tier-only key collapses
+        // this.
+        assert_eq!(published.len(), 6);
+
+        // A tier's own bytes under a sibling tier's path: `inspect_component_tier` reads the
+        // packing off the headers and `capture` cross-checks it against the sealed path tier.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fixture_root(tmp.path(), MODEL_ID, "q4");
+        let crossed = root.parent().unwrap().join("q8");
+        std::fs::rename(&root, &crossed).unwrap();
+        assert!(IdeogramLoadReceipt::capture(MODEL_ID, &spec(crossed, MODEL_ID)).is_err());
+    }
+
+    /// A loaded overlay is a different resident set than the clean base cell an anchor prices, so it
+    /// publishes no identity — while the turbo route's MANDATORY bundled TurboTime LoRA, which
+    /// `validate_route` already requires, leaves the turbo cells intact.
+    ///
+    /// *Mutation this kills:* dropping `!receipt.adapters.is_empty()` (or `receipt.pid.is_some()`)
+    /// from [`production_calibration_identity`]; and, in the other direction, adding
+    /// `receipt.turbo_adapter.is_some()` to it, which would silently retire both turbo cells.
+    #[test]
+    fn a_user_adapter_withholds_the_identity_but_the_bundled_turbo_lora_does_not() {
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fixture_root(tmp.path(), provider, "q4");
+            let clean = spec(root.clone(), provider);
+            let receipt = IdeogramLoadReceipt::capture(provider, &clean).unwrap();
+            assert_eq!(provider == MODEL_ID_TURBO, receipt.turbo_adapter.is_some());
+            assert_eq!(
+                contract_from_receipt(provider, &clean, &receipt)
+                    .calibration
+                    .unwrap()
+                    .fingerprint,
+                production_calibration_fingerprint(provider, Some(Quant::Q4)).unwrap()
+            );
+
+            let adapter = tmp.path().join("user_lora.safetensors");
+            write_safetensors(
+                &adapter,
+                &[("layers.0.lora_down.weight", "F32", &[2, 2], 16)],
+            );
+            let mut adapted = clean;
+            adapted.adapters.push(AdapterSpec {
+                path: adapter,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            });
+            let adapted_receipt = IdeogramLoadReceipt::capture(provider, &adapted).unwrap();
+            assert_eq!(adapted_receipt.adapters.len(), 1);
+            assert!(
+                contract_from_receipt(provider, &adapted, &adapted_receipt)
+                    .calibration
+                    .is_none(),
+                "{provider}: a user adapter stack must publish no identity"
+            );
+        }
+    }
+
+    /// The three context readers (sc-22732): a context built for a receipt-backed contract ECHOES
+    /// the handshake that contract publishes and is ACCEPTED, and every crossing of it is still
+    /// rejected. The weights-free contract keeps the empty handshake and its deliberate
+    /// `calibration_abi = MEMORY_CALIBRATION_ABI` negative control.
+    ///
+    /// *Mutation this kills:* reverting `estimated_behavior_context` to the hard-stamped
+    /// `calibration_abi: 0` / `calibration_fingerprint: String::new()` / `load_shape:
+    /// contract.load_shape` — the receipt-backed context is then refused by `validate_context`'s
+    /// calibration-handshake gate, so no anchor could ever build a run context for a measured route.
+    #[test]
+    fn a_receipt_backed_context_echoes_its_contracts_handshake_and_a_crossed_one_is_refused() {
+        for provider in [MODEL_ID, MODEL_ID_TURBO] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fixture_root(tmp.path(), provider, "q8");
+            let load = spec(root, provider);
+            let receipt = IdeogramLoadReceipt::capture(provider, &load).unwrap();
+            let contract = contract_from_receipt(provider, &load, &receipt);
+            let identity = contract.calibration.clone().unwrap();
+            let tier = receipt.route.tier;
+            let numeric = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: tier,
+                component_precision_floors: &[],
+            };
+            let context = estimated_behavior_context(
+                &contract,
+                MemoryStrategy::StagedResidency,
+                numeric,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::TextToImage,
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(context.calibration_fingerprint, identity.fingerprint);
+            assert_eq!(context.calibration_abi, identity.abi);
+            assert_eq!(context.load_shape, identity.load_shape);
+            validate_context(provider, &contract, &context, tier)
+                .expect("the receipt-backed context must be admitted");
+
+            for crossed in [
+                {
+                    let mut stale = context.clone();
+                    stale.calibration_fingerprint.push_str("-stale");
+                    stale
+                },
+                {
+                    let mut empty = context.clone();
+                    empty.calibration_fingerprint = String::new();
+                    empty.calibration_abi = 0;
+                    empty
+                },
+                {
+                    let mut shape = context.clone();
+                    shape.load_shape = LoadShape::EagerMaterialization;
+                    shape
+                },
+            ] {
+                assert!(
+                    validate_context(provider, &contract, &crossed, tier).is_err(),
+                    "{provider}: a crossed calibration handshake must be refused"
+                );
+            }
+
+            // The weights-free witness publishes none, so its own context stays empty — and the
+            // `registry_behavior_fixtures_cover_every_rung_on_exact_dense_routes` negative control
+            // (a context claiming an ABI) still has something to reject.
+            let witness = weights_free_contract(provider, &load).unwrap();
+            let witness_context = estimated_behavior_context(
+                &witness,
+                MemoryStrategy::StagedResidency,
+                MemoryNumericTier {
+                    precision: Precision::Bf16,
+                    quant: None,
+                    component_precision_floors: &[],
+                },
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::TextToImage,
+                    reference_count: 0,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(witness_context.calibration_abi, 0);
+            assert!(witness_context.calibration_fingerprint.is_empty());
+            let mut crossed = witness_context;
+            crossed.calibration_abi = gen_core::MEMORY_CALIBRATION_ABI;
+            assert!(validate_context(provider, &witness, &crossed, None).is_err());
+        }
     }
 }
