@@ -310,7 +310,11 @@ fn full_shared_ladder_exercises_every_rung_and_preserves_the_image() {
     println!(
         "RESULT status=pass provider=krea_2_turbo tier={} fingerprint={} decode_edge={} decode_overlap={} attention_chunk_size={} transformer_window_size={} staged_peak_gib={:.3} full_ladder_peak_gib={:.3}",
         tier().0,
-        mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT,
+        mlx_gen_krea::block_memory_strategy::production_calibration_fingerprint(
+            "krea_2_turbo",
+            tier().0
+        )
+        .expect("krea_2_turbo publishes a production identity at every shipped tier"),
         mlx_gen_krea::block_memory_strategy::DECODE_TILE_EDGE,
         mlx_gen_krea::block_memory_strategy::DECODE_OVERLAP,
         mlx_gen_krea::block_memory_strategy::ATTENTION_CHUNK_SIZE,

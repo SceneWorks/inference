@@ -64,8 +64,6 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
 /// The Wan terminal decoder has not been measured as part of Krea's whole-request ladder. A separate
 /// identity prevents native-decoder evidence from being reused and forces conservative
 /// asset-facts + headroom estimation (including SceneWorks' estimate margin).
@@ -91,15 +89,19 @@ pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-2-mlx-registry-behavior-v1";
 /// `tier` is `bf16`, `q4`, or `q8` — the tier the base transformer ACTUALLY runs at, never the
 /// request knob alone. Anything else, and any provider id outside the base family, is `None`.
 ///
-/// `krea_2_turbo` deliberately keeps ONE string across all three tiers: the shipped SceneWorks
-/// anchor plan declares [`MEMORY_CALIBRATION_FINGERPRINT`] for all three `krea_2_turbo:*:mlx` rows
-/// and the manifest's turbo `memoryStrategyContract` rows declare it for
-/// `tiers: ["bf16","q4","q8"]`, so re-keying turbo per tier would invalidate three current plan
-/// rows for no evidentiary gain. The other three routes are keyed per (route, tier) as
-/// `krea-2-<route>-<tier>-mlx-shared-ladder-v1`: before sc-22735 all four routes published the
-/// turbo measured string at every tier, so a `krea_2_raw` bf16 anchor was indistinguishable by
+/// **Every** base route — `krea_2_turbo` included — is keyed per (route, tier) as
+/// `krea-2-<route>-<tier>-mlx-shared-ladder-v1`. Before sc-22735 all four routes published one
+/// measured turbo string at every tier, so a `krea_2_raw` bf16 anchor was indistinguishable by
 /// calibration identity from a `krea_2_turbo` q4 anchor, and the capture apparatus binds records
 /// by exactly this string.
+///
+/// Turbo was carved out of the first sc-22735 pass on the argument that its three shipped plan rows
+/// already declared the shared key. That argument does not survive the evidence: SceneWorks'
+/// `config/memory-anchors.json` holds **no** measured `krea_2_turbo` MLX record at any tier (the one
+/// turbo anchor in the catalog is `krea_2_turbo:candle:q4`, which is a Candle string owned by
+/// `candle-gen-krea`). Three MLX plan rows sharing a string with nothing measured behind it is not
+/// preserved evidence — it is an ambiguity with no offsetting gain, so the retired
+/// `krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3` is retained nowhere.
 ///
 /// Offload policy and load shape are deliberately not inputs: the identity names the artifact the
 /// evidence was captured against, and [`MemoryCalibrationIdentity`]`::load_shape` carries the
@@ -113,7 +115,7 @@ pub fn production_calibration_fingerprint(provider_id: &str, tier: &str) -> Opti
         return None;
     }
     let route = match provider_id {
-        crate::model::KREA_2_TURBO_ID => return Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        crate::model::KREA_2_TURBO_ID => "turbo",
         crate::model::KREA_2_RAW_ID => "raw",
         crate::model::KREA_2_EDIT_ID => "edit",
         crate::model::KREA_2_TURBO_EDIT_ID => "turbo-edit",
@@ -1610,44 +1612,33 @@ mod tests {
     ///
     /// Before this change all four base routes published the single measured turbo string at all
     /// three tiers, so a `krea_2_raw` bf16 anchor was indistinguishable by calibration identity
-    /// from a `krea_2_turbo` q4 anchor. Turbo deliberately keeps ONE string across its tiers (the
-    /// shipped anchor plan and manifest rows declare it for `["bf16","q4","q8"]`); the other nine
-    /// cells must be pairwise distinct and match the documented format.
+    /// from a `krea_2_turbo` q4 anchor. Every one of the twelve cells — turbo's three included —
+    /// must now be pairwise distinct and match the documented format.
     #[test]
     fn every_base_route_and_tier_cell_publishes_its_own_production_string() {
         let cells = production_cells();
         assert_eq!(cells.len(), BASE_ROUTES.len() * BASE_TIERS.len());
 
-        let mut turbo = Vec::new();
         let mut per_tier = Vec::new();
         for (provider_id, tier, fingerprint) in &cells {
             mlx_gen::gen_core::validate_calibration_fingerprint(fingerprint)
                 .unwrap_or_else(|reason| panic!("{provider_id}:{tier} fingerprint {reason}"));
-            if *provider_id == crate::model::KREA_2_TURBO_ID {
-                assert_eq!(
-                    fingerprint, MEMORY_CALIBRATION_FINGERPRINT,
-                    "turbo keeps its measured string at {tier}"
-                );
-                turbo.push(fingerprint.clone());
-            } else {
-                let route = provider_id
-                    .strip_prefix("krea_2_")
-                    .expect("base route ids are krea_2_*")
-                    .replace('_', "-");
-                assert_eq!(
-                    *fingerprint,
-                    format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"),
-                    "{provider_id}:{tier}"
-                );
-                per_tier.push(fingerprint.clone());
-            }
+            let route = provider_id
+                .strip_prefix("krea_2_")
+                .expect("base route ids are krea_2_*")
+                .replace('_', "-");
+            assert_eq!(
+                *fingerprint,
+                format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"),
+                "{provider_id}:{tier}"
+            );
+            per_tier.push(fingerprint.clone());
         }
 
-        assert_eq!(turbo.len(), BASE_TIERS.len());
         assert_eq!(
             per_tier.len(),
-            (BASE_ROUTES.len() - 1) * BASE_TIERS.len(),
-            "every non-turbo route is keyed per tier"
+            BASE_ROUTES.len() * BASE_TIERS.len(),
+            "every route is keyed per tier"
         );
         let distinct: std::collections::BTreeSet<_> = per_tier.iter().collect();
         assert_eq!(
@@ -1655,22 +1646,37 @@ mod tests {
             per_tier.len(),
             "no two (route, tier) cells may collide: {per_tier:?}"
         );
+        // The retired shared key is retained by no cell: no MLX turbo record was ever measured
+        // against it, so preserving it would only re-create the ambiguity.
         for fingerprint in &per_tier {
             assert_ne!(
-                fingerprint, MEMORY_CALIBRATION_FINGERPRINT,
-                "only turbo may publish the measured key"
+                fingerprint, RETIRED_SHARED_MLX_FINGERPRINT,
+                "the retired shared MLX key must not come back"
             );
         }
     }
 
-    /// (c) `krea_2_raw` never returns the measured turbo key at any tier — stated on its own so a
+    /// The string every base route used to publish at every tier, kept here and nowhere else so a
+    /// re-collapse onto it reddens a named test rather than passing as a plausible identity.
+    const RETIRED_SHARED_MLX_FINGERPRINT: &str =
+        "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+
+    /// (c) `krea_2_raw` never returns the turbo key at any tier — stated on its own so a
     /// provider-match mutation that folds raw back onto turbo reddens a named test.
     #[test]
-    fn raw_never_publishes_the_measured_turbo_key() {
+    fn raw_never_publishes_the_turbo_key() {
         for tier in BASE_TIERS {
             let raw = production_calibration_fingerprint(crate::model::KREA_2_RAW_ID, tier)
                 .expect("raw ships every tier");
-            assert_ne!(raw, MEMORY_CALIBRATION_FINGERPRINT, "{tier}");
+            assert_ne!(raw, RETIRED_SHARED_MLX_FINGERPRINT, "{tier}");
+            for turbo_tier in BASE_TIERS {
+                assert_ne!(
+                    raw,
+                    production_calibration_fingerprint(crate::model::KREA_2_TURBO_ID, turbo_tier)
+                        .expect("turbo ships every tier"),
+                    "{tier} vs turbo {turbo_tier}"
+                );
+            }
             assert!(raw.starts_with("krea-2-raw-"), "{raw}");
         }
     }
@@ -1936,7 +1942,8 @@ mod tests {
         );
         assert_eq!(
             native.calibration.as_ref().unwrap().fingerprint,
-            MEMORY_CALIBRATION_FINGERPRINT
+            production_calibration_fingerprint(crate::model::KREA_2_TURBO_ID, "q4").unwrap(),
+            "the fixture packs the transformer at q4, so the native contract names the turbo q4 cell"
         );
 
         // sc-22735: the VAE-composite marker keeps precedence over the per-(route, tier) base

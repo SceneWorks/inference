@@ -275,7 +275,14 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// Content identity for the CUDA resident/staged and ladder calibration harness.
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "krea-cuda-residency-ladder-v1";
-/// Provider contract identity for the Krea Turbo five-rung phase curves.
+/// Provider contract identity for the Krea Turbo five-rung phase curves — the **measured q4 cell**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This string used to be published by `krea_2_turbo` at all three
+/// artifact tiers, so a bf16 or q8 turbo capture would have been filed under the same key as the
+/// only turbo record that exists. SceneWorks' `config/memory-anchors.json` holds exactly one turbo
+/// anchor — `krea_2_turbo:candle:q4` — recorded against this exact string, so it is preserved
+/// byte-identical and is now reachable only from the q4 arm of
+/// [`krea_turbo_production_calibration_fingerprint`]. bf16 and q8 get their own keys.
 pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str = "krea-turbo-cuda-phase-curves-v1";
 /// Provider contract identity for the Krea pose-control direct calibration.
 pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-direct-1024-v1";
@@ -2235,11 +2242,10 @@ fn loaded_asset_facts(
 /// pins the executable structure that makes those measurements valid.
 fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
     use gen_core::{
-        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-        MemoryPrerequisiteScope, MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy,
-        MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-        MemoryWindowMaterialization,
+        LoadShape, MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
+        MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
     // File and Dir execute through one provider identity, so the already-qualified resident/staged
@@ -2344,10 +2350,12 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
                 MemoryFormulaVariable::OverlayBytes,
             ],
         },
-        calibration: Some(MemoryCalibrationIdentity::new(
-            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
-            LoadShape::DeferredMaterialization,
-        )),
+        // sc-22735: no identity here. This builder serves BOTH the validated load and the
+        // weights-free surface, and the two must not publish the same key — the tier a production
+        // identity names has to be proven from the artifact, which only the validated path can do.
+        // `validated_krea_turbo_memory_strategy_contract` stamps the production (route, tier) cell;
+        // `weights_free_krea_turbo_memory_strategy_contract` stamps the registry-behavior key.
+        calibration: None,
         // Zero here, and only here: this builder also serves the weights-free surface, which
         // resolves no snapshot. A **validated** load stamps the load-exact decomposition over these
         // through `loaded_asset_facts` (SC-22667, E1); see
@@ -2357,12 +2365,70 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     }
 }
 
+/// Production calibration identity of `krea_2_turbo`, keyed on the **artifact-proven tier**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). Turbo shipped three tiers behind one string, so a bf16 or q8
+/// turbo capture would have been filed under the key of the single measured q4 record. Only the q4
+/// arm is measured, and it keeps [`TURBO_MEMORY_CALIBRATION_FINGERPRINT`] byte-identical — the
+/// SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly that string. bf16 and q8 name
+/// their own cells in the same `phase-curves` family, so an anchor captured on either can never be
+/// read back as authority for the measured one.
+///
+/// `None` for a tier this lane does not ship (NVFP4 and the INT8-ConvRot rotated artifact): the
+/// honest answer is no identity, never another cell's.
+pub fn krea_turbo_production_calibration_fingerprint(tier: Option<Quant>) -> Option<String> {
+    match tier {
+        Some(Quant::Q4) => Some(TURBO_MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        None => Some("krea-2-turbo-bf16-cuda-phase-curves-v1".to_owned()),
+        Some(Quant::Q8) => Some("krea-2-turbo-q8-cuda-phase-curves-v1".to_owned()),
+        Some(_) => None,
+    }
+}
+
+/// Weights-free registry-behavior identity of `krea_2_turbo` at one declared surface tier.
+///
+/// Disjoint from every production string by construction, so a catalog surface — which resolves no
+/// snapshot and therefore measures nothing — can never read as evidence of the cell it describes.
+///
+/// Covers **every tier the turbo surface is declared at**, NVFP4 included — which is why this does
+/// not reuse [`request_scoped_tier_token`]. The two axes are different questions and must not share
+/// a token: a PRODUCTION identity answers "which measured cell is this", so NVFP4 correctly has
+/// none ([`krea_turbo_production_calibration_fingerprint`] returns `None`); a registry-behavior
+/// identity answers "which declared surface is this", and `krea_2_turbo` declares an NVFP4 import
+/// surface (`supported_quants` lists `Quant::Nvfp4`). Withholding a key there does not withhold
+/// evidence — there is none either way — it makes the surface builder fail and takes the whole
+/// declaration walk down with it, which is exactly what `raw_and_edit_catalog_surfaces_are_exact…`
+/// caught. Before sc-22735 every one of these surfaces published the MEASURED q4 string instead.
+fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String> {
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+        Some(_) => return None,
+    };
+    Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
+}
+
 fn validated_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     let (root, native_dit, convrot_dit, _, encoder_source) =
         validate_load_spec(spec, KREA_2_TURBO_ID)?;
     let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    // sc-22735: the tier comes from the ARTIFACT, never from `spec.quantize` — the SceneWorks
+    // worker forwards a default quant for the packed turnkeys at every tier, so keying on the
+    // request knob would collapse all three cells back onto one string. Unprovable (an unreadable
+    // packed marker, or the INT8-ConvRot rotated DiT, which is not one of the three measured
+    // tiers) publishes NO identity, which forces admission to name an explicit estimate authority.
+    contract.calibration = krea_provable_artifact_tier(spec, KREA_2_TURBO_ID)
+        .and_then(krea_turbo_production_calibration_fingerprint)
+        .map(|fingerprint| {
+            gen_core::MemoryCalibrationIdentity::new(
+                fingerprint,
+                gen_core::LoadShape::DeferredMaterialization,
+            )
+        });
     // The pin is the sealed identity this load validated; price its path, not `spec.weights`.
     contract.asset_facts = loaded_asset_facts(
         KREA_2_TURBO_ID,
@@ -2385,7 +2451,18 @@ fn registered_krea_turbo_memory_strategy_contract(
 fn weights_free_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    Ok(build_krea_turbo_memory_strategy_contract(spec))
+    let fingerprint = krea_turbo_static_behavior_fingerprint(spec.quantize).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{KREA_2_TURBO_ID}: no weights-free Krea turbo declaration is registered for tier {:?}",
+            spec.quantize
+        ))
+    })?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        gen_core::LoadShape::DeferredMaterialization,
+    ));
+    Ok(contract)
 }
 
 /// Trailing stem of every request-scoped **production** calibration identity: the backend and the
@@ -2445,7 +2522,8 @@ pub fn krea_request_scoped_production_calibration_fingerprint(
     ))
 }
 
-/// The tier a request-scoped load can **prove** from the artifact, or `None` when it cannot.
+/// The tier a Krea load can **prove** from the artifact, or `None` when it cannot. Shared by the
+/// three request-scoped routes and by `krea_2_turbo`.
 ///
 /// `LoadSpec::quantize` is not the answer: on a `WeightsSource::Dir` load this crate accepts it as a
 /// no-op recipe knob (the turnkey is already packed), and the SceneWorks worker forwards a default
@@ -2456,10 +2534,7 @@ pub fn krea_request_scoped_production_calibration_fingerprint(
 /// malformed packed config, an unsupported packed width, an imported single file whose companion
 /// snapshot disagrees with the request, and the INT8-ConvRot DiT path, whose rotated single-file
 /// artifact is not one of the three measured tiers.
-fn request_scoped_provable_artifact_tier(
-    spec: &LoadSpec,
-    provider_id: &str,
-) -> Option<Option<Quant>> {
+fn krea_provable_artifact_tier(spec: &LoadSpec, provider_id: &str) -> Option<Option<Quant>> {
     match convrot_selector(spec, provider_id) {
         Ok(None) => {}
         Ok(Some(_)) | Err(_) => return None,
@@ -2473,7 +2548,7 @@ fn krea_request_scoped_production_calibration(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> Option<gen_core::MemoryCalibrationIdentity> {
-    let tier = request_scoped_provable_artifact_tier(spec, provider_id)?;
+    let tier = krea_provable_artifact_tier(spec, provider_id)?;
     let fingerprint = krea_request_scoped_production_calibration_fingerprint(provider_id, tier)?;
     Some(gen_core::MemoryCalibrationIdentity::new(
         fingerprint,
@@ -2682,14 +2757,36 @@ fn weights_free_krea_request_scoped_surface_contract(
     weights_free_krea_request_scoped_contract(provider_id, &production_spec, tier)
 }
 
+/// The turbo contract the safety-check tests grade against: the shape
+/// [`build_krea_turbo_memory_strategy_contract`] produces, carrying the identity a **validated q4**
+/// load would stamp on it.
+///
+/// sc-22735: the shared builder itself publishes no identity any more — it serves both the validated
+/// load and the weights-free surface, and only the validated path can prove a tier from the
+/// artifact. These tests exercise the tier/authority handshake, which needs a contract that actually
+/// names a calibration, and the q4 cell is the one turbo record that is measured. Stamping it here
+/// (rather than restoring it in the builder) keeps the production split intact: a builder that
+/// published this string again would re-file a bf16 or q8 capture under the measured q4 key, which
+/// is exactly the defect this story closes. The path is deliberately nonexistent, so nothing here
+/// can be mistaken for a real artifact-proven load.
 #[cfg(test)]
 fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
     static CONTRACT: std::sync::OnceLock<gen_core::MemoryProviderContract> =
         std::sync::OnceLock::new();
     CONTRACT.get_or_init(|| {
-        build_krea_turbo_memory_strategy_contract(&LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/krea".into(),
-        )))
+        let mut contract = build_krea_turbo_memory_strategy_contract(&LoadSpec::new(
+            WeightsSource::Dir("/nonexistent/krea".into()),
+        ));
+        assert!(
+            contract.calibration.is_none(),
+            "the shared turbo builder must publish no identity; only a validated load proves a tier"
+        );
+        contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4))
+                .expect("krea_2_turbo publishes a production identity at q4"),
+            gen_core::LoadShape::DeferredMaterialization,
+        ));
+        contract
     })
 }
 
@@ -3120,7 +3217,10 @@ mod weights_free_behavior_tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         for (contract, strategy) in [
             (
-                build_krea_turbo_memory_strategy_contract(&spec),
+                // sc-22735: the SHARED builder publishes no identity now (only a validated load can
+                // prove a tier), and an optimized behavior needs one. Grade against the turbo
+                // contract carrying the identity a validated q4 load stamps.
+                krea_turbo_memory_strategy_contract().clone(),
                 gen_core::MemoryStrategy::BoundedDecode,
             ),
             (
@@ -3717,13 +3817,41 @@ mod request_scoped_calibration_identity_tests {
     fn turbo_and_control_keep_the_bound_measured_identities_they_already_published() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        // sc-22735 fix pass. The SHARED builder publishes nothing: it serves the weights-free
+        // surface as well as the validated load, and a surface that resolves no snapshot cannot
+        // prove which of the three tiers it is describing.
+        assert!(
+            turbo.calibration.is_none(),
+            "the shared turbo builder must not name a cell it cannot prove"
+        );
+        // The measured cell is q4 and ONLY q4, and it keeps its string byte-identical — the
+        // SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly this literal.
         assert_eq!(
-            turbo.calibration.as_ref().unwrap().fingerprint,
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4)).unwrap(),
             TURBO_MEMORY_CALIBRATION_FINGERPRINT
         );
         assert_eq!(
             TURBO_MEMORY_CALIBRATION_FINGERPRINT, "krea-turbo-cuda-phase-curves-v1",
             "the SceneWorks anchor plan and the packaged krea_2_turbo candle q4 record name this"
+        );
+        // The two unmeasured tiers name their own cells, so a bf16 or q8 capture can never be read
+        // back as authority for the measured one.
+        let bf16 = krea_turbo_production_calibration_fingerprint(None).unwrap();
+        let q8 = krea_turbo_production_calibration_fingerprint(Some(Quant::Q8)).unwrap();
+        for other in [&bf16, &q8] {
+            assert_ne!(
+                other, TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+                "an unmeasured turbo tier must not republish the measured q4 key"
+            );
+        }
+        assert_ne!(
+            bf16, q8,
+            "the two unmeasured turbo tiers are distinct cells"
+        );
+        // A tier this lane does not ship gets no identity rather than another cell's.
+        assert_eq!(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Nvfp4)),
+            None
         );
         assert_eq!(
             turbo.load_shape,
