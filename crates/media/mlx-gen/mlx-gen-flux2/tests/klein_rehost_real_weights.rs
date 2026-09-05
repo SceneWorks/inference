@@ -23,11 +23,11 @@ use mlx_gen_flux2::{FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID};
 
 const BASE_REHOST: (&str, &str) = (
     "models--SceneWorks--flux2-klein-9b-mlx",
-    "acf05e8d5103838baba6a5e32dc91d6997a56023",
+    "1902693279fcfb828919370dfac2b8922d99499a",
 );
 const KV_REHOST: (&str, &str) = (
     "models--SceneWorks--flux2-klein-9b-kv-mlx",
-    "406265beebe141024a06e24038c3713cf7af87d8",
+    "bbf22de8d654789de3b177632d2e283cc4f77729",
 );
 const TIERS: [(&str, Option<Quant>); 3] = [
     ("bf16", None),

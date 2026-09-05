@@ -13,10 +13,10 @@ use sha2::{Digest, Sha256};
 
 const REVISIONS: &[&str] = &[
     crate::memory_strategy::KLEIN_CALIBRATED_REVISION,
-    "acf05e8d5103838baba6a5e32dc91d6997a56023",
+    "1902693279fcfb828919370dfac2b8922d99499a",
 ];
-pub(crate) const KLEIN_REHOST_REVISION: &str = "acf05e8d5103838baba6a5e32dc91d6997a56023";
-pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "406265beebe141024a06e24038c3713cf7af87d8";
+pub(crate) const KLEIN_REHOST_REVISION: &str = "1902693279fcfb828919370dfac2b8922d99499a";
+pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "bbf22de8d654789de3b177632d2e283cc4f77729";
 const KLEIN_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-mlx";
 const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-mlx";
 const TRUE_V2_TRANSFORMER_SHA256: &str =

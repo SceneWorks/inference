@@ -232,7 +232,7 @@ expected_files = [
 # harness consumes the q4 tier only; catalog siblings own their own artifact/tier/mode calibration.
 key = "flux2-klein-9b-mlx-q4"
 repository = "SceneWorks/flux2-klein-9b-mlx"
-revision = "acf05e8d5103838baba6a5e32dc91d6997a56023"
+revision = "1902693279fcfb828919370dfac2b8922d99499a"
 license = "FLUX Non-Commercial License"
 size_class = "very-large"
 profiles = ["media-cuda-memory-ladder"]
