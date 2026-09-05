@@ -29,13 +29,34 @@ use crate::config::{
 };
 use crate::MAX_WAN_FRAMES;
 
+/// The **`bf16` / `Resident`** production cell of the Candle TI2V-5B ladder (SC-19223).
+///
+/// Retained byte-for-byte by [`production_calibration_fingerprint`]: this string is `pub` and has
+/// been published since SC-19223, so it keeps naming exactly the cell it always named. Before
+/// sc-22736 it named *every* tier at `Resident`, which is the defect that story closes — a q4 load
+/// and a dense bf16 load published one identity, so an anchor measured under either priced both.
 pub const CALIBRATION_FINGERPRINT_RESIDENT: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-resident-load-v1";
+/// The same production cell under [`OffloadPolicy::Sequential`]. Retained byte-for-byte for the
+/// same reason as [`CALIBRATION_FINGERPRINT_RESIDENT`].
 pub const CALIBRATION_FINGERPRINT_SEQUENTIAL: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-sequential-load-v1";
+/// The tier the two retained strings above are folded into — the dense `Wan-AI/Wan2.2-TI2V-5B-
+/// Diffusers` snapshot. Every other shipped tier (`SceneWorks/wan2.2-ti2v-5b-candle` q4 and q8)
+/// mints its own string, so no packed cell can inherit the dense cell's identity.
+pub const CALIBRATED_TIER: Option<Quant> = None;
+/// Namespace every weights-free (registry-conformance) identity lives in.
+///
+/// No production string may start with this prefix — that is what keeps a fixture contract from
+/// being mistaken for measured evidence of the cell it describes, and it is asserted directly.
+#[cfg(any(feature = "cuda", test))]
+const WEIGHTS_FREE_FINGERPRINT_PREFIX: &str = "sc-19223-wan2-2-ti2v-5b-candle-registry-";
+/// The weights-free `bf16` / `Resident` cell, retained byte-for-byte for the same reason as the
+/// production pair.
 #[cfg(any(feature = "cuda", test))]
 const STATIC_CALIBRATION_FINGERPRINT_RESIDENT: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-registry-resident-v1";
+/// The weights-free `bf16` / `Sequential` cell, retained byte-for-byte.
 #[cfg(any(feature = "cuda", test))]
 const STATIC_CALIBRATION_FINGERPRINT_SEQUENTIAL: &str =
     "sc-19223-wan2-2-ti2v-5b-candle-registry-sequential-v1";
@@ -50,6 +71,25 @@ const PACK_GROUP_SIZE: usize = crate::candle_tier_build::TIER_GROUP_SIZE;
 struct NumericAssets {
     facts: MemoryAssetFacts,
     tier: MemoryNumericTier,
+    /// Whether the artifact on disk **proved** `tier` rather than merely being priced consistently
+    /// with it (sc-22736). Only a proven tier may be turned into a calibration identity; see
+    /// [`production_calibration_identity`].
+    tier_proven: bool,
+}
+
+/// A transformer artifact's resident pricing together with its tier proof (sc-22736).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransformerAssets {
+    /// Resident bytes of the representation the Wan loader materializes.
+    bytes: u64,
+    /// The tier that representation is in: `None` dense, `Some(quant)` affine-packed.
+    tier: Option<Quant>,
+    /// Whether the ARTIFACT proved that tier. `false` only for a dense transformer whose
+    /// `transformer/quantize_config.json` is present but unreadable or self-inconsistent: the Wan
+    /// loader never opens that file (it packed-detects from the `.scales`/`.biases` companions,
+    /// `lib.rs`), so the dense pricing is still exact and the load is unaffected — but the artifact
+    /// has stopped describing itself, so no identity may be published off it.
+    tier_proven: bool,
 }
 
 fn checked_sum(label: &str, values: impl IntoIterator<Item = u64>) -> gen_core::Result<u64> {
@@ -319,48 +359,79 @@ fn validate_packed_triple(
     })
 }
 
-fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
+/// Resident bytes of a **dense** transformer: every leaf cast to the loader's bf16 compute dtype.
+fn dense_transformer_bytes(
+    tensors: &BTreeMap<String, gen_core::weightsmeta::SafetensorsTensorHeader>,
+) -> gen_core::Result<u64> {
+    tensors.values().try_fold(0_u64, |total, tensor| {
+        // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 DiT is refused instead of
+        // being priced at the bf16 width its `.scale_weight` companions would only reach through
+        // the separate `crate::comfyui` dequant seam.
+        if !tensor.is_float() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{MODEL_ID}: calibrated dense transformer tensor {} must use a floating source dtype; the loader would cast {:?} to bf16",
+                tensor.name, tensor.dtype
+            )));
+        }
+        let bytes = tensor_elements("transformer", tensor)?
+            .checked_mul(2)
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!(
+                    "{MODEL_ID}: transformer projected byte count overflows u64"
+                ))
+            })?;
+        total.checked_add(bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{MODEL_ID}: transformer resident byte total overflows u64"
+            ))
+        })
+    })
+}
+
+fn transformer_assets(root: &Path) -> gen_core::Result<TransformerAssets> {
     let path = root.join("transformer");
     let headers = component_headers(&path, "transformer")?;
-    let marker = packed_marker(&path)?;
     let tensors = headers
         .into_iter()
         .map(|tensor| (tensor.name.clone(), tensor))
         .collect::<BTreeMap<_, _>>();
+    let carries_packed_leaves = tensors.values().any(|tensor| {
+        is_packed_leaf(&tensor.name)
+            || (tensor.name.ends_with(".weight") && tensor.dtype == Dtype::U32)
+    });
+
+    let marker = match packed_marker(&path) {
+        Ok(marker) => marker,
+        // sc-22736: an unreadable or self-inconsistent marker beside a transformer that carries no
+        // packed leaves cannot change what the loader materializes — the Wan loader never opens
+        // `quantize_config.json`, it packed-detects from the `.scales`/`.biases` companions — so the
+        // dense pricing stays exact and the LOAD is untouched. What is lost is the artifact's own
+        // account of itself, so the tier is left UNPROVEN and the identity is withheld rather than
+        // the contract read failing. A transformer that *does* carry packed leaves is a different
+        // case: the marker is load-bearing for pricing the triples, so it stays a hard error and
+        // `contract_for_loaded` turns that into `Ok(None)` — fail-closed, still fail-open for the
+        // load.
+        Err(_) if !carries_packed_leaves => {
+            return Ok(TransformerAssets {
+                bytes: dense_transformer_bytes(&tensors)?,
+                tier: None,
+                tier_proven: false,
+            });
+        }
+        Err(error) => return Err(error),
+    };
 
     let Some(quant) = marker else {
-        if tensors.values().any(|tensor| {
-            is_packed_leaf(&tensor.name)
-                || (tensor.name.ends_with(".weight") && tensor.dtype == Dtype::U32)
-        }) {
+        if carries_packed_leaves {
             return Err(gen_core::Error::Unsupported(format!(
                 "{MODEL_ID}: dense transformer contains affine-packed leaves without a valid quantize_config.json"
             )));
         }
-        let bytes = tensors.values().try_fold(0_u64, |total, tensor| {
-            // FP8 posture: `is_float` excludes `F8_E4M3`, so a scaled-fp8 DiT is refused instead of
-            // being priced at the bf16 width its `.scale_weight` companions would only reach through
-            // the separate `crate::comfyui` dequant seam.
-            if !tensor.is_float() {
-                return Err(gen_core::Error::Unsupported(format!(
-                    "{MODEL_ID}: calibrated dense transformer tensor {} must use a floating source dtype; the loader would cast {:?} to bf16",
-                    tensor.name, tensor.dtype
-                )));
-            }
-            let bytes = tensor_elements("transformer", tensor)?
-                .checked_mul(2)
-                .ok_or_else(|| {
-                    gen_core::Error::Msg(format!(
-                        "{MODEL_ID}: transformer projected byte count overflows u64"
-                    ))
-                })?;
-            total.checked_add(bytes).ok_or_else(|| {
-                gen_core::Error::Msg(format!(
-                    "{MODEL_ID}: transformer resident byte total overflows u64"
-                ))
-            })
-        })?;
-        return Ok((bytes, None));
+        return Ok(TransformerAssets {
+            bytes: dense_transformer_bytes(&tensors)?,
+            tier: None,
+            tier_proven: true,
+        });
     };
 
     for tensor in tensors
@@ -446,10 +517,11 @@ fn transformer_assets(root: &Path) -> gen_core::Result<(u64, Option<Quant>)> {
             ))
         })
     })?;
-    Ok((
-        checked_sum("transformer", [packed_bytes, dense_bytes])?,
-        Some(quant),
-    ))
+    Ok(TransformerAssets {
+        bytes: checked_sum("transformer", [packed_bytes, dense_bytes])?,
+        tier: Some(quant),
+        tier_proven: true,
+    })
 }
 
 fn validate_contract_route(spec: &LoadSpec) -> gen_core::Result<&Path> {
@@ -497,45 +569,140 @@ fn production_assets(
     }
     let conditioning_bytes =
         projected_dense_component_bytes(&root.join("text_encoder"), "text_encoder", 2)?;
-    let (transformer_bytes, quant) = transformer_assets(root)?;
-    if spec.quantize != quant {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: requested tier {:?} does not match the header/sidecar-derived transformer tier {:?}",
-            spec.quantize, quant
-        )));
-    }
+    let transformer = transformer_assets(root)?;
     let decoder_bytes = projected_dense_component_bytes(&root.join("vae"), "vae", 4)?;
     let base_bytes = checked_sum(
         "base model",
-        [conditioning_bytes, transformer_bytes, decoder_bytes],
+        [conditioning_bytes, transformer.bytes, decoder_bytes],
     )?;
     Ok(NumericAssets {
         facts: MemoryAssetFacts {
             base_bytes,
             conditioning_bytes,
-            transformer_bytes,
+            transformer_bytes: transformer.bytes,
             decoder_bytes,
             overlay_bytes: 0,
         },
         tier: MemoryNumericTier {
             precision: Precision::Bf16,
-            quant,
+            quant: transformer.tier,
             component_precision_floors: &[],
         },
+        tier_proven: transformer.tier_proven,
     })
 }
 
-fn calibration_fingerprint(spec: &LoadSpec, fixture: bool) -> &'static str {
-    match (fixture, spec.offload_policy) {
-        (false, OffloadPolicy::Resident) => CALIBRATION_FINGERPRINT_RESIDENT,
-        (false, OffloadPolicy::Sequential) => CALIBRATION_FINGERPRINT_SEQUENTIAL,
-        #[cfg(any(feature = "cuda", test))]
-        (true, OffloadPolicy::Resident) => STATIC_CALIBRATION_FINGERPRINT_RESIDENT,
-        #[cfg(any(feature = "cuda", test))]
-        (true, OffloadPolicy::Sequential) => STATIC_CALIBRATION_FINGERPRINT_SEQUENTIAL,
-        #[cfg(not(any(feature = "cuda", test)))]
-        (true, _) => unreachable!("fixture fingerprints are not built outside CUDA/tests"),
+const fn policy_label(policy: OffloadPolicy) -> &'static str {
+    match policy {
+        OffloadPolicy::Resident => "resident",
+        OffloadPolicy::Sequential => "sequential",
     }
+}
+
+/// Label of a Wan numeric tier. Total over `Option<Quant>` so the weights-free namespace can name
+/// every selector the registry may hand it; [`production_calibration_fingerprint`] refuses the
+/// tiers this family does not ship rather than relying on this label to be partial.
+const fn tier_label(quant: Option<Quant>) -> &'static str {
+    match quant {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+    }
+}
+
+/// **The production calibration TABLE, keyed on `(tier, offload_policy)` — not the binding.**
+///
+/// Only `production_calibration_identity`, which proves the tier against the artifact on disk
+/// first, may turn one of these strings into a contract identity. Calling this function with a tier
+/// nobody has read off `transformer/` produces a string for a cell that was never loaded, which is
+/// exactly the defect sc-22736 closes; it is `pub` so a measurement harness can *name* a cell, never
+/// so a caller can mint one.
+///
+/// `candle-gen-wan` serves exactly one provider (`config::MODEL_ID`), and the route axis is already
+/// pinned by `validate_contract_route` (snapshot directory, `EagerMaterialization`, `Bf16`, no
+/// controls/adapters/components), so `(tier, policy)` is the whole key. The load shape is carried
+/// separately by [`MemoryCalibrationIdentity::load_shape`].
+///
+/// The two SC-19223 strings are folded into the [`CALIBRATED_TIER`] (`bf16`) cell **byte-identical**
+/// — they are `pub`, published, and named the dense cell all along. `Nvfp4` gets no production
+/// string: no Wan artifact can prove it (`validate_packed_triple` refuses it), so there is no cell
+/// to name.
+pub fn production_calibration_fingerprint(
+    tier: Option<Quant>,
+    policy: OffloadPolicy,
+) -> Option<String> {
+    if tier == Some(Quant::Nvfp4) {
+        return None;
+    }
+    if tier == CALIBRATED_TIER {
+        return Some(
+            match policy {
+                OffloadPolicy::Resident => CALIBRATION_FINGERPRINT_RESIDENT,
+                OffloadPolicy::Sequential => CALIBRATION_FINGERPRINT_SEQUENTIAL,
+            }
+            .to_owned(),
+        );
+    }
+    Some(format!(
+        "sc-19223-wan2-2-ti2v-5b-candle-{}-{}-load-v1",
+        tier_label(tier),
+        policy_label(policy)
+    ))
+}
+
+/// The weights-free registry-conformance TABLE: the same `(tier, policy)` coordinate inside the
+/// isolated [`WEIGHTS_FREE_FINGERPRINT_PREFIX`] namespace, which no production string can enter.
+///
+/// A registry fixture describes a load that never happened, so it must never be mistakable for
+/// measured evidence of the cell it names. The two SC-19223 `-registry-` strings are folded into the
+/// [`CALIBRATED_TIER`] cell byte-identical, and the packed tiers get distinct siblings so the
+/// weights-free surface is per-tier too — otherwise a fixture handshake minted for one tier would
+/// satisfy a contract built for another.
+#[cfg(any(feature = "cuda", test))]
+fn weights_free_calibration_fingerprint(tier: Option<Quant>, policy: OffloadPolicy) -> String {
+    if tier == CALIBRATED_TIER {
+        return match policy {
+            OffloadPolicy::Resident => STATIC_CALIBRATION_FINGERPRINT_RESIDENT,
+            OffloadPolicy::Sequential => STATIC_CALIBRATION_FINGERPRINT_SEQUENTIAL,
+        }
+        .to_owned();
+    }
+    format!(
+        "{WEIGHTS_FREE_FINGERPRINT_PREFIX}{}-{}-v1",
+        tier_label(tier),
+        policy_label(policy)
+    )
+}
+
+/// **The BINDING**: the production identity a load may publish, bound to the artifact on disk.
+///
+/// `assets` came out of [`production_assets`], which read the transformer's own headers and its
+/// `quantize_config.json` and cross-checked the two against each other
+/// (`transformer_assets` → `validate_packed_triple`). Three things withhold the identity, and none
+/// of them fails the contract read or the load:
+///
+/// 1. **An unproven tier.** A dense transformer whose marker file is unreadable or self-inconsistent
+///    still prices exactly (the loader never reads that file), so the contract and its asset facts
+///    stay publishable — but the artifact no longer describes itself, so it may not be named.
+///    This is the `.ok()?`-shaped fail-closed the merged precedent uses.
+/// 2. **Request/artifact disagreement.** `LoadSpec::quantize` is a **no-op** for this loader: Wan
+///    tiers ship pre-quantized and are packed-detected from disk, never requantized at load
+///    (`lib.rs`, sc-10025). So a spec that asks for q8 over a q4 snapshot still LOADS, and refusing
+///    the whole contract there would drop admission entirely for a load that runs. What is wrong is
+///    only the *claim*: the caller believes it opened a cell no anchor measured under that belief.
+///    The identity is therefore withheld while the artifact-derived facts are still published —
+///    the same posture as `mlx-gen-sd3`'s `artifact_tier != spec.quantize` return.
+/// 3. **A tier this family ships no anchor for** (`Nvfp4`), which the table itself refuses.
+fn production_calibration_identity(
+    spec: &LoadSpec,
+    assets: &NumericAssets,
+) -> Option<MemoryCalibrationIdentity> {
+    if !assets.tier_proven || spec.quantize != assets.tier.quant {
+        return None;
+    }
+    production_calibration_fingerprint(assets.tier.quant, spec.offload_policy)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
 }
 
 fn strategies() -> Vec<MemoryStrategyCapability> {
@@ -619,7 +786,7 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
 fn build_contract(
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
-    fingerprint: &str,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> gen_core::Result<MemoryProviderContract> {
     validate_contract_route(spec)?;
     let phases = vec![
@@ -665,7 +832,7 @@ fn build_contract(
                 MemoryFormulaVariable::DecodeTileArea,
             ],
         },
-        calibration: Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)),
+        calibration,
         asset_facts: facts,
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     })
@@ -676,7 +843,8 @@ fn production_contract_and_tier(
     dit_source: &crate::DitSource,
 ) -> gen_core::Result<(MemoryProviderContract, MemoryNumericTier)> {
     let assets = production_assets(spec, dit_source)?;
-    let contract = build_contract(spec, assets.facts, calibration_fingerprint(spec, false))?;
+    let calibration = production_calibration_identity(spec, &assets);
+    let contract = build_contract(spec, assets.facts, calibration)?;
     Ok((contract, assets.tier))
 }
 
@@ -702,17 +870,25 @@ pub(crate) fn weights_free_memory_strategy_contract(
     build_contract(
         spec,
         MemoryAssetFacts::default(),
-        calibration_fingerprint(spec, true),
+        Some(MemoryCalibrationIdentity::new(
+            weights_free_calibration_fingerprint(spec.quantize, spec.offload_policy),
+            spec.load_shape,
+        )),
     )
 }
 
 #[cfg(any(feature = "cuda", test))]
+/// Whether `contract` came from the weights-free registry surface.
+///
+/// Detected on the isolated namespace rather than on an enumerated pair of strings (sc-22736): the
+/// weights-free table is now per-tier, and an enumeration would silently stop recognising the packed
+/// cells the moment they were added — sending a fixture contract down `resolved_numeric_tier`, which
+/// has no artifact to read.
 fn fixture_contract(contract: &MemoryProviderContract) -> bool {
     contract.calibration.as_ref().is_some_and(|identity| {
-        matches!(
-            identity.fingerprint.as_str(),
-            STATIC_CALIBRATION_FINGERPRINT_RESIDENT | STATIC_CALIBRATION_FINGERPRINT_SEQUENTIAL
-        )
+        identity
+            .fingerprint
+            .starts_with(WEIGHTS_FREE_FINGERPRINT_PREFIX)
     })
 }
 
@@ -1457,16 +1633,325 @@ mod tests {
         .unwrap();
         assert!(memory_strategy_contract(&spec).is_err());
 
+        // sc-22736: a request tier that disagrees with the artifact no longer removes ADMISSION —
+        // `LoadSpec::quantize` is a no-op for this loader (the tier is packed-detected from disk and
+        // never requantized at load, `lib.rs`/sc-10025), so the load runs and its artifact-derived
+        // facts stay publishable. What is removed is the IDENTITY: see
+        // `a_disagreeing_request_tier_withholds_the_identity_but_keeps_the_contract`.
         spec.quantize = Some(Quant::Q8);
         std::fs::write(
             temp.path().join("transformer/quantize_config.json"),
             r#"{"bits":4,"quantization":{"group_size":64}}"#,
         )
         .unwrap();
-        assert!(memory_strategy_contract(&spec).is_err());
-        assert!(contract_for_loaded(&spec, &crate::DitSource::Snapshot)
+        let contract = memory_strategy_contract(&spec).unwrap();
+        assert!(contract.calibration.is_none());
+        let (_, tier) = contract_for_loaded(&spec, &crate::DitSource::Snapshot)
             .unwrap()
+            .unwrap();
+        assert_eq!(
+            tier.quant,
+            Some(Quant::Q4),
+            "the tier on disk, not the knob"
+        );
+    }
+
+    /// The shipped tiers of the Candle TI2V-5B route, in the order the SceneWorks catalog ships
+    /// them: dense `Wan-AI/Wan2.2-TI2V-5B-Diffusers`, then the packed
+    /// `SceneWorks/wan2.2-ti2v-5b-candle` q4 and q8.
+    const SHIPPED_TIERS: [Option<Quant>; 3] = [None, Some(Quant::Q4), Some(Quant::Q8)];
+    const POLICIES: [OffloadPolicy; 2] = [OffloadPolicy::Resident, OffloadPolicy::Sequential];
+    const LOAD_SHAPES: [LoadShape; 2] = [
+        LoadShape::EagerMaterialization,
+        LoadShape::DeferredMaterialization,
+    ];
+
+    fn cell_spec(
+        root: &Path,
+        quant: Option<Quant>,
+        policy: OffloadPolicy,
+        shape: LoadShape,
+    ) -> LoadSpec {
+        let mut load = spec(root, quant);
+        load.offload_policy = policy;
+        load.load_shape = shape;
+        load
+    }
+
+    /// sc-22736 (epic sc-22723, E1 measurable): every (tier x offload policy x load shape) cell this
+    /// route can reach publishes its OWN production identity, and the weights-free surface publishes
+    /// a per-cell string from a namespace production can never enter.
+    ///
+    /// Before this, `calibration_fingerprint` matched on `(fixture, offload_policy)` only, so all
+    /// three shipped tiers collapsed onto two strings: a q4 anchor priced the bf16 cell and vice
+    /// versa. The set is gathered into a `BTreeSet` and sized against a DERIVED count so adding a
+    /// tier to `SHIPPED_TIERS` cannot be satisfied by a table that replays an existing string.
+    ///
+    /// *Mutations this kills:* dropping the tier from the table key (the three tiers would collide
+    /// on one string per policy); dropping the policy from the key; replaying a packed tier's string
+    /// on the dense cell; letting the weights-free table hand out a production string (the disjoint
+    /// and prefix assertions); letting the weights-free table collapse its packed cells onto the
+    /// retained `-registry-` pair; and publishing a deferred cell this provider has no block loader
+    /// for.
+    #[test]
+    fn every_reachable_cell_publishes_its_own_identity() {
+        let mut production = BTreeSet::new();
+        let mut weights_free = BTreeSet::new();
+        let mut admitted = 0_usize;
+        for quant in SHIPPED_TIERS {
+            let temp = fixture_root(quant);
+            for policy in POLICIES {
+                for load_shape in LOAD_SHAPES {
+                    let load = cell_spec(temp.path(), quant, policy, load_shape);
+                    if load_shape == LoadShape::DeferredMaterialization {
+                        // No deferred block loader: the contract read itself is refused, so the cell
+                        // does not exist to be named.
+                        assert!(
+                            production_contract_and_tier(&load, &crate::DitSource::Snapshot)
+                                .is_err()
+                        );
+                        assert!(weights_free_memory_strategy_contract(&load).is_err());
+                        continue;
+                    }
+
+                    let (contract, tier) =
+                        production_contract_and_tier(&load, &crate::DitSource::Snapshot).unwrap();
+                    assert_eq!(tier.quant, quant);
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{quant:?} {policy:?} publishes an identity"));
+                    assert_eq!(
+                        identity.fingerprint,
+                        production_calibration_fingerprint(quant, policy).unwrap(),
+                        "the contract publishes the table's own cell"
+                    );
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(!identity
+                        .fingerprint
+                        .starts_with(WEIGHTS_FREE_FINGERPRINT_PREFIX));
+                    assert!(
+                        production.insert(identity.fingerprint.clone()),
+                        "{quant:?} {policy:?} replays another cell's identity: {}",
+                        identity.fingerprint
+                    );
+                    assert!(contract.conformance_errors().is_empty());
+
+                    let free = weights_free_memory_strategy_contract(&load).unwrap();
+                    let free_identity = free.calibration.as_ref().unwrap();
+                    assert!(free_identity
+                        .fingerprint
+                        .starts_with(WEIGHTS_FREE_FINGERPRINT_PREFIX));
+                    assert!(fixture_contract(&free));
+                    assert!(!fixture_contract(&contract));
+                    assert_ne!(free_identity.fingerprint, identity.fingerprint);
+                    assert!(
+                        weights_free.insert(free_identity.fingerprint.clone()),
+                        "{quant:?} {policy:?} replays another weights-free cell"
+                    );
+                    admitted += 1;
+                }
+            }
+        }
+        let expected = SHIPPED_TIERS.len() * POLICIES.len();
+        assert_eq!(admitted, expected);
+        assert_eq!(production.len(), expected, "{production:?}");
+        assert_eq!(weights_free.len(), expected, "{weights_free:?}");
+        assert!(
+            production.is_disjoint(&weights_free),
+            "a registry-conformance surface must never publish a production string"
+        );
+    }
+
+    /// sc-22736: the two `pub`, published SC-19223 strings still name exactly the `bf16` cells they
+    /// always named, and the two `-registry-` strings still name the weights-free `bf16` cells.
+    ///
+    /// Asserted VERBATIM, not against the table, so a table edit that silently re-spells a published
+    /// identity is caught rather than confirmed. SceneWorks holds no measured record keyed on either
+    /// production string today, but they are public API and have named the dense cell since
+    /// SC-19223.
+    ///
+    /// *Mutations this kills:* re-spelling either retained string; folding them into a packed cell
+    /// instead of the dense one; moving `CALIBRATED_TIER` off `None`; short-circuiting the retained
+    /// pair ahead of the artifact proof (the disagreeing-tier arm at the end).
+    #[test]
+    fn the_retained_sc_19223_strings_name_exactly_the_bf16_cells() {
+        assert_eq!(CALIBRATED_TIER, None);
+        assert_eq!(
+            production_calibration_fingerprint(None, OffloadPolicy::Resident).unwrap(),
+            "sc-19223-wan2-2-ti2v-5b-candle-resident-load-v1"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(None, OffloadPolicy::Sequential).unwrap(),
+            "sc-19223-wan2-2-ti2v-5b-candle-sequential-load-v1"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(Some(Quant::Q4), OffloadPolicy::Resident).unwrap(),
+            "sc-19223-wan2-2-ti2v-5b-candle-q4-resident-load-v1"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(Some(Quant::Q8), OffloadPolicy::Sequential).unwrap(),
+            "sc-19223-wan2-2-ti2v-5b-candle-q8-sequential-load-v1"
+        );
+        // NVFP4 is not a Wan affine-packed tier, so it names no production cell at all.
+        assert!(
+            production_calibration_fingerprint(Some(Quant::Nvfp4), OffloadPolicy::Resident)
+                .is_none()
+        );
+
+        assert_eq!(
+            weights_free_calibration_fingerprint(None, OffloadPolicy::Resident),
+            "sc-19223-wan2-2-ti2v-5b-candle-registry-resident-v1"
+        );
+        assert_eq!(
+            weights_free_calibration_fingerprint(None, OffloadPolicy::Sequential),
+            "sc-19223-wan2-2-ti2v-5b-candle-registry-sequential-v1"
+        );
+        assert_eq!(
+            weights_free_calibration_fingerprint(Some(Quant::Q4), OffloadPolicy::Resident),
+            "sc-19223-wan2-2-ti2v-5b-candle-registry-q4-resident-v1"
+        );
+
+        // The retained strings are reached only THROUGH the artifact proof: a dense fixture opened
+        // with a q4 knob is still a bf16 artifact, and it publishes nothing rather than the retained
+        // bf16 string.
+        let temp = fixture_root(None);
+        let mut load = spec(temp.path(), Some(Quant::Q4));
+        load.offload_policy = OffloadPolicy::Resident;
+        assert!(memory_strategy_contract(&load)
+            .unwrap()
+            .calibration
             .is_none());
+        load.quantize = None;
+        assert_eq!(
+            memory_strategy_contract(&load)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint,
+            CALIBRATION_FINGERPRINT_RESIDENT
+        );
+    }
+
+    /// sc-22736: a request tier that disagrees with the artifact WITHHOLDS the identity; it does not
+    /// fail the contract read.
+    ///
+    /// `LoadSpec::quantize` is a no-op for this loader — Wan tiers ship pre-quantized and are
+    /// packed-detected from disk, never requantized at load (`lib.rs`, sc-10025) — so the load runs
+    /// and its artifact-derived facts are exactly what goes resident. Erroring would drop admission
+    /// entirely for a load that proceeds. Only the CLAIM is wrong, so only the claim is withheld.
+    ///
+    /// *Mutations this kills:* accepting a disagreeing tier (an identity would appear); publishing
+    /// the REQUESTED tier's string instead of withholding; restoring the hard error in
+    /// `production_assets` (the contract read would fail and the facts assertions would not run);
+    /// and pricing the requested tier rather than the artifact's.
+    #[test]
+    fn a_disagreeing_request_tier_withholds_the_identity_but_keeps_the_contract() {
+        for (on_disk, requested) in [
+            (Some(Quant::Q4), Some(Quant::Q8)),
+            (Some(Quant::Q8), None),
+            (None, Some(Quant::Q4)),
+            (Some(Quant::Q4), Some(Quant::Nvfp4)),
+        ] {
+            let temp = fixture_root(on_disk);
+            let agreeing = spec(temp.path(), on_disk);
+            let truth = production_contract_and_tier(&agreeing, &crate::DitSource::Snapshot)
+                .unwrap()
+                .0;
+            assert!(truth.calibration.is_some());
+
+            let load = spec(temp.path(), requested);
+            let (contract, tier) =
+                production_contract_and_tier(&load, &crate::DitSource::Snapshot).unwrap();
+            assert!(
+                contract.calibration.is_none(),
+                "disk {on_disk:?} opened as {requested:?} names no measured cell"
+            );
+            assert_eq!(
+                tier.quant, on_disk,
+                "the tier is the artifact's, not the knob"
+            );
+            assert_eq!(
+                contract.asset_facts, truth.asset_facts,
+                "the facts are the artifact's either way"
+            );
+            // Fail-open on the load side is unchanged: the generator still gets a contract.
+            assert!(contract_for_loaded(&load, &crate::DitSource::Snapshot)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// sc-22736: an unreadable or self-inconsistent `transformer/quantize_config.json` fails CLOSED
+    /// to `calibration: None` without failing the load — and, where the marker is not load-bearing
+    /// for pricing, without even failing the contract read.
+    ///
+    /// The Wan loader never opens that file (it packed-detects from the `.scales`/`.biases`
+    /// companions), so beside a DENSE transformer the marker is pure self-description: the dense
+    /// pricing stays exact, the contract is still published, and only the identity is withheld.
+    /// Beside a PACKED transformer the marker is load-bearing — the triples cannot be priced without
+    /// it — so the contract read is refused and `contract_for_loaded` turns that into `Ok(None)`,
+    /// which is the provider-side fail-open the generator relies on.
+    ///
+    /// *Mutations this kills:* making an unreadable marker error instead of withhold (the dense arm
+    /// would panic on `unwrap`); making it publish an identity anyway (the `is_none` assertion);
+    /// letting the unproven-tier arm reach the table at all; letting a garbage marker change the
+    /// dense pricing; and making the packed arm fail the LOAD instead of failing open.
+    #[test]
+    fn an_unprovable_tier_marker_withholds_the_identity_without_failing_the_load() {
+        for corrupt in [
+            "not json at all",
+            "{\"bits\":",
+            "{\"bits\":6,\"quantization\":{\"group_size\":64}}",
+            "{\"bits\":4,\"quantization\":{\"group_size\":32}}",
+        ] {
+            let temp = fixture_root(None);
+            let load = spec(temp.path(), None);
+            let clean = production_contract_and_tier(&load, &crate::DitSource::Snapshot)
+                .unwrap()
+                .0;
+            assert!(clean.calibration.is_some());
+
+            std::fs::write(
+                temp.path().join("transformer/quantize_config.json"),
+                corrupt,
+            )
+            .unwrap();
+            let (contract, tier) = production_contract_and_tier(&load, &crate::DitSource::Snapshot)
+                .unwrap_or_else(|error| panic!("{corrupt:?} must not fail the contract: {error}"));
+            assert!(
+                contract.calibration.is_none(),
+                "{corrupt:?} must publish no identity"
+            );
+            assert_eq!(tier.quant, None);
+            assert_eq!(contract.asset_facts, clean.asset_facts);
+            assert!(contract_for_loaded(&load, &crate::DitSource::Snapshot)
+                .unwrap()
+                .is_some());
+
+            // Beside a packed transformer the same marker IS the pricing input, so the contract read
+            // is refused and the provider fails open instead.
+            let packed = fixture_root(Some(Quant::Q4));
+            let packed_load = spec(packed.path(), Some(Quant::Q4));
+            std::fs::write(
+                packed.path().join("transformer/quantize_config.json"),
+                corrupt,
+            )
+            .unwrap();
+            assert!(
+                production_contract_and_tier(&packed_load, &crate::DitSource::Snapshot).is_err(),
+                "{corrupt:?} cannot price a packed transformer"
+            );
+            assert!(
+                contract_for_loaded(&packed_load, &crate::DitSource::Snapshot)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                crate::build_generator(&packed_load).is_ok(),
+                "the LOAD is unaffected"
+            );
+        }
     }
 
     #[test]

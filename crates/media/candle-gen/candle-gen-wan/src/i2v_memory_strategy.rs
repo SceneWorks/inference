@@ -218,7 +218,10 @@ pub fn architecture_facts(
             crate::config::VaeConfig::ti2v_5b().z_dim,
             crate::WAN_Z48_VAE_TILING,
         ),
-        gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
+        // T2V and I2V A14B share `wan14b.rs` and therefore one transformer preset; the routes
+        // differ in their carrier, not in their trunk shape.
+        gen_core::wan_i2v_memory::WanI2vRoute::T2v14b
+        | gen_core::wan_i2v_memory::WanI2vRoute::I2v14b
         | gen_core::wan_i2v_memory::WanI2vRoute::Vace
         | gen_core::wan_i2v_memory::WanI2vRoute::VaceFun => (
             crate::config::TransformerConfig::i2v_14b(),
@@ -259,11 +262,13 @@ pub fn request_contract_for_mode(
     Ok(contract)
 }
 
-pub fn begin_request<'a>(
-    prepared: &'a PreparedWanI2vMemory,
+/// The request scope owns a CLONE of the receipt, so the returned box borrows nothing from
+/// `prepared` and the registry seam can build one from a receipt it prepared itself (sc-22736).
+pub fn begin_request(
+    prepared: &PreparedWanI2vMemory,
     device: Device,
     context: &MemoryRunContext,
-) -> gen_core::Result<Option<Box<dyn MemoryRequestScope + 'a>>> {
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
     gen_core::wan_i2v_memory::validate_context(prepared, context)?;
     let request_contract = request_contract_for_mode(prepared, context.mode.as_key())?;
     let memory = request_contract.generation_memory(&context.selection);
@@ -299,6 +304,285 @@ pub fn begin_request<'a>(
         active: ActiveEvidenceGuard::default(),
     })))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Registry surface for the two A14B routes (sc-22736, epic sc-22723 E1).
+//
+// The Candle sibling of `mlx-gen-wan`'s block, and the same gap it closes: before this story only
+// `wan2_2_ti2v_5b` carried a `MemoryRegistration` on this lane, so the two A14B routes LOADED with
+// a full memory receipt and yet resolved nothing at all before the weights existed.
+// ---------------------------------------------------------------------------------------------
+
+/// The isolated namespace [`gen_core::wan_i2v_memory::weights_free_calibration_fingerprint`] mints
+/// in. A contract carrying it describes a load that never happened.
+const WEIGHTS_FREE_INFIX: &str = "-weights-free-conformance-";
+
+/// Whether `contract` is the weights-free registry fixture rather than a sealed production receipt.
+fn weights_free(contract: &gen_core::MemoryProviderContract) -> bool {
+    contract
+        .calibration
+        .as_ref()
+        .is_some_and(|identity| identity.fingerprint.contains(WEIGHTS_FREE_INFIX))
+}
+
+fn a14b_route(provider_id: &str) -> gen_core::Result<gen_core::wan_i2v_memory::WanI2vRoute> {
+    let route = gen_core::wan_i2v_memory::WanI2vRoute::for_provider(provider_id)?;
+    if gen_core::wan_i2v_memory::a14b_public_mode_key(route).is_none() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{provider_id}: not an A14B route"
+        )));
+    }
+    Ok(route)
+}
+
+fn a14b_contract(
+    spec: &LoadSpec,
+    provider_id: &'static str,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    a14b_route(provider_id)?;
+    Ok(prepare(spec, provider_id)?.contract)
+}
+
+fn a14b_weights_free_contract(
+    spec: &LoadSpec,
+    provider_id: &'static str,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let route = a14b_route(provider_id)?;
+    let mut contract =
+        gen_core::wan_i2v_memory::weights_free_contract(provider_id, WanI2vBackend::Candle, spec)?;
+    contract.architecture_facts = architecture_facts(route);
+    Ok(contract)
+}
+
+fn a14b_tier(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    provider_id: &'static str,
+) -> gen_core::Result<gen_core::MemoryNumericTier> {
+    if weights_free(contract) {
+        gen_core::wan_i2v_memory::spec_numeric_tier(spec, WanI2vBackend::Candle)
+    } else {
+        Ok(prepare(spec, provider_id)?.tier)
+    }
+}
+
+fn a14b_safety_check(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &MemoryRunContext,
+    provider_id: &'static str,
+) -> MemorySafetyDecision {
+    let decision = if weights_free(contract) {
+        gen_core::wan_i2v_memory::validate_weights_free_context(
+            provider_id,
+            WanI2vBackend::Candle,
+            spec,
+            contract,
+            context,
+        )
+    } else {
+        prepare(spec, provider_id)
+            .and_then(|prepared| gen_core::wan_i2v_memory::validate_context(&prepared, context))
+    };
+    match decision {
+        Ok(()) => MemorySafetyDecision::Accept,
+        Err(error) => MemorySafetyDecision::Reject {
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn a14b_valid_fixtures(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    strategy: MemoryStrategy,
+    provider_id: &'static str,
+) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+    let route = a14b_route(provider_id)?;
+    if !matches!(
+        contract
+            .capability(strategy)
+            .map(|capability| &capability.support),
+        Some(gen_core::MemoryStrategySupport::Implemented)
+    ) {
+        return Ok(Vec::new());
+    }
+    let tier = a14b_tier(spec, contract, provider_id)?;
+    let mode_key =
+        gen_core::wan_i2v_memory::a14b_public_mode_key(route).expect("a14b_route admitted it");
+    let reference_count = u32::from(route == gen_core::wan_i2v_memory::WanI2vRoute::I2v14b);
+    let mut context = gen_core::standard_memory_behavior_context(
+        contract,
+        strategy,
+        tier,
+        gen_core::MemoryBehaviorRoute {
+            mode: gen_core::MemoryMode::Other(mode_key.to_owned()),
+            reference_count,
+            use_pid: false,
+            has_phases: false,
+            overlay: None,
+        },
+    )?;
+    let (width, height, frames) = gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY;
+    context.geometry.width = width;
+    context.geometry.height = height;
+    context.geometry.frames = frames;
+    if contract.engages(strategy, MemoryStrategy::BoundedDecode) {
+        context.selection.parameters.decode_tile_edge =
+            gen_core::wan_i2v_memory::DECODE_TILE_EDGES.first().copied();
+        context.selection.parameters.decode_overlap =
+            gen_core::wan_i2v_memory::DECODE_OVERLAPS.first().copied();
+    }
+    contract.validate_selection(&context.selection)?;
+    let mut fixture = gen_core::MemoryBehaviorFixture::new(context);
+    fixture.request.prompt = format!("weights-free Candle {provider_id} memory behavior");
+    Ok(vec![fixture])
+}
+
+fn a14b_begin_request(
+    spec: &LoadSpec,
+    contract: &gen_core::MemoryProviderContract,
+    context: &MemoryRunContext,
+    provider_id: &'static str,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    if !weights_free(contract) {
+        let prepared = prepare(spec, provider_id)?;
+        return begin_request(&prepared, Device::Cpu, context);
+    }
+    gen_core::wan_i2v_memory::validate_weights_free_context(
+        provider_id,
+        WanI2vBackend::Candle,
+        spec,
+        contract,
+        context,
+    )?;
+    let route = a14b_route(provider_id)?;
+    let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
+        provider_id,
+        // The weights-free seam never touches an accelerator, exactly as the TI2V-5B registration's
+        // `registered_begin_request` does not.
+        Device::Cpu,
+        context.geometry,
+        contract.generation_memory(&context.selection),
+        false,
+        // ONE expert's depth, read off the same preset `architecture_facts` publishes.
+        architecture_facts(route)
+            .transformer_blocks
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(format!("{provider_id}: undeclared trunk depth"))
+            })?
+            .try_into()
+            .map_err(|_| {
+                gen_core::Error::Unsupported(format!("{provider_id}: trunk depth exceeds usize"))
+            })?,
+        |_pid, edge, overlap| {
+            if gen_core::wan_i2v_memory::DECODE_TILE_EDGES.contains(&edge)
+                && gen_core::wan_i2v_memory::DECODE_OVERLAPS.contains(&overlap)
+            {
+                Ok(())
+            } else {
+                Err(gen_core::Error::Unsupported(
+                    "Wan decode parameters crossed the sealed domain".to_owned(),
+                ))
+            }
+        },
+    )?;
+    config.default_frames = context.geometry.frames;
+    Ok(Some(Box::new(
+        candle_gen::request_scope::CandleRequestScopeCore::new(config),
+    )))
+}
+
+/// The Candle A14B load surface, as a witness set.
+///
+/// Both routes ship `q4` and `q8` under `SceneWorks/wan2.2-*-a14b-candle` and their dense leg under
+/// the upstream `Wan-AI/Wan2.2-*-A14B-Diffusers` snapshot, so they witness the common Candle
+/// registry tiers.
+///
+/// Only the materialization axis is filtered, and only to its eager half: this lane declares no
+/// bounded-transformer-residency route, so publishing the deferred selectors would advertise a load
+/// surface no contract can be built for.
+///
+/// The residency axis is NOT filtered, even though `video_jobs/candle.rs`'s
+/// `candle_video_offload_policy` names both routes `Sequential` in production — that is the
+/// *render* default, not the load surface. `wan_i2v_memory` reads `LoadSpec::offload_policy`
+/// nowhere, so the contract genuinely does not vary on it, and
+/// `every_registered_memory_strategy_rejects_cross_route_decode_geometry` pins the residency axis
+/// to the whole `OffloadPolicy` enum precisely because a per-provider set lets a whole axis collapse
+/// unnoticed. Publishing one policy would have claimed a variation this route does not have.
+fn a14b_memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
+    gen_core::candle_memory_contract_surface_specs()
+        .into_iter()
+        .filter(|surface| surface.selector.load_shape == gen_core::LoadShape::EagerMaterialization)
+        .collect()
+}
+
+macro_rules! a14b_registration {
+    ($module:ident, $provider:path) => {
+        /// Pre-load memory-strategy surface for one A14B route (sc-22736).
+        pub mod $module {
+            use super::*;
+
+            fn contract(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryProviderContract> {
+                super::a14b_contract(spec, $provider)
+            }
+
+            fn weights_free_contract(
+                spec: &LoadSpec,
+            ) -> gen_core::Result<gen_core::MemoryProviderContract> {
+                super::a14b_weights_free_contract(spec, $provider)
+            }
+
+            fn safety_check(
+                spec: &LoadSpec,
+                contract: &gen_core::MemoryProviderContract,
+                context: &MemoryRunContext,
+            ) -> MemorySafetyDecision {
+                super::a14b_safety_check(spec, contract, context, $provider)
+            }
+
+            fn valid_fixtures(
+                spec: &LoadSpec,
+                contract: &gen_core::MemoryProviderContract,
+                strategy: MemoryStrategy,
+            ) -> gen_core::Result<Vec<gen_core::MemoryBehaviorFixture>> {
+                super::a14b_valid_fixtures(spec, contract, strategy, $provider)
+            }
+
+            fn begin(
+                spec: &LoadSpec,
+                contract: &gen_core::MemoryProviderContract,
+                context: &MemoryRunContext,
+            ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+                super::a14b_begin_request(spec, contract, context, $provider)
+            }
+
+            pub const MEMORY_REGISTRATION: gen_core::MemoryRegistration =
+                gen_core::MemoryRegistration {
+                    provider_id: $provider,
+                    contract,
+                    safety_check,
+                };
+
+            pub const MEMORY_FIXTURE: gen_core::MemoryContractFixtureRegistration =
+                gen_core::MemoryContractFixtureRegistration {
+                    provider_id: $provider,
+                    contract: weights_free_contract,
+                    surface_specs: super::a14b_memory_contract_surface_specs,
+                };
+
+            pub const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
+                gen_core::MemoryBehaviorRegistration {
+                    provider_id: $provider,
+                    valid_fixtures,
+                    begin_request: begin,
+                };
+        }
+    };
+}
+
+a14b_registration!(t2v_14b, crate::config::MODEL_ID_T2V_14B);
+a14b_registration!(i2v_14b, crate::config::MODEL_ID_I2V_14B);
 
 pub fn selected_strategy(request: &GenerationRequest) -> Option<MemoryStrategy> {
     request.memory.map(|memory| {
