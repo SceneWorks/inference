@@ -1145,6 +1145,7 @@ impl KleinArtifactInventory {
             Some(stale) => encoder_contract
                 .validate_source_for_discovery_with_stale_packed_marker(
                     &text_encoder_source,
+                    &root,
                     &discovery_roots,
                     stale,
                 )?,
@@ -1217,7 +1218,7 @@ impl KleinArtifactInventory {
         )
     }
 
-    fn text_encoder_source_for_load_from_inventory(
+    pub(crate) fn text_encoder_source_for_load_from_inventory(
         encoder_contract: EncoderContract,
         inventory: Option<&Self>,
         spec: &LoadSpec,
@@ -2542,6 +2543,121 @@ mod tests {
         )
         .unwrap();
         assert_eq!(validated.packed_quant_bits(), None);
+    }
+
+    /// sc-22727 scope gap: the public entry `text_encoder_source_for_load` — the one `model.rs`
+    /// and `loader.rs` call — driven end to end.
+    ///
+    /// Two behaviors, neither reachable through
+    /// `text_encoder_source_for_load_from_inventory` (which is handed an inventory):
+    ///
+    /// * the `spec.text_encoder.is_none()` gate — a user-selected alternate skips artifact
+    ///   verification entirely and takes the ordinary encoder path, and
+    /// * no silent fallback — a pinned turnkey whose inventory refuses propagates the inventory's
+    ///   reason even though the ordinary encoder path over the same directory would have succeeded.
+    ///
+    /// The `provider_id` argument is forwarded to `verify_for_provider`; the refusal it produces
+    /// (`validate_provider`) is asserted over a bounded inventory in the provider-binding test,
+    /// because reaching it through this entry would need a text encoder satisfying the
+    /// *production* 9B encoder contract.
+    #[test]
+    fn text_encoder_source_for_load_gates_artifact_verification_on_the_spec_override() {
+        let contract = crate::config::bounded_klein_encoder_contract();
+        let fixture = immutable_turnkey_fixture(TurnkeyFamily::Base, None);
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
+
+        // The ordinary bounded encoder path over this very snapshot succeeds …
+        contract.source_for_load(&spec, &fixture.root).unwrap();
+        // … so this refusal is the inventory's, not the encoder contract's: a pinned turnkey that
+        // fails artifact verification never falls back to the ordinary path.
+        let error = KleinArtifactInventory::text_encoder_source_for_load(
+            contract,
+            crate::FLUX2_KLEIN_9B_ID,
+            &spec,
+            &fixture.root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("text encoder contract mismatch"), "{error}");
+
+        // A `LoadSpec::text_encoder` override skips artifact verification altogether: the same
+        // root that just refused now resolves through the ordinary encoder path.
+        let selected = spec
+            .clone()
+            .with_text_encoder(WeightsSource::Dir(fixture.root.join("text_encoder")));
+        let validated = KleinArtifactInventory::text_encoder_source_for_load(
+            contract,
+            crate::FLUX2_KLEIN_9B_ID,
+            &selected,
+            &fixture.root,
+        )
+        .unwrap();
+        assert_eq!(validated.packed_quant_bits(), None);
+    }
+
+    /// sc-22727: the concrete Qwen3 load derives its packed parts from the **validated** source,
+    /// never from a second read of the on-disk `quantization` block.
+    ///
+    /// The shipped q4/q8 turnkeys carry a stale marker over dense shards, so re-reading the block
+    /// would hand `Some(Flux2Quant{4,64})` to `from_weights_quant` — a mismatch that survives only
+    /// because `lin()` and `load_embed()` fall back to dense when `.scales` is absent. A corrected
+    /// re-host packed at its tier must still report its real width.
+    #[test]
+    fn text_encoder_load_quant_comes_from_the_validated_source_not_the_config_block() {
+        let contract = crate::config::bounded_klein_encoder_contract();
+        for tier in [Some(Quant::Q4), Some(Quant::Q8)] {
+            // Shipped: stale marker over dense shards ⇒ the load must build dense parts.
+            let fixture = immutable_turnkey_fixture(TurnkeyFamily::Base, tier);
+            let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
+            let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
+                contract,
+                Some(&fixture.inventory),
+                &spec,
+                &fixture.root,
+            )
+            .unwrap();
+            // The on-disk block the old code re-read still declares the stale tier …
+            assert_eq!(
+                crate::loader::read_component_quant(&fixture.root.join("text_encoder"))
+                    .unwrap()
+                    .map(|quant| quant.bits),
+                tier.map(Quant::bits),
+                "{tier:?}"
+            );
+            // … and the decision function ignores it.
+            assert_eq!(
+                crate::loader::validated_text_encoder_quant(&validated),
+                None,
+                "{tier:?}"
+            );
+
+            // A corrected re-host genuinely packed at its tier reports that width.
+            let tmp = turnkey_fixture_with_text_encoder(
+                TurnkeyFamily::Base,
+                tier,
+                TextEncoderFixture::PackedAtTier,
+            );
+            let root = fixture_root(&tmp, TurnkeyFamily::Base, tier);
+            let packed_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let inventory =
+                verify_bounded_turnkey(root.clone(), TurnkeyFamily::Base, tier, &packed_spec)
+                    .unwrap();
+            let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
+                contract,
+                Some(&inventory),
+                &packed_spec,
+                &root,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::loader::validated_text_encoder_quant(&validated),
+                Some(crate::config::Flux2Quant {
+                    bits: tier.map(Quant::bits).unwrap(),
+                    group_size: 64,
+                }),
+                "{tier:?}"
+            );
+        }
     }
 
     #[test]

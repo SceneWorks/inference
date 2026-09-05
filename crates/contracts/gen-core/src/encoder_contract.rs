@@ -223,7 +223,7 @@ pub struct ValidatedEncoderSource {
     requested_source: WeightsSource,
     weights: WeightsSource,
     config_path: Option<PathBuf>,
-    packed_quant_bits: Option<i32>,
+    packed_quant: Option<PackedQuantization>,
     pinned: PinnedEncoderSource,
     tokenizer: Option<ValidatedTokenizerSource>,
 }
@@ -467,7 +467,14 @@ impl ValidatedEncoderSource {
     /// A source admitted through [`EncoderContract::source_for_load_with_stale_packed_marker`]
     /// reports `None`: its verified stale marker carries no packed evidence.
     pub fn packed_quant_bits(&self) -> Option<i32> {
-        self.packed_quant_bits
+        self.packed_quant.map(|quant| quant.bits as i32)
+    }
+
+    /// The affine group size of the packed tier this exact validated source stores, or `None` for
+    /// a dense source. Paired with [`Self::packed_quant_bits`] so a backend can build the packed
+    /// parts from the validated source instead of re-reading the on-disk `quantization` block.
+    pub fn packed_quant_group_size(&self) -> Option<i32> {
+        self.packed_quant.map(|quant| quant.group_size as i32)
     }
 
     /// Derive the load-time conversion from the quantization evidence retained by this exact
@@ -479,7 +486,7 @@ impl ValidatedEncoderSource {
         provider_id: &str,
     ) -> Result<Option<i32>> {
         self.ensure_unchanged()?;
-        resolve_encoder_load_time_quant_bits(self.packed_quant_bits, expected_bits, provider_id)
+        resolve_encoder_load_time_quant_bits(self.packed_quant_bits(), expected_bits, provider_id)
     }
 
     /// Exact bytes in the direct shard inventory accepted by both backends. Nested files are not
@@ -578,7 +585,7 @@ impl ValidatedEncoderSource {
     ) -> Result<Vec<SafetensorsTensorHeader>> {
         self.ensure_unchanged()?;
         let headers = self.pinned.headers()?;
-        let packing = if self.packed_quant_bits.is_some() {
+        let packing = if self.packed_quant.is_some() {
             Some(contract.packing.ok_or_else(|| {
                 Error::Unsupported(format!(
                     "validated packed encoder has no packing contract for architecture {}",
@@ -865,6 +872,10 @@ fn collect_unique_encoder_headers(
 ///
 /// Public so a provider that pins an exact artifact can name the marker it expects on that
 /// artifact — see [`EncoderContract::source_for_load_with_stale_packed_marker`].
+///
+/// Naming a marker is not by itself an allowance: both `*_with_stale_packed_marker` entry points
+/// bind the allowance to the caller's own `base_root/text_encoder`, so the value can never be used
+/// to admit a contradiction on some other source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedQuantization {
     pub bits: usize,
@@ -1368,7 +1379,18 @@ impl EncoderContract {
     /// admitted as dense (`packed_quant_bits() == None`), so a provider whose policy is "as
     /// stored" loads it dense and one whose policy is packed folds it at load time. A
     /// [`crate::LoadSpec::text_encoder`] override is never eligible: the stale marker is a fact
-    /// about one pinned bundled artifact, not a policy a user-selected alternate may claim.
+    /// about one pinned bundled artifact, not a policy a user-selected alternate may claim, and the
+    /// validated source is built from `base_root` here rather than accepted from the caller.
+    ///
+    /// # Callers
+    ///
+    /// * `mlx_gen_flux2::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load_from_inventory`
+    ///   — the only production caller. It reaches this method exactly when its verified
+    ///   [pinned turnkey inventory][`crate::EncoderContract`] carries a stale marker
+    ///   (`turnkey_text_encoder_stale_marker`) for the SceneWorks Klein q4/q8 re-hosts (sc-22727).
+    ///
+    /// A new caller must be added to this list together with the pinned artifact inventory that
+    /// establishes its marker; there is no general "admit a contradiction" mode.
     pub fn source_for_load_with_stale_packed_marker(
         &self,
         spec: &crate::LoadSpec,
@@ -1420,12 +1442,30 @@ impl EncoderContract {
     /// Bounded discovery counterpart to [`Self::source_for_load_with_stale_packed_marker`]: the
     /// same confinement and header inspection as [`Self::validate_source_for_discovery`], with the
     /// config's packed marker required to equal `stale` and the shard surface required to be dense.
+    ///
+    /// Like the load counterpart, the allowance covers only the bundled component: `source` must be
+    /// exactly `base_root/text_encoder`, so a caller cannot point the named marker at a sibling
+    /// directory, an alternate the user selected, or another repository's component.
+    ///
+    /// # Callers
+    ///
+    /// * `mlx_gen_flux2::artifact_inventory::KleinArtifactInventory::verify_turnkey_with_contracts`
+    ///   — the only production caller, verifying the SceneWorks Klein q4/q8 re-hosts whose pinned
+    ///   `text_encoder/config.json` carries a stale marker over dense shards (sc-22727).
     pub fn validate_source_for_discovery_with_stale_packed_marker(
         &self,
         source: &WeightsSource,
+        base_root: &Path,
         allowed_roots: &[PathBuf],
         stale: PackedQuantization,
     ) -> Result<EncoderDiscoveryFacts> {
+        let bundled = base_root.join("text_encoder");
+        if !matches!(source, WeightsSource::Dir(path) if path == &bundled) {
+            return Err(Error::Unsupported(
+                "a stale packed-marker allowance applies only to the bundled text encoder, not to a selected alternate"
+                    .into(),
+            ));
+        }
         self.validate_source_for_discovery_with_policy(
             source,
             allowed_roots,
@@ -1661,7 +1701,7 @@ impl EncoderContract {
             requested_source: source.clone(),
             weights,
             config_path,
-            packed_quant_bits: packed_quant.map(|quant| quant.bits as i32),
+            packed_quant,
             pinned,
             tokenizer,
         })
@@ -3597,12 +3637,27 @@ fn ensure_discovery_paths_lexically_confined(
 /// repository, another volume, an arbitrary file) still fails `ensure_discovery_paths_confined`.
 /// The repository directory must lie strictly above the snapshot revision on `path`; a directory
 /// merely *named* `snapshots` elsewhere on the path does not widen the roots.
+///
+/// The repository is derived from the **canonical** path, never the lexical one:
+/// `std::path::absolute` keeps `..` components, so a lexical path such as
+/// `<hub>/models--org--repo/snapshots/<rev>/../../../models--evil--x/text_encoder` names a
+/// `models--org--repo` snapshot ancestor while its real location is an unrelated repository.
+/// Deriving from the canonical path authorizes only the repository the source actually lives in.
 pub fn hf_cache_discovery_roots(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let absolute = std::path::absolute(path)?;
-    let mut roots = vec![absolute.clone(), std::fs::canonicalize(&absolute)?];
-    if let Some(repository) = hf_cache_repository_dir(&absolute) {
+    let canonical = std::fs::canonicalize(&absolute)?;
+    let mut roots = vec![absolute.clone(), canonical.clone()];
+    if let Some(repository) = hf_cache_repository_dir(&canonical) {
         roots.push(repository.to_path_buf());
-        roots.push(std::fs::canonicalize(repository)?);
+        // The lexical repository is authorized only when it denotes the same directory as the
+        // canonical one, so a `..`-bearing path cannot smuggle in a sibling repository.
+        if let Some(lexical_repository) = hf_cache_repository_dir(&absolute) {
+            if std::fs::canonicalize(lexical_repository)
+                .is_ok_and(|resolved| resolved == repository)
+            {
+                roots.push(lexical_repository.to_path_buf());
+            }
+        }
     }
     roots.sort();
     roots.dedup();
@@ -5513,11 +5568,42 @@ mod tests {
         let facts = CONTRACT
             .validate_source_for_discovery_with_stale_packed_marker(
                 &WeightsSource::Dir(component.clone()),
+                &base,
                 &authorized_test_roots(&base),
                 stale,
             )
             .unwrap();
         assert!(!facts.materialized_language_tensor_headers().is_empty());
+
+        // The discovery allowance is tied to the spec's own `base_root/text_encoder`: the same
+        // bytes reached under any other name are refused, so naming a marker is never itself an
+        // allowance for an arbitrary source.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for name in ["config.json", "model.safetensors"] {
+            std::fs::copy(component.join(name), elsewhere.join(name)).unwrap();
+        }
+        let error = CONTRACT
+            .validate_source_for_discovery_with_stale_packed_marker(
+                &WeightsSource::Dir(elsewhere.clone()),
+                &base,
+                &authorized_test_roots(&elsewhere),
+                stale,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundled text encoder"), "{error}");
+        // Nor may a sibling `base_root` claim the marker for this component.
+        let error = CONTRACT
+            .validate_source_for_discovery_with_stale_packed_marker(
+                &WeightsSource::Dir(component.clone()),
+                &elsewhere,
+                &authorized_test_roots(&base),
+                stale,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundled text encoder"), "{error}");
 
         // A different marker than the one named is a different artifact.
         let other = PackedQuantization {
@@ -5536,6 +5622,7 @@ mod tests {
         assert!(CONTRACT
             .validate_source_for_discovery_with_stale_packed_marker(
                 &WeightsSource::Dir(component.clone()),
+                &base,
                 &authorized_test_roots(&base),
                 other,
             )
@@ -5660,6 +5747,29 @@ mod tests {
         assert_eq!(
             hf_cache_discovery_roots(&bare_repository).unwrap(),
             authorized_test_roots(&bare_repository)
+        );
+
+        // A `..`-bearing path whose real location is a *different* repository must not authorize
+        // the repository its lexical ancestors name. `std::path::absolute` keeps `..`, so the
+        // repository has to be derived from the canonical path.
+        let sibling = hub.join("models--evil--x/text_encoder");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let traversal = snapshot.join("../../../models--evil--x/text_encoder");
+        let traversal_roots = hf_cache_discovery_roots(&traversal).unwrap();
+        assert!(
+            !traversal_roots.contains(&std::path::absolute(&repository).unwrap()),
+            "{traversal_roots:?}"
+        );
+        assert!(
+            !traversal_roots
+                .iter()
+                .any(|root| std::fs::canonicalize(root).unwrap()
+                    == std::fs::canonicalize(&repository).unwrap()),
+            "{traversal_roots:?}"
+        );
+        assert!(
+            traversal_roots.contains(&std::fs::canonicalize(&sibling).unwrap()),
+            "{traversal_roots:?}"
         );
     }
 

@@ -91,6 +91,28 @@ pub fn contract_for_variant(
     Ok(None)
 }
 
+/// [`contract_for_variant`] over an inventory the caller has already verified, so a load that
+/// holds one does not re-walk the artifact for its memory contract.
+pub(crate) fn contract_for_variant_with_inventory(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
+) -> mlx_gen::Result<Option<MemoryProviderContract>> {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
+        crate::model::validate_klein_load_axes(spec, variant.id())
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+        return Ok(Some(klein_contract_with_inventory(
+            variant.id(),
+            spec,
+            inventory,
+        )?));
+    }
+    contract_for_variant(variant, spec)
+}
+
 /// The per-component asset bytes a Dev / Dev-Edit load materializes (SC-22667, E1).
 ///
 /// Both Dev contracts published `MemoryAssetFacts::default()` — five zeros — on every path,
@@ -1007,12 +1029,11 @@ fn klein_contract_with_inventory(
     spec: &LoadSpec,
     inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    let footprint = match provider_id {
-        crate::FLUX2_KLEIN_9B_ID => crate::model::component_footprint(spec)?,
-        crate::FLUX2_KLEIN_9B_EDIT_ID => crate::model::klein_edit_component_footprint(spec)?,
-        crate::FLUX2_KLEIN_9B_KV_EDIT_ID => crate::model::klein_kv_edit_component_footprint(spec)?,
-        _ => unreachable!("validate_klein_load_axes rejects unknown providers"),
-    };
+    // Price from the inventory the caller already verified: the registry footprint callbacks
+    // (`component_footprint` and friends) re-run `verify_for_provider`, which re-walks all three
+    // component directories and re-parses every shard header.
+    let footprint =
+        crate::model::klein_component_footprint_with_inventory(provider_id, spec, inventory)?;
     klein_contract_from_parts(provider_id, spec, inventory, footprint)
 }
 

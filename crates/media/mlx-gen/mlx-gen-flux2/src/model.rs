@@ -185,9 +185,18 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
             mlx_gen::residency::warn_sequential_requantize(variant.id(), q.bits());
         }
     }
+    // Verify the Klein artifact inventory ONCE for this load and thread it through both the
+    // encoder-source selection and the memory contract, instead of re-walking every component
+    // directory per consumer.
+    let inventory = klein_inventory_for(variant, spec)?;
     // The dev checkpoint has a different tokenizer (Mistral3, not Qwen3) than klein.
-    let text_encoder_source =
-        text_encoder_source_for_load(variant, variant.encoder_contract(), spec, root)?;
+    let text_encoder_source = text_encoder_source_for_load_with_inventory(
+        variant,
+        variant.encoder_contract(),
+        spec,
+        root,
+        inventory.as_ref(),
+    )?;
     let tokenizer = if variant.is_dev() {
         loader::load_validated_tokenizer_dev(&text_encoder_source)?
     } else {
@@ -197,7 +206,11 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
-        memory_strategy: crate::memory_strategy::contract_for_variant(variant, spec)?,
+        memory_strategy: crate::memory_strategy::contract_for_variant_with_inventory(
+            variant,
+            spec,
+            inventory.as_ref(),
+        )?,
         memory_numeric_tier: Some(memory_numeric_tier),
         loaded_spec: spec.clone(),
         tokenizer: Some(tokenizer),
@@ -264,6 +277,9 @@ fn load_flux2_text(
     multimodal_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
     text_encoder_load_time_quant_bits: Option<i32>,
 ) -> Result<Flux2TextOwned> {
+    // Derived from the *validated* source, never from a second read of the on-disk `quantization`
+    // block: a pinned Klein turnkey's q4/q8 marker is stale over dense shards (sc-22727).
+    let klein_quant = loader::validated_text_encoder_quant(text_encoder_source);
     text_encoder_source.read_unchanged(|source| {
         let (mut text_encoder, vision_tower, projector) = if variant.is_dev() {
             let (encoder, vision_tower, projector) =
@@ -272,7 +288,11 @@ fn load_flux2_text(
                 })?;
             (encoder, Some(vision_tower), Some(projector))
         } else {
-            (loader::load_text_encoder_from_source(source)?, None, None)
+            (
+                loader::load_text_encoder_from_source(source, klein_quant)?,
+                None,
+                None,
+            )
         };
         if let Some(bits) = text_encoder_load_time_quant_bits {
             text_encoder.quantize(bits)?;
@@ -440,25 +460,46 @@ fn build_residency_from_admitted_sources(
     )
 }
 
-/// The bundled text encoder of one FLUX.2 load, validated for that load.
+/// Verify the Klein artifact inventory for one load or admission — `None` for Dev, for a
+/// [`LoadSpec::text_encoder`] override (which is never eligible for the pinned-artifact
+/// allowance), and for a Klein source that matches no pinned artifact.
+///
+/// Callers hold the result and thread it through
+/// [`text_encoder_source_for_load_with_inventory`] and
+/// [`crate::memory_strategy::contract_for_variant_with_inventory`] so one load/admission verifies
+/// the inventory exactly once instead of re-walking three component directories and re-parsing
+/// every shard header per consumer.
+pub(crate) fn klein_inventory_for(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> Result<Option<crate::artifact_inventory::KleinArtifactInventory>> {
+    if variant.is_dev() || spec.text_encoder.is_some() {
+        return Ok(None);
+    }
+    Ok(crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(variant.id(), spec)?)
+}
+
+/// The bundled text encoder of one FLUX.2 load, validated for that load, over an inventory the
+/// caller has already verified with [`klein_inventory_for`].
 ///
 /// Klein routes go through [`crate::artifact_inventory::KleinArtifactInventory`] so a pinned
 /// turnkey whose Qwen3 text encoder carries the verified stale packed marker (sc-22727) is admitted
 /// as the dense artifact it is; Dev and every other Klein source take
 /// [`mlx_gen::gen_core::EncoderContract::source_for_load`] unchanged.
-fn text_encoder_source_for_load(
+fn text_encoder_source_for_load_with_inventory(
     variant: Flux2Variant,
     language_contract: mlx_gen::gen_core::EncoderContract,
     spec: &LoadSpec,
     root: &Path,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
 ) -> Result<mlx_gen::gen_core::ValidatedEncoderSource> {
     if variant.is_dev() {
         return Ok(language_contract.source_for_load(spec, root)?);
     }
     Ok(
-        crate::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load(
+        crate::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
             language_contract,
-            variant.id(),
+            inventory,
             spec,
             root,
         )?,
@@ -472,6 +513,17 @@ fn text_encoder_source_for_load(
 /// exactly as stored: a dense encoder stays dense (the shipped q4/q8/bf16 turnkeys, sc-22727), and
 /// a packed encoder must sit at the transformer's own tier — a tier is a whole-pipeline contract,
 /// so a Q8 encoder on a Q4 transformer is refused rather than silently served above tier.
+///
+/// # Reachability
+///
+/// The Klein packed arm (`selected.packed_quant_bits().is_some()`) is **unreachable for every
+/// pinned revision**: the shipped SceneWorks re-hosts carry a dense Qwen3 tower at every tier
+/// (q4/q8 under the stale marker, sc-22727), and `KleinArtifactInventory` admits no other Klein
+/// artifact whose text encoder is packed. It is retained for a future corrected re-host that ships
+/// a genuinely packed tower at its tier. Landing such a re-host is **not** a drop-in: SceneWorks
+/// `config/tier-integrity.jsonc` declares an unconditional dense text-encoder exception for the
+/// klein rows with fixed `costBytesByTier`, so the re-host and a matching `tier-integrity.jsonc`
+/// update must land together or admission will price the tower dense while the load runs it packed.
 fn expected_language_quant_bits(
     variant: Flux2Variant,
     spec: &LoadSpec,
@@ -1604,22 +1656,55 @@ pub(crate) fn component_footprint_for(
     include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let inventory = klein_inventory_for(variant, spec)?;
     component_footprint_for_with_contracts(
         variant,
         provider_id,
         include_builtin_multimodal,
         spec,
+        inventory.as_ref(),
         variant.encoder_contract(),
         crate::config::DEV_ENCODER_CONTRACT,
         crate::config::DEV_VISION_ENCODER_CONTRACT,
     )
 }
 
+/// [`component_footprint_for`] over an inventory the caller has already verified — the admission
+/// path (`memory_strategy::klein_contract_with_inventory`) holds one and must not re-verify it.
+pub(crate) fn klein_component_footprint_with_inventory(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let variant = match provider_id {
+        crate::config::FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        crate::config::FLUX2_KLEIN_9B_EDIT_ID => Flux2Variant::Klein9bEdit,
+        crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID => Flux2Variant::Klein9bKvEdit,
+        _ => {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 Klein memory provider {provider_id}"
+            )))
+        }
+    };
+    component_footprint_for_with_contracts(
+        variant,
+        provider_id,
+        false,
+        spec,
+        inventory,
+        variant.encoder_contract(),
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn component_footprint_for_with_contracts(
     variant: Flux2Variant,
     provider_id: &str,
     include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
     language_contract: mlx_gen::gen_core::EncoderContract,
     dev_language_contract: mlx_gen::gen_core::EncoderContract,
     dev_vision_contract: mlx_gen::gen_core::VisionEncoderContract,
@@ -1639,7 +1724,13 @@ fn component_footprint_for_with_contracts(
             ))
         }
     };
-    let selected = text_encoder_source_for_load(variant, language_contract, spec, root)?;
+    let selected = text_encoder_source_for_load_with_inventory(
+        variant,
+        language_contract,
+        spec,
+        root,
+        inventory,
+    )?;
     // Resolve and validate the language-tier policy here, at the registry footprint consumed by
     // the estimated fit fallback, so admission cannot underprice a dense alternate or accept a
     // packed mismatch the loader rejects: see `expected_language_quant_bits`.
@@ -3339,11 +3430,13 @@ mod tests {
         } else {
             crate::config::bounded_klein_encoder_contract()
         };
+        let inventory = klein_inventory_for(variant, spec)?;
         component_footprint_for_with_contracts(
             variant,
             provider_id,
             include_builtin_multimodal,
             spec,
+            inventory.as_ref(),
             language_contract,
             crate::config::bounded_dev_encoder_contract(),
             crate::config::bounded_dev_vision_encoder_contract(),
