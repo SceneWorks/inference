@@ -496,18 +496,24 @@ fn a14b_begin_request(
 /// The Candle A14B load surface, as a witness set.
 ///
 /// Both routes ship `q4` and `q8` under `SceneWorks/wan2.2-*-a14b-candle` and their dense leg under
-/// the upstream `Wan-AI/Wan2.2-*-A14B-Diffusers` snapshot, and `video_jobs/candle.rs`'s
-/// `candle_video_offload_policy` names both of them `Sequential` — the two 14B MoE experts cannot
-/// be co-resident, so the engine stages TE -> high -> low -> VAE. Materialization is eager: this
-/// lane declares no bounded-transformer-residency route, so `evaluate_declared_candle_load_shape`
-/// hands the spec straight back.
+/// the upstream `Wan-AI/Wan2.2-*-A14B-Diffusers` snapshot, so they witness the common Candle
+/// registry tiers.
+///
+/// Only the materialization axis is filtered, and only to its eager half: this lane declares no
+/// bounded-transformer-residency route, so publishing the deferred selectors would advertise a load
+/// surface no contract can be built for.
+///
+/// The residency axis is NOT filtered, even though `video_jobs/candle.rs`'s
+/// `candle_video_offload_policy` names both routes `Sequential` in production — that is the
+/// *render* default, not the load surface. `wan_i2v_memory` reads `LoadSpec::offload_policy`
+/// nowhere, so the contract genuinely does not vary on it, and
+/// `every_registered_memory_strategy_rejects_cross_route_decode_geometry` pins the residency axis
+/// to the whole `OffloadPolicy` enum precisely because a per-provider set lets a whole axis collapse
+/// unnoticed. Publishing one policy would have claimed a variation this route does not have.
 fn a14b_memory_contract_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
     gen_core::candle_memory_contract_surface_specs()
         .into_iter()
-        .filter(|surface| {
-            surface.selector.offload_policy == OffloadPolicy::Sequential
-                && surface.selector.load_shape == gen_core::LoadShape::EagerMaterialization
-        })
+        .filter(|surface| surface.selector.load_shape == gen_core::LoadShape::EagerMaterialization)
         .collect()
 }
 

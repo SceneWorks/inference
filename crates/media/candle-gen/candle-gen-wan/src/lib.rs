@@ -1446,14 +1446,29 @@ mod explicit_registry_tests {
                 .find(|fixture| fixture.provider_id == provider)
                 .unwrap_or_else(|| panic!("{provider} registers a weights-free fixture"));
             let surfaces = (fixture.surface_specs)();
-            // Every shipped tier, one selector apiece: Sequential + eager, which is what
-            // `candle_video_offload_policy` names for both A14B routes.
+            // Every shipped tier under BOTH residency policies, eager only. The A14B lane has no
+            // deferred block loader, but `wan_i2v_memory` reads `LoadSpec::offload_policy` nowhere,
+            // so the residency axis is published whole rather than collapsed onto the render-time
+            // `Sequential` default. Stated as the rectangle it is, so a filter that drops a policy
+            // or a tier is caught here and not only in the cuda-gated catalog walk.
             assert_eq!(
-                surfaces.len(),
-                3,
-                "{provider} witnesses one selector per tier"
+                surfaces
+                    .iter()
+                    .map(|surface| surface.selector.id().to_owned())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["bf16", "q4", "q8"]
+                    .into_iter()
+                    .flat_map(|tier| ["resident", "sequential"]
+                        .into_iter()
+                        .map(move |policy| format!("{tier}:{policy}:eager")))
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{provider} must witness every shipped tier under both residency policies, eager only"
             );
-            let mut identities = std::collections::BTreeSet::new();
+            // The calibration identity is keyed per (provider, artifact tier, load shape) and NOT
+            // per residency policy, so a tier's two policies deliberately SHARE one fingerprint.
+            // Asserting the multiplicity rather than uniqueness is what makes a policy-keyed
+            // identity — which would mint six strings — fail here.
+            let mut identities = std::collections::BTreeMap::<String, usize>::new();
             for surface in &surfaces {
                 let contract = (fixture.contract)(&surface.spec).unwrap_or_else(|error| {
                     panic!("{provider} {:?}: {error}", surface.selector.id())
@@ -1468,11 +1483,7 @@ mod explicit_registry_tests {
                     "{provider}: a fixture must not publish a production string: {}",
                     identity.fingerprint
                 );
-                assert!(
-                    identities.insert(identity.fingerprint.clone()),
-                    "{provider}: {} names more than one selector",
-                    identity.fingerprint
-                );
+                *identities.entry(identity.fingerprint.clone()).or_default() += 1;
                 // The optimized rungs really are advertised, which is what obliges the behavior
                 // seam the conformance walk exercises.
                 assert_eq!(
@@ -1482,6 +1493,12 @@ mod explicit_registry_tests {
                     Some(MemoryStrategySupport::Implemented)
                 );
             }
+            assert_eq!(
+                identities.values().copied().collect::<Vec<_>>(),
+                vec![2, 2, 2],
+                "{provider}: exactly three fixture identities, each shared by that tier's two \
+                 residency selectors — {identities:?}"
+            );
         }
 
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
