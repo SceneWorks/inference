@@ -50,11 +50,17 @@ const WEIGHTS_FREE_CALIBRATION_FINGERPRINT: &str = "scail2-14b-candle-weights-fr
 
 /// The production calibration identity for a Candle SCAIL-2 load of `artifact_tier`.
 ///
-/// `None` for every tier but dense bf16 — and that is a *routing* fact, not an omission:
+/// `None` for every tier but dense bf16, because this **memory contract** admits only dense bf16:
 /// `PreparedMemory::prepare` refuses `config.packed_quant.is_some() || spec.quantize.is_some()`
-/// (see the `accepts dense bf16 only` refusal) and `is_bf16_tier` requires the snapshot's own
-/// `bf16` directory, so the Candle lane has no q4 or q8 cell to name. If the engine ever grows
-/// one, this function is where its string is minted.
+/// (the `accepts dense bf16 only` refusal) and `is_bf16_tier` requires the snapshot's own `bf16`
+/// directory.
+///
+/// That is narrower than the RENDER route, and deliberately stated as such: SceneWorks'
+/// `crates/sceneworks-worker/src/video_jobs/candle.rs::resolve_candle_scail2_tier` accepts
+/// `advanced.mlxQuantize` of 4, 8 or `<= 0`, so the Candle lane does render q4 and q8 — it just has
+/// no memory contract for them, and therefore no cell for a measurement to name. Closing that gap
+/// means teaching `PreparedMemory::prepare` the packed layout's byte accounting; this function is
+/// where the resulting strings would be minted.
 pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> Option<String> {
     if artifact_tier.quant.is_some() {
         return None;
@@ -1494,15 +1500,19 @@ pub(crate) mod tests {
         assert_ne!(free_fingerprint, MLX_PEER_BF16_FINGERPRINT);
     }
 
-    /// The Candle lane routes **no** packed tier, and this test goes red the day it does.
+    /// This memory contract admits **no** packed tier, and this test goes red the day it does.
     ///
     /// `PreparedMemory::prepare` refuses `config.packed_quant.is_some() || spec.quantize.is_some()`
     /// with `accepts dense bf16 only`, and the canonical-artifact check requires the snapshot's own
-    /// `bf16` directory. That is why `production_calibration_fingerprint` mints nothing for q4/q8:
-    /// there is no Candle cell to name. If either refusal is relaxed without minting the
-    /// corresponding string, this fails.
+    /// `bf16` directory. That is why `production_calibration_fingerprint` mints nothing for q4/q8.
+    ///
+    /// The SceneWorks Candle **render** route is wider — `resolve_candle_scail2_tier` accepts
+    /// `advanced.mlxQuantize` 4 and 8 — so those two cells render with no memory contract at all.
+    /// This test pins the current boundary so relaxing either refusal without minting the
+    /// corresponding identity fails loudly rather than silently publishing a bf16 string for a
+    /// packed load.
     #[test]
-    fn the_candle_lane_routes_no_packed_tier_so_it_mints_no_packed_identity() {
+    fn the_candle_memory_contract_admits_no_packed_tier_so_it_mints_no_packed_identity() {
         for quant in [gen_core::Quant::Q4, gen_core::Quant::Q8] {
             let tier = MemoryNumericTier {
                 precision: Precision::Bf16,
