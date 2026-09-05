@@ -974,7 +974,7 @@ pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static 
 
 /// The route token one provider id contributes to its identity: the full planner+renderer pipeline
 /// the `bernini` / `bernini_image` catalog entries resolve to, and the renderer-only sibling.
-fn calibration_route(provider_id: &str) -> Option<&'static str> {
+pub fn calibration_route(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         FULL_ID => Some("image"),
         RENDERER_ID => Some("renderer"),
