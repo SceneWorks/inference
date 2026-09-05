@@ -1010,6 +1010,20 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
     PreparedMemory::prepare(spec).map(|prepared| prepared.contract)
 }
 
+/// The structural resident receipt a load of `spec` seals — the same one the loaded generator
+/// carries (sc-22736).
+///
+/// [`request_evidence_revision`] takes that receipt, and until now only a LOADED generator held
+/// one, so a caller that must PRESENT an admitted request identity — a measurement harness driving
+/// this provider's own registered admission check — had no way to mint it. This exposes exactly
+/// what `PreparedMemory::prepare` seals and nothing else: it opens the same artifact, proves the
+/// same tier off the snapshot's own marker, and fails the same way for a non-canonical root.
+pub fn structural_resident_evidence(
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryStructuralResidentEvidence> {
+    PreparedMemory::prepare(spec).map(|prepared| prepared.structural_evidence)
+}
+
 /// Weights-free catalog witness for the sole shipped dense-bf16 Resident surface. Production loads
 /// still require the immutable canonical receipt in [`PreparedMemory::prepare`].
 fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
