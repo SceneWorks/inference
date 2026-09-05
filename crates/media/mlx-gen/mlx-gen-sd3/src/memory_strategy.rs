@@ -30,8 +30,8 @@
 //! # Production calibration identity (sc-22730, epic sc-22723 E1/E4)
 //!
 //! Every clean base load of a SHIPPED SceneWorks turnkey publishes a production calibration identity
-//! keyed on the route — see [`production_calibration_fingerprint`] for the table and
-//! `production_calibration_identity` for the binding. Until sc-22730 the identity existed only for
+//! keyed on the route AND the proven artifact tier — see [`production_calibration_fingerprint`] for
+//! the table and `production_calibration_identity` for the binding. Until sc-22730 the identity existed only for
 //! that one content-pinned Large BF16 snapshot, so all nine `<route>:<tier>:mlx` cells the worker can
 //! actually load published none and no memory anchor could bind to them: the SceneWorks capture arm
 //! reads `contract.calibration` off the LOADED generator and refuses a contract without one.
@@ -40,8 +40,10 @@
 //! loads `Resident + EagerMaterialization` — and it is bound to the artifact, never to the request
 //! knob: `artifact_inventory::shipped_turnkey_tier` proves the pinned repository, revision and tier
 //! subdir and then cross-checks the transformer's packed triples against the `quantization` manifest
-//! the converter wrote, and a dense snapshot opened with `quantize = Some(_)` (a genuine runtime
-//! requantization, since this engine quantizes dense at load) publishes nothing. A load that is not
+//! the converter wrote, and a snapshot opened with a `quantize` that is not its own tier (a genuine
+//! runtime requantization, since this engine quantizes dense at load) publishes nothing — including
+//! the dense content-pinned SC-15522 snapshot, whose measured string is a `bf16` cell of the same
+//! table and is unreachable under a quant knob. A load that is not
 //! a shipped turnkey — an anonymous structurally admitted snapshot — still publishes no calibration
 //! and is admitted only under explicit
 //! [`mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated`] authority (SC-18093). Weights-free
@@ -232,24 +234,57 @@ fn build_contract(
     Ok(contract)
 }
 
-/// Production calibration identity table of the clean SD3.5 base routes, keyed on the route
+/// The label a PROVEN artifact tier carries inside a production calibration string.
+///
+/// The input is the tier of the transformer on disk — never `LoadSpec::quantize` — so a tier this
+/// family does not ship is unnameable rather than silently collapsed onto a neighbour.
+fn calibration_tier_label(artifact_tier: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match artifact_tier {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity table of the clean SD3.5 base routes, keyed on
+/// (route, proven artifact tier, whether the artifact is the content-pinned SC-15522 snapshot)
 /// (sc-22730, epic sc-22723 E1/E4).
 ///
 /// This is the TABLE, not the binding: only `production_calibration_identity` — which proves the
-/// load against the artifact on disk first — may turn one of these strings into a contract identity.
+/// tier against the artifact on disk first — may turn one of these strings into a contract identity.
 ///
-/// The measured [`MEMORY_CALIBRATION_FINGERPRINT`] stays exactly where its evidence is: the exact
-/// content-pinned SC-15522 Large BF16 snapshot, and it is returned by the binding rather than by this
-/// table. Every shipped SceneWorks turnkey publishes `sd3-5-<route>-mlx-shared-ladder-v1` instead.
-/// Offload policy, load shape and tier are deliberately NOT inputs: one turnkey family per route
-/// carries all three tiers of the same ladder, `MemoryCalibrationIdentity::load_shape` carries the
-/// materialization axis separately, and the tier is what the binding proves before publishing at all.
-pub fn production_calibration_fingerprint(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        crate::MODEL_ID => Some("sd3-5-large-mlx-shared-ladder-v1"),
-        crate::TURBO_MODEL_ID => Some("sd3-5-large-turbo-mlx-shared-ladder-v1"),
-        crate::MEDIUM_MODEL_ID => Some("sd3-5-medium-mlx-shared-ladder-v1"),
-        _ => None,
+/// The measured [`MEMORY_CALIBRATION_FINGERPRINT`] is folded in HERE rather than short-circuited
+/// ahead of the tier proof, and it occupies exactly one cell: the content-pinned SC-15522 Large
+/// snapshot at its own `bf16` tier. That snapshot is dense by content pin
+/// (`artifact_inventory::FILES` names no `.scales` tensor), so a `quantize = Some(_)` load of it is
+/// a runtime requantization (`crate::model::load_heavy` quantizes dense at load) whose peak the
+/// bf16 evidence never measured — the caller passes the artifact tier, so that load reaches no
+/// string at all. Every shipped SceneWorks turnkey publishes
+/// `sd3-5-<route>-<tier>-mlx-shared-ladder-v1`: nine distinct cells, because the three tiers of one
+/// route are three different resident sets and one anchor cannot price all three.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<mlx_gen::Quant>,
+    calibrated: bool,
+) -> Option<String> {
+    let route = match provider_id {
+        crate::MODEL_ID => "large",
+        crate::TURBO_MODEL_ID => "large-turbo",
+        crate::MEDIUM_MODEL_ID => "medium",
+        _ => return None,
+    };
+    let tier = calibration_tier_label(artifact_tier)?;
+    match (calibrated, provider_id, artifact_tier) {
+        // The one measured cell. Its evidence is bf16 Large and nothing else.
+        (true, crate::MODEL_ID, None) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        // A content-pinned snapshot is not a shipped turnkey, so it may never borrow a turnkey
+        // string; any other calibrated shape is unnameable and fails closed.
+        (true, _, _) => None,
+        (false, _, _) => Some(format!("sd3-5-{route}-{tier}-mlx-shared-ladder-v1")),
     }
 }
 
@@ -265,35 +300,38 @@ pub fn production_calibration_fingerprint(provider_id: &str) -> Option<&'static 
 ///
 /// * the load must be a clean base load ([`clean`]) at bf16 execution precision — an overlay or an
 ///   external text encoder is a different resident set that no anchor measured; and
-/// * `spec.quantize` must be the tier the artifact on disk already is
-///   (`artifact_inventory::shipped_turnkey_tier`). This engine quantizes DENSE AT LOAD
-///   (`crate::model::load_heavy`), so a dense snapshot opened with `quantize = Some(_)` is a genuine
-///   runtime requantization whose peak is nobody's anchor, while a packed turnkey opened at its own
-///   tier is the checked no-op the worker performs (`resolve_quant` → `reconcile_resolved_tier_quant`
-///   settle the load quant onto the resolved tier subdir).
+/// * `spec.quantize` must be the tier the artifact on disk already is — proven for a turnkey by
+///   `artifact_inventory::shipped_turnkey_tier`, and by the content pin itself for the SC-15522
+///   snapshot (dense: `artifact_inventory::FILES` names no `.scales` tensor, so its tier is `bf16`).
+///   This engine quantizes DENSE AT LOAD (`crate::model::load_heavy`), so ANY snapshot opened with a
+///   `quantize` that is not its own tier is a genuine runtime requantization whose peak is nobody's
+///   anchor — the calibrated snapshot included — while a packed turnkey opened at its own tier is
+///   the checked no-op the worker performs (`resolve_quant` → `reconcile_resolved_tier_quant` settle
+///   the load quant onto the resolved tier subdir).
+///
+/// Withholding is never fatal: an unparseable or self-inconsistent turnkey marker yields no identity
+/// instead of failing the LOAD (`crate::model::load_heavy` propagates `contract_for`'s error).
+/// `artifact_inventory::shipped_turnkey_tier` keeps its hard error for callers that want it.
 fn production_calibration_identity(
     provider_id: &str,
     spec: &LoadSpec,
     calibrated: bool,
-) -> mlx_gen::gen_core::Result<Option<MemoryCalibrationIdentity>> {
+) -> Option<MemoryCalibrationIdentity> {
     if !clean(spec) || spec.precision != mlx_gen::Precision::Bf16 {
-        return Ok(None);
+        return None;
     }
-    if calibrated {
-        return Ok(Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
-            spec.load_shape,
-        )));
-    }
-    let Some(artifact_tier) = crate::artifact_inventory::shipped_turnkey_tier(provider_id, spec)?
-    else {
-        return Ok(None);
+    let artifact_tier = if calibrated {
+        None
+    } else {
+        crate::artifact_inventory::shipped_turnkey_tier(provider_id, spec)
+            .ok()
+            .flatten()?
     };
     if artifact_tier != spec.quantize {
-        return Ok(None);
+        return None;
     }
-    Ok(production_calibration_fingerprint(provider_id)
-        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)))
+    production_calibration_fingerprint(provider_id, artifact_tier, calibrated)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
 }
 
 /// Production contract for a loaded (or loadable) SD3.5 route.
@@ -325,7 +363,7 @@ pub(crate) fn contract_for(
             .is_some_and(|inventory| inventory.is_calibrated()),
     };
     let streamable = stream.is_some();
-    let calibration = production_calibration_identity(provider_id, spec, calibrated)?;
+    let calibration = production_calibration_identity(provider_id, spec, calibrated);
     build_contract(
         provider_id,
         spec,
@@ -888,27 +926,29 @@ mod tests {
     /// to bind. Nine cells (three routes x three tiers) had none before.
     ///
     /// *Mutations this kills:* restoring `calibrated.then(…)` (every turnkey goes back to `None`);
-    /// keying the string on the tier, the offload policy or the load shape (the six specs below
-    /// would disagree); replaying one route's string on another; publishing the weights-free
-    /// registry string in production; and dropping the artifact proof — the last two blocks load a
-    /// dense turnkey with a quant knob and a packed turnkey at the wrong tier, both of which are
-    /// runtime requantizations no anchor measured.
+    /// keying the string on the offload policy or the load shape (the six specs below would
+    /// disagree); DROPPING the tier from the key (the nine strings collapse to three and the
+    /// distinctness assert fails); replaying one route's string on another; publishing the
+    /// weights-free registry string in production; and dropping the artifact proof — the last two
+    /// blocks load a dense turnkey with a quant knob and a packed turnkey at the wrong tier, both of
+    /// which are runtime requantizations no anchor measured.
     #[test]
     fn every_shipped_turnkey_tier_publishes_its_routes_production_identity() {
         let mut published = std::collections::BTreeSet::new();
         for provider in PROVIDERS {
-            let expected = production_calibration_fingerprint(provider).unwrap();
             let weights_free = format!(
                 "{STATIC_BEHAVIOR_FINGERPRINT}-{}",
                 provider.replace('_', "-")
             );
-            assert_ne!(expected, weights_free);
-            assert_ne!(expected, MEMORY_CALIBRATION_FINGERPRINT);
             for (tier, quant) in [
                 ("bf16", None),
                 ("q4", Some(mlx_gen::Quant::Q4)),
                 ("q8", Some(mlx_gen::Quant::Q8)),
             ] {
+                let expected = production_calibration_fingerprint(provider, quant, false).unwrap();
+                assert!(expected.contains(tier), "{provider} {tier}: {expected}");
+                assert_ne!(expected, weights_free);
+                assert_ne!(expected, MEMORY_CALIBRATION_FINGERPRINT);
                 let (_temp, root) = turnkey_fixture(provider, tier);
                 assert_eq!(
                     crate::artifact_inventory::shipped_turnkey_tier(
@@ -963,10 +1003,108 @@ mod tests {
                         "{other} must not claim {provider}'s turnkey"
                     );
                 }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{provider} {tier} repeats another cell's identity: {expected}"
+                );
             }
-            published.insert(expected);
         }
-        assert_eq!(published.len(), PROVIDERS.len());
+        // Nine distinct strings: three routes x three tiers. A route-only key collapses this to 3.
+        assert_eq!(published.len(), PROVIDERS.len() * 3);
+    }
+
+    /// sc-22730 review (blocker): the calibrated arm is NOT a short-circuit ahead of the tier proof.
+    /// The content-pinned SC-15522 snapshot is dense — `artifact_inventory::FILES` names no
+    /// `.scales` tensor — so its tier is `bf16`, and a `quantize = Some(_)` load of it is a runtime
+    /// requantization (`crate::model::load_heavy` quantizes dense at load) that the bf16 evidence
+    /// never measured. It must publish nothing, and it must not fall back to a turnkey string
+    /// either.
+    ///
+    /// *Mutation this kills:* restoring `if calibrated { return Some(MemoryCalibrationIdentity::
+    /// new(MEMORY_CALIBRATION_FINGERPRINT, spec.load_shape)) }` ahead of the tier proof — both quant
+    /// knobs then publish the bf16-measured string.
+    #[test]
+    fn the_calibrated_arm_withholds_the_measured_identity_under_a_quant_knob() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = production_calibration_identity(
+            crate::MODEL_ID,
+            &turnkey_spec(temp.path(), None),
+            true,
+        )
+        .expect("the dense content-pinned snapshot at its own bf16 tier is the one cell");
+        assert_eq!(identity.fingerprint, MEMORY_CALIBRATION_FINGERPRINT);
+        for quant in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+            assert!(
+                production_calibration_identity(
+                    crate::MODEL_ID,
+                    &turnkey_spec(temp.path(), Some(quant)),
+                    true
+                )
+                .is_none(),
+                "a {quant:?} load of the dense content-pinned snapshot requantizes at load and \
+                 must publish nothing"
+            );
+            assert!(
+                production_calibration_fingerprint(crate::MODEL_ID, Some(quant), true).is_none(),
+                "a calibrated {quant:?} cell must not borrow the turnkey table's string"
+            );
+        }
+        // The measured string is reachable only from the Large calibrated bf16 cell.
+        for provider in [crate::TURBO_MODEL_ID, crate::MEDIUM_MODEL_ID] {
+            assert!(
+                production_calibration_fingerprint(provider, None, true).is_none(),
+                "{provider} has no calibrated cell"
+            );
+        }
+    }
+
+    /// sc-22730 review (minor): a self-inconsistent or unparseable `transformer/config.json` at a
+    /// pinned turnkey path WITHHOLDS the identity rather than failing the LOAD —
+    /// `crate::model::load_heavy` propagates `contract_for`'s error, so an escaping error turns a
+    /// loadable snapshot into a refused one. `artifact_inventory::shipped_turnkey_tier` keeps the
+    /// hard error for callers that want it.
+    ///
+    /// *Mutation this kills:* `shipped_turnkey_tier(..).ok().flatten()?` -> `.unwrap().flatten()?`
+    /// (the error escapes and `contract_for` never returns a contract at all).
+    #[test]
+    fn an_inconsistent_turnkey_marker_withholds_the_identity_without_failing_the_load() {
+        // The path names q4 but the tensors on disk are dense: the two proofs disagree.
+        let (_disagree_temp, disagreeing) = turnkey_fixture(crate::MODEL_ID, "q4");
+        write_header_only_safetensors(
+            &disagreeing.join("transformer/diffusion_pytorch_model.safetensors"),
+            &["blocks.0.proj.weight"],
+        );
+        // The marker itself does not parse.
+        let (_unparseable_temp, unparseable) = turnkey_fixture(crate::TURBO_MODEL_ID, "q8");
+        std::fs::write(unparseable.join("transformer/config.json"), b"{ not json").unwrap();
+
+        for (label, provider, root, quant) in [
+            (
+                "dense tensors under a q4 path",
+                crate::MODEL_ID,
+                &disagreeing,
+                mlx_gen::Quant::Q4,
+            ),
+            (
+                "unparseable quantization marker",
+                crate::TURBO_MODEL_ID,
+                &unparseable,
+                mlx_gen::Quant::Q8,
+            ),
+        ] {
+            let spec = turnkey_spec(root, Some(quant));
+            assert!(
+                crate::artifact_inventory::shipped_turnkey_tier(provider, &spec).is_err(),
+                "{label}: artifact_inventory keeps its hard error"
+            );
+            let contract = contract_for(provider, &spec)
+                .unwrap_or_else(|error| panic!("{label} must not fail the load: {error}"));
+            assert!(
+                contract.calibration.is_none(),
+                "{label} must publish no calibration identity"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{label}");
+        }
     }
 
     #[test]
