@@ -19,8 +19,56 @@ use candle_gen::gen_core::{
 use crate::config::{DEFAULT_FRAMES, MODEL_ID};
 use candle_gen::gen_core::{MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryMode};
 
+/// The identity of the **q4** cell — the tier this route's evidence campaign named, and the only
+/// one it admitted before sc-22737. Retained byte-for-byte so that record keeps its key.
 pub const CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-candle-q4-i2v-v1";
 const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-candle-q4-i2v-registry-v1";
+
+/// The tier [`CALIBRATION_FINGERPRINT`] names.
+pub const CALIBRATED_TIER: &str = "q4";
+
+/// The packed tiers the Candle LTX-2.3 route can open.
+///
+/// **q4 and q8, not bf16.** The worker resolves a Candle LTX-2.3 tier subdirectory through
+/// `crates/sceneworks-worker/src/video_jobs/candle.rs#candle_ltx_bundle_tier_across_revisions`,
+/// which returns `None` for `CandleLtxTier::Bf16` — there is no dense off-Mac tier to open, and the
+/// manifest ships LTX-2.3's `bf16` download as `platforms: ["macos"]`. So `ltx_2_3:bf16:candle` is
+/// an unrouted (lane, tier) rather than an unmeasured one.
+const SHIPPED_PACKED_BITS: [i32; 2] = [4, 8];
+
+/// Artifact-tier label of a Candle LTX-2.3 load, from the tier config's own packed width.
+pub fn calibration_tier_label(bits: i32) -> Option<&'static str> {
+    match bits {
+        4 => Some("q4"),
+        8 => Some("q8"),
+        _ => None,
+    }
+}
+
+/// The production calibration identity for one artifact-proven tier.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4): q8 is a routed cell, and the key is per tier
+///
+/// Two defects, both in the "no contract at all" direction rather than the false-green one:
+///
+/// 1. **q8 was refused outright.** `tier_paths` required `spec.quantize == Some(Quant::Q4)` and a
+///    4-bit tier config, so a q8 Candle render — which the worker DOES route, see
+///    `video_jobs/candle.rs:404` and `candle_ltx_bundle_tier_across_revisions`'s `"q8"` arm — could
+///    not build a memory contract at all, and no anchor could name the cell.
+/// 2. **The one string it did publish was keyed on the route**, so had q8 been admitted it would
+///    have reported the q4 cell's identity and been priced from a 4-bit checkpoint's peaks.
+///
+/// The tier is proven by the artifact: `tier_paths` reads the tier directory's own
+/// `quantize_config.json` and reconciles it against `spec.quantize`, so a crossed request never
+/// reaches here.
+fn production_calibration_fingerprint(bits: i32) -> Option<String> {
+    let tier = calibration_tier_label(bits)?;
+    Some(if tier == CALIBRATED_TIER {
+        CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("sc-20772-ltx-2-3-candle-{tier}-i2v-v1")
+    })
+}
 pub const DECODE_OVERLAP: u32 = 64;
 pub const DECODE_TILE_EDGES: &[u32] = &[768, 640, 512, 448, 384, 320, 256, 192];
 const SHIPPED_GEOMETRIES: &[(u32, u32)] =
@@ -191,7 +239,9 @@ fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
             "{MODEL_ID}: calibrated q4 memory admission requires eager bf16 component loading"
         )));
     }
-    if spec.quantize != Some(Quant::Q4)
+    // sc-22737: q4 AND q8 (see `SHIPPED_PACKED_BITS`). `None` is not admitted — this route has no
+    // dense off-Mac tier — and the requested width is reconciled against the tier config below.
+    if !matches!(spec.quantize, Some(Quant::Q4) | Some(Quant::Q8))
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
@@ -201,7 +251,7 @@ fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
         || !spec.components.is_empty()
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: calibrated q4 I2V/first-last admission requires the plain split q4 tier without load overlays"
+            "{MODEL_ID}: calibrated I2V/first-last admission requires a plain split q4 or q8 tier without load overlays"
         )));
     }
     let gemma = spec.text_encoder.as_ref().map(|source| match source {
@@ -215,10 +265,20 @@ fn tier_paths(spec: &LoadSpec) -> gen_core::Result<crate::tier::TierPaths> {
     let config = paths
         .packed_config()
         .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
-    if config.bits != 4 || config.group_size as usize != crate::quant::GROUP_SIZE {
+    // The ARTIFACT decides the tier, and the request must agree with it: a q8 directory asked for
+    // as q4 (or the reverse) is a crossed load whose peaks no anchor measured.
+    if !SHIPPED_PACKED_BITS.contains(&config.bits)
+        || config.group_size as usize != crate::quant::GROUP_SIZE
+    {
         return Err(gen_core::Error::Unsupported(format!(
-            "{MODEL_ID}: q4 admission requires the released 4-bit group-{} tier",
+            "{MODEL_ID}: admission requires a released {SHIPPED_PACKED_BITS:?}-bit group-{} tier",
             crate::quant::GROUP_SIZE
+        )));
+    }
+    if spec.quantize.map(|quant| quant.bits()) != Some(config.bits) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{MODEL_ID}: requested tier {:?} does not match the {}-bit tier on disk",
+            spec.quantize, config.bits
         )));
     }
     Ok(paths)
@@ -376,19 +436,34 @@ fn build_contract(
 }
 
 pub fn memory_strategy_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    build_contract(spec, exact_load_receipt(spec)?, CALIBRATION_FINGERPRINT)
+    let bits = resolved_tier_bits(spec)?;
+    let fingerprint = production_calibration_fingerprint(bits).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!("{MODEL_ID}: unshipped packed width {bits}"))
+    })?;
+    build_contract(spec, exact_load_receipt(spec)?, &fingerprint)
+}
+
+/// The packed width of the tier `spec` resolves, read off the tier directory's own config.
+fn resolved_tier_bits(spec: &LoadSpec) -> gen_core::Result<i32> {
+    Ok(tier_paths(spec)?
+        .packed_config()
+        .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?
+        .bits)
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) fn contract_for_loaded(
     spec: &LoadSpec,
 ) -> gen_core::Result<Option<(MemoryProviderContract, MemoryNumericTier)>> {
+    // sc-22737: the tier is the one that was RESOLVED, not a hard-coded `Q4`. `tier_paths` has
+    // already reconciled `spec.quantize` against the tier config on disk, so this cannot disagree
+    // with the artifact.
     Ok(memory_strategy_contract(spec).ok().map(|contract| {
         (
             contract,
             MemoryNumericTier {
                 precision: Precision::Bf16,
-                quant: Some(Quant::Q4),
+                quant: spec.quantize,
                 component_precision_floors: &[],
             },
         )
@@ -1103,6 +1178,107 @@ mod tests {
             weights_free_contract(&LoadSpec::new(WeightsSource::Dir("/nonexistent".into())))
                 .unwrap();
         assert!(weights_free.architecture_facts.is_empty());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the Candle LTX-2.3 route admits q4 AND q8, and keys its
+    // identity on the tier the artifact carries.
+    // ------------------------------------------------------------------------------------------
+
+    /// A split tier directory: the two files `TierPaths::detect` gates on, the component files
+    /// `exact_load_receipt` sizes, and a real `quantize_config.json` at `bits`.
+    fn ltx_candle_tier_dir(bits: i32) -> tempfile::TempDir {
+        let snapshot = tempfile::tempdir().unwrap();
+        let tier = snapshot.path().join(if bits == 4 { "q4" } else { "q8" });
+        std::fs::create_dir_all(&tier).unwrap();
+        std::fs::create_dir_all(snapshot.path().join("gemma")).unwrap();
+        for name in [
+            "transformer.safetensors",
+            "connector.safetensors",
+            "vae_decoder.safetensors",
+            "vae_encoder.safetensors",
+            "upsampler.safetensors",
+        ] {
+            let file = std::fs::File::create(tier.join(name)).unwrap();
+            file.set_len(1024).unwrap();
+        }
+        std::fs::write(
+            tier.join("quantize_config.json"),
+            format!(
+                "{{\"quantization\":{{\"bits\":{bits},\"group_size\":{}}}}}",
+                crate::quant::GROUP_SIZE
+            ),
+        )
+        .unwrap();
+        snapshot
+    }
+
+    fn ltx_candle_tier_spec(snapshot: &std::path::Path, bits: i32) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(snapshot.join(if bits == 4 {
+            "q4"
+        } else {
+            "q8"
+        })))
+        .with_quant(if bits == 4 { Quant::Q4 } else { Quant::Q8 })
+    }
+
+    /// **q8 is a routed cell.** It could not build a memory contract at all before sc-22737, so no
+    /// anchor could name it — and q4 keeps its retained key.
+    #[test]
+    fn both_routed_candle_tiers_build_a_contract_with_their_own_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for bits in SHIPPED_PACKED_BITS {
+            let snapshot = ltx_candle_tier_dir(bits);
+            let spec = ltx_candle_tier_spec(snapshot.path(), bits);
+            let identity = memory_strategy_contract(&spec)
+                .unwrap_or_else(|error| panic!("q{bits} must build a contract: {error}"))
+                .calibration
+                .expect("a routed tier publishes an identity")
+                .fingerprint;
+            assert!(seen.insert(identity.clone()), "q{bits} reuses {identity}");
+            assert_ne!(identity, STATIC_CALIBRATION_FINGERPRINT);
+        }
+        assert_eq!(seen.len(), 2);
+
+        let q4 = ltx_candle_tier_dir(4);
+        assert_eq!(
+            memory_strategy_contract(&ltx_candle_tier_spec(q4.path(), 4))
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint,
+            CALIBRATION_FINGERPRINT,
+            "the measured q4 cell keeps its retained key"
+        );
+        let q8 = ltx_candle_tier_dir(8);
+        assert_eq!(
+            memory_strategy_contract(&ltx_candle_tier_spec(q8.path(), 8))
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint,
+            "sc-20772-ltx-2-3-candle-q8-i2v-v1"
+        );
+    }
+
+    /// **The artifact decides.** A q8 tier asked for as q4 is refused rather than published under
+    /// the q4 key, and bf16 is not a Candle cell at all — the worker resolves no dense off-Mac tier
+    /// (`video_jobs/candle.rs#candle_ltx_bundle_tier_across_revisions` returns `None` for `Bf16`).
+    #[test]
+    fn a_crossed_or_dense_candle_tier_is_refused() {
+        let snapshot = ltx_candle_tier_dir(8);
+        let crossed =
+            LoadSpec::new(WeightsSource::Dir(snapshot.path().join("q8"))).with_quant(Quant::Q4);
+        let error = memory_strategy_contract(&crossed).unwrap_err().to_string();
+        assert!(
+            error.contains("does not match the 8-bit tier on disk"),
+            "{error}"
+        );
+
+        // No `quantize` at all is the dense request this route cannot serve.
+        let dense = LoadSpec::new(WeightsSource::Dir(snapshot.path().join("q8")));
+        assert!(memory_strategy_contract(&dense).is_err());
+        assert!(production_calibration_fingerprint(16).is_none());
     }
 
     #[test]

@@ -368,9 +368,16 @@ mod explicit_registry_tests {
                         .unwrap()
                         .remove(0);
                 let mut context = fixture.context;
-                // The production contract mints no calibration identity until a real-weight record
-                // exists, so an optimized selection rides explicit estimate authority.
+                // An optimized selection rides explicit estimate authority: publishing a key is
+                // not the same as having a record behind it, and no Bernini cell is measured yet.
                 context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                // sc-22737: the fixture context is seeded from the weights-free DECLARATION, whose
+                // identity is the registry-behaviour key. The contract under test is the loaded
+                // PRODUCTION one, which now publishes a per-(provider, tier) key rather than
+                // nothing, so the handshake needs the production identity to get past.
+                context.calibration_fingerprint =
+                    crate::memory_strategy::production_calibration_fingerprint(provider_id, &spec)
+                        .expect("a loaded Bernini generator publishes a production identity");
                 assert_eq!(
                     model.memory_strategy_safety_check(&context),
                     MemorySafetyDecision::Accept,
@@ -454,6 +461,11 @@ mod explicit_registry_tests {
                         .remove(0)
                         .context;
                 context.optimization_authority = MemoryOptimizationAuthority::Estimated;
+                // sc-22737, as above: check the loaded production contract under the identity the
+                // production contract publishes, not the declaration's.
+                context.calibration_fingerprint =
+                    crate::memory_strategy::production_calibration_fingerprint(provider_id, &spec)
+                        .expect("a loaded Bernini generator publishes a production identity");
                 context
             };
 
