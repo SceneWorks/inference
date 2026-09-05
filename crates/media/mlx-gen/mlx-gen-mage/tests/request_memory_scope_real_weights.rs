@@ -64,7 +64,13 @@ fn context(
             },
         },
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-        calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+        // sc-22733: the RL route's per-tier production identity, bound to the tier the loaded
+        // artifact IS (`REGISTRATION` is `mage_flow`).
+        calibration_fingerprint: mlx_gen_mage::model::production_calibration_fingerprint(
+            "mage_flow",
+            tier,
+        )
+        .expect("a shipped Mage tier is nameable"),
         load_shape: mlx_gen::LoadShape::EagerMaterialization,
         mode: MemoryMode::TextToImage,
         has_reference: false,
