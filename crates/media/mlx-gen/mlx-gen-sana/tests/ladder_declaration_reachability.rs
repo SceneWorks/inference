@@ -77,6 +77,25 @@ fn weightless_spec() -> LoadSpec {
     .with_load_shape(LoadShape::DeferredMaterialization)
 }
 
+/// A snapshot root that carries the three component directories and the transformer's DENSE tier
+/// marker, and no weights at all (sc-22731). It is what a production contract needs to name the
+/// tier it is describing; every load through it is still weights-free, and `generate` still fails
+/// on the missing component files rather than on memory.
+fn weight_free_tier_root_spec() -> LoadSpec {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for component in ["transformer", "vae", "text_encoder"] {
+            std::fs::create_dir_all(tmp.path().join(component)).expect("component dir");
+        }
+        std::fs::write(tmp.path().join("transformer/config.json"), "{}").expect("dense marker");
+        tmp
+    });
+    LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(LoadShape::DeferredMaterialization)
+}
+
 fn probe_request(memory: GenerationMemory) -> GenerationRequest {
     GenerationRequest {
         prompt: "a red fox in a snowy forest, photograph".into(),
@@ -246,7 +265,15 @@ fn every_declared_surface_is_exact_for_both_entries() {
                 base.selector.id()
             );
         }
-        assert_eq!(base.contract.calibration, sprint.contract.calibration);
+        // sc-22731: the same LADDER, never the same IDENTITY. The two entries are two different
+        // repositories at two different revisions, so an identity they shared would let a Sprint
+        // anchor bind base SANA's measured evidence (the sc-22511 false green).
+        assert_ne!(
+            base.contract.calibration,
+            sprint.contract.calibration,
+            "{} publishes one identity for both routes",
+            base.selector.id()
+        );
     }
 }
 
@@ -427,7 +454,11 @@ fn the_production_route_reaches_the_declared_ladder_for_both_entries() {
 fn the_registered_scope_produces_a_selection_the_production_path_admits() {
     let registry = mlx_gen_sana::provider_registry().expect("SANA provider registry");
     for id in ENTRIES {
-        let spec = weightless_spec();
+        // sc-22731: the production contract publishes its calibration identity only once it can
+        // read the loaded tier off disk, so this walk — which drives the PRODUCTION gate — needs a
+        // snapshot root whose tier marker exists. `weight_free_tier_root` supplies exactly that and
+        // nothing else: the components are empty, so every load is still weights-free.
+        let spec = weight_free_tier_root_spec();
         let contract = ms::memory_strategy_contract(id, &spec).expect("contract");
         let behavior = registry
             .memory_behavior_registrations()
