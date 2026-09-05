@@ -301,9 +301,22 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "`PRODUCTION_SPATIAL_MULTIPLE` of 32 (`8 * 2^2`, the U-Net's two exact skip joins) — the "
         "same deliberate strict/loose split as sdxl's SIZE_MULTIPLE below."
     ),
+    ("kolors", "STATIC_BEHAVIOR_FINGERPRINT"): (
+        "the registry-conformance namespace, per-backend by construction (sc-22732). It exists so a "
+        "weights-free declaration surface can never be mistaken for a measured route, and each "
+        "backend asserts its own value is disjoint from that backend's own production identity set. "
+        "Two backends sharing one would let a context assembled against the candle declaration "
+        "satisfy the mlx handshake — the same reasoning as flux2's CALIBRATION_FINGERPRINT above."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."
+    ),
+    ("lens", "STATIC_BEHAVIOR_FINGERPRINT"): (
+        "the registry-conformance namespace, per-backend by construction (sc-22732) — the same "
+        "reasoning as this family's MEMORY_CALIBRATION_FINGERPRINT directly above. candle-gen-lens "
+        "gained one in sc-22732; before that it published its production identity on all 24 "
+        "weights-free surfaces, which is the defect the split fixes."
     ),
     ("ltx", "MODEL_ID"): (
         "the two backends ship different checkpoints of the family and register different ids: "
