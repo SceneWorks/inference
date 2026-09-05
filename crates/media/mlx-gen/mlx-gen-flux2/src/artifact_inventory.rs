@@ -22,11 +22,50 @@ const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-m
 const TRUE_V2_TRANSFORMER_SHA256: &str =
     "72ae74528050cd97bf056568000fcb7915012b4d0fd0807de205513e0fdc64b9";
 
+/// Authorized roots for text-encoder discovery under `root`.
+///
+/// An HF cache snapshot (`<hub>/models--*/snapshots/<rev>/…`) stores every entry as a symlink into
+/// the sibling `models--*/blobs/`, so confinement must authorize the owning `models--*` directory
+/// alongside the snapshot itself; otherwise every canonical target "escapes" and the only root
+/// shape the worker produces is refused. A root outside an HF cache authorizes only itself.
 fn discovery_roots(root: &Path) -> CoreResult<Vec<PathBuf>> {
     let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
+    if let Some(cache_dir) = hf_cache_dir(root) {
+        roots.push(std::path::absolute(&cache_dir)?);
+        roots.push(std::fs::canonicalize(&cache_dir)?);
+    }
     roots.sort();
     roots.dedup();
     Ok(roots)
+}
+
+/// The `models--*` HF cache directory owning `root`, when `root` sits under its `snapshots/`.
+fn hf_cache_dir(root: &Path) -> Option<PathBuf> {
+    root.ancestors().find_map(|ancestor| {
+        let parent = ancestor.parent()?;
+        (ancestor.file_name()? == "snapshots"
+            && parent
+                .file_name()?
+                .to_str()
+                .is_some_and(|name| name.starts_with("models--")))
+        .then(|| parent.to_path_buf())
+    })
+}
+
+/// A component's `(bits, group_size)` packed marker, or `None` for a dense component.
+fn packed_marker(directory: &Path, component: &str) -> CoreResult<Option<(i32, i32)>> {
+    match (
+        mlx_gen::quant::packed_quant_bits_at(directory)
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+        mlx_gen::quant::packed_quant_group_size_at(directory)
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(bits), Some(group_size)) => Ok(Some((bits, group_size))),
+        _ => Err(CoreError::Unsupported(format!(
+            "flux2 Klein {component} quantization marker is incomplete"
+        ))),
+    }
 }
 
 const FILES: &[(&str, &str)] = &[
@@ -320,17 +359,41 @@ fn visible_safetensors(directory: &Path) -> CoreResult<BTreeSet<String>> {
     Ok(visible)
 }
 
-fn single_safetensors(directory: &Path) -> CoreResult<(PathBuf, BTreeSet<String>)> {
+/// Every visible safetensors shard of a component, in name order. The rehosts ship the bf16 tier
+/// sharded (four text-encoder shards, two transformer shards) and the packed tiers as one file per
+/// component; both shapes are one inventory.
+fn component_safetensors(directory: &Path) -> CoreResult<(Vec<PathBuf>, BTreeSet<String>)> {
     let visible = visible_safetensors(directory)?;
-    if visible.len() != 1 {
+    if visible.is_empty() {
         return Err(CoreError::Unsupported(format!(
-            "flux2 Klein {} must contain exactly one visible safetensors file, found {:?}",
-            directory.display(),
-            visible
+            "flux2 Klein {} must contain at least one visible safetensors file",
+            directory.display()
         )));
     }
-    let name = visible.iter().next().expect("one entry");
-    Ok((directory.join(name), visible))
+    let shards = visible.iter().map(|name| directory.join(name)).collect();
+    Ok((shards, visible))
+}
+
+/// Tensor headers across a component's shards. A tensor stored in two shards has no single
+/// authoritative definition, so the merge refuses duplicates instead of letting one shadow another.
+fn component_tensor_headers(
+    shards: &[PathBuf],
+) -> CoreResult<Vec<mlx_gen::gen_core::weightsmeta::SafetensorsTensorHeader>> {
+    let mut headers = Vec::new();
+    let mut seen = BTreeSet::new();
+    for shard in shards {
+        for header in safetensors_path_tensor_headers(shard)? {
+            if !seen.insert(header.name.clone()) {
+                return Err(CoreError::Unsupported(format!(
+                    "flux2 Klein tensor {} is stored in more than one shard of {}",
+                    header.name,
+                    shard.parent().unwrap_or(shard).display()
+                )));
+            }
+            headers.push(header);
+        }
+    }
+    Ok(headers)
 }
 
 fn pinned_entry(source: PathBuf) -> CoreResult<Entry> {
@@ -440,8 +503,8 @@ fn validate_vae_tensor_headers(
     Ok(())
 }
 
-fn validate_vae_headers(path: &Path) -> CoreResult<()> {
-    validate_vae_tensor_headers(&safetensors_path_tensor_headers(path)?)
+fn validate_vae_headers(shards: &[PathBuf]) -> CoreResult<()> {
+    validate_vae_tensor_headers(&component_tensor_headers(shards)?)
 }
 
 fn klein_required_vae_weights() -> BTreeMap<String, Vec<usize>> {
@@ -763,8 +826,8 @@ fn validate_transformer_tensor_headers(
     }
 }
 
-fn validate_transformer_headers(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
-    validate_transformer_tensor_headers(&safetensors_path_tensor_headers(path)?, quant)
+fn validate_transformer_headers(shards: &[PathBuf], quant: Option<Quant>) -> CoreResult<()> {
+    validate_transformer_tensor_headers(&component_tensor_headers(shards)?, quant)
 }
 
 fn klein_required_transformer_weights(
@@ -985,8 +1048,8 @@ impl KleinArtifactInventory {
         tier: Option<Quant>,
         spec: &LoadSpec,
         encoder_contract: mlx_gen::gen_core::EncoderContract,
-        validate_transformer: impl Fn(&Path, Option<Quant>) -> CoreResult<()>,
-        validate_vae: impl Fn(&Path) -> CoreResult<()>,
+        validate_transformer: impl Fn(&[PathBuf], Option<Quant>) -> CoreResult<()>,
+        validate_vae: impl Fn(&[PathBuf]) -> CoreResult<()>,
     ) -> CoreResult<Self> {
         if spec.precision != mlx_gen::Precision::Bf16 || spec.quantize.is_some() {
             return Err(CoreError::Unsupported(
@@ -994,21 +1057,7 @@ impl KleinArtifactInventory {
                     .to_owned(),
             ));
         }
-        let transformer_dir = root.join("transformer");
-        let observed = match (
-            mlx_gen::quant::packed_quant_bits_at(&transformer_dir)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
-            mlx_gen::quant::packed_quant_group_size_at(&transformer_dir)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
-        ) {
-            (None, None) => None,
-            (Some(bits), Some(group_size)) => Some((bits, group_size)),
-            _ => {
-                return Err(CoreError::Unsupported(
-                    "flux2 Klein transformer quantization marker is incomplete".to_owned(),
-                ))
-            }
-        };
+        let observed = packed_marker(&root.join("transformer"), "transformer")?;
         let expected = tier.map(|quant| (quant.bits(), 64));
         if observed != expected {
             return Err(CoreError::Unsupported(format!(
@@ -1016,13 +1065,10 @@ impl KleinArtifactInventory {
                 observed, tier
             )));
         }
+        // Every published tier ships the Qwen3 text encoder and the VAE dense; only the transformer
+        // packs. A packed marker on either is a foreign or defective artifact, not a tier.
         for component in ["text_encoder", "vae"] {
-            let directory = root.join(component);
-            let bits = mlx_gen::quant::packed_quant_bits_at(&directory)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-            let group_size = mlx_gen::quant::packed_quant_group_size_at(&directory)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-            if bits.is_some() || group_size.is_some() {
+            if packed_marker(&root.join(component), component)?.is_some() {
                 return Err(CoreError::Unsupported(format!(
                     "flux2 Klein {component} must stay dense at every turnkey tier"
                 )));
@@ -1044,14 +1090,16 @@ impl KleinArtifactInventory {
         let mut visible = Vec::new();
         for component in ["text_encoder", "transformer", "vae"] {
             let directory = root.join(component);
-            let (weights, membership) = single_safetensors(&directory)?;
+            let (shards, membership) = component_safetensors(&directory)?;
             match component {
-                "transformer" => validate_transformer(&weights, tier)?,
-                "vae" => validate_vae(&weights)?,
+                "transformer" => validate_transformer(&shards, tier)?,
+                "vae" => validate_vae(&shards)?,
                 "text_encoder" => {}
                 _ => unreachable!("turnkey component list is exhaustive"),
             }
-            entries.push(pinned_entry(weights)?);
+            for shard in shards {
+                entries.push(pinned_entry(shard)?);
+            }
             visible.push((directory, membership));
         }
         let inventory = Self {
@@ -1374,7 +1422,10 @@ mod tests {
         quant: Option<Quant>,
     ) -> Vec<(String, &'static str, Vec<usize>)> {
         match quant {
-            None => vec![("block.weight".to_owned(), "BF16", vec![8, 8])],
+            None => vec![
+                ("block.weight".to_owned(), "BF16", vec![8, 8]),
+                ("block.bias".to_owned(), "BF16", vec![8]),
+            ],
             Some(Quant::Q4 | Quant::Q8) => {
                 let bits = quant.expect("packed tier").bits() as usize;
                 vec![
@@ -1389,6 +1440,22 @@ mod tests {
 
     fn write_transformer_safetensors(path: &Path, quant: Option<Quant>) {
         write_tensor_file(path, bounded_transformer_tensors(quant));
+    }
+
+    /// The rehosts ship the dense tier sharded and the packed tiers as one file; mirror that so the
+    /// bounded fixtures exercise both membership shapes.
+    fn write_transformer_component(directory: &Path, quant: Option<Quant>) {
+        match quant {
+            None => {
+                for (index, tensor) in bounded_transformer_tensors(None).into_iter().enumerate() {
+                    write_tensor_file(
+                        &directory.join(format!("model-0000{}-of-00002.safetensors", index + 1)),
+                        vec![tensor],
+                    );
+                }
+            }
+            Some(_) => write_transformer_safetensors(&directory.join("model.safetensors"), quant),
+        }
     }
 
     fn vae_tensors() -> Vec<(String, &'static str, Vec<usize>)> {
@@ -1408,9 +1475,11 @@ mod tests {
         write_tensor_file(path, bounded_vae_tensors());
     }
 
-    fn validate_bounded_transformer(path: &Path, quant: Option<Quant>) -> CoreResult<()> {
-        let headers = safetensors_path_tensor_headers(path)?;
-        let expected = tensor_headers(bounded_transformer_tensors(quant));
+    fn validate_bounded_transformer(shards: &[PathBuf], quant: Option<Quant>) -> CoreResult<()> {
+        let mut headers = component_tensor_headers(shards)?;
+        headers.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut expected = tensor_headers(bounded_transformer_tensors(quant));
+        expected.sort_by(|a, b| a.name.cmp(&b.name));
         if headers != expected {
             return Err(CoreError::Unsupported(
                 "bounded transformer inventory is not exact".to_owned(),
@@ -1419,8 +1488,8 @@ mod tests {
         Ok(())
     }
 
-    fn validate_bounded_vae(path: &Path) -> CoreResult<()> {
-        let headers = safetensors_path_tensor_headers(path)?;
+    fn validate_bounded_vae(shards: &[PathBuf]) -> CoreResult<()> {
+        let headers = component_tensor_headers(shards)?;
         if headers != tensor_headers(bounded_vae_tensors()) {
             return Err(CoreError::Unsupported(
                 "bounded VAE inventory is not exact".to_owned(),
@@ -1456,19 +1525,57 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("vae/config.json"), "{}").unwrap();
-        let transformer_config = tier.map_or_else(
-            || "{}".to_owned(),
-            |quant| {
-                format!(
-                    r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
-                    quant.bits()
-                )
-            },
-        );
-        std::fs::write(root.join("transformer/config.json"), transformer_config).unwrap();
-        write_transformer_safetensors(&root.join("transformer/model.safetensors"), tier);
+        std::fs::write(
+            root.join("transformer/config.json"),
+            quantization_config(tier.map(Quant::bits)),
+        )
+        .unwrap();
+        write_transformer_component(&root.join("transformer"), tier);
         write_vae_safetensors(&root.join("vae/model.safetensors"));
         tmp
+    }
+
+    fn quantization_config(bits: Option<i32>) -> String {
+        bits.map_or_else(
+            || "{}".to_owned(),
+            |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+        )
+    }
+
+    /// Rewrite a fixture tier into the HF cache shape: every regular file moves into the owning
+    /// `models--*/blobs/` directory and its snapshot entry becomes a relative symlink, exactly as
+    /// `huggingface_hub` materializes a download on macOS.
+    fn relink_into_hf_blobs(tier_root: &Path) {
+        let cache_dir =
+            hf_cache_dir(tier_root).expect("fixture tier sits under models--*/snapshots");
+        let blobs = cache_dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let mut files = Vec::new();
+        collect_regular_files(tier_root, &mut files);
+        for (index, file) in files.into_iter().enumerate() {
+            let blob = blobs.join(format!("{index:040x}"));
+            std::fs::rename(&file, &blob).unwrap();
+            let depth = file.strip_prefix(&cache_dir).unwrap().components().count() - 1;
+            let mut target = PathBuf::new();
+            for _ in 0..depth {
+                target.push("..");
+            }
+            target.push("blobs");
+            target.push(blob.file_name().unwrap());
+            std::os::unix::fs::symlink(target, &file).unwrap();
+        }
+    }
+
+    fn collect_regular_files(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                collect_regular_files(&path, files);
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
     }
 
     fn fixture_root(
@@ -1627,7 +1734,8 @@ mod tests {
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
         let transformer_dir = root.join("transformer");
-        let (transformer, membership) = single_safetensors(&transformer_dir).unwrap();
+        let (shards, membership) = component_safetensors(&transformer_dir).unwrap();
+        let transformer = shards[0].clone();
         let inventory = KleinArtifactInventory {
             root: root.clone(),
             entries: vec![pinned_entry(transformer.clone()).unwrap()],
@@ -1642,7 +1750,10 @@ mod tests {
         inventory.ensure_unchanged().unwrap();
         write_safetensors(&transformer, true);
         assert!(inventory.ensure_unchanged().is_err());
-        assert!(validate_transformer_headers(&transformer, Some(Quant::Q4)).is_err());
+        assert!(
+            validate_transformer_headers(std::slice::from_ref(&transformer), Some(Quant::Q4))
+                .is_err()
+        );
         write_transformer_safetensors(&transformer, Some(Quant::Q4));
         std::fs::write(
             root.join("transformer/config.json"),
@@ -1705,7 +1816,10 @@ mod tests {
         let validated = bounded_contract
             .validate_source_for_planning(&encoder_source)
             .expect("the bounded encoder fixture must be valid before mutation");
-        let encoder_file = single_safetensors(&root.join("text_encoder")).unwrap().0;
+        let encoder_file = component_safetensors(&root.join("text_encoder"))
+            .unwrap()
+            .0
+            .remove(0);
         let mut mutated_headers =
             gen_core_testkit::encoder_contract_fixture_tensor_headers(bounded_contract, None)
                 .unwrap();
@@ -1832,6 +1946,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn turnkey_inventory_keeps_the_text_encoder_and_vae_dense_at_every_tier() {
+        // (family, tier, encoder marker, vae marker)
+        let cases = [
+            (TurnkeyFamily::Base, Some(Quant::Q4), Some(4), None),
+            (TurnkeyFamily::Kv, Some(Quant::Q8), Some(8), None),
+            (TurnkeyFamily::Base, None, Some(4), None),
+            (TurnkeyFamily::Kv, None, None, Some(4)),
+            (TurnkeyFamily::Base, Some(Quant::Q8), None, Some(8)),
+        ];
+        for (family, tier, encoder_bits, vae_bits) in cases {
+            let tmp = turnkey_fixture(family, tier);
+            let root = fixture_root(&tmp, family, tier);
+            gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                &root.join("text_encoder"),
+                crate::config::bounded_klein_encoder_contract(),
+                encoder_bits,
+            )
+            .unwrap();
+            std::fs::write(root.join("vae/config.json"), quantization_config(vae_bits)).unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let error = verify_bounded_turnkey(root, family, tier, &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("must stay dense at every turnkey tier"),
+                "{family:?} {tier:?} encoder={encoder_bits:?} vae={vae_bits:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn turnkey_inventory_admits_the_symlinked_hf_cache_shape_and_refuses_foreign_blobs() {
+        for (family, tier) in [
+            (TurnkeyFamily::Base, None),
+            (TurnkeyFamily::Kv, Some(Quant::Q4)),
+            (TurnkeyFamily::Base, Some(Quant::Q8)),
+        ] {
+            let tmp = turnkey_fixture(family, tier);
+            let root = fixture_root(&tmp, family, tier);
+            relink_into_hf_blobs(&root);
+            for shard in component_safetensors(&root.join("text_encoder")).unwrap().0 {
+                assert!(std::fs::symlink_metadata(&shard).unwrap().is_symlink());
+            }
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let inventory = verify_bounded_turnkey(root.clone(), family, tier, &spec)
+                .unwrap_or_else(|error| panic!("{family:?} {tier:?}: {error}"));
+            inventory.ensure_unchanged().unwrap();
+            assert_eq!(inventory.resolved_quant(), tier);
+            if tier.is_none() {
+                assert_eq!(
+                    inventory
+                        .visible_safetensors
+                        .iter()
+                        .find(|(directory, _)| directory.ends_with("transformer"))
+                        .map(|(_, membership)| membership.len()),
+                    Some(2),
+                    "the dense tier stays sharded"
+                );
+            }
+
+            // A snapshot entry resolving outside the owning `models--*` cache dir is not that
+            // cache's artifact, whatever its bytes say.
+            let foreign = tmp.path().join("foreign-model.safetensors");
+            let encoder_shard = component_safetensors(&root.join("text_encoder"))
+                .unwrap()
+                .0
+                .remove(0);
+            std::fs::copy(&encoder_shard, &foreign).unwrap();
+            std::fs::remove_file(&encoder_shard).unwrap();
+            std::os::unix::fs::symlink(&foreign, &encoder_shard).unwrap();
+            let error = verify_bounded_turnkey(root, family, tier, &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("escapes authorized model roots"),
+                "{family:?} {tier:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn turnkey_inventory_refuses_a_tensor_stored_in_two_shards() {
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, None);
+        let root = fixture_root(&tmp, TurnkeyFamily::Base, None);
+        write_tensor_file(
+            &root.join("transformer/model-00002-of-00002.safetensors"),
+            vec![("block.weight".to_owned(), "BF16", vec![8, 8])],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let error = verify_bounded_turnkey(root, TurnkeyFamily::Base, None, &spec)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stored in more than one shard"), "{error}");
+    }
+
+    #[test]
+    fn hf_cache_dir_is_the_models_directory_owning_the_snapshot() {
+        assert_eq!(
+            hf_cache_dir(Path::new(
+                "/hub/models--SceneWorks--flux2-klein-9b-mlx/snapshots/abc/q4"
+            )),
+            Some(PathBuf::from("/hub/models--SceneWorks--flux2-klein-9b-mlx"))
+        );
+        assert_eq!(hf_cache_dir(Path::new("/models/klein/q4")), None);
+        assert_eq!(
+            hf_cache_dir(Path::new("/hub/not-a-cache/snapshots/abc/q4")),
+            None
+        );
     }
 
     #[test]
