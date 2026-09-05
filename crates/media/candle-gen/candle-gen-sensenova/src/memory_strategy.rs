@@ -20,9 +20,6 @@ use candle_gen::gen_core::{
 
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
-/// Weights-free registry behavior identity. Production Candle contracts remain uncalibrated until
-/// the deferred Windows/CUDA terminal campaign records an artifact-bound measurement.
-pub const CALIBRATION_FINGERPRINT: &str = "sensenova-u1-candle-request-memory-ladder-static-v1";
 const QUALITY_ROUTES: &[&str] = &[
     "sensenova_u1_8b",
     "sensenova_u1_8b_infographic_v2",
@@ -560,7 +557,9 @@ pub(crate) fn validate_artifact_tier(spec: &LoadSpec) -> gen_core::Result<()> {
 /// `MemoryRegistration`). Component bytes always come from the on-disk inventory when the root
 /// exists, so an eager load can never advertise zero bytes for weights a deferred load prices at
 /// full size. Unlike the registry-only fixture seam it never grants a synthetic calibration
-/// identity. Load shape is expressed *inside* the contract, not by swapping contracts:
+/// identity: it publishes the artifact-bound [`production_calibration_fingerprint`], which lives in
+/// a namespace [`weights_free_contract`] can never reach. Load shape is expressed *inside* the
+/// contract, not by swapping contracts:
 /// `build_contract` declares `BoundedTransformerResidency` `Missing` on a non-streamable spec.
 pub(crate) fn provider_contract(
     provider_id: &str,
@@ -572,14 +571,26 @@ pub(crate) fn provider_contract(
         WeightsSource::Dir(root) if root.is_dir() => Some(CheckpointInventory::capture(root)?),
         _ => None,
     };
-    let facts = match &inventory {
+    // The identity is published ONLY on the `Some(inventory)` branch, and only after
+    // `validate_numeric_tier` has returned Ok. That call is the artifact binding: it compares
+    // `spec.quantize` against `detect_checkpoint_quantization`'s header-only `.scales` scan of the
+    // backbone Linears and ERRORS on any disagreement, so past it `spec.quantize` is not a request
+    // knob any more — it is the tier of the weights on disk. The no-root branch has proven nothing
+    // about any artifact and stays `None`: fail closed rather than publish an anchor key for a load
+    // whose tier was never read.
+    let (facts, calibration) = match &inventory {
         Some(inventory) => {
             inventory.validate_numeric_tier(spec)?;
-            inventory.asset_facts()?
+            (
+                inventory.asset_facts()?,
+                production_calibration_fingerprint(provider_id, spec).map(|fingerprint| {
+                    MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)
+                }),
+            )
         }
-        None => MemoryAssetFacts::default(),
+        None => (MemoryAssetFacts::default(), None),
     };
-    Ok(build_contract(provider_id, spec, facts, None))
+    Ok(build_contract(provider_id, spec, facts, calibration))
 }
 
 pub(crate) fn weights_free_contract(
@@ -587,14 +598,82 @@ pub(crate) fn weights_free_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     validate_load_spec(provider_id, spec)?;
+    let calibration = weights_free_calibration_fingerprint(provider_id, spec)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     Ok(build_contract(
         provider_id,
         spec,
         MemoryAssetFacts::default(),
-        Some(MemoryCalibrationIdentity::new(
-            CALIBRATION_FINGERPRINT,
-            spec.load_shape,
-        )),
+        calibration,
+    ))
+}
+
+/// The route slug the calibration identity strings carry, for each of the **six** public catalog
+/// routes the two SenseNova providers serve (sc-22734, epic sc-22723 E1/E4). Identical to the MLX
+/// sibling's `route_label`, so the two lanes name the same cell the same way.
+pub fn route_label(route: &str) -> Option<&'static str> {
+    match route {
+        "sensenova_u1_8b" => Some("quality"),
+        "sensenova_u1_8b_fast" => Some("fast"),
+        "sensenova_u1_8b_infographic_v2" => Some("infographic-v2"),
+        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic-v2-fast"),
+        "sensenova_u1_8b_infographic_v3" => Some("infographic-v3"),
+        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic-v3-fast"),
+        _ => None,
+    }
+}
+
+/// The catalog route a spec loads: its explicit `resolved_route` when the worker set one, else the
+/// provider's own base route id (which is itself one of the six).
+fn spec_route<'a>(provider_id: &'a str, spec: &'a LoadSpec) -> &'a str {
+    spec.resolved_route.as_deref().unwrap_or(provider_id)
+}
+
+/// Tier label of a SenseNova load: `bf16` for the dense turnkey, `q4`/`q8` for the two packed ones
+/// (`validate_load_spec` refuses anything else). `None` for a tier this family does not ship.
+pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity table of the Candle SenseNova cells, keyed on **(route, tier)** —
+/// sc-22734, epic sc-22723 E1/E4. Six public catalog routes x three shipped tiers = 18 cells.
+///
+/// Before sc-22734 `provider_contract` published `None` for every one of them, so no Candle
+/// SenseNova load could be anchored at all, and the single weights-free `CALIBRATION_FINGERPRINT`
+/// was shared by both providers — quality and fast collided on one string.
+///
+/// **`offload_policy` is deliberately NOT in the key**, unlike the SANA table (sc-22731). SenseNova's
+/// rung 4 keys off `LoadSpec::load_shape` and not `offload_policy` — see `streamable_spec` and the
+/// MLX sibling's module header (`supports_sequential_offload: false`, F-176) — so a policy axis
+/// would split one measurement into two coordinates describing the same load. This follows the
+/// FLUX.1 precedent (sc-22726), whose table is likewise policy-free. The materialization axis is not
+/// lost: `MemoryCalibrationIdentity::load_shape` carries it alongside the fingerprint.
+///
+/// This is the TABLE, not the binding. Only `provider_contract` may turn one of these strings into
+/// a published identity, and only past `CheckpointInventory::validate_numeric_tier`, which proves
+/// `spec.quantize` against the checkpoint's own packed width.
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = route_label(spec_route(provider_id, spec))?;
+    let tier = calibration_tier_label(spec.quantize)?;
+    Some(format!(
+        "sensenova-u1-{route}-{tier}-candle-request-memory-ladder-v1"
+    ))
+}
+
+/// The weights-free registry-conformance identity: the same (route, tier) coordinate in a namespace
+/// that can never collide with [`production_calibration_fingerprint`], so a fixture contract can
+/// never be filed as evidence of a real load — and, unlike the single shared string it replaces, it
+/// tells the eighteen registry surfaces apart.
+pub fn weights_free_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = route_label(spec_route(provider_id, spec))?;
+    let tier = calibration_tier_label(spec.quantize)?;
+    Some(format!(
+        "sensenova-u1-{route}-{tier}-candle-weights-free-conformance-v1"
     ))
 }
 
@@ -1051,6 +1130,225 @@ mod tests {
         std::fs::write(root.join("config.json"), config).unwrap();
     }
 
+    // ------------------------------------------------------------------------------------------
+    // sc-22734 (epic sc-22723 E1/E4): every shipped (route, tier) cell publishes its own
+    // production calibration identity, bound to the tier `validate_numeric_tier` proved.
+    // ------------------------------------------------------------------------------------------
+
+    /// The six public catalog routes, paired with the provider that serves each.
+    fn every_route() -> Vec<(&'static str, &'static str)> {
+        QUALITY_ROUTES
+            .iter()
+            .map(|route| (crate::MODEL_ID, *route))
+            .chain(
+                FAST_ROUTES
+                    .iter()
+                    .map(|route| (crate::MODEL_ID_FAST, *route)),
+            )
+            .collect()
+    }
+
+    /// The three shipped tiers, as `(fixture bits, LoadSpec::quantize)`.
+    const SHIPPED_TIERS: [(Option<u8>, Option<Quant>); 3] = [
+        (None, None),
+        (Some(4), Some(Quant::Q4)),
+        (Some(8), Some(Quant::Q8)),
+    ];
+
+    /// A turnkey root under a path component carrying the route's own repository identity, so
+    /// [`validate_resolved_artifact_binding`] admits it.
+    fn tier_root(tmp: &Path, route: &str, bits: Option<u8>) -> PathBuf {
+        let root = tmp
+            .join(format!("{route}-{bits:?}"))
+            .join(format!("SceneWorks__{}-mlx", route.replace('_', "-")));
+        write_tier_fixture(&root, bits);
+        if route.ends_with("_fast") {
+            std::fs::write(root.join(crate::DISTILL_MERGED_MARKER), b"{}\n").unwrap();
+        }
+        root
+    }
+
+    fn tier_spec(root: &Path, route: &str, quant: Option<Quant>) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_resolved_route(route)
+            .with_load_shape(LoadShape::EagerMaterialization);
+        spec.quantize = quant;
+        spec
+    }
+
+    /// **All eighteen shipped Candle cells publish a distinct production identity through the
+    /// production seam, and the set is exactly the eighteen the SceneWorks anchor plan binds**
+    /// (sc-22734). Six public catalog routes x three tiers.
+    ///
+    /// Mutation that fails this: restoring `Ok(build_contract(provider_id, spec, facts, None))` in
+    /// `provider_contract` — production publishes no identity at all and no Candle SenseNova load
+    /// can be anchored, which is the sc-22734 defect.
+    #[test]
+    fn every_shipped_candle_cell_publishes_its_own_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        let mut published = std::collections::BTreeSet::new();
+        for (provider, route) in every_route() {
+            let slug = route_label(route).expect("a public route has a slug");
+            for (bits, quant) in SHIPPED_TIERS {
+                let tier = calibration_tier_label(quant).unwrap();
+                expected.insert(format!(
+                    "sensenova-u1-{slug}-{tier}-candle-request-memory-ladder-v1"
+                ));
+                let root = tier_root(tmp.path(), route, bits);
+                let spec = tier_spec(&root, route, quant);
+                let label = format!("{provider} {route} {tier}");
+                let contract = provider_contract(provider, &spec).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: no production identity"));
+                assert_eq!(identity.load_shape, spec.load_shape, "{label}");
+                assert_eq!(
+                    Some(identity.fingerprint.clone()),
+                    production_calibration_fingerprint(provider, &spec),
+                    "{label}"
+                );
+                assert!(
+                    published.insert(identity.fingerprint.clone()),
+                    "{label}: two cells share the identity {}",
+                    identity.fingerprint
+                );
+            }
+        }
+        assert_eq!(published, expected);
+        assert_eq!(published.len(), every_route().len() * SHIPPED_TIERS.len());
+    }
+
+    /// **No production string is ever a weights-free string**, and the eighteen weights-free
+    /// strings are themselves distinct (sc-22734). The single shared `CALIBRATION_FINGERPRINT` this
+    /// replaces collided quality with fast on the registry surface.
+    ///
+    /// Mutation that fails this: publishing `production_calibration_fingerprint` from
+    /// [`weights_free_contract`], or restoring one shared constant — a fixture contract becomes
+    /// indistinguishable from measured evidence, or the routes collide.
+    #[test]
+    fn the_weights_free_namespace_is_per_cell_and_never_the_production_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut production = std::collections::BTreeSet::new();
+        let mut weights_free = std::collections::BTreeSet::new();
+        let mut expected = std::collections::BTreeSet::new();
+        for (provider, route) in every_route() {
+            let slug = route_label(route).unwrap();
+            for (bits, quant) in SHIPPED_TIERS {
+                let tier = calibration_tier_label(quant).unwrap();
+                expected.insert(format!(
+                    "sensenova-u1-{slug}-{tier}-candle-weights-free-conformance-v1"
+                ));
+                let root = tier_root(tmp.path(), route, bits);
+                let spec = tier_spec(&root, route, quant);
+                production.insert(
+                    provider_contract(provider, &spec)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                );
+                weights_free.insert(
+                    weights_free_contract(provider, &spec)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                );
+            }
+        }
+        assert_eq!(weights_free, expected);
+        assert_eq!(
+            weights_free.len(),
+            every_route().len() * SHIPPED_TIERS.len()
+        );
+        assert!(production.is_disjoint(&weights_free));
+    }
+
+    /// **The tier in the published string is the tier `validate_numeric_tier` proved.** A q4-packed
+    /// root asked for q8 or bf16 is REFUSED outright by the production seam — the tier binding is
+    /// an error on this lane, not a silent `None` — so no identity can ever be published over
+    /// another tier's weights. A dense root asked for q4 is refused the same way, while the dense
+    /// request publishes the bf16 identity.
+    ///
+    /// Mutation that fails this: publishing the identity on the `None` (no-root) branch of
+    /// `provider_contract`, or before `validate_numeric_tier` — an unproven tier reaches the
+    /// anchor key.
+    #[test]
+    fn the_production_identity_never_outruns_the_proven_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (provider, route) in every_route() {
+            let slug = route_label(route).unwrap();
+            let q4 = tier_root(tmp.path(), route, Some(4));
+            assert_eq!(
+                provider_contract(provider, &tier_spec(&q4, route, Some(Quant::Q4)))
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint,
+                format!("sensenova-u1-{slug}-q4-candle-request-memory-ladder-v1"),
+                "{route}"
+            );
+            for mismatch in [Some(Quant::Q8), None] {
+                assert!(
+                    provider_contract(provider, &tier_spec(&q4, route, mismatch)).is_err(),
+                    "{route}: q4 weights admitted a {mismatch:?} request"
+                );
+            }
+            let dense = tier_root(tmp.path(), route, None);
+            assert_eq!(
+                provider_contract(provider, &tier_spec(&dense, route, None))
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint,
+                format!("sensenova-u1-{slug}-bf16-candle-request-memory-ladder-v1"),
+                "{route}"
+            );
+            assert!(
+                provider_contract(provider, &tier_spec(&dense, route, Some(Quant::Q4))).is_err(),
+                "{route}: dense weights admitted a q4 request"
+            );
+            // The TABLE still answers for the request knob — the refusal is the binding's.
+            assert!(production_calibration_fingerprint(
+                provider,
+                &tier_spec(&dense, route, Some(Quant::Q4))
+            )
+            .is_some());
+        }
+    }
+
+    /// **A load with no resolvable snapshot root publishes NO identity** (sc-22734). Nothing about
+    /// any artifact has been proven on that branch, so an anchor key there would be evidence for a
+    /// load whose tier was never read — fail closed.
+    ///
+    /// Mutation that fails this: publishing the identity outside the `Some(inventory)` match arm.
+    #[test]
+    fn a_rootless_load_publishes_no_production_identity() {
+        for (provider, route) in every_route() {
+            let spec = LoadSpec::new(WeightsSource::Dir(
+                std::env::temp_dir()
+                    .join(format!("SceneWorks__{}-mlx", route.replace('_', "-")))
+                    .join("sensenova-does-not-exist"),
+            ))
+            .with_resolved_route(route);
+            let contract = provider_contract(provider, &spec).unwrap();
+            assert!(
+                contract.calibration.is_none(),
+                "{provider} {route}: published an identity with no inventory"
+            );
+            // The weights-free seam, which proves nothing by construction, still declares its own
+            // conformance identity — a different namespace entirely.
+            assert!(weights_free_contract(provider, &spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint
+                .contains("weights-free-conformance"));
+        }
+    }
+
     /// AC (epic SC-22657, E2): the architecture axes are READ from the same `<root>/config.json`
     /// keys `NeoChatConfig::from_dir` parses — never asserted from the published 8B-MoT values —
     /// the four SenseNova structurally lacks stay absent, and the weights-free surface is empty.
@@ -1414,19 +1712,35 @@ mod tests {
         );
     }
 
+    /// The registry's synthetic identity is never production evidence.
+    ///
+    /// **Updated by sc-22734.** This used to assert that production published *nothing at all* —
+    /// which was the defect, not the guarantee: no Candle SenseNova load could be anchored. The
+    /// separation is now expressed as two disjoint NAMESPACES rather than as an absent production
+    /// identity, so a fixture contract still can never be filed as evidence of a real load while
+    /// every shipped cell remains measurable.
     #[test]
     fn synthetic_registry_identity_never_becomes_production_cuda_evidence() {
         let tmp = tempfile::tempdir().unwrap();
         write_tier_fixture(tmp.path(), None);
         let spec = LoadSpec::new(WeightsSource::Dir(tmp.path().to_path_buf()));
-        assert!(weights_free_contract(crate::MODEL_ID, &spec)
+        let fixture = weights_free_contract(crate::MODEL_ID, &spec)
             .unwrap()
             .calibration
-            .is_some());
-        assert!(provider_contract(crate::MODEL_ID, &spec)
+            .unwrap();
+        let production = provider_contract(crate::MODEL_ID, &spec)
             .unwrap()
             .calibration
-            .is_none());
+            .unwrap();
+        assert_eq!(
+            fixture.fingerprint,
+            "sensenova-u1-quality-bf16-candle-weights-free-conformance-v1"
+        );
+        assert_eq!(
+            production.fingerprint,
+            "sensenova-u1-quality-bf16-candle-request-memory-ladder-v1"
+        );
+        assert_ne!(fixture.fingerprint, production.fingerprint);
     }
 
     #[test]

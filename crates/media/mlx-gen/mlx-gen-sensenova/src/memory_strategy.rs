@@ -60,13 +60,27 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// Exact production parameters exercised by the serial real-Metal runner below.
 pub const ATTENTION_CHUNK_SIZE: u32 = 16_777_216;
 pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
+/// The measured `2026-08-03` key of the **(`sensenova_u1_8b`, q8)** cell, captured on the
+/// checkpoint whose SHA-256 is [`QUALITY_Q8_ARTIFACT`]. Retained byte-for-byte by
+/// [`production_calibration_fingerprint`] at that coordinate.
 pub const QUALITY_CALIBRATION_FINGERPRINT: &str =
     "sensenova-u1-quality-q8-mlx-shared-ladder-2026-08-03-v1";
+/// The measured `2026-08-03` key of the **(`sensenova_u1_8b_fast`, q8)** cell, captured on the
+/// pre-merged turnkey whose SHA-256 is [`FAST_Q8_ARTIFACT`]. Retained byte-for-byte by
+/// [`production_calibration_fingerprint`] at that coordinate.
 pub const FAST_CALIBRATION_FINGERPRINT: &str =
     "sensenova-u1-fast-q8-mlx-shared-ladder-2026-08-03-v1";
-const QUALITY_Q8_ARTIFACT: &str =
+/// SHA-256 of the exact quality-route q8 checkpoint [`QUALITY_CALIBRATION_FINGERPRINT`] was
+/// measured on. It is no longer a precondition of publishing that string — sc-22734 binds the
+/// identity to the artifact's *tier* rather than to one recorded digest, so every shipped cell can
+/// be anchored — but it remains the provenance of that measurement and the fail-closed gate the
+/// real-weight runner ([`validate_runner_gate`]) still holds the campaign to.
+pub const QUALITY_Q8_ARTIFACT: &str =
     "8da38dde4c39722259a98cfc47643c88e48cea205595625fdbd9fec097f9dc4f";
-const FAST_Q8_ARTIFACT: &str = "a9f8968d44ec440bdd7bfb2937a61b847d6f80bb563ffe60ca56be0e395bcf50";
+/// SHA-256 of the exact pre-merged `_fast` q8 turnkey [`FAST_CALIBRATION_FINGERPRINT`] was measured
+/// on. See [`QUALITY_Q8_ARTIFACT`] for why it is provenance rather than a publishing precondition.
+pub const FAST_Q8_ARTIFACT: &str =
+    "a9f8968d44ec440bdd7bfb2937a61b847d6f80bb563ffe60ca56be0e395bcf50";
 /// Source-owned weights-free behavior identity. Route/fixture semantics are versioned here so a
 /// correction never restamps the measured calibration fingerprints above. v2 makes the registry
 /// fixtures single-phase and fails phase-bearing contexts closed.
@@ -487,19 +501,218 @@ pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
     verified_artifact(spec).map(|artifact| artifact.digest)
 }
 
-fn calibration_fingerprint(
+/// The route slug the calibration identity strings carry, for each of the **six** public catalog
+/// routes the two SenseNova providers serve (sc-22734, epic sc-22723 E1/E4).
+///
+/// Before sc-22734 the identity was published only when `spec.resolved_route == provider_id`, so
+/// the four infographic aliases published nothing at all and could never be anchored. They are
+/// independently resolved checkpoints with their own repositories
+/// (`validate_resolved_artifact_binding`), so each gets its own slug rather than borrowing a
+/// sibling's evidence — which is exactly what the old veto was protecting against, now expressed as
+/// a distinct key instead of an absent one.
+pub fn route_label(route: &str) -> Option<&'static str> {
+    match route {
+        "sensenova_u1_8b" => Some("quality"),
+        "sensenova_u1_8b_fast" => Some("fast"),
+        "sensenova_u1_8b_infographic_v2" => Some("infographic-v2"),
+        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic-v2-fast"),
+        "sensenova_u1_8b_infographic_v3" => Some("infographic-v3"),
+        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic-v3-fast"),
+        _ => None,
+    }
+}
+
+/// The catalog route a spec loads: its explicit `resolved_route` when the worker set one, else the
+/// provider's own base route id (which is itself one of the six).
+fn spec_route<'a>(provider_id: &'a str, spec: &'a LoadSpec) -> &'a str {
+    spec.resolved_route.as_deref().unwrap_or(provider_id)
+}
+
+/// Tier label of a SenseNova load: `bf16` for the dense source, `q4`/`q8` for the two shipped
+/// packed tiers (`validate_load_contract` refuses anything else). `None` for a tier this family
+/// does not ship.
+pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The tier of the artifact `spec` points at, read from the checkpoint's own tensor headers.
+///
+/// This deliberately does **not** consult `config.json`: `validate_artifact_tier`'s own doc says
+/// an absent `quantization` marker is compatible with any declared tier, so a config probe would
+/// accept a dense snapshot as evidence for a packed anchor — precisely the failure this binding
+/// exists to close. The tier comes off the same seam `crate::quant::lin` packed-detects on: a
+/// `{base}.scales` companion of a backbone decoder Linear, with the width inferred from the u32
+/// codes / scales shape ratio at `crate::quant::GROUP_SIZE` (64).
+///
+/// "Backbone" is `crate::convert::is_backbone_linear`, the exact predicate the converter packs
+/// by and the same key set the Candle sibling's `is_backbone_linear` scans, so the two lanes can
+/// never disagree about which Linears carry the tier.
+///
+/// `Ok(None)` is a dense (bf16) checkpoint. `Err` fails closed on anything that is not a readable
+/// shipped tier: a source that is not a snapshot directory, a root whose `model.safetensors`
+/// cannot be read, a checkpoint with no backbone decoder Linears at all, a `.scales` with no codes,
+/// a codes/scales ratio that is not an exact 4- or 8-bit pack, or two bases packed at different
+/// widths.
+pub fn resolved_artifact_tier(spec: &LoadSpec) -> CoreResult<Option<Quant>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "sensenova artifact tier: the load is not a snapshot directory".to_owned(),
+        ));
+    };
+    // `verified_artifact` already establishes that a SenseNova snapshot is exactly one
+    // `model.safetensors`; reading that file directly keeps this seam on the same shape.
+    let path = root.join("model.safetensors");
+    let fail = |detail: String| {
+        CoreError::Unsupported(format!(
+            "sensenova artifact tier: {} — {detail}",
+            path.display()
+        ))
+    };
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path)
+        .map_err(|error| fail(format!("no readable checkpoint weights ({error})")))?;
+    let shapes: HashMap<&str, &[usize]> = headers
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor.shape.as_slice()))
+        .collect();
+    let mut width: Option<Quant> = None;
+    let mut backbone_linears = 0_usize;
+    for tensor in &headers {
+        if let Some(base) = tensor.name.strip_suffix(".weight") {
+            if crate::convert::is_backbone_linear(base) {
+                backbone_linears += 1;
+            }
+            continue;
+        }
+        let Some(base) = tensor.name.strip_suffix(".scales") else {
+            continue;
+        };
+        if !crate::convert::is_backbone_linear(base) {
+            continue;
+        }
+        let codes = shapes
+            .get(format!("{base}.weight").as_str())
+            .ok_or_else(|| fail(format!("`{base}.scales` has no `{base}.weight` codes")))?;
+        let bits = packed_width_from_shapes(codes, &tensor.shape)
+            .ok_or_else(|| fail(format!("`{base}` is not an exact 4- or 8-bit pack")))?;
+        match width {
+            None => width = Some(bits),
+            Some(seen) if seen == bits => {}
+            Some(seen) => {
+                return Err(fail(format!(
+                    "packed bases disagree on their width: `{base}` is {bits:?}, an earlier base \
+                     is {seen:?}"
+                )))
+            }
+        }
+    }
+    if backbone_linears == 0 {
+        return Err(fail(
+            "no backbone decoder Linears to read a tier from".to_owned(),
+        ));
+    }
+    Ok(width)
+}
+
+/// Packed width from header shapes alone: `scales` is `[out, in / GROUP_SIZE]` and the u32 codes are
+/// `[out, in · bits / 32]`, so `bits = codes.cols · 32 / (scales.cols · GROUP_SIZE)` when that
+/// division is exact and lands on a shipped width. This is the same arithmetic the Candle sibling's
+/// `detect_checkpoint_quantization` performs against `crate::quant::GROUP_SIZE`.
+fn packed_width_from_shapes(codes: &[usize], scales: &[usize]) -> Option<Quant> {
+    let (&[out, code_cols], &[scale_rows, scale_cols]) = (codes, scales) else {
+        return None;
+    };
+    if out != scale_rows {
+        return None;
+    }
+    let group = usize::try_from(crate::quant::GROUP_SIZE).ok()?;
+    let in_dim = scale_cols.checked_mul(group)?;
+    let packed_width = code_cols.checked_mul(32)?;
+    if in_dim == 0 || packed_width % in_dim != 0 {
+        return None;
+    }
+    match packed_width / in_dim {
+        4 => Some(Quant::Q4),
+        8 => Some(Quant::Q8),
+        _ => None,
+    }
+}
+
+/// The tier a load ASKS for — `LoadSpec::quantize`, with no artifact fallback.
+///
+/// Unlike packed-detect-only families, SenseNova's MLX loader genuinely quantizes at load time
+/// (`crate::model::load`: `if let Some(q) = spec.quantize { model.quantize(q.bits())? }`), so the
+/// request knob is a real, independent fact about the load. Falling back to the artifact's own
+/// width would let a `quantize = None` request over a packed root claim that tier's anchor while
+/// the loader was asked for something else; `production_calibration_identity` instead requires
+/// the two to AGREE before publishing anything.
+pub fn requested_tier(spec: &LoadSpec) -> Option<Quant> {
+    spec.quantize
+}
+
+/// Production calibration identity table of the MLX SenseNova cells, keyed on **(route, tier)** —
+/// sc-22734, epic sc-22723 E1/E4. Six public catalog routes x three shipped tiers = 18 cells.
+///
+/// Before sc-22734 this published a string only for `(provider base route, q8, exact recorded
+/// artifact digest)`: 16 of the 18 cells published nothing at all and could never be anchored.
+///
+/// **`offload_policy` is deliberately NOT in the key**, unlike the SANA table (sc-22731). SANA's
+/// rung 4 is declared per offload policy, so its two policies are genuinely different ladders.
+/// SenseNova's rung 4 keys off `LoadSpec::load_shape` and explicitly not `offload_policy` (this
+/// module's header, and `supports_sequential_offload: false`, F-176), so sequential offload is a
+/// no-op fallback here and a policy axis would split one measurement into two coordinates that
+/// describe the same load. This follows the FLUX.1 precedent (sc-22726), whose table is likewise
+/// policy-free. The materialization axis is not lost: `MemoryCalibrationIdentity::load_shape`
+/// carries it alongside the fingerprint.
+///
+/// The two `2026-08-03` strings are the measured literals, retained byte-for-byte at the exact
+/// coordinates they were captured on — `(quality, q8)` on [`QUALITY_Q8_ARTIFACT`] and `(fast, q8)`
+/// on [`FAST_Q8_ARTIFACT`], the two checkpoint digests those campaigns ran against.
+///
+/// This is the TABLE, not the binding: the tier here is [`requested_tier`], the caller's knob. Only
+/// `production_calibration_identity` — which proves that tier against the artifact on disk and
+/// re-checks the load composition — may turn one of these strings into a published contract
+/// identity.
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = route_label(spec_route(provider_id, spec))?;
+    let tier = calibration_tier_label(requested_tier(spec))?;
+    Some(match (route, tier) {
+        ("quality", "q8") => QUALITY_CALIBRATION_FINGERPRINT.to_owned(),
+        ("fast", "q8") => FAST_CALIBRATION_FINGERPRINT.to_owned(),
+        _ => format!("sensenova-u1-{route}-{tier}-mlx-shared-ladder-v1"),
+    })
+}
+
+/// The identity a PRODUCTION load publishes: the (route, tier) string from
+/// [`production_calibration_fingerprint`], but only once the load is one an anchor could describe.
+///
+/// This NEVER fails the load — every refusal is `None`, not `Err`.
+///
+/// * **Composition.** Every guard the pre-sc-22734 gate carried is retained: an overridden
+///   precision, user adapters, component overlays, control/extra controls, IP adapter, PiD,
+///   identity, or an external text encoder all zero the identity. The loader ignores most of those
+///   rather than refusing, so a contract published under one would key a rung to a composition
+///   nothing measured.
+/// * **Pinned artifact.** A snapshot that is not the single stable `model.safetensors`
+///   [`verified_artifact`] pins is not a shape any campaign ran on.
+/// * **Pre-merged `_fast` turnkey.** A `_fast` root without [`crate::DISTILL_MERGED_MARKER`] loads
+///   an unmerged base and merges a curated LoRA at runtime — a different resident shape from the
+///   measured one, on every tier, matching [`can_stream_gen_with_artifact`]'s own requirement.
+/// * **Artifact tier.** The requested tier must be the tier of the weights on disk. A dense
+///   snapshot asked for at q4 is a load-time requantization no anchor measured, a packed snapshot
+///   asked for the other packed tier is not a shipped load, and a `quantize = None` request over a
+///   packed root is not the packed load either. An artifact whose width cannot be read publishes
+///   `None` — fail closed.
+fn production_calibration_identity(
     provider_id: &str,
     spec: &LoadSpec,
     artifact: Option<&PinnedArtifact>,
-) -> Option<&'static str> {
-    // The recorded digests belong to the two original public routes. Infographic aliases are
-    // tensor-compatible but independently resolved checkpoints; until each alias has its own
-    // artifact-bound campaign it may use estimated admission only, never borrow sibling evidence.
-    if spec.resolved_route.as_deref().unwrap_or(provider_id) != provider_id {
-        return None;
-    }
+) -> Option<MemoryCalibrationIdentity> {
     if spec.precision != mlx_gen::Precision::Bf16
-        || spec.quantize != Some(Quant::Q8)
         || !spec.adapters.is_empty()
         || !spec.components.is_empty()
         || spec.control.is_some()
@@ -511,13 +724,20 @@ fn calibration_fingerprint(
     {
         return None;
     }
-    match (provider_id, artifact?.digest()) {
-        (crate::MODEL_ID, QUALITY_Q8_ARTIFACT) => Some(QUALITY_CALIBRATION_FINGERPRINT),
-        (crate::MODEL_ID_FAST, FAST_Q8_ARTIFACT) if matches!(&spec.weights, WeightsSource::Dir(root) if root.join(crate::DISTILL_MERGED_MARKER).is_file()) => {
-            Some(FAST_CALIBRATION_FINGERPRINT)
+    artifact?;
+    if provider_id == crate::MODEL_ID_FAST {
+        let WeightsSource::Dir(root) = &spec.weights else {
+            return None;
+        };
+        if !root.join(crate::DISTILL_MERGED_MARKER).is_file() {
+            return None;
         }
-        _ => None,
     }
+    if resolved_artifact_tier(spec).ok()? != requested_tier(spec) {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, spec)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
 }
 
 /// Validate converter-written packed-tier provenance. MLX may still quantize a dense source at load
@@ -662,8 +882,7 @@ pub(crate) fn memory_strategy_contract_with_artifact(
 ) -> CoreResult<MemoryProviderContract> {
     let footprint = crate::model::component_footprint(spec)?;
     let streamable = can_stream_gen_with_artifact(provider_id, spec, artifact);
-    let calibration = calibration_fingerprint(provider_id, spec, artifact)
-        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    let calibration = production_calibration_identity(provider_id, spec, artifact);
     build_memory_strategy_contract(provider_id, spec, footprint, streamable, calibration)
 }
 
@@ -1178,6 +1397,525 @@ mod tests {
             has_phases: false,
             overlay: None,
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22734 (epic sc-22723 E1/E4): every shipped (route, tier) cell publishes its own
+    // production calibration identity, bound to the tier of the artifact on disk.
+    // ------------------------------------------------------------------------------------------
+
+    /// Write one safetensors file by hand: `(name, dtype, shape)` entries over a zero-filled data
+    /// region. Only the HEADER matters to the tier seam, exactly as it does to the loader's
+    /// packed-detect.
+    fn write_safetensors(path: &std::path::Path, entries: &[(String, &str, Vec<usize>)]) {
+        let width = |dtype: &str| match dtype {
+            "BF16" => 2,
+            "U32" | "F32" => 4,
+            other => panic!("fixture dtype {other}"),
+        };
+        let mut offset = 0_usize;
+        let mut fields = Vec::new();
+        for (name, dtype, shape) in entries {
+            let bytes = shape.iter().product::<usize>() * width(dtype);
+            let shape = shape
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let end = offset + bytes;
+            fields.push(format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{end}]}}"
+            ));
+            offset = end;
+        }
+        let mut json = format!("{{{}}}", fields.join(",")).into_bytes();
+        while json.len() % 8 != 0 {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The packed triple `crate::convert` writes for one backbone Linear `{base}` of `in = 64` at
+    /// `crate::quant::GROUP_SIZE` 64 — u32 codes `[out, 64·bits/32]`, bf16 scales/biases `[out, 1]`
+    /// — or the dense bf16 `[out, 64]` weight when `bits` is `None`.
+    fn linear_entries(
+        base: &str,
+        out: usize,
+        bits: Option<usize>,
+    ) -> Vec<(String, &'static str, Vec<usize>)> {
+        match bits {
+            Some(bits) => vec![
+                (format!("{base}.weight"), "U32", vec![out, 64 * bits / 32]),
+                (format!("{base}.scales"), "BF16", vec![out, 1]),
+                (format!("{base}.biases"), "BF16", vec![out, 1]),
+            ],
+            None => vec![(format!("{base}.weight"), "BF16", vec![out, 64])],
+        }
+    }
+
+    /// Two backbone decoder Linears — one attention projection, one MLP projection, on both the
+    /// understanding and generation paths — packed at `bits` (`None` = dense bf16), plus a
+    /// non-backbone tensor the tier scan must ignore.
+    fn backbone_entries(bits: Option<usize>) -> Vec<(String, &'static str, Vec<usize>)> {
+        let mut entries = linear_entries("language_model.model.layers.0.self_attn.q_proj", 8, bits);
+        entries.extend(linear_entries(
+            "language_model.model.layers.0.mlp_mot_gen.gate_proj",
+            8,
+            bits,
+        ));
+        // Not a backbone Linear: never carries the tier, and a `.scales`-less dense key here must
+        // not make a packed checkpoint read as dense.
+        entries.push((
+            "language_model.model.embed_tokens.weight".to_owned(),
+            "BF16",
+            vec![16, 64],
+        ));
+        entries
+    }
+
+    /// A snapshot root shaped the way the SenseNova turnkey ships: exactly one `model.safetensors`
+    /// (the shape [`verified_artifact`] pins), under a path component carrying the route's own
+    /// repository identity so `validate_resolved_artifact_binding` admits it.
+    fn tier_root(tmp: &tempfile::TempDir, route: &str, bits: Option<usize>) -> std::path::PathBuf {
+        let repository = format!("SceneWorks__{}-mlx", route.replace('_', "-"));
+        let root = unique_root(tmp, "tier").join(repository);
+        std::fs::create_dir_all(&root).unwrap();
+        write_safetensors(&root.join("model.safetensors"), &backbone_entries(bits));
+        if route.ends_with("_fast") {
+            std::fs::write(root.join(crate::DISTILL_MERGED_MARKER), b"{}\n").unwrap();
+        }
+        root
+    }
+
+    fn tier_spec(root: &std::path::Path, route: &str, quant: Option<Quant>) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_resolved_route(route)
+            .with_load_shape(LoadShape::EagerMaterialization);
+        spec.quantize = quant;
+        spec
+    }
+
+    /// The six public catalog routes, paired with the provider that serves each.
+    fn every_route() -> Vec<(&'static str, &'static str)> {
+        QUALITY_PUBLIC_ROUTES
+            .iter()
+            .map(|route| (crate::MODEL_ID, *route))
+            .chain(
+                FAST_PUBLIC_ROUTES
+                    .iter()
+                    .map(|route| (crate::MODEL_ID_FAST, *route)),
+            )
+            .collect()
+    }
+
+    /// The three shipped tiers, as `(fixture bits, LoadSpec::quantize)`.
+    const SHIPPED_TIERS: [(Option<usize>, Option<Quant>); 3] = [
+        (None, None),
+        (Some(4), Some(Quant::Q4)),
+        (Some(8), Some(Quant::Q8)),
+    ];
+
+    /// **All eighteen shipped MLX cells publish a distinct production identity, and the set is
+    /// exactly the eighteen the SceneWorks anchor plan binds** (sc-22734). Six public catalog
+    /// routes x three tiers; the `(quality, q8)` and `(fast, q8)` coordinates keep their measured
+    /// `2026-08-03` literals byte-for-byte.
+    ///
+    /// Mutation that fails this: restoring the `resolved_route != provider_id` veto (the four
+    /// infographic routes publish nothing) or the `quantize != Some(Q8)` veto (q4 and bf16 publish
+    /// nothing) — sixteen of the eighteen cells go unanchorable, which is the sc-22734 defect.
+    #[test]
+    fn every_shipped_mlx_cell_publishes_its_own_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        let mut published = std::collections::BTreeSet::new();
+        for (provider, route) in every_route() {
+            let slug = route_label(route).expect("a public route has a slug");
+            for (bits, quant) in SHIPPED_TIERS {
+                let tier = calibration_tier_label(quant).unwrap();
+                expected.insert(match (slug, tier) {
+                    ("quality", "q8") => QUALITY_CALIBRATION_FINGERPRINT.to_owned(),
+                    ("fast", "q8") => FAST_CALIBRATION_FINGERPRINT.to_owned(),
+                    _ => format!("sensenova-u1-{slug}-{tier}-mlx-shared-ladder-v1"),
+                });
+                let root = tier_root(&tmp, route, bits);
+                let spec = tier_spec(&root, route, quant);
+                let label = format!("{provider} {route} {tier}");
+                assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{label}");
+                let contract = memory_strategy_contract(provider, &spec).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: no production identity"));
+                assert_eq!(identity.load_shape, spec.load_shape, "{label}");
+                assert_eq!(
+                    Some(identity.fingerprint.clone()),
+                    production_calibration_fingerprint(provider, &spec),
+                    "{label}"
+                );
+                assert!(
+                    published.insert(identity.fingerprint.clone()),
+                    "{label}: two cells share the identity {}",
+                    identity.fingerprint
+                );
+            }
+        }
+        assert_eq!(published, expected);
+        assert_eq!(published.len(), every_route().len() * SHIPPED_TIERS.len());
+    }
+
+    /// **The two measured `2026-08-03` literals are returned unchanged at the coordinates they were
+    /// captured on**, and nowhere else (sc-22734). They are the only strings in the table that are
+    /// not derived from the (route, tier) template, so a template change must not silently restamp
+    /// them.
+    #[test]
+    fn the_measured_literals_survive_at_their_measured_coordinates() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (provider, route, expected) in [
+            (
+                crate::MODEL_ID,
+                "sensenova_u1_8b",
+                "sensenova-u1-quality-q8-mlx-shared-ladder-2026-08-03-v1",
+            ),
+            (
+                crate::MODEL_ID_FAST,
+                "sensenova_u1_8b_fast",
+                "sensenova-u1-fast-q8-mlx-shared-ladder-2026-08-03-v1",
+            ),
+        ] {
+            let root = tier_root(&tmp, route, Some(8));
+            let spec = tier_spec(&root, route, Some(Quant::Q8));
+            assert_eq!(
+                memory_strategy_contract(provider, &spec)
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint,
+                expected
+            );
+            // Every OTHER tier of the same route is the derived string, never the measured one.
+            for (bits, quant) in [(None, None), (Some(4), Some(Quant::Q4))] {
+                let other = tier_root(&tmp, route, bits);
+                let spec = tier_spec(&other, route, quant);
+                assert_ne!(
+                    production_calibration_fingerprint(provider, &spec).as_deref(),
+                    Some(expected)
+                );
+            }
+        }
+        assert_eq!(
+            QUALITY_CALIBRATION_FINGERPRINT,
+            "sensenova-u1-quality-q8-mlx-shared-ladder-2026-08-03-v1"
+        );
+        assert_eq!(
+            FAST_CALIBRATION_FINGERPRINT,
+            "sensenova-u1-fast-q8-mlx-shared-ladder-2026-08-03-v1"
+        );
+    }
+
+    /// **No production string is ever a weights-free string.** A registry fixture contract carries
+    /// [`STATIC_BEHAVIOR_CALIBRATION`], a namespace the production table cannot reach, so a
+    /// weights-free declaration can never be filed as measured evidence of the cell it describes.
+    #[test]
+    fn no_production_identity_collides_with_the_weights_free_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut production = std::collections::BTreeSet::new();
+        let mut weights_free = std::collections::BTreeSet::new();
+        for (provider, route) in every_route() {
+            for (bits, quant) in SHIPPED_TIERS {
+                let root = tier_root(&tmp, route, bits);
+                let spec = tier_spec(&root, route, quant);
+                production.insert(
+                    production_calibration_fingerprint(provider, &spec)
+                        .expect("a shipped cell has a production identity"),
+                );
+                weights_free.insert(
+                    weights_free_memory_strategy_contract(provider, &spec)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                );
+            }
+        }
+        assert!(production.is_disjoint(&weights_free));
+        for fingerprint in &production {
+            assert!(
+                !fingerprint.starts_with(STATIC_BEHAVIOR_CALIBRATION),
+                "{fingerprint} reaches the static behavior namespace"
+            );
+        }
+    }
+
+    /// **The identity is bound to the tier of the artifact on disk, at the seam the worker calls.**
+    /// A packed root publishes its own tier's string; the SAME root asked for the other packed tier
+    /// or for the dense one publishes nothing; a dense root asked for q4 publishes nothing while the
+    /// dense request publishes the bf16 string.
+    ///
+    /// Mutation that fails this: deleting the
+    /// `resolved_artifact_tier(spec) != requested_tier(spec)` refusal in
+    /// `production_calibration_identity` — every mismatched cell publishes the requested tier's
+    /// string over another tier's weights.
+    #[test]
+    fn the_production_identity_is_withheld_when_the_request_and_the_artifact_disagree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = |provider: &str, spec: &LoadSpec| {
+            memory_strategy_contract(provider, spec)
+                .unwrap()
+                .calibration
+                .map(|calibration| calibration.fingerprint)
+        };
+        for (provider, route) in every_route() {
+            let slug = route_label(route).unwrap();
+            // A q4-packed root: q4 publishes q4, q8 and bf16 publish nothing.
+            let q4 = tier_root(&tmp, route, Some(4));
+            assert_eq!(
+                identity(provider, &tier_spec(&q4, route, Some(Quant::Q4))),
+                Some(format!("sensenova-u1-{slug}-q4-mlx-shared-ladder-v1")),
+                "{route}"
+            );
+            for mismatch in [Some(Quant::Q8), None] {
+                assert_eq!(
+                    identity(provider, &tier_spec(&q4, route, mismatch)),
+                    None,
+                    "{route}: q4 weights published an identity for {mismatch:?}"
+                );
+            }
+            // A dense root: bf16 publishes bf16, q4 (a load-time requantization) publishes nothing.
+            let dense = tier_root(&tmp, route, None);
+            assert_eq!(
+                identity(provider, &tier_spec(&dense, route, None)),
+                Some(format!("sensenova-u1-{slug}-bf16-mlx-shared-ladder-v1")),
+                "{route}"
+            );
+            assert_eq!(
+                identity(provider, &tier_spec(&dense, route, Some(Quant::Q4))),
+                None,
+                "{route}: dense weights published a q4 identity"
+            );
+            // The TABLE still answers for the request knob in all of those cases — the refusal is
+            // the binding's, so a table change can never be mistaken for the binding working.
+            assert!(production_calibration_fingerprint(
+                provider,
+                &tier_spec(&dense, route, Some(Quant::Q4))
+            )
+            .is_some());
+        }
+    }
+
+    /// **An unreadable or malformed checkpoint publishes no identity and NEVER fails the load.**
+    /// The contract itself is still produced in every case — an admission gate that threw here
+    /// would turn a measurement gap into an outage.
+    #[test]
+    fn an_unreadable_artifact_publishes_no_identity_without_failing_the_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = "sensenova_u1_8b";
+        let repository = format!("SceneWorks__{}-mlx", route.replace('_', "-"));
+
+        let make = |label: &str, entries: Option<Vec<(String, &'static str, Vec<usize>)>>| {
+            let root = unique_root(&tmp, label).join(&repository);
+            std::fs::create_dir_all(&root).unwrap();
+            match entries {
+                Some(entries) => write_safetensors(&root.join("model.safetensors"), &entries),
+                // Not a safetensors file at all.
+                None => std::fs::write(root.join("model.safetensors"), [0_u8; 8]).unwrap(),
+            }
+            root
+        };
+
+        // A packed base whose codes/scales ratio is not a shipped width.
+        let two_bit = linear_entries("language_model.model.layers.0.self_attn.q_proj", 8, Some(2));
+        // Two backbone bases packed at different widths.
+        let mut mixed =
+            linear_entries("language_model.model.layers.0.self_attn.q_proj", 8, Some(4));
+        mixed.extend(linear_entries(
+            "language_model.model.layers.0.mlp.gate_proj",
+            8,
+            Some(8),
+        ));
+        // A `.scales` with no codes companion.
+        let orphan = vec![(
+            "language_model.model.layers.0.self_attn.q_proj.scales".to_owned(),
+            "BF16",
+            vec![8, 1],
+        )];
+        // No backbone decoder Linears at all.
+        let no_backbone = vec![(
+            "language_model.model.embed_tokens.weight".to_owned(),
+            "BF16",
+            vec![16, 64],
+        )];
+
+        for (label, root) in [
+            ("unreadable bytes", make("unreadable", None)),
+            ("2-bit pack", make("two-bit", Some(two_bit))),
+            ("mixed q4/q8 pack", make("mixed", Some(mixed))),
+            ("orphan scales", make("orphan", Some(orphan))),
+            (
+                "no backbone linears",
+                make("no-backbone", Some(no_backbone)),
+            ),
+        ] {
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let spec = tier_spec(&root, route, quant);
+                assert!(
+                    resolved_artifact_tier(&spec).is_err(),
+                    "{label} {quant:?}: read a tier it cannot prove"
+                );
+                let contract = memory_strategy_contract(crate::MODEL_ID, &spec)
+                    .unwrap_or_else(|error| panic!("{label} {quant:?}: contract failed: {error}"));
+                assert!(
+                    contract.calibration.is_none(),
+                    "{label} {quant:?}: published an identity over unreadable weights"
+                );
+            }
+        }
+        // A source that is not a snapshot directory fails closed the same way.
+        let mut file_spec = LoadSpec::new(WeightsSource::File("model.safetensors".into()));
+        file_spec.quantize = Some(Quant::Q8);
+        assert!(resolved_artifact_tier(&file_spec).is_err());
+    }
+
+    /// **A `_fast` root without the pre-merged distill marker publishes no identity, on any tier.**
+    /// Such a root loads an unmerged base and merges a curated LoRA at runtime — a different
+    /// resident shape from the one the `_fast` campaign measured, and the same requirement
+    /// [`can_stream_gen_with_artifact`] holds rung 4 to.
+    #[test]
+    fn a_fast_root_without_the_merged_marker_publishes_no_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        for route in FAST_PUBLIC_ROUTES {
+            for (bits, quant) in SHIPPED_TIERS {
+                let root = tier_root(&tmp, route, bits);
+                assert!(memory_strategy_contract(
+                    crate::MODEL_ID_FAST,
+                    &tier_spec(&root, route, quant)
+                )
+                .unwrap()
+                .calibration
+                .is_some());
+                std::fs::remove_file(root.join(crate::DISTILL_MERGED_MARKER)).unwrap();
+                let contract =
+                    memory_strategy_contract(crate::MODEL_ID_FAST, &tier_spec(&root, route, quant))
+                        .unwrap();
+                assert!(
+                    contract.calibration.is_none(),
+                    "{route} {quant:?}: an unmerged fast root published an identity"
+                );
+            }
+        }
+    }
+
+    /// **A composition the measured load never carried zeroes the identity**, on every route and
+    /// tier. These are the guards the pre-sc-22734 gate held and sc-22734 retains: the loader
+    /// silently ignores most of them, so a published identity would key a rung to a composition
+    /// nothing measured.
+    #[test]
+    fn an_unmeasured_composition_publishes_no_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = "sensenova_u1_8b";
+        let root = tier_root(&tmp, route, Some(8));
+        let base = tier_spec(&root, route, Some(Quant::Q8));
+        assert!(production_calibration_identity(
+            crate::MODEL_ID,
+            &base,
+            verified_artifact(&base).as_ref()
+        )
+        .is_some());
+        let overlay = || WeightsSource::File(root.join("overlay.safetensors"));
+        // One unmeasured-composition mutation, applied to a spec that otherwise publishes.
+        type Mutation<'a> = (&'a str, Box<dyn Fn(&mut LoadSpec) + 'a>);
+        let mutations: Vec<Mutation<'_>> = vec![
+            (
+                "precision override",
+                Box::new(|spec: &mut LoadSpec| spec.precision = mlx_gen::Precision::Fp32),
+            ),
+            (
+                "user adapter",
+                Box::new(|spec: &mut LoadSpec| {
+                    spec.adapters.push(mlx_gen::gen_core::AdapterSpec::new(
+                        "lora.safetensors".into(),
+                        1.0,
+                        mlx_gen::gen_core::AdapterKind::Lora,
+                    ));
+                }),
+            ),
+            (
+                "component overlay",
+                Box::new(|spec: &mut LoadSpec| {
+                    spec.components
+                        .insert(DISTILL_LORA_COMPONENT.to_owned(), overlay());
+                }),
+            ),
+            (
+                "control",
+                Box::new(|spec: &mut LoadSpec| spec.control = Some(overlay())),
+            ),
+            (
+                "extra control",
+                Box::new(|spec: &mut LoadSpec| spec.extra_controls.push(overlay())),
+            ),
+            (
+                "ip adapter",
+                Box::new(|spec: &mut LoadSpec| spec.ip_adapter = Some(overlay())),
+            ),
+            (
+                "pid",
+                Box::new(|spec: &mut LoadSpec| {
+                    spec.pid = Some(mlx_gen::gen_core::PidWeights {
+                        checkpoint: overlay(),
+                        gemma: WeightsSource::Dir(root.clone()),
+                    });
+                }),
+            ),
+            (
+                "identity",
+                Box::new(|spec: &mut LoadSpec| {
+                    spec.identity = Some(mlx_gen::gen_core::IdentityWeights {
+                        encoder: Some(overlay()),
+                        eva: Some(overlay()),
+                        face_dir: Some(WeightsSource::Dir(root.clone())),
+                    });
+                }),
+            ),
+            (
+                "text encoder",
+                Box::new(|spec: &mut LoadSpec| spec.text_encoder = Some(overlay())),
+            ),
+        ];
+        for (label, mutate) in mutations {
+            let mut spec = base.clone();
+            mutate(&mut spec);
+            let artifact = verified_artifact(&spec);
+            assert!(
+                production_calibration_identity(crate::MODEL_ID, &spec, artifact.as_ref())
+                    .is_none(),
+                "{label}: published an identity for an unmeasured composition"
+            );
+        }
+        // The pinned artifact is a precondition too: no pin, no identity.
+        assert!(production_calibration_identity(crate::MODEL_ID, &base, None).is_none());
+    }
+
+    /// The two recorded campaign artifact digests stay distinct, well-formed SHA-256 hex, and
+    /// [`verified_artifact_identity`] still produces that shape over a real snapshot — the evidence
+    /// [`QUALITY_CALIBRATION_FINGERPRINT`] and [`FAST_CALIBRATION_FINGERPRINT`] were measured on,
+    /// and the gate [`validate_runner_gate`] still holds the real-weight runner to.
+    #[test]
+    fn the_recorded_campaign_artifact_digests_stay_distinct_sha256_hex() {
+        let hex = |digest: &str| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        assert!(hex(QUALITY_Q8_ARTIFACT), "{QUALITY_Q8_ARTIFACT}");
+        assert!(hex(FAST_Q8_ARTIFACT), "{FAST_Q8_ARTIFACT}");
+        assert_ne!(QUALITY_Q8_ARTIFACT, FAST_Q8_ARTIFACT);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tier_root(&tmp, "sensenova_u1_8b", Some(8));
+        let spec = tier_spec(&root, "sensenova_u1_8b", Some(Quant::Q8));
+        let observed = verified_artifact_identity(&spec).expect("a pinned single-file snapshot");
+        assert!(hex(&observed), "{observed}");
+        assert_ne!(observed, QUALITY_Q8_ARTIFACT);
     }
 
     /// sc-20569 (production outage): every geometry the manifest offers is outside the measured
