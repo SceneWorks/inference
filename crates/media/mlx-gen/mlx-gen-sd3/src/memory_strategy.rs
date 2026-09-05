@@ -24,11 +24,29 @@
 //!   block for every variant. The mechanism was never Large-specific; only the snapshot admission
 //!   was, which `artifact_inventory::stream_inventory` now resolves per variant.
 //!
-//! What stays Large-only is **evidence**, not implementation: the exact content-pinned SC-15522
-//! artifact is the sole carrier of [`MEMORY_CALIBRATION_FINGERPRINT`]. Large-Turbo and Medium
-//! publish the same implemented ladder with no calibration identity, which
-//! [`standard_memory_strategy_safety_check`] admits only under explicit
-//! [`mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated`] authority (SC-18093).
+//! What stays Large-only is one **string**, not implementation: the exact content-pinned SC-15522
+//! artifact remains the sole carrier of [`MEMORY_CALIBRATION_FINGERPRINT`].
+//!
+//! # Production calibration identity (sc-22730, epic sc-22723 E1/E4)
+//!
+//! Every clean base load of a SHIPPED SceneWorks turnkey publishes a production calibration identity
+//! keyed on the route — see [`production_calibration_fingerprint`] for the table and
+//! `production_calibration_identity` for the binding. Until sc-22730 the identity existed only for
+//! that one content-pinned Large BF16 snapshot, so all nine `<route>:<tier>:mlx` cells the worker can
+//! actually load published none and no memory anchor could bind to them: the SceneWorks capture arm
+//! reads `contract.calibration` off the LOADED generator and refuses a contract without one.
+//!
+//! The identity is independent of `OffloadPolicy` and `LoadShape` — the worker's still-image path
+//! loads `Resident + EagerMaterialization` — and it is bound to the artifact, never to the request
+//! knob: `artifact_inventory::shipped_turnkey_tier` proves the pinned repository, revision and tier
+//! subdir and then cross-checks the transformer's packed triples against the `quantization` manifest
+//! the converter wrote, and a dense snapshot opened with `quantize = Some(_)` (a genuine runtime
+//! requantization, since this engine quantizes dense at load) publishes nothing. A load that is not
+//! a shipped turnkey — an anonymous structurally admitted snapshot — still publishes no calibration
+//! and is admitted only under explicit
+//! [`mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated`] authority (SC-18093). Weights-free
+//! registry conformance keeps its own [`STATIC_BEHAVIOR_FINGERPRINT`] family, which never equals a
+//! production string.
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
 use mlx_gen::gen_core::{
@@ -214,6 +232,70 @@ fn build_contract(
     Ok(contract)
 }
 
+/// Production calibration identity table of the clean SD3.5 base routes, keyed on the route
+/// (sc-22730, epic sc-22723 E1/E4).
+///
+/// This is the TABLE, not the binding: only `production_calibration_identity` — which proves the
+/// load against the artifact on disk first — may turn one of these strings into a contract identity.
+///
+/// The measured [`MEMORY_CALIBRATION_FINGERPRINT`] stays exactly where its evidence is: the exact
+/// content-pinned SC-15522 Large BF16 snapshot, and it is returned by the binding rather than by this
+/// table. Every shipped SceneWorks turnkey publishes `sd3-5-<route>-mlx-shared-ladder-v1` instead.
+/// Offload policy, load shape and tier are deliberately NOT inputs: one turnkey family per route
+/// carries all three tiers of the same ladder, `MemoryCalibrationIdentity::load_shape` carries the
+/// materialization axis separately, and the tier is what the binding proves before publishing at all.
+pub fn production_calibration_fingerprint(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        crate::MODEL_ID => Some("sd3-5-large-mlx-shared-ladder-v1"),
+        crate::TURBO_MODEL_ID => Some("sd3-5-large-turbo-mlx-shared-ladder-v1"),
+        crate::MEDIUM_MODEL_ID => Some("sd3-5-medium-mlx-shared-ladder-v1"),
+        _ => None,
+    }
+}
+
+/// The identity a loaded SD3.5 route publishes, bound to the artifact it opens.
+///
+/// Before sc-22730 this was `calibrated.then(…)`: only the exact SC-15522 Large BF16 snapshot ever
+/// carried an identity, so the SceneWorks turnkeys the worker actually loads — every tier of Large,
+/// and every tier of Large-Turbo and Medium — published none, and a memory anchor had nothing to
+/// bind (the capture arm reads `contract.calibration` off the loaded generator and refuses a
+/// contract without one).
+///
+/// Two gates, both fail-closed:
+///
+/// * the load must be a clean base load ([`clean`]) at bf16 execution precision — an overlay or an
+///   external text encoder is a different resident set that no anchor measured; and
+/// * `spec.quantize` must be the tier the artifact on disk already is
+///   (`artifact_inventory::shipped_turnkey_tier`). This engine quantizes DENSE AT LOAD
+///   (`crate::model::load_heavy`), so a dense snapshot opened with `quantize = Some(_)` is a genuine
+///   runtime requantization whose peak is nobody's anchor, while a packed turnkey opened at its own
+///   tier is the checked no-op the worker performs (`resolve_quant` → `reconcile_resolved_tier_quant`
+///   settle the load quant onto the resolved tier subdir).
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+    calibrated: bool,
+) -> mlx_gen::gen_core::Result<Option<MemoryCalibrationIdentity>> {
+    if !clean(spec) || spec.precision != mlx_gen::Precision::Bf16 {
+        return Ok(None);
+    }
+    if calibrated {
+        return Ok(Some(MemoryCalibrationIdentity::new(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        )));
+    }
+    let Some(artifact_tier) = crate::artifact_inventory::shipped_turnkey_tier(provider_id, spec)?
+    else {
+        return Ok(None);
+    };
+    if artifact_tier != spec.quantize {
+        return Ok(None);
+    }
+    Ok(production_calibration_fingerprint(provider_id)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)))
+}
+
 /// Production contract for a loaded (or loadable) SD3.5 route.
 ///
 /// Rungs 1-3 need no artifact admission at all — they are residency policy, VAE tiling, and an
@@ -223,9 +305,8 @@ fn build_contract(
 /// [`crate::model::load_heavy`](crate::model) uses to attach the block stream, so the declared rung
 /// and the engaged rung cannot disagree.
 ///
-/// Calibration stays exactly where the evidence is: only the exact content-pinned SC-15522 Large
-/// artifact carries [`MEMORY_CALIBRATION_FINGERPRINT`]. Every other admitted route publishes no
-/// calibration identity and is therefore admissible only under explicit estimate authority.
+/// Calibration is decided separately by `production_calibration_identity`, which is bound to the
+/// artifact rather than to the rung: rung 4 stays gated on `streamable`, the identity does not.
 pub(crate) fn contract_for(
     provider_id: &str,
     spec: &LoadSpec,
@@ -244,8 +325,7 @@ pub(crate) fn contract_for(
             .is_some_and(|inventory| inventory.is_calibrated()),
     };
     let streamable = stream.is_some();
-    let calibration = calibrated
-        .then(|| MemoryCalibrationIdentity::new(MEMORY_CALIBRATION_FINGERPRINT, spec.load_shape));
+    let calibration = production_calibration_identity(provider_id, spec, calibrated)?;
     build_contract(
         provider_id,
         spec,
@@ -722,6 +802,171 @@ mod tests {
                 .finish(mlx_gen::gen_core::MemoryRunOutcome::Complete)
                 .unwrap();
         }
+    }
+
+    /// A header-valid safetensors file with no weight body: `safetensors_header_shapes` reads the
+    /// header alone, so the tensor names are all a tier proof needs.
+    fn write_header_only_safetensors(path: &std::path::Path, names: &[&str]) {
+        let mut header = serde_json::Map::new();
+        for name in names {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({ "dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 0] }),
+            );
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (encoded.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(encoded);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// One shipped SceneWorks turnkey tier directory, at the exact HF-cache path
+    /// `artifact_inventory::SHIPPED_TURNKEYS` pins for `provider_id`.
+    fn turnkey_fixture(provider_id: &str, tier: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (_, repository, revision) = crate::artifact_inventory::SHIPPED_TURNKEYS
+            .iter()
+            .find(|(id, _, _)| *id == provider_id)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join(format!("models--SceneWorks--{repository}"))
+            .join("snapshots")
+            .join(revision)
+            .join(tier);
+        for component in [
+            "transformer",
+            "text_encoder",
+            "text_encoder_2",
+            "text_encoder_3",
+            "vae",
+        ] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+        }
+        let packed = matches!(tier, "q4" | "q8");
+        let names: &[&str] = if packed {
+            &[
+                "blocks.0.proj.weight",
+                "blocks.0.proj.scales",
+                "blocks.0.proj.biases",
+            ]
+        } else {
+            &["blocks.0.proj.weight"]
+        };
+        write_header_only_safetensors(
+            &root.join("transformer/diffusion_pytorch_model.safetensors"),
+            names,
+        );
+        let config = if packed {
+            serde_json::json!({ "quantization": { "bits": if tier == "q4" { 4 } else { 8 }, "group_size": 64 } })
+        } else {
+            serde_json::json!({})
+        };
+        std::fs::write(
+            root.join("transformer/config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        (temp, root)
+    }
+
+    fn turnkey_spec(root: &std::path::Path, quant: Option<mlx_gen::Quant>) -> LoadSpec {
+        // The worker's MLX still-image shape: Resident + EagerMaterialization are the `LoadSpec`
+        // defaults and it never overrides either (`image_jobs/base.rs`, no `memory_route_registry`
+        // rule and no `mlx.memoryStrategyContract` for sd3), with the load quant settled onto the
+        // resolved tier subdir.
+        let mut spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(root.to_path_buf()));
+        if let Some(quant) = quant {
+            spec = spec.with_quant(quant);
+        }
+        spec
+    }
+
+    /// sc-22730 (epic sc-22723, E1 measurable / E4 production loader): every shipped SD3.5 turnkey
+    /// tier the worker can load publishes its route's production calibration identity, under the
+    /// worker's own load shape and under the staged/deferred one, so a memory anchor has something
+    /// to bind. Nine cells (three routes x three tiers) had none before.
+    ///
+    /// *Mutations this kills:* restoring `calibrated.then(…)` (every turnkey goes back to `None`);
+    /// keying the string on the tier, the offload policy or the load shape (the six specs below
+    /// would disagree); replaying one route's string on another; publishing the weights-free
+    /// registry string in production; and dropping the artifact proof — the last two blocks load a
+    /// dense turnkey with a quant knob and a packed turnkey at the wrong tier, both of which are
+    /// runtime requantizations no anchor measured.
+    #[test]
+    fn every_shipped_turnkey_tier_publishes_its_routes_production_identity() {
+        let mut published = std::collections::BTreeSet::new();
+        for provider in PROVIDERS {
+            let expected = production_calibration_fingerprint(provider).unwrap();
+            let weights_free = format!(
+                "{STATIC_BEHAVIOR_FINGERPRINT}-{}",
+                provider.replace('_', "-")
+            );
+            assert_ne!(expected, weights_free);
+            assert_ne!(expected, MEMORY_CALIBRATION_FINGERPRINT);
+            for (tier, quant) in [
+                ("bf16", None),
+                ("q4", Some(mlx_gen::Quant::Q4)),
+                ("q8", Some(mlx_gen::Quant::Q8)),
+            ] {
+                let (_temp, root) = turnkey_fixture(provider, tier);
+                assert_eq!(
+                    crate::artifact_inventory::shipped_turnkey_tier(
+                        provider,
+                        &turnkey_spec(&root, quant)
+                    )
+                    .unwrap(),
+                    Some(quant),
+                );
+                for (offload, load_shape) in [
+                    (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                    (
+                        OffloadPolicy::Sequential,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let spec = turnkey_spec(&root, quant)
+                        .with_offload_policy(offload)
+                        .with_load_shape(load_shape);
+                    let contract = contract_for(provider, &spec).unwrap();
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {load_shape:?} publishes none")
+                    });
+                    assert_eq!(identity.fingerprint, expected, "{provider} {tier}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                }
+
+                // The request knob never outranks the artifact: every tier the snapshot is NOT.
+                for wrong in [None, Some(mlx_gen::Quant::Q4), Some(mlx_gen::Quant::Q8)] {
+                    if wrong == quant {
+                        continue;
+                    }
+                    assert!(
+                        contract_for(provider, &turnkey_spec(&root, wrong))
+                            .unwrap()
+                            .calibration
+                            .is_none(),
+                        "{provider} {tier} must publish nothing for a {wrong:?} load quant"
+                    );
+                }
+
+                // Another route's artifact is not this route's cell.
+                for other in PROVIDERS.into_iter().filter(|other| *other != provider) {
+                    assert!(
+                        crate::artifact_inventory::shipped_turnkey_tier(
+                            other,
+                            &turnkey_spec(&root, quant)
+                        )
+                        .unwrap()
+                        .is_none(),
+                        "{other} must not claim {provider}'s turnkey"
+                    );
+                }
+            }
+            published.insert(expected);
+        }
+        assert_eq!(published.len(), PROVIDERS.len());
     }
 
     #[test]
