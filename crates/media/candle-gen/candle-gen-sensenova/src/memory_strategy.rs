@@ -1326,9 +1326,15 @@ mod tests {
     /// Mutation that fails this: publishing the identity outside the `Some(inventory)` match arm.
     #[test]
     fn a_rootless_load_publishes_no_production_identity() {
+        // The root must not exist, but it must still carry the route's repository component so
+        // `validate_resolved_artifact_binding` passes and the refusal under test is the INVENTORY
+        // branch rather than the binding. Minted from a tempfile guard (never a bare
+        // `env::temp_dir()` path, which survives a panicking test and collides at the same PID)
+        // and then joined with a name nothing creates inside it.
+        let temp = tempfile::tempdir().unwrap();
         for (provider, route) in every_route() {
             let spec = LoadSpec::new(WeightsSource::Dir(
-                std::env::temp_dir()
+                temp.path()
                     .join(format!("SceneWorks__{}-mlx", route.replace('_', "-")))
                     .join("sensenova-does-not-exist"),
             ))
