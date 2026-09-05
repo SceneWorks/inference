@@ -1196,6 +1196,20 @@ impl KleinArtifactInventory {
         }
     }
 
+    /// Artifact family segment of the production calibration identity (sc-22727): the two dense
+    /// tagged artifacts keep their [`Self::calibration_tag`], and the packed SceneWorks turnkeys —
+    /// which have no tag because they are a family of tiers, not one measured snapshot — are named
+    /// by family and take their tier from [`Self::resolved_quant`].
+    pub(crate) fn artifact_tag(&self) -> &'static str {
+        match self.kind {
+            KleinArtifactKind::BaseRehost(_) => "rehost",
+            KleinArtifactKind::KvRehost(_) => "kv-rehost",
+            KleinArtifactKind::CalibratedBase | KleinArtifactKind::TrueV2 => self
+                .calibration_tag()
+                .expect("tagged dense artifacts carry a calibration tag"),
+        }
+    }
+
     pub(crate) fn resolved_quant(&self) -> Option<Quant> {
         match self.kind {
             KleinArtifactKind::BaseRehost(quant) | KleinArtifactKind::KvRehost(quant) => quant,
@@ -1832,6 +1846,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// sc-22727 (epic sc-22723 E1/E4): every admitted turnkey publishes a production calibration
+    /// identity keyed on (provider, artifact family, tier) for the worker's
+    /// `Resident + EagerMaterialization` rung as well as the deferred evidence shape, the six
+    /// (family, tier) cells are pairwise distinct, and none of them is the weights-free registry
+    /// string the production path used to hand out for a tagless turnkey.
+    ///
+    /// Mutation that fails this: restoring `if streamable { .. } else { None }` around the
+    /// identity in `klein_contract_for` / `klein_production_calibration` (every resident cell drops
+    /// to `None`), or the `calibration_tag()`/`KLEIN_STATIC_BEHAVIOR_FINGERPRINT` fallback (every
+    /// turnkey collides with its weights-free string and the tiers collapse onto one identity).
+    #[test]
+    fn turnkey_inventory_publishes_a_per_tier_production_identity_for_every_load_shape() {
+        use mlx_gen::{LoadShape, OffloadPolicy};
+
+        let mut published = std::collections::BTreeSet::new();
+        for (family, provider_id, resolved_route, artifact) in [
+            (
+                TurnkeyFamily::Base,
+                crate::FLUX2_KLEIN_9B_ID,
+                "flux2_klein_9b",
+                "rehost",
+            ),
+            (
+                TurnkeyFamily::Kv,
+                crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                "flux2_klein_9b_kv",
+                "kv-rehost",
+            ),
+        ] {
+            let route = match family {
+                TurnkeyFamily::Base => "t2i",
+                TurnkeyFamily::Kv => "kv-edit",
+            };
+            for (tier, label) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                let fixture = immutable_turnkey_fixture(family, tier);
+                assert_eq!(fixture.inventory.artifact_tag(), artifact);
+                let expected =
+                    format!("flux2-klein-9b-{label}-mlx-shared-ladder-{artifact}-{route}-v1");
+                let weights_free = format!(
+                    "{}-{}",
+                    crate::memory_strategy::KLEIN_STATIC_BEHAVIOR_FINGERPRINT,
+                    provider_id.replace('_', "-")
+                );
+                for (offload_policy, load_shape) in [
+                    (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                    (
+                        OffloadPolicy::Sequential,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()))
+                        .with_resolved_route(resolved_route)
+                        .with_offload_policy(offload_policy)
+                        .with_load_shape(load_shape);
+                    let identity = crate::memory_strategy::klein_production_calibration(
+                        provider_id,
+                        &spec,
+                        &fixture.inventory,
+                    )
+                    .unwrap()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{provider_id} {tier:?} {offload_policy:?} {load_shape:?}: no identity"
+                        )
+                    });
+                    assert_eq!(identity.fingerprint, expected);
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert_ne!(identity.fingerprint, weights_free);
+                    // An overlay on the route has no clean base cell to bind.
+                    let with_adapter = spec.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+                        fixture.root.join("lora.safetensors"),
+                        1.0,
+                        mlx_gen::AdapterKind::Lora,
+                    )]);
+                    assert!(crate::memory_strategy::klein_production_calibration(
+                        provider_id,
+                        &with_adapter,
+                        &fixture.inventory,
+                    )
+                    .unwrap()
+                    .is_none());
+                }
+                published.insert(expected);
+            }
+        }
+        assert_eq!(
+            published.len(),
+            6,
+            "two (family, tier) cells share one identity"
+        );
     }
 
     #[test]

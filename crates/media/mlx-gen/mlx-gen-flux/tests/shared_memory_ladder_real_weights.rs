@@ -607,9 +607,20 @@ fn exact_q4_shared_memory_ladder_arm() {
     )
     .expect("arm contract");
     if arm == Arm::Resident {
-        assert!(
-            contract.calibration.is_none(),
-            "Resident+Eager is the comparison baseline, not a calibrated optimized route"
+        // sc-22726: the resident baseline is the same (dev, q4) artifact and carries the same
+        // identity under its own `EagerMaterialization` load shape; only the optimized arms are
+        // additionally bound to the exact composite runner key below.
+        let identity = contract
+            .calibration
+            .as_ref()
+            .expect("Resident+Eager publishes the (dev, q4) identity");
+        assert_eq!(
+            identity.fingerprint,
+            mlx_gen_flux::memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            identity.load_shape,
+            mlx_gen::LoadShape::EagerMaterialization
         );
     } else {
         mlx_gen_flux::memory_strategy::validate_runner_gate(

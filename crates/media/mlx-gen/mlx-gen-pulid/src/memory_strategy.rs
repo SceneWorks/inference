@@ -47,6 +47,31 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
 /// Source-owned weights-free behavior identity. Version route/fixture semantics here without
 /// restamping the real-weight calibration above.
 const STATIC_CALIBRATION: &str = "pulid-flux-static-registry-behavior-v2";
+
+/// Production calibration identity of the PuLID-FLUX route, keyed on the loaded FLUX.1-dev
+/// backbone tier (sc-22726, epic sc-22723 E1/E4).
+///
+/// The route rides the FLUX.1-dev backbone, so its identity follows the backbone's per-tier
+/// scheme: the measured `2026-08-04` Q4 key [`MEMORY_CALIBRATION_FINGERPRINT`] is returned
+/// unchanged for q4, and every other shipped tier is `pulid-flux-dev-<tier>-mlx-shared-ladder-v1`.
+/// Like the backbone's, it is independent of `OffloadPolicy` and `LoadShape` — the worker's
+/// `character_image` load is `Resident + EagerMaterialization`. `None` only when the backbone
+/// itself has no base cell (a non-bf16 precision, a foreign tier, or an extra overlay beside the
+/// identity stack).
+pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
+    let base = backbone_spec(spec);
+    mlx_gen_flux::memory_strategy::production_calibration_fingerprint(
+        mlx_gen_flux::FLUX1_DEV_ID,
+        &base,
+    )?;
+    let tier = mlx_gen_flux::memory_strategy::calibration_tier_label(&base)?;
+    Some(if tier == "q4" {
+        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("pulid-flux-dev-{tier}-mlx-shared-ladder-v1")
+    })
+}
+
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen_flux::memory_strategy::ATTENTION_CHUNK_SIZE;
 pub const DECODE_TILE_EDGES: &[u32] = mlx_gen_flux::memory_strategy::DECODE_TILE_EDGES;
 pub const DECODE_OVERLAP: u32 = mlx_gen_flux::memory_strategy::DECODE_OVERLAP;
@@ -282,10 +307,9 @@ fn adapt(
             spec.load_shape,
         ))
     } else if exact_calibration && contract.calibration.is_some() {
-        Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
-            spec.load_shape,
-        ))
+        // sc-22726: per-tier and shape-independent, like the backbone identity it replaces.
+        production_calibration_fingerprint(spec)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
     } else {
         None
     };
@@ -1082,6 +1106,91 @@ mod tests {
         assert!(
             drifted.calibration.is_none(),
             "only the calibration identity may be withheld on pinned-hash drift"
+        );
+    }
+
+    /// sc-22726 (epic sc-22723 E1/E4): the loaded route publishes a production calibration
+    /// identity per backbone tier, for the worker's `Resident + EagerMaterialization`
+    /// `character_image` load as well as the deferred evidence shape; the q4 string is the
+    /// retained `2026-08-04` measured key and the weights-free identity never names a production
+    /// cell.
+    ///
+    /// Mutation that fails this: restoring `Some(MemoryCalibrationIdentity::new(
+    /// MEMORY_CALIBRATION_FINGERPRINT, ..))` in `adapt` (q8/bf16 then collide with the q4 key), or
+    /// the backbone's old `Sequential + DeferredMaterialization + exact composite` gate (every
+    /// resident cell and every non-q4 cell drop to `None`).
+    #[test]
+    fn loaded_route_publishes_its_per_tier_identity_for_every_worker_load_shape() {
+        let root_tmp = tempfile::tempdir().unwrap();
+        let root = root_tmp.path().to_path_buf();
+        for (component, bytes) in [("text_encoder", 3_u8), ("transformer", 5), ("vae", 4)] {
+            std::fs::create_dir_all(root.join(component)).unwrap();
+            std::fs::write(
+                root.join(component).join("model.safetensors"),
+                vec![0_u8; usize::from(bytes)],
+            )
+            .unwrap();
+        }
+        let exact = IdentityArtifactInventory {
+            files: Vec::new(),
+            bytes: 4096,
+            exact_calibration: true,
+        };
+        let expected: [(Option<Quant>, &str); 3] = [
+            (Some(Quant::Q4), MEMORY_CALIBRATION_FINGERPRINT),
+            (Some(Quant::Q8), "pulid-flux-dev-q8-mlx-shared-ladder-v1"),
+            (None, "pulid-flux-dev-bf16-mlx-shared-ladder-v1"),
+        ];
+        let mut published = std::collections::BTreeSet::new();
+        for (quant, fingerprint) in expected {
+            for (offload_policy, load_shape) in [
+                (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                (
+                    OffloadPolicy::Sequential,
+                    LoadShape::DeferredMaterialization,
+                ),
+            ] {
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_offload_policy(offload_policy)
+                    .with_load_shape(load_shape);
+                if let Some(quant) = quant {
+                    spec = spec.with_quant(quant);
+                }
+                spec.identity = Some(IdentityWeights {
+                    encoder: Some(WeightsSource::File("/encoder".into())),
+                    eva: Some(WeightsSource::File("/eva".into())),
+                    face_dir: Some(WeightsSource::Dir("/face".into())),
+                });
+                assert_eq!(
+                    production_calibration_fingerprint(&spec).as_deref(),
+                    Some(fingerprint),
+                    "{quant:?} {offload_policy:?} {load_shape:?}"
+                );
+                let contract = contract_with_inventory(&spec, &exact).unwrap();
+                let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                    panic!("{quant:?} {offload_policy:?} {load_shape:?}: no identity")
+                });
+                assert_eq!(identity.fingerprint, fingerprint);
+                assert_eq!(identity.load_shape, load_shape);
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{:?}",
+                    contract.conformance_errors()
+                );
+                let fixture = weights_free_contract(&spec).unwrap();
+                assert_ne!(fixture.calibration.unwrap().fingerprint, fingerprint);
+            }
+            published.insert(fingerprint);
+        }
+        assert_eq!(
+            published.len(),
+            expected.len(),
+            "two tiers share one identity"
+        );
+        assert!(!published.contains(STATIC_CALIBRATION));
+        assert_eq!(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1"
         );
     }
 }
