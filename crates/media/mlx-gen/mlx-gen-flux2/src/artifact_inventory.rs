@@ -1188,11 +1188,28 @@ impl KleinArtifactInventory {
         self.root.join("transformer")
     }
 
+    /// Measured-snapshot tag of the two dense tagged artifacts; `None` for the packed SceneWorks
+    /// turnkeys, which are a family of tiers rather than one measured snapshot. The production
+    /// identity is keyed on [`Self::artifact_tag`] for every kind (sc-22727).
+    #[cfg(test)]
     pub(crate) fn calibration_tag(&self) -> Option<&'static str> {
         match self.kind {
-            KleinArtifactKind::CalibratedBase => Some("base"),
-            KleinArtifactKind::TrueV2 => Some("true-two"),
+            KleinArtifactKind::CalibratedBase | KleinArtifactKind::TrueV2 => {
+                Some(self.artifact_tag())
+            }
             KleinArtifactKind::BaseRehost(_) | KleinArtifactKind::KvRehost(_) => None,
+        }
+    }
+
+    /// Artifact family segment of the production calibration identity (sc-22727): the two dense
+    /// tagged artifacts are named by their [`Self::calibration_tag`], and the packed SceneWorks
+    /// turnkeys by family, taking their tier from [`Self::resolved_quant`].
+    pub(crate) fn artifact_tag(&self) -> &'static str {
+        match self.kind {
+            KleinArtifactKind::CalibratedBase => "base",
+            KleinArtifactKind::TrueV2 => "true-two",
+            KleinArtifactKind::BaseRehost(_) => "rehost",
+            KleinArtifactKind::KvRehost(_) => "kv-rehost",
         }
     }
 
@@ -1810,10 +1827,16 @@ mod tests {
                 assert_eq!(fixture.inventory.resolved_quant(), tier);
                 assert!(crate::memory_strategy::klein_streamable(&spec));
                 // The bounded sealed inventory above owns source/identity admission. Exercise the
-                // same production contract builder without resealing the fixture a second time.
-                let contract =
-                    crate::memory_strategy::weights_free_klein_contract(provider_id, &spec)
-                        .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
+                // production contract builder proper with it — everything `klein_contract_for`
+                // does after artifact verification and footprint pricing — without resealing the
+                // fixture or pricing a Qwen tower the bounded fixture does not carry.
+                let contract = crate::memory_strategy::klein_contract_from_parts(
+                    provider_id,
+                    &spec,
+                    Some(&fixture.inventory),
+                    Default::default(),
+                )
+                .unwrap_or_else(|error| panic!("{provider_id} {tier:?}: {error}"));
                 assert_eq!(
                     contract
                         .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1824,14 +1847,164 @@ mod tests {
                 assert!(contract.conformance_errors().is_empty());
                 assert_eq!(
                     contract.calibration.as_ref().unwrap().fingerprint,
-                    format!(
-                        "{}-{}",
-                        crate::memory_strategy::KLEIN_STATIC_BEHAVIOR_FINGERPRINT,
-                        provider_id.replace('_', "-")
+                    crate::memory_strategy::klein_production_calibration_fingerprint(
+                        provider_id,
+                        fixture.inventory.artifact_tag(),
+                        tier,
                     )
+                    .unwrap()
                 );
+                // Without an admitted inventory the same spec reaches neither rung 4 nor an
+                // identity.
+                let unadmitted = crate::memory_strategy::klein_contract_from_parts(
+                    provider_id,
+                    &spec,
+                    None,
+                    Default::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    unadmitted
+                        .capability(MemoryStrategy::BoundedTransformerResidency)
+                        .unwrap()
+                        .support,
+                    MemoryStrategySupport::Missing
+                );
+                assert!(unadmitted.calibration.is_none());
             }
         }
+    }
+
+    /// sc-22727 (epic sc-22723 E1/E4): every admitted turnkey publishes a production calibration
+    /// identity keyed on (provider, artifact family, tier) for the worker's
+    /// `Resident + EagerMaterialization` rung as well as the deferred evidence shape, the six
+    /// (family, tier) cells are pairwise distinct, and none of them is the weights-free registry
+    /// string the production path used to hand out for a tagless turnkey.
+    ///
+    /// Mutation that fails this: restoring `if streamable { .. } else { None }` around the
+    /// identity in `klein_contract_from_parts` (every resident cell drops to `None`), or the
+    /// `calibration_tag()`/`KLEIN_STATIC_BEHAVIOR_FINGERPRINT` fallback (every turnkey collides
+    /// with its weights-free string and the tiers collapse onto one identity), or restoring
+    /// `spec.quantize.or(inventory.resolved_quant())` in `klein_production_calibration` (a
+    /// request knob that disagrees with the artifact publishes the requested tier's cell).
+    #[test]
+    fn turnkey_inventory_publishes_a_per_tier_production_identity_for_every_load_shape() {
+        use mlx_gen::{LoadShape, OffloadPolicy};
+
+        let mut published = std::collections::BTreeSet::new();
+        for (family, provider_id, resolved_route, artifact) in [
+            (
+                TurnkeyFamily::Base,
+                crate::FLUX2_KLEIN_9B_ID,
+                "flux2_klein_9b",
+                "rehost",
+            ),
+            (
+                TurnkeyFamily::Kv,
+                crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+                "flux2_klein_9b_kv",
+                "kv-rehost",
+            ),
+        ] {
+            let route = match family {
+                TurnkeyFamily::Base => "t2i",
+                TurnkeyFamily::Kv => "kv-edit",
+            };
+            for (tier, label) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                let fixture = immutable_turnkey_fixture(family, tier);
+                assert_eq!(fixture.inventory.artifact_tag(), artifact);
+                let expected =
+                    format!("flux2-klein-9b-{label}-mlx-shared-ladder-{artifact}-{route}-v1");
+                let weights_free = format!(
+                    "{}-{}",
+                    crate::memory_strategy::KLEIN_STATIC_BEHAVIOR_FINGERPRINT,
+                    provider_id.replace('_', "-")
+                );
+                for (offload_policy, load_shape) in [
+                    (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                    (
+                        OffloadPolicy::Sequential,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()))
+                        .with_resolved_route(resolved_route)
+                        .with_offload_policy(offload_policy)
+                        .with_load_shape(load_shape);
+                    let label = format!("{provider_id} {tier:?} {offload_policy:?} {load_shape:?}");
+                    // The production contract builder, fed the sealed fixture inventory exactly as
+                    // `klein_contract_for` feeds it the verified one (and a declaration-only
+                    // footprint, since the bounded fixture carries no priceable Qwen tower).
+                    let contract = crate::memory_strategy::klein_contract_from_parts(
+                        provider_id,
+                        &spec,
+                        Some(&fixture.inventory),
+                        Default::default(),
+                    )
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{label}: no identity"));
+                    assert_eq!(identity.fingerprint, expected, "{label}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert_eq!(contract.load_shape, load_shape);
+                    assert_ne!(identity.fingerprint, weights_free);
+                    assert!(
+                        contract.conformance_errors().is_empty(),
+                        "{label}: {:?}",
+                        contract.conformance_errors()
+                    );
+                    // An overlay on the route has no clean base cell to bind.
+                    let with_adapter = spec.clone().with_adapters(vec![mlx_gen::AdapterSpec::new(
+                        fixture.root.join("lora.safetensors"),
+                        1.0,
+                        mlx_gen::AdapterKind::Lora,
+                    )]);
+                    assert!(crate::memory_strategy::klein_production_calibration(
+                        provider_id,
+                        &with_adapter,
+                        &fixture.inventory,
+                    )
+                    .unwrap()
+                    .is_none());
+                    // The request knob never outranks the admitted artifact: `LoadSpec::quantize`
+                    // set against the fixture's tier publishes nothing, and set equal to it
+                    // publishes the artifact's own cell.
+                    for requested in [Quant::Q4, Quant::Q8] {
+                        let knob = spec.clone().with_quant(requested);
+                        let identity = crate::memory_strategy::klein_production_calibration(
+                            provider_id,
+                            &knob,
+                            &fixture.inventory,
+                        )
+                        .unwrap();
+                        if Some(requested) == tier {
+                            assert_eq!(
+                                identity.map(|identity| identity.fingerprint).as_deref(),
+                                Some(expected.as_str()),
+                                "{label} requested {requested:?}"
+                            );
+                        } else {
+                            assert!(
+                                identity.is_none(),
+                                "{label} requested {requested:?} published {identity:?}"
+                            );
+                        }
+                    }
+                }
+                published.insert(expected);
+            }
+        }
+        assert_eq!(
+            published.len(),
+            6,
+            "two (family, tier) cells share one identity"
+        );
     }
 
     #[test]
