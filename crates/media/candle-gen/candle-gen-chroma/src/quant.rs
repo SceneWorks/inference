@@ -119,6 +119,23 @@ mod tests {
     use candle_gen::testkit::{q4_packed, tensor_cosine};
     use std::collections::HashMap;
 
+    /// A deterministic stand-in for `Tensor::randn`: `rows x cols` values in `[-1, 1)` from a fixed
+    /// LCG seeded by `seed`. The device RNG is unseeded, so a `randn` input here made the
+    /// `cos > 0.99999` bounds below a per-run coin flip (the CPU-lane flake on PR #946); the same
+    /// bounds over a fixed input are a property of the loader, not of the draw.
+    fn lcg_input(rows: usize, cols: usize, seed: u64, dev: &Device) -> Result<Tensor> {
+        let mut state = seed;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect();
+        Tensor::from_vec(values, (rows, cols), dev)
+    }
+
     /// **Packed-detect fires on the Chroma DiT key layout (incl. the `attn.to_out.0` nesting and a
     /// biased projection).** Writes a safetensors mimicking the real Chroma packed layout — a
     /// `to_out.0` triple *with* a dense `.bias` (the key remap that would silently fall back to dense if
@@ -147,7 +164,7 @@ mod tests {
         // A dense sibling (`to_q`) with no `.scales` → the dense path must stay unchanged.
         map.insert(
             "attn.to_q.weight".into(),
-            Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
+            lcg_input(out_dim, in_dim, 0x5c94_0901, &dev)?,
         );
         map.insert(
             "attn.to_q.bias".into(),
@@ -178,7 +195,7 @@ mod tests {
             in_dim,
             out_dim,
         );
-        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let x = lcg_input(4, in_dim, 0x5c94_0902, &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
 
@@ -244,7 +261,7 @@ mod tests {
             in_dim,
             out_dim,
         );
-        let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
+        let x = lcg_input(3, in_dim, 0x5c94_0903, &dev)?;
         let cos = tensor_cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
 

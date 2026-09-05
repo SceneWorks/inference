@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryWindowMaterialization, Precision, Quant, WeightsSource,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
@@ -966,14 +966,46 @@ pub(crate) fn contract_from_receipt(
             residency: MemoryComponentResidency::WholeRender,
         });
     }
+    let calibration = production_calibration_fingerprint(provider_id, receipt.tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     build_contract(
         provider_id,
         spec,
         receipt.tier,
+        calibration,
         receipt.components,
         overlays,
     )
 }
+
+/// Production calibration identity table of the Candle Chroma routes, keyed on
+/// **(provider, tier)** — sc-22731, epic sc-22723 E1/E4.
+///
+/// `tier` is the LOAD RECEIPT's, never a request knob: `ChromaLoadReceipt::capture` reads the path
+/// tier and cross-checks it against the transformer's own packed marker, refusing the crossing by
+/// name, so a string published here always names the artifact that was actually opened. That is why
+/// this takes the tier rather than the `LoadSpec` — there is no way to call it with an unproven one.
+///
+/// `None` only for an id no route serves. The three routes are separate receipt/evidence domains
+/// (SC-20788), so they take three separate identities, and each tier takes its own.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    let route = route_identity(provider_id).ok()?.provider.replace('_', "-");
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(_) => return None,
+    };
+    Some(format!("{route}-{tier}-cuda-{CANDLE_LADDER_REVISION}"))
+}
+
+/// The shape of the Candle Chroma ladder every identity above names: the request-scoped
+/// Resident/Staged surface SC-20788 sealed. Bump it when that shape changes, which is what makes
+/// every Chroma anchor recaptured rather than silently re-bound.
+const CANDLE_LADDER_REVISION: &str = "request-scoped-staged-residency-v1";
 
 #[cfg(test)]
 pub(crate) fn uncalibrated_contract(
@@ -985,6 +1017,7 @@ pub(crate) fn uncalibrated_contract(
         provider_id,
         spec,
         physical_tier_hint(spec),
+        None,
         Default::default(),
         Vec::new(),
     ))
@@ -1012,6 +1045,8 @@ pub(crate) fn weights_free_contract(
         provider_id,
         &normalized,
         tier,
+        // No artifact, so no proven tier: a weights-free declaration stays unmeasured (sc-22731).
+        None,
         Default::default(),
         Vec::new(),
     ))
@@ -1058,6 +1093,8 @@ pub(crate) fn weights_free_surface_contract(
         provider_id,
         &spec,
         tier,
+        // Same: the finite surface describes a tier, it does not open one (sc-22731).
+        None,
         Default::default(),
         Vec::new(),
     ))
@@ -1120,6 +1157,7 @@ fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
     _tier: Option<Quant>,
+    calibration: Option<MemoryCalibrationIdentity>,
     components: gen_core::PerComponentBytes,
     overlays: Vec<MemoryResidentComponent>,
 ) -> MemoryProviderContract {
@@ -1190,9 +1228,19 @@ fn build_contract(
                 resident_components: overlays.clone(),
             }
         },
-        // Chroma has no promoted measured curve. These bounds are structural estimates, so an
-        // invented calibration identity must never upgrade selector authority to Calibrated.
-        calibration: None,
+        // sc-22731 (epic sc-22723 E1/E4). This used to be an unconditional `None`, on the reasoning
+        // that "Chroma has no promoted measured curve, so an invented calibration identity must
+        // never upgrade selector authority to Calibrated". The reasoning conflated two things: an
+        // identity is the KEY evidence is filed under, not a claim that evidence exists. With `None`
+        // the anchor capture had nothing to record against and the lane could never BECOME measured
+        // — the false negative the epic exists to close.
+        //
+        // What keeps the original guarantee is the caller: only [`contract_from_receipt`], whose
+        // tier is the load receipt's — the path tier cross-checked against the transformer's own
+        // packed marker — passes an identity. The weights-free and finite-surface contracts still
+        // pass `None`, so the generated structural declarations remain exactly as unmeasured as they
+        // were, and `Calibrated` authority still requires a matching anchor to exist.
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -1751,8 +1799,18 @@ fn estimated_behavior_context(
     Ok(MemoryRunContext {
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
-        calibration_abi: 0,
-        calibration_fingerprint: String::new(),
+        // sc-22731: the handshake half is the contract's OWN identity, whatever it is — the empty
+        // pair for a weights-free declaration that publishes none, and the production
+        // (provider, tier) string for a load that does. It was hard-coded to the empty pair while
+        // the production contract could never publish, which stopped being true here.
+        calibration_abi: contract
+            .calibration
+            .as_ref()
+            .map_or(0, |identity| identity.abi),
+        calibration_fingerprint: contract
+            .calibration
+            .as_ref()
+            .map_or_else(String::new, |identity| identity.fingerprint.clone()),
         load_shape: contract.load_shape,
         mode: route.mode,
         has_reference: route.reference_count > 0,
@@ -1978,6 +2036,70 @@ mod tests {
         }
     }
 
+    /// sc-22731 (epic sc-22723 E1/E4): every one of the nine shipped Candle Chroma cells (three
+    /// routes x three tiers) publishes its OWN production calibration identity through the
+    /// production contract builder, and the weights-free and finite-surface declarations still
+    /// publish none.
+    ///
+    /// Before sc-22731 `build_contract` hard-coded `calibration: None`, so no Chroma anchor could
+    /// be recorded on this lane at all — the lane could never become measured. The identity is a
+    /// KEY, not a claim of measurement: whether a cell HAS evidence is the anchor store's answer,
+    /// which is why the unmeasured weights-free declarations are unchanged.
+    ///
+    /// Mutation that fails this: restoring the unconditional `calibration: None` in
+    /// `build_contract` — all nine cells lose their identity; or passing the identity through in
+    /// `weights_free_contract` too — the declarations stop being unmeasured.
+    #[test]
+    fn every_shipped_candle_chroma_cell_publishes_its_own_identity_from_its_load_receipt() {
+        let mut published = std::collections::BTreeSet::new();
+        for route in ROUTES {
+            for (tier, expected_quant) in [
+                ("q4", Some(Quant::Q4)),
+                ("q8", Some(Quant::Q8)),
+                ("bf16", None),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = fixture_root(tmp.path(), *route, tier);
+                let load = spec(root, route.provider);
+                let label = format!("{} {tier}", route.provider);
+                let contract = provider_contract(route.provider, &load).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: no production identity"));
+                assert_eq!(identity.load_shape, contract.load_shape, "{label}");
+                assert_eq!(
+                    Some(identity.fingerprint.clone()),
+                    production_calibration_fingerprint(route.provider, expected_quant),
+                    "{label}"
+                );
+                assert!(
+                    identity.fingerprint.contains(tier),
+                    "{label}: names its tier"
+                );
+                // The declarations the capability dumps are generated from stay unmeasured.
+                assert!(
+                    weights_free_contract(route.provider, &load)
+                        .unwrap()
+                        .calibration
+                        .is_none(),
+                    "{label}: the weights-free declaration must publish no identity"
+                );
+                published.insert(identity.fingerprint.clone());
+            }
+        }
+        assert_eq!(
+            published.len(),
+            ROUTES.len() * 3,
+            "two (provider, tier) cells share one identity: {published:?}"
+        );
+        // An id no route serves, and a tier this family does not ship, have no cell at all.
+        assert!(production_calibration_fingerprint("chroma1_unknown", None).is_none());
+        assert!(
+            production_calibration_fingerprint(crate::CHROMA1_HD_ID, Some(Quant::Nvfp4)).is_none()
+        );
+    }
+
     #[test]
     fn path_route_revision_and_tensor_tier_crossing_fail_closed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2192,8 +2314,16 @@ mod tests {
                 },
             },
             optimization_authority: gen_core::MemoryOptimizationAuthority::Estimated,
-            calibration_abi: 0,
-            calibration_fingerprint: String::new(),
+            // sc-22731: the contract's own identity, so this helper follows the production contract
+            // whether or not it publishes one.
+            calibration_abi: contract
+                .calibration
+                .as_ref()
+                .map_or(0, |identity| identity.abi),
+            calibration_fingerprint: contract
+                .calibration
+                .as_ref()
+                .map_or_else(String::new, |identity| identity.fingerprint.clone()),
             load_shape: contract.load_shape,
             geometry: gen_core::MemoryGeometry {
                 width: 1024,
