@@ -1071,8 +1071,9 @@ fn surface_selector_matches_spec(
 
 /// Resolve the finite catalog surface from the already-selected artifact tier.
 ///
-/// Packed Klein turnkeys reach production with `LoadSpec::quantize == None` because only the DiT is
-/// packed and the Qwen3 tower deliberately stays dense. The generic witness keeps Q4/Q8 in the
+/// Packed Klein turnkeys reach production with `LoadSpec::quantize == None`: the tier is the
+/// artifact's own (a packed DiT, and a Qwen3 tower admitted exactly as stored — dense in the
+/// shipped q4/q8 tiers, sc-22727), never a load-time request. The generic witness keeps Q4/Q8 in the
 /// synthetic `LoadSpec` solely to make the selector self-checking; this resolver consumes the typed
 /// selector and never reinterprets it as load-time quantization.
 pub(crate) fn weights_free_klein_surface_contract(

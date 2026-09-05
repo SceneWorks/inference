@@ -32,10 +32,9 @@ fn selected_encoder_discovery_roots(
             ))
         })?,
     };
-    let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
+    // A Hugging Face cache snapshot symlinks every file into the repository's sibling `blobs/`
+    // tree, so the shared helper authorizes that repository directory too (sc-22727).
+    Ok(gen_core::hf_cache_discovery_roots(root)?)
 }
 
 /// Full output edge used by the bounded-decode hook at the representative 1024px calibration cell.

@@ -463,6 +463,13 @@ impl ValidatedEncoderSource {
         self.config_path.is_some()
     }
 
+    /// The packed Q4/Q8 tier this exact validated source stores, or `None` for a dense source.
+    /// A source admitted through [`EncoderContract::source_for_load_with_stale_packed_marker`]
+    /// reports `None`: its verified stale marker carries no packed evidence.
+    pub fn packed_quant_bits(&self) -> Option<i32> {
+        self.packed_quant_bits
+    }
+
     /// Derive the load-time conversion from the quantization evidence retained by this exact
     /// validated source. This prevents a swap/restore between a second metadata read and payload
     /// load from selecting the conversion for different bytes.
@@ -853,10 +860,15 @@ fn collect_unique_encoder_headers(
     Ok(headers.into_values().collect())
 }
 
+/// One affine packed-quantization marker as a selected encoder's `config.json` declares it
+/// (`quantization: {bits, group_size}`).
+///
+/// Public so a provider that pins an exact artifact can name the marker it expects on that
+/// artifact — see [`EncoderContract::source_for_load_with_stale_packed_marker`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PackedQuantization {
-    bits: usize,
-    group_size: usize,
+pub struct PackedQuantization {
+    pub bits: usize,
+    pub group_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -869,9 +881,29 @@ enum EncoderDtypePolicy {
 enum EncoderConfigPolicy {
     /// Ordinary alternates must supply their own behavior-bearing config.
     Required,
+    /// [`Self::Required`], and the config is known to carry exactly this packed marker over dense
+    /// shards (a pinned artifact's publishing defect, sc-22727). The marker is verified and then
+    /// disregarded for tier evidence; see [`EncoderContract::source_for_load_with_stale_packed_marker`].
+    RequiredWithStalePackedMarker(PackedQuantization),
     /// Legacy ComfyUI exports contain only tensors. Their consuming route freezes the provider's
     /// config/tokenizer policy, so a present sibling config is checked but its absence is allowed.
     ProviderOwnedComfyUi,
+}
+
+impl EncoderConfigPolicy {
+    fn requires_config(self) -> bool {
+        matches!(
+            self,
+            Self::Required | Self::RequiredWithStalePackedMarker(_)
+        )
+    }
+
+    fn stale_packed_marker(self) -> Option<PackedQuantization> {
+        match self {
+            Self::RequiredWithStalePackedMarker(stale) => Some(stale),
+            Self::Required | Self::ProviderOwnedComfyUi => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1326,6 +1358,43 @@ impl EncoderContract {
         Ok(validated)
     }
 
+    /// [`Self::source_for_load`] for a bundled component whose pinned artifact carries a *stale*
+    /// packed marker: its `config.json` declares `quantization: {bits, group_size}` while every
+    /// direct shard is dense.
+    ///
+    /// Ordinary validation refuses that contradiction (`validate_quantization_evidence`), and
+    /// this method keeps refusing everything except the one shape the caller names: the config
+    /// must declare exactly `stale`, and the shard surface must be dense. The source is then
+    /// admitted as dense (`packed_quant_bits() == None`), so a provider whose policy is "as
+    /// stored" loads it dense and one whose policy is packed folds it at load time. A
+    /// [`crate::LoadSpec::text_encoder`] override is never eligible: the stale marker is a fact
+    /// about one pinned bundled artifact, not a policy a user-selected alternate may claim.
+    pub fn source_for_load_with_stale_packed_marker(
+        &self,
+        spec: &crate::LoadSpec,
+        base_root: &Path,
+        stale: PackedQuantization,
+    ) -> Result<ValidatedEncoderSource> {
+        if spec.text_encoder.is_some() {
+            return Err(Error::Unsupported(
+                "a stale packed-marker allowance applies only to the bundled text encoder, not to a selected alternate"
+                    .into(),
+            ));
+        }
+        spec.validate_prepared_file_pins()?;
+        let source = WeightsSource::Dir(base_root.join("text_encoder"));
+        let mut validated = self.validate_source_with_policy(
+            &source,
+            EncoderDtypePolicy::Native,
+            EncoderConfigPolicy::RequiredWithStalePackedMarker(stale),
+            None,
+        )?;
+        validated.tokenizer = Some(self.bind_tokenizer(base_root, &source)?);
+        validated.ensure_unchanged()?;
+        spec.validate_prepared_file_pins()?;
+        Ok(validated)
+    }
+
     /// Validate one catalog/discovery candidate without acquiring a reusable source receipt.
     ///
     /// This path is intentionally limited to direct-file inventory, bounded behavior config, and
@@ -1345,6 +1414,23 @@ impl EncoderContract {
             allowed_roots,
             EncoderDtypePolicy::Native,
             EncoderConfigPolicy::Required,
+        )
+    }
+
+    /// Bounded discovery counterpart to [`Self::source_for_load_with_stale_packed_marker`]: the
+    /// same confinement and header inspection as [`Self::validate_source_for_discovery`], with the
+    /// config's packed marker required to equal `stale` and the shard surface required to be dense.
+    pub fn validate_source_for_discovery_with_stale_packed_marker(
+        &self,
+        source: &WeightsSource,
+        allowed_roots: &[PathBuf],
+        stale: PackedQuantization,
+    ) -> Result<EncoderDiscoveryFacts> {
+        self.validate_source_for_discovery_with_policy(
+            source,
+            allowed_roots,
+            EncoderDtypePolicy::Native,
+            EncoderConfigPolicy::RequiredWithStalePackedMarker(stale),
         )
     }
 
@@ -1380,7 +1466,7 @@ impl EncoderContract {
         let inspected = inspect_encoder_source_for_discovery(
             source,
             allowed_roots,
-            config_policy == EncoderConfigPolicy::Required,
+            config_policy.requires_config(),
             true,
         )?;
         let packed_quant = self.validate_inspected_source(
@@ -1593,13 +1679,33 @@ impl EncoderContract {
         let declared_quant = if let Some((config_path, config)) = config {
             self.validate_config(config, config_path)?;
             parse_packed_quantization(config, config_path)?
-        } else if config_policy == EncoderConfigPolicy::Required {
+        } else if config_policy.requires_config() {
             return Err(Error::Msg(format!(
                 "text encoder substitution has no config.json (source {}); exact behavior, tokenizer, head-topology, and precision compatibility cannot be proven from tensor shapes alone",
                 source_path(requested_source).display()
             )));
         } else {
             None
+        };
+        // A caller naming a stale marker asserts exactly one contradiction — this marker over a
+        // dense surface — and gets dense admission for it. Any other marker (absent, or a different
+        // tier) is a different artifact than the one it pinned, and packed evidence under the marker
+        // means the marker is not stale at all; both fall through to the ordinary mismatch refusals.
+        let declared_quant = match (config_policy.stale_packed_marker(), declared_quant) {
+            (None, declared) => declared,
+            (Some(stale), Some(declared)) if declared == stale => None,
+            (Some(stale), declared) => {
+                return Err(Error::Unsupported(format!(
+                    "text encoder stale packed marker at {}: expected config.json to declare Q{} group_size {}, found {}",
+                    source_path(weights).display(),
+                    stale.bits,
+                    stale.group_size,
+                    declared.map_or_else(
+                        || "no quantization marker".to_owned(),
+                        |declared| format!("Q{} group_size {}", declared.bits, declared.group_size)
+                    ),
+                )));
+            }
         };
 
         let language_headers = language_quantization_evidence_headers(headers);
@@ -1677,7 +1783,7 @@ impl EncoderContract {
                 file.display()
             ))
             })?;
-        if config_policy == EncoderConfigPolicy::Required && !config_path.is_file() {
+        if config_policy.requires_config() && !config_path.is_file() {
             return Err(Error::Unsupported(format!(
                 "embedded text encoder {} requires sibling config.json; tensor headers cannot prove behavior, tokenizer, or head topology",
                 file.display()
@@ -3478,6 +3584,47 @@ fn ensure_discovery_paths_lexically_confined(
         }
     }
     Ok(())
+}
+
+/// The authorized discovery roots for an encoder source living at `path`.
+///
+/// Every root set carries the path itself, lexically absolute and canonical. When `path` lies
+/// inside a Hugging Face cache snapshot — `<hub>/models--<org>--<repo>/snapshots/<revision>/…` —
+/// the repository directory is authorized as well, because a snapshot's files are symlinks into the
+/// sibling `blobs/` tree: the canonical target of `<snapshot>/text_encoder/model-00001.safetensors`
+/// is `<hub>/models--<org>--<repo>/blobs/<sha256>`, which the snapshot directory alone can never
+/// contain. Nothing above the repository directory is authorized, so a symlink escaping it (another
+/// repository, another volume, an arbitrary file) still fails `ensure_discovery_paths_confined`.
+/// The repository directory must lie strictly above the snapshot revision on `path`; a directory
+/// merely *named* `snapshots` elsewhere on the path does not widen the roots.
+pub fn hf_cache_discovery_roots(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let absolute = std::path::absolute(path)?;
+    let mut roots = vec![absolute.clone(), std::fs::canonicalize(&absolute)?];
+    if let Some(repository) = hf_cache_repository_dir(&absolute) {
+        roots.push(repository.to_path_buf());
+        roots.push(std::fs::canonicalize(repository)?);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// `<hub>/models--<org>--<repo>` for an absolute path strictly below that repository's
+/// `snapshots/<revision>` directory, else `None`.
+fn hf_cache_repository_dir(absolute: &Path) -> Option<&Path> {
+    absolute.ancestors().skip(1).find_map(|ancestor| {
+        let snapshots = ancestor.parent()?;
+        let repository = snapshots.parent()?;
+        let is_snapshot_revision = snapshots
+            .file_name()
+            .is_some_and(|name| name == "snapshots")
+            && repository
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("models--"))
+            && ancestor.file_name().is_some();
+        is_snapshot_revision.then_some(repository)
+    })
 }
 
 fn ensure_discovery_paths_confined(paths: &[PathBuf], allowed_roots: &[PathBuf]) -> Result<()> {
@@ -5321,6 +5468,199 @@ mod tests {
             .to_string();
         assert!(error.contains("config declares Q4"), "{error}");
         assert!(error.contains("direct-shard surface is dense"), "{error}");
+    }
+
+    /// sc-22727: a pinned bundled artifact whose `config.json` carries a stale packed marker over
+    /// dense shards is admitted only when the caller names exactly that marker, and only as dense.
+    /// Every other combination keeps the ordinary refusals: a different marker, no marker, packed
+    /// evidence under the marker, or a user-selected alternate claiming the allowance.
+    #[test]
+    fn stale_packed_marker_allowance_admits_exactly_the_named_contradiction_as_dense() {
+        let stale = PackedQuantization {
+            bits: 4,
+            group_size: 64,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let component = base.join("text_encoder");
+        std::fs::create_dir_all(&base).unwrap();
+        write_tokenizer_fixture(&base);
+        write_fixture(&component, 8);
+        rewrite_config_quantization(&component, 4);
+        let spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
+
+        // The ordinary paths still refuse the contradiction.
+        assert!(CONTRACT.source_for_load(&spec, &base).is_err());
+        assert!(CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(component.clone()),
+                &authorized_test_roots(&base)
+            )
+            .is_err());
+
+        let validated = CONTRACT
+            .source_for_load_with_stale_packed_marker(&spec, &base, stale)
+            .unwrap();
+        assert_eq!(validated.packed_quant_bits(), None);
+        assert_eq!(
+            validated.load_time_quant_bits(None, "fixture").unwrap(),
+            None
+        );
+        assert_eq!(
+            validated.load_time_quant_bits(Some(4), "fixture").unwrap(),
+            Some(4)
+        );
+        let facts = CONTRACT
+            .validate_source_for_discovery_with_stale_packed_marker(
+                &WeightsSource::Dir(component.clone()),
+                &authorized_test_roots(&base),
+                stale,
+            )
+            .unwrap();
+        assert!(!facts.materialized_language_tensor_headers().is_empty());
+
+        // A different marker than the one named is a different artifact.
+        let other = PackedQuantization {
+            bits: 8,
+            group_size: 64,
+        };
+        let error = CONTRACT
+            .source_for_load_with_stale_packed_marker(&spec, &base, other)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale packed marker"), "{error}");
+        assert!(
+            error.contains("expected config.json to declare Q8"),
+            "{error}"
+        );
+        assert!(CONTRACT
+            .validate_source_for_discovery_with_stale_packed_marker(
+                &WeightsSource::Dir(component.clone()),
+                &authorized_test_roots(&base),
+                other,
+            )
+            .is_err());
+
+        // A user-selected alternate can never claim the allowance.
+        let mut selected = spec.clone();
+        selected.text_encoder = Some(WeightsSource::Dir(component.clone()));
+        let error = CONTRACT
+            .source_for_load_with_stale_packed_marker(&selected, &base, stale)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bundled text encoder"), "{error}");
+
+        // No marker at all: the named contradiction is absent, so the pin does not match.
+        let clean = temp.path().join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        write_tokenizer_fixture(&clean);
+        write_fixture(&clean.join("text_encoder"), 8);
+        let error = CONTRACT
+            .source_for_load_with_stale_packed_marker(
+                &crate::LoadSpec::new(WeightsSource::Dir(clean.clone())),
+                &clean,
+                stale,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("found no quantization marker"), "{error}");
+
+        // Packed evidence under the marker means the marker is not stale: refused as before.
+        let packed = temp.path().join("packed");
+        std::fs::create_dir_all(&packed).unwrap();
+        write_tokenizer_fixture(&packed);
+        write_packed_fixture(&packed.join("text_encoder"), 8, true);
+        let error = PACKED_CONTRACT
+            .source_for_load_with_stale_packed_marker(
+                &crate::LoadSpec::new(WeightsSource::Dir(packed.clone())),
+                &packed,
+                stale,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("packed tensor evidence requires authoritative config.json"),
+            "{error}"
+        );
+    }
+
+    /// sc-22727: a Hugging Face cache snapshot's files are symlinks into the repository's sibling
+    /// `blobs/` tree, so the snapshot directory alone can never confine their canonical targets.
+    /// [`hf_cache_discovery_roots`] authorizes the `models--<org>--<repo>` directory for a path
+    /// below its `snapshots/<revision>`, and nothing above it.
+    #[cfg(unix)]
+    #[test]
+    fn hf_cache_discovery_roots_authorize_the_repository_blobs_and_nothing_above() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hub = temp.path().join("hub");
+        let repository = hub.join("models--org--repo");
+        let blobs = repository.join("blobs");
+        let snapshot = repository.join("snapshots/0123456789abcdef");
+        let component = snapshot.join("q4/text_encoder");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&component).unwrap();
+        let staged = temp.path().join("staged");
+        write_fixture(&staged, 8);
+        for (name, blob) in [("config.json", "aaaa"), ("model.safetensors", "bbbb")] {
+            std::fs::copy(staged.join(name), blobs.join(blob)).unwrap();
+            symlink(
+                Path::new("../../../../blobs").join(blob),
+                component.join(name),
+            )
+            .unwrap();
+        }
+
+        let roots = hf_cache_discovery_roots(&component).unwrap();
+        assert!(roots.contains(&std::path::absolute(&component).unwrap()));
+        assert!(roots.contains(&std::path::absolute(&repository).unwrap()));
+        assert!(!roots.contains(&hub));
+        // The snapshot-only roots the old callers computed still refuse the blobs target …
+        let error = CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(component.clone()),
+                &authorized_test_roots(&component),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+        // … and the repository-aware roots admit it.
+        CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(component.clone()), &roots)
+            .unwrap();
+
+        // A symlink escaping the repository directory stays refused under the wider roots.
+        let outside = temp.path().join("outside");
+        write_fixture(&outside, 8);
+        std::fs::remove_file(component.join("model.safetensors")).unwrap();
+        symlink(
+            outside.join("model.safetensors"),
+            component.join("model.safetensors"),
+        )
+        .unwrap();
+        let error = CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(component.clone()), &roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical target"), "{error}");
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+
+        // Outside a cache snapshot the roots are just the path itself.
+        let plain = hf_cache_discovery_roots(&staged).unwrap();
+        assert_eq!(plain, authorized_test_roots(&staged));
+        // A directory merely named `snapshots` above the path does not widen the roots either.
+        let decoy = temp.path().join("models--x--y/snapshots");
+        std::fs::create_dir_all(&decoy).unwrap();
+        assert_eq!(
+            hf_cache_discovery_roots(&decoy).unwrap(),
+            authorized_test_roots(&decoy)
+        );
+        let bare_repository = temp.path().join("models--x--y");
+        assert_eq!(
+            hf_cache_discovery_roots(&bare_repository).unwrap(),
+            authorized_test_roots(&bare_repository)
+        );
     }
 
     #[test]

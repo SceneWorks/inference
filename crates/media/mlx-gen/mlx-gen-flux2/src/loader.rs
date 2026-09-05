@@ -13,7 +13,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Result, WeightsSource};
+use mlx_gen::{LoadSpec, Result, WeightsSource};
 
 use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
@@ -87,9 +87,15 @@ pub(crate) fn load_validated_tokenizer(
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree
 /// under the `"model"` prefix — no remap needed. Manifest-aware: a pre-quantized klein snapshot
 /// (sc-5917 convert) loads packed; a stock dense snapshot loads dense (no `quantization` block).
+/// A pinned SceneWorks turnkey whose q4/q8 `text_encoder/config.json` carries the stale packed
+/// marker over dense shards (sc-22727) is validated through the artifact inventory and loads dense.
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
-    let selected = crate::config::KLEIN_ENCODER_CONTRACT
-        .validate_source_against_base(&WeightsSource::Dir(root.join("text_encoder")), root)?;
+    let selected = crate::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load(
+        crate::config::KLEIN_ENCODER_CONTRACT,
+        crate::config::FLUX2_KLEIN_9B_ID,
+        &LoadSpec::new(WeightsSource::Dir(root.to_path_buf())),
+        root,
+    )?;
     selected.read_unchanged(load_text_encoder_from_source)
 }
 
