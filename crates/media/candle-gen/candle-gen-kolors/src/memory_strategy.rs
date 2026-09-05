@@ -93,6 +93,7 @@ impl KolorsLoadSeal {
         auxiliary: Option<(&str, MemoryComponentKind, &Path, &str, &str, &str)>,
         pid: Option<&PidWeights>,
         contract: MemoryProviderContract,
+        load_shape: gen_core::LoadShape,
     ) -> gen_core::Result<Self> {
         validate_base_source(root)?;
         if let Some((_, _, path, repository, revision, namespace)) = auxiliary {
@@ -134,7 +135,7 @@ impl KolorsLoadSeal {
             inventories,
         };
         seal.ensure_unchanged()?;
-        let recaptured = sealed_contract(provider_id, root, adapters, auxiliary, pid)?;
+        let recaptured = sealed_contract(provider_id, root, adapters, auxiliary, pid, load_shape)?;
         if recaptured != seal.contract {
             return Err(gen_core::Error::Unsupported(format!(
                 "{provider_id}: artifact assembly changed while admission was sealed"
@@ -148,9 +149,18 @@ impl KolorsLoadSeal {
         root: &Path,
         adapters: &[AdapterSpec],
         pid: Option<&PidWeights>,
+        load_shape: gen_core::LoadShape,
     ) -> gen_core::Result<Self> {
-        let contract = sealed_contract(crate::MODEL_ID, root, adapters, None, pid)?;
-        Self::capture(crate::MODEL_ID, root, adapters, None, pid, contract)
+        let contract = sealed_contract(crate::MODEL_ID, root, adapters, None, pid, load_shape)?;
+        Self::capture(
+            crate::MODEL_ID,
+            root,
+            adapters,
+            None,
+            pid,
+            contract,
+            load_shape,
+        )
     }
 
     pub(crate) fn capture_ip(paths: &crate::IpAdapterKolorsPaths) -> gen_core::Result<Self> {
@@ -169,6 +179,7 @@ impl KolorsLoadSeal {
             )),
             None,
             contract,
+            gen_core::LoadShape::EagerMaterialization,
         )
     }
 
@@ -191,6 +202,7 @@ impl KolorsLoadSeal {
             )),
             pid,
             contract,
+            gen_core::LoadShape::EagerMaterialization,
         )
     }
 
@@ -616,9 +628,11 @@ fn sealed_contract(
     adapters: &[AdapterSpec],
     auxiliary: Option<(&str, MemoryComponentKind, &Path, &str, &str, &str)>,
     pid: Option<&PidWeights>,
+    load_shape: gen_core::LoadShape,
 ) -> gen_core::Result<MemoryProviderContract> {
     validate_base_source(root)?;
-    let _ = physical_tier(root)?;
+    // sc-22732: the proven tier is the production calibration key, not a discarded side effect.
+    let tier = physical_tier(root)?;
     let conditioning_tokenizer = receipt_for("kolors-tokenizer", &root.join("tokenizer"))?;
     let conditioning_text = receipt_for("kolors-chatglm", &root.join("text_encoder"))?;
     let transformer = receipt_for("kolors-unet", &root.join("unet"))?;
@@ -677,7 +691,11 @@ fn sealed_contract(
             residency: MemoryComponentResidency::WholeRender,
         });
     }
-    let mut contract = provider_contract_for(provider_id);
+    let mut contract = provider_contract_for(
+        provider_id,
+        load_shape,
+        production_calibration_identity(provider_id, tier.quant, adapters, pid, load_shape),
+    );
     // The seal is the only path that has proven a materialized snapshot, so it is the only one that
     // may publish architecture axes; `provider_contract_for` stays the empty weights-free surface.
     contract.architecture_facts = architecture_facts(root);
@@ -793,10 +811,15 @@ pub fn provider_contract_for_load(
     root: &Path,
     adapters: &[AdapterSpec],
     pid: Option<&PidWeights>,
+    load_shape: gen_core::LoadShape,
 ) -> gen_core::Result<MemoryProviderContract> {
-    sealed_contract(crate::MODEL_ID, root, adapters, None, pid)
+    sealed_contract(crate::MODEL_ID, root, adapters, None, pid, load_shape)
 }
 
+/// The two composed routes are assembled from typed path structs, never from a [`LoadSpec`]
+/// (`KolorsIpAdapterGenerator::load` / `KolorsControlGenerator::load` take `IpAdapterKolorsPaths` /
+/// `KolorsControlPaths`), so there is no spec load shape to thread here — they eagerly materialize
+/// and declare exactly that.
 pub fn provider_contract_for_ip(
     paths: &crate::IpAdapterKolorsPaths,
 ) -> gen_core::Result<MemoryProviderContract> {
@@ -813,9 +836,11 @@ pub fn provider_contract_for_ip(
             IP_CACHE_NAMESPACE,
         )),
         None,
+        gen_core::LoadShape::EagerMaterialization,
     )
 }
 
+/// See [`provider_contract_for_ip`]: the strict-pose composition likewise has no [`LoadSpec`].
 pub fn provider_contract_for_control(
     paths: &crate::KolorsControlPaths,
     pid: Option<&PidWeights>,
@@ -833,6 +858,7 @@ pub fn provider_contract_for_control(
             CONTROL_CACHE_NAMESPACE,
         )),
         pid,
+        gen_core::LoadShape::EagerMaterialization,
     )
 }
 
@@ -857,29 +883,132 @@ pub fn provider_overlay_identity(contract: &MemoryProviderContract) -> Option<St
     (!identities.is_empty()).then(|| identities.join("+"))
 }
 
-/// Per-provider calibration fingerprint.
+/// Source-owned identity of the **weights-free registry-conformance** surface (sc-22732, epic
+/// sc-22723 E1/E4).
 ///
-/// The three Kolors contracts share one physical base but are deliberately independent evidence
-/// identities (base T2I/edit, IP-Adapter, strict-pose ControlNet). A single shared fingerprint let
-/// any one of them satisfy another's calibration check, so each mints its own route suffix — the
-/// same shape SDXL/Anima use (`sdxl-candle-{route}-...`).
-fn calibration_fingerprint(provider_id: &str) -> String {
-    let route = match provider_id {
-        IP_PROVIDER_ID => "ipadapter",
-        CONTROL_PROVIDER_ID => "control",
-        // The registered base id (and any future route) names itself; no two ids can collide.
-        other => other,
-    };
-    format!("kolors-candle-{route}-staged-chatglm-unet-f32-vae-v1")
+/// `provider_contract_for` is reached both by the sealed production path and by every
+/// declaration-only surface (`provider_contract`, `weights_free_contract`, `composed_contract_for`).
+/// Until sc-22732 all of them stamped the production string, so a conformance context assembled with
+/// no snapshot on disk satisfied a real load's calibration handshake. The declaration surfaces now
+/// publish this namespace instead — an identity, not `None`, because `provider_contract()` has
+/// always carried one and the registry conformance walk needs one (publishing `None` would require
+/// `validate_context`'s structural-estimate branch, which is out of scope here).
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "kolors-candle-registry-behavior-v1";
+
+/// The kebab route token that discriminates the three Kolors provider ids.
+///
+/// `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens and the composed ids
+/// are snake_case, so `candle_kolors_ipadapter` is spelled `ipadapter` here.
+fn route_token(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        crate::MODEL_ID => Some("kolors"),
+        IP_PROVIDER_ID => Some("ipadapter"),
+        CONTROL_PROVIDER_ID => Some("control"),
+        _ => None,
+    }
 }
 
+/// Per-route static behavior identity for the weights-free declaration surfaces.
+///
+/// Keyed on the route so one selector's handshake cannot be replayed against another's, exactly as
+/// the production table is. It carries no tier token because a surface with no snapshot on disk has
+/// proven no tier — that is the whole distinction between this namespace and the production one.
+fn static_behavior_identity(
+    provider_id: &str,
+    load_shape: gen_core::LoadShape,
+) -> MemoryCalibrationIdentity {
+    let route = route_token(provider_id).unwrap_or("unknown");
+    MemoryCalibrationIdentity::new(format!("{STATIC_BEHAVIOR_FINGERPRINT}-{route}"), load_shape)
+}
+
+/// Production calibration identity TABLE, keyed on (route, **proven artifact tier**) — sc-22732,
+/// epic sc-22723 E1/E4.
+///
+/// This is the table, not the binding: only `production_calibration_identity`, fed the tier
+/// [`physical_tier`] proved from real tensor headers, may turn one of these strings into a contract
+/// identity.
+///
+/// The three Kolors contracts share one physical base but are deliberately independent evidence
+/// identities (base T2I/edit, IP-Adapter, strict-pose ControlNet); a single shared fingerprint let
+/// any one of them satisfy another's calibration check. What sc-22732 adds is the **tier**: the old
+/// `kolors-candle-{route}-staged-chatglm-unet-f32-vae-v1` was one string for all three advertised
+/// tiers, so an anchor captured on q4 was indistinguishable from one captured on q8 or bf16.
+///
+/// **No measured cell is retired by this rename.** The old string is not declared in any SceneWorks
+/// manifest — `config/manifests/builtin.models.jsonc` has the kolors `candle` block as `null` — the
+/// module documentation states no tier, date, revision or "measured" claim for it, and its own doc
+/// justified it solely as a per-route collision guard. There is therefore no evidence keyed on the
+/// old spelling to invalidate.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// [`MemoryCalibrationIdentity::load_shape`] carries the materialization axis separately.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<Quant>,
+) -> Option<String> {
+    let route = route_token(provider_id)?;
+    let tier = match artifact_tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
+        _ => return None,
+    };
+    Some(format!(
+        "kolors-candle-{route}-{tier}-staged-chatglm-unet-f32-vae-v1"
+    ))
+}
+
+/// The identity a sealed Kolors contract publishes, bound to the artifact it opened.
+///
+/// The tier comes from [`physical_tier`], which cross-checks each component's `config.json` marker
+/// against the real safetensors header dtypes, shapes and packed-triple geometry and refuses a
+/// snapshot whose ChatGLM and UNet disagree — a strong proof, kept as-is.
+///
+/// **What withholds an identity.** A user LoRA stack or a PiD decode overlay is a resident set no
+/// clean anchor priced, on ANY route, so either withholds. The IP-Adapter and ControlNet routes are
+/// overlay identities *by construction* — the overlay they are named for is what the route IS, and
+/// the cell already covers it — so their own auxiliary never withholds; only the user-supplied
+/// stack does.
+fn production_calibration_identity(
+    provider_id: &str,
+    artifact_tier: Option<Quant>,
+    adapters: &[AdapterSpec],
+    pid: Option<&PidWeights>,
+    load_shape: gen_core::LoadShape,
+) -> Option<MemoryCalibrationIdentity> {
+    if !adapters.is_empty() || pid.is_some() {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, artifact_tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, load_shape))
+}
+
+/// The declaration-only base contract, at the eager shape a caller holding no [`LoadSpec`] must
+/// assume. Callers that DO hold one ([`weights_free_contract`], `composed_contract_for`) pass the
+/// spec's own shape instead.
 pub fn provider_contract() -> MemoryProviderContract {
-    provider_contract_for(crate::MODEL_ID)
+    let load_shape = gen_core::LoadShape::EagerMaterialization;
+    provider_contract_for(
+        crate::MODEL_ID,
+        load_shape,
+        Some(static_behavior_identity(crate::MODEL_ID, load_shape)),
+    )
 }
 
 /// Bespoke IP-Adapter and ControlNet routes deliberately mint independent contracts; they may share
 /// a physical Kolors base but never a provider/evidence identity.
-pub fn provider_contract_for(provider_id: &str) -> MemoryProviderContract {
+///
+/// `load_shape` is a separate parameter rather than being read off `calibration` because
+/// `MemoryProviderContract::conformance_errors` requires `contract.load_shape` to equal
+/// `calibration.load_shape`, and a withheld (`None`) identity still has to leave the contract
+/// declaring the shape the load really has. Before sc-22732 this function hard-stamped
+/// `EagerMaterialization` on both, so every deferred load published an eager identity.
+pub fn provider_contract_for(
+    provider_id: &str,
+    load_shape: gen_core::LoadShape,
+    calibration: Option<MemoryCalibrationIdentity>,
+) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
         MemoryBackendRealization::CandleCuda {
@@ -912,10 +1041,8 @@ pub fn provider_contract_for(provider_id: &str) -> MemoryProviderContract {
             MemoryFormulaVariable::OverlayBytes,
         ],
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        calibration_fingerprint(provider_id),
-        gen_core::LoadShape::EagerMaterialization,
-    ));
+    contract.load_shape = load_shape;
+    contract.calibration = calibration;
     for capability in &mut contract.strategies {
         capability.support = match capability.strategy {
             MemoryStrategy::Resident | MemoryStrategy::StagedResidency => {
@@ -1332,6 +1459,7 @@ fn registered_seal(spec: &LoadSpec) -> gen_core::Result<Option<KolorsLoadSeal>> 
             root,
             &spec.adapters,
             spec.pid.as_ref(),
+            spec.load_shape,
         )?)),
         _ => Ok(None),
     }
@@ -1341,7 +1469,7 @@ fn registered_seal(spec: &LoadSpec) -> gen_core::Result<Option<KolorsLoadSeal>> 
 pub fn registered_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     Ok(match registered_seal(spec)? {
         Some(seal) => seal.contract().clone(),
-        None => provider_contract(),
+        None => weights_free_contract(spec)?,
     })
 }
 
@@ -1440,8 +1568,16 @@ pub(crate) fn surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
 
 /// The declaration-only contract catalog conformance uses when no snapshot is on disk. It carries
 /// the same route/strategy declaration as the sealed contract and injects zero asset facts.
-pub fn weights_free_contract(_spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
-    Ok(provider_contract())
+///
+/// sc-22732: it publishes the source-owned [`STATIC_BEHAVIOR_FINGERPRINT`] namespace rather than a
+/// production string — it has proven no artifact tier — and it carries the SPEC's load shape, which
+/// it does have.
+pub fn weights_free_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
+    Ok(provider_contract_for(
+        crate::MODEL_ID,
+        spec.load_shape,
+        Some(static_behavior_identity(crate::MODEL_ID, spec.load_shape)),
+    ))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1493,7 +1629,12 @@ pub fn control_composed_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProv
 }
 
 fn composed_contract_for(provider_id: &str, spec: &LoadSpec) -> MemoryProviderContract {
-    let mut contract = provider_contract_for(provider_id);
+    // Declaration-only: no typed overlay paths, so no proven tier and no production string.
+    let mut contract = provider_contract_for(
+        provider_id,
+        spec.load_shape,
+        Some(static_behavior_identity(provider_id, spec.load_shape)),
+    );
     if let Some(root) = candle_gen::architecture_facts::snapshot_root(spec) {
         contract.architecture_facts = architecture_facts(root);
     }
@@ -1997,31 +2138,40 @@ mod tests {
     }
 
     fn canonical_base(temp: &tempfile::TempDir) -> PathBuf {
+        canonical_base_tier(temp, "q4")
+    }
+
+    /// One canonical Kolors snapshot at an advertised tier (sc-22732).
+    ///
+    /// `validate_base_source` requires the leaf directory to be spelled exactly `q4`/`q8`/`bf16`,
+    /// and `inspect_component_tier` cross-checks the `quantization` marker against the real tensor
+    /// headers — so a packed tier writes the packed triple AND the matching marker, and `bf16`
+    /// writes dense BF16 tensors under an empty config.
+    fn canonical_base_tier(temp: &tempfile::TempDir, tier: &str) -> PathBuf {
+        let bits = match tier {
+            "bf16" => None,
+            "q4" => Some(4_u8),
+            "q8" => Some(8_u8),
+            other => panic!("unhandled fixture tier {other}"),
+        };
         let root = temp
             .path()
             .join("models--SceneWorks--kolors-mlx")
             .join("snapshots")
             .join(KOLORS_REVISION)
-            .join("q4");
+            .join(tier);
         for component in ["text_encoder", "unet", "vae"] {
-            if component == "vae" {
-                write_tensor(
-                    &root.join(component).join("model.safetensors"),
-                    "BF16",
-                    &[2, 3],
-                );
-            } else {
-                write_packed_tensor(&root.join(component).join("model.safetensors"), 4);
+            let path = root.join(component).join("model.safetensors");
+            let heavy = component != "vae";
+            match bits.filter(|_| heavy) {
+                Some(bits) => write_packed_tensor(&path, bits),
+                None => write_tensor(&path, "BF16", &[2, 3]),
             }
-            std::fs::write(
-                root.join(component).join("config.json"),
-                if component == "vae" {
-                    "{}"
-                } else {
-                    r#"{"quantization":{"bits":4,"group_size":64}}"#
-                },
-            )
-            .unwrap();
+            let config = match bits.filter(|_| heavy) {
+                Some(bits) => format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                None => "{}".to_owned(),
+            };
+            std::fs::write(root.join(component).join("config.json"), config).unwrap();
         }
         std::fs::create_dir_all(root.join("tokenizer")).unwrap();
         std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
@@ -2069,7 +2219,10 @@ mod tests {
                 MemoryOptimizationAuthority::Estimated
             },
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: calibration_fingerprint(provider),
+            // Every `context()` consumer below admits against a SEALED contract built from the q4
+            // `canonical_base` fixture, so the handshake is that cell's production string.
+            calibration_fingerprint: production_calibration_fingerprint(provider, Some(Quant::Q4))
+                .unwrap(),
             mode: if provider == IP_PROVIDER_ID {
                 MemoryMode::Other("character_image".into())
             } else {
@@ -2145,7 +2298,16 @@ mod tests {
         // The weights-free surface has resolved no snapshot, so no axis is knowable there.
         assert!(provider_contract().architecture_facts.is_empty());
         for id in [crate::MODEL_ID, IP_PROVIDER_ID, CONTROL_PROVIDER_ID] {
-            assert!(provider_contract_for(id).architecture_facts.is_empty());
+            assert!(provider_contract_for(
+                id,
+                gen_core::LoadShape::EagerMaterialization,
+                Some(static_behavior_identity(
+                    id,
+                    gen_core::LoadShape::EagerMaterialization
+                )),
+            )
+            .architecture_facts
+            .is_empty());
         }
         let unresolved = LoadSpec::new(WeightsSource::Dir(
             "/__sceneworks_memory_contract_surface__".into(),
@@ -2312,7 +2474,8 @@ mod tests {
         write_tensor(&control, "BF16", &[4, 4]);
 
         let sealed = [
-            provider_contract_for_load(&base, &[], None).unwrap(),
+            provider_contract_for_load(&base, &[], None, gen_core::LoadShape::EagerMaterialization)
+                .unwrap(),
             provider_contract_for_ip(&crate::IpAdapterKolorsPaths {
                 kolors_base: base.clone(),
                 ip_adapter: ip,
@@ -2345,6 +2508,231 @@ mod tests {
             3,
             "the three sealed Kolors contracts must not share a calibration fingerprint: {fingerprints:?}"
         );
+    }
+
+    /// Every advertised tier of every Kolors route.
+    const ROUTE_TIERS: [&str; 3] = ["bf16", "q4", "q8"];
+
+    fn route_ids() -> [&'static str; 3] {
+        [crate::MODEL_ID, IP_PROVIDER_ID, CONTROL_PROVIDER_ID]
+    }
+
+    /// The IP-Adapter and ControlNet auxiliaries at their pinned immutable cache paths.
+    fn composed_auxiliaries(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let ip = temp.path().join(IP_CACHE_NAMESPACE).join(IP_REVISION);
+        write_tensor(
+            &ip.join("ip_adapter_plus_general.safetensors"),
+            "BF16",
+            &[3, 5],
+        );
+        write_tensor(&ip.join("image_encoder/model.safetensors"), "BF16", &[7, 2]);
+        let control = temp
+            .path()
+            .join(CONTROL_CACHE_NAMESPACE)
+            .join(CONTROL_REVISION)
+            .join("control.safetensors");
+        write_tensor(&control, "BF16", &[4, 4]);
+        (ip, control)
+    }
+
+    /// The production seam for one route at one base snapshot: exactly what the worker's loader
+    /// reaches (`registered_contract` for the registered base id, the typed-path builders for the
+    /// two compositions).
+    fn sealed_route_contract(
+        provider_id: &str,
+        base: &Path,
+        ip: &Path,
+        control: &Path,
+        load_shape: gen_core::LoadShape,
+    ) -> gen_core::Result<MemoryProviderContract> {
+        match provider_id {
+            IP_PROVIDER_ID => provider_contract_for_ip(&crate::IpAdapterKolorsPaths {
+                kolors_base: base.to_path_buf(),
+                ip_adapter: ip.to_path_buf(),
+                adapters: vec![],
+            }),
+            CONTROL_PROVIDER_ID => provider_contract_for_control(
+                &crate::KolorsControlPaths {
+                    kolors_base: base.to_path_buf(),
+                    controlnet: control.to_path_buf(),
+                    adapters: vec![],
+                },
+                None,
+            ),
+            _ => registered_contract(
+                &LoadSpec::new(WeightsSource::Dir(base.to_path_buf())).with_load_shape(load_shape),
+            ),
+        }
+    }
+
+    /// sc-22732 (epic sc-22723, E1 measurable / E4 production loader): every (route, advertised
+    /// tier) cell publishes its OWN production calibration identity, so a memory anchor capture has
+    /// a fingerprint that names the cell it measured. Before sc-22732 the key was route-only and the
+    /// three tiers of a route were one string.
+    ///
+    /// *Mutations this kills:* dropping `{tier}` from the table (the nine strings collapse to three
+    /// and `published.len()` fails); replaying one route's string on another; publishing the
+    /// weights-free registry string in production; and restoring the hard-stamped
+    /// `LoadShape::EagerMaterialization` in `provider_contract_for` (the base route is exercised
+    /// under both shapes).
+    #[test]
+    fn every_route_and_tier_publishes_its_own_production_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ip, control) = composed_auxiliaries(&temp);
+        let mut published = BTreeSet::new();
+        for provider in route_ids() {
+            let weights_free =
+                static_behavior_identity(provider, gen_core::LoadShape::EagerMaterialization)
+                    .fingerprint;
+            for tier in ROUTE_TIERS {
+                let quant = match tier {
+                    "bf16" => None,
+                    "q4" => Some(Quant::Q4),
+                    _ => Some(Quant::Q8),
+                };
+                let expected = production_calibration_fingerprint(provider, quant).unwrap();
+                assert!(expected.contains(tier), "{provider} {tier}: {expected}");
+                assert_ne!(expected, weights_free);
+                let base = canonical_base_tier(&temp, tier);
+                assert_eq!(physical_tier(&base).unwrap().quant, quant, "{tier}");
+
+                // Only the registered base route is reached through a `LoadSpec`; the two
+                // compositions are assembled from typed path structs and materialize eagerly.
+                let shapes: &[gen_core::LoadShape] = if provider == crate::MODEL_ID {
+                    &[
+                        gen_core::LoadShape::EagerMaterialization,
+                        gen_core::LoadShape::DeferredMaterialization,
+                    ]
+                } else {
+                    &[gen_core::LoadShape::EagerMaterialization]
+                };
+                for load_shape in shapes.iter().copied() {
+                    let contract =
+                        sealed_route_contract(provider, &base, &ip, &control, load_shape).unwrap();
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {load_shape:?} publishes no identity")
+                    });
+                    assert_eq!(identity.fingerprint, expected, "{provider} {tier}");
+                    // Kills the hard-stamped eager shape: the identity follows the SPEC.
+                    assert_eq!(identity.load_shape, load_shape, "{provider} {tier}");
+                    assert_eq!(contract.load_shape, load_shape, "{provider} {tier}");
+                    assert!(
+                        contract.conformance_errors().is_empty(),
+                        "{provider} {tier}: {:?}",
+                        contract.conformance_errors()
+                    );
+                }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{provider} {tier} repeats another cell's identity: {expected}"
+                );
+            }
+        }
+        // Nine distinct strings: three routes x three tiers. A route-only key collapses this to 3.
+        assert_eq!(published.len(), route_ids().len() * ROUTE_TIERS.len());
+    }
+
+    /// sc-22732: the declaration-only surfaces publish the source-owned
+    /// [`STATIC_BEHAVIOR_FINGERPRINT`] namespace, distinct from every one of the nine production
+    /// strings. Until sc-22732 `provider_contract_for` stamped the production string on every
+    /// caller, so a conformance context assembled with no snapshot on disk satisfied a real load's
+    /// calibration handshake.
+    ///
+    /// *Mutation this kills:* handing `production_calibration_identity` to `weights_free_contract`
+    /// or `composed_contract_for`.
+    #[test]
+    fn the_weights_free_surfaces_never_publish_a_production_string() {
+        let production = route_ids()
+            .into_iter()
+            .flat_map(|provider| {
+                [None, Some(Quant::Q4), Some(Quant::Q8)]
+                    .into_iter()
+                    .filter_map(move |quant| production_calibration_fingerprint(provider, quant))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(production.len(), 9);
+
+        for load_shape in [
+            gen_core::LoadShape::EagerMaterialization,
+            gen_core::LoadShape::DeferredMaterialization,
+        ] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/kolors".into()))
+                .with_load_shape(load_shape);
+            let surfaces = [
+                ("weights_free", weights_free_contract(&spec).unwrap()),
+                ("registered", registered_contract(&spec).unwrap()),
+                ("ip_composed", ip_composed_contract(&spec).unwrap()),
+                (
+                    "control_composed",
+                    control_composed_contract(&spec).unwrap(),
+                ),
+            ];
+            for (label, contract) in surfaces {
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .expect("the declaration surface still carries an identity");
+                assert!(
+                    identity
+                        .fingerprint
+                        .starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                    "{label}: {}",
+                    identity.fingerprint
+                );
+                assert!(!production.contains(&identity.fingerprint), "{label}");
+                assert_eq!(identity.load_shape, load_shape, "{label}");
+                assert_eq!(contract.load_shape, load_shape, "{label}");
+                assert!(contract.conformance_errors().is_empty(), "{label}");
+            }
+        }
+        // The bare no-spec entry point is the eager declaration and is equally not production.
+        let bare = provider_contract().calibration.unwrap();
+        assert!(!production.contains(&bare.fingerprint));
+    }
+
+    /// sc-22732: a user LoRA stack or a PiD decode overlay is a resident set no clean anchor
+    /// priced, so the sealed contract publishes NO production identity for it — on any route.
+    /// (The IP-Adapter / ControlNet auxiliaries are what those routes ARE, and keep their cells.)
+    ///
+    /// *Mutation this kills:* dropping the `!adapters.is_empty() || pid.is_some()` guard from
+    /// `production_calibration_identity` — each load below then borrows the clean q4 cell.
+    #[test]
+    fn an_adapter_or_pid_load_publishes_no_production_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = canonical_base_tier(&temp, "q4");
+        let (pid, _student, _gemma) = canonical_pid(&temp);
+        let adapter = temp
+            .path()
+            .join("models--SceneWorks--kolors-lora")
+            .join("lora.safetensors");
+        write_tensor(&adapter, "BF16", &[2, 2]);
+        let adapters = [AdapterSpec::new(adapter, 0.75, AdapterKind::Lora)];
+
+        assert!(
+            provider_contract_for_load(&base, &[], None, gen_core::LoadShape::EagerMaterialization)
+                .unwrap()
+                .calibration
+                .is_some(),
+            "the clean base control must publish one"
+        );
+        for (label, adapters, pid) in [
+            ("adapters", adapters.as_slice(), None),
+            ("pid", [].as_slice(), Some(&pid)),
+            ("adapters+pid", adapters.as_slice(), Some(&pid)),
+        ] {
+            let contract = provider_contract_for_load(
+                &base,
+                adapters,
+                pid,
+                gen_core::LoadShape::EagerMaterialization,
+            )
+            .unwrap();
+            assert!(
+                contract.calibration.is_none(),
+                "{label} must publish no production identity"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{label}");
+        }
     }
 
     /// sc-20762 review (MAJOR 14): the bespoke routes ran with no request scope at all — nothing
@@ -2439,7 +2827,13 @@ mod tests {
         }
         std::fs::create_dir_all(arbitrary.join("tokenizer")).unwrap();
         std::fs::write(arbitrary.join("tokenizer/tokenizer.json"), "{}").unwrap();
-        assert!(provider_contract_for_load(&arbitrary, &[], None).is_err());
+        assert!(provider_contract_for_load(
+            &arbitrary,
+            &[],
+            None,
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
     }
 
     #[test]
@@ -2487,7 +2881,13 @@ mod tests {
             student.clone(),
             gemma.join("model.safetensors"),
         ] {
-            let seal = KolorsLoadSeal::capture_load(&base, &adapters, Some(&pid)).unwrap();
+            let seal = KolorsLoadSeal::capture_load(
+                &base,
+                &adapters,
+                Some(&pid),
+                gen_core::LoadShape::EagerMaterialization,
+            )
+            .unwrap();
             let original = std::fs::read(&path).unwrap();
             std::fs::write(&path, b"mutated-after-admission").unwrap();
             assert!(seal.ensure_unchanged().is_err(), "path={}", path.display());
@@ -2551,13 +2951,25 @@ mod tests {
         write_packed_tensor(&base.join("unet/model.safetensors"), 4);
 
         write_tensor(&base.join("vae/model.safetensors"), "U32", &[2, 3]);
-        assert!(KolorsLoadSeal::capture_load(&base, &[], None).is_err());
+        assert!(KolorsLoadSeal::capture_load(
+            &base,
+            &[],
+            None,
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
         write_tensor(&base.join("vae/model.safetensors"), "BF16", &[2, 3]);
 
         let adapter = temp.path().join("forged-adapter.safetensors");
         write_tensor(&adapter, "U32", &[2, 2]);
         let adapters = vec![AdapterSpec::new(adapter, 1.0, AdapterKind::Lora)];
-        assert!(KolorsLoadSeal::capture_load(&base, &adapters, None).is_err());
+        assert!(KolorsLoadSeal::capture_load(
+            &base,
+            &adapters,
+            None,
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
 
         let ip = temp.path().join(IP_CACHE_NAMESPACE).join(IP_REVISION);
         write_tensor(
@@ -2587,7 +2999,13 @@ mod tests {
 
         let (pid, student, _) = canonical_pid(&temp);
         write_tensor(&student, "U32", &[2, 2]);
-        assert!(KolorsLoadSeal::capture_load(&base, &[], Some(&pid)).is_err());
+        assert!(KolorsLoadSeal::capture_load(
+            &base,
+            &[],
+            Some(&pid),
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
 
         let arbitrary_student = temp.path().join("pid_sdxl_2kto4k.safetensors");
         write_tensor(&arbitrary_student, "BF16", &[2, 2]);
@@ -2597,7 +3015,13 @@ mod tests {
             checkpoint: WeightsSource::File(arbitrary_student),
             gemma: WeightsSource::Dir(arbitrary_gemma),
         };
-        assert!(KolorsLoadSeal::capture_load(&base, &[], Some(&arbitrary_pid)).is_err());
+        assert!(KolorsLoadSeal::capture_load(
+            &base,
+            &[],
+            Some(&arbitrary_pid),
+            gen_core::LoadShape::EagerMaterialization
+        )
+        .is_err());
     }
 
     #[test]
@@ -2611,6 +3035,7 @@ mod tests {
             &base,
             &[AdapterSpec::new(adapter, 0.75, AdapterKind::Lora)],
             Some(&pid),
+            gen_core::LoadShape::EagerMaterialization,
         )
         .unwrap();
         let mut admitted = context("kolors", MemoryStrategy::StagedResidency);
