@@ -1203,10 +1203,27 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
-                assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+                // sc-22735: the weights-free declaration surface publishes a per-(route, tier,
+                // policy) STATIC identity, never a production calibration key. It used to
+                // republish the measured turbo string on all four routes at all three tiers.
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                assert!(
+                    fingerprint.starts_with(
+                        mlx_gen_krea::block_memory_strategy::STATIC_BEHAVIOR_FINGERPRINT
+                    ),
+                    "{provider_id}: {fingerprint}"
                 );
+                for tier in ["bf16", "q4", "q8"] {
+                    assert_ne!(
+                        *fingerprint,
+                        mlx_gen_krea::block_memory_strategy::production_calibration_fingerprint(
+                            provider_id,
+                            tier
+                        )
+                        .expect("every base route ships every tier"),
+                        "{provider_id}: declaration surface republished a production key"
+                    );
+                }
             }
             assert_eq!(implemented, 3, "{provider_id}");
         }

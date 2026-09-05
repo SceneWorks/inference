@@ -5500,6 +5500,11 @@ mod tests {
                 .collect(),
                 "{provider_id}"
             );
+            // sc-22735: these are weights-free declarations, so their identities live in the
+            // registry-behavior namespace and carry their own (route, declared tier) key. The
+            // production strings — `krea-2-<route>-<tier>-cuda-staged-residency-v1` — are what a
+            // measured anchor binds to, and no catalog surface may republish one.
+            let mut declared = std::collections::BTreeSet::new();
             for surface in provider_surfaces {
                 assert!(!surface.composed, "{provider_id}");
                 assert_eq!(
@@ -5507,11 +5512,34 @@ mod tests {
                     candle_gen::gen_core::MemoryAssetFacts::default(),
                     "{provider_id}"
                 );
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => "bf16",
+                    MemoryContractSurfaceTier::Q4 => "q4",
+                    MemoryContractSurfaceTier::Q8 => "q8",
+                    other => panic!("{provider_id}: unexpected surface tier {other:?}"),
+                };
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    "krea-candle-request-scoped-staged-residency-v1",
-                    "{provider_id}"
+                    fingerprint,
+                    &format!(
+                        "krea-2-candle-registry-behavior-v1-{}-{tier}",
+                        provider_id.replace('_', "-")
+                    ),
+                    "{provider_id}:{}",
+                    surface.selector.id()
                 );
+                for cell in ["q4", "q8", "bf16"] {
+                    assert_ne!(
+                        fingerprint,
+                        &format!(
+                            "{}-{cell}-cuda-staged-residency-v1",
+                            provider_id.replace('_', "-")
+                        ),
+                        "{provider_id}: a weights-free surface must never republish a production \
+                         calibration identity"
+                    );
+                }
+                declared.insert(fingerprint.clone());
                 for strategy in MemoryStrategy::ALL {
                     let expected = matches!(
                         strategy,
@@ -5526,6 +5554,11 @@ mod tests {
                     );
                 }
             }
+            assert_eq!(
+                declared.len(),
+                3,
+                "{provider_id}: one declaration per artifact tier: {declared:?}"
+            );
         }
     }
 

@@ -2388,7 +2388,21 @@ fn weights_free_krea_turbo_memory_strategy_contract(
     Ok(build_krea_turbo_memory_strategy_contract(spec))
 }
 
-const REQUEST_SCOPED_MEMORY_FINGERPRINT: &str = "krea-candle-request-scoped-staged-residency-v1";
+/// Trailing stem of every request-scoped **production** calibration identity: the backend and the
+/// structural mechanism the string names, after the `{route}-{tier}` key.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This used to be a whole, standalone fingerprint —
+/// `krea-candle-request-scoped-staged-residency-v1` — published verbatim by all three request-scoped
+/// routes at all three artifact tiers, and republished by the weights-free surfaces. Nine production
+/// cells and thirty-six weights-free surfaces shared one string, so a captured anchor could not say
+/// which cell it measured. It survives only as this stem; the full identity is composed by
+/// [`krea_request_scoped_production_calibration_fingerprint`].
+const REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM: &str = "cuda-staged-residency-v1";
+
+/// Namespace of the **weights-free** request-scoped identities: registry-behavior declarations that
+/// resolve no snapshot and therefore measure nothing. Kept disjoint from every production string so
+/// a fixture or catalog surface can never read as evidence of a measured cell.
+const REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-2-candle-registry-behavior-v1";
 
 fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
     matches!(
@@ -2397,19 +2411,126 @@ fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
     )
 }
 
+/// Kebab token naming an artifact tier inside a calibration identity.
+fn request_scoped_tier_token(tier: Option<Quant>) -> Option<&'static str> {
+    match tier {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity of one request-scoped Krea route, keyed on **(route, tier)**.
+///
+/// `krea_2_raw`, `krea_2_edit` and `krea_2_turbo_edit` execute the same structural staging seam but
+/// are three separate evidence domains, and each ships three artifact tiers — nine cells that an
+/// anchor must be able to tell apart. The string is
+/// `{route}-{tier}-cuda-staged-residency-v1` with `{route}` the provider id in kebab case and
+/// `{tier}` in `{q4, q8, bf16}`.
+///
+/// `None` for a provider no request-scoped route serves and for a tier this lane does not ship
+/// (NVFP4): publishing nothing is correct, publishing another cell's string is not.
+pub fn krea_request_scoped_production_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{}-{tier}-{REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The tier a request-scoped load can **prove** from the artifact, or `None` when it cannot.
+///
+/// `LoadSpec::quantize` is not the answer: on a `WeightsSource::Dir` load this crate accepts it as a
+/// no-op recipe knob (the turnkey is already packed), and the SceneWorks worker forwards a default
+/// tier regardless of what is on disk. [`actual_quant_tier`] reads the transformer's own packed
+/// marker instead, so the tier named in a published identity is the tier that was opened.
+///
+/// Fails closed to `None` — never to an error, and never to a fabricated tier — for an unreadable or
+/// malformed packed config, an unsupported packed width, an imported single file whose companion
+/// snapshot disagrees with the request, and the INT8-ConvRot DiT path, whose rotated single-file
+/// artifact is not one of the three measured tiers.
+fn request_scoped_provable_artifact_tier(
+    spec: &LoadSpec,
+    provider_id: &str,
+) -> Option<Option<Quant>> {
+    match convrot_selector(spec, provider_id) {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return None,
+    }
+    actual_quant_tier(spec, provider_id).ok()
+}
+
+/// The production calibration identity a request-scoped load publishes, or `None` when the artifact
+/// tier cannot be proven.
+fn krea_request_scoped_production_calibration(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    let tier = request_scoped_provable_artifact_tier(spec, provider_id)?;
+    let fingerprint = krea_request_scoped_production_calibration_fingerprint(provider_id, tier)?;
+    Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ))
+}
+
+/// Weights-free registry-behavior identity of one request-scoped route at one **declared** surface
+/// tier: `krea-2-candle-registry-behavior-v1-{route}-{tier}`.
+///
+/// The tier comes from the surface selector, which names an already-resolved artifact tier — not
+/// from `LoadSpec::quantize` (the surface builder deliberately erases it) and not from the
+/// filesystem (there is no snapshot to read). `None` for a tier this lane does not declare.
+fn krea_request_scoped_static_behavior_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{tier}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The artifact tier a weights-free surface selector declares, as a [`Quant`] key.
+///
+/// NVFP4 is refused: this lane ships no NVFP4 request-scoped turnkey, which is the same refusal
+/// [`surface_selector_matches_request_scoped_spec`] already makes.
+fn request_scoped_surface_tier(tier: gen_core::MemoryContractSurfaceTier) -> Option<Option<Quant>> {
+    match tier {
+        gen_core::MemoryContractSurfaceTier::Bf16 => Some(None),
+        gen_core::MemoryContractSurfaceTier::Q4 => Some(Some(Quant::Q4)),
+        gen_core::MemoryContractSurfaceTier::Q8 => Some(Some(Quant::Q8)),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => None,
+    }
+}
+
 /// Source-derived contract shared by the Raw and both Edit execution paths.
 ///
 /// These generators all execute request-scoped component staging, but deliberately reject Turbo's
-/// decode tiling, attention chunking, and block-window controls. The fingerprint identifies this
+/// decode tiling, attention chunking, and block-window controls. The contract identifies this
 /// structural execution seam; it is not a performance, capacity, or real-weight claim.
+///
+/// The calibration identity it publishes is the **production** one, keyed on (route, tier) with the
+/// tier proven from the artifact. Weights-free callers overwrite it with the registry-behavior
+/// identity through [`weights_free_krea_request_scoped_contract`].
 fn build_krea_request_scoped_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     use gen_core::{
-        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract,
-        MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
+        MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
     if !is_request_scoped_memory_provider(provider_id) {
@@ -2448,10 +2569,7 @@ fn build_krea_request_scoped_memory_strategy_contract(
             MemoryFormulaVariable::ConditioningTokenCount,
         ],
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        REQUEST_SCOPED_MEMORY_FINGERPRINT,
-        spec.load_shape,
-    ));
+    contract.calibration = krea_request_scoped_production_calibration(provider_id, spec);
     contract
         .strategies
         .iter_mut()
@@ -2517,16 +2635,51 @@ fn surface_selector_matches_request_scoped_spec(
     }
 }
 
+/// Structural declaration of one request-scoped route at one **declared** tier, resolving no
+/// snapshot.
+///
+/// The contract body is the production one; only the calibration identity differs, and it must:
+/// it names the registry-behavior namespace, so a catalog surface can never be mistaken for
+/// evidence of the production cell it describes. The identity stays `Some(..)` — a weights-free
+/// declaration that publishes none is indistinguishable from a route with no memory contract at
+/// all — and keeps `spec.load_shape` on the materialization axis.
+fn weights_free_krea_request_scoped_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    tier: Option<Quant>,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let fingerprint = krea_request_scoped_static_behavior_fingerprint(provider_id, tier)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{provider_id}: no weights-free Krea request-scoped declaration is registered for tier {tier:?}"
+            ))
+        })?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ));
+    Ok(contract)
+}
+
 fn weights_free_krea_request_scoped_surface_contract(
     provider_id: &str,
     surface: &gen_core::MemoryContractSurfaceSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     surface_selector_matches_request_scoped_spec(surface)?;
+    // The SELECTOR carries the resolved artifact tier; the spec's `quantize` is erased below, so it
+    // has to be read before that happens.
+    let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: Krea ships no request-scoped {:?} surface",
+            surface.resolved_artifact_tier()
+        ))
+    })?;
     let mut production_spec = surface.spec.clone();
     // Q4/Q8 are already-packed artifact tiers. The generic fixture uses this field only to make its
     // selector self-checking; the real Krea directory loader resolves the packed marker itself.
     production_spec.quantize = None;
-    build_krea_request_scoped_memory_strategy_contract(provider_id, &production_spec)
+    weights_free_krea_request_scoped_contract(provider_id, &production_spec, tier)
 }
 
 #[cfg(test)]
@@ -2761,10 +2914,14 @@ mod weights_free_behavior_tests {
                     gen_core::MemoryAssetFacts::default(),
                     "{provider_id}: weights-free catalog surfaces cannot claim inventory"
                 );
+                // A weights-free catalog surface declares the registry-behavior identity of its own
+                // (route, declared tier) — never a production cell's string.
+                let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap();
                 assert_eq!(
                     surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    REQUEST_SCOPED_MEMORY_FINGERPRINT,
-                    "{provider_id}"
+                    krea_request_scoped_static_behavior_fingerprint(provider_id, tier).unwrap(),
+                    "{provider_id}:{}",
+                    surface.selector.id()
                 );
                 for strategy in gen_core::MemoryStrategy::ALL {
                     let support = &surface.contract.capability(strategy).unwrap().support;
@@ -3338,7 +3495,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_RAW_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_RAW_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -3352,7 +3512,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_EDIT_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_EDIT_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -3366,7 +3529,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_TURBO_EDIT_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_TURBO_EDIT_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_TURBO_EDIT_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -3388,6 +3554,371 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Krea provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// sc-22735 (epic sc-22723 E1/E4): the request-scoped calibration identities are the key a captured
+/// SceneWorks memory anchor is filed under, so every cell that can be measured separately must be
+/// nameable separately. Three routes x three artifact tiers = nine production cells, plus a disjoint
+/// weights-free namespace for the declarations that measure nothing.
+#[cfg(test)]
+mod request_scoped_calibration_identity_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::*;
+
+    const ROUTES: [&str; 3] = [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID];
+    const TIERS: [Option<Quant>; 3] = [None, Some(Quant::Q4), Some(Quant::Q8)];
+
+    fn tier_token(tier: Option<Quant>) -> &'static str {
+        match tier {
+            None => "bf16",
+            Some(Quant::Q4) => "q4",
+            Some(Quant::Q8) => "q8",
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        }
+    }
+
+    /// A snapshot whose `transformer/config.json` declares `tier` — the marker
+    /// `loader::read_packed_config` reads and the only place the tier can be proven from.
+    fn snapshot_at_tier(root: &Path, tier: Option<Quant>) -> LoadSpec {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let config = match tier {
+            None => serde_json::json!({ "hidden_size": 6144 }),
+            Some(Quant::Q4) => {
+                serde_json::json!({ "quantization": { "bits": 4, "group_size": 64 } })
+            }
+            Some(Quant::Q8) => {
+                serde_json::json!({ "quantization": { "bits": 8, "group_size": 64 } })
+            }
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        };
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    fn published(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+        build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+            .expect("the request-scoped contract builder never fails on a registered route")
+            .calibration
+            .map(|identity| identity.fingerprint)
+    }
+
+    /// The nine production strings, derived from the documented format rather than frozen here, so
+    /// the other tests can assert disjointness against a set that cannot silently shrink.
+    fn production_identities() -> BTreeSet<String> {
+        let set: BTreeSet<String> = ROUTES
+            .into_iter()
+            .flat_map(|route| {
+                TIERS.into_iter().map(move |tier| {
+                    krea_request_scoped_production_calibration_fingerprint(route, tier)
+                        .expect("every shipped (route, tier) cell has a production identity")
+                })
+            })
+            .collect();
+        assert_eq!(set.len(), ROUTES.len() * TIERS.len());
+        set
+    }
+
+    #[test]
+    fn every_request_scoped_cell_publishes_its_own_production_identity_keyed_on_the_artifact() {
+        let mut seen: std::collections::BTreeMap<String, (&str, Option<Quant>)> =
+            Default::default();
+        for route in ROUTES {
+            for tier in TIERS {
+                let tmp = tempfile::tempdir().unwrap();
+                let spec = snapshot_at_tier(tmp.path(), tier);
+                let fingerprint = published(route, &spec).unwrap_or_else(|| {
+                    panic!("{route}/{tier:?} must publish a production identity")
+                });
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{}-{}-cuda-staged-residency-v1",
+                        route.replace('_', "-"),
+                        tier_token(tier)
+                    ),
+                    "{route}/{tier:?}"
+                );
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+
+                // THE load-bearing property: the key is the tier on disk, not the request knob. A
+                // `Dir` load accepts `quantize` as a recipe-only no-op and the SceneWorks worker
+                // forwards a default tier regardless of the artifact, so a request-keyed identity
+                // would file three different artifacts under one string.
+                for requested in [Some(Quant::Q4), Some(Quant::Q8)] {
+                    let mut misrequested = spec.clone();
+                    misrequested.quantize = requested;
+                    assert_eq!(
+                        published(route, &misrequested).as_deref(),
+                        Some(fingerprint.as_str()),
+                        "{route}/{tier:?}: a {requested:?} request must not relabel the artifact"
+                    );
+                }
+
+                assert!(
+                    seen.insert(fingerprint.clone(), (route, tier)).is_none(),
+                    "{route}/{tier:?} collides with {:?} on '{fingerprint}'",
+                    seen.get(&fingerprint)
+                );
+            }
+        }
+        assert_eq!(seen.len(), ROUTES.len() * TIERS.len());
+        assert_eq!(
+            seen.keys().cloned().collect::<BTreeSet<_>>(),
+            production_identities()
+        );
+    }
+
+    #[test]
+    fn the_three_request_scoped_routes_never_share_an_identity_at_the_same_tier() {
+        for tier in TIERS {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = snapshot_at_tier(tmp.path(), tier);
+            let per_route: Vec<String> = ROUTES
+                .into_iter()
+                .map(|route| published(route, &spec).unwrap())
+                .collect();
+            assert_eq!(
+                per_route.iter().collect::<BTreeSet<_>>().len(),
+                ROUTES.len(),
+                "{tier:?}: raw/edit/turbo-edit must be distinguishable: {per_route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_validated_production_path_carries_the_same_cell_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(tmp.path(), None);
+        for route in ROUTES {
+            let contract =
+                validated_krea_request_scoped_memory_strategy_contract(route, &spec).unwrap();
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                krea_request_scoped_production_calibration_fingerprint(route, None).unwrap(),
+                "{route}"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{route}");
+        }
+    }
+
+    #[test]
+    fn turbo_and_control_keep_the_bound_measured_identities_they_already_published() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(
+            turbo.calibration.as_ref().unwrap().fingerprint,
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT, "krea-turbo-cuda-phase-curves-v1",
+            "the SceneWorks anchor plan and the packaged krea_2_turbo candle q4 record name this"
+        );
+        assert_eq!(
+            turbo.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        );
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            control.calibration.as_ref().unwrap().fingerprint,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+            "sc-16013-krea-control-direct-1024-v1"
+        );
+
+        let production = production_identities();
+        for bound in [
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+        ] {
+            assert!(
+                !production.contains(bound),
+                "the request-scoped split must not reach into '{bound}'"
+            );
+            assert!(!bound.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT));
+        }
+    }
+
+    #[test]
+    fn weights_free_declarations_are_disjoint_from_every_production_identity() {
+        type SurfaceSeam = fn(
+            &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract>;
+
+        let production = production_identities();
+        let surfaces = gen_core::candle_memory_contract_surface_specs();
+        assert!(!surfaces.is_empty());
+        let mut every_route = BTreeSet::new();
+        for (route, seam) in [
+            (
+                KREA_2_RAW_ID,
+                weights_free_krea_raw_surface_contract as SurfaceSeam,
+            ),
+            (KREA_2_EDIT_ID, weights_free_krea_edit_surface_contract),
+            (
+                KREA_2_TURBO_EDIT_ID,
+                weights_free_krea_turbo_edit_surface_contract,
+            ),
+        ] {
+            let mut per_route = BTreeSet::new();
+            for surface in &surfaces {
+                let contract = seam(surface).unwrap();
+                let fingerprint = contract.calibration.as_ref().unwrap().fingerprint.clone();
+                assert!(
+                    fingerprint.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT),
+                    "{route}: '{fingerprint}' is outside the registry-behavior namespace"
+                );
+                assert!(
+                    !production.contains(&fingerprint),
+                    "{route}: weights-free surface republished production identity '{fingerprint}'"
+                );
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{}",
+                        route.replace('_', "-"),
+                        tier_token(
+                            request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap()
+                        )
+                    )
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}");
+                // The macro-generated seam and the shared entry point are the same declaration.
+                assert_eq!(
+                    weights_free_krea_request_scoped_surface_contract(route, surface)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                    fingerprint
+                );
+                per_route.insert(fingerprint);
+            }
+            assert_eq!(
+                per_route.len(),
+                TIERS.len(),
+                "{route}: the three declared surface tiers must be distinguishable: {per_route:?}"
+            );
+            every_route.extend(per_route);
+        }
+        assert_eq!(every_route.len(), ROUTES.len() * TIERS.len());
+
+        // The conformance-fixture seam registered alongside the resolver is weights-free too.
+        let witness = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        for route in ROUTES {
+            for tier in TIERS {
+                let fingerprint = weights_free_krea_request_scoped_contract(route, &witness, tier)
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint;
+                assert!(!production.contains(&fingerprint), "{route}/{tier:?}");
+                assert!(every_route.contains(&fingerprint), "{route}/{tier:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_has_no_request_scoped_identity_on_either_side_of_the_split() {
+        for route in ROUTES {
+            assert!(krea_request_scoped_production_calibration_fingerprint(
+                route,
+                Some(Quant::Nvfp4)
+            )
+            .is_none());
+            assert!(
+                krea_request_scoped_static_behavior_fingerprint(route, Some(Quant::Nvfp4))
+                    .is_none()
+            );
+        }
+        assert!(
+            request_scoped_surface_tier(gen_core::MemoryContractSurfaceTier::Nvfp4).is_none(),
+            "the NVFP4 surface refusal must stay"
+        );
+        for foreign in [KREA_2_TURBO_ID, "krea_2_turbo_control", "krea_2_raw_typo"] {
+            assert!(
+                krea_request_scoped_production_calibration_fingerprint(foreign, None).is_none()
+            );
+            assert!(krea_request_scoped_static_behavior_fingerprint(foreign, None).is_none());
+        }
+    }
+
+    #[test]
+    fn an_unprovable_artifact_tier_withholds_the_identity_without_failing_the_contract() {
+        // An unsupported packed width: the marker is present and readable, and names a tier this
+        // lane has never measured.
+        let unsupported = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(unsupported.path(), Some(Quant::Q4));
+        std::fs::write(
+            unsupported.path().join("transformer").join("config.json"),
+            br#"{"quantization": {"bits": 5, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        // A malformed marker: present but not JSON.
+        let corrupt = tempfile::tempdir().unwrap();
+        let corrupt_spec = snapshot_at_tier(corrupt.path(), None);
+        std::fs::write(
+            corrupt.path().join("transformer").join("config.json"),
+            b"{ not json",
+        )
+        .unwrap();
+
+        // The INT8-ConvRot single-file DiT: a rotated artifact that is none of the three tiers.
+        let convrot = tempfile::tempdir().unwrap();
+        let mut convrot_spec = snapshot_at_tier(convrot.path(), None);
+        convrot_spec.components.insert(
+            KREA_CONVROT_DIT_COMPONENT.to_owned(),
+            WeightsSource::File(convrot.path().join("krea2_int8_convrot.safetensors")),
+        );
+
+        // An imported single file with no base snapshot: nothing to read the marker from.
+        let imported = tempfile::tempdir().unwrap();
+        let native = imported.path().join("imported.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let imported_spec = LoadSpec::new(WeightsSource::File(native));
+
+        for (label, spec) in [
+            ("unsupported packed width", &spec),
+            ("corrupt packed marker", &corrupt_spec),
+            ("convrot single-file DiT", &convrot_spec),
+            ("imported file without a base snapshot", &imported_spec),
+        ] {
+            for route in ROUTES {
+                let contract =
+                    build_krea_request_scoped_memory_strategy_contract(route, spec).unwrap();
+                assert!(
+                    contract.calibration.is_none(),
+                    "{route}: {label} must withhold the identity, not fabricate one"
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}: {label}");
+                assert_eq!(
+                    contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .unwrap()
+                        .support,
+                    gen_core::MemoryStrategySupport::Implemented,
+                    "{route}: {label}: the structural declaration still stands"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3534,9 +4065,15 @@ mod explicit_registry_tests {
                     .unwrap_or_else(|| {
                         panic!("{provider_id} must register its CUDA memory-strategy contract")
                     });
+                // A production load: the dense fixture snapshot proves the bf16 cell, and the
+                // identity names that route and that tier alone.
                 assert_eq!(
                     contract.calibration.as_ref().unwrap().fingerprint,
-                    super::REQUEST_SCOPED_MEMORY_FINGERPRINT,
+                    super::krea_request_scoped_production_calibration_fingerprint(
+                        provider_id,
+                        None
+                    )
+                    .unwrap(),
                     "{provider_id}"
                 );
                 for strategy in candle_gen::gen_core::MemoryStrategy::ALL {
