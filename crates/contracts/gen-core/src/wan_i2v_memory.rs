@@ -257,7 +257,13 @@ impl WanI2vRoute {
         }
     }
 
-    fn accepts_rate(self, fps: u32, frames: u32) -> bool {
+    /// The public `(fps, frames)` rate menu this route admits.
+    ///
+    /// `pub` since sc-22736 so a measurement harness can validate a planned video geometry against
+    /// the ENGINE's own menu instead of restating the manifest's `fps` / `durations` lists in a
+    /// second place — the two would then be free to drift, and the drift would only ever surface as
+    /// a refused capture on a host that already holds the weights.
+    pub fn accepts_rate(self, fps: u32, frames: u32) -> bool {
         match self {
             Self::Ti2v5b => match fps {
                 16 => [65, 81, 97, 113, 129].contains(&frames),
@@ -475,6 +481,33 @@ pub fn production_calibration_fingerprint(
     backend: WanI2vBackend,
     tier: MemoryNumericTier,
 ) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
+    Some(format!(
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-v1"
+    ))
+}
+
+/// The numeric tier a load spec names on `backend`, without opening anything.
+///
+/// This is the same `tier` resolution every sealed receipt runs — MLX reads the tier off the
+/// snapshot's own directory name when `quantize` is unset, Candle reads only `quantize` — exposed
+/// so a weights-free registry surface can key on the witness selector's tier rather than
+/// reimplementing that split (sc-22736).
+pub fn spec_numeric_tier(
+    spec: &LoadSpec,
+    backend: WanI2vBackend,
+) -> crate::Result<MemoryNumericTier> {
+    tier(spec, backend)
+}
+
+/// The `(route, backend, tier)` coordinate every A14B identity minted here is keyed on, or `None`
+/// for a cell this authority does not name. [`production_calibration_fingerprint`] documents why
+/// each token is part of the key and why the other three routes are silent.
+fn a14b_cell_tokens(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<(&'static str, &'static str, &'static str)> {
     let route_token = match route {
         WanI2vRoute::T2v14b => "wan2-2-t2v-a14b",
         WanI2vRoute::I2v14b => "wan2-2-i2v-a14b",
@@ -494,10 +527,149 @@ pub fn production_calibration_fingerprint(
         // `tier` refuses every other quant before a receipt can seal.
         Some(_) => return None,
     };
+    Some((route_token, backend_token, tier_token))
+}
+
+/// The **weights-free** registry-conformance identity of one A14B cell (sc-22736).
+///
+/// A catalog walk reads no artifact, so it can never prove a tier and must never publish a
+/// measurable identity. The `-weights-free-conformance-` infix puts every string minted here in a
+/// namespace no production string can enter, and the disjointness is asserted over the derived cell
+/// grid rather than over a frozen list.
+pub fn weights_free_calibration_fingerprint(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
     Some(format!(
-        "sc-22736-{route_token}-{backend_token}-{tier_token}-v1"
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-weights-free-conformance-v1"
     ))
 }
+
+/// The contract a registry catalog walk resolves for an A14B route whose root is **not**
+/// materialized (sc-22736, epic sc-22723 E1).
+///
+/// Identical in shape to the sealed contract — same strategy support, same lifecycle, same formula,
+/// same load shape — with [`MemoryAssetFacts::default`] in place of the header-derived facts and the
+/// isolated [`weights_free_calibration_fingerprint`] in place of the production identity. It touches
+/// no filesystem at all, which is the whole point: a [`crate::MemoryContractFixtureRegistration`] is
+/// consulted exactly when the weights are unavailable.
+///
+/// Only the two A14B routes are served. Ti2V-5B's weights-free fixture belongs to the per-crate
+/// `memory_strategy` modules that own its production identity, and the VACE routes register no
+/// memory strategy at all, so answering for either here would publish a second fixture for a cell
+/// that already has one.
+pub fn weights_free_contract(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+) -> crate::Result<MemoryProviderContract> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    if !matches!(route, WanI2vRoute::T2v14b | WanI2vRoute::I2v14b) {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority publishes no weights-free contract for it"
+        )));
+    }
+    let tier = tier(spec, backend)?;
+    let mut contract = contract(
+        provider_id,
+        route,
+        backend,
+        spec,
+        MemoryAssetFacts::default(),
+    );
+    contract.calibration = weights_free_calibration_fingerprint(route, backend, tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    Ok(contract)
+}
+
+/// The one public mode an A14B route admits: T2V carries nothing, I2V carries one Reference.
+///
+/// Named here rather than at three call sites so the weights-free admission surface and the
+/// weights-free behavior fixtures cannot disagree about which carrier the route takes.
+pub fn a14b_public_mode_key(route: WanI2vRoute) -> Option<&'static str> {
+    match route {
+        WanI2vRoute::T2v14b => Some("text_to_video"),
+        WanI2vRoute::I2v14b => Some("image_to_video"),
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+/// The single frame rate the A14B manifest menu publishes (`fps: [16]` on both routes).
+///
+/// [`WanI2vRoute::accepts_rate`] is still the authority on the `(fps, frames)` pair; this only says
+/// which of the rates that authority might admit an A14B cell actually ships, and it is asserted
+/// against `accepts_rate` rather than trusted.
+pub const A14B_PUBLIC_FPS: u32 = 16;
+
+/// Admission for an A14B route whose weights are **not** materialized (sc-22736, epic sc-22723 E1).
+///
+/// This is [`validate_context`] with exactly the artifact-bound clauses removed, and nothing else:
+///
+/// * `ensure_unchanged`, the `artifact_identity` receipt-tail prefix and the `adapter_identity`
+///   overlay comparison are all statements about a sealed snapshot, and there is no snapshot here.
+///   A weights-free context therefore carries no overlay at all rather than an overlay this
+///   function cannot check.
+/// * the receipt's embedded frame rate is likewise unavailable, so the rate menu is asked at
+///   [`A14B_PUBLIC_FPS`] — which is the only rate either A14B route's manifest ships, and
+///   `accepts_rate` still owns whether the frame count belongs to it.
+///
+/// Everything else — mode, carrier, geometry bucket, batch, PiD/phase exclusion, the selected
+/// strategy, and the whole of [`crate::standard_memory_strategy_safety_check`] (calibration ABI,
+/// fingerprint, load shape and tier) — is the same check the sealed path runs, which is what makes
+/// a registry conformance walk's mutation probes bite.
+pub fn validate_weights_free_context(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> crate::Result<()> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    let Some(mode_key) = a14b_public_mode_key(route) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority has no weights-free admission surface for it"
+        )));
+    };
+    let tier = tier(spec, backend)?;
+    let geometry = context.geometry;
+    let expected_references = u32::from(route == WanI2vRoute::I2v14b);
+    if context.mode.as_key() != mode_key
+        || geometry.batch != 1
+        || geometry.reference_count != expected_references
+        || context.has_reference != (expected_references > 0)
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.is_some()
+        || !route
+            .public_geometries()
+            .contains(&(geometry.width, geometry.height))
+        || !route.accepts_rate(A14B_PUBLIC_FPS, geometry.frames)
+        || !matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
+        )
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: crossed weights-free Wan A14B memory context"
+        )));
+    }
+    match crate::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
+    }
+}
+
+/// A geometry every A14B cell admits, for a weights-free behavior fixture: the manifest's own
+/// default resolution at its shortest published duration.
+///
+/// Read back through [`WanI2vRoute::public_geometries`] and [`WanI2vRoute::accepts_rate`] by
+/// `a14b_weights_free_fixture_geometry_is_admissible`, so a menu change cannot leave this naming a
+/// bucket the route stopped admitting.
+pub const A14B_FIXTURE_GEOMETRY: (u32, u32, u32) = (1280, 720, 45);
 
 fn repository_policy(
     backend: WanI2vBackend,
@@ -4848,6 +5020,165 @@ mod tests {
                 error.contains("Q8") || error.contains("q8") || error.contains("Q8"),
                 "{}: refusal does not name the tier: {error}",
                 route.provider_id()
+            );
+        }
+    }
+
+    /// sc-22736 (epic sc-22723, E1): the weights-free registry surface is per-cell, and no string it
+    /// mints can ever be mistaken for a measured production identity.
+    ///
+    /// Both sets are DERIVED from the same route x backend x tier grid rather than frozen, so a new
+    /// route or a new tier is swept the moment `WanI2vRoute::ALL` or the tier ladder moves.
+    ///
+    /// Mutation that fails this: dropping the `-weights-free-conformance-` infix (the two sets then
+    /// collide cell for cell), or keying the weights-free string on fewer coordinates than the
+    /// production one (two cells then share one fixture identity).
+    #[test]
+    fn the_weights_free_a14b_namespace_is_per_cell_and_disjoint_from_production() {
+        let mut production = BTreeSet::new();
+        let mut weights_free = BTreeSet::new();
+        let mut cells = 0_usize;
+        for route in WanI2vRoute::ALL {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let Some(free) = weights_free_calibration_fingerprint(route, backend, tier)
+                    else {
+                        // A route this authority does not name has neither string.
+                        assert_eq!(
+                            production_calibration_fingerprint(route, backend, tier),
+                            None,
+                            "{} has a production string but no weights-free sibling",
+                            route.provider_id()
+                        );
+                        continue;
+                    };
+                    let named = production_calibration_fingerprint(route, backend, tier)
+                        .expect("a named cell has both strings");
+                    assert!(
+                        weights_free.insert(free.clone()),
+                        "{free} names more than one cell"
+                    );
+                    assert!(
+                        production.insert(named.clone()),
+                        "{named} names more than one cell"
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 12, "two A14B routes x two backends x three tiers");
+        assert!(
+            production.is_disjoint(&weights_free),
+            "the weights-free namespace overlaps production: {:?}",
+            production.intersection(&weights_free).collect::<Vec<_>>()
+        );
+    }
+
+    /// The weights-free contract touches no filesystem, keeps the route's declared shape, and
+    /// publishes the isolated identity at the spec's own load shape — which is exactly what a
+    /// registry catalog walk on a host with no weights consumes.
+    #[test]
+    fn the_weights_free_contract_is_filesystem_free_and_publishes_the_isolated_identity() {
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for (quant, spec_of) in [
+                    (
+                        None,
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        )),
+                    ),
+                    (
+                        Some(Quant::Q4),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q4),
+                    ),
+                    (
+                        Some(Quant::Q8),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q8),
+                    ),
+                ] {
+                    let contract = weights_free_contract(route.provider_id(), backend, &spec_of)
+                        .unwrap_or_else(|error| {
+                            panic!("{:?} {} {quant:?}: {error}", backend, route.provider_id())
+                        });
+                    assert_eq!(contract.provider_id, route.provider_id());
+                    assert_eq!(contract.backend, backend.realization());
+                    assert_eq!(contract.load_shape, spec_of.load_shape);
+                    assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .expect("a weights-free A14B contract is calibratable");
+                    assert_eq!(
+                        identity.fingerprint,
+                        weights_free_calibration_fingerprint(route, backend, tier).unwrap()
+                    );
+                    assert_eq!(identity.load_shape, spec_of.load_shape);
+                }
+            }
+        }
+        // Ti2V-5B and the VACE routes are owned elsewhere and must be refused rather than answered.
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let spec = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            assert!(
+                weights_free_contract(route.provider_id(), WanI2vBackend::Mlx, &spec).is_err(),
+                "{} must not resolve a weights-free contract here",
+                route.provider_id()
+            );
+        }
+    }
+
+    /// The constants the weights-free surface hands a behavior fixture are READ BACK through the
+    /// route's own menus, so a manifest/menu change cannot leave them naming a bucket or a rate the
+    /// route stopped admitting.
+    #[test]
+    fn a14b_weights_free_fixture_geometry_is_admissible() {
+        let (width, height, frames) = A14B_FIXTURE_GEOMETRY;
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            assert!(
+                route.public_geometries().contains(&(width, height)),
+                "{}: {width}x{height} left the public bucket list",
+                route.provider_id()
+            );
+            assert!(
+                route.accepts_rate(A14B_PUBLIC_FPS, frames),
+                "{}: {frames}@{A14B_PUBLIC_FPS} left the public rate menu",
+                route.provider_id()
+            );
+            // The A14B menu really is single-rate; if that ever stops being true the weights-free
+            // surface has to carry the rate instead of assuming it.
+            for other in [8_u32, 24, 25, 30] {
+                assert!(
+                    !route.accepts_rate(other, frames),
+                    "{}: the A14B rate menu gained {other} fps",
+                    route.provider_id()
+                );
+            }
+            assert_eq!(
+                a14b_public_mode_key(route),
+                Some(if route == WanI2vRoute::T2v14b {
+                    "text_to_video"
+                } else {
+                    "image_to_video"
+                })
             );
         }
     }

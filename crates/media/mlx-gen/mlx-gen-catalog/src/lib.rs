@@ -932,8 +932,10 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 54);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 51);
+        // +2 on both counts in sc-22736: `wan2_2_t2v_14b` and `wan2_2_i2v_14b` now carry the
+        // pre-load half of what their loaded generators already publish.
+        assert_eq!(registry.memory_strategy_registrations().len(), 56);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 53);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
@@ -950,7 +952,11 @@ mod tests {
         // tier. SVD is instead covered by the separate resident-only witness assertion above.
         // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
         // rather than folded into a single total.
-        assert_eq!(surfaces.len(), 49 * 12 + 6 + 3);
+        //
+        // sc-22736 adds the two A14B routes as a THIRD narrowed shape: both ship all three tiers,
+        // and the MLX worker loads every one of them Resident + eagerly materialized, so each
+        // witnesses one selector per tier — 3 apiece, not 12.
+        assert_eq!(surfaces.len(), 49 * 12 + 6 + 3 + 2 * 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);

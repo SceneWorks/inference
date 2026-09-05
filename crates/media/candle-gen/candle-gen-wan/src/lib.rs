@@ -1313,7 +1313,15 @@ pub fn register_providers(
     let registry = registry
         .register_memory_strategy(memory_strategy::MEMORY_REGISTRATION)
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
-        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR);
+        .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
+        // sc-22736 (epic sc-22723, E1): the pre-load half for the two A14B routes, which loaded
+        // with a full receipt but resolved nothing before their weights existed.
+        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
+        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR);
     registry
         // The Wan 2.2 ComfyUI expert pair (epic 20398, sc-20644). Registering it is what makes
         // `ProviderRegistry::checkpoint_adapters` — and therefore SceneWorks'
@@ -1409,6 +1417,78 @@ mod explicit_registry_tests {
     ///
     /// Failing mutations: delete the `register_checkpoint_adapter` call from `register_providers`;
     /// change the binding's `provider_id` to an id no generator registers.
+    /// sc-22736 (epic sc-22723, E1): both A14B routes resolve a complete weights-free registry
+    /// surface, and the shared conformance walk drives their behavior seam.
+    ///
+    /// The candle CATALOG cannot ask this question: this crate's memory registrations are
+    /// `#[cfg(any(feature = "cuda", test))]`, and a catalog build compiles this crate as an
+    /// ordinary dependency with neither cfg set. The walk therefore lives here, where the
+    /// registrations exist, and it is the walk itself — not a hand-written probe — because
+    /// `check_memory_registration` is what mutates the calibration ABI, fingerprint, load shape,
+    /// numeric tier and budget and requires each mutation to be REFUSED.
+    ///
+    /// Mutation that fails this: making `a14b_safety_check` fall through to `Accept` on the
+    /// weights-free branch, or dropping the `standard_memory_strategy_safety_check` call out of
+    /// `validate_weights_free_context` (the ABI/fingerprint/shape/tier probes then all pass).
+    #[test]
+    fn both_a14b_routes_resolve_a_conformant_weights_free_registry_surface() {
+        use candle_gen::gen_core::{LoadShape, LoadSpec, MemoryStrategySupport, WeightsSource};
+
+        let registry = super::provider_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
+
+        for provider in [
+            crate::config::MODEL_ID_T2V_14B,
+            crate::config::MODEL_ID_I2V_14B,
+        ] {
+            let fixture = registry
+                .memory_contract_fixture_registrations()
+                .find(|fixture| fixture.provider_id == provider)
+                .unwrap_or_else(|| panic!("{provider} registers a weights-free fixture"));
+            let surfaces = (fixture.surface_specs)();
+            // Every shipped tier, one selector apiece: Sequential + eager, which is what
+            // `candle_video_offload_policy` names for both A14B routes.
+            assert_eq!(
+                surfaces.len(),
+                3,
+                "{provider} witnesses one selector per tier"
+            );
+            let mut identities = std::collections::BTreeSet::new();
+            for surface in &surfaces {
+                let contract = (fixture.contract)(&surface.spec).unwrap_or_else(|error| {
+                    panic!("{provider} {:?}: {error}", surface.selector.id())
+                });
+                assert_eq!(contract.provider_id, provider);
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{provider} publishes a fixture identity"));
+                assert!(
+                    identity.fingerprint.contains("-weights-free-conformance-"),
+                    "{provider}: a fixture must not publish a production string: {}",
+                    identity.fingerprint
+                );
+                assert!(
+                    identities.insert(identity.fingerprint.clone()),
+                    "{provider}: {} names more than one selector",
+                    identity.fingerprint
+                );
+                // The optimized rungs really are advertised, which is what obliges the behavior
+                // seam the conformance walk exercises.
+                assert_eq!(
+                    contract
+                        .capability(candle_gen::gen_core::MemoryStrategy::StagedResidency)
+                        .map(|capability| capability.support.clone()),
+                    Some(MemoryStrategySupport::Implemented)
+                );
+            }
+        }
+
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_load_shape(LoadShape::EagerMaterialization);
+        gen_core_testkit::memory_strategy_registry_conformance(&registry, &spec);
+    }
+
     #[test]
     fn the_wan_checkpoint_adapter_is_reachable_from_the_built_registry() {
         let registry = super::provider_registry().unwrap();
