@@ -471,8 +471,11 @@ fn proven_artifact_tier(spec: &LoadSpec) -> gen_core::Result<Option<QuantTier>> 
 ///
 /// * `spec.quantize` must be unset. On this engine the tier is the *directory*: every canonical
 ///   tier is already packed (or dense bf16), so a `quantize` knob would be an independent on-load
-///   transform whose peak no anchor measured. [`validate_load_spec`] refuses it outright; the
-///   identity withholds independently so the two cannot drift apart.
+///   transform whose peak no anchor measured. [`ArtifactReceipt::capture`] refuses it outright on
+///   the production path; the identity withholds independently so the two cannot drift apart.
+///   Since sc-22736 [`validate_load_spec`] admits it, because a weights-free surface SELECTOR
+///   carries its tier in `quantize` and never opens an artifact — the production refusal is the
+///   one that binds.
 /// * the load must carry no adapter. An overlay is a different resident set — `overlay_bytes` and
 ///   the folded-full-rank transient both move — and the clean base cell is the one the anchor
 ///   prices.
@@ -811,8 +814,19 @@ fn build_structural_evidence_in_backend(
 }
 
 fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    // sc-22736: Q4/Q8 pass this gate so a WEIGHTS-FREE SELECTOR can be built for the two packed
+    // tiers this lane ships. A `MemoryContractSurfaceSpec` carries its tier the only way a spec
+    // can — in `LoadSpec::quantize` (`MemoryContractSurfaceTier::load_spec`) — so refusing
+    // `quantize` here left `q4` and `q8` with no constructible witness at all, while the tier axis
+    // is exactly what the witness set exists to enumerate.
+    //
+    // A PRODUCTION load still refuses it, unchanged: on this engine the tier is the DIRECTORY, and
+    // `ArtifactReceipt::capture` rejects a canonical-tier load that also asks for a second on-load
+    // quantization. That refusal — not this gate — is what keeps the identity bound to the
+    // artifact, and `production_calibration_identity` withholds on `quantize` independently of
+    // both.
     if spec.precision != Precision::Bf16
-        || spec.quantize.is_some()
+        || !matches!(spec.quantize, None | Some(Quant::Q4) | Some(Quant::Q8))
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
@@ -987,11 +1001,15 @@ fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryPro
     ))
 }
 
+/// The witness set for the Resident-only MLX SCAIL-2 surface.
+///
+/// All three shipped tiers since sc-22736 — `SceneWorks/scail2-mlx` ships `bf16`, `q8` and `q4` to
+/// every platform and BOTH engine lanes open that same per-tier turnkey, so witnessing only `bf16`
+/// left the two packed cells of this lane with no constructible weights-free contract at all. The
+/// offload and materialization selectors are published whole because the contract does not vary on
+/// them.
 fn resident_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
     gen_core::mlx_memory_contract_surface_specs()
-        .into_iter()
-        .filter(|surface| surface.selector.tier == gen_core::MemoryContractSurfaceTier::Bf16)
-        .collect()
 }
 
 fn validate_route(
@@ -1153,6 +1171,62 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
 mod tests {
     use super::*;
     use mlx_gen::{Conditioning, GenerationRequest, Image, ReplacementMode};
+
+    /// sc-22736 (epic sc-22723, E1): the MLX witness set covers EVERY shipped tier.
+    ///
+    /// `SceneWorks/scail2-mlx` ships `bf16`, `q8` and `q4`, and this lane opens all three, but the
+    /// witness set filtered itself to `bf16` and `validate_load_spec` refused any `quantize` at all
+    /// — so the two packed cells of this lane had no constructible weights-free contract, and a
+    /// consumer resolving one fell through to `PreparedMemory::prepare`, which opens the artifact.
+    ///
+    /// The tier set is spelled out against the shared MLX default rather than counted, so a filter
+    /// that drops one tier or a shared default that grows one is a red test either way. Each
+    /// selector is then actually BUILT, which is what a witness set claims and what a `quantize`
+    /// rejection would break.
+    ///
+    /// Failing mutations, both run: restore the `tier == Bf16` filter on `resident_surface_specs`;
+    /// restore `spec.quantize.is_some()` in `validate_load_spec`.
+    #[test]
+    fn the_weights_free_witness_set_covers_every_shipped_tier() {
+        let surfaces = resident_surface_specs();
+        assert_eq!(
+            surfaces
+                .iter()
+                .map(|surface| surface.selector.id().to_owned())
+                .collect::<std::collections::BTreeSet<_>>(),
+            gen_core::mlx_memory_contract_surface_specs()
+                .iter()
+                .map(|surface| surface.selector.id().to_owned())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the MLX SCAIL-2 witness set is the shared MLX default, unfiltered"
+        );
+        let mut tiers = std::collections::BTreeSet::new();
+        for surface in &surfaces {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap_or_else(|error| {
+                panic!("{}: {error}", surface.selector.id());
+            });
+            assert_eq!(
+                contract
+                    .calibration
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                Some(WEIGHTS_FREE_CONFORMANCE_FINGERPRINT),
+                "{}: a witness must never publish a production identity",
+                surface.selector.id()
+            );
+            tiers.insert(surface.selector.tier);
+        }
+        assert_eq!(
+            tiers,
+            [
+                gen_core::MemoryContractSurfaceTier::Bf16,
+                gen_core::MemoryContractSurfaceTier::Q4,
+                gen_core::MemoryContractSurfaceTier::Q8,
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
 
     /// AC (SC-22662): the SCAIL-2 contract publishes the axes of the Wan-derived trunk and the
     /// z16 video VAE this crate declares, and passes the shared facts conformance check.
