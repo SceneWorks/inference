@@ -2999,14 +2999,17 @@ pub fn validate_context(
                 | MemoryStrategy::BoundedDecode
         ),
     };
+    // Which public modes carry a reference still, named rather than written as the negation of the
+    // two that do not: `has_reference != !matches!(..)` said the same thing and read as a typo, and
+    // `-D clippy::nonminimal_bool` refuses it on the CUDA lane.
+    let carries_reference = !matches!(
+        mode,
+        WanPublicMode::VideoBridge | WanPublicMode::TextToVideo
+    );
     if !selection_ok
         || geometry.batch != 1
         || !carrier_ok
-        || (context.has_reference
-            != !matches!(
-                mode,
-                WanPublicMode::VideoBridge | WanPublicMode::TextToVideo
-            ))
+        || context.has_reference != carries_reference
         || !prepared
             .route
             .public_geometries()
