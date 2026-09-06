@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use mlx_gen::gen_core::MemoryPhase;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -96,6 +97,9 @@ pub struct KreaRealtimeJob<'a> {
     pub seed: u64,
     /// Few-step denoise-count override (`None` = the config's `denoising_step_list`).
     pub steps: Option<usize>,
+    /// Request-scoped shared-ladder levers, carried from the `GenerationRequest`. Only the
+    /// authorized calibration-fault pair is consumed today (sc-22738); the default arms nothing.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
 }
 
 /// The **Mac memory-feasible** AR config: bound the KV read/store window to the streaming frame count
@@ -478,11 +482,17 @@ pub fn generate_t2v_from_components(
     // `on_progress` are threaded INTO the loop (sc-8441 S8): it polls the flag per AR step and emits a
     // `Progress::Step` per denoise step, so a mid-clip cancel bails within ~one step (not just here at
     // the stage boundary).
+    // SC-15449/sc-22738: the next call runs the first AR denoise step — the physical denoise
+    // boundary for this clip.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Denoise)?;
     let latents = generate_latents(transformer, cfg, context, params, cancel, on_progress)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
+    // SC-15449/sc-22738: the latents are denoised and the z16 VAE is about to decode the first
+    // frame — the physical decode boundary.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Decode)?;
     // `out_frames` trims the z16 decode's leading over-delivery back to the requested output count.
     decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
 }
@@ -573,6 +583,9 @@ pub fn generate_i2v_from_components(
     // Stage 2: warm the cache from the reference + AR-generate the continuation conditioned on it. The
     // `cancel` + `on_progress` thread INTO the loop (sc-8441 S8) — per-step cancel poll + per-step
     // sampling progress across the generated chunks.
+    // SC-15449/sc-22738: the physical denoise boundary — the reference latent is materialized and
+    // the next call runs the first AR denoise step.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Denoise)?;
     let latents = generate_i2v_latents(
         transformer,
         cfg,
@@ -586,6 +599,8 @@ pub fn generate_i2v_from_components(
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
+    // SC-15449/sc-22738: the physical decode boundary.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Decode)?;
     decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
 }
 
@@ -624,6 +639,9 @@ pub fn generate_v2v_from_components(
     }
     // Stage 2: strength-controlled AR generation from the renoised source. The `cancel` +
     // `on_progress` thread INTO the loop (sc-8441 S8) — per-step cancel poll + per-step progress.
+    // SC-15449/sc-22738: the physical denoise boundary — the source latent is materialized and the
+    // next call runs the first AR denoise step.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Denoise)?;
     let latents = generate_v2v_latents(
         transformer,
         cfg,
@@ -638,6 +656,8 @@ pub fn generate_v2v_from_components(
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
+    // SC-15449/sc-22738: the physical decode boundary.
+    crate::memory_strategy::calibration_fault(&params.memory, MemoryPhase::Decode)?;
     decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
 }
 
@@ -854,6 +874,10 @@ pub(crate) fn generate_t2v_reported(
     let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
 
+    // SC-15449/sc-22738: the prompt is encoded and the text encoder has been released — the
+    // physical conditioning boundary. `stage_components` materializes the context, so an armed
+    // fault fails here without perturbing an ordinary render.
+    crate::memory_strategy::calibration_fault(&job.memory, MemoryPhase::Conditioning)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -861,6 +885,7 @@ pub(crate) fn generate_t2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = (num_latent_frames * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -1025,6 +1050,10 @@ pub(crate) fn generate_i2v_reported(
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
     let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
+    // SC-15449/sc-22738: the prompt is encoded and the text encoder has been released — the
+    // physical conditioning boundary. `stage_components` materializes the context, so an armed
+    // fault fails here without perturbing an ordinary render.
+    crate::memory_strategy::calibration_fault(&job.memory, MemoryPhase::Conditioning)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -1032,6 +1061,7 @@ pub(crate) fn generate_i2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = ((F_REF + num_generate) * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -1108,6 +1138,10 @@ pub(crate) fn generate_v2v_reported(
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
     let (context, transformer, vae, adapter_reports) =
         stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
+    // SC-15449/sc-22738: the prompt is encoded and the text encoder has been released — the
+    // physical conditioning boundary. `stage_components` materializes the context, so an armed
+    // fault fails here without perturbing an ordinary render.
+    crate::memory_strategy::calibration_fault(&job.memory, MemoryPhase::Conditioning)?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -1115,6 +1149,7 @@ pub(crate) fn generate_v2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = (num_latent * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -1142,6 +1177,86 @@ pub(crate) fn generate_v2v_reported(
 mod tests {
     use super::*;
 
+    /// sc-22738: the Conditioning fault fires on the real conditioning boundary — after the prompt
+    /// encode staged (and released) the text encoder, and before any generation params are built —
+    /// on every reported route. Pinned as source text because the encode itself needs the snapshot.
+    #[test]
+    fn the_conditioning_calibration_fault_follows_the_prompt_encode_on_every_route() {
+        let source = include_str!("t2v.rs");
+        let routes = [
+            "pub(crate) fn generate_t2v_reported(",
+            "pub(crate) fn generate_i2v_reported(",
+            "pub(crate) fn generate_v2v_reported(",
+        ];
+        for route in routes {
+            let body = source
+                .split_once(route)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1;
+            let staged = body.find("stage_components(root").expect("prompt encode");
+            let fault = body
+                .find("MemoryPhase::Conditioning")
+                .unwrap_or_else(|| panic!("{route} has no Conditioning calibration fault"));
+            let params = body.find("ArGenParams {").expect("generation params");
+            assert!(
+                staged < fault && fault < params,
+                "{route} must refuse between the prompt encode and the generation"
+            );
+        }
+    }
+
+    /// sc-22738: each `*_from_components` seam refuses at its denoise boundary before the AR loop and
+    /// at its decode boundary before the VAE, in that order.
+    #[test]
+    fn the_denoise_and_decode_faults_bracket_every_component_seam() {
+        let source = include_str!("t2v.rs");
+        for (route, start, generate) in [
+            (
+                "t2v",
+                "pub fn generate_t2v_from_components(",
+                "let latents = generate_latents(",
+            ),
+            (
+                "i2v",
+                "pub fn generate_i2v_from_components(",
+                "let latents = generate_i2v_latents(",
+            ),
+            (
+                "v2v",
+                "pub fn generate_v2v_from_components(",
+                "let latents = generate_v2v_latents(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1
+                .split_once("\n}\n")
+                .expect("function end")
+                .0;
+            let denoise = body
+                .find("MemoryPhase::Denoise")
+                .unwrap_or_else(|| panic!("{route} has no Denoise fault"));
+            let ar = body.find(generate).expect("AR generation");
+            let decode_fault = body
+                .find("MemoryPhase::Decode")
+                .unwrap_or_else(|| panic!("{route} has no Decode fault"));
+            let decode = body.find("decode_latents_to_video(").expect("VAE decode");
+            assert!(
+                denoise < ar,
+                "{route}: the Denoise fault must precede the AR loop"
+            );
+            assert!(
+                ar < decode_fault,
+                "{route}: the Decode fault must follow the AR loop"
+            );
+            assert!(
+                decode_fault < decode,
+                "{route}: the Decode fault must precede the VAE decode"
+            );
+        }
+    }
+
     #[test]
     fn latent_frame_count_uses_causal_convention() {
         // (frames − 1)/4 + 1: 1→1, 4→1, 5→2, 8→2, 9→3, 21 latent for 81 frames.
@@ -1167,6 +1282,7 @@ mod tests {
             fps: 16,
             seed: 0,
             steps: None,
+            memory: Default::default(),
         };
         let missing = Path::new("/nonexistent-krea-realtime-snapshot");
         let t2v_error = generate_t2v(

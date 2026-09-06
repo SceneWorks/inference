@@ -492,6 +492,46 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
     )
 }
 
+/// Is an **authorized** calibration fault armed for `phase` on this request-scoped memory selection?
+///
+/// The shared request floor (`GenerationMemory::authorize_calibration_fault`) sets the pair; a
+/// production selector leaves both controls unset, so this is a `false` for every ordinary render.
+/// Callers use it to arm the extra materialization a fault boundary needs without perturbing an
+/// ordinary render's laziness.
+pub(crate) fn calibration_fault_armed(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    phase: MemoryPhase,
+) -> bool {
+    memory.is_some_and(|memory| {
+        memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+    })
+}
+
+/// Request-local conformance fault at a physical phase boundary (SC-15449, sc-22738), keyed on a
+/// request-scoped memory selection. Mirrors the FLUX/Chroma/Z-Image spelling so a lifecycle
+/// certification sees the same error at the same boundaries on every MLX family.
+pub(crate) fn calibration_fault_for_memory(
+    memory: Option<mlx_gen::gen_core::GenerationMemory>,
+    phase: MemoryPhase,
+    provider_id: &str,
+) -> mlx_gen::Result<()> {
+    if calibration_fault_armed(memory, phase) {
+        return Err(mlx_gen::Error::Msg(format!(
+            "{provider_id}: injected memory-strategy calibration error at {phase:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// [`calibration_fault_for_memory`] against a whole request — the spelling the model layer uses.
+pub(crate) fn calibration_fault(
+    req: &mlx_gen::GenerationRequest,
+    phase: MemoryPhase,
+    provider_id: &str,
+) -> mlx_gen::Result<()> {
+    calibration_fault_for_memory(req.memory, phase, provider_id)
+}
+
 /// Compatibility shim for the former bespoke imported-control entrypoint.
 #[cfg(test)]
 pub(crate) fn native_memory_strategy_contract(
@@ -776,6 +816,60 @@ fn begin_request_with_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every phase: the authorized pair refuses at exactly its own boundary and nowhere else.
+    #[test]
+    fn an_authorized_calibration_fault_refuses_at_exactly_its_named_phase() {
+        for named in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            let mut memory = mlx_gen::gen_core::GenerationMemory::default();
+            memory.authorize_calibration_fault(named);
+            for phase in [
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ] {
+                let result =
+                    calibration_fault_for_memory(Some(memory), phase, crate::KREA_2_RAW_ID);
+                if phase == named {
+                    let error = result.expect_err("the named phase must refuse").to_string();
+                    assert!(error.contains(&format!("{phase:?}")), "{error}");
+                    assert!(error.contains(crate::KREA_2_RAW_ID), "{error}");
+                } else {
+                    assert!(result.is_ok(), "{phase:?} must not fire for {named:?}");
+                }
+                assert_eq!(calibration_fault_armed(Some(memory), phase), phase == named);
+            }
+        }
+    }
+
+    /// A phase selection WITHOUT the harness authorization is inert: an ordinary render proceeds.
+    #[test]
+    fn an_unauthorized_phase_selection_never_refuses_a_render() {
+        for phase in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            let memory = mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(phase),
+                calibration_fault_harness_authorized: false,
+                ..Default::default()
+            };
+            assert!(!calibration_fault_armed(Some(memory), phase));
+            assert!(
+                calibration_fault_for_memory(Some(memory), phase, crate::KREA_2_RAW_ID).is_ok(),
+                "{phase:?} must render normally without harness authorization"
+            );
+        }
+        assert!(
+            calibration_fault_for_memory(None, MemoryPhase::Decode, crate::KREA_2_RAW_ID).is_ok()
+        );
+    }
+
     use mlx_gen::gen_core::{
         MemoryBudget, MemoryCacheState, MemoryMode, MemorySelection, MemoryStrategyParameters,
         Precision, Quant, WeightsSource,

@@ -200,6 +200,7 @@ impl AdmittedControlGeometry {
             scheduler: req.scheduler.clone(),
             transformer_window_size,
             memory: req.memory.unwrap_or_default(),
+            provider_id: KREA_2_TURBO_CONTROL_ID,
         }
     }
 }
@@ -644,19 +645,15 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
+    /// The shared authorized phase-boundary fault (sc-22738). Before this the pose-control arm
+    /// honoured `calibration_error_phase` WITHOUT the `calibration_fault_harness_authorized`
+    /// conjunct, so an unauthorized phase selection refused an otherwise valid render.
     fn calibration_fault(
         &self,
         req: &GenerationRequest,
         phase: gen_core::MemoryPhase,
     ) -> Result<()> {
-        match req.memory {
-            Some(memory) if memory.calibration_error_phase == Some(phase) => {
-                Err(Error::Msg(format!(
-                    "{KREA_2_TURBO_CONTROL_ID}: injected memory-strategy calibration error at {phase:?}"
-                )))
-            }
-            _ => Ok(()),
-        }
+        crate::memory_strategy::calibration_fault(req, phase, KREA_2_TURBO_CONTROL_ID)
     }
 
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
@@ -699,9 +696,10 @@ impl KreaTurboControl {
                 // `Residency::run` materializes only under Sequential. For calibration fault
                 // injection, evaluate at the conditioning boundary here as well so Resident and
                 // Sequential exercise the same physical phase without changing ordinary renders.
-                if req.memory.is_some_and(|memory| {
-                    memory.calibration_error_phase == Some(gen_core::MemoryPhase::Conditioning)
-                }) {
+                if crate::memory_strategy::calibration_fault_armed(
+                    req.memory,
+                    gen_core::MemoryPhase::Conditioning,
+                ) {
                     mlx_rs::transforms::eval([&context])?;
                     self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
                 }
@@ -773,7 +771,6 @@ impl KreaTurboControl {
                             .alternate_decoder
                             .map(|decoder| decoder as &dyn LatentDecoder),
                         decode_tiling.as_ref(),
-                        req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
                         &req.cancel,
                         &req.preview,

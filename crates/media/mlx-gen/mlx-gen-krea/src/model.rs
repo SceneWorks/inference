@@ -1382,7 +1382,7 @@ impl Krea {
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                self.encode_contexts(
+                let ctx = self.encode_contexts(
                     text,
                     req,
                     is_raw,
@@ -1390,7 +1390,26 @@ impl Krea {
                     encode_guidance,
                     &negative,
                     &edit_sources,
-                )
+                )?;
+                // SC-15449/sc-22738: the conditioning phase physically completes here. `Residency::run`
+                // materializes only under `Sequential`, so an armed fault evaluates the contexts itself
+                // — the boundary is then identical under both residencies, and an ordinary render (both
+                // controls unset) keeps its laziness untouched.
+                if crate::memory_strategy::calibration_fault_armed(
+                    req.memory,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                ) {
+                    match &ctx.neg {
+                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                        None => mlx_rs::transforms::eval([&ctx.pos])?,
+                    }
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Conditioning,
+                        self.descriptor.id,
+                    )?;
+                }
+                Ok(ctx)
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
@@ -1458,7 +1477,15 @@ impl Krea {
                             scheduler: req.scheduler.clone(),
                             transformer_window_size,
                             memory: req.memory.unwrap_or_default(),
+                            provider_id: self.descriptor.id,
                         };
+                        // SC-15449/sc-22738: the next call runs the first heavy DiT step of this
+                        // image's denoise — the physical denoise boundary.
+                        crate::memory_strategy::calibration_fault(
+                            req,
+                            mlx_gen::gen_core::MemoryPhase::Denoise,
+                            self.descriptor.id,
+                        )?;
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
                             full,
@@ -1543,7 +1570,17 @@ impl Krea {
                         scheduler: req.scheduler.clone(),
                         transformer_window_size,
                         memory: req.memory.unwrap_or_default(),
+                        provider_id: self.descriptor.id,
                     };
+                    // SC-15449/sc-22738: the dispatch below runs the first heavy DiT step of this
+                    // image's denoise — the physical denoise boundary. The count-invariant plan
+                    // (reference VAE encode + text fusion) is already built, so an armed fault fails
+                    // exactly where the denoise begins.
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Denoise,
+                        self.descriptor.id,
+                    )?;
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical
                     // to Resident.
@@ -2024,6 +2061,60 @@ mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
     use std::path::PathBuf;
+
+    /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
+    /// The calibration-fault boundaries are structural claims about *where* in this body the fault
+    /// fires; a weights-free test cannot drive the real DiT, so the placement is pinned here and the
+    /// gating behaviour by `memory_strategy`'s own tests.
+    fn generate_impl_source() -> &'static str {
+        let source = include_str!("model.rs");
+        let body = source
+            .split_once("    fn generate_impl(")
+            .expect("generate_impl")
+            .1;
+        body.split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(body)
+    }
+
+    /// Conditioning: the fault fires inside the text-encode phase, before the heavy phase begins.
+    #[test]
+    fn the_conditioning_calibration_fault_fires_before_the_heavy_phase() {
+        let body = generate_impl_source();
+        let fault = body
+            .find("MemoryPhase::Conditioning")
+            .expect("generate_impl must carry a Conditioning calibration fault");
+        let heavy = body
+            .find("// Phase B: heavy render components")
+            .expect("phase B marker");
+        assert!(
+            fault < heavy,
+            "the Conditioning fault must fire in the text-encode phase, not after it"
+        );
+    }
+
+    /// Denoise: every render dispatch is preceded by the fault, so no route reaches a DiT step first.
+    #[test]
+    fn the_denoise_calibration_fault_precedes_every_render_dispatch() {
+        let body = generate_impl_source();
+        for dispatch in ["heavy.heavy.render_multiphase(", "let img = match &plan {"] {
+            let at = body
+                .find(dispatch)
+                .unwrap_or_else(|| panic!("missing render dispatch {dispatch}"));
+            let fault = body[..at]
+                .rfind("MemoryPhase::Denoise")
+                .unwrap_or_else(|| panic!("no Denoise fault before {dispatch}"));
+            assert!(
+                !body[fault..at].contains("heavy.heavy.render_"),
+                "the Denoise fault must be the last thing before {dispatch}"
+            );
+        }
+        assert_eq!(
+            body.matches("MemoryPhase::Denoise").count(),
+            2,
+            "one Denoise fault per render dispatch"
+        );
+    }
 
     #[test]
     fn bounded_encoder_contracts_retain_production_policy_and_production_headers_stay_exact() {

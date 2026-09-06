@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 
+use mlx_gen::gen_core::MemoryPhase;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, GenerationOutput, Image, Progress};
 use mlx_gen_krea_realtime::{
@@ -326,6 +327,7 @@ fn params(seed: u64, frames: usize) -> ArGenParams {
         latent_height: 4,
         latent_width: 4,
         fps: 16,
+        memory: Default::default(),
     }
 }
 
@@ -333,6 +335,119 @@ fn video_frames(out: &GenerationOutput) -> &Vec<mlx_gen::Image> {
     match out {
         GenerationOutput::Video { frames, .. } => frames,
         other => panic!("expected Video output, got {other:?}"),
+    }
+}
+
+/// A tiny-config `params` with a calibration fault selected for `phase`, authorized or not.
+fn fault_params(seed: u64, frames: usize, phase: MemoryPhase, authorized: bool) -> ArGenParams {
+    let mut params = params(seed, frames);
+    params.memory.calibration_error_phase = Some(phase);
+    params.memory.calibration_fault_harness_authorized = authorized;
+    params
+}
+
+/// sc-22738: the authorized Denoise fault refuses at the physical denoise boundary — before the AR
+/// loop runs a single step, so no `Progress::Step` and no decode ever happen.
+#[test]
+fn the_authorized_denoise_fault_refuses_before_the_first_ar_step() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+    let mut seen: Vec<Progress> = Vec::new();
+    let mut on_progress = |p: Progress| seen.push(p);
+
+    let error = generate_t2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &fault_params(42, 4, MemoryPhase::Denoise, true),
+        None,
+        None,
+        &cancel,
+        &mut on_progress,
+    )
+    .expect_err("an authorized Denoise fault must refuse");
+
+    let error = error.to_string();
+    assert!(error.contains("Denoise"), "{error}");
+    assert!(error.contains("krea_realtime_14b"), "{error}");
+    assert!(
+        seen.is_empty(),
+        "the fault must precede the denoise: {seen:?}"
+    );
+}
+
+/// sc-22738: the authorized Decode fault refuses at the physical decode boundary — after the denoise
+/// has run (steps were reported) but before the VAE produces a single frame.
+#[test]
+fn the_authorized_decode_fault_refuses_before_the_vae_decode() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+    let mut seen: Vec<Progress> = Vec::new();
+    let mut on_progress = |p: Progress| seen.push(p);
+
+    let error = generate_t2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &fault_params(42, 4, MemoryPhase::Decode, true),
+        None,
+        None,
+        &cancel,
+        &mut on_progress,
+    )
+    .expect_err("an authorized Decode fault must refuse");
+
+    let error = error.to_string();
+    assert!(error.contains("Decode"), "{error}");
+    assert!(error.contains("krea_realtime_14b"), "{error}");
+    assert!(
+        seen.iter().any(|p| matches!(p, Progress::Step { .. })),
+        "the denoise must have completed before the decode boundary: {seen:?}"
+    );
+}
+
+/// sc-22738: a phase selection WITHOUT the harness authorization is inert — the clip renders.
+#[test]
+fn an_unauthorized_phase_selection_renders_the_clip_normally() {
+    let cfg = tiny_cfg();
+    let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
+        .expect("load tiny DiT");
+    let transformer = CausalKreaTransformer::new(dit, &cfg);
+    let vae = tiny_vae();
+    let context = tiny_context(&cfg);
+    let cancel = CancelFlag::default();
+    let mut noop = |_: Progress| {};
+
+    for phase in [
+        MemoryPhase::Conditioning,
+        MemoryPhase::Denoise,
+        MemoryPhase::Decode,
+    ] {
+        let out = generate_t2v_from_components(
+            &transformer,
+            &cfg,
+            &vae,
+            &context,
+            &fault_params(42, 2, phase, false),
+            None,
+            None,
+            &cancel,
+            &mut noop,
+        )
+        .unwrap_or_else(|error| panic!("{phase:?} must render normally: {error}"));
+        assert_eq!(video_frames(&out).len(), 4 * 2, "{phase:?}");
     }
 }
 

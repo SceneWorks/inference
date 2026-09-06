@@ -770,10 +770,83 @@ pub const RESIDENT_ONLY_WITNESS: ResidentOnlyMemoryContractRegistration =
         surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
     };
 
+/// Is an **authorized** calibration fault armed for `phase` on this request-scoped selection?
+///
+/// The shared request floor (`GenerationMemory::authorize_calibration_fault`) sets the pair; a
+/// production selector leaves both controls unset, so this is `false` for every ordinary render.
+pub(crate) fn calibration_fault_armed(
+    memory: &mlx_gen::gen_core::GenerationMemory,
+    phase: MemoryPhase,
+) -> bool {
+    memory.calibration_fault_harness_authorized && memory.calibration_error_phase == Some(phase)
+}
+
+/// Request-local conformance fault at a physical phase boundary (SC-15449, sc-22738). Mirrors the
+/// FLUX/Chroma/Z-Image/Krea spelling so a lifecycle certification sees the same error at the same
+/// boundaries on every MLX family.
+pub(crate) fn calibration_fault(
+    memory: &mlx_gen::gen_core::GenerationMemory,
+    phase: MemoryPhase,
+) -> Result<()> {
+    if calibration_fault_armed(memory, phase) {
+        return Err(Error::Msg(format!(
+            "{MODEL_ID}: injected memory-strategy calibration error at {phase:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_gen::Quant;
+
+    /// sc-22738: the authorized pair refuses at exactly its own phase and nowhere else.
+    #[test]
+    fn an_authorized_calibration_fault_refuses_at_exactly_its_named_phase() {
+        for named in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            let mut memory = mlx_gen::gen_core::GenerationMemory::default();
+            memory.authorize_calibration_fault(named);
+            for phase in [
+                MemoryPhase::Conditioning,
+                MemoryPhase::Denoise,
+                MemoryPhase::Decode,
+            ] {
+                assert_eq!(calibration_fault_armed(&memory, phase), phase == named);
+                let result = calibration_fault(&memory, phase);
+                if phase == named {
+                    let error = result.expect_err("the named phase must refuse").to_string();
+                    assert!(error.contains(&format!("{phase:?}")), "{error}");
+                    assert!(error.contains(MODEL_ID), "{error}");
+                } else {
+                    assert!(result.is_ok(), "{phase:?} must not fire for {named:?}");
+                }
+            }
+        }
+    }
+
+    /// sc-22738: a phase selection WITHOUT the harness authorization never refuses a render.
+    #[test]
+    fn an_unauthorized_phase_selection_never_refuses_a_render() {
+        for phase in [
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ] {
+            let memory = mlx_gen::gen_core::GenerationMemory {
+                calibration_error_phase: Some(phase),
+                calibration_fault_harness_authorized: false,
+                ..Default::default()
+            };
+            assert!(!calibration_fault_armed(&memory, phase));
+            assert!(calibration_fault(&memory, phase).is_ok(), "{phase:?}");
+        }
+        assert!(calibration_fault(&Default::default(), MemoryPhase::Decode).is_ok());
+    }
 
     /// AC (SC-22662): the Krea Realtime contract publishes the axes of the Wan 2.1 T2V-14B trunk
     /// and z16 video VAE it reuses, and passes the shared facts conformance check.

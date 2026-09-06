@@ -515,6 +515,7 @@ impl KreaRealtime {
             fps: frames.fps,
             seed: req.seed.unwrap_or_else(default_seed),
             steps: req.steps.map(|s| s as usize),
+            memory: req.memory.unwrap_or_default(),
         };
 
         // Route on the advertised conditioning (sc-8440 S7): a `VideoClip` source → v2v; else a

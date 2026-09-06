@@ -126,6 +126,9 @@ pub struct TurboOptions {
     pub transformer_window_size: Option<usize>,
     /// Request-scoped shared-ladder levers. The default preserves the historical unbounded paths.
     pub memory: mlx_gen::gen_core::GenerationMemory,
+    /// Descriptor id of the provider driving this render. Names the provider in the decode-boundary
+    /// calibration fault (sc-22738), where the model layer's descriptor is out of scope.
+    pub provider_id: &'static str,
 }
 
 impl TurboOptions {
@@ -741,7 +744,6 @@ impl KreaHeavy {
             control_scale,
             None,
             None,
-            None,
             opts,
             cancel,
             &PreviewSink::default(),
@@ -789,7 +791,6 @@ impl KreaHeavy {
         control_scale: f32,
         decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
-        calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
         preview: &PreviewSink,
@@ -830,12 +831,14 @@ impl KreaHeavy {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        if calibration_error_phase == Some(mlx_gen::gen_core::MemoryPhase::Decode) {
-            return Err(Error::Msg(
-                "krea_2_turbo_control: injected memory-strategy calibration error at Decode"
-                    .to_owned(),
-            ));
-        }
+        // SC-15449/sc-22738: the pose-control decode boundary, through the same authorized gate as
+        // every other Krea route (the former literal here honoured the phase without the harness
+        // authorization conjunct, so an unauthorized phase selection could refuse a real render).
+        crate::memory_strategy::calibration_fault_for_memory(
+            Some(opts.memory),
+            mlx_gen::gen_core::MemoryPhase::Decode,
+            opts.provider_id,
+        )?;
         self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)
     }
 
@@ -1478,6 +1481,14 @@ impl KreaHeavy {
         opts: &TurboOptions,
         cancel: &CancelFlag,
     ) -> Result<Image> {
+        // SC-15449/sc-22738: the physical decode boundary for every t2i/img2img/edit/multi-phase
+        // route — the latent is denoised and the VAE is about to run. Placed on the decode entry
+        // itself so the fault fires before any decode work, not after it.
+        crate::memory_strategy::calibration_fault_for_memory(
+            Some(opts.memory),
+            mlx_gen::gen_core::MemoryPhase::Decode,
+            opts.provider_id,
+        )?;
         self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)
     }
 
@@ -2145,6 +2156,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("out_hidden_size"), "{error}");
+    }
+
+    /// Decode: every route's decode entry refuses BEFORE the VAE runs. `decode_latents` is the one
+    /// decode entry for the t2i/img2img/edit/multi-phase routes; the pose-control route decodes
+    /// through `decode_latents_with_tiling` directly and carries its own hook.
+    #[test]
+    fn the_decode_calibration_fault_precedes_every_vae_decode() {
+        let source = include_str!("pipeline.rs");
+        for (route, start, end) in [
+            (
+                "base routes",
+                "    fn decode_latents(\n",
+                "    /// Decode through the shared trait seam.",
+            ),
+            (
+                "pose control",
+                "    pub fn render_control_from(",
+                "    /// **img2img latent-init Turbo render**",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            let fault = body
+                .find("MemoryPhase::Decode")
+                .unwrap_or_else(|| panic!("{route} has no Decode calibration fault"));
+            let decode = body
+                .find("self.decode_latents_with_tiling(")
+                .unwrap_or_else(|| panic!("{route} has no decode call"));
+            assert!(
+                fault < decode,
+                "{route} must refuse before the VAE decode, not after it"
+            );
+        }
     }
 
     #[test]
