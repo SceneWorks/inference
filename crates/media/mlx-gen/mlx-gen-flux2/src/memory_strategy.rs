@@ -1029,11 +1029,10 @@ fn klein_contract_with_inventory(
     spec: &LoadSpec,
     inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    // Price from the inventory the caller already verified: the registry footprint callbacks
+    // The caller already verified the inventory: the registry footprint callbacks
     // (`component_footprint` and friends) re-run `verify_for_provider`, which re-walks all three
-    // component directories and re-parses every shard header.
-    let footprint =
-        crate::model::klein_component_footprint_with_inventory(provider_id, spec, inventory)?;
+    // component directories and re-parses every shard header, so price without them.
+    let footprint = crate::model::klein_component_footprint(provider_id, spec)?;
     klein_contract_from_parts(provider_id, spec, inventory, footprint)
 }
 
