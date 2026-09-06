@@ -39,7 +39,46 @@ use crate::gemma::GemmaQuant;
 
 /// Contract/execution identity introduced by SC-19109. The earlier SC-18808 capture predates this
 /// shared-contract carrier and therefore cannot be reused as if its calibration semantics matched.
+///
+/// Since sc-22737 this is the identity of the **q8** cell specifically — the tier this family's
+/// retained anchor is filed under — rather than one string shared by all three shipped tiers. See
+/// [`production_calibration_fingerprint`]. Retained byte-for-byte so that record keeps its key.
 pub const CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-memory-ladder-v2";
+
+/// The tier [`CALIBRATION_FINGERPRINT`] names.
+pub const CALIBRATED_TIER: &str = "q8";
+
+/// Artifact-tier label of an LTX-2.3 load: `bf16` dense, `q4`/`q8` prepacked.
+pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The production calibration identity for one shipped tier.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4): the key is per TIER
+///
+/// It used to be one string for the whole route, so a q4 load and a bf16 load published the
+/// identity of the q8 cell. That is worse than publishing nothing: an anchor measured on one tier
+/// would be matched against loads of the other two, and the ladder for a 20GB checkpoint would be
+/// priced from a 47GB one's peaks.
+///
+/// The tier is the one the ARTIFACT carries. Callers pass the tier
+/// `numeric_tier_from_split` resolved, which reads the split checkpoint's own quantization and
+/// REFUSES a `spec.quantize` that disagrees with it, so a crossed request never reaches here.
+/// `None` for a packed width this family does not ship — withheld, never a failed load.
+pub fn production_calibration_fingerprint(tier: &MemoryNumericTier) -> Option<String> {
+    let label = calibration_tier_label(tier.quant)?;
+    Some(if label == CALIBRATED_TIER {
+        CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("sc-20772-ltx-2-3-{label}-mlx-memory-ladder-v2")
+    })
+}
 const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-registry-behavior-v2";
 
 pub const DECODE_OVERLAP: u32 = 64;
@@ -831,10 +870,14 @@ pub(crate) fn contract_for_loaded(
         return Ok(None);
     }
     let tier = numeric_tier_from_split(spec, split)?;
+    // sc-22737: the identity names the tier the checkpoint carries, not the route.
+    let Some(fingerprint) = production_calibration_fingerprint(&tier) else {
+        return Ok(None);
+    };
     let contract = build_contract(
         spec,
         production_asset_declaration(spec, gemma_dir)?,
-        CALIBRATION_FINGERPRINT,
+        &fingerprint,
     )?;
     Ok(Some((contract, tier, route_overlay(spec))))
 }
@@ -846,7 +889,7 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
         ));
     };
     let split = SplitModel::from_model_dir(root)?;
-    let _tier = numeric_tier_from_split(spec, &split)?;
+    let tier = numeric_tier_from_split(spec, &split)?;
     let gemma_dir = crate::model::resolve_gemma_dir(spec.text_encoder.as_ref())?;
     if let Some(quant) = crate::model::resolve_gemma_quant(&gemma_dir)? {
         return Err(mlx_gen::Error::Unsupported(format!(
@@ -862,10 +905,16 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
                 .into(),
         ));
     }
+    let fingerprint = production_calibration_fingerprint(&tier).ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "ltx_2_3: the checkpoint declares an unshipped packed tier {:?}",
+            tier.quant
+        ))
+    })?;
     build_contract(
         spec,
         production_asset_declaration(spec, &gemma_dir)?,
-        CALIBRATION_FINGERPRINT,
+        &fingerprint,
     )
 }
 
@@ -2685,6 +2734,55 @@ mod tests {
         .unwrap();
         assert_eq!(contract.asset_facts.conditioning_bytes, enhancer_bytes);
         assert_eq!(contract.total_resident_bytes(), enhancer_bytes);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the identity is per TIER, not per route.
+    // ------------------------------------------------------------------------------------------
+
+    fn ltx_tier(quant: Option<Quant>) -> MemoryNumericTier {
+        MemoryNumericTier {
+            precision: mlx_gen::Precision::Bf16,
+            quant,
+            component_precision_floors: &[],
+        }
+    }
+
+    /// The retained q8 key is unchanged, and the other two shipped tiers publish their OWN keys —
+    /// so an anchor measured on one tier can never be matched against a load of another.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_identity() {
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(Some(Quant::Q8))).as_deref(),
+            Some(CALIBRATION_FINGERPRINT),
+            "the measured cell keeps its retained key"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let fingerprint = production_calibration_fingerprint(&ltx_tier(quant))
+                .unwrap_or_else(|| panic!("{quant:?} publishes an identity"));
+            assert!(
+                seen.insert(fingerprint.clone()),
+                "{quant:?} reuses {fingerprint}"
+            );
+            assert_ne!(fingerprint, STATIC_CALIBRATION_FINGERPRINT);
+        }
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(None)).unwrap(),
+            "sc-20772-ltx-2-3-bf16-mlx-memory-ladder-v2"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(Some(Quant::Q4))).unwrap(),
+            "sc-20772-ltx-2-3-q4-mlx-memory-ladder-v2"
+        );
+    }
+
+    /// A packed width this family does not ship publishes nothing rather than a plausible key.
+    /// NVFP4 is a real `Quant` variant with no MLX hardware behind it, so it is the honest probe.
+    #[test]
+    fn an_unshipped_packed_width_is_withheld() {
+        assert!(production_calibration_fingerprint(&ltx_tier(Some(Quant::Nvfp4))).is_none());
     }
 
     #[test]

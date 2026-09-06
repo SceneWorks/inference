@@ -32,10 +32,9 @@ fn selected_encoder_discovery_roots(
             ))
         })?,
     };
-    let mut roots = vec![std::path::absolute(root)?, std::fs::canonicalize(root)?];
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
+    // A Hugging Face cache snapshot symlinks every file into the repository's sibling `blobs/`
+    // tree, so the shared helper authorizes that repository directory too (sc-22727).
+    Ok(gen_core::hf_cache_discovery_roots(root)?)
 }
 
 /// Full output edge used by the bounded-decode hook at the representative 1024px calibration cell.
@@ -1520,6 +1519,83 @@ pub fn registered_begin_request(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// sc-22727: `selected_encoder_discovery_roots` widened confinement to the Hugging Face cache
+    /// **repository** so a snapshot's `blobs/` symlink targets are admitted. This crate's own
+    /// widening is asserted here: the blobs target of an HF-cache-shaped snapshot is admitted, and
+    /// a target symlinked outside `models--<org>--<repo>` is still refused.
+    ///
+    /// Unix-only: the fixture is built from relative symlinks, exactly as `huggingface_hub` lays a
+    /// snapshot out. This test needs no GPU and runs on macOS.
+    #[cfg(unix)]
+    #[test]
+    fn selected_encoder_discovery_roots_admit_cache_blobs_and_refuse_an_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        // Author a contract-valid encoder, then relayout it as a cache snapshot whose files are
+        // relative symlinks into the repository's sibling `blobs/` tree.
+        let staged = temp.path().join("staged");
+        gen_core_testkit::write_encoder_contract_fixture(
+            &staged,
+            crate::config::KLEIN_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let repository = temp.path().join("hub/models--org--repo");
+        let blobs = repository.join("blobs");
+        let component = repository
+            .join("snapshots/0123456789abcdef")
+            .join("text_encoder");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&component).unwrap();
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&staged).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_owned();
+            let blob = format!("blob-{}", name.to_string_lossy());
+            std::fs::copy(&path, blobs.join(&blob)).unwrap();
+            symlink(
+                std::path::Path::new("../../../blobs").join(&blob),
+                component.join(&name),
+            )
+            .unwrap();
+            names.push(name);
+        }
+
+        let source = WeightsSource::Dir(component.clone());
+        let roots = selected_encoder_discovery_roots(&source).unwrap();
+        assert!(
+            roots.contains(&std::fs::canonicalize(&repository).unwrap()),
+            "{roots:?}"
+        );
+        assert!(
+            !roots.contains(&std::fs::canonicalize(temp.path().join("hub")).unwrap()),
+            "{roots:?}"
+        );
+        crate::config::KLEIN_ENCODER_CONTRACT
+            .validate_source_for_discovery(&source, &roots)
+            .expect("a cache snapshot's blobs targets are inside the authorized repository");
+
+        // Repoint one shard at a file outside `models--org--repo`: still refused.
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let shard = names
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".safetensors"))
+            .expect("fixture writes a safetensors shard")
+            .clone();
+        std::fs::copy(staged.join(&shard), outside.join(&shard)).unwrap();
+        std::fs::remove_file(component.join(&shard)).unwrap();
+        symlink(outside.join(&shard), component.join(&shard)).unwrap();
+        let error = crate::config::KLEIN_ENCODER_CONTRACT
+            .validate_source_for_discovery(&source, &roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+    }
 
     fn spec() -> LoadSpec {
         let mut spec =

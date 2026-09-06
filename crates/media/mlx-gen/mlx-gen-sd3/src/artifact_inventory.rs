@@ -23,10 +23,165 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use mlx_gen::{Error, LoadSpec, Result, WeightsSource};
+use mlx_gen::{Error, LoadSpec, Quant, Result, WeightsSource};
 use sha2::{Digest, Sha256};
 
 pub const CALIBRATED_REVISION: &str = "ceddf0a7fdf2064ea28e2213e3b84e4afa170a0f";
+
+/// The SceneWorks pre-built MLX quant-matrix turnkey each SD3.5 route ships (sc-8513), as
+/// `(provider id, repository, revision)`.
+///
+/// This is the artifact the WORKER loads: `standard_tier_subdir` opens `<snapshot>/<tier>` under one
+/// of these repositories, and nothing else reaches these providers on the MLX lane. Pinning the
+/// revision here is the same discipline `candle_gen_sd3::memory_strategy::Sd35Route::revision`
+/// already applies on the sibling lane — the identity a load publishes names an artifact, so the
+/// artifact has to be named.
+pub(crate) const SHIPPED_TURNKEYS: &[(&str, &str, &str)] = &[
+    (
+        crate::MODEL_ID,
+        "sd3.5-large-mlx",
+        "0cf819d00d30d296cee58e02c59b0daa5b8ede89",
+    ),
+    (
+        crate::TURBO_MODEL_ID,
+        "sd3.5-large-turbo-mlx",
+        "e9166f4632ec64f74d560be3ac778d346f89a364",
+    ),
+    (
+        crate::MEDIUM_MODEL_ID,
+        "sd3.5-medium-mlx",
+        "5413e962bb326db248be2026a93b147c323392b6",
+    ),
+];
+
+/// The tier a shipped turnkey root names by its path — `<…>/<revision>/{q4,q8,bf16}`.
+fn turnkey_path_tier(provider_id: &str, root: &Path) -> Option<Option<Quant>> {
+    let (_, repository, revision) = SHIPPED_TURNKEYS
+        .iter()
+        .find(|(id, _, _)| *id == provider_id)?;
+    let components = root
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let tier = components.last()?.as_str();
+    let quant = match tier {
+        "q4" => Some(Quant::Q4),
+        "q8" => Some(Quant::Q8),
+        "bf16" => None,
+        _ => return None,
+    };
+    // The three shapes a SceneWorks snapshot is materialized in: the HF cache, the desktop app's
+    // own cache, and a bare `<repository>/<revision>/<tier>` export. Mirrors
+    // `candle_gen_sd3::memory_strategy::validate_snapshot_binding`.
+    let accepted = [
+        vec![
+            format!("models--SceneWorks--{repository}"),
+            "snapshots".to_owned(),
+            (*revision).to_owned(),
+            tier.to_owned(),
+        ],
+        vec![
+            format!("SceneWorks__{repository}"),
+            (*revision).to_owned(),
+            tier.to_owned(),
+        ],
+        vec![
+            (*repository).to_owned(),
+            (*revision).to_owned(),
+            tier.to_owned(),
+        ],
+    ];
+    accepted
+        .iter()
+        .any(|suffix| components.ends_with(suffix))
+        .then_some(quant)
+}
+
+/// The packed tier the transformer on disk actually is, read from the `quantization` manifest the
+/// converter writes into `transformer/config.json` (`crate::convert::write_quantized_config`) and
+/// cross-checked against the packed triples in the safetensors headers.
+///
+/// Header-only: `safetensors_header_shapes` reads the JSON header and never the weight body, so this
+/// costs a few KB of I/O against a 27-39 GB tree. Fails closed — a config that declares a packing the
+/// tensors do not carry, or packed tensors with no config, is not a tier this can name.
+fn packed_transformer_tier(root: &Path) -> Result<Option<Quant>> {
+    let transformer = root.join("transformer");
+    let declared = match std::fs::read_to_string(transformer.join("config.json")) {
+        Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|error| {
+                Error::Msg(format!(
+                    "sd3 transformer config at {}: {error}",
+                    transformer.display()
+                ))
+            })?
+            .get("quantization")
+            .and_then(|block| block.get("bits"))
+            .and_then(serde_json::Value::as_i64),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(Error::Msg(format!(
+                "sd3 transformer config at {}: {error}",
+                transformer.display()
+            )))
+        }
+    };
+    let quant = match declared {
+        None => None,
+        Some(4) => Some(Quant::Q4),
+        Some(8) => Some(Quant::Q8),
+        Some(bits) => {
+            return Err(Error::Unsupported(format!(
+                "sd3 transformer declares an unshipped {bits}-bit packing"
+            )))
+        }
+    };
+    let mut packed = false;
+    for name in visible_files(&transformer)? {
+        if Path::new(&name)
+            .extension()
+            .is_none_or(|extension| extension != "safetensors")
+        {
+            continue;
+        }
+        let headers = crate::convert::safetensors_header_shapes(&transformer.join(&name))?;
+        packed |= headers.keys().any(|key| key.ends_with(".scales"));
+    }
+    if packed != quant.is_some() {
+        return Err(Error::Unsupported(format!(
+            "sd3 transformer at {} declares quantization {declared:?} but its tensors are {}packed",
+            transformer.display(),
+            if packed { "" } else { "not " }
+        )));
+    }
+    Ok(quant)
+}
+
+/// The tier of the shipped SceneWorks turnkey `spec` opens for `provider_id`, proven twice.
+///
+/// `Ok(None)` — not this provider's shipped turnkey at all (a bare directory, another route's
+/// artifact, a non-`Dir` source, or a path that is not `<pinned revision>/<tier>`). A snapshot whose
+/// path tier and whose on-disk transformer packing disagree is an error, not a `None`: naming the
+/// wrong tier is the failure this exists to prevent.
+pub(crate) fn shipped_turnkey_tier(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Result<Option<Option<Quant>>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(None);
+    };
+    let root = std::path::absolute(root)?;
+    let Some(path_tier) = turnkey_path_tier(provider_id, &root) else {
+        return Ok(None);
+    };
+    let packed_tier = packed_transformer_tier(&root)?;
+    if packed_tier != path_tier {
+        return Err(Error::Unsupported(format!(
+            "sd3 turnkey {} names tier {path_tier:?} but its transformer is packed {packed_tier:?}",
+            root.display()
+        )));
+    }
+    Ok(Some(path_tier))
+}
 
 const FILES: &[(&str, &str)] = &[
     (

@@ -47,6 +47,35 @@ pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
 /// Source-owned weights-free behavior identity. Version route/fixture semantics here without
 /// restamping the real-weight calibration above.
 const STATIC_CALIBRATION: &str = "pulid-flux-static-registry-behavior-v2";
+
+/// Production calibration identity of the PuLID-FLUX route, keyed on the loaded FLUX.1-dev
+/// backbone tier (sc-22726, epic sc-22723 E1/E4).
+///
+/// The route rides the FLUX.1-dev backbone, so its identity follows the backbone's per-tier
+/// scheme: the measured `2026-08-04` Q4 key [`MEMORY_CALIBRATION_FINGERPRINT`] is returned
+/// unchanged for q4, and every other shipped tier is `pulid-flux-dev-<tier>-mlx-shared-ladder-v1`.
+/// Like the backbone's, it is independent of `OffloadPolicy` and `LoadShape` — the worker's
+/// `character_image` load is `Resident + EagerMaterialization`. `None` only when the backbone
+/// itself has no base cell (a non-bf16 precision, a foreign tier, or an extra overlay beside the
+/// identity stack).
+///
+/// This is the (tier) table for the request knob; `adapt` publishes it only when the backbone's
+/// production contract published its own identity, which is where the tier is proven against the
+/// loaded snapshot's markers and packed content (a dense snapshot requantized at load time gets
+/// no backbone identity and therefore no PuLID identity either).
+pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
+    let base = backbone_spec(spec);
+    if !mlx_gen_flux::memory_strategy::has_base_cell(mlx_gen_flux::FLUX1_DEV_ID, &base) {
+        return None;
+    }
+    let tier = mlx_gen_flux::memory_strategy::calibration_tier_label(&base)?;
+    Some(if tier == "q4" {
+        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("pulid-flux-dev-{tier}-mlx-shared-ladder-v1")
+    })
+}
+
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen_flux::memory_strategy::ATTENTION_CHUNK_SIZE;
 pub const DECODE_TILE_EDGES: &[u32] = mlx_gen_flux::memory_strategy::DECODE_TILE_EDGES;
 pub const DECODE_OVERLAP: u32 = mlx_gen_flux::memory_strategy::DECODE_OVERLAP;
@@ -282,10 +311,9 @@ fn adapt(
             spec.load_shape,
         ))
     } else if exact_calibration && contract.calibration.is_some() {
-        Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
-            spec.load_shape,
-        ))
+        // sc-22726: per-tier and shape-independent, like the backbone identity it replaces.
+        production_calibration_fingerprint(spec)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
     } else {
         None
     };
@@ -901,6 +929,85 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Write a multi-tensor safetensors file with zeroed payload; `(name, dtype, shape)` per tensor.
+    fn write_safetensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        let mut offset = 0_usize;
+        let mut entries = Vec::new();
+        for (name, dtype, shape) in tensors {
+            let width = match *dtype {
+                "U32" => 4,
+                "BF16" => 2,
+                other => panic!("unexpected fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() * width;
+            let shape = shape
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{}]}}",
+                offset + bytes
+            ));
+            offset += bytes;
+        }
+        let mut header = format!("{{{}}}", entries.join(",")).into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A FLUX.1-dev backbone snapshot whose four components all encode `quant`: a packed Q4/Q8
+    /// triple under a `{"quantization":{"bits":..,"group_size":64}}` marker, or one dense bf16
+    /// weight under an empty config. Header-valid, so the backbone's production contract can prove
+    /// the artifact tier the way it does for the worker's resident load.
+    fn write_backbone_snapshot(root: &Path, quant: Option<Quant>) {
+        for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            let base = if component == "vae" {
+                "probe.attn.to_q"
+            } else {
+                "probe"
+            };
+            let weight = format!("{base}.weight");
+            let scales = format!("{base}.scales");
+            let biases = format!("{base}.biases");
+            match quant {
+                Some(quant) => {
+                    let packed = [2, quant.bits() as usize * 2];
+                    write_safetensors(
+                        &dir.join("model.safetensors"),
+                        &[
+                            (weight.as_str(), "U32", &packed),
+                            (scales.as_str(), "BF16", &[2, 1]),
+                            (biases.as_str(), "BF16", &[2, 1]),
+                        ],
+                    );
+                    std::fs::write(
+                        dir.join("config.json"),
+                        format!(
+                            r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                            quant.bits()
+                        ),
+                    )
+                    .unwrap();
+                }
+                None => {
+                    write_safetensors(
+                        &dir.join("model.safetensors"),
+                        &[(weight.as_str(), "BF16", &[2, 64])],
+                    );
+                    std::fs::write(dir.join("config.json"), "{}").unwrap();
+                }
+            }
+        }
+    }
+
     /// Element counts and stored dtypes for the five identity artifacts, in `identity_paths` order.
     /// The encoder and the EVA tower ship at half precision — exactly the case that used to be
     /// underpriced.
@@ -1082,6 +1189,106 @@ mod tests {
         assert!(
             drifted.calibration.is_none(),
             "only the calibration identity may be withheld on pinned-hash drift"
+        );
+    }
+
+    /// sc-22726 (epic sc-22723 E1/E4): the loaded route publishes a production calibration
+    /// identity per backbone tier, for the worker's `Resident + EagerMaterialization`
+    /// `character_image` load as well as the deferred evidence shape; the q4 string is the
+    /// retained `2026-08-04` measured key and the weights-free identity never names a production
+    /// cell.
+    ///
+    /// Mutation that fails this: restoring `Some(MemoryCalibrationIdentity::new(
+    /// MEMORY_CALIBRATION_FINGERPRINT, ..))` in `adapt` (q8/bf16 then collide with the q4 key), or
+    /// the backbone's old `Sequential + DeferredMaterialization + exact composite` gate (every
+    /// resident cell and every non-q4 cell drop to `None`), or deleting the backbone's
+    /// `artifact_tier != spec.quantize` refusal (the requantized dense snapshot below publishes
+    /// the measured q4 key).
+    #[test]
+    fn loaded_route_publishes_its_per_tier_identity_for_every_worker_load_shape() {
+        let exact = IdentityArtifactInventory {
+            files: Vec::new(),
+            bytes: 4096,
+            exact_calibration: true,
+        };
+        let expected: [(Option<Quant>, &str); 3] = [
+            (Some(Quant::Q4), MEMORY_CALIBRATION_FINGERPRINT),
+            (Some(Quant::Q8), "pulid-flux-dev-q8-mlx-shared-ladder-v1"),
+            (None, "pulid-flux-dev-bf16-mlx-shared-ladder-v1"),
+        ];
+        let mut published = std::collections::BTreeSet::new();
+        for (quant, fingerprint) in expected {
+            for (offload_policy, load_shape) in [
+                (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                (
+                    OffloadPolicy::Sequential,
+                    LoadShape::DeferredMaterialization,
+                ),
+            ] {
+                let root_tmp = tempfile::tempdir().unwrap();
+                let root = root_tmp.path().to_path_buf();
+                write_backbone_snapshot(&root, quant);
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_offload_policy(offload_policy)
+                    .with_load_shape(load_shape);
+                if let Some(quant) = quant {
+                    spec = spec.with_quant(quant);
+                }
+                spec.identity = Some(IdentityWeights {
+                    encoder: Some(WeightsSource::File("/encoder".into())),
+                    eva: Some(WeightsSource::File("/eva".into())),
+                    face_dir: Some(WeightsSource::Dir("/face".into())),
+                });
+                assert_eq!(
+                    production_calibration_fingerprint(&spec).as_deref(),
+                    Some(fingerprint),
+                    "{quant:?} {offload_policy:?} {load_shape:?}"
+                );
+                let contract = contract_with_inventory(&spec, &exact).unwrap();
+                let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                    panic!("{quant:?} {offload_policy:?} {load_shape:?}: no identity")
+                });
+                assert_eq!(identity.fingerprint, fingerprint);
+                assert_eq!(identity.load_shape, load_shape);
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{:?}",
+                    contract.conformance_errors()
+                );
+                let fixture = weights_free_contract(&spec).unwrap();
+                assert_ne!(fixture.calibration.unwrap().fingerprint, fingerprint);
+                // The identity is bound to the backbone artifact, not the request knob: the same
+                // route over a dense snapshot the loader would requantize to `quant` publishes
+                // nothing, even though the tier table still answers for the knob.
+                if let Some(quant) = quant {
+                    let dense_tmp = tempfile::tempdir().unwrap();
+                    let dense_root = dense_tmp.path().to_path_buf();
+                    write_backbone_snapshot(&dense_root, None);
+                    let mut requantized = spec.clone();
+                    requantized.weights = WeightsSource::Dir(dense_root);
+                    assert_eq!(
+                        production_calibration_fingerprint(&requantized).as_deref(),
+                        Some(fingerprint)
+                    );
+                    let contract = contract_with_inventory(&requantized, &exact).unwrap();
+                    assert!(
+                        contract.calibration.is_none(),
+                        "{quant:?} {offload_policy:?} {load_shape:?} over a dense snapshot published {:?}",
+                        contract.calibration
+                    );
+                }
+            }
+            published.insert(fingerprint);
+        }
+        assert_eq!(
+            published.len(),
+            expected.len(),
+            "two tiers share one identity"
+        );
+        assert!(!published.contains(STATIC_CALIBRATION));
+        assert_eq!(
+            MEMORY_CALIBRATION_FINGERPRINT,
+            "pulid-flux-dev-q4-mlx-shared-ladder-2026-08-04-v1"
         );
     }
 }

@@ -633,40 +633,141 @@ fn build_contract(
 /// actually measured rather than what a path happens to be called. An unreadable or absent marker
 /// fails closed: no calibration, and the selector cannot reach an optimized strategy at all.
 ///
-/// Measured: `chroma1_base`, transformer packed at **4** bits, bf16 precision, Sequential, clean
-/// route. Everything else — the other two entries, the q8 and bf16 tiers, every overlay — is
-/// deliberately uncalibrated until it has its own evidence (sc-17695).
-fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<&'static str> {
-    if provider_id != crate::CHROMA1_BASE_ID
-        || spec.precision != mlx_gen::Precision::Bf16
-        || spec.quantize.is_some()
-        || spec.offload_policy != OffloadPolicy::Sequential
-        || !clean(spec)
-    {
+/// Measured: `chroma1_base`, transformer packed at **4** bits — the cell
+/// [`MEMORY_CALIBRATION_FINGERPRINT`] names and the only one this crate has ever swept.
+///
+/// ## sc-22731 (epic sc-22723 E1/E4): every clean base load publishes an identity
+///
+/// Until sc-22731 this returned `Some` for exactly one route, one tier, `OffloadPolicy::Sequential`
+/// and `spec.quantize.is_none()` — the same Sequential+Deferred-only shape inference PR #948
+/// removed from `mlx-gen-flux`. Two consequences, both false negatives rather than false greens:
+///
+/// 1. **The shipped worker load published nothing at all.** The worker's MLX still-image path loads
+///    `OffloadPolicy::Resident` and passes the resolved tier through `LoadSpec::quantize`
+///    (`mlx_load_quant_for_resolved_artifact` leaves Chroma's quant intact), so the `Sequential` and
+///    `quantize.is_none()` conjuncts were BOTH false on every real Chroma render. No anchor could
+///    bind, on any tier, including the measured one.
+/// 2. **`chroma1_hd` and `chroma1_flash` had no cell at all**, on any tier.
+///
+/// The key is now **(provider, tier)**, and the policy and the load shape are deliberately not in
+/// it: the identity names the artifact the evidence was captured against, and
+/// `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately. The measured
+/// (base, q4) string is returned unchanged; every other cell is
+/// `chroma1-<route>-<tier>-mlx-shared-ladder-v1`, which is a KEY for evidence, not a claim that
+/// evidence exists — the anchor store is what says whether a cell has been measured.
+///
+/// This is the TABLE, not the binding: the tier here is the requested one, and only [`contract_for`]
+/// — which proves it against the transformer's own packed marker — may publish one of these strings.
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    if !has_base_cell(provider_id, spec) {
         return None;
     }
-    let WeightsSource::Dir(root) = &spec.weights else {
-        return None;
-    };
-    // `Ok(None)` is a dense (bf16) tier and `Err` an unreadable marker; both are "not the measured
-    // artifact" and both fail closed here.
-    (mlx_gen::quant::packed_quant_bits_at(&root.join("transformer"))
-        .ok()
-        .flatten()
-        == Some(CALIBRATED_QUANT_BITS))
-    .then_some(MEMORY_CALIBRATION_FINGERPRINT)
+    let route = variant_for(provider_id).ok()?.id().replace("chroma1_", "");
+    let tier = calibration_tier_label(requested_tier(spec))?;
+    Some(
+        if provider_id == crate::CHROMA1_BASE_ID && tier == CALIBRATED_TIER {
+            MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+        } else {
+            format!("chroma1-{route}-{tier}-mlx-shared-ladder-v1")
+        },
+    )
 }
 
-/// The packed width of the one measured tier. Part of `production_calibration_fingerprint`'s key.
+/// Whether `spec` on `provider_id` is a load with a measurable base cell at all: a registered
+/// Chroma route, the clean base route (no adapter/control/IP/identity/external-TE/PiD axis), bf16
+/// execution precision, and one of the three shipped tiers.
+pub fn has_base_cell(provider_id: &str, spec: &LoadSpec) -> bool {
+    variant_for(provider_id).is_ok()
+        && spec.precision == mlx_gen::Precision::Bf16
+        && clean(spec)
+        && calibration_tier_label(requested_tier(spec)).is_some()
+}
+
+/// The tier the REQUEST asks for. Chroma's turnkey tiers are prepacked, so the worker may pass the
+/// resolved tier through `LoadSpec::quantize` or leave it `None` and let the loader packed-detect;
+/// both spellings reach production, so the requested tier is the explicit one when it is there and
+/// the artifact's own marker otherwise. [`contract_for`] then proves the answer against that marker
+/// either way, so this can never turn a dense snapshot into a packed claim on its own.
+fn requested_tier(spec: &LoadSpec) -> Option<mlx_gen::Quant> {
+    spec.quantize.or_else(|| loaded_tier(spec).quant)
+}
+
+/// Artifact-tier label of a Chroma load: `bf16` dense, `q4`/`q8` packed. `None` for a tier this
+/// family does not ship.
+pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The packed width of the one measured tier, and the tier label it carries.
 pub const CALIBRATED_QUANT_BITS: i32 = 4;
+/// The tier [`MEMORY_CALIBRATION_FINGERPRINT`] was measured on.
+pub const CALIBRATED_TIER: &str = "q4";
+
+/// The tier of the artifact `spec` points at, read from the transformer component's own packed
+/// marker — the same `quantization.bits` the loader packed-detects on.
+///
+/// `Err` for a root with no readable transformer marker: `mlx_gen::quant::packed_quant_bits_at`
+/// answers `Ok(None)` for a *missing* `config.json`, which would make an absent snapshot look like
+/// a dense tier and publish the bf16 identity for weights nobody can see. Fail closed instead.
+pub fn resolved_artifact_tier(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::Quant>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "Chroma artifact tier: the load is not a snapshot directory".to_owned(),
+        ));
+    };
+    let component = root.join("transformer");
+    if !component.join("config.json").is_file() {
+        return Err(CoreError::Unsupported(format!(
+            "Chroma artifact tier: {} has no readable transformer/config.json marker",
+            root.display()
+        )));
+    }
+    Ok(
+        match mlx_gen::quant::packed_quant_bits_at(&component)
+            .map_err(|error| CoreError::Unsupported(format!("Chroma artifact tier: {error}")))?
+        {
+            None => None,
+            Some(4) => Some(mlx_gen::Quant::Q4),
+            Some(8) => Some(mlx_gen::Quant::Q8),
+            Some(bits) => {
+                return Err(CoreError::Unsupported(format!(
+                    "Chroma artifact tier: {} declares an unshipped packed width of {bits} bits",
+                    root.display()
+                )))
+            }
+        },
+    )
+}
+
+/// The identity a PRODUCTION load publishes: the (provider, tier) string, but only once the
+/// requested tier has been proven to be the tier of the artifact on disk (sc-22731, the sc-22726
+/// review rule). A dense snapshot loaded with `quantize = Some(_)` is a load-time requantization
+/// whose peak no anchor measured; a packed snapshot asked for as another tier is no shipped load
+/// either; and an unreadable marker proves no tier at all. All three publish `None`.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<MemoryCalibrationIdentity> {
+    if resolved_artifact_tier(spec).ok()? != requested_tier(spec) {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, spec)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
 
 /// The production contract, with filesystem-backed asset facts.
 pub fn contract_for(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
-    let calibration = production_calibration_fingerprint(provider_id, spec)
-        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    let calibration = production_calibration_identity(provider_id, spec);
     build_contract(
         provider_id,
         spec,
@@ -1245,52 +1346,198 @@ mod tests {
                 );
             }
         }
-        // Sibling entries must not be Verified by sharing code: only the measured entry, at the
-        // measured tier, carries a production calibration identity.
+        // Sibling entries must not be Verified by sharing code: each carries its OWN identity, and
+        // no sibling may report the measured entry's string (sc-22731 — before it, the siblings had
+        // no identity at all, which is a different failure: nothing to bind rather than the wrong
+        // thing to bind).
         let measured = tier_root(&tmp, "measured", Some(CALIBRATED_QUANT_BITS));
         assert_eq!(
-            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&measured)),
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&measured))
+                .as_deref(),
             Some(MEMORY_CALIBRATION_FINGERPRINT)
         );
         for provider in [crate::CHROMA1_HD_ID, crate::CHROMA1_FLASH_ID] {
-            assert!(production_calibration_fingerprint(provider, &tier_spec(&measured)).is_none());
+            let sibling = production_calibration_fingerprint(provider, &tier_spec(&measured))
+                .unwrap_or_else(|| panic!("{provider} declares its own q4 identity"));
+            assert_ne!(sibling, MEMORY_CALIBRATION_FINGERPRINT, "{provider}");
         }
         std::fs::remove_dir_all(measured).ok();
     }
 
+    // ------------------------------------------------------------------------------------------
+    // sc-22731 (epic sc-22723 E1/E4): every clean base load publishes a per-(provider, tier)
+    // identity, on the worker's shape as well as the evidence runner's.
+    // ------------------------------------------------------------------------------------------
+
+    /// The worker's MLX still-image load is `Resident` and passes the resolved tier through
+    /// `LoadSpec::quantize`; the evidence runner's is `Sequential` with the tier packed-detected
+    /// off disk. Both are the same artifact, and both must publish.
+    fn chroma_worker_load_shapes() -> [(OffloadPolicy, LoadShape, bool); 3] {
+        [
+            (
+                OffloadPolicy::Resident,
+                LoadShape::EagerMaterialization,
+                true,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+                false,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                LoadShape::DeferredMaterialization,
+                true,
+            ),
+        ]
+    }
+
+    /// All nine shipped MLX cells (three routes x three tiers) publish their own identity, through
+    /// the production entry point, on every load shape the worker and the evidence runner use — and
+    /// the measured (base, q4) string stays byte-identical.
+    ///
+    /// Mutation that fails this: restoring the
+    /// `provider_id != CHROMA1_BASE_ID || quantize.is_some() || offload_policy != Sequential` gate
+    /// — eight of the nine cells drop to `None`, and so does the ninth on the worker's own shape.
+    #[test]
+    fn every_shipped_chroma_cell_publishes_its_own_identity_on_every_worker_load_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut published = std::collections::BTreeSet::new();
+        for provider in [
+            crate::CHROMA1_HD_ID,
+            crate::CHROMA1_BASE_ID,
+            crate::CHROMA1_FLASH_ID,
+        ] {
+            for (tag, bits, quant) in [
+                ("q4", Some(4), Some(Quant::Q4)),
+                ("q8", Some(8), Some(Quant::Q8)),
+                ("bf16", None, None),
+            ] {
+                for (policy, shape, explicit_quant) in chroma_worker_load_shapes() {
+                    let root = tier_root(&tmp, &format!("{provider}-{tag}"), bits);
+                    let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                        .with_offload_policy(policy)
+                        .with_load_shape(shape);
+                    if explicit_quant {
+                        spec.quantize = quant;
+                    }
+                    let label = format!("{provider} {tag} {policy:?} {shape:?} q={explicit_quant}");
+                    assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{label}");
+                    let contract = contract_for(provider, &spec).unwrap();
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{label}: no production identity"));
+                    assert_eq!(identity.load_shape, shape, "{label}");
+                    assert_eq!(
+                        Some(identity.fingerprint.clone()),
+                        production_calibration_fingerprint(provider, &spec),
+                        "{label}"
+                    );
+                    // The registry-conformance identity is a separate namespace, so a weights-free
+                    // fixture can never read as evidence of this cell.
+                    let fixture = weights_free_contract(provider, &spec).unwrap();
+                    assert_ne!(
+                        fixture.calibration.as_ref().unwrap().fingerprint,
+                        identity.fingerprint,
+                        "{label}"
+                    );
+                    published.insert(identity.fingerprint.clone());
+                    std::fs::remove_dir_all(root).ok();
+                }
+            }
+        }
+        assert_eq!(
+            published.len(),
+            3 * 3,
+            "two (provider, tier) cells share one identity: {published:?}"
+        );
+        assert!(published.contains(MEMORY_CALIBRATION_FINGERPRINT));
+        assert_eq!(CALIBRATED_TIER, "q4");
+    }
+
+    /// The tier in the published string is the tier of the artifact on disk, never the request knob
+    /// alone: a dense snapshot asked for at q4 would be a load-time requantization no anchor
+    /// measured, and a packed snapshot asked for as the other tier is no shipped load either.
+    ///
+    /// Mutation that fails this: deleting the
+    /// `resolved_artifact_tier(spec) != requested_tier(spec)` refusal in
+    /// `production_calibration_identity` — every mismatched cell publishes the requested tier's
+    /// string over another tier's weights.
+    #[test]
+    fn the_chroma_identity_is_withheld_when_the_request_and_the_artifact_disagree() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (tag, bits, requested) in [
+            ("dense-as-q4", None, Some(Quant::Q4)),
+            ("dense-as-q8", None, Some(Quant::Q8)),
+            ("q4-as-q8", Some(4), Some(Quant::Q8)),
+            ("q8-as-q4", Some(8), Some(Quant::Q4)),
+        ] {
+            for provider in [
+                crate::CHROMA1_HD_ID,
+                crate::CHROMA1_BASE_ID,
+                crate::CHROMA1_FLASH_ID,
+            ] {
+                let root = tier_root(&tmp, tag, bits);
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_offload_policy(OffloadPolicy::Resident);
+                spec.quantize = requested;
+                let label = format!("{provider} {tag}");
+                assert!(
+                    production_calibration_fingerprint(provider, &spec).is_some(),
+                    "{label}: the table still answers for the request knob"
+                );
+                assert!(
+                    contract_for(provider, &spec).unwrap().calibration.is_none(),
+                    "{label}: published an identity over another tier's weights"
+                );
+                std::fs::remove_dir_all(root).ok();
+            }
+        }
+    }
+
+    /// The measured (base, q4) key is exact in the axes that still discriminate it, and every axis
+    /// with no measurable base cell at all fails closed.
+    ///
+    /// Two axes deliberately left this set in sc-22731 — `quantize == Some(matching tier)` and
+    /// `OffloadPolicy::Resident` — because they are the worker's own shipped load shape, and a key
+    /// that excluded them was a key no production render could ever publish. They are covered
+    /// positively by `every_shipped_chroma_cell_publishes_its_own_identity_on_every_worker_load_shape`
+    /// instead. The tier axis stays a discriminant: it moved from "only q4 has a key" to "each tier
+    /// has its OWN key", which is the same guarantee.
     #[test]
     fn the_calibration_key_is_exact_and_every_other_axis_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let measured = tier_root(&tmp, "exact", Some(CALIBRATED_QUANT_BITS));
         let exact = tier_spec(&measured);
         assert_eq!(
-            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &exact),
+            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &exact).as_deref(),
             Some(MEMORY_CALIBRATION_FINGERPRINT),
             "the measured tier must be calibrated, else every negative below is vacuous"
         );
 
-        // **The tier is part of the key.** All three shipped tiers are pre-packed, so all three load
-        // with `quantize == None`: without this discriminant a q8 or bf16 request would inherit the
-        // q4-measured key and could select an optimized fit on evidence never taken for it.
+        // **The tier is part of the key.** All three shipped tiers are pre-packed, so all three can
+        // load with `quantize == None`: without this discriminant a q8 or bf16 request would inherit
+        // the q4-measured key and could select an optimized fit on evidence never taken for it.
         for (tag, bits) in [("q8", Some(8)), ("bf16", None)] {
             let other = tier_root(&tmp, tag, bits);
-            assert!(
+            assert_ne!(
                 production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &tier_spec(&other))
-                    .is_none(),
+                    .as_deref(),
+                Some(MEMORY_CALIBRATION_FINGERPRINT),
                 "the {tag} tier must not inherit the q4-measured calibration"
             );
             std::fs::remove_dir_all(other).ok();
         }
         // An unreadable or absent tier marker fails closed rather than defaulting to the measured
-        // one — `/nonexistent` has no `transformer/config.json` at all.
-        assert!(
-            production_calibration_fingerprint(crate::CHROMA1_BASE_ID, &sequential_spec())
-                .is_none()
-        );
+        // one — `/nonexistent` has no `transformer/config.json` at all, so the production contract
+        // publishes nothing even though the table would answer for a dense request.
+        assert!(contract_for(crate::CHROMA1_BASE_ID, &sequential_spec())
+            .unwrap()
+            .calibration
+            .is_none());
 
         for changed in [
-            exact.clone().with_quant(Quant::Q4),
-            exact.clone().with_offload_policy(OffloadPolicy::Resident),
             {
                 let mut spec = exact.clone();
                 spec.precision = mlx_gen::Precision::Fp32;

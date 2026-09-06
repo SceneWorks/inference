@@ -91,6 +91,28 @@ pub fn contract_for_variant(
     Ok(None)
 }
 
+/// [`contract_for_variant`] over an inventory the caller has already verified, so a load that
+/// holds one does not re-walk the artifact for its memory contract.
+pub(crate) fn contract_for_variant_with_inventory(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
+) -> mlx_gen::Result<Option<MemoryProviderContract>> {
+    if matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) {
+        crate::model::validate_klein_load_axes(spec, variant.id())
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?;
+        return Ok(Some(klein_contract_with_inventory(
+            variant.id(),
+            spec,
+            inventory,
+        )?));
+    }
+    contract_for_variant(variant, spec)
+}
+
 /// The per-component asset bytes a Dev / Dev-Edit load materializes (SC-22667, E1).
 ///
 /// Both Dev contracts published `MemoryAssetFacts::default()` — five zeros — on every path,
@@ -752,12 +774,38 @@ fn klein_provider_static(provider_id: &str) -> mlx_gen::gen_core::Result<&'stati
     }
 }
 
-fn klein_calibration_fingerprint(
+/// Production calibration identity of one clean Klein route, keyed on (provider, artifact, tier).
+///
+/// `artifact_tag` is the admitted inventory's `KleinArtifactInventory::artifact_tag` and `tier`
+/// its resolved DiT tier. The measured dense-base key [`KLEIN_MEMORY_CALIBRATION_FINGERPRINT`] is
+/// returned unchanged for (`flux2_klein_9b`, `base`, bf16); every other cell is
+/// `flux2-klein-9b-<tier>-mlx-shared-ladder-<artifact>-<route>-v1`, so the dense tagged artifacts
+/// keep the strings they always had and the packed `rehost`/`kv-rehost` turnkeys gain one per
+/// tier. Offload policy and load shape are deliberately not inputs (sc-22727): the identity names
+/// the artifact the evidence was captured against, and `MemoryCalibrationIdentity::load_shape`
+/// carries the materialization axis separately.
+///
+/// The `Err` for an unshipped tier is reachable only through this direct entry point: the
+/// production path ([`klein_contract_for`]) takes `tier` from an admitted
+/// `KleinArtifactInventory`, whose verification has already refused an NVFP4 artifact, so the
+/// inventory stays the single fail-closed site for artifact tiers.
+pub fn klein_production_calibration_fingerprint(
     provider_id: &str,
     artifact_tag: &str,
+    tier: Option<Quant>,
 ) -> mlx_gen::gen_core::Result<String> {
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(other) => {
+            return Err(CoreError::Unsupported(format!(
+                "{provider_id}: FLUX.2 Klein ships no {other:?} tier"
+            )))
+        }
+    };
     let route = match provider_id {
-        crate::FLUX2_KLEIN_9B_ID if artifact_tag == "base" => {
+        crate::FLUX2_KLEIN_9B_ID if artifact_tag == "base" && tier == "bf16" => {
             return Ok(KLEIN_MEMORY_CALIBRATION_FINGERPRINT.to_owned());
         }
         crate::FLUX2_KLEIN_9B_ID => "t2i",
@@ -770,8 +818,45 @@ fn klein_calibration_fingerprint(
         }
     };
     Ok(format!(
-        "flux2-klein-9b-bf16-mlx-shared-ladder-{artifact_tag}-{route}-v1"
+        "flux2-klein-9b-{tier}-mlx-shared-ladder-{artifact_tag}-{route}-v1"
     ))
+}
+
+/// The production calibration identity an admitted Klein inventory publishes for `spec`, or
+/// `None` when the load carries an overlay (adapters, control, IP-adapter, identity, external text
+/// encoder, extra components) and therefore has no clean base cell to measure.
+///
+/// sc-22727 (epic sc-22723 E1/E4): this used to be published only when the load was streamable —
+/// `Sequential + DeferredMaterialization + quantize.is_none()` — while the worker's resident rung
+/// loads `Resident + EagerMaterialization`, so the resident anchor had no identity to bind and the
+/// packed turnkeys were handed the weights-free registry string in production.
+///
+/// The tier is the admitted artifact's (`KleinArtifactInventory::resolved_quant`), never the
+/// request knob: `validate_klein_load_axes` does not constrain `LoadSpec::quantize`, so a
+/// `Some(_)` that disagrees with the artifact — a dense tagged base the loader would requantize
+/// at runtime, or a packed turnkey asked for the other tier — has no measured cell and publishes
+/// `None` rather than the requested tier's string.
+pub(crate) fn klein_production_calibration(
+    provider_id: &str,
+    spec: &LoadSpec,
+    inventory: &crate::artifact_inventory::KleinArtifactInventory,
+) -> mlx_gen::gen_core::Result<Option<MemoryCalibrationIdentity>> {
+    if klein_overlay(spec).is_some() {
+        return Ok(None);
+    }
+    let tier = inventory.resolved_quant();
+    if spec
+        .quantize
+        .is_some_and(|requested| Some(requested) != tier)
+    {
+        return Ok(None);
+    }
+    let fingerprint =
+        klein_production_calibration_fingerprint(provider_id, inventory.artifact_tag(), tier)?;
+    Ok(Some(MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    )))
 }
 
 /// Provider-local identity of Klein's resident LoRA/LoKr factor stack.
@@ -934,34 +1019,46 @@ pub fn klein_contract_for(
         .map_err(|error| CoreError::Unsupported(error.to_string()))?;
     let inventory =
         crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(provider_id, spec)?;
+    klein_contract_with_inventory(provider_id, spec, inventory.as_ref())
+}
+
+/// The production contract for an already-admitted (or absent) inventory — everything
+/// [`klein_contract_for`] does after artifact verification.
+fn klein_contract_with_inventory(
+    provider_id: &str,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    // The caller already verified the inventory: the registry footprint callbacks
+    // (`component_footprint` and friends) re-run `verify_for_provider`, which re-walks all three
+    // component directories and re-parses every shard header, so price without them.
+    let footprint = crate::model::klein_component_footprint(provider_id, spec)?;
+    klein_contract_from_parts(provider_id, spec, inventory, footprint)
+}
+
+/// The rung-4 and calibration-identity seam of the production contract, over an inventory the
+/// caller has verified and a footprint it has priced. Split out so the seam can be driven with a
+/// sealed bounded fixture inventory that the full artifact and encoder contracts would refuse;
+/// every production caller reaches it through [`klein_contract_for`].
+pub(crate) fn klein_contract_from_parts(
+    provider_id: &str,
+    spec: &LoadSpec,
+    inventory: Option<&crate::artifact_inventory::KleinArtifactInventory>,
+    footprint: mlx_gen::PerComponentBytes,
+) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    crate::model::validate_klein_load_axes(spec, provider_id)
+        .map_err(|error| CoreError::Unsupported(error.to_string()))?;
     let streamable = inventory.is_some() && klein_streamable(spec);
-    let calibration = if streamable {
-        let fingerprint = match inventory
-            .as_ref()
-            .expect("streamable requires an admitted inventory")
-            .calibration_tag()
-        {
-            Some(tag) => klein_calibration_fingerprint(provider_id, tag)?,
-            None => format!(
-                "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
-                provider_id.replace('_', "-")
-            ),
-        };
-        Some(MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
-    } else {
-        None
+    // The identity is a property of the admitted artifact and tier, not of the load shape: rung 4
+    // stays gated on `streamable` above, the identity does not (sc-22727).
+    let calibration = match inventory {
+        Some(inventory) => klein_production_calibration(provider_id, spec, inventory)?,
+        None => None,
     };
     build_klein_contract(
         provider_id,
         spec,
-        match provider_id {
-            crate::FLUX2_KLEIN_9B_ID => crate::model::component_footprint(spec)?,
-            crate::FLUX2_KLEIN_9B_EDIT_ID => crate::model::klein_edit_component_footprint(spec)?,
-            crate::FLUX2_KLEIN_9B_KV_EDIT_ID => {
-                crate::model::klein_kv_edit_component_footprint(spec)?
-            }
-            _ => unreachable!("validate_klein_load_axes rejects unknown providers"),
-        },
+        footprint,
         streamable,
         calibration,
         klein_adapter_bytes(spec)?,
@@ -1033,8 +1130,9 @@ fn surface_selector_matches_spec(
 
 /// Resolve the finite catalog surface from the already-selected artifact tier.
 ///
-/// Packed Klein turnkeys reach production with `LoadSpec::quantize == None` because only the DiT is
-/// packed and the Qwen3 tower deliberately stays dense. The generic witness keeps Q4/Q8 in the
+/// Packed Klein turnkeys reach production with `LoadSpec::quantize == None`: the tier is the
+/// artifact's own (a packed DiT, and a Qwen3 tower admitted exactly as stored — dense in the
+/// shipped q4/q8 tiers, sc-22727), never a load-time request. The generic witness keeps Q4/Q8 in the
 /// synthetic `LoadSpec` solely to make the selector self-checking; this resolver consumes the typed
 /// selector and never reinterprets it as load-time quantization.
 pub(crate) fn weights_free_klein_surface_contract(
@@ -2179,6 +2277,85 @@ mod tests {
             transformer.parameters.transformer_window_components,
             [TransformerComponent::Dit]
         );
+    }
+
+    /// sc-22727: the identity table is keyed on (provider, artifact, tier); the measured dense-base
+    /// key stays byte-identical for (`flux2_klein_9b`, `base`, bf16), the dense tagged strings
+    /// keep their historical shape, and every cell is distinct from every other and from the
+    /// weights-free registry strings.
+    #[test]
+    fn klein_production_identity_table_is_per_tier_and_preserves_the_measured_key() {
+        assert_eq!(
+            klein_production_calibration_fingerprint(crate::FLUX2_KLEIN_9B_ID, "base", None)
+                .unwrap(),
+            "flux2-klein-9b-bf16-mlx-shared-ladder-t2i-v1"
+        );
+        assert_eq!(
+            klein_production_calibration_fingerprint(crate::FLUX2_KLEIN_9B_ID, "base", None)
+                .unwrap(),
+            KLEIN_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            klein_production_calibration_fingerprint(crate::FLUX2_KLEIN_9B_ID, "true-two", None)
+                .unwrap(),
+            "flux2-klein-9b-bf16-mlx-shared-ladder-true-two-t2i-v1"
+        );
+        let providers = [
+            crate::FLUX2_KLEIN_9B_ID,
+            crate::FLUX2_KLEIN_9B_EDIT_ID,
+            crate::FLUX2_KLEIN_9B_KV_EDIT_ID,
+        ];
+        let mut published = std::collections::BTreeSet::new();
+        for provider_id in providers {
+            for artifact in ["base", "true-two", "rehost", "kv-rehost"] {
+                for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    let fingerprint =
+                        klein_production_calibration_fingerprint(provider_id, artifact, tier)
+                            .unwrap();
+                    assert!(
+                        published.insert(fingerprint.clone()),
+                        "{provider_id} {artifact} {tier:?} collides on {fingerprint}"
+                    );
+                    assert_ne!(
+                        fingerprint,
+                        format!(
+                            "{KLEIN_STATIC_BEHAVIOR_FINGERPRINT}-{}",
+                            provider_id.replace('_', "-")
+                        )
+                    );
+                }
+            }
+        }
+        assert_eq!(published.len(), 3 * 4 * 3);
+        // The weights-free registry surface never resolves to any production cell, under every
+        // catalog surface and every registry entry point.
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            for provider_id in providers {
+                let resolved = weights_free_klein_surface_contract(provider_id, &surface).unwrap();
+                let fingerprint = resolved.calibration.unwrap().fingerprint;
+                assert!(
+                    !published.contains(&fingerprint),
+                    "{provider_id} surface {} resolved to production identity {fingerprint}",
+                    surface.selector.id()
+                );
+                let plain = weights_free_klein_contract(provider_id, &surface.spec).unwrap();
+                let fingerprint = plain.calibration.unwrap().fingerprint;
+                assert!(
+                    !published.contains(&fingerprint),
+                    "{provider_id} plain surface {} resolved to production identity {fingerprint}",
+                    surface.selector.id()
+                );
+            }
+        }
+        assert!(
+            klein_production_calibration_fingerprint("flux2_klein_alias", "base", None).is_err()
+        );
+        assert!(klein_production_calibration_fingerprint(
+            crate::FLUX2_KLEIN_9B_ID,
+            "rehost",
+            Some(Quant::Nvfp4)
+        )
+        .is_err());
     }
 
     #[test]

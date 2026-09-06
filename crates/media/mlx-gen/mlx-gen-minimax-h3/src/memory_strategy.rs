@@ -203,6 +203,99 @@ use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
 /// changes — every one of those invalidates the measured stage peaks above.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "minimax-h3-mlx-staged-joint-av-eager-abi3-v1";
 
+/// The tier [`MEMORY_CALIBRATION_FINGERPRINT`] was measured on, and whose key it therefore keeps.
+pub const CALIBRATED_TIER: &str = "bf16";
+
+/// Calibration identity of the weights-free registry conformance walk.
+///
+/// **sc-22737.** [`weights_free_contract`] used to publish [`MEMORY_CALIBRATION_FINGERPRINT`],
+/// because it shares `build_contract` with the production path. That is a false green in the worst
+/// direction: a contract that read no weights at all reported the identity of a MEASURED production
+/// cell, so an evidence runner could satisfy a plan row naming that cell without ever loading the
+/// artifact. The declaration now carries its own key, and
+/// `the_weights_free_declaration_cannot_publish_a_production_string` holds the two apart.
+pub const STATIC_CALIBRATION_FINGERPRINT: &str = "minimax-h3-mlx-registry-behavior-v1";
+
+/// Artifact-tier label of a MiniMax-H3 load: `bf16` dense, `q4`/`q8` packed.
+pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The DiT directory a load resolves — the staged override when one is configured, the snapshot's
+/// own `transformer` otherwise. Shared with [`ComponentBytes::resolve`] so the tier is read off the
+/// same directory whose bytes are counted.
+fn dit_dir(spec: &LoadSpec) -> std::path::PathBuf {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.clone(),
+        WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
+    };
+    match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(staged)) => staged.clone(),
+        _ => root.join(DIT_COMPONENT),
+    }
+}
+
+/// The tier the ARTIFACT carries, read from the DiT's own packed marker.
+///
+/// `Err` for an unreadable marker — `packed_quant_bits_at` answers `Ok(None)` for a MISSING
+/// `config.json`, which would make an absent snapshot look like a dense tier and publish the bf16
+/// identity for weights nobody can see. Fail closed instead.
+pub fn resolved_artifact_tier(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::Quant>> {
+    let dir = dit_dir(spec);
+    if !dir.join("config.json").is_file() {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID} artifact tier: {} has no readable transformer config.json marker",
+            dir.display()
+        )));
+    }
+    Ok(
+        match mlx_gen::quant::packed_quant_bits_at(&dir)
+            .map_err(|error| CoreError::Unsupported(format!("{MODEL_ID} artifact tier: {error}")))?
+        {
+            None => None,
+            Some(4) => Some(mlx_gen::Quant::Q4),
+            Some(8) => Some(mlx_gen::Quant::Q8),
+            Some(bits) => {
+                return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID} artifact tier: {} declares an unshipped packed width of {bits} bits",
+                dir.display()
+            )))
+            }
+        },
+    )
+}
+
+/// The production calibration identity for one artifact-proven tier.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4): the key is per TIER
+///
+/// It used to be one string for every load, so a q4 render and a bf16 render published the same
+/// identity and an anchor measured on one tier would be matched against loads of the other two.
+///
+/// The tier is proven, not requested: the DiT's own packed marker decides, and a `spec.quantize`
+/// that disagrees with it publishes `None` — a dense snapshot asked for as q4 is a load-time
+/// requantization whose peak no anchor measured. Withheld, never a failed load; `contract_for`
+/// still returns a contract, just an uncalibrated one.
+pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
+    let resolved = resolved_artifact_tier(spec).ok()?;
+    if spec.quantize.is_some() && spec.quantize != resolved {
+        return None;
+    }
+    let tier = calibration_tier_label(resolved)?;
+    Some(if tier == CALIBRATED_TIER {
+        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("minimax-h3-{tier}-mlx-staged-joint-av-eager-abi3-v1")
+    })
+}
+
 /// The DiT block count, mirrored from `MiniMaxH3DitConfig::default().num_layers`.
 pub const DIT_BLOCKS: u32 = 50;
 
@@ -1191,6 +1284,9 @@ fn build_contract(
     components: &ComponentBytes,
     load_shape: LoadShape,
     streamable: bool,
+    // sc-22737: passed in rather than hard-coded, so the weights-free surface cannot publish the
+    // production identity and the production one is keyed on the artifact's own tier.
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
         architecture_facts: architecture_facts(spec),
@@ -1317,10 +1413,7 @@ fn build_contract(
         // The calibration identity carries the RESOLVED shape, not the resident default: a
         // deferred load's peaks are a different curve from a resident load's, and an evidence
         // record that named the wrong one would be matched against measurements of the other.
-        calibration: Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
-            load_shape,
-        )),
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components.base(),
             conditioning_bytes: components.text_encoder,
@@ -1348,11 +1441,16 @@ fn build_contract(
 
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let load_shape = resolved_load_shape(spec);
     Ok(build_contract(
         spec,
         &ComponentBytes::resolve(spec)?,
-        resolved_load_shape(spec),
+        load_shape,
         streamable(spec),
+        // The identity carries the RESOLVED shape, not the resident default: a deferred load's
+        // peaks are a different curve from a resident load's.
+        production_calibration_fingerprint(spec)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, load_shape)),
     ))
 }
 
@@ -1365,11 +1463,16 @@ pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProvider
 /// byte count, and on the registry's never-created sentinel path it reads nothing and publishes
 /// the preset.
 pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let load_shape = resolved_load_shape(spec);
     Ok(build_contract(
         spec,
         &ComponentBytes::weights_free(),
-        resolved_load_shape(spec),
+        load_shape,
         streamable(spec),
+        Some(MemoryCalibrationIdentity::new(
+            STATIC_CALIBRATION_FINGERPRINT,
+            load_shape,
+        )),
     ))
 }
 
@@ -2168,6 +2271,136 @@ mod tests {
         }
     }
 
+    /// Write the DiT's own `quantization` marker into a snapshot tree — the same `config.json`
+    /// `mlx_gen::quant::packed_quant_bits_at` parses on the load path, and therefore the file
+    /// `resolved_artifact_tier` reads. `None` writes a DENSE marker (a real `config.json` with no
+    /// `quantization` block), which is what makes a bf16 root distinguishable from an absent one.
+    fn write_tier_marker(root: &Path, bits: Option<i32>) {
+        let dir = root.join(DIT_COMPONENT);
+        std::fs::create_dir_all(&dir).expect("component dir");
+        let body = match bits {
+            Some(bits) => format!(
+                "{{\"quantization\":{{\"bits\":{bits},\"group_size\":{}}}}}",
+                crate::quant::GROUP_SIZE
+            ),
+            None => "{}".to_owned(),
+        };
+        std::fs::write(dir.join("config.json"), body).expect("quantization marker");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the identity is per ARTIFACT-PROVEN tier, and the
+    // weights-free surface may not publish it.
+    // ------------------------------------------------------------------------------------------
+
+    /// A snapshot root whose DiT carries a real tier marker.
+    fn minimax_tier_root(bits: Option<i32>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(root.path(), bits);
+        root
+    }
+
+    /// Three shipped tiers, three DISTINCT identities, each reaching the production contract — and
+    /// the measured bf16 cell keeping its retained key. Before sc-22737 all three published the
+    /// SAME string, so an anchor measured on bf16 would have been matched against q4 and q8 loads.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (bits, expected_tier) in [(None, "bf16"), (Some(4), "q4"), (Some(8), "q8")] {
+            let root = minimax_tier_root(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            let fingerprint = production_calibration_fingerprint(&spec)
+                .unwrap_or_else(|| panic!("{expected_tier} publishes an identity"));
+            assert!(
+                fingerprint.contains(expected_tier) || expected_tier == "bf16",
+                "{fingerprint} must name {expected_tier}"
+            );
+            assert!(
+                seen.insert(fingerprint.clone()),
+                "{expected_tier} reuses {fingerprint}"
+            );
+            assert_ne!(fingerprint, STATIC_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                contract_for(&spec)
+                    .unwrap()
+                    .calibration
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                Some(fingerprint.as_str()),
+                "{expected_tier}: the identity must reach the CONTRACT, not just the table"
+            );
+        }
+        assert_eq!(seen.len(), 3);
+        // The measured cell keeps its retained key byte-for-byte.
+        let bf16 = minimax_tier_root(None);
+        assert_eq!(
+            production_calibration_fingerprint(&LoadSpec::new(WeightsSource::Dir(
+                bf16.path().into()
+            )))
+            .as_deref(),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+    }
+
+    /// **The tier is proven, not requested.** A dense root asked for as q4 is a load-time
+    /// requantization no anchor measured, and an absent snapshot proves nothing at all. Both
+    /// withhold — and neither fails the load.
+    #[test]
+    fn a_tier_the_artifact_does_not_prove_is_withheld() {
+        let dense = minimax_tier_root(None);
+        let crossed =
+            LoadSpec::new(WeightsSource::Dir(dense.path().into())).with_quant(mlx_gen::Quant::Q4);
+        assert!(production_calibration_fingerprint(&crossed).is_none());
+        assert!(
+            contract_for(&crossed).unwrap().calibration.is_none(),
+            "a withheld identity must not fail the load"
+        );
+
+        // An honest request for the tier the artifact carries does publish.
+        let packed = minimax_tier_root(Some(8));
+        let honest =
+            LoadSpec::new(WeightsSource::Dir(packed.path().into())).with_quant(mlx_gen::Quant::Q8);
+        assert_eq!(
+            production_calibration_fingerprint(&honest).as_deref(),
+            Some("minimax-h3-q8-mlx-staged-joint-av-eager-abi3-v1")
+        );
+
+        // No marker at all is an UNREADABLE tier, not a dense one — fail closed.
+        assert!(production_calibration_fingerprint(&weightless_spec()).is_none());
+        let unmarked = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(unmarked.path(), &[("transformer", DIT_BF16_BYTES)]);
+        assert!(
+            production_calibration_fingerprint(&LoadSpec::new(WeightsSource::Dir(
+                unmarked.path().into()
+            )))
+            .is_none(),
+            "a snapshot with no config.json marker must not read as the dense tier"
+        );
+    }
+
+    /// The weights-free declaration may never publish a production string — the leak sc-22737
+    /// closed. A plan row naming a measured cell could otherwise be satisfied by a contract that
+    /// loaded no weights at all.
+    #[test]
+    fn the_weights_free_declaration_cannot_publish_a_production_string() {
+        for bits in [None, Some(4), Some(8)] {
+            let root = minimax_tier_root(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            let declared = weights_free_contract(&spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint;
+            assert_eq!(declared, STATIC_CALIBRATION_FINGERPRINT);
+            assert_ne!(
+                production_calibration_fingerprint(&spec).unwrap(),
+                declared,
+                "q{bits:?}"
+            );
+        }
+    }
+
     // --- AC1: the resolved contract is the DECLARED one, never the compatibility default ---------
 
     /// A Resident-only assertion is a false green here: `compatibility_default` also reports
@@ -2203,9 +2436,22 @@ mod tests {
             MemoryStrategySupport::Implemented,
             "the fallback declares every optimized rung Missing"
         );
+        // sc-22737: `contract_for` on a weightless spec proves no artifact tier and so publishes no
+        // identity, which the compatibility fallback also does — so this is no longer a
+        // discriminator on THIS spec. The claim it was making is kept, against a spec that resolves
+        // a real tier: a resolved declaration publishes a per-tier identity, the fallback never
+        // publishes one at all.
+        assert_eq!(fallback.calibration, None);
+        let resolved_root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(resolved_root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(resolved_root.path(), None);
+        let resolved = (registration.contract)(&LoadSpec::new(WeightsSource::Dir(
+            resolved_root.path().into(),
+        )))
+        .expect("registered contract");
         assert!(
-            contract.calibration.is_some(),
-            "the fallback carries no calibration identity"
+            resolved.calibration.is_some(),
+            "a resolved declaration publishes a per-tier identity; the fallback never does"
         );
         assert!(
             matches!(
@@ -2296,7 +2542,18 @@ mod tests {
         assert_eq!(fixture.strategies, production.strategies);
         assert_eq!(fixture.lifecycle, production.lifecycle);
         assert_eq!(fixture.formula, production.formula);
-        assert_eq!(fixture.calibration, production.calibration);
+        // sc-22737: the two identities must DIFFER. This asserted they were equal, which is what
+        // let a contract that read no weights report the identity of a measured production cell.
+        // On this weightless spec the production side proves no tier at all and so publishes
+        // nothing; the declaration publishes its own registry-behaviour key.
+        assert_eq!(
+            fixture
+                .calibration
+                .as_ref()
+                .map(|id| id.fingerprint.as_str()),
+            Some(STATIC_CALIBRATION_FINGERPRINT)
+        );
+        assert_eq!(production.calibration, None);
         assert_eq!(fixture.load_shape, production.load_shape);
         assert_eq!(fixture.backend, production.backend);
     }
@@ -2659,7 +2916,15 @@ mod tests {
                 parameters: MemoryStrategyParameters::default(),
             },
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            // sc-22737: read off the contract under test for exactly the reason `load_shape` is.
+            // The identity is per-(artifact tier) now, and the weights-free declaration carries its
+            // own key, so a context pinned to the production constant fails the handshake and makes
+            // every geometry rejection below vacuous.
+            calibration_fingerprint: contract
+                .calibration
+                .as_ref()
+                .map(|identity| identity.fingerprint.clone())
+                .unwrap_or_default(),
             // sc-18662: the contract's shape now follows the spec, so a context pinned to
             // `LOAD_SHAPE` would fail the calibration handshake on a deferred spec and make every
             // geometry rejection below vacuous. Read it off the contract under test.
@@ -3807,7 +4072,16 @@ mod tests {
         // loaders exist now (`load_dir_deferred`, `MiniMaxH3TextEncoder::from_dir_deferred`), so the
         // honest answer is the spec's — and the test that has to exist is that the two shapes give
         // DIFFERENT contracts rather than one silently winning.
-        let deferred = contract_for(&weightless_spec()).expect("contract");
+        // sc-22737: a weightless spec proves no artifact tier and so publishes no identity at all,
+        // and the claim under test is about the identity's shape — so it needs a resolvable root.
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(root.path(), None);
+        let deferred = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        )
+        .expect("contract");
         assert_eq!(deferred.load_shape, LoadShape::DeferredMaterialization);
         assert_eq!(
             deferred.calibration.as_ref().unwrap().load_shape,

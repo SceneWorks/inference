@@ -134,15 +134,187 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 /// contract REFUSES it rather than letting an unmeasured scope be selected.
 pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerComponent::Dit;
 
+/// The measured `2026-08-06` key of the **(`sana_1600m`, q4, Sequential)** cell — the one cell
+/// `tests/memory_ladder_real_weights.rs` actually sweeps (`REPRESENTATIVE` = `sana_1600m`,
+/// `DEFAULT_TIER` = `q4`). Retained byte-for-byte by [`production_calibration_fingerprint`].
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "sana-mlx-full-ladder-2026-08-06-v1-sequential";
+/// The same measured cell under `OffloadPolicy::Resident`.
 pub const RESIDENT_MEMORY_CALIBRATION_FINGERPRINT: &str =
     "sana-mlx-full-ladder-2026-08-06-v1-resident";
 
-pub const fn calibration_fingerprint(policy: OffloadPolicy) -> &'static str {
-    match policy {
-        OffloadPolicy::Sequential => MEMORY_CALIBRATION_FINGERPRINT,
-        OffloadPolicy::Resident => RESIDENT_MEMORY_CALIBRATION_FINGERPRINT,
+/// The route the two retained strings above were measured on.
+pub const CALIBRATED_ROUTE: &str = crate::MODEL_ID;
+/// The tier the two retained strings above were measured on.
+pub const CALIBRATED_TIER: &str = "q4";
+
+/// Artifact-tier label of a SANA load: `bf16` for a dense snapshot, `q4`/`q8` for the shipped
+/// packed tiers. `None` for a tier this family does not ship.
+///
+/// Both callers pass the tier they have *proven*: [`production_calibration_fingerprint`] answers
+/// for the request knob and the production contract binds that answer to the artifact's own marker
+/// through [`resolved_artifact_tier`].
+pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
     }
+}
+
+const fn policy_label(policy: OffloadPolicy) -> &'static str {
+    match policy {
+        OffloadPolicy::Sequential => "sequential",
+        OffloadPolicy::Resident => "resident",
+    }
+}
+
+fn route_label(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        crate::MODEL_ID => Some("base"),
+        crate::SPRINT_MODEL_ID => Some("sprint"),
+        _ => None,
+    }
+}
+
+/// The tier of the artifact `spec` points at, read from the seam the SANA loader itself
+/// packed-detects on: the `{base}.scales` companions inside the `transformer/` weight file(s)
+/// (`crate::quant::lin` → [`mlx_gen::quant::lin`]), with the width inferred from the u32 codes /
+/// scales shape ratio at `crate::quant::GROUP_SIZE` exactly as [`mlx_gen::quant::packed_bits`]
+/// infers it at load. The SANA turnkey writes **no** `transformer/config.json` (`crate::convert`:
+/// the config is the hard-coded `SanaTransformerConfig`, and the width self-describes via the
+/// `.scales` shapes), so a JSON marker is never consulted — a probe on it read every shipped tier
+/// as unreadable and published no identity at all.
+///
+/// `Ok(None)` is a dense (bf16) transformer. `Err` fails closed on anything that is not a
+/// readable shipped tier: a root that is not a snapshot directory, a `transformer/` component that
+/// is absent or carries no readable `.safetensors`, a packed base with no `.weight` codes, a codes /
+/// scales ratio that is not an exact 4- or 8-bit pack, or two bases packed at different widths.
+pub fn resolved_artifact_tier(spec: &LoadSpec) -> CoreResult<Option<mlx_gen::Quant>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "SANA artifact tier: the load is not a snapshot directory".to_owned(),
+        ));
+    };
+    let component = root.join("transformer");
+    let fail = |detail: String| {
+        CoreError::Unsupported(format!(
+            "SANA artifact tier: {} — {detail}",
+            component.display()
+        ))
+    };
+    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&component)
+        .map_err(|error| fail(format!("no readable transformer weights ({error})")))?;
+    if headers.is_empty() {
+        return Err(fail(
+            "no transformer weights to read a tier from".to_owned(),
+        ));
+    }
+    let shapes: std::collections::HashMap<&str, &[usize]> = headers
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor.shape.as_slice()))
+        .collect();
+    let mut width: Option<mlx_gen::Quant> = None;
+    for tensor in &headers {
+        let Some(base) = tensor.name.strip_suffix(".scales") else {
+            continue;
+        };
+        let codes = shapes
+            .get(format!("{base}.weight").as_str())
+            .ok_or_else(|| fail(format!("`{base}.scales` has no `{base}.weight` codes")))?;
+        let bits = packed_width_from_shapes(codes, &tensor.shape)
+            .ok_or_else(|| fail(format!("`{base}` is not an exact 4- or 8-bit pack")))?;
+        match width {
+            None => width = Some(bits),
+            Some(seen) if seen == bits => {}
+            Some(seen) => {
+                return Err(fail(format!(
+                    "packed bases disagree on their width: `{base}` is {bits:?}, an earlier base \
+                     is {seen:?}"
+                )))
+            }
+        }
+    }
+    Ok(width)
+}
+
+/// [`mlx_gen::quant::packed_bits`] on header shapes alone: `scales` is `[out, in / GROUP_SIZE]` and
+/// the u32 codes are `[out, in · bits / 32]`, so `bits = codes.cols · 32 / (scales.cols · GROUP_SIZE)`
+/// when that division is exact and lands on a shipped width.
+fn packed_width_from_shapes(codes: &[usize], scales: &[usize]) -> Option<mlx_gen::Quant> {
+    let (&[out, code_cols], &[scale_rows, scale_cols]) = (codes, scales) else {
+        return None;
+    };
+    if out != scale_rows {
+        return None;
+    }
+    let group = usize::try_from(crate::quant::GROUP_SIZE).ok()?;
+    let in_dim = scale_cols.checked_mul(group)?;
+    let packed_width = code_cols.checked_mul(32)?;
+    if in_dim == 0 || packed_width % in_dim != 0 {
+        return None;
+    }
+    match packed_width / in_dim {
+        4 => Some(mlx_gen::Quant::Q4),
+        8 => Some(mlx_gen::Quant::Q8),
+        _ => None,
+    }
+}
+
+/// The tier a load ASKS for. SANA's tiers are prepacked and the loader packed-detects them, so the
+/// worker may pass the resolved tier through `LoadSpec::quantize` (its shipped shape) or leave it
+/// `None` and let the loader detect; both spellings load the same weights, so the requested tier is
+/// the explicit one when it is there and the artifact's own packed width otherwise.
+/// [`memory_strategy_contract`] then proves the answer against that width either way, so this can
+/// never turn a dense snapshot into a packed claim on its own.
+pub fn requested_tier(spec: &LoadSpec) -> Option<mlx_gen::Quant> {
+    spec.quantize
+        .or_else(|| resolved_artifact_tier(spec).ok().flatten())
+}
+
+/// Production calibration identity table of the SANA routes, keyed on
+/// **(provider, tier, offload policy)** — sc-22731, epic sc-22723 E1/E4.
+///
+/// Before sc-22731 the key was the offload policy ALONE, so `sana_1600m` and `sana_sprint_1600m`
+/// published the same string and so did all three shipped tiers of each: six cells sharing two
+/// identities, which is exactly the sc-22511 false green — a Sprint q8 anchor binding base SANA's
+/// q4 evidence. The provider and the tier are now in the key.
+///
+/// The **policy stays in the key** (unlike the FLUX.1 table, sc-22726): SANA's two strings are not
+/// one measurement seen twice. Rung 4 is declared only on `Sequential` (`windowed` in
+/// `contract_with_asset_facts`), so the two policies publish genuinely different ladders and each
+/// carries its own retained measured string. `MemoryCalibrationIdentity::load_shape` continues to
+/// carry the materialization axis separately, and the identity is independent of it.
+///
+/// This is the TABLE, not the binding: the tier here is [`requested_tier`], and only
+/// [`memory_strategy_contract`] — which proves that tier against the artifact's own packed width
+/// before publishing — may turn one of these strings into a production contract identity.
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = route_label(provider_id)?;
+    let tier = calibration_tier_label(requested_tier(spec))?;
+    let policy = policy_label(spec.offload_policy);
+    Some(
+        if provider_id == CALIBRATED_ROUTE && tier == CALIBRATED_TIER {
+            match spec.offload_policy {
+                OffloadPolicy::Sequential => MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+                OffloadPolicy::Resident => RESIDENT_MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            }
+        } else {
+            format!("sana-{route}-{tier}-mlx-full-ladder-v1-{policy}")
+        },
+    )
+}
+
+/// The weights-free registry-conformance identity: the same (provider, tier, policy) coordinate in
+/// a namespace that can never collide with a production string, so a fixture contract can never be
+/// mistaken for measured evidence of the cell it describes.
+pub fn weights_free_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = route_label(provider_id)?;
+    let tier = calibration_tier_label(requested_tier(spec))?;
+    let policy = policy_label(spec.offload_policy);
+    Some(format!(
+        "sana-{route}-{tier}-mlx-weights-free-conformance-v1-{policy}"
+    ))
 }
 
 /// The two catalog ids this contract serves.
@@ -260,10 +432,32 @@ pub fn memory_strategy_contract(
     contract_with_asset_facts(
         provider_id,
         spec,
+        production_calibration_identity(provider_id, spec),
         components.text_encoder,
         components.dit,
         resident_decoder_bytes(spec, components.vae),
     )
+}
+
+/// The identity a PRODUCTION load publishes: the (provider, tier, policy) string from
+/// [`production_calibration_fingerprint`], but only once the requested tier has been proven to be
+/// the tier of the artifact on disk (sc-22731, the sc-22726 review rule).
+///
+/// A dense snapshot loaded with `quantize = Some(_)` would be a load-time requantization whose peak
+/// no anchor measured, and a packed snapshot loaded with the OTHER packed tier requested is not a
+/// shipped load either. Both publish `None` rather than the requested tier's string. A packed
+/// snapshot loaded with `quantize = None` IS the packed load (the loader detects the width, and
+/// [`requested_tier`] follows it), so it publishes that tier's string. An artifact whose width
+/// cannot be read publishes `None` — fail closed.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<MemoryCalibrationIdentity> {
+    if resolved_artifact_tier(spec).ok()? != requested_tier(spec) {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, spec)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
 }
 
 /// Architecture axes for one registered SANA route (epic SC-22657, E2).
@@ -307,12 +501,15 @@ pub(crate) fn weights_free_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> CoreResult<MemoryProviderContract> {
     validate_load_contract(provider_id, spec)?;
-    contract_with_asset_facts(provider_id, spec, 0, 0, 0)
+    let calibration = weights_free_calibration_fingerprint(provider_id, spec)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    contract_with_asset_facts(provider_id, spec, calibration, 0, 0, 0)
 }
 
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
+    calibration: Option<MemoryCalibrationIdentity>,
     conditioning_bytes: u64,
     transformer_bytes: u64,
     decoder_bytes: u64,
@@ -354,10 +551,7 @@ fn contract_with_asset_facts(
         ],
         variables,
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        calibration_fingerprint(spec.offload_policy),
-        spec.load_shape,
-    ));
+    contract.calibration = calibration;
     contract.asset_facts.conditioning_bytes = conditioning_bytes;
     contract.asset_facts.transformer_bytes = transformer_bytes;
     contract.asset_facts.decoder_bytes = decoder_bytes;
@@ -1132,14 +1326,362 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------------------------
+    // sc-22731 (epic sc-22723 E1/E4): the production calibration identity is per
+    // (provider, tier, offload policy), bound to the artifact on disk.
+    // ------------------------------------------------------------------------------------------
+
+    /// Write one safetensors file by hand: `(name, dtype, shape)` entries over a zero-filled data
+    /// region. Only the HEADER matters to the tier seam, exactly as it does to the loader's
+    /// packed-detect.
+    fn write_safetensors(path: &std::path::Path, entries: &[(String, &str, Vec<usize>)]) {
+        let width = |dtype: &str| match dtype {
+            "BF16" => 2,
+            "U32" | "F32" => 4,
+            other => panic!("fixture dtype {other}"),
+        };
+        let mut offset = 0usize;
+        let mut fields = Vec::new();
+        for (name, dtype, shape) in entries {
+            let bytes = shape.iter().product::<usize>() * width(dtype);
+            let shape = shape
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let end = offset + bytes;
+            fields.push(format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{end}]}}"
+            ));
+            offset = end;
+        }
+        let mut json = format!("{{{}}}", fields.join(",")).into_bytes();
+        while json.len() % 8 != 0 {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + offset, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The packed triple `crate::convert` writes for one Linear `{base}` of `in = 64` at
+    /// `GROUP_SIZE` 64 — u32 codes `[out, 64·bits/32]`, bf16 scales/biases `[out, 1]` — or the
+    /// dense bf16 `[out, 64]` weight when `bits` is `None`.
+    fn linear_entries(
+        base: &str,
+        out: usize,
+        bits: Option<usize>,
+    ) -> Vec<(String, &'static str, Vec<usize>)> {
+        match bits {
+            Some(bits) => vec![
+                (format!("{base}.weight"), "U32", vec![out, 64 * bits / 32]),
+                (format!("{base}.scales"), "BF16", vec![out, 1]),
+                (format!("{base}.biases"), "BF16", vec![out, 1]),
+            ],
+            None => vec![(format!("{base}.weight"), "BF16", vec![out, 64])],
+        }
+    }
+
+    /// A snapshot root laid out the way `crate::convert` writes the shipped turnkey tiers: the three
+    /// component directories SANA resolves, each holding its single weight file, with the trunk
+    /// Linears and the Gemma-2 projections packed at `bits` (`None` = dense bf16) as real
+    /// `.weight`/`.scales`/`.biases` triples, the convs and the DC-AE dense, and **no**
+    /// `transformer/config.json` — the turnkey never writes one.
+    fn sana_tier_root(bits: Option<usize>) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for component in ["transformer", "vae", "text_encoder"] {
+            std::fs::create_dir_all(tmp.path().join(component)).unwrap();
+        }
+        let mut transformer = linear_entries("transformer_blocks.0.attn1.to_q", 8, bits);
+        transformer.extend(linear_entries("proj_out", 8, bits));
+        transformer.push((
+            "patch_embed.proj.weight".to_owned(),
+            "BF16",
+            vec![8, 32, 1, 1],
+        ));
+        write_safetensors(
+            &tmp.path()
+                .join("transformer/diffusion_pytorch_model.safetensors"),
+            &transformer,
+        );
+        let mut te = linear_entries("model.layers.0.self_attn.q_proj", 8, bits);
+        te.push(("model.embed_tokens.weight".to_owned(), "BF16", vec![16, 64]));
+        write_safetensors(
+            &tmp.path().join("text_encoder/gemma-2-2b-it.safetensors"),
+            &te,
+        );
+        write_safetensors(
+            &tmp.path().join("vae/diffusion_pytorch_model.safetensors"),
+            &[(
+                "decoder.conv_out.weight".to_owned(),
+                "F32",
+                vec![3, 8, 3, 3],
+            )],
+        );
+        assert!(
+            !tmp.path().join("transformer/config.json").exists(),
+            "the fixture must mirror the turnkey, which writes no transformer/config.json"
+        );
+        tmp
+    }
+
+    fn tier_spec(root: &std::path::Path, quant: Option<mlx_gen::Quant>) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_offload_policy(OffloadPolicy::Resident)
+            .with_load_shape(LoadShape::EagerMaterialization);
+        spec.quantize = quant;
+        spec
+    }
+
+    /// The six shipped MLX cells (two routes x three tiers) each publish their OWN production
+    /// identity, on both offload policies and both load shapes, and the measured `2026-08-06`
+    /// strings stay byte-identical on the (`sana_1600m`, q4) cell they were captured on.
+    ///
+    /// Mutation that fails this: restoring `calibration_fingerprint(policy)` as the key — all six
+    /// cells collapse onto two strings, which is the sc-22511 false green (a Sprint q8 anchor
+    /// binding base SANA's q4 evidence).
+    #[test]
+    fn every_shipped_sana_cell_publishes_its_own_per_tier_identity_on_both_policies() {
+        let mut published = std::collections::BTreeSet::new();
+        for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+            for (bits, quant) in [
+                (Some(4), Some(mlx_gen::Quant::Q4)),
+                (Some(8), Some(mlx_gen::Quant::Q8)),
+                (None, None),
+            ] {
+                for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+                    for shape in [
+                        LoadShape::EagerMaterialization,
+                        LoadShape::DeferredMaterialization,
+                    ] {
+                        let root = sana_tier_root(bits);
+                        let spec = {
+                            let mut spec = tier_spec(root.path(), quant);
+                            spec = spec.with_offload_policy(policy).with_load_shape(shape);
+                            spec
+                        };
+                        let label = format!("{provider} {quant:?} {policy:?} {shape:?}");
+                        assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{label}");
+                        let contract = memory_strategy_contract(provider, &spec).unwrap();
+                        let identity = contract
+                            .calibration
+                            .as_ref()
+                            .unwrap_or_else(|| panic!("{label}: no production identity"));
+                        assert_eq!(identity.load_shape, shape, "{label}");
+                        assert_eq!(
+                            Some(identity.fingerprint.clone()),
+                            production_calibration_fingerprint(provider, &spec),
+                            "{label}"
+                        );
+                        // The weights-free conformance identity is a different namespace, so a
+                        // fixture contract can never be read as evidence of this cell.
+                        let fixture =
+                            weights_free_memory_strategy_contract(provider, &spec).unwrap();
+                        assert_ne!(
+                            fixture.calibration.as_ref().unwrap().fingerprint,
+                            identity.fingerprint,
+                            "{label}"
+                        );
+                        published.insert(identity.fingerprint.clone());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            published.len(),
+            2 * 3 * 2,
+            "two (provider, tier, policy) cells share one identity: {published:?}"
+        );
+        // The retained measured cell, byte-for-byte.
+        let q4 = sana_tier_root(Some(4));
+        for (policy, expected) in [
+            (OffloadPolicy::Sequential, MEMORY_CALIBRATION_FINGERPRINT),
+            (
+                OffloadPolicy::Resident,
+                RESIDENT_MEMORY_CALIBRATION_FINGERPRINT,
+            ),
+        ] {
+            assert_eq!(
+                production_calibration_fingerprint(
+                    CALIBRATED_ROUTE,
+                    &tier_spec(q4.path(), Some(mlx_gen::Quant::Q4)).with_offload_policy(policy),
+                )
+                .as_deref(),
+                Some(expected),
+            );
+        }
+        assert_eq!(CALIBRATED_ROUTE, "sana_1600m");
+        assert_eq!(CALIBRATED_TIER, "q4");
+    }
+
+    /// **The worker's real MLX SANA load publishes the retained measured identity over a
+    /// convert-shaped q4 root.** SceneWorks loads SANA as `quantize = Some(Q4)` + `Resident` +
+    /// `EagerMaterialization` (manifest `mlx.quantize: 4`) over a turnkey that carries NO
+    /// `transformer/config.json`; the tier must come off the `.scales` shapes the loader itself
+    /// packed-detects on, or every shipped render publishes nothing.
+    ///
+    /// Mutation that fails this: restoring the `transformer/config.json` existence check in
+    /// `resolved_artifact_tier` — the convert-shaped root reads as unreadable and the contract's
+    /// `calibration` is `None`.
+    #[test]
+    fn the_workers_real_q4_resident_eager_load_publishes_the_measured_resident_identity() {
+        let q4 = sana_tier_root(Some(4));
+        let spec = tier_spec(q4.path(), Some(mlx_gen::Quant::Q4));
+        assert_eq!(spec.offload_policy, OffloadPolicy::Resident);
+        assert_eq!(spec.load_shape, LoadShape::EagerMaterialization);
+        assert_eq!(
+            resolved_artifact_tier(&spec).unwrap(),
+            Some(mlx_gen::Quant::Q4)
+        );
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert_eq!(
+            contract.calibration,
+            Some(MemoryCalibrationIdentity::new(
+                "sana-mlx-full-ladder-2026-08-06-v1-resident".to_owned(),
+                LoadShape::EagerMaterialization,
+            ))
+        );
+        // The q8 and dense turnkeys resolve off the same seam.
+        for (bits, quant) in [(Some(8), Some(mlx_gen::Quant::Q8)), (None, None)] {
+            let root = sana_tier_root(bits);
+            let spec = tier_spec(root.path(), quant);
+            assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{bits:?}");
+        }
+    }
+
+    /// `quantize = None` over a packed turnkey is the same load as `quantize = Some(tier)` — the
+    /// loader packed-detects either way — so [`requested_tier`] follows the artifact and the cell
+    /// publishes its own tier's string, not the dense one and not nothing.
+    ///
+    /// Mutation that fails this: dropping the `or_else(resolved_artifact_tier)` fallback in
+    /// `requested_tier` — the request reads as bf16, the binding sees `Some(Q4) != None`, and the
+    /// contract publishes no identity.
+    #[test]
+    fn a_quantize_none_load_over_a_packed_root_publishes_the_artifacts_tier() {
+        for (bits, quant, tier) in [(4, mlx_gen::Quant::Q4, "q4"), (8, mlx_gen::Quant::Q8, "q8")] {
+            for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+                let root = sana_tier_root(Some(bits));
+                let spec = tier_spec(root.path(), None);
+                assert_eq!(requested_tier(&spec), Some(quant), "{provider} {tier}");
+                let explicit = tier_spec(root.path(), Some(quant));
+                let published = memory_strategy_contract(provider, &spec)
+                    .unwrap()
+                    .calibration
+                    .unwrap_or_else(|| panic!("{provider} {tier}: no identity on quantize=None"));
+                assert_eq!(
+                    Some(published.fingerprint.clone()),
+                    production_calibration_fingerprint(provider, &explicit),
+                    "{provider} {tier}"
+                );
+                assert!(
+                    published.fingerprint.contains(&format!("-{tier}-"))
+                        || published.fingerprint == RESIDENT_MEMORY_CALIBRATION_FINGERPRINT
+                );
+                assert_eq!(
+                    weights_free_calibration_fingerprint(provider, &spec),
+                    weights_free_calibration_fingerprint(provider, &explicit),
+                    "{provider} {tier}: the weights-free key must follow the artifact too"
+                );
+            }
+        }
+    }
+
+    /// The tier in the published string is the tier of the artifact on disk, never the request knob
+    /// alone: a dense snapshot asked for at q4 would be a load-time requantization no anchor
+    /// measured, and a packed snapshot asked for the other packed tier is no shipped load either.
+    /// A transformer whose packed width cannot be read fails closed.
+    ///
+    /// Mutation that fails this: deleting the `resolved_artifact_tier(spec) != requested_tier(spec)`
+    /// refusal in `production_calibration_identity` — every mismatched cell publishes the requested
+    /// tier's string over another tier's weights.
+    #[test]
+    fn the_production_identity_is_withheld_when_the_request_and_the_artifact_disagree() {
+        for (bits, requested) in [
+            (None, Some(mlx_gen::Quant::Q4)),
+            (None, Some(mlx_gen::Quant::Q8)),
+            (Some(4), Some(mlx_gen::Quant::Q8)),
+            (Some(8), Some(mlx_gen::Quant::Q4)),
+        ] {
+            for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
+                let root = sana_tier_root(bits);
+                let spec = tier_spec(root.path(), requested);
+                let label = format!("{provider} artifact {bits:?} requested {requested:?}");
+                assert!(
+                    production_calibration_fingerprint(provider, &spec).is_some(),
+                    "{label}: the table still answers for the request knob"
+                );
+                assert!(
+                    memory_strategy_contract(provider, &spec)
+                        .unwrap()
+                        .calibration
+                        .is_none(),
+                    "{label}: published an identity over another tier's weights"
+                );
+            }
+        }
+        // A root whose transformer weights cannot be read proves no tier at all: no `transformer/`
+        // (the old weightless declaration root), a `transformer/` with no weight file, a packed
+        // base whose codes/scales ratio is not a shipped width, and two bases packed differently.
+        let empty = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bare.path().join("transformer")).unwrap();
+        let unshipped = sana_tier_root(Some(4));
+        write_safetensors(
+            &unshipped
+                .path()
+                .join("transformer/diffusion_pytorch_model.safetensors"),
+            &linear_entries("proj_out", 8, Some(2)),
+        );
+        let mixed = sana_tier_root(Some(4));
+        let mut entries = linear_entries("proj_out", 8, Some(4));
+        entries.extend(linear_entries(
+            "transformer_blocks.0.attn1.to_q",
+            8,
+            Some(8),
+        ));
+        write_safetensors(
+            &mixed
+                .path()
+                .join("transformer/diffusion_pytorch_model.safetensors"),
+            &entries,
+        );
+        for (label, root) in [
+            ("no transformer/", empty.path()),
+            ("transformer/ without weights", bare.path()),
+            ("2-bit pack", unshipped.path()),
+            ("mixed q4/q8 pack", mixed.path()),
+        ] {
+            for requested in [None, Some(mlx_gen::Quant::Q4)] {
+                let spec = tier_spec(root, requested);
+                assert!(
+                    resolved_artifact_tier(&spec).is_err(),
+                    "{label} {requested:?}"
+                );
+                assert!(
+                    memory_strategy_contract(crate::MODEL_ID, &spec)
+                        .unwrap()
+                        .calibration
+                        .is_none(),
+                    "{label} {requested:?}: published an identity over unreadable weights"
+                );
+            }
+        }
+    }
+
     /// **The declared ladder is invariant in the advisory `quantize` axis — asserted, not assumed.**
     ///
     /// Sibling families register a selector-aware surface resolver because their `LoadSpec::quantize`
     /// means "pack this dense source at load time", so the resolved artifact tier and the request are
     /// genuinely different facts. SANA's tiers are **packed-detected from the on-disk `.scales`**
-    /// (sc-8489), so `quantize` never changes what is loaded or what is declared. Rather than import
-    /// another family's axis, that invariance is pinned here: if a future tier ever moves a rung, this
-    /// goes red and the resolver becomes the right answer.
+    /// (sc-8489), so `quantize` never changes what rungs are declared. Rather than import another
+    /// family's axis, that invariance is pinned here: if a future tier ever moves a rung, this goes
+    /// red and the resolver becomes the right answer.
+    ///
+    /// **The calibration IDENTITY is deliberately not in that invariance (sc-22731).** The rungs a
+    /// tier can run are the same; the memory each one costs is not, and an identity shared across
+    /// tiers is what let a q8 anchor bind q4's evidence. The identity is asserted to MOVE with the
+    /// tier here, so the invariance claim above can never be widened back over it by accident.
     #[test]
     fn the_declared_ladder_is_invariant_in_the_advisory_quantize_axis() {
         for provider in [crate::MODEL_ID, crate::SPRINT_MODEL_ID] {
@@ -1164,7 +1706,11 @@ mod tests {
                                 "{provider} {policy:?}/{shape:?} {quant:?} moved {strategy:?}"
                             );
                         }
-                        assert_eq!(contract.calibration, dense.calibration);
+                        assert_ne!(
+                            contract.calibration, dense.calibration,
+                            "{provider} {policy:?}/{shape:?}: {quant:?} must not share the dense \
+                             tier's identity"
+                        );
                         assert_eq!(
                             contract.lifecycle.transformer_window_materialization,
                             dense.lifecycle.transformer_window_materialization
@@ -1291,7 +1837,8 @@ mod tests {
                     parameters: MemoryStrategyParameters::default(),
                 },
                 declared_calibration: MemoryCalibrationIdentity::new(
-                    calibration_fingerprint(spec.offload_policy),
+                    weights_free_calibration_fingerprint(crate::MODEL_ID, &spec)
+                        .expect("the base route at a shipped tier has a conformance identity"),
                     spec.load_shape,
                 ),
                 observed_calibration: contract.calibration.clone().unwrap(),

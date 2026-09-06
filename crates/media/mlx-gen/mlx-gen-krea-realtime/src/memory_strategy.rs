@@ -13,8 +13,8 @@ use std::{
 };
 
 use mlx_gen::gen_core::{
-    default_memory_strategy_safety_check, MemoryBackendRealization, MemoryComponentKind,
-    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    default_memory_strategy_safety_check, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract, MemoryRegistration,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategySupport, ResidentOnlyMemoryContractRegistration,
@@ -38,6 +38,14 @@ pub const ARTIFACT_RECEIPT_DOMAIN: &str = "krea-realtime-video-resident-v3";
 pub const REQUEST_RECEIPT_DOMAIN: &str = "provider-resident-video-request-v3";
 pub const CANONICAL_REPOSITORY: &str = "SceneWorks/krea-realtime-14b-mlx";
 pub const CANONICAL_REVISION: &str = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626";
+/// Static-behavior identity family published by the weights-free registry declaration surface.
+///
+/// This seam opens no file, so it can only describe *behavior* — the resident-only rung set this
+/// provider declares for a given requested tier and residency policy. It is deliberately a
+/// different family from [`production_calibration_fingerprint`], whose strings name the resident
+/// ladder measured against a real artifact on disk; nothing weights-free may ever produce one of
+/// those.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-realtime-14b-mlx-registry-behavior-v1";
 const PACKED_FILES: &[&str] = &[CONFIG, DIT, TEXT_ENCODER, TOKENIZER, VAE];
 const BF16_FILES: &[&str] = &[
     CONFIG,
@@ -352,6 +360,75 @@ pub fn resolved_numeric_tier(spec: &LoadSpec) -> Result<mlx_gen::gen_core::Memor
     })
 }
 
+/// Production calibration identity table of the Krea Realtime 14B resident ladder, keyed on
+/// (provider, artifact tier).
+///
+/// Every shipped cell is `krea-realtime-14b-<tier>-mlx-resident-ladder-v1` for `tier` in
+/// `bf16`/`q4`/`q8`; there is no pre-existing measured string for this provider to preserve, so
+/// the three cells are uniform. A provider id other than [`MODEL_ID`] has no cell.
+///
+/// Offload policy and load shape are deliberately not inputs: the identity names the artifact the
+/// evidence was captured against, and [`MemoryCalibrationIdentity::load_shape`] carries the
+/// materialization axis separately.
+///
+/// This is the table, not the binding. The `tier` here is a caller-supplied label; only
+/// [`production_calibration_identity`] — which proves the tier against the packed marker in the
+/// snapshot's own `config.json` — may turn one of these strings into a contract identity.
+pub fn production_calibration_fingerprint(provider_id: &str, tier: &str) -> Option<String> {
+    if provider_id != MODEL_ID || !matches!(tier, "bf16" | "q4" | "q8") {
+        return None;
+    }
+    Some(format!("krea-realtime-14b-{tier}-mlx-resident-ladder-v1"))
+}
+
+/// The production identity of `spec`, bound to the tier of the artifact actually on disk.
+///
+/// Fail-closed in every direction, and never an error: a file-backed source, a directory that is
+/// not materialized, a snapshot whose packed `quantization.bits` crosses `LoadSpec::quantize`, or
+/// a non-bf16 execution precision all publish `None` rather than a string no anchor measured.
+/// Building the contract itself must not become fallible on account of the identity.
+///
+/// The materialized-directory check is load-bearing rather than redundant with the tier proof:
+/// `KreaRealtimeConfig::from_model_dir` keeps the shipped preset for a snapshot with no
+/// `config.json`, and a directory that does not exist has none either — so without it a
+/// nonexistent path would publish the `bf16` anchor coordinate.
+///
+/// The tier comes from the snapshot's own packed marker, never from `spec.quantize` alone: the
+/// SceneWorks worker resolves a Krea Realtime tier by directory and leaves `LoadSpec::quantize` at
+/// `None` for all three tiers (the tier on disk *is* the quantization), so keying on that field
+/// would collapse q4, q8 and bf16 onto one string.
+pub fn production_calibration_identity(spec: &LoadSpec) -> Option<MemoryCalibrationIdentity> {
+    if spec.precision != mlx_gen::Precision::Bf16 {
+        return None;
+    }
+    let root = mlx_gen::architecture_facts::materialized_root(spec)?;
+    let resolved_tier = tier(spec, root).ok()?;
+    production_calibration_fingerprint(MODEL_ID, resolved_tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
+/// Per-selector static behavior identity for the weights-free declaration surface.
+///
+/// The tier token comes from `spec.quantize` alone because this seam touches no filesystem: there
+/// is no artifact whose packed marker could be read. `MemoryProviderContract::conformance_errors`
+/// requires lowercase kebab tokens, so every component spelled in is already one.
+fn static_behavior_identity(spec: &LoadSpec) -> MemoryCalibrationIdentity {
+    let tier = match spec.quantize {
+        None => "bf16",
+        Some(mlx_gen::Quant::Q4) => "q4",
+        Some(mlx_gen::Quant::Q8) => "q8",
+        Some(_) => "unshipped",
+    };
+    let policy = match spec.offload_policy {
+        mlx_gen::OffloadPolicy::Resident => "resident",
+        mlx_gen::OffloadPolicy::Sequential => "sequential",
+    };
+    MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{tier}-{policy}"),
+        spec.load_shape,
+    )
+}
+
 /// Canonical receipt for the exact tier/direct-file/adapter load identity.
 ///
 /// The generator cache separately retains filesystem replacement tokens. This digest is the
@@ -444,12 +521,16 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
             .checked_add(inspect_safetensors(&adapter.path)?.logical_bytes)
             .ok_or_else(|| Error::Unsupported(format!("{MODEL_ID}: adapter byte overflow")))
     })?;
-    // Structural artifact identity is intentionally not written into `calibration`: that field
-    // means a measured memory campaign. The registry/worker carry the immutable artifact receipt
-    // separately while this contract remains truthfully estimate-backed.
+    // `calibration` names the anchor cell this load belongs to — the (provider, artifact tier)
+    // coordinate a memory campaign captures against — not a completed campaign. Publishing it is
+    // what makes the cell measurable at all: the capture arm reads the identity off the loaded
+    // generator and refuses a contract without one. The immutable artifact receipt below is a
+    // separate, finer-grained quantity and stays out of the identity: it changes with every byte
+    // on disk, while the anchor coordinate must be stable across snapshots of the same tier.
     let _identity = canonical_artifact_identity(spec)?;
     contract_from_asset_facts(
         spec,
+        production_calibration_identity(spec),
         mlx_gen::gen_core::MemoryAssetFacts {
             base_bytes,
             conditioning_bytes,
@@ -501,8 +582,15 @@ fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureF
     }
 }
 
+/// Shared contract shape for both publication seams.
+///
+/// `calibration` is threaded in rather than derived here because the two callers are answering
+/// different questions with it: the production path names the anchor cell of the artifact it just
+/// inspected, and the weights-free declaration path names its own static behavior. Deriving one
+/// rule inside this builder would let a weights-free witness publish a production string.
 fn contract_from_asset_facts(
     spec: &LoadSpec,
+    calibration: Option<MemoryCalibrationIdentity>,
     asset_facts: mlx_gen::gen_core::MemoryAssetFacts,
 ) -> Result<MemoryProviderContract> {
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -516,7 +604,7 @@ fn contract_from_asset_facts(
     );
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
-    contract.calibration = None;
+    contract.calibration = calibration;
     contract.asset_facts = asset_facts;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -566,6 +654,10 @@ fn contract_from_asset_facts(
 /// Production admission still uses [`memory_strategy_contract`] and its exact physical file facts.
 /// This witness carries no asset magnitudes: it exists only so catalog reconciliation can prove,
 /// for every shipped bf16/q4/q8 selector, that Krea Realtime exposes no optimized rung by omission.
+///
+/// It publishes a [`static_behavior_identity`], never a
+/// [`production_calibration_fingerprint`]: the two families are disjoint by construction, so a
+/// weights-free witness can never be mistaken for measured-cell evidence.
 pub(crate) fn weights_free_resident_contract(spec: &LoadSpec) -> Result<MemoryProviderContract> {
     if !matches!(
         spec.quantize,
@@ -575,7 +667,11 @@ pub(crate) fn weights_free_resident_contract(spec: &LoadSpec) -> Result<MemoryPr
             "{MODEL_ID}: unsupported weights-free resident tier"
         )));
     }
-    contract_from_asset_facts(spec, mlx_gen::gen_core::MemoryAssetFacts::default())
+    contract_from_asset_facts(
+        spec,
+        Some(static_behavior_identity(spec)),
+        mlx_gen::gen_core::MemoryAssetFacts::default(),
+    )
 }
 
 pub(crate) fn safety_check(
@@ -636,7 +732,23 @@ pub(crate) fn loaded_safety_check(
     safety_check(spec, contract, context)
 }
 
+/// Registry entry point for [`MemoryRegistration::contract`].
+///
+/// A materialized snapshot directory resolves the exact physical contract. A spec that names no
+/// materialized directory is not a load at all — it is a declaration probe, the shape catalog
+/// reconciliation and the SceneWorks planned-lane walk both synthesize — and it resolves the same
+/// weights-free declaration contract [`RESIDENT_ONLY_WITNESS`] publishes, so a caller that reaches
+/// this registration without a fixture still gets a well-formed, identity-carrying witness instead
+/// of a directory-read error.
+///
+/// This does not widen admission. The declaration contract carries zero asset magnitudes, and the
+/// paired [`safety_check`] independently re-resolves [`memory_strategy_contract`] and
+/// [`canonical_artifact_identity`] against real files before any request is admitted, so a
+/// nonexistent directory is still refused at the request boundary.
 fn registry_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    if mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return registry_resident_witness(spec);
+    }
     memory_strategy_contract(spec).map_err(|error| mlx_gen::gen_core::Error::Msg(error.to_string()))
 }
 
@@ -898,9 +1010,19 @@ mod tests {
             assert!(contract.asset_facts.base_bytes > 0);
             assert!(contract.asset_facts.conditioning_bytes > 0);
             assert!(contract.asset_facts.decoder_bytes > 0);
+            // sc-22735: the anchor coordinate IS published now — the capture arm refuses a
+            // contract without one — but it names the (provider, tier) cell, never the
+            // per-byte structural receipt, which must stay out of the identity.
+            let calibration = contract
+                .calibration
+                .as_ref()
+                .expect("every shipped tier publishes its anchor cell");
+            assert_eq!(calibration.load_shape, contract.load_shape);
             assert!(
-                contract.calibration.is_none(),
-                "structural facts are not calibration"
+                !calibration
+                    .fingerprint
+                    .contains(&canonical_artifact_identity(&q4_spec).unwrap()),
+                "the structural artifact receipt is not the anchor coordinate"
             );
             assert!(matches!(
                 contract
@@ -946,6 +1068,170 @@ mod tests {
                 }
             }));
         }
+    }
+
+    /// The three production tiers, resolved from a real fixture directory the way the contract
+    /// builder resolves them. Keyed on the tier set, never a frozen count.
+    fn production_identities() -> std::collections::BTreeMap<&'static str, String> {
+        ["q4", "q8", "bf16"]
+            .into_iter()
+            .map(|tier| {
+                let (root, spec) = fixture(tier, 400);
+                let fingerprint = memory_strategy_contract(&spec)
+                    .unwrap()
+                    .calibration
+                    .expect("a shipped tier publishes its anchor cell")
+                    .fingerprint;
+                drop(root);
+                (tier, fingerprint)
+            })
+            .collect()
+    }
+
+    /// AC (sc-22735 a): each shipped tier publishes its own anchor coordinate in the documented
+    /// `krea-realtime-14b-<tier>-mlx-resident-ladder-v1` format, and the three are pairwise
+    /// distinct — the defect this replaces is `LoadSpec::quantize` being `None` for all three
+    /// tiers, which would have collapsed them onto one string.
+    #[test]
+    fn every_shipped_tier_publishes_its_own_production_anchor_identity() {
+        let identities = production_identities();
+        for (tier, fingerprint) in &identities {
+            assert_eq!(
+                *fingerprint,
+                format!("krea-realtime-14b-{tier}-mlx-resident-ladder-v1"),
+                "{tier} anchor coordinate"
+            );
+            assert_eq!(
+                production_calibration_fingerprint(MODEL_ID, tier).as_ref(),
+                Some(fingerprint)
+            );
+            assert!(mlx_gen::gen_core::validate_calibration_fingerprint(fingerprint).is_ok());
+        }
+        let distinct: std::collections::BTreeSet<&String> = identities.values().collect();
+        assert_eq!(
+            distinct.len(),
+            identities.len(),
+            "the tiers must not collapse onto one anchor string: {identities:?}"
+        );
+        // A foreign provider id has no cell in this table.
+        assert_eq!(
+            production_calibration_fingerprint("wan_2_1_14b", "q4"),
+            None
+        );
+    }
+
+    /// AC (sc-22735 b): the weights-free declaration surface publishes an identity that is
+    /// `Some`, carries the spec's own load shape (the SceneWorks planned-lane gate asserts that
+    /// equality), and can never be confused with a production anchor string.
+    #[test]
+    fn the_weights_free_surface_publishes_a_distinct_static_behavior_identity() {
+        let production: std::collections::BTreeSet<String> =
+            production_identities().into_values().collect();
+        let mut seen = 0_usize;
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            let contract = weights_free_resident_contract(&surface.spec).unwrap();
+            let calibration = contract
+                .calibration
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} publishes no identity", surface.selector.id()));
+            assert_eq!(
+                calibration.load_shape,
+                surface.spec.load_shape,
+                "{} static identity must carry its own load shape",
+                surface.selector.id()
+            );
+            assert!(
+                calibration
+                    .fingerprint
+                    .starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{} published {}",
+                surface.selector.id(),
+                calibration.fingerprint
+            );
+            assert!(
+                !production.contains(&calibration.fingerprint),
+                "{} published a production anchor string {}",
+                surface.selector.id(),
+                calibration.fingerprint
+            );
+            assert!(contract.conformance_errors().is_empty());
+            seen += 1;
+        }
+        assert!(seen > 0, "the surface walk must not be vacuous");
+
+        // The tier and policy tokens are the two axes this weights-free seam can actually see.
+        let mut spec = weights_free_spec();
+        assert_eq!(
+            static_behavior_identity(&spec).fingerprint,
+            format!("{STATIC_BEHAVIOR_FINGERPRINT}-bf16-resident")
+        );
+        spec.quantize = Some(Quant::Q8);
+        spec.offload_policy = mlx_gen::OffloadPolicy::Sequential;
+        assert_eq!(
+            static_behavior_identity(&spec).fingerprint,
+            format!("{STATIC_BEHAVIOR_FINGERPRINT}-q8-sequential")
+        );
+    }
+
+    /// AC (sc-22735 c): an unprovable tier publishes no identity and never turns a contract build
+    /// into an error it was not before.
+    #[test]
+    fn an_unprovable_tier_fails_closed_to_no_identity() {
+        // No directory at all, and a file-backed source: neither can prove an artifact tier.
+        assert!(production_calibration_identity(&weights_free_spec()).is_none());
+        assert!(
+            production_calibration_identity(&LoadSpec::new(WeightsSource::File(
+                "/nonexistent-krea-realtime/dit.safetensors".into()
+            )))
+            .is_none()
+        );
+
+        // A real q4 snapshot loaded at an execution precision no anchor was captured at: the
+        // contract still builds, with its exact physical facts, and simply declines the cell.
+        let (_root, mut spec) = fixture("q4", 400);
+        assert!(production_calibration_identity(&spec).is_some());
+        spec.precision = mlx_gen::Precision::Fp32;
+        let contract = memory_strategy_contract(&spec).expect("the contract must still build");
+        assert!(contract.calibration.is_none());
+        assert!(contract.asset_facts.base_bytes > 0);
+    }
+
+    /// AC (sc-22735, second half): the SceneWorks planned-lane gate
+    /// (`every_planned_mlx_lane_resolves_a_weights_free_provider_contract`) synthesizes a
+    /// weights-free `LoadSpec` over a directory that does not exist and, finding no memory-contract
+    /// fixture for this provider, falls back to `MemoryRegistration::contract`. That fallback must
+    /// build, name this provider, and carry an identity whose load shape is the spec's.
+    #[test]
+    fn the_registry_registration_resolves_a_weights_free_contract_for_every_planned_lane() {
+        for load_shape in [
+            mlx_gen::gen_core::LoadShape::EagerMaterialization,
+            mlx_gen::gen_core::LoadShape::DeferredMaterialization,
+        ] {
+            for quantize in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let mut spec = LoadSpec::new(WeightsSource::Dir("fixture".into()));
+                spec.load_shape = load_shape;
+                spec.quantize = quantize;
+                let contract = (REGISTRATION.contract)(&spec).unwrap_or_else(|error| {
+                    panic!("planned lane {quantize:?}/{load_shape:?} cannot build: {error}")
+                });
+                assert_eq!(contract.provider_id, MODEL_ID);
+                assert_eq!(contract.load_shape, load_shape);
+                let calibration = contract
+                    .calibration
+                    .as_ref()
+                    .expect("a planned lane must resolve a calibratable contract");
+                assert_eq!(calibration.load_shape, load_shape);
+            }
+        }
+
+        // A materialized snapshot still resolves the exact physical contract, not the witness.
+        let (_root, spec) = fixture("q8", 800);
+        let contract = (REGISTRATION.contract)(&spec).unwrap();
+        assert!(contract.asset_facts.base_bytes > 0);
+        assert_eq!(
+            contract.calibration.unwrap().fingerprint,
+            "krea-realtime-14b-q8-mlx-resident-ladder-v1"
+        );
     }
 
     #[test]
@@ -1018,7 +1304,19 @@ mod tests {
             },
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Resident,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: String::new(),
+            // sc-22735: the contract now publishes an anchor coordinate, so an admitting caller
+            // must carry the matching one through the calibration handshake. These fixtures pack
+            // the tier they request, so the requested `quant` names the artifact tier here.
+            calibration_fingerprint: production_calibration_fingerprint(
+                MODEL_ID,
+                match quant {
+                    None => "bf16",
+                    Some(Quant::Q4) => "q4",
+                    Some(Quant::Q8) => "q8",
+                    Some(other) => panic!("fixture premise: unshipped tier {other:?}"),
+                },
+            )
+            .expect("every shipped tier has an anchor coordinate"),
             load_shape: mlx_gen::gen_core::LoadShape::EagerMaterialization,
             mode: mlx_gen::gen_core::MemoryMode::Other(mode.to_owned()),
             has_reference: true,
@@ -1086,6 +1384,21 @@ mod tests {
             safety_check(&spec, &contract, &crossed),
             MemorySafetyDecision::Reject { .. }
         ));
+
+        // sc-22735: a caller admitting against another cell's anchor coordinate — or against no
+        // coordinate at all, the pre-story shape — is refused by the calibration handshake.
+        for fingerprint in [
+            production_calibration_fingerprint(MODEL_ID, "q8").unwrap(),
+            String::new(),
+        ] {
+            let mut crossed =
+                resident_context("video_to_video", "video_clip", &artifact, Some(Quant::Q4));
+            crossed.calibration_fingerprint = fingerprint;
+            assert!(matches!(
+                safety_check(&spec, &contract, &crossed),
+                MemorySafetyDecision::Reject { .. }
+            ));
+        }
     }
 
     #[test]

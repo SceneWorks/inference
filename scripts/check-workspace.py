@@ -301,9 +301,22 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "`PRODUCTION_SPATIAL_MULTIPLE` of 32 (`8 * 2^2`, the U-Net's two exact skip joins) — the "
         "same deliberate strict/loose split as sdxl's SIZE_MULTIPLE below."
     ),
+    ("kolors", "STATIC_BEHAVIOR_FINGERPRINT"): (
+        "the registry-conformance namespace, per-backend by construction (sc-22732). It exists so a "
+        "weights-free declaration surface can never be mistaken for a measured route, and each "
+        "backend asserts its own value is disjoint from that backend's own production identity set. "
+        "Two backends sharing one would let a context assembled against the candle declaration "
+        "satisfy the mlx handshake — the same reasoning as flux2's CALIBRATION_FINGERPRINT above."
+    ),
     ("lens", "MEMORY_CALIBRATION_FINGERPRINT"): (
         "a calibration identity, per-backend by construction — the candle value names the CUDA "
         "campaign and the mlx value names the Metal one."
+    ),
+    ("lens", "STATIC_BEHAVIOR_FINGERPRINT"): (
+        "the registry-conformance namespace, per-backend by construction (sc-22732) — the same "
+        "reasoning as this family's MEMORY_CALIBRATION_FINGERPRINT directly above. candle-gen-lens "
+        "gained one in sc-22732; before that it published its production identity on all 24 "
+        "weights-free surfaces, which is the defect the split fixes."
     ),
     ("ltx", "MODEL_ID"): (
         "the two backends ship different checkpoints of the family and register different ids: "
@@ -320,6 +333,13 @@ CROSS_BACKEND_GEOMETRY_EXEMPTIONS: dict[tuple[str, str], str] = {
         "a calibration identity is backend-specific: Candle names the released CUDA q4 I2V cell, "
         "while MLX names the Metal base/Eros I2V cell. Sharing a fingerprint would cross the "
         "physical artifact and backend evidence domains."
+    ),
+    ("ltx", "CALIBRATED_TIER"): (
+        "the companion of the CALIBRATION_FINGERPRINT exemption above, one level down: this names "
+        "WHICH tier that backend-specific identity was measured on, so it is backend-specific for "
+        "exactly the same reason. Candle's released cell is the CUDA q4 I2V one; MLX's is the Metal "
+        "q8 base cell its retained anchor is filed under. Making the two agree would either "
+        "relabel a measured record or claim a cell that lane never swept (sc-22737)."
     ),
     ("ltx", "MEMORY_REGISTRATION"): (
         "the registration is structurally identical but resolves its provider id through each "

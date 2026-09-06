@@ -4,10 +4,11 @@
 //! real-weight row that loads that exact shape through the public registry for both rehosts at all
 //! three tiers; the unit fixtures in `artifact_inventory.rs` only model it.
 //!
-//! Every tier ships the Qwen3 text encoder and the VAE dense; only the transformer packs. The q4/q8
-//! `text_encoder/config.json` files published at the pinned revisions carry a `quantization` marker
-//! over those dense tensors, which the encoder contract refuses as a config/surface mismatch, so
-//! this row passes only against a snapshot whose encoder config matches its weights.
+//! Every tier ships the Qwen3 text encoder and the VAE dense; only the transformer packs. The
+//! pinned revisions (`1902693279` base, `bbf22de8d6` kv) are the corrected rehosts: their q4/q8
+//! `text_encoder/config.json` carries no `quantization` marker, so the artifact inventory admits
+//! every tier as published (an earlier upload carried a stale marker over the dense tensors, which
+//! the inventory refuses).
 //!
 //! `#[ignore]`d — needs both rehosts in an explicit models root and Apple/Metal:
 //!

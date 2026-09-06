@@ -104,12 +104,17 @@ pub const PROVIDER_IDS: [&str; 2] = [RENDERER_ID, FULL_ID];
 /// production identity from being restamped by a route correction.
 const STATIC_CALIBRATION: &str = "bernini-mlx-registry-behavior-v3";
 
-/// The production calibration identity, minted once a cell has real-weight evidence behind it.
+/// The production calibration identity of the `(bernini, q4)` cell — the one this family's
+/// evidence campaign names.
 ///
-/// Not yet returned by `production_calibration_fingerprint` for any load: no `MEMORY_EVIDENCE_V1`
-/// record exists for this family. Until one does, `contract_for` carries `calibration: None`, which
-/// is what makes `MemoryEvidence::optimized_eligibility` refuse every optimized fit — the resident
-/// path still runs, and no selector can claim a verified saving this repository cannot show.
+/// Since sc-22737 this is one member of the per-`(provider, tier)` family
+/// [`production_calibration_fingerprint`] mints, not the only string the crate can publish. It is
+/// retained BYTE-FOR-BYTE because it is the key an existing record is filed under; the format the
+/// function interpolates reproduces it exactly for that cell.
+///
+/// A published fingerprint is a key for evidence, never a claim that evidence exists:
+/// `MemoryEvidence::optimized_eligibility` still refuses every optimized fit for a cell with no
+/// record, so the resident path runs and no selector claims a saving this repository cannot show.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "bernini-image-q4-mlx-dual-expert-ladder-v1";
 
 /// Rung 2 — production decode tile edges, in **output pixels**.
@@ -956,22 +961,60 @@ fn known_provider(provider_id: &str) -> CoreResult<()> {
     })
 }
 
-/// The measured production key, or `None`.
+/// Artifact-tier label of a Bernini load: `bf16` dense, `q4`/`q8` prepacked. `None` for a packed
+/// width this family does not ship.
+pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The route token one provider id contributes to its identity: the full planner+renderer pipeline
+/// the `bernini` / `bernini_image` catalog entries resolve to, and the renderer-only sibling.
+pub fn calibration_route(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        FULL_ID => Some("image"),
+        RENDERER_ID => Some("renderer"),
+        _ => None,
+    }
+}
+
+/// The tier [`MEMORY_CALIBRATION_FINGERPRINT`] names.
+pub const CALIBRATED_TIER: &str = "q4";
+
+/// The production calibration identity for one `(provider, artifact-proven tier)` cell.
 ///
-/// `None` for every load today: no `MEMORY_EVIDENCE_V1` record exists for this family, so there is no
-/// key to hand a selector. Returning a fingerprint here without a record behind it is precisely the
-/// "unknown, stale, or fingerprint-mismatched evidence selects a claimed fit" failure the epic
-/// forbids, so this function stays honest and the ladder ships selectable-but-uncalibrated: the
-/// mechanisms are reachable through an explicit request, and no automatic optimized fit is claimed.
+/// ## sc-22737 (epic sc-22723 E1/E4): every clean load publishes an identity
 ///
-/// When the first cell is measured, this returns [`MEMORY_CALIBRATION_FINGERPRINT`] for exactly the
-/// measured axes — provider, precision, packed tier and route — and nothing else, the same way
-/// Chroma's does.
-fn production_calibration_fingerprint(
-    _provider_id: &str,
-    _spec: &LoadSpec,
-) -> Option<&'static str> {
-    None
+/// This returned `None` for **every** load until sc-22737, on the reasoning that a key without a
+/// measurement behind it is a false claim. That conflated two different things. A fingerprint is a
+/// *key for* evidence, not an assertion *that* evidence exists — the anchor store is what says
+/// whether a cell has been measured — and while this published nothing, no anchor could bind to a
+/// Bernini load at all: the measurement machinery had no name to record against, so the family was
+/// permanently unmeasurable rather than merely unmeasured. `MemoryEvidence::optimized_eligibility`
+/// still refuses every optimized fit for a cell with no record, so nothing here can claim a saving
+/// this repository cannot show.
+///
+/// The key is **(provider, tier)**, and the tier is the one the ARTIFACT proves:
+/// [`resolved_numeric_tier`] reads the renderer/planner manifests and the packed safetensors
+/// headers, and refuses a prepacked root that also carries a load-time `quantize`, a manifest that
+/// disagrees with its headers, and a dense root whose headers are packed. Every one of those is
+/// `Err`, which becomes `None` here — **withheld on disagreement, never a failed load**. Keying on
+/// `spec.quantize` instead would let a dense snapshot asked for as q4 publish the q4 identity.
+///
+/// The measured `(bernini, q4)` cell keeps [`MEMORY_CALIBRATION_FINGERPRINT`] unchanged; the format
+/// below is the one that mints it, so the retained string is produced rather than special-cased
+/// (`the_measured_cell_keeps_its_retained_string` asserts the two agree).
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    let route = calibration_route(provider_id)?;
+    if spec.precision != mlx_gen::Precision::Bf16 {
+        return None;
+    }
+    let tier = calibration_tier_label(resolved_numeric_tier(spec).ok()?.quant)?;
+    Some(format!("bernini-{route}-{tier}-mlx-dual-expert-ladder-v1"))
 }
 
 /// The public contract for a loaded provider.
@@ -3287,12 +3330,148 @@ mod tests {
             context.selection.tier = tier;
             context.optimization_authority =
                 mlx_gen::gen_core::MemoryOptimizationAuthority::Estimated;
+            // sc-22737: the context is seeded from the weights-free DECLARATION, whose identity is
+            // `STATIC_CALIBRATION`, but the contract under test is the PRODUCTION one — which now
+            // publishes a per-(provider, tier) key rather than nothing. Carry the production
+            // identity, or the handshake rejects before any geometry clause is reached.
+            context.calibration_fingerprint =
+                production_calibration_fingerprint(FULL_ID, &spec).unwrap();
             assert_eq!(
                 safety_check(&spec, &production, &context),
                 MemorySafetyDecision::Accept,
                 "provider safety must admit the resolved q{bits:?} tier"
             );
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the per-(provider, tier) production identity.
+    // ------------------------------------------------------------------------------------------
+
+    /// The retained `(bernini, q4)` key is what the format string mints for that cell — so the
+    /// generalization cannot silently restamp a record that is already filed under it.
+    #[test]
+    fn the_measured_cell_keeps_its_retained_string() {
+        let root = tier_snapshot(Some(4));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert_eq!(
+            production_calibration_fingerprint(FULL_ID, &spec).as_deref(),
+            Some(MEMORY_CALIBRATION_FINGERPRINT),
+        );
+    }
+
+    /// Every shipped `(provider, tier)` publishes, and every cell publishes its OWN string: six
+    /// loads, six distinct identities. Before sc-22737 all six published nothing, so no anchor
+    /// could bind to a Bernini load on this lane at all.
+    #[test]
+    fn every_provider_and_tier_publishes_a_distinct_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for bits in [None, Some(4), Some(8)] {
+            let root = tier_snapshot(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            for provider in PROVIDER_IDS {
+                let fingerprint = production_calibration_fingerprint(provider, &spec)
+                    .unwrap_or_else(|| panic!("{provider} q{bits:?} publishes an identity"));
+                assert!(
+                    seen.insert(fingerprint.clone()),
+                    "{provider} q{bits:?} reuses {fingerprint}"
+                );
+                // The identity must reach the CONTRACT, not merely the table: the production
+                // contract is what an evidence runner and the worker read.
+                let contract = memory_strategy_contract(provider, &spec).unwrap();
+                assert_eq!(
+                    contract
+                        .calibration
+                        .as_ref()
+                        .map(|identity| identity.fingerprint.as_str()),
+                    Some(fingerprint.as_str()),
+                    "{provider} q{bits:?}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    /// The weights-free declaration surface may never publish a production string. A plan row
+    /// naming the declaration key could otherwise be "satisfied" by a contract that loaded nothing.
+    #[test]
+    fn the_weights_free_declaration_cannot_publish_a_production_string() {
+        let root = tier_snapshot(Some(4));
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        let declaration = weights_free_memory_strategy_contract(FULL_ID, &spec).unwrap();
+        let declared = declaration
+            .calibration
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .clone();
+        assert_eq!(declared, STATIC_CALIBRATION);
+        for bits in [None, Some(4), Some(8)] {
+            let root = tier_snapshot(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+            for provider in PROVIDER_IDS {
+                assert_ne!(
+                    production_calibration_fingerprint(provider, &spec).unwrap(),
+                    declared,
+                    "{provider} q{bits:?}"
+                );
+            }
+        }
+    }
+
+    /// **Withheld, never failed.** Every shape whose tier the artifact does not prove publishes
+    /// `None` and still loads: an unknown provider, a prepacked root asked for as a second
+    /// quantization, a manifest that disagrees with its headers, and a root with no snapshot at
+    /// all. Keying on `spec.quantize` instead of the resolved tier would publish a q4 identity for
+    /// each of the middle two.
+    #[test]
+    fn a_tier_the_artifact_does_not_prove_is_withheld() {
+        let root = tier_snapshot(Some(4));
+        let base = LoadSpec::new(WeightsSource::Dir(root.path().to_owned()));
+        assert!(production_calibration_fingerprint("not_a_bernini", &base).is_none());
+
+        // A prepacked root that ALSO asks for a load-time quantization is not a shipped load. The
+        // identity is withheld and the LOAD still succeeds — the contract publishes, uncalibrated.
+        let mut requantized = base.clone();
+        requantized.quantize = Some(mlx_gen::Quant::Q4);
+        assert!(production_calibration_fingerprint(FULL_ID, &requantized).is_none());
+        assert!(
+            memory_strategy_contract(FULL_ID, &requantized)
+                .unwrap()
+                .calibration
+                .is_none(),
+            "a withheld identity must not fail the load"
+        );
+
+        // A manifest that disagrees with its packed headers proves no tier.
+        let crossed = tier_snapshot(Some(4));
+        write_tier_file(&crossed.path().join("qwen2_5_vl.safetensors"), Some(8));
+        let spec = LoadSpec::new(WeightsSource::Dir(crossed.path().to_owned()));
+        assert!(production_calibration_fingerprint(FULL_ID, &spec).is_none());
+
+        // An absent snapshot proves no tier either, and asking costs nothing.
+        let missing = LoadSpec::new(WeightsSource::Dir(
+            root.path().join("no-such-snapshot").to_owned(),
+        ));
+        assert!(production_calibration_fingerprint(FULL_ID, &missing).is_none());
+    }
+
+    /// A tier is read off the ARTIFACT, so the dense root publishes `bf16` however the request is
+    /// spelled — and a packed root never publishes the dense key.
+    #[test]
+    fn the_identity_names_the_artifacts_tier_not_the_requested_one() {
+        let dense = tier_snapshot(None);
+        let dense_spec = LoadSpec::new(WeightsSource::Dir(dense.path().to_owned()));
+        assert_eq!(
+            production_calibration_fingerprint(FULL_ID, &dense_spec).unwrap(),
+            "bernini-image-bf16-mlx-dual-expert-ladder-v1"
+        );
+        let packed = tier_snapshot(Some(8));
+        let packed_spec = LoadSpec::new(WeightsSource::Dir(packed.path().to_owned()));
+        assert_eq!(
+            production_calibration_fingerprint(FULL_ID, &packed_spec).unwrap(),
+            "bernini-image-q8-mlx-dual-expert-ladder-v1"
+        );
     }
 
     #[test]
