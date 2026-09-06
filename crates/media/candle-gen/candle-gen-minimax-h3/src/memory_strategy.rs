@@ -91,8 +91,8 @@ use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     adapter_stack_resident_bytes, safetensors_path_bytes, AdapterResidencyMode, Error as CoreError,
-    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryComponentKind,
-    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
@@ -788,6 +788,38 @@ fn architecture_facts(
     }
 }
 
+/// Artifact-tier label of a MiniMax-H3 Candle load: `bf16` dense, `q4`/`q8` packed.
+pub fn calibration_tier_label(bits: Option<i32>) -> Option<&'static str> {
+    match bits {
+        None => Some("bf16"),
+        Some(4) => Some("q4"),
+        Some(8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The production calibration identity for one `artifact-proven tier` on the Candle lane.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4)
+///
+/// This lane published `None` for every load, on the reasoning that no fitted curve exists for the
+/// backend. But a fingerprint is a KEY for evidence, not a claim that evidence exists — and while
+/// nothing was published, no anchor could bind to a Candle MiniMax-H3 load at all, so the lane was
+/// permanently unmeasurable rather than merely unmeasured. Optimized selection still fails closed at
+/// admission for any cell without a record, so nothing here claims an unproven saving.
+///
+/// The tier is the one the ARTIFACT carries: [`ComponentBytes::resolve`] sets `dit_dir` only for a
+/// partition directory that exists, and the packed width is read from that partition's own
+/// `config.json` — the same marker `crate::tier` parses on the load path. A spec that resolved no
+/// snapshot has no `dit_dir` and therefore no identity, which is what keeps the weights-free
+/// fixture from publishing one.
+fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<String> {
+    let dit_dir = components.dit_dir.as_ref()?;
+    let bits = crate::tier::MiniMaxH3TierPaths::staged_bits(dit_dir).ok()?;
+    let tier = calibration_tier_label(bits)?;
+    Some(format!("minimax-h3-{tier}-candle-staged-joint-av-v1"))
+}
+
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
         architecture_facts: architecture_facts(components),
@@ -906,9 +938,12 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 resident
             },
         },
-        // No fitted curve exists for this backend. `None` is the honest state, and it is load
-        // bearing: it makes every optimized selection fail closed at admission.
-        calibration: None,
+        // sc-22737: the per-(artifact-proven tier) production identity. `None` only when the tier
+        // is not proven — see `production_calibration_fingerprint`. Publishing a KEY is not a
+        // claim that a fitted curve exists: with no evidence record filed under it, every
+        // optimized selection still fails closed at admission exactly as before.
+        calibration: production_calibration_fingerprint(components)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, LOAD_SHAPE)),
         asset_facts: MemoryAssetFacts {
             base_bytes: components.base(),
             conditioning_bytes: components.text_encoder,
@@ -1073,6 +1108,95 @@ mod tests {
                 // charged on top.
                 ("transformer_ref", DIT_BF16_BYTES),
             ],
+        );
+    }
+
+    /// Write the charged DiT partition's own `quantization` marker — the same `config.json`
+    /// `crate::tier` parses on the load path. `None` writes a marker-free `config.json`, the dense
+    /// `bf16` tier.
+    fn write_dit_tier_marker(root: &Path, bits: Option<i32>) {
+        for partition in DIT_PARTITIONS {
+            let dir = root.join(partition);
+            std::fs::create_dir_all(&dir).expect("dit dir");
+            let body = match bits {
+                Some(bits) => format!("{{\"quantization\":{{\"bits\":{bits}}}}}"),
+                None => "{}".to_owned(),
+            };
+            std::fs::write(dir.join("config.json"), body).expect("marker");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the Candle lane publishes a per-(artifact tier) identity.
+    // Before it this crate published `None` for every load, so no anchor could name a Candle
+    // MiniMax-H3 cell at all and the lane was unmeasurable rather than merely unmeasured.
+    // ------------------------------------------------------------------------------------------
+
+    /// Three shipped tiers, three DISTINCT identities, each reaching the production contract.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_candle_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (bits, tier) in [(None, "bf16"), (Some(4), "q4"), (Some(8), "q8")] {
+            let root = tempfile::tempdir().expect("tempdir");
+            full_snapshot(root.path());
+            write_dit_tier_marker(root.path(), bits);
+            let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+                .expect("contract");
+            let identity = contract
+                .calibration
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier} publishes an identity"));
+            assert_eq!(
+                identity.fingerprint,
+                format!("minimax-h3-{tier}-candle-staged-joint-av-v1")
+            );
+            // The lane is part of the key: a Candle cell may never collide with its MLX twin,
+            // whose strings all carry `-mlx-`.
+            assert!(identity.fingerprint.contains("-candle-"));
+            assert!(seen.insert(identity.fingerprint.clone()));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    /// **Withheld, never failed.** A spec that resolves no DiT partition proves no tier, so it
+    /// publishes nothing — and the contract still builds.
+    #[test]
+    fn a_tier_the_artifact_does_not_prove_is_withheld_on_candle() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(empty.path().into())))
+            .expect("a withheld identity must not fail the load");
+        assert_eq!(contract.calibration, None);
+
+        // `contract_for` on the registry's never-created sentinel path is the same story.
+        assert_eq!(
+            contract_for(&LoadSpec::new(WeightsSource::Dir("/nonexistent".into())))
+                .expect("contract")
+                .calibration,
+            None
+        );
+    }
+
+    /// Both MiniMax-H3 catalog routes ride ONE Candle provider whose contract declares the LARGER
+    /// of the two DiT partitions, so the reference route resolves the SAME identity as the base
+    /// one. That is the engine's deliberate over-declaration, and binding it here means a future
+    /// change that made the partitions diverge cannot pass silently.
+    #[test]
+    fn the_reference_partition_resolves_the_same_candle_identity_as_the_base() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        write_dit_tier_marker(root.path(), Some(8));
+        let flat =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+
+        let staged = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+            REFERENCE_DIT_PARTITION,
+            WeightsSource::Dir(root.path().join(REFERENCE_DIT_PARTITION)),
+        );
+        let referenced = contract_for(&staged).expect("contract");
+        assert_eq!(flat.calibration, referenced.calibration);
+        assert_eq!(
+            referenced.calibration.unwrap().fingerprint,
+            "minimax-h3-q8-candle-staged-joint-av-v1"
         );
     }
 
@@ -1561,7 +1685,12 @@ mod tests {
         assert_eq!(fixture.strategies, production.strategies);
         assert_eq!(fixture.lifecycle, production.lifecycle);
         assert_eq!(fixture.formula, production.formula);
-        assert_eq!(fixture.calibration, production.calibration);
+        // sc-22737: the identities must DIFFER, and this is the strongest form of that — the
+        // weights-free fixture resolves no snapshot, so it has no `dit_dir`, so it proves no tier
+        // and publishes NOTHING, while the production contract publishes the resolved tier's key.
+        // A plan row naming a production cell therefore cannot be satisfied by the fixture.
+        assert_eq!(fixture.calibration, None);
+        assert!(production.calibration.is_some());
         assert_eq!(fixture.load_shape, production.load_shape);
         assert_eq!(fixture.backend, production.backend);
     }

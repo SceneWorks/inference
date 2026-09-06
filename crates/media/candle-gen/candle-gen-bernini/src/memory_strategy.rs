@@ -1478,15 +1478,77 @@ fn production_assets(
     ))
 }
 
-/// Real loads expose load-exact asset/tier identity, but no calibration identity until the
-/// Windows/CUDA evidence campaign exists. That makes the shared selector reachable while every
-/// optimized selection still refuses through the normal uncalibrated contract path.
+/// Artifact-tier label of a Bernini Candle load.
+fn calibration_tier_label(packing: ComponentPacking) -> &'static str {
+    match packing {
+        ComponentPacking::Dense => "bf16",
+        ComponentPacking::Q4 => "q4",
+        ComponentPacking::Q8 => "q8",
+    }
+}
+
+/// The route token one provider id contributes to its identity — the same two routes the MLX
+/// sibling names, so a cell's key differs across the lanes only in the lane token.
+fn calibration_route(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        crate::bernini::MODEL_ID => Some("image"),
+        crate::pipeline::MODEL_ID => Some("renderer"),
+        _ => None,
+    }
+}
+
+/// The production calibration identity for one `(provider, artifact-proven tier)` cell.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4)
+///
+/// This lane published `None` for every load, on the reasoning that no Windows/CUDA evidence
+/// campaign exists yet. But a fingerprint is a KEY for evidence, not a claim that evidence exists —
+/// and while nothing was published, no anchor could bind to a Candle Bernini load at all, so the
+/// lane was permanently unmeasurable rather than merely unmeasured. Optimized selection still fails
+/// closed at admission for any cell without a record, so nothing here claims an unproven saving.
+///
+/// The tier is **artifact-proven rather than requested**: this is only ever called with the
+/// `expected` packing that [`production_assets`] has already reconciled against the transformer's
+/// own `quantize_config.json` AND its direct tensor geometry (`component_receipt` errors on either
+/// disagreement). A dense root asked for as q4 therefore never reaches this function, so it can
+/// never publish the q4 identity for dense weights.
+/// An OVERLAID load is deliberately not a base cell. The LoKr/LoRA factors are a second residency
+/// whose bytes `asset_facts.overlay_bytes` prices separately, so an anchor measured on the plain
+/// ladder does not describe it; the adapter's own identity is carried by `adapter_identity`.
+fn production_calibration_fingerprint(
+    provider_id: &str,
+    spec: &LoadSpec,
+    packing: ComponentPacking,
+) -> Option<String> {
+    let route = calibration_route(provider_id)?;
+    if !spec.adapters.is_empty() {
+        return None;
+    }
+    let tier = calibration_tier_label(packing);
+    Some(format!(
+        "bernini-{route}-{tier}-candle-dual-expert-ladder-v1"
+    ))
+}
+
+/// Real loads expose load-exact asset/tier identity and, since sc-22737, the per-(provider, tier)
+/// production calibration identity that lets an anchor name this cell. A withheld identity is never
+/// a failed load: `production_assets` is what refuses a crossed tier, and every shape it admits has
+/// had its packing proven against the artifact.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let (facts, _tier, adapter_identity) = production_assets(provider_id, spec)?;
-    Ok(contract(provider_id, spec, None, facts, adapter_identity))
+    let calibration =
+        production_calibration_fingerprint(provider_id, spec, expected_packing(spec)?)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    Ok(contract(
+        provider_id,
+        spec,
+        calibration,
+        facts,
+        adapter_identity,
+    ))
 }
 
 /// Recompute the load-exact contract immediately around the lazy component load. A caller may keep
@@ -3389,6 +3451,9 @@ mod tests {
             },
         ];
         let contract = memory_strategy_contract(crate::bernini::MODEL_ID, &spec).unwrap();
+        // sc-22737: a plain load publishes a per-(provider, tier) identity, but an OVERLAID one
+        // does not — the adapter factors are a second residency an anchor on the plain ladder never
+        // measured, and `adapter_identity` is what names them.
         assert_eq!(contract.calibration, None);
         assert_eq!(
             contract.asset_facts.overlay_bytes,
@@ -3563,6 +3628,106 @@ mod tests {
         write_component(root.path(), "transformer_2", ComponentPacking::Q8);
         spec.quantize = Some(gen_core::Quant::Q4);
         assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &spec).is_err());
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the per-(provider, tier) production identity on the Candle
+    // lane. Before it this crate published `None` for every load, so no anchor could name a Candle
+    // Bernini cell at all and the lane was unmeasurable rather than merely unmeasured.
+    // ------------------------------------------------------------------------------------------
+
+    fn bernini_candle_tier_spec(root: &Path, packing: ComponentPacking) -> LoadSpec {
+        let spec = LoadSpec::new(gen_core::WeightsSource::Dir(root.to_owned()));
+        match packing {
+            ComponentPacking::Dense => spec,
+            ComponentPacking::Q4 => spec.with_quant(gen_core::Quant::Q4),
+            ComponentPacking::Q8 => spec.with_quant(gen_core::Quant::Q8),
+        }
+    }
+
+    /// Six cells — two providers x three shipped tiers — and six DISTINCT identities, each of which
+    /// reaches the production contract rather than merely the table.
+    #[test]
+    fn every_provider_and_tier_publishes_a_distinct_candle_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for packing in [
+            ComponentPacking::Dense,
+            ComponentPacking::Q4,
+            ComponentPacking::Q8,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_full_snapshot(root.path(), packing);
+            let spec = bernini_candle_tier_spec(root.path(), packing);
+            for provider in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+                let contract = memory_strategy_contract(provider, &spec).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{provider} {packing:?} publishes an identity"));
+                assert_eq!(identity.load_shape, spec.load_shape);
+                assert!(
+                    seen.insert(identity.fingerprint.clone()),
+                    "{provider} {packing:?} reuses {}",
+                    identity.fingerprint
+                );
+                // The lane is part of the key: a Candle cell may never collide with its MLX twin.
+                assert!(
+                    identity.fingerprint.contains("-candle-"),
+                    "{}",
+                    identity.fingerprint
+                );
+                assert_ne!(identity.fingerprint, STATIC_CALIBRATION);
+            }
+        }
+        assert_eq!(seen.len(), 6);
+    }
+
+    /// **The tier is proven by the artifact, not asked for.** A q8 snapshot requested as q4 never
+    /// reaches the identity at all — `production_assets` refuses it — so a crossed request can
+    /// never publish the identity of a tier the weights do not carry.
+    #[test]
+    fn a_crossed_tier_request_publishes_no_candle_identity() {
+        let root = tempfile::tempdir().unwrap();
+        write_full_snapshot(root.path(), ComponentPacking::Q8);
+        let crossed = bernini_candle_tier_spec(root.path(), ComponentPacking::Q4);
+        assert!(memory_strategy_contract(crate::bernini::MODEL_ID, &crossed).is_err());
+
+        let honest = bernini_candle_tier_spec(root.path(), ComponentPacking::Q8);
+        assert_eq!(
+            memory_strategy_contract(crate::bernini::MODEL_ID, &honest)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint,
+            "bernini-image-q8-candle-dual-expert-ladder-v1"
+        );
+
+        // An unknown provider is refused by name before any identity is minted.
+        assert!(memory_strategy_contract("not_a_bernini", &honest).is_err());
+    }
+
+    /// The weights-free declaration surface can never publish a production string.
+    #[test]
+    fn the_candle_weights_free_declaration_cannot_publish_a_production_string() {
+        let root = tempfile::tempdir().unwrap();
+        write_full_snapshot(root.path(), ComponentPacking::Q4);
+        let spec = bernini_candle_tier_spec(root.path(), ComponentPacking::Q4);
+        for provider in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+            let declared = weights_free_memory_strategy_contract(provider, &spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint;
+            assert_eq!(declared, STATIC_CALIBRATION);
+            assert_ne!(
+                memory_strategy_contract(provider, &spec)
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint,
+                declared
+            );
+        }
     }
 
     #[test]
