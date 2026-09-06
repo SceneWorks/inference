@@ -464,8 +464,6 @@ impl ValidatedEncoderSource {
     }
 
     /// The packed Q4/Q8 tier this exact validated source stores, or `None` for a dense source.
-    /// A source admitted through [`EncoderContract::source_for_load_with_stale_packed_marker`]
-    /// reports `None`: its verified stale marker carries no packed evidence.
     pub fn packed_quant_bits(&self) -> Option<i32> {
         self.packed_quant.map(|quant| quant.bits as i32)
     }
@@ -869,17 +867,10 @@ fn collect_unique_encoder_headers(
 
 /// One affine packed-quantization marker as a selected encoder's `config.json` declares it
 /// (`quantization: {bits, group_size}`).
-///
-/// Public so a provider that pins an exact artifact can name the marker it expects on that
-/// artifact — see [`EncoderContract::source_for_load_with_stale_packed_marker`].
-///
-/// Naming a marker is not by itself an allowance: both `*_with_stale_packed_marker` entry points
-/// bind the allowance to the caller's own `base_root/text_encoder`, so the value can never be used
-/// to admit a contradiction on some other source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PackedQuantization {
-    pub bits: usize,
-    pub group_size: usize,
+struct PackedQuantization {
+    bits: usize,
+    group_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -892,10 +883,6 @@ enum EncoderDtypePolicy {
 enum EncoderConfigPolicy {
     /// Ordinary alternates must supply their own behavior-bearing config.
     Required,
-    /// [`Self::Required`], and the config is known to carry exactly this packed marker over dense
-    /// shards (a pinned artifact's publishing defect, sc-22727). The marker is verified and then
-    /// disregarded for tier evidence; see [`EncoderContract::source_for_load_with_stale_packed_marker`].
-    RequiredWithStalePackedMarker(PackedQuantization),
     /// Legacy ComfyUI exports contain only tensors. Their consuming route freezes the provider's
     /// config/tokenizer policy, so a present sibling config is checked but its absence is allowed.
     ProviderOwnedComfyUi,
@@ -903,17 +890,7 @@ enum EncoderConfigPolicy {
 
 impl EncoderConfigPolicy {
     fn requires_config(self) -> bool {
-        matches!(
-            self,
-            Self::Required | Self::RequiredWithStalePackedMarker(_)
-        )
-    }
-
-    fn stale_packed_marker(self) -> Option<PackedQuantization> {
-        match self {
-            Self::RequiredWithStalePackedMarker(stale) => Some(stale),
-            Self::Required | Self::ProviderOwnedComfyUi => None,
-        }
+        matches!(self, Self::Required)
     }
 }
 
@@ -1369,54 +1346,6 @@ impl EncoderContract {
         Ok(validated)
     }
 
-    /// [`Self::source_for_load`] for a bundled component whose pinned artifact carries a *stale*
-    /// packed marker: its `config.json` declares `quantization: {bits, group_size}` while every
-    /// direct shard is dense.
-    ///
-    /// Ordinary validation refuses that contradiction (`validate_quantization_evidence`), and
-    /// this method keeps refusing everything except the one shape the caller names: the config
-    /// must declare exactly `stale`, and the shard surface must be dense. The source is then
-    /// admitted as dense (`packed_quant_bits() == None`), so a provider whose policy is "as
-    /// stored" loads it dense and one whose policy is packed folds it at load time. A
-    /// [`crate::LoadSpec::text_encoder`] override is never eligible: the stale marker is a fact
-    /// about one pinned bundled artifact, not a policy a user-selected alternate may claim, and the
-    /// validated source is built from `base_root` here rather than accepted from the caller.
-    ///
-    /// # Callers
-    ///
-    /// * `mlx_gen_flux2::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load_from_inventory`
-    ///   — the only production caller. It reaches this method exactly when its verified
-    ///   [pinned turnkey inventory][`crate::EncoderContract`] carries a stale marker
-    ///   (`turnkey_text_encoder_stale_marker`) for the SceneWorks Klein q4/q8 re-hosts (sc-22727).
-    ///
-    /// A new caller must be added to this list together with the pinned artifact inventory that
-    /// establishes its marker; there is no general "admit a contradiction" mode.
-    pub fn source_for_load_with_stale_packed_marker(
-        &self,
-        spec: &crate::LoadSpec,
-        base_root: &Path,
-        stale: PackedQuantization,
-    ) -> Result<ValidatedEncoderSource> {
-        if spec.text_encoder.is_some() {
-            return Err(Error::Unsupported(
-                "a stale packed-marker allowance applies only to the bundled text encoder, not to a selected alternate"
-                    .into(),
-            ));
-        }
-        spec.validate_prepared_file_pins()?;
-        let source = WeightsSource::Dir(base_root.join("text_encoder"));
-        let mut validated = self.validate_source_with_policy(
-            &source,
-            EncoderDtypePolicy::Native,
-            EncoderConfigPolicy::RequiredWithStalePackedMarker(stale),
-            None,
-        )?;
-        validated.tokenizer = Some(self.bind_tokenizer(base_root, &source)?);
-        validated.ensure_unchanged()?;
-        spec.validate_prepared_file_pins()?;
-        Ok(validated)
-    }
-
     /// Validate one catalog/discovery candidate without acquiring a reusable source receipt.
     ///
     /// This path is intentionally limited to direct-file inventory, bounded behavior config, and
@@ -1436,41 +1365,6 @@ impl EncoderContract {
             allowed_roots,
             EncoderDtypePolicy::Native,
             EncoderConfigPolicy::Required,
-        )
-    }
-
-    /// Bounded discovery counterpart to [`Self::source_for_load_with_stale_packed_marker`]: the
-    /// same confinement and header inspection as [`Self::validate_source_for_discovery`], with the
-    /// config's packed marker required to equal `stale` and the shard surface required to be dense.
-    ///
-    /// Like the load counterpart, the allowance covers only the bundled component: `source` must be
-    /// exactly `base_root/text_encoder`, so a caller cannot point the named marker at a sibling
-    /// directory, an alternate the user selected, or another repository's component.
-    ///
-    /// # Callers
-    ///
-    /// * `mlx_gen_flux2::artifact_inventory::KleinArtifactInventory::verify_turnkey_with_contracts`
-    ///   — the only production caller, verifying the SceneWorks Klein q4/q8 re-hosts whose pinned
-    ///   `text_encoder/config.json` carries a stale marker over dense shards (sc-22727).
-    pub fn validate_source_for_discovery_with_stale_packed_marker(
-        &self,
-        source: &WeightsSource,
-        base_root: &Path,
-        allowed_roots: &[PathBuf],
-        stale: PackedQuantization,
-    ) -> Result<EncoderDiscoveryFacts> {
-        let bundled = base_root.join("text_encoder");
-        if !matches!(source, WeightsSource::Dir(path) if path == &bundled) {
-            return Err(Error::Unsupported(
-                "a stale packed-marker allowance applies only to the bundled text encoder, not to a selected alternate"
-                    .into(),
-            ));
-        }
-        self.validate_source_for_discovery_with_policy(
-            source,
-            allowed_roots,
-            EncoderDtypePolicy::Native,
-            EncoderConfigPolicy::RequiredWithStalePackedMarker(stale),
         )
     }
 
@@ -1727,27 +1621,6 @@ impl EncoderContract {
         } else {
             None
         };
-        // A caller naming a stale marker asserts exactly one contradiction — this marker over a
-        // dense surface — and gets dense admission for it. Any other marker (absent, or a different
-        // tier) is a different artifact than the one it pinned, and packed evidence under the marker
-        // means the marker is not stale at all; both fall through to the ordinary mismatch refusals.
-        let declared_quant = match (config_policy.stale_packed_marker(), declared_quant) {
-            (None, declared) => declared,
-            (Some(stale), Some(declared)) if declared == stale => None,
-            (Some(stale), declared) => {
-                return Err(Error::Unsupported(format!(
-                    "text encoder stale packed marker at {}: expected config.json to declare Q{} group_size {}, found {}",
-                    source_path(weights).display(),
-                    stale.bits,
-                    stale.group_size,
-                    declared.map_or_else(
-                        || "no quantization marker".to_owned(),
-                        |declared| format!("Q{} group_size {}", declared.bits, declared.group_size)
-                    ),
-                )));
-            }
-        };
-
         let language_headers = language_quantization_evidence_headers(headers);
         let packed_quant = validate_quantization_evidence(
             &language_headers,
@@ -5523,152 +5396,6 @@ mod tests {
             .to_string();
         assert!(error.contains("config declares Q4"), "{error}");
         assert!(error.contains("direct-shard surface is dense"), "{error}");
-    }
-
-    /// sc-22727: a pinned bundled artifact whose `config.json` carries a stale packed marker over
-    /// dense shards is admitted only when the caller names exactly that marker, and only as dense.
-    /// Every other combination keeps the ordinary refusals: a different marker, no marker, packed
-    /// evidence under the marker, or a user-selected alternate claiming the allowance.
-    #[test]
-    fn stale_packed_marker_allowance_admits_exactly_the_named_contradiction_as_dense() {
-        let stale = PackedQuantization {
-            bits: 4,
-            group_size: 64,
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().join("base");
-        let component = base.join("text_encoder");
-        std::fs::create_dir_all(&base).unwrap();
-        write_tokenizer_fixture(&base);
-        write_fixture(&component, 8);
-        rewrite_config_quantization(&component, 4);
-        let spec = crate::LoadSpec::new(WeightsSource::Dir(base.clone()));
-
-        // The ordinary paths still refuse the contradiction.
-        assert!(CONTRACT.source_for_load(&spec, &base).is_err());
-        assert!(CONTRACT
-            .validate_source_for_discovery(
-                &WeightsSource::Dir(component.clone()),
-                &authorized_test_roots(&base)
-            )
-            .is_err());
-
-        let validated = CONTRACT
-            .source_for_load_with_stale_packed_marker(&spec, &base, stale)
-            .unwrap();
-        assert_eq!(validated.packed_quant_bits(), None);
-        assert_eq!(
-            validated.load_time_quant_bits(None, "fixture").unwrap(),
-            None
-        );
-        assert_eq!(
-            validated.load_time_quant_bits(Some(4), "fixture").unwrap(),
-            Some(4)
-        );
-        let facts = CONTRACT
-            .validate_source_for_discovery_with_stale_packed_marker(
-                &WeightsSource::Dir(component.clone()),
-                &base,
-                &authorized_test_roots(&base),
-                stale,
-            )
-            .unwrap();
-        assert!(!facts.materialized_language_tensor_headers().is_empty());
-
-        // The discovery allowance is tied to the spec's own `base_root/text_encoder`: the same
-        // bytes reached under any other name are refused, so naming a marker is never itself an
-        // allowance for an arbitrary source.
-        let elsewhere = temp.path().join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        for name in ["config.json", "model.safetensors"] {
-            std::fs::copy(component.join(name), elsewhere.join(name)).unwrap();
-        }
-        let error = CONTRACT
-            .validate_source_for_discovery_with_stale_packed_marker(
-                &WeightsSource::Dir(elsewhere.clone()),
-                &base,
-                &authorized_test_roots(&elsewhere),
-                stale,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("bundled text encoder"), "{error}");
-        // Nor may a sibling `base_root` claim the marker for this component.
-        let error = CONTRACT
-            .validate_source_for_discovery_with_stale_packed_marker(
-                &WeightsSource::Dir(component.clone()),
-                &elsewhere,
-                &authorized_test_roots(&base),
-                stale,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("bundled text encoder"), "{error}");
-
-        // A different marker than the one named is a different artifact.
-        let other = PackedQuantization {
-            bits: 8,
-            group_size: 64,
-        };
-        let error = CONTRACT
-            .source_for_load_with_stale_packed_marker(&spec, &base, other)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("stale packed marker"), "{error}");
-        assert!(
-            error.contains("expected config.json to declare Q8"),
-            "{error}"
-        );
-        assert!(CONTRACT
-            .validate_source_for_discovery_with_stale_packed_marker(
-                &WeightsSource::Dir(component.clone()),
-                &base,
-                &authorized_test_roots(&base),
-                other,
-            )
-            .is_err());
-
-        // A user-selected alternate can never claim the allowance.
-        let mut selected = spec.clone();
-        selected.text_encoder = Some(WeightsSource::Dir(component.clone()));
-        let error = CONTRACT
-            .source_for_load_with_stale_packed_marker(&selected, &base, stale)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("bundled text encoder"), "{error}");
-
-        // No marker at all: the named contradiction is absent, so the pin does not match.
-        let clean = temp.path().join("clean");
-        std::fs::create_dir_all(&clean).unwrap();
-        write_tokenizer_fixture(&clean);
-        write_fixture(&clean.join("text_encoder"), 8);
-        let error = CONTRACT
-            .source_for_load_with_stale_packed_marker(
-                &crate::LoadSpec::new(WeightsSource::Dir(clean.clone())),
-                &clean,
-                stale,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("found no quantization marker"), "{error}");
-
-        // Packed evidence under the marker means the marker is not stale: refused as before.
-        let packed = temp.path().join("packed");
-        std::fs::create_dir_all(&packed).unwrap();
-        write_tokenizer_fixture(&packed);
-        write_packed_fixture(&packed.join("text_encoder"), 8, true);
-        let error = PACKED_CONTRACT
-            .source_for_load_with_stale_packed_marker(
-                &crate::LoadSpec::new(WeightsSource::Dir(packed.clone())),
-                &packed,
-                stale,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("packed tensor evidence requires authoritative config.json"),
-            "{error}"
-        );
     }
 
     /// sc-22727: a Hugging Face cache snapshot's files are symlinks into the repository's sibling

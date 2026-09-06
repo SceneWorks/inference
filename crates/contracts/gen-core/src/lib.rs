@@ -118,7 +118,7 @@ pub use encoder_contract::{
     EncoderConfigFloat, EncoderContract, EncoderPackingContract, EncoderPromptExecutionContract,
     EncoderPromptLengthPolicy, EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken,
     EncoderTokenizerBinding, EncoderTokenizerContract, EncoderTokenizerDisposition,
-    PackedQuantization, TextEncoderPlanningFacts, TextEncoderSourceLayout, ValidatedEncoderSource,
+    TextEncoderPlanningFacts, TextEncoderSourceLayout, ValidatedEncoderSource,
     ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};

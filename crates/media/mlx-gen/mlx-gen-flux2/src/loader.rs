@@ -87,8 +87,8 @@ pub(crate) fn load_validated_tokenizer(
 /// Load the Qwen3 text encoder. The on-disk `model.*` keys map directly onto the encoder tree
 /// under the `"model"` prefix — no remap needed. Manifest-aware: a pre-quantized klein snapshot
 /// (sc-5917 convert) loads packed; a stock dense snapshot loads dense (no `quantization` block).
-/// A pinned SceneWorks turnkey whose q4/q8 `text_encoder/config.json` carries the stale packed
-/// marker over dense shards (sc-22727) is validated through the artifact inventory and loads dense.
+/// A pinned SceneWorks turnkey is verified through the artifact inventory first (its Qwen3 tower
+/// is dense at every tier, sc-22760) and then takes the ordinary contract path.
 pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
     let selected = crate::artifact_inventory::KleinArtifactInventory::text_encoder_source_for_load(
         crate::config::KLEIN_ENCODER_CONTRACT,
@@ -102,10 +102,10 @@ pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
 
 /// The packed parts the concrete Qwen3 load must build from, derived from the **validated** source.
 ///
-/// Never re-read the on-disk `quantization` block here: a pinned SceneWorks turnkey carries a stale
-/// q4/q8 marker over dense shards (sc-22727), which the contract verifies and then discards —
-/// [`ValidatedEncoderSource::packed_quant_bits`] reports `None` for it. Re-reading the block would
-/// hand `Some(Flux2Quant{4,64})` to `from_weights_quant` and survive only because `lin()` and
+/// Never re-read the on-disk `quantization` block here: the contract has already reconciled the
+/// marker against the shard surface, and [`ValidatedEncoderSource::packed_quant_bits`] is the one
+/// answer both the load and admission price from (sc-22727). A second read of the block would let
+/// a marker the contract refused reach `from_weights_quant`, surviving only because `lin()` and
 /// `load_embed()` silently fall back to dense when `.scales` is absent.
 pub(crate) fn validated_text_encoder_quant(
     selected: &mlx_gen::gen_core::ValidatedEncoderSource,

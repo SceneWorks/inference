@@ -10,18 +10,17 @@ use mlx_gen::gen_core::weightsmeta::{
     safetensors_path_tensor_headers, Dtype, SafetensorsTensorHeader,
 };
 use mlx_gen::gen_core::{
-    EncoderContract, Error as CoreError, PackedQuantization, Result as CoreResult,
-    ValidatedEncoderSource,
+    EncoderContract, Error as CoreError, Result as CoreResult, ValidatedEncoderSource,
 };
 use mlx_gen::{LoadSpec, Quant, WeightsSource};
 use sha2::{Digest, Sha256};
 
 const REVISIONS: &[&str] = &[
     crate::memory_strategy::KLEIN_CALIBRATED_REVISION,
-    "acf05e8d5103838baba6a5e32dc91d6997a56023",
+    "1902693279fcfb828919370dfac2b8922d99499a",
 ];
-pub(crate) const KLEIN_REHOST_REVISION: &str = "acf05e8d5103838baba6a5e32dc91d6997a56023";
-pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "406265beebe141024a06e24038c3713cf7af87d8";
+pub(crate) const KLEIN_REHOST_REVISION: &str = "1902693279fcfb828919370dfac2b8922d99499a";
+pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "bbf22de8d654789de3b177632d2e283cc4f77729";
 const KLEIN_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-mlx";
 const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-mlx";
 const TRUE_V2_TRANSFORMER_SHA256: &str =
@@ -34,6 +33,22 @@ const TRUE_V2_TRANSFORMER_SHA256: &str =
 /// directory still fails confinement.
 fn discovery_roots(root: &Path) -> CoreResult<Vec<PathBuf>> {
     Ok(mlx_gen::gen_core::hf_cache_discovery_roots(root)?)
+}
+
+/// A component's `(bits, group_size)` packed marker, or `None` for a dense component.
+fn packed_marker(directory: &Path, component: &str) -> CoreResult<Option<(i32, i32)>> {
+    match (
+        mlx_gen::quant::packed_quant_bits_at(directory)
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+        mlx_gen::quant::packed_quant_group_size_at(directory)
+            .map_err(|error| CoreError::Unsupported(error.to_string()))?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(bits), Some(group_size)) => Ok(Some((bits, group_size))),
+        _ => Err(CoreError::Unsupported(format!(
+            "flux2 Klein {component} quantization marker is incomplete"
+        ))),
+    }
 }
 
 const FILES: &[(&str, &str)] = &[
@@ -245,10 +260,6 @@ pub(crate) struct KleinArtifactInventory {
     entries: Vec<Entry>,
     visible_safetensors: Vec<(PathBuf, BTreeSet<String>)>,
     kind: KleinArtifactKind,
-    /// The verified stale packed marker on this turnkey's text encoder, if it carries one — see
-    /// [`turnkey_text_encoder_stale_marker`]. `None` for every dense-tagged artifact and for a
-    /// turnkey whose text encoder marker (or absence of one) agrees with its shards.
-    text_encoder_stale_marker: Option<PackedQuantization>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,65 +376,6 @@ fn component_tensor_headers(shards: &[PathBuf]) -> CoreResult<Vec<SafetensorsTen
         }
     }
     Ok(headers)
-}
-
-/// Whether any header carries affine packed evidence (a `U32` code matrix or a `.scales` /
-/// `.biases` companion). The shipped q4/q8 Klein text encoders carry none: see
-/// [`turnkey_text_encoder_stale_marker`].
-fn has_packed_tensor_evidence(headers: &[SafetensorsTensorHeader]) -> bool {
-    headers.iter().any(|header| {
-        header.dtype == Dtype::U32
-            || header.name.ends_with(".scales")
-            || header.name.ends_with(".biases")
-    })
-}
-
-/// The text-encoder tier policy of a pinned turnkey, and the one contradiction it tolerates.
-///
-/// A turnkey tier's Qwen3 text encoder is admitted exactly as stored: dense, or packed at the
-/// tier's own bits with the tier's group size. What is refused: a marker at any other tier, any
-/// marker on the bf16 tier, and packed evidence without a marker (the shared contract refuses that
-/// last one on its own; it is named here so the inventory's error is the legible one).
-///
-/// sc-22727: at both pinned rehost revisions the q4 and q8 tiers ship the 8B Qwen3 text encoder
-/// **dense** — every tensor BF16, 16,381,470,720 payload bytes, no `.scales`/`.biases` — while
-/// `<tier>/text_encoder/config.json` declares `quantization: {bits: <tier>, group_size: 64}`.
-/// That marker is a publishing defect of the sc-8711 upload, immutable at the pinned revision,
-/// and the shared encoder contract rightly refuses a packed marker over dense shards. Rather than
-/// weaken that rule, the inventory returns the stale marker it verified so its contract calls
-/// name exactly that contradiction ([`EncoderContract::source_for_load_with_stale_packed_marker`])
-/// and the artifact that ships is admitted as what it is: dense. A corrected re-host whose text
-/// encoder is genuinely packed at the tier returns `None` here and takes the ordinary contract
-/// path.
-fn turnkey_text_encoder_stale_marker(
-    tier: Option<Quant>,
-    marker: Option<(i32, i32)>,
-    headers: &[SafetensorsTensorHeader],
-) -> CoreResult<Option<PackedQuantization>> {
-    let packed_evidence = has_packed_tensor_evidence(headers);
-    match (tier, marker) {
-        (_, None) if packed_evidence => Err(CoreError::Unsupported(
-            "flux2 Klein turnkey text_encoder carries packed tensors without a quantization marker"
-                .to_owned(),
-        )),
-        (_, None) => Ok(None),
-        (None, Some((bits, group_size))) => Err(CoreError::Unsupported(format!(
-            "flux2 Klein bf16 turnkey text_encoder must stay dense, found quantization marker Q{bits} group_size {group_size}"
-        ))),
-        (Some(quant), Some((bits, group_size))) if bits == quant.bits() && group_size == 64 => {
-            if packed_evidence {
-                Ok(None)
-            } else {
-                Ok(Some(PackedQuantization {
-                    bits: bits as usize,
-                    group_size: group_size as usize,
-                }))
-            }
-        }
-        (Some(quant), Some((bits, group_size))) => Err(CoreError::Unsupported(format!(
-            "flux2 Klein turnkey text_encoder quantization marker Q{bits} group_size {group_size} does not match resolved tier {quant:?} (group_size 64)"
-        ))),
-    }
 }
 
 fn pinned_entry(source: PathBuf) -> CoreResult<Entry> {
@@ -1048,7 +1000,6 @@ impl KleinArtifactInventory {
             entries,
             visible_safetensors: Vec::new(),
             kind: KleinArtifactKind::CalibratedBase,
-            text_encoder_stale_marker: None,
         };
         inventory.ensure_unchanged()?;
         inventory.validate_provider(provider_id)?;
@@ -1088,21 +1039,7 @@ impl KleinArtifactInventory {
                     .to_owned(),
             ));
         }
-        let transformer_dir = root.join("transformer");
-        let observed = match (
-            mlx_gen::quant::packed_quant_bits_at(&transformer_dir)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
-            mlx_gen::quant::packed_quant_group_size_at(&transformer_dir)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?,
-        ) {
-            (None, None) => None,
-            (Some(bits), Some(group_size)) => Some((bits, group_size)),
-            _ => {
-                return Err(CoreError::Unsupported(
-                    "flux2 Klein transformer quantization marker is incomplete".to_owned(),
-                ))
-            }
-        };
+        let observed = packed_marker(&root.join("transformer"), "transformer")?;
         let expected = tier.map(|quant| (quant.bits(), 64));
         if observed != expected {
             return Err(CoreError::Unsupported(format!(
@@ -1110,48 +1047,23 @@ impl KleinArtifactInventory {
                 observed, tier
             )));
         }
-        let component_marker = |component: &str| -> CoreResult<Option<(i32, i32)>> {
-            let directory = root.join(component);
-            let bits = mlx_gen::quant::packed_quant_bits_at(&directory)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-            let group_size = mlx_gen::quant::packed_quant_group_size_at(&directory)
-                .map_err(|error| CoreError::Unsupported(error.to_string()))?;
-            match (bits, group_size) {
-                (None, None) => Ok(None),
-                (Some(bits), Some(group_size)) => Ok(Some((bits, group_size))),
-                _ => Err(CoreError::Unsupported(format!(
-                    "flux2 Klein {component} quantization marker is incomplete"
-                ))),
+        // Every published tier ships the Qwen3 text encoder and the VAE dense; only the transformer
+        // packs. A packed marker on either is a foreign or defective artifact, not a tier
+        // (sc-22760: the corrected rehost revisions carry no such marker).
+        for component in ["text_encoder", "vae"] {
+            if packed_marker(&root.join(component), component)?.is_some() {
+                return Err(CoreError::Unsupported(format!(
+                    "flux2 Klein {component} must stay dense at every turnkey tier"
+                )));
             }
-        };
-        // The VAE is dense at every tier; only its two mid-block attentions would even pack.
-        if component_marker("vae")?.is_some() {
-            return Err(CoreError::Unsupported(
-                "flux2 Klein vae must stay dense at every turnkey tier".to_owned(),
-            ));
         }
         let text_encoder_dir = root.join("text_encoder");
         let (text_encoder_shards, text_encoder_membership) =
             component_safetensors(&text_encoder_dir)?;
-        let text_encoder_stale_marker = turnkey_text_encoder_stale_marker(
-            tier,
-            component_marker("text_encoder")?,
-            &component_tensor_headers(&text_encoder_shards)?,
+        encoder_contract.validate_source_for_discovery(
+            &WeightsSource::Dir(text_encoder_dir.clone()),
+            &discovery_roots(&root)?,
         )?;
-
-        let discovery_roots = discovery_roots(&root)?;
-        let text_encoder_source = WeightsSource::Dir(text_encoder_dir.clone());
-        match text_encoder_stale_marker {
-            Some(stale) => encoder_contract
-                .validate_source_for_discovery_with_stale_packed_marker(
-                    &text_encoder_source,
-                    &root,
-                    &discovery_roots,
-                    stale,
-                )?,
-            None => encoder_contract
-                .validate_source_for_discovery(&text_encoder_source, &discovery_roots)?,
-        };
 
         let tokenizer = root.join("tokenizer/tokenizer.json");
         let mut entries = vec![
@@ -1185,7 +1097,6 @@ impl KleinArtifactInventory {
                 TurnkeyFamily::Base => KleinArtifactKind::BaseRehost(tier),
                 TurnkeyFamily::Kv => KleinArtifactKind::KvRehost(tier),
             },
-            text_encoder_stale_marker,
         };
         inventory.ensure_unchanged()?;
         Ok(inventory)
@@ -1193,43 +1104,22 @@ impl KleinArtifactInventory {
 
     /// The bundled text encoder of a Klein snapshot, validated for one generator load.
     ///
-    /// A pinned turnkey whose text encoder carries the verified stale packed marker
-    /// ([`turnkey_text_encoder_stale_marker`]) is validated as the dense artifact it is; every
-    /// other Klein source — a dense-tagged artifact, a turnkey whose marker agrees with its shards,
-    /// an unpinned snapshot, or a [`LoadSpec::text_encoder`] override — takes
-    /// [`EncoderContract::source_for_load`] unchanged. A pinned turnkey that fails its inventory
-    /// does not fall back to the ordinary path: the load refuses with the inventory's reason.
+    /// A pinned turnkey is verified first and a failed inventory does not fall back to the
+    /// ordinary path: the load refuses with the inventory's reason. Every admitted Klein source —
+    /// a dense-tagged artifact, a verified turnkey, an unpinned snapshot, or a
+    /// [`LoadSpec::text_encoder`] override (which skips verification) — then takes
+    /// [`EncoderContract::source_for_load`] unchanged; the inventory admits no text encoder the
+    /// shared contract would refuse.
     pub(crate) fn text_encoder_source_for_load(
         encoder_contract: EncoderContract,
         provider_id: &str,
         spec: &LoadSpec,
         root: &Path,
     ) -> CoreResult<ValidatedEncoderSource> {
-        let inventory = if spec.text_encoder.is_none() {
-            Self::verify_for_provider(provider_id, spec)?
-        } else {
-            None
-        };
-        Self::text_encoder_source_for_load_from_inventory(
-            encoder_contract,
-            inventory.as_ref(),
-            spec,
-            root,
-        )
-    }
-
-    pub(crate) fn text_encoder_source_for_load_from_inventory(
-        encoder_contract: EncoderContract,
-        inventory: Option<&Self>,
-        spec: &LoadSpec,
-        root: &Path,
-    ) -> CoreResult<ValidatedEncoderSource> {
-        match inventory.and_then(|inventory| inventory.text_encoder_stale_marker()) {
-            Some(stale) if spec.text_encoder.is_none() => {
-                encoder_contract.source_for_load_with_stale_packed_marker(spec, root, stale)
-            }
-            _ => encoder_contract.source_for_load(spec, root),
+        if spec.text_encoder.is_none() {
+            Self::verify_for_provider(provider_id, spec)?;
         }
+        encoder_contract.source_for_load(spec, root)
     }
 
     fn validate_provider(&self, provider_id: &str) -> CoreResult<()> {
@@ -1344,7 +1234,6 @@ impl KleinArtifactInventory {
             entries,
             visible_safetensors: Vec::new(),
             kind: KleinArtifactKind::TrueV2,
-            text_encoder_stale_marker: None,
         };
         inventory.ensure_unchanged()?;
         Ok(inventory)
@@ -1385,11 +1274,6 @@ impl KleinArtifactInventory {
             KleinArtifactKind::TrueV2 => None,
             KleinArtifactKind::CalibratedBase => None,
         }
-    }
-
-    /// See [`turnkey_text_encoder_stale_marker`].
-    pub(crate) fn text_encoder_stale_marker(&self) -> Option<PackedQuantization> {
-        self.text_encoder_stale_marker
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
@@ -1599,6 +1483,13 @@ mod tests {
         write_tensor_file(path, bounded_vae_tensors());
     }
 
+    fn quantization_config(bits: Option<i32>) -> String {
+        bits.map_or_else(
+            || "{}".to_owned(),
+            |bits| format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+        )
+    }
+
     fn validate_bounded_transformer(shards: &[PathBuf], quant: Option<Quant>) -> CoreResult<()> {
         let headers = component_tensor_headers(shards)?;
         let expected = tensor_headers(bounded_transformer_tensors(quant));
@@ -1620,30 +1511,13 @@ mod tests {
         Ok(())
     }
 
-    /// Which text encoder a fixture tier carries.
-    #[derive(Clone, Copy, Debug)]
-    enum TextEncoderFixture {
-        /// What the pinned revisions ship: dense shards at every tier; q4/q8 carry the stale
-        /// `quantization` marker over them (sc-22727).
-        Shipped,
-        /// A corrected re-host: packed at the tier (dense on bf16), marker agreeing with the shards.
-        PackedAtTier,
-    }
-
     /// One tier of a SceneWorks Klein rehost exactly as `huggingface_hub` lays it out on disk:
     /// `<hub>/models--SceneWorks--<repo>/snapshots/<revision>/<tier>/…`, every file a relative
-    /// symlink into the repository's sibling `blobs/` tree. q4/q8 mirror the shipped defect
-    /// (dense Qwen3 shards under a packed marker); bf16 mirrors the shipped sharding (a
-    /// multi-shard text encoder and transformer, each with its `*.index.json`).
+    /// symlink into the repository's sibling `blobs/` tree. The Qwen3 text encoder is dense with
+    /// no `quantization` marker at every tier (the corrected rehost revisions, sc-22760); bf16
+    /// mirrors the shipped sharding (a multi-shard text encoder and transformer, each with its
+    /// `*.index.json`), and q4/q8 pack only the transformer.
     fn turnkey_fixture(family: TurnkeyFamily, tier: Option<Quant>) -> tempfile::TempDir {
-        turnkey_fixture_with_text_encoder(family, tier, TextEncoderFixture::Shipped)
-    }
-
-    fn turnkey_fixture_with_text_encoder(
-        family: TurnkeyFamily,
-        tier: Option<Quant>,
-        text_encoder: TextEncoderFixture,
-    ) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let (cache, revision) = match family {
             TurnkeyFamily::Base => (KLEIN_REHOST_CACHE_DIR, KLEIN_REHOST_REVISION),
@@ -1661,33 +1535,18 @@ mod tests {
             std::fs::create_dir_all(root.join(component)).unwrap();
         }
         let contract = crate::config::bounded_klein_encoder_contract();
-        let packed_bits = match text_encoder {
-            TextEncoderFixture::Shipped => None,
-            TextEncoderFixture::PackedAtTier => tier.map(Quant::bits),
-        };
-        gen_core_testkit::write_encoder_contract_fixture_with_quant(
-            &root.join("text_encoder"),
-            contract,
-            packed_bits,
-        )
-        .unwrap();
-        match (text_encoder, tier) {
-            (TextEncoderFixture::Shipped, Some(quant)) => {
-                write_text_encoder_marker(&root, quant.bits(), 64);
-            }
-            (TextEncoderFixture::Shipped, None) => {
-                let headers =
-                    gen_core_testkit::encoder_contract_fixture_tensor_headers(contract, None)
-                        .unwrap();
-                std::fs::remove_file(root.join("text_encoder/model.safetensors")).unwrap();
-                write_sharded_tensor_files(
-                    &root.join("text_encoder"),
-                    "model",
-                    header_tuples(headers),
-                    4,
-                );
-            }
-            (TextEncoderFixture::PackedAtTier, _) => {}
+        gen_core_testkit::write_encoder_contract_fixture(&root.join("text_encoder"), contract)
+            .unwrap();
+        if tier.is_none() {
+            let headers =
+                gen_core_testkit::encoder_contract_fixture_tensor_headers(contract, None).unwrap();
+            std::fs::remove_file(root.join("text_encoder/model.safetensors")).unwrap();
+            write_sharded_tensor_files(
+                &root.join("text_encoder"),
+                "model",
+                header_tuples(headers),
+                4,
+            );
         }
         std::fs::write(root.join("vae/config.json"), "{}").unwrap();
         let transformer_config = tier.map_or_else(
@@ -1716,14 +1575,6 @@ mod tests {
         write_vae_safetensors(&root.join("vae/diffusion_pytorch_model.safetensors"));
         relink_into_blobs(&repository, &root);
         tmp
-    }
-
-    fn write_text_encoder_marker(root: &Path, bits: i32, group_size: i32) {
-        let path = root.join("text_encoder/config.json");
-        let mut config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        config["quantization"] = serde_json::json!({"bits": bits, "group_size": group_size});
-        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
 
     fn header_tuples(
@@ -1981,7 +1832,6 @@ mod tests {
             entries: vec![pinned_entry(transformer.clone()).unwrap()],
             visible_safetensors: vec![(transformer_dir, membership)],
             kind: KleinArtifactKind::BaseRehost(Some(Quant::Q4)),
-            text_encoder_stale_marker: None,
         };
         inventory.ensure_unchanged().unwrap();
 
@@ -2050,11 +1900,7 @@ mod tests {
             .2[1] = 1;
         assert!(validate_vae_tensor_headers(&tensor_headers(vae)).is_err());
 
-        let tmp = turnkey_fixture_with_text_encoder(
-            TurnkeyFamily::Base,
-            Some(Quant::Q8),
-            TextEncoderFixture::PackedAtTier,
-        );
+        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q8));
         let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q8));
         let bounded_contract = crate::config::bounded_klein_encoder_contract();
         let encoder_source = WeightsSource::Dir(root.join("text_encoder"));
@@ -2066,7 +1912,7 @@ mod tests {
             .0
             .remove(0);
         let mut mutated_headers =
-            gen_core_testkit::encoder_contract_fixture_tensor_headers(bounded_contract, Some(8))
+            gen_core_testkit::encoder_contract_fixture_tensor_headers(bounded_contract, None)
                 .unwrap();
         mutated_headers
             .iter_mut()
@@ -2339,25 +2185,17 @@ mod tests {
 
     /// sc-22727: the six shipped (family, tier) cells are admitted in the layout the app installs —
     /// every file a symlink into the repository's `blobs/` tree, the bf16 text encoder and
-    /// transformer sharded, and the q4/q8 text encoder dense under its stale packed marker.
+    /// transformer sharded, and the text encoder dense at every tier (sc-22760).
     ///
     /// Mutations that fail this: restoring the snapshot-only `discovery_roots` (every cell fails
-    /// confinement on its `blobs/` target), restoring the single-file component rule (both bf16
-    /// cells), or restoring the "must stay dense" marker rule (all four packed cells).
+    /// confinement on its `blobs/` target) or restoring the single-file component rule (both
+    /// bf16 cells).
     #[test]
     fn turnkey_inventory_admits_the_shipped_hf_cache_layout_at_every_tier() {
         for family in [TurnkeyFamily::Base, TurnkeyFamily::Kv] {
             for tier in [None, Some(Quant::Q4), Some(Quant::Q8)] {
                 let fixture = immutable_turnkey_fixture(family, tier);
                 let inventory = &fixture.inventory;
-                assert_eq!(
-                    inventory.text_encoder_stale_marker(),
-                    tier.map(|quant| PackedQuantization {
-                        bits: quant.bits() as usize,
-                        group_size: 64,
-                    }),
-                    "{family:?} {tier:?}"
-                );
                 assert!(
                     inventory
                         .entries
@@ -2407,75 +2245,6 @@ mod tests {
         assert!(error.contains("escapes authorized model roots"), "{error}");
     }
 
-    /// sc-22727: the only marker contradiction the inventory tolerates is the shipped one — the
-    /// tier's own bits at group size 64 over dense shards. Any other marker on the text encoder
-    /// is a different artifact and stays refused; the VAE marker rule is untouched.
-    #[test]
-    fn turnkey_inventory_refuses_text_encoder_markers_that_disagree_with_the_tier() {
-        for (tier, bits, group_size, expected) in [
-            (Some(Quant::Q4), 8, 64, "does not match resolved tier"),
-            (Some(Quant::Q8), 4, 64, "does not match resolved tier"),
-            (Some(Quant::Q4), 4, 32, "does not match resolved tier"),
-            (None, 4, 64, "bf16 turnkey text_encoder must stay dense"),
-        ] {
-            let tmp = turnkey_fixture(TurnkeyFamily::Kv, tier);
-            let root = fixture_root(&tmp, TurnkeyFamily::Kv, tier);
-            write_text_encoder_marker(&root, bits, group_size);
-            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            let error = verify_bounded_turnkey(root, TurnkeyFamily::Kv, tier, &spec)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(expected),
-                "{tier:?} Q{bits} g{group_size}: {error}"
-            );
-        }
-
-        let tmp = turnkey_fixture(TurnkeyFamily::Base, Some(Quant::Q4));
-        let root = fixture_root(&tmp, TurnkeyFamily::Base, Some(Quant::Q4));
-        std::fs::write(
-            root.join("vae/config.json"),
-            r#"{"quantization":{"bits":4,"group_size":64}}"#,
-        )
-        .unwrap();
-        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-        let error = verify_bounded_turnkey(root, TurnkeyFamily::Base, Some(Quant::Q4), &spec)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("vae must stay dense"), "{error}");
-    }
-
-    /// sc-22727: a corrected re-host whose Qwen3 tower is genuinely packed at the tier is admitted
-    /// through the ordinary contract path (no stale marker), and a packed tower at the other tier
-    /// is refused — the tier is a whole-pipeline contract.
-    #[test]
-    fn turnkey_inventory_admits_a_text_encoder_packed_at_its_tier_and_refuses_off_tier_packing() {
-        for tier in [Some(Quant::Q4), Some(Quant::Q8)] {
-            let tmp = turnkey_fixture_with_text_encoder(
-                TurnkeyFamily::Base,
-                tier,
-                TextEncoderFixture::PackedAtTier,
-            );
-            let root = fixture_root(&tmp, TurnkeyFamily::Base, tier);
-            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            let inventory =
-                verify_bounded_turnkey(root.clone(), TurnkeyFamily::Base, tier, &spec).unwrap();
-            assert_eq!(inventory.text_encoder_stale_marker(), None, "{tier:?}");
-            assert_eq!(inventory.resolved_quant(), tier);
-
-            // Relabel the packed tower as the other tier: the marker no longer matches the DiT.
-            let other = if tier == Some(Quant::Q4) { 8 } else { 4 };
-            write_text_encoder_marker(&root, other, 64);
-            let error = verify_bounded_turnkey(root, TurnkeyFamily::Base, tier, &spec)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("does not match resolved tier"),
-                "{tier:?}: {error}"
-            );
-        }
-    }
-
     /// sc-22727: a sharded component is one inventory, so a tensor present in two shards is
     /// refused before any loader could pick whichever shard it reads last.
     #[test]
@@ -2494,62 +2263,8 @@ mod tests {
         assert!(error.contains("appears in more than one shard"), "{error}");
     }
 
-    /// sc-22727: the load path admits the shipped q4/q8 text encoder as dense under its verified
-    /// stale marker, refuses it through the ordinary contract (proving the inventory route is
-    /// load-bearing), never extends the allowance to a selected alternate, and takes the ordinary
-    /// path for the bf16 tier.
-    #[test]
-    fn turnkey_text_encoder_loads_as_dense_under_its_stale_marker() {
-        let contract = crate::config::bounded_klein_encoder_contract();
-        for tier in [Some(Quant::Q4), Some(Quant::Q8)] {
-            let fixture = immutable_turnkey_fixture(TurnkeyFamily::Base, tier);
-            let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
-            assert!(contract.source_for_load(&spec, &fixture.root).is_err());
-            let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
-                contract,
-                Some(&fixture.inventory),
-                &spec,
-                &fixture.root,
-            )
-            .unwrap();
-            assert_eq!(validated.packed_quant_bits(), None);
-            assert_eq!(
-                validated
-                    .load_time_quant_bits(None, crate::FLUX2_KLEIN_9B_ID)
-                    .unwrap(),
-                None
-            );
-
-            let selected = spec
-                .clone()
-                .with_text_encoder(WeightsSource::Dir(fixture.root.join("text_encoder")));
-            assert!(
-                KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
-                    contract,
-                    Some(&fixture.inventory),
-                    &selected,
-                    &fixture.root,
-                )
-                .is_err()
-            );
-        }
-        let fixture = immutable_turnkey_fixture(TurnkeyFamily::Base, None);
-        let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
-        let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
-            contract,
-            Some(&fixture.inventory),
-            &spec,
-            &fixture.root,
-        )
-        .unwrap();
-        assert_eq!(validated.packed_quant_bits(), None);
-    }
-
-    /// sc-22727 scope gap: the public entry `text_encoder_source_for_load` — the one `model.rs`
-    /// and `loader.rs` call — driven end to end.
-    ///
-    /// Two behaviors, neither reachable through
-    /// `text_encoder_source_for_load_from_inventory` (which is handed an inventory):
+    /// sc-22727 scope gap: the public entry `text_encoder_source_for_load` — the one `loader.rs`
+    /// calls — driven end to end. Two behaviors:
     ///
     /// * the `spec.text_encoder.is_none()` gate — a user-selected alternate skips artifact
     ///   verification entirely and takes the ordinary encoder path, and
@@ -2595,67 +2310,41 @@ mod tests {
         assert_eq!(validated.packed_quant_bits(), None);
     }
 
-    /// sc-22727: the concrete Qwen3 load derives its packed parts from the **validated** source,
-    /// never from a second read of the on-disk `quantization` block.
-    ///
-    /// The shipped q4/q8 turnkeys carry a stale marker over dense shards, so re-reading the block
-    /// would hand `Some(Flux2Quant{4,64})` to `from_weights_quant` — a mismatch that survives only
-    /// because `lin()` and `load_embed()` fall back to dense when `.scales` is absent. A corrected
-    /// re-host packed at its tier must still report its real width.
+    /// sc-22760: a `quantization` marker on the text encoder or the VAE is refused at every tier,
+    /// whatever the shards under it carry. The corrected rehost revisions ship none; the earlier
+    /// stale-marker tolerance (sc-22727) is gone, so a pinned tier carrying one is not a tier.
     #[test]
-    fn text_encoder_load_quant_comes_from_the_validated_source_not_the_config_block() {
-        let contract = crate::config::bounded_klein_encoder_contract();
-        for tier in [Some(Quant::Q4), Some(Quant::Q8)] {
-            // Shipped: stale marker over dense shards ⇒ the load must build dense parts.
-            let fixture = immutable_turnkey_fixture(TurnkeyFamily::Base, tier);
-            let spec = LoadSpec::new(WeightsSource::Dir(fixture.root.clone()));
-            let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
-                contract,
-                Some(&fixture.inventory),
-                &spec,
-                &fixture.root,
+    fn turnkey_inventory_keeps_the_text_encoder_and_vae_dense_at_every_tier() {
+        // (family, tier, encoder marker, vae marker)
+        let cases = [
+            (TurnkeyFamily::Base, Some(Quant::Q4), Some(4), None),
+            (TurnkeyFamily::Kv, Some(Quant::Q8), Some(8), None),
+            (TurnkeyFamily::Base, None, Some(4), None),
+            (TurnkeyFamily::Kv, None, None, Some(4)),
+            (TurnkeyFamily::Base, Some(Quant::Q8), None, Some(8)),
+        ];
+        for (family, tier, encoder_bits, vae_bits) in cases {
+            let tmp = turnkey_fixture(family, tier);
+            let root = fixture_root(&tmp, family, tier);
+            gen_core_testkit::write_encoder_contract_fixture_with_quant(
+                &root.join("text_encoder"),
+                crate::config::bounded_klein_encoder_contract(),
+                encoder_bits,
             )
             .unwrap();
-            // The on-disk block the old code re-read still declares the stale tier …
-            assert_eq!(
-                crate::loader::read_component_quant(&fixture.root.join("text_encoder"))
-                    .unwrap()
-                    .map(|quant| quant.bits),
-                tier.map(Quant::bits),
-                "{tier:?}"
-            );
-            // … and the decision function ignores it.
-            assert_eq!(
-                crate::loader::validated_text_encoder_quant(&validated),
-                None,
-                "{tier:?}"
-            );
-
-            // A corrected re-host genuinely packed at its tier reports that width.
-            let tmp = turnkey_fixture_with_text_encoder(
-                TurnkeyFamily::Base,
-                tier,
-                TextEncoderFixture::PackedAtTier,
-            );
-            let root = fixture_root(&tmp, TurnkeyFamily::Base, tier);
-            let packed_spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
-            let inventory =
-                verify_bounded_turnkey(root.clone(), TurnkeyFamily::Base, tier, &packed_spec)
-                    .unwrap();
-            let validated = KleinArtifactInventory::text_encoder_source_for_load_from_inventory(
-                contract,
-                Some(&inventory),
-                &packed_spec,
-                &root,
-            )
-            .unwrap();
-            assert_eq!(
-                crate::loader::validated_text_encoder_quant(&validated),
-                Some(crate::config::Flux2Quant {
-                    bits: tier.map(Quant::bits).unwrap(),
-                    group_size: 64,
-                }),
-                "{tier:?}"
+            // The fixture is content-addressed (`relink_into_blobs`): on the bf16 tier the empty
+            // transformer and VAE configs share one blob, so replace the VAE's symlink rather than
+            // writing through it and re-tagging the transformer too.
+            let vae_config = root.join("vae/config.json");
+            std::fs::remove_file(&vae_config).unwrap();
+            std::fs::write(&vae_config, quantization_config(vae_bits)).unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            let error = verify_bounded_turnkey(root, family, tier, &spec)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("must stay dense at every turnkey tier"),
+                "{family:?} {tier:?} encoder={encoder_bits:?} vae={vae_bits:?}: {error}"
             );
         }
     }
@@ -2684,7 +2373,6 @@ mod tests {
             entries: Vec::new(),
             visible_safetensors: Vec::new(),
             kind,
-            text_encoder_stale_marker: None,
         };
         assert_eq!(inventory(KleinArtifactKind::TrueV2).resolved_quant(), None);
         assert_eq!(
