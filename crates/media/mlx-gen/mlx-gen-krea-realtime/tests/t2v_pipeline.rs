@@ -346,10 +346,16 @@ fn fault_params(seed: u64, frames: usize, phase: MemoryPhase, authorized: bool) 
     params
 }
 
-/// sc-22738: the authorized Denoise fault refuses at the physical denoise boundary — before the AR
-/// loop runs a single step, so no `Progress::Step` and no decode ever happen.
+/// sc-22738 (coordinator decision): the authorized Denoise fault refuses at the denoise phase's
+/// **EXIT** — the AR loop has run to completion (its per-step `Progress::Step` events were emitted)
+/// and its latents were materialized — but before the decode boundary is reached, so no
+/// `Progress::Decoding` is ever emitted and the VAE never runs.
+///
+/// This is the behavioural discriminator for the convention: under the previous entry convention the
+/// fault fired before the first AR step, so `seen` was empty. Hoisting the fault back above
+/// `generate_latents` makes the `Progress::Step` assertion fail.
 #[test]
-fn the_authorized_denoise_fault_refuses_before_the_first_ar_step() {
+fn the_authorized_denoise_fault_refuses_after_the_ar_denoise_has_run() {
     let cfg = tiny_cfg();
     let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
         .expect("load tiny DiT");
@@ -377,25 +383,42 @@ fn the_authorized_denoise_fault_refuses_before_the_first_ar_step() {
     assert!(error.contains("Denoise"), "{error}");
     assert!(error.contains("krea_realtime_14b"), "{error}");
     assert!(
-        seen.is_empty(),
-        "the fault must precede the denoise: {seen:?}"
+        seen.iter().any(|p| matches!(p, Progress::Step { .. })),
+        "the AR denoise must have run before the fault: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&Progress::Decoding),
+        "the fault must precede the decode boundary: {seen:?}"
     );
 }
 
-/// sc-22738: the authorized Decode fault refuses at the physical decode boundary — after the denoise
-/// has run (steps were reported) but before the VAE produces a single frame.
+/// sc-22738 (coordinator decision): the authorized Decode fault refuses at the decode phase's
+/// **EXIT** — the z16 VAE decode has actually run and its frames were read back to host RGB — and
+/// only then is the fault returned.
+///
+/// Proving "the decode ran" needs a witness, because a refused generation returns no frames. The
+/// witness is `decode_to_frames`' own entry cancellation check (`mlx-gen-wan/src/pipeline.rs`): the
+/// second half of this test cancels from inside the progress callback on `Progress::Decoding`, which
+/// the seam emits AFTER its own last cancel check and immediately BEFORE calling the decode. So
+///
+///   * under the exit convention control reaches into the decode, which observes the freshly-set
+///     flag and returns `Canceled` — the calibration fault is never reached;
+///   * under the entry convention the fault fires first and the error names `Decode` instead.
+///
+/// Together with the first half (the fault does fire, after `Progress::Decoding`) and the source-text
+/// ordering test in `t2v.rs`, that pins fault-after-decode rather than fault-before-decode.
 #[test]
-fn the_authorized_decode_fault_refuses_before_the_vae_decode() {
+fn the_authorized_decode_fault_refuses_after_the_vae_decode_has_run() {
     let cfg = tiny_cfg();
     let dit = mlx_gen_krea_realtime::load_krea_realtime_transformer(native_dit_map(&cfg), &cfg)
         .expect("load tiny DiT");
     let transformer = CausalKreaTransformer::new(dit, &cfg);
     let vae = tiny_vae();
     let context = tiny_context(&cfg);
+
+    // Half 1: the fault fires, after the denoise ran and the decode boundary was reached.
     let cancel = CancelFlag::default();
     let mut seen: Vec<Progress> = Vec::new();
-    let mut on_progress = |p: Progress| seen.push(p);
-
     let error = generate_t2v_from_components(
         &transformer,
         &cfg,
@@ -405,16 +428,46 @@ fn the_authorized_decode_fault_refuses_before_the_vae_decode() {
         None,
         None,
         &cancel,
-        &mut on_progress,
+        &mut |p: Progress| seen.push(p),
     )
     .expect_err("an authorized Decode fault must refuse");
-
     let error = error.to_string();
     assert!(error.contains("Decode"), "{error}");
     assert!(error.contains("krea_realtime_14b"), "{error}");
     assert!(
         seen.iter().any(|p| matches!(p, Progress::Step { .. })),
         "the denoise must have completed before the decode boundary: {seen:?}"
+    );
+    assert!(
+        seen.contains(&Progress::Decoding),
+        "the decode boundary must have been reached: {seen:?}"
+    );
+
+    // Half 2: the decode really is entered before the fault. Cancelling on `Progress::Decoding`
+    // lands the flag after the seam's last cancel check and before its decode call, so the decode's
+    // own entry check is the first thing that can observe it.
+    let cancel = CancelFlag::default();
+    let error = generate_t2v_from_components(
+        &transformer,
+        &cfg,
+        &vae,
+        &context,
+        &fault_params(42, 4, MemoryPhase::Decode, true),
+        None,
+        None,
+        &cancel,
+        &mut |p: Progress| {
+            if p == Progress::Decoding {
+                cancel.cancel();
+            }
+        },
+    )
+    .expect_err("the cancelled decode must refuse");
+    assert!(
+        matches!(error, mlx_gen::Error::Canceled),
+        "the VAE decode must have been entered and observed the cancellation, but the error was \
+         `{error}` — a calibration-fault error here means the fault fired BEFORE the decode (the \
+         entry convention)"
     );
 }
 

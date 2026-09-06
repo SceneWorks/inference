@@ -784,6 +784,23 @@ pub(crate) fn calibration_fault_armed(
 /// Request-local conformance fault at a physical phase boundary (SC-15449, sc-22738). Mirrors the
 /// FLUX/Chroma/Z-Image/Krea spelling so a lifecycle certification sees the same error at the same
 /// boundaries on every MLX family.
+///
+/// # The boundary is the phase's EXIT, not its entry
+///
+/// Krea Realtime follows the FLUX/Chroma/Qwen convention: every call site raises the fault **after**
+/// the phase's work has run and its produced tensor has been evaluated — the conditioning fault
+/// inside `stage_components` after `encode_prompt` materializes the context and before the 14B DiT
+/// and z16 VAE load (`mlx-gen-chroma/src/model.rs`, the `eval` of the embeds inside its text-phase
+/// closure), the denoise fault after the AR loop with an `eval` of the latents (chroma's
+/// `eval([&final_latents])` then its `Denoise` fault), the decode fault after the VAE decode has been
+/// read back to host frames (`mlx-gen-flux/src/model.rs`, which force-evals its lazy decode before
+/// faulting).
+///
+/// That is not cosmetic. The SceneWorks adapter certifies an anchor by injecting an authorized fault
+/// here and then reading the engine's retained bytes against its `allows_retained` bound, so the
+/// phase's real allocation has to exist when the error is returned. An entry-convention fault (the
+/// anima spelling) would hand the adapter the *previous* phase's heap and certify nothing. See
+/// `denoise_exit_fault` / `decode_exit_fault` in `t2v.rs` for the two render-side sites.
 pub(crate) fn calibration_fault(
     memory: &mlx_gen::gen_core::GenerationMemory,
     phase: MemoryPhase,

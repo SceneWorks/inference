@@ -1479,13 +1479,10 @@ impl Krea {
                             memory: req.memory.unwrap_or_default(),
                             provider_id: self.descriptor.id,
                         };
-                        // SC-15449/sc-22738: the next call runs the first heavy DiT step of this
-                        // image's denoise — the physical denoise boundary.
-                        crate::memory_strategy::calibration_fault(
-                            req,
-                            mlx_gen::gen_core::MemoryPhase::Denoise,
-                            self.descriptor.id,
-                        )?;
+                        // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                        // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                        // decoded image actually exist; `opts` above carries the request-scoped
+                        // `memory` + `provider_id` those hooks read.
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
                             full,
@@ -1572,15 +1569,10 @@ impl Krea {
                         memory: req.memory.unwrap_or_default(),
                         provider_id: self.descriptor.id,
                     };
-                    // SC-15449/sc-22738: the dispatch below runs the first heavy DiT step of this
-                    // image's denoise — the physical denoise boundary. The count-invariant plan
-                    // (reference VAE encode + text fusion) is already built, so an armed fault fails
-                    // exactly where the denoise begins.
-                    crate::memory_strategy::calibration_fault(
-                        req,
-                        mlx_gen::gen_core::MemoryPhase::Denoise,
-                        self.descriptor.id,
-                    )?;
+                    // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                    // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                    // decoded image actually exist; `opts` above carries the request-scoped `memory`
+                    // + `provider_id` those hooks read.
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical
                     // to Resident.
@@ -2077,10 +2069,14 @@ mod tests {
             .unwrap_or(body)
     }
 
-    /// Conditioning: the fault fires inside the text-encode phase, before the heavy phase begins.
+    /// Conditioning: the fault fires at the conditioning phase's EXIT — after `encode_contexts` has
+    /// produced (and, when armed, evaluated) the contexts, and before the heavy phase begins.
     #[test]
-    fn the_conditioning_calibration_fault_fires_before_the_heavy_phase() {
+    fn the_conditioning_calibration_fault_fires_after_the_encode_and_before_the_heavy_phase() {
         let body = generate_impl_source();
+        let encode = body
+            .find("self.encode_contexts(")
+            .expect("generate_impl must encode the contexts");
         let fault = body
             .find("MemoryPhase::Conditioning")
             .expect("generate_impl must carry a Conditioning calibration fault");
@@ -2088,31 +2084,62 @@ mod tests {
             .find("// Phase B: heavy render components")
             .expect("phase B marker");
         assert!(
+            encode < fault,
+            "the Conditioning fault must FOLLOW the text encode, not precede it"
+        );
+        assert!(
             fault < heavy,
             "the Conditioning fault must fire in the text-encode phase, not after it"
         );
     }
 
-    /// Denoise: every render dispatch is preceded by the fault, so no route reaches a DiT step first.
+    /// sc-22738 (coordinator decision): `generate_impl` no longer carries an entry-convention Denoise
+    /// hook before its render dispatches. The Denoise and Decode faults are phase EXITS and live in
+    /// `pipeline.rs` (`denoise_exit_fault` after the sampler, `decode_exit_fault` after the VAE),
+    /// where the produced latent and decoded image actually exist. A hook re-added here would fire
+    /// before the first DiT step and certify a pre-denoise heap.
     #[test]
-    fn the_denoise_calibration_fault_precedes_every_render_dispatch() {
+    fn generate_impl_carries_no_entry_convention_render_hook() {
         let body = generate_impl_source();
-        for dispatch in ["heavy.heavy.render_multiphase(", "let img = match &plan {"] {
-            let at = body
-                .find(dispatch)
-                .unwrap_or_else(|| panic!("missing render dispatch {dispatch}"));
-            let fault = body[..at]
-                .rfind("MemoryPhase::Denoise")
-                .unwrap_or_else(|| panic!("no Denoise fault before {dispatch}"));
+        for phase in ["MemoryPhase::Denoise", "MemoryPhase::Decode"] {
             assert!(
-                !body[fault..at].contains("heavy.heavy.render_"),
-                "the Denoise fault must be the last thing before {dispatch}"
+                !body.contains(phase),
+                "{phase} must fire at its phase exit in pipeline.rs, not in generate_impl"
             );
         }
+    }
+
+    /// sc-22738: every `TurboOptions` `generate_impl` builds threads the **request-scoped** memory
+    /// selection and this provider's id down to the render body. `pipeline.rs`'s `denoise_exit_fault`
+    /// / `decode_exit_fault` read exactly those two fields, so replacing
+    /// `req.memory.unwrap_or_default()` with `Default::default()` (or hardcoding the id) makes every
+    /// render-side hook unreachable — and would leave the ordering tests above green. Pinned as
+    /// source text because driving the real render needs the Krea 2 snapshot.
+    #[test]
+    fn every_turbo_options_threads_the_request_scoped_memory_and_provider_id() {
+        let body = generate_impl_source();
+        let mut count = 0usize;
+        let mut rest = body;
+        while let Some(at) = rest.find("TurboOptions {") {
+            let tail = &rest[at..];
+            let region = tail
+                .split_once("};")
+                .expect("TurboOptions literal must be terminated")
+                .0;
+            assert!(
+                region.contains("memory: req.memory.unwrap_or_default(),"),
+                "a TurboOptions literal drops the request-scoped memory: {region}"
+            );
+            assert!(
+                region.contains("provider_id: self.descriptor.id,"),
+                "a TurboOptions literal drops the provider id: {region}"
+            );
+            count += 1;
+            rest = &tail["TurboOptions {".len()..];
+        }
         assert_eq!(
-            body.matches("MemoryPhase::Denoise").count(),
-            2,
-            "one Denoise fault per render dispatch"
+            count, 2,
+            "generate_impl builds one TurboOptions per render dispatch (multi-phase + single-phase)"
         );
     }
 

@@ -588,6 +588,37 @@ mod tests {
         }
     }
 
+    /// sc-22738: the job the provider hands to the t2v/i2v/v2v routes carries the **request-scoped**
+    /// memory selection. Every calibration fault in this crate reads `job.memory` (the Conditioning
+    /// hook inside `stage_components`) or `params.memory` (derived from it), so a `run` that dropped
+    /// the request scope — `Default::default()` instead of `req.memory.unwrap_or_default()` — would
+    /// silently make every hook unreachable while leaving the phase-ordering tests green. Pinned as
+    /// source text because `run` cannot be driven without the 28 GB snapshot.
+    #[test]
+    fn the_job_carries_the_request_scoped_memory_selection() {
+        let source = include_str!("pipeline.rs");
+        let region = source
+            .split_once("let job = KreaRealtimeJob {")
+            .expect("job construction")
+            .1
+            .split_once("};")
+            .expect("job construction end")
+            .0;
+        assert!(
+            region.contains("memory: req.memory.unwrap_or_default(),"),
+            "KreaRealtimeJob must take its memory from the request, not a default: {region}"
+        );
+        let production = source
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(head, _)| head)
+            .unwrap_or(source);
+        assert_eq!(
+            production.matches("KreaRealtimeJob {").count(),
+            1,
+            "one production job construction — add the assertion above to any new one"
+        );
+    }
+
     #[test]
     fn generator_contract_returns_the_provider_owned_adapter_reports() {
         let provider = unloaded();
