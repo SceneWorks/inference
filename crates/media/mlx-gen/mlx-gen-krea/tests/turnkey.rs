@@ -79,6 +79,7 @@ fn assemble_turnkey_loads() {
                 scheduler: None,
                 transformer_window_size: None,
                 memory: Default::default(),
+                provider_id: mlx_gen_krea::KREA_2_TURBO_ID,
             },
         )
         .expect("generate_turbo");

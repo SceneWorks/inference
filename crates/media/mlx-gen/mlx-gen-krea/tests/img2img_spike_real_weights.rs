@@ -119,6 +119,7 @@ fn opts(seed: u64) -> TurboOptions {
         scheduler: None,
         transformer_window_size: None,
         memory: Default::default(),
+        provider_id: mlx_gen_krea::KREA_2_TURBO_ID,
     }
 }
 
