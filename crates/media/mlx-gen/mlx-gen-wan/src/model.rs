@@ -1363,6 +1363,36 @@ fn resolve_load_time_quant(
     }
 }
 
+/// The z16 decode tiling for one A14B render, from the decoded output dims.
+///
+/// A BoundedDecode the route's own contract admitted has to be REACHED: the sealed edge/overlap
+/// pair only ever comes out of [`crate::i2v_memory_strategy::decode_tiling`], never out of the auto
+/// selector. The I2V arm reaches it through its `image_to_video` mode; the T2V route has no such
+/// mode, so the `tile_vae_decode` knob is the second door — otherwise the T2V provider would
+/// publish a BoundedDecode contract, admit the rung, and silently decode with the auto tile
+/// (sc-22738). Everything else keeps the z16 selector, which is the A14B autoencoder's own cost
+/// model.
+pub(crate) fn a14b_decode_tiling(
+    req: &GenerationRequest,
+    out_width: i32,
+    out_height: i32,
+    out_frames: i32,
+) -> Result<Option<mlx_gen::TilingConfig>> {
+    let bounded_decode = req.memory.is_some_and(|memory| memory.tile_vae_decode);
+    if bounded_decode
+        || (req.video_mode.as_deref() == Some("image_to_video") && req.memory.is_some())
+    {
+        crate::i2v_memory_strategy::decode_tiling(
+            req,
+            out_width as u32,
+            out_height as u32,
+            out_frames as u32,
+        )
+    } else {
+        auto_tiling_budgeted_z16(out_height, out_width, out_frames)
+    }
+}
+
 /// Load the Wan2.2 T2V-A14B from a converted MLX snapshot directory (`convert_wan.py` output:
 /// `low_noise_model.safetensors` + `high_noise_model.safetensors` + `t5_encoder.safetensors` +
 /// `vae.safetensors` + `tokenizer.json` + `config.json`). LoRA adapters merge per-expert at generate
@@ -1394,6 +1424,20 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     let quant = resolve_load_time_quant(MODEL_ID_T2V_14B, &config, spec.quantize)?;
+    // The T2V-A14B route publishes the same pre-load memory surface as its I2V sibling (`lib.rs`
+    // registers `i2v_memory_strategy::t2v_14b::MEMORY_{REGISTRATION,FIXTURE,BEHAVIOR}`), so the
+    // LOADED provider has to seal the same receipt. Without it the registry declares a contract
+    // the generator never publishes: `memory_strategy_contract()` answers `None`,
+    // `memory_strategy_safety_check` refuses every optimized rung with "has no prepared I2V memory
+    // receipt", and `begin_memory_strategy_request` opens no scope — so a selection the video gate
+    // admits dies at the consumer's scope check (sc-22738).
+    let i2v_memory = if spec.resolved_route.as_deref() == Some(MODEL_ID_T2V_14B)
+        && spec.prepared_file_pins().is_prepared()
+    {
+        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_T2V_14B).map_err(Error::from)?)
+    } else {
+        None
+    };
     Ok(Box::new(Wan14b {
         descriptor: descriptor_t2v_14b(),
         config,
@@ -1401,7 +1445,7 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         adapters: spec.adapters.clone(),
         quant,
         offload_policy: spec.offload_policy,
-        i2v_memory: None,
+        i2v_memory,
     }))
 }
 
@@ -1843,17 +1887,7 @@ impl Wan14b {
         let out_frames = lat[1] * A14bProviderVae::VAE_TILING.temporal_scale;
         let out_height = lat[2] * A14bProviderVae::VAE_TILING.spatial_scale;
         let out_width = lat[3] * A14bProviderVae::VAE_TILING.spatial_scale;
-        let tiling = if req.video_mode.as_deref() == Some("image_to_video") && req.memory.is_some()
-        {
-            crate::i2v_memory_strategy::decode_tiling(
-                req,
-                out_width as u32,
-                out_height as u32,
-                out_frames as u32,
-            )?
-        } else {
-            auto_tiling_budgeted_z16(out_height, out_width, out_frames)?
-        };
+        let tiling = a14b_decode_tiling(req, out_width, out_height, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = A14bProviderVae::from_weights(&w)?;
