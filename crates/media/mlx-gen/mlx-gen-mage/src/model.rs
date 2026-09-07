@@ -1529,13 +1529,14 @@ impl Generator for MageFlow {
                         )
                     },
                     crate::pipeline::materialize_edit_denoised,
-                    |view, denoised, _| {
+                    |view, denoised, progress| {
                         calibration_fault(req, MemoryPhase::Decode)?;
                         crate::pipeline::decode_edit_phase(
                             view.vae,
                             denoised,
                             req.memory,
                             &req.cancel,
+                            progress,
                         )
                     },
                 )?;
@@ -1599,13 +1600,14 @@ impl Generator for MageFlow {
                     )
                 },
                 crate::pipeline::materialize_generation_denoised,
-                |view, denoised, _| {
+                |view, denoised, progress| {
                     calibration_fault(req, MemoryPhase::Decode)?;
                     crate::pipeline::decode_generation_phase(
                         view.vae,
                         denoised,
                         req.memory,
                         &req.cancel,
+                        progress,
                     )
                 },
             )?

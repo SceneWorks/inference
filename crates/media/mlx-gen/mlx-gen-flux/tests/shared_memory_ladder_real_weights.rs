@@ -353,9 +353,11 @@ fn run_success(generator: &dyn Generator, arm: Arm) -> Run {
             phase_started = Instant::now();
         }
         Progress::Step { current: 1, .. } => {
-            // Progress::Step(1) is emitted after the first denoise evaluation. Sequential therefore
-            // samples renderer load + step 1 here; Resident samples conditioning + step 1 because it
-            // has no Loading(Renderer) boundary. The post-reset interval is clean step 2.
+            // Progress::Step(1) is emitted after the first denoise evaluation, so Sequential samples
+            // renderer load + step 1 here. Since sc-22738 the resident arm also reports
+            // Loading(Renderer) — after the prompt encode, where the renderer phase begins — so its
+            // interval is a clean step 1 and its conditioning window covers the warm load plus the
+            // encode. The post-reset interval is clean step 2 on both arms.
             first_render = Some(metric(phase_started));
             reset_peak_memory();
             phase_started = Instant::now();
@@ -446,7 +448,7 @@ fn report_success(arm: Arm, artifact_sha256: &str, load: Metric, run: &Run) {
         .max(run.denoise.peak_bytes)
         .max(run.decode.peak_bytes);
     let (conditioning_scope, first_render_scope) = if arm == Arm::Resident {
-        ("unavailable", "conditioning_plus_first_step")
+        ("warm_load_plus_text_conditioning", "first_step")
     } else {
         ("text_conditioning", "renderer_load_plus_first_step")
     };
