@@ -659,6 +659,180 @@ pub fn selected_strategy(request: &GenerationRequest) -> MemoryStrategy {
 mod tests {
     use super::*;
 
+    /// One exact-envelope A14B render for `route` carrying `selection`'s rung.
+    ///
+    /// Geometry, rate and carrier come from the route's own menus rather than from literals: the
+    /// T2V leg is the carrier-free one (`text_to_video`, no conditioning), the I2V leg carries the
+    /// single full-strength Reference its mode requires.
+    fn a14b_public_request(
+        route: gen_core::wan_i2v_memory::WanI2vRoute,
+        selection: gen_core::MemorySelection,
+    ) -> GenerationRequest {
+        let (width, height, frames) = gen_core::wan_i2v_memory::A14B_FIXTURE_GEOMETRY;
+        let memory = gen_core::GenerationMemory {
+            stage_residency: selection.strategy == MemoryStrategy::StagedResidency,
+            tile_vae_decode: selection.strategy == MemoryStrategy::BoundedDecode,
+            decode_tile_edge: selection.parameters.decode_tile_edge,
+            decode_overlap: selection.parameters.decode_overlap,
+            ..Default::default()
+        };
+        let image_to_video = route == gen_core::wan_i2v_memory::WanI2vRoute::I2v14b;
+        GenerationRequest {
+            prompt: "a slow dolly across an empty room".to_owned(),
+            width,
+            height,
+            count: 1,
+            seed: Some(17),
+            steps: Some(40),
+            frames: Some(frames),
+            fps: Some(gen_core::wan_i2v_memory::A14B_PUBLIC_FPS),
+            video_mode: Some(
+                if image_to_video {
+                    "image_to_video"
+                } else {
+                    "text_to_video"
+                }
+                .to_owned(),
+            ),
+            conditioning: if image_to_video {
+                vec![gen_core::Conditioning::Reference {
+                    image: gen_core::Image {
+                        width: 16,
+                        height: 16,
+                        pixels: vec![7; 16 * 16 * 3],
+                    },
+                    strength: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            memory: Some(memory),
+            ..Default::default()
+        }
+    }
+
+    /// AC (sc-22738): every A14B route whose pre-load registration declares a memory-strategy
+    /// contract publishes that same sealed receipt from its **loaded** provider, and reaches its
+    /// implemented rungs from there.
+    ///
+    /// `lib.rs` registers `t2v_14b::MEMORY_{REGISTRATION,FIXTURE,BEHAVIOR}` beside `i2v_14b`'s, so
+    /// the T2V declaration has always been true of the registry. But `load_t2v_14b` hardcoded
+    /// `i2v_memory: None`, so the loaded generator answered `None` from
+    /// `memory_strategy_contract()`, refused every optimized rung with "has no prepared I2V memory
+    /// receipt", and opened no request scope — a declaration the loaded path could not reach. The
+    /// consumer then fails the admitted render at its own scope check.
+    ///
+    /// Mutation that fails this: restoring `i2v_memory: None` in `model::load_t2v_14b` (the shape
+    /// at inference `3b922bac6`) — the T2V leg's contract assertion fires, and with the contract
+    /// assertion removed the safety-check and scope assertions fire in turn.
+    #[test]
+    fn every_registered_a14b_route_publishes_and_reaches_its_contract_once_loaded() {
+        use gen_core::wan_i2v_memory::WanI2vRoute;
+
+        let registry = crate::provider_registry().unwrap();
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            let provider_id = route.provider_id();
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = gen_core_testkit::wan_i2v::write_mlx_snapshot(tmp.path(), route);
+            let registration = registry
+                .memory_strategy_registrations()
+                .find(|registration| registration.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id}: no memory-strategy registration"));
+            let declared = (registration.contract)(&spec).unwrap();
+            let loaded = registry
+                .load(provider_id, &spec)
+                .unwrap_or_else(|error| panic!("{provider_id}: {error}"));
+            assert_eq!(
+                loaded.memory_strategy_contract(),
+                Some(&declared),
+                "{provider_id}: the loaded provider must publish the contract its registration \
+                 declares"
+            );
+
+            // Reach, not just declaration: each rung the contract implements is admitted by the
+            // LOADED provider and opens a scope on it, driven by the route's own fixture context.
+            let behavior = registry
+                .memory_behavior_registrations()
+                .find(|behavior| behavior.provider_id == provider_id)
+                .unwrap_or_else(|| panic!("{provider_id}: no memory-behavior registration"));
+            let prepared = prepare(&spec, provider_id).unwrap();
+            let mut reached = 0_usize;
+            for strategy in [
+                MemoryStrategy::StagedResidency,
+                MemoryStrategy::BoundedDecode,
+            ] {
+                for fixture in (behavior.valid_fixtures)(&spec, &declared, strategy).unwrap() {
+                    reached += 1;
+                    let selection = fixture.context.selection;
+                    let request = a14b_public_request(route, selection);
+                    let mut context = fixture.context.clone();
+                    // The fixture context is keyed on the catalog's weights-free evidence and its
+                    // shared behavior route; the sealed receipt keys on its own request identity,
+                    // so both are re-derived from the request the route would actually run — the
+                    // same pre-pass the capture arm does before it calls the loaded provider.
+                    context.geometry = gen_core::wan_i2v_memory::geometry_from_request(&request);
+                    context.has_reference = context.geometry.reference_count > 0;
+                    context.overlay = Some(prepared.adapter_identity.clone());
+                    context.evidence_revision =
+                        request_evidence_revision(&prepared, &request).unwrap();
+                    let decision = loaded.memory_strategy_safety_check(&context);
+                    assert!(
+                        matches!(decision, MemorySafetyDecision::Accept),
+                        "{provider_id}: the loaded provider refused its own {strategy:?} fixture: \
+                         {decision:?}"
+                    );
+                    assert!(
+                        loaded
+                            .begin_memory_strategy_request(&context)
+                            .unwrap()
+                            .is_some(),
+                        "{provider_id}: {strategy:?} opened no request scope on the loaded provider"
+                    );
+                }
+            }
+            assert!(
+                reached > 0,
+                "{provider_id}: no optimized rung was exercised — the reach assertions above are \
+                 vacuous"
+            );
+        }
+    }
+
+    /// AC (sc-22738): the sealed BoundedDecode pair is REACHED on both A14B routes' decode. The
+    /// I2V arm gets there through its `image_to_video` mode; the T2V route has no such mode, so a
+    /// T2V render that was admitted for BoundedDecode would otherwise decode with the auto tile —
+    /// an admitted rung the pixels never see.
+    ///
+    /// Mutation that fails this: gating `model::Wan14b::generate_impl`'s tiling on
+    /// `video_mode == "image_to_video"` alone — the text-to-video leg then returns the auto
+    /// selector's tile instead of the sealed 256/32 pair.
+    #[test]
+    fn bounded_decode_reaches_the_sealed_tile_pair_without_an_image_to_video_mode() {
+        let edge = gen_core::wan_i2v_memory::DECODE_TILE_EDGES[0];
+        let overlap = gen_core::wan_i2v_memory::DECODE_OVERLAPS[0];
+        for mode in ["text_to_video", "image_to_video"] {
+            let request = GenerationRequest {
+                video_mode: Some(mode.to_owned()),
+                memory: Some(gen_core::GenerationMemory {
+                    tile_vae_decode: true,
+                    decode_tile_edge: Some(edge),
+                    decode_overlap: Some(overlap),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let tiling = crate::model::a14b_decode_tiling(&request, 1280, 704, 81)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{mode}: BoundedDecode must tile"));
+            let spatial = tiling.spatial.unwrap();
+            assert_eq!(
+                (spatial.tile_px, spatial.overlap_px),
+                (edge as i32, overlap as i32),
+                "{mode}: the sealed decode pair must reach the decode"
+            );
+        }
+    }
+
     /// AC (SC-22662, review follow-up): the three 14B I2V routes publish the A14B trunk's axes, not
     /// `MemoryArchitectureFacts::default()`. `gen_core::wan_i2v_memory` has no model config, so its
     /// shared contract can only publish the empty default; this crate overlays the real geometry.
