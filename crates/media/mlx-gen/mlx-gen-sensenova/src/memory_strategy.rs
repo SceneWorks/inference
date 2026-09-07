@@ -17,7 +17,8 @@
 //!   builds the budgeted `AttentionPlan` for all understanding and generation forwards. Nothing
 //!   about it depends on the artifact layout.
 //! * [`MemoryStrategy::BoundedTransformerResidency`] — the **deferred** surfaces of a verified
-//!   single-file snapshot only, and for `_fast` only once the distill LoRA is pre-merged. This is
+//!   snapshot only (one `model.safetensors`, or exactly the shard set its HF index names —
+//!   [`PinnedArtifact`]), and for `_fast` only once the distill LoRA is pre-merged. This is
 //!   provider-local block windowing over the generation-path Qwen stack, reached through
 //!   [`crate::t2i::T2iOptions::transformer_window_size`].
 //!
@@ -238,21 +239,76 @@ struct SourceEntryIdentity {
     changed_nanoseconds: i64,
 }
 
+/// One verified checkpoint file: the pinned snapshot entry, the object it resolves to, and the
+/// SHA-256 of its exact bytes.
 #[derive(Clone, Debug)]
-pub struct PinnedArtifact {
+struct PinnedFile {
     source: SourceEntryIdentity,
     identity: ArtifactFileIdentity,
     digest: String,
 }
 
+/// The verified checkpoint a load binds to: every file the loader will open, pinned, plus one
+/// content identity over all of them.
+///
+/// Two shipped layouts are pinned (sc-22738):
+///
+/// * **One `model.safetensors`** — every packed tier and the `_fast` bf16 turnkey. The artifact
+///   identity is that file's SHA-256, unchanged from the single-file pin so the recorded campaign
+///   digests ([`QUALITY_Q8_ARTIFACT`], [`FAST_Q8_ARTIFACT`]) still name their checkpoints.
+/// * **An HF-sharded snapshot** — the three dense quality rehosts ship `model-0000N-of-00008
+///   .safetensors` plus `model.safetensors.index.json`. Every shard the index's `weight_map`
+///   names is pinned, in shard-name order, and the artifact identity is the SHA-256 over that
+///   ordered list of `(shard name, shard digest)` pairs: order-insensitive to how the directory
+///   happens to list, sensitive to every shard's bytes. Before sc-22738 a sharded snapshot pinned
+///   nothing, so the bf16 quality tier could publish no calibration identity and was
+///   unmeasurable.
+#[derive(Clone, Debug)]
+pub struct PinnedArtifact {
+    /// The pinned files in identity order: the single `model.safetensors`, or the indexed shards
+    /// sorted by name.
+    files: Vec<PinnedFile>,
+    digest: String,
+}
+
 impl PinnedArtifact {
     /// Verify and pin one explicit safetensors file. Production directory loads additionally enforce
-    /// the single-file inventory rule in the internal `verified_artifact` selector.
+    /// the inventory rules in the internal `verified_artifact` selector.
     pub fn verify_file(path: impl AsRef<Path>) -> Option<Self> {
-        pinned_artifact(path.as_ref())
+        pinned_file(path.as_ref()).map(Self::single)
     }
 
-    /// Snapshot entry consumed by format-dispatching runtime loaders.
+    fn single(file: PinnedFile) -> Self {
+        let digest = file.digest.clone();
+        Self {
+            files: vec![file],
+            digest,
+        }
+    }
+
+    /// Pin an ordered shard set as one artifact. The identity digests each `(name, digest)` pair
+    /// in the given order, so the caller's ordering is the identity's.
+    fn sharded(files: Vec<PinnedFile>) -> Self {
+        let mut hasher = Sha256::new();
+        for file in &files {
+            let name = file
+                .source
+                .absolute_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(file.digest.as_bytes());
+            hasher.update(b"\n");
+        }
+        Self {
+            files,
+            digest: format!("{:x}", hasher.finalize()),
+        }
+    }
+
+    /// Snapshot entries consumed by format-dispatching runtime loaders, in identity order.
     ///
     /// mlx-rs selects the safetensors loader from the path EXTENSION: `SafeTensors::load_device`
     /// rejects any path whose final component is not literally `*.safetensors` with
@@ -262,12 +318,14 @@ impl PinnedArtifact {
     /// does, to resolve the identity — strips the extension. Opening that canonical blob is how
     /// every HF-cached SenseNova load died with `backend op failed: Unsupported file format`.
     ///
-    /// Runtime opens therefore use this pinned entry, never the canonical blob. That does not
-    /// weaken the pin: the entry, its symlink target, and the canonical file it resolves to are all
-    /// re-checked by [`ensure_unchanged`](Self::ensure_unchanged) on both sides of every open, so a
-    /// repointed symlink is rejected rather than followed.
-    pub(crate) fn loader_path(&self) -> &Path {
-        &self.source.absolute_path
+    /// Runtime opens therefore use these pinned entries, never the canonical blobs. That does not
+    /// weaken the pin: each entry, its symlink target, and the canonical file it resolves to are
+    /// all re-checked by [`ensure_unchanged`](Self::ensure_unchanged) on both sides of every open,
+    /// so a repointed symlink is rejected rather than followed.
+    pub(crate) fn loader_paths(&self) -> impl Iterator<Item = &Path> {
+        self.files
+            .iter()
+            .map(|file| file.source.absolute_path.as_path())
     }
 
     pub(crate) fn digest(&self) -> &str {
@@ -275,6 +333,51 @@ impl PinnedArtifact {
     }
 
     pub(crate) fn ensure_unchanged(&self) -> CoreResult<()> {
+        self.files.iter().try_for_each(PinnedFile::ensure_unchanged)
+    }
+
+    /// Open every pinned file as one lazily materialized tensor map, re-verifying the pin on both
+    /// sides of the open.
+    ///
+    /// A sharded artifact merges its shards the way the eager directory loader
+    /// ([`crate::loader::load_raw`]) does, with the same disjointness rule: a tensor key present in
+    /// two shards is a wrong shard set, not a later-wins merge. Shard metadata is descriptive and
+    /// unread by this crate, so it is not carried across the merge. Each shard open is an mmap-lazy
+    /// `load_safetensors`, which is why the deferred Gen windows can reopen a shard set as cheaply
+    /// as one file (see [`can_stream_gen_with_artifact`]).
+    pub(crate) fn open_weights(&self) -> mlx_gen::Result<mlx_gen::weights::Weights> {
+        self.ensure_unchanged()
+            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+        let weights = if let [only] = self.files.as_slice() {
+            mlx_gen::weights::Weights::from_file(&only.source.absolute_path)?
+        } else {
+            let mut tensors = HashMap::new();
+            for path in self.loader_paths() {
+                let shard = mlx_gen::weights::Weights::from_file(path)
+                    .map_err(|error| {
+                        mlx_gen::Error::Msg(format!("loading shard {}: {error}", path.display()))
+                    })?
+                    .into_tensors();
+                for (key, tensor) in shard {
+                    if tensors.insert(key.clone(), tensor).is_some() {
+                        return Err(mlx_gen::Error::Msg(format!(
+                            "duplicate tensor key `{key}` across the pinned shards (shard {} \
+                             repeats it; non-disjoint shard set)",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            mlx_gen::weights::Weights::from_map(tensors)
+        };
+        self.ensure_unchanged()
+            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
+        Ok(weights)
+    }
+}
+
+impl PinnedFile {
+    fn ensure_unchanged(&self) -> CoreResult<()> {
         // Canonical-target check FIRST so an in-place replacement of a regular file keeps reporting
         // "replaced or mutated" (the established message for that lane). The two entry-level checks
         // below are what the canonical stat cannot see: when the entry is an HF symlink, re-statting
@@ -312,15 +415,6 @@ impl PinnedArtifact {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) fn open_weights(&self) -> mlx_gen::Result<mlx_gen::weights::Weights> {
-        self.ensure_unchanged()
-            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
-        let weights = mlx_gen::weights::Weights::from_file(self.loader_path())?;
-        self.ensure_unchanged()
-            .map_err(|error| mlx_gen::Error::Msg(error.to_string()))?;
-        Ok(weights)
     }
 }
 
@@ -411,7 +505,7 @@ fn hash_exact_file(identity: &ArtifactFileIdentity) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
+fn pinned_file(path: &Path) -> Option<PinnedFile> {
     loop {
         // Pin the ENTRY (lstat) and the object it resolves to (canonicalize) as one observation.
         // The digest cache stays keyed on the resolved identity, so two snapshot entries backed by
@@ -429,7 +523,7 @@ fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
                 if source_entry_identity(&source.absolute_path).ok().as_ref() == Some(&source)
                     && file_identity(&source.absolute_path).ok()? == identity
                 {
-                    return Some(PinnedArtifact {
+                    return Some(PinnedFile {
                         source,
                         identity,
                         digest,
@@ -454,7 +548,7 @@ fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
                         entries
                             .retain(|cached, _| cached.canonical_path != identity.canonical_path);
                         entries.insert(identity.clone(), DigestState::Ready(digest.clone()));
-                        PinnedArtifact {
+                        PinnedFile {
                             source,
                             identity,
                             digest,
@@ -470,31 +564,108 @@ fn pinned_artifact(path: &Path) -> Option<PinnedArtifact> {
     }
 }
 
-/// SHA-256 of the exact checkpoint bytes, cached by a mutation-sensitive filesystem identity.
+/// The Hugging Face shard index a sharded snapshot ships next to its `model-0000N-of-0000M
+/// .safetensors` shards. Its `weight_map` is the authority on which shards make up the checkpoint.
+pub(crate) const SHARD_INDEX: &str = "model.safetensors.index.json";
+
+/// The one file a single-file snapshot ships.
+const SINGLE_FILE: &str = "model.safetensors";
+
+/// The non-hidden `*.safetensors` entries directly under `root`, by file name, sorted. `None` when
+/// the directory cannot be listed. Hidden entries (macOS `._` sidecars) are not shards.
+fn safetensors_inventory(root: &Path) -> Option<Vec<String>> {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| !mlx_gen::gen_core::weightsmeta::is_hidden_file(path))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "safetensors"))
+        .filter_map(|path| Some(path.file_name()?.to_str()?.to_owned()))
+        .collect();
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
+/// The shard names an HF index's `weight_map` references, deduplicated and sorted — HF's
+/// `model-{i:05}-of-{n:05}.safetensors` naming sorts numerically, so this is index order for every
+/// shipped snapshot while staying independent of how the index's JSON object happens to be keyed.
+///
+/// Fails closed (`None`) on an unreadable or malformed index, an empty map, a non-string value, or
+/// a shard path that is not a single plain file name (`..`, nested, absolute): the pin must never
+/// follow an index outside the snapshot.
+fn indexed_shard_names(index: &Path) -> Option<Vec<String>> {
+    let body = std::fs::read_to_string(index).ok()?;
+    let index: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let weight_map = index.get("weight_map")?.as_object()?;
+    if weight_map.is_empty() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(weight_map.len());
+    for value in weight_map.values() {
+        let name = value.as_str()?;
+        let path = Path::new(name);
+        let mut components = path.components();
+        let plain = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none()
+            && path.extension().is_some_and(|ext| ext == "safetensors");
+        if !plain {
+            return None;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    names.dedup();
+    Some(names)
+}
+
+/// The files a snapshot directory's checkpoint consists of, in identity order (sc-22738).
+///
+/// * With [`SHARD_INDEX`] present the checkpoint is the shard set the index names — and the
+///   directory's `*.safetensors` inventory must be exactly that set. A shard the index names but
+///   the directory lacks is an incomplete download; a `*.safetensors` the index does not name is
+///   a file the eager directory loader would merge but the pin would not cover. Both fail closed.
+/// * Without an index the checkpoint is one [`SINGLE_FILE`], and it must be the only
+///   `*.safetensors` present.
+fn checkpoint_files(root: &Path) -> Option<Vec<PathBuf>> {
+    let inventory = safetensors_inventory(root)?;
+    let index = root.join(SHARD_INDEX);
+    if index.is_file() {
+        let shards = indexed_shard_names(&index)?;
+        if shards != inventory {
+            return None;
+        }
+        return Some(shards.iter().map(|name| root.join(name)).collect());
+    }
+    if inventory.as_slice() != [SINGLE_FILE] {
+        return None;
+    }
+    Some(vec![root.join(SINGLE_FILE)])
+}
+
+/// SHA-256 identity of the exact checkpoint bytes, cached per file by a mutation-sensitive
+/// filesystem identity.
 ///
 /// The cache key includes device/inode/size plus mtime and ctime at nanosecond precision. A
 /// before/after identity comparison prevents caching a digest when the file changes while it is
 /// being read. This keeps repeated selector/contract calls cheap without trusting an HF blob
 /// basename (which is attacker-controlled local path text).
+///
+/// Pins both shipped layouts — see [`PinnedArtifact`] and [`checkpoint_files`] — and returns
+/// `None` for any inventory that is neither.
 pub(crate) fn verified_artifact(spec: &LoadSpec) -> Option<PinnedArtifact> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return None;
     };
-    let mut safetensors = std::fs::read_dir(root)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| !mlx_gen::gen_core::weightsmeta::is_hidden_file(&entry.path()))
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "safetensors")
-        });
-    let only = safetensors.next()?.path();
-    if safetensors.next().is_some() || only.file_name()? != "model.safetensors" {
-        return None;
+    let files = checkpoint_files(root)?;
+    if let [only] = files.as_slice() {
+        return pinned_file(only).map(PinnedArtifact::single);
     }
-    pinned_artifact(&only)
+    let files = files
+        .iter()
+        .map(|path| pinned_file(path))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PinnedArtifact::sharded(files))
 }
 
 pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
@@ -554,27 +725,45 @@ pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
 /// never disagree about which Linears carry the tier.
 ///
 /// `Ok(None)` is a dense (bf16) checkpoint. `Err` fails closed on anything that is not a readable
-/// shipped tier: a source that is not a snapshot directory, a root whose `model.safetensors`
-/// cannot be read, a checkpoint with no backbone decoder Linears at all, a `.scales` with no codes,
-/// a codes/scales ratio that is not an exact 4- or 8-bit pack, or two bases packed at different
-/// widths.
+/// shipped tier: a source that is not a snapshot directory, a root whose checkpoint inventory is
+/// not pinnable (the same inventory rules `verified_artifact` pins by: one `model.safetensors`, or
+/// exactly the shard set the HF index names) or has a shard that cannot be read, a checkpoint with
+/// no backbone decoder Linears at all, a `.scales` with no codes, a codes/scales ratio that is not
+/// an exact 4- or 8-bit pack, or two bases packed at different widths.
 pub fn resolved_artifact_tier(spec: &LoadSpec) -> CoreResult<Option<Quant>> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(CoreError::Unsupported(
             "sensenova artifact tier: the load is not a snapshot directory".to_owned(),
         ));
     };
-    // `verified_artifact` already establishes that a SenseNova snapshot is exactly one
-    // `model.safetensors`; reading that file directly keeps this seam on the same shape.
-    let path = root.join("model.safetensors");
+    // The tier is read off the same files `verified_artifact` pins: the single `model.safetensors`,
+    // or every shard the HF index names (sc-22738). A packed tier is a property of the whole
+    // shard set, so the headers of every shard are folded into one scan.
     let fail = |detail: String| {
         CoreError::Unsupported(format!(
             "sensenova artifact tier: {} — {detail}",
-            path.display()
+            root.display()
         ))
     };
-    let headers = mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(&path)
-        .map_err(|error| fail(format!("no readable checkpoint weights ({error})")))?;
+    let files = checkpoint_files(root).ok_or_else(|| {
+        fail(format!(
+            "no pinnable checkpoint inventory (one `{SINGLE_FILE}`, or exactly the shards \
+             `{SHARD_INDEX}` names)"
+        ))
+    })?;
+    let mut headers = Vec::new();
+    for path in &files {
+        headers.extend(
+            mlx_gen::gen_core::weightsmeta::safetensors_path_tensor_headers(path).map_err(
+                |error| {
+                    fail(format!(
+                        "no readable checkpoint weights in {} ({error})",
+                        path.display()
+                    ))
+                },
+            )?,
+        );
+    }
     let shapes: HashMap<&str, &[usize]> = headers
         .iter()
         .map(|tensor| (tensor.name.as_str(), tensor.shape.as_slice()))
@@ -697,8 +886,9 @@ pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) ->
 ///   identity, or an external text encoder all zero the identity. The loader ignores most of those
 ///   rather than refusing, so a contract published under one would key a rung to a composition
 ///   nothing measured.
-/// * **Pinned artifact.** A snapshot that is not the single stable `model.safetensors`
-///   [`verified_artifact`] pins is not a shape any campaign ran on.
+/// * **Pinned artifact.** A snapshot [`verified_artifact`] cannot pin — neither one stable
+///   `model.safetensors` nor exactly the shard set its HF index names — is not a shape any
+///   campaign ran on.
 /// * **Pre-merged `_fast` turnkey.** A `_fast` root without [`crate::DISTILL_MERGED_MARKER`] loads
 ///   an unmerged base and merges a curated LoRA at runtime — a different resident shape from the
 ///   measured one, on every tier, matching [`can_stream_gen_with_artifact`]'s own requirement.
@@ -806,6 +996,14 @@ fn structurally_can_stream_gen(provider_id: &str, spec: &LoadSpec) -> bool {
     matches!(provider_id, crate::MODEL_ID | crate::MODEL_ID_FAST)
 }
 
+/// Whether the deferred Gen-block windows (rung 4) can stream from `artifact`.
+///
+/// Streaming needs a pinned artifact the windows can reopen per block, not a single file: each
+/// window reopens the pinned entries through [`PinnedArtifact::open_weights`], and every open is
+/// an mmap-lazy `load_safetensors` that costs headers rather than tensor bytes, so an HF shard set
+/// streams exactly as a single `model.safetensors` does. Before sc-22738 a sharded snapshot pinned
+/// nothing and therefore could not stream; now the bf16 quality rehosts reach rung 4 too. The
+/// remaining single-shape rule is the `_fast` pre-merge one below.
 pub(crate) fn can_stream_gen_with_artifact(
     provider_id: &str,
     spec: &LoadSpec,
@@ -964,8 +1162,16 @@ fn build_memory_strategy_contract(
     contract.load_shape = spec.load_shape;
     contract.architecture_facts = architecture_facts(spec);
     contract.calibration = calibration;
+    // The three phases the engine now bounds with progress events (sc-22738): conditioning up to
+    // `Loading(Renderer)`, denoise up to `Decoding`, and the decode tail (unpatchify + host copy)
+    // after it. There is still no VAE — the decode phase is the FM head's RGB patches becoming an
+    // image — but it is an observable window the measurement adapter records, so it is declared.
     contract.formula = MemoryFormulaKind::PhaseEnvelope {
-        phases: vec![MemoryPhase::Conditioning, MemoryPhase::Denoise],
+        phases: vec![
+            MemoryPhase::Conditioning,
+            MemoryPhase::Denoise,
+            MemoryPhase::Decode,
+        ],
         variables: vec![
             MemoryFormulaVariable::AssetBytes,
             MemoryFormulaVariable::PixelCount,
@@ -977,6 +1183,12 @@ fn build_memory_strategy_contract(
     };
     contract.asset_facts.base_bytes = footprint.dit;
     contract.asset_facts.transformer_bytes = footprint.dit;
+    // `lifecycle.phases` is deliberately NOT the formula's phase list. In gen-core it is the
+    // staged-residency hook declaration — "this scope implements `enter_phase`/`leave_phase` as a
+    // component-release seam" — and `conformance_errors` rejects a non-empty list while
+    // `StagedResidency` is `StructurallyNotApplicable`, which it structurally is here (one fused
+    // dual-path checkpoint, nothing to release between phases). The Candle sibling keeps it empty
+    // for the same reason. The phase BOUNDARIES are emitted as progress events instead (sc-22738).
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: Vec::new(),
         synchronized_phase_release: false,
@@ -2763,11 +2975,15 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A multi-file inventory WITHOUT an HF index is not a layout this family ships and pins
+    /// nothing: no calibration identity, no rung 4. (An indexed shard set is pinned — see the
+    /// sc-22738 tests below.)
     #[test]
-    fn sharded_inventory_does_not_advertise_deferred_streaming() {
+    fn an_unindexed_multi_file_inventory_does_not_pin_or_stream() {
         let tmp = tempfile::tempdir().unwrap();
         let (root, spec) = fixture_spec(&tmp);
         std::fs::write(root.join("model-00001-of-00002.safetensors"), [1_u8; 8]).unwrap();
+        assert!(verified_artifact(&spec).is_none());
         let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
         assert_eq!(
             contract
@@ -2795,6 +3011,339 @@ mod tests {
         );
         assert!(verified_artifact(&spec).is_some());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22738 (epic sc-22723): the three dense quality rehosts are HF-sharded
+    // (`model-0000N-of-00008.safetensors` + `model.safetensors.index.json`). The pin covers that
+    // layout as one artifact so the bf16 tier is measurable.
+    // ------------------------------------------------------------------------------------------
+
+    /// The two-shard split of [`backbone_entries`]: the attention Linear in shard 1, the MLP
+    /// Linear and the embedding in shard 2.
+    fn shard_split(bits: Option<usize>) -> [Vec<(String, &'static str, Vec<usize>)>; 2] {
+        let entries = backbone_entries(bits);
+        let first: Vec<_> = entries
+            .iter()
+            .filter(|(name, _, _)| name.contains("self_attn"))
+            .cloned()
+            .collect();
+        let second: Vec<_> = entries
+            .iter()
+            .filter(|(name, _, _)| !name.contains("self_attn"))
+            .cloned()
+            .collect();
+        assert!(!first.is_empty() && !second.is_empty());
+        [first, second]
+    }
+
+    const SHARD_NAMES: [&str; 2] = [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ];
+
+    /// One fixture shard: its file name and the `(name, dtype, shape)` entries it carries.
+    type ShardEntries<'a> = (&'a str, &'a [(String, &'a str, Vec<usize>)]);
+    /// One way to break an otherwise intact sharded snapshot root.
+    type Breakage = Box<dyn Fn(&Path)>;
+
+    /// Write the HF index for `shards` (`(shard name, entries)`), keying `weight_map` in the given
+    /// order — `reversed` writes the same map with its tensors listed backwards, which is the
+    /// same index by content and must be the same artifact by identity.
+    fn write_shard_index(root: &Path, shards: &[ShardEntries<'_>], reversed: bool) {
+        let mut pairs: Vec<String> = shards
+            .iter()
+            .flat_map(|(shard, entries)| {
+                entries
+                    .iter()
+                    .map(move |(name, _, _)| format!("\"{name}\":\"{shard}\""))
+            })
+            .collect();
+        if reversed {
+            pairs.reverse();
+        }
+        std::fs::write(
+            root.join(SHARD_INDEX),
+            format!(
+                "{{\"metadata\":{{}},\"weight_map\":{{{}}}}}",
+                pairs.join(",")
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A snapshot root shaped the way the dense quality rehosts ship: two indexed shards under a
+    /// path component carrying the route's repository identity.
+    fn sharded_tier_root(
+        tmp: &tempfile::TempDir,
+        route: &str,
+        bits: Option<usize>,
+        reversed: bool,
+    ) -> PathBuf {
+        let repository = format!("SceneWorks__{}-mlx", route.replace('_', "-"));
+        let root = unique_root(tmp, "sharded").join(repository);
+        std::fs::create_dir_all(&root).unwrap();
+        let [first, second] = shard_split(bits);
+        let shards: Vec<ShardEntries<'_>> =
+            vec![(SHARD_NAMES[0], &first), (SHARD_NAMES[1], &second)];
+        let order: Vec<usize> = if reversed { vec![1, 0] } else { vec![0, 1] };
+        for i in order {
+            write_safetensors(&root.join(shards[i].0), shards[i].1);
+        }
+        write_shard_index(&root, &shards, reversed);
+        root
+    }
+
+    /// **An indexed shard set pins as one artifact with one stable content identity** (sc-22738).
+    /// The identity is a function of the shards' bytes in shard-name order: the same content
+    /// written in the other order, under an index keyed the other way round, is the same artifact;
+    /// a change to ANY shard — first or last — is a different one. The bf16 tier resolves from the
+    /// folded shard headers, so the quality route publishes its bf16 identity and, on the deferred
+    /// shape, reaches rung 4.
+    ///
+    /// Mutation that fails this: pinning only the first shard (the last shard's bytes stop moving
+    /// the digest), or reading the tier off one shard (the MLP pack in shard 2 is what proves q4).
+    #[test]
+    fn an_indexed_shard_set_pins_one_stable_content_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = "sensenova_u1_8b";
+
+        let root = sharded_tier_root(&tmp, route, None, false);
+        let spec = tier_spec(&root, route, None);
+        let artifact = verified_artifact(&spec).expect("an indexed shard set pins");
+        assert_eq!(artifact.files.len(), 2);
+        assert_eq!(
+            artifact.loader_paths().collect::<Vec<_>>(),
+            SHARD_NAMES
+                .iter()
+                .map(|name| std::path::absolute(root.join(name)).unwrap())
+                .collect::<Vec<_>>()
+        );
+        let digest = artifact.digest().to_owned();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            digest, artifact.files[0].digest,
+            "the artifact identity is not the first shard's digest"
+        );
+        assert_ne!(digest, artifact.files[1].digest);
+
+        // Same bytes, opposite creation order and index key order: the same artifact.
+        let mirrored = sharded_tier_root(&tmp, route, None, true);
+        assert_eq!(
+            verified_artifact(&tier_spec(&mirrored, route, None))
+                .unwrap()
+                .digest(),
+            digest
+        );
+
+        // Any shard's bytes move the identity — the LAST shard too.
+        for (label, changed) in [(SHARD_NAMES[0], 0_usize), (SHARD_NAMES[1], 1)] {
+            let touched = sharded_tier_root(&tmp, route, None, false);
+            let [first, second] = shard_split(None);
+            let mut entries = if changed == 0 { first } else { second };
+            entries[0].2[0] += 1;
+            write_safetensors(&touched.join(label), &entries);
+            let moved = verified_artifact(&tier_spec(&touched, route, None))
+                .unwrap_or_else(|| panic!("{label}: still a complete shard set"));
+            assert_ne!(
+                moved.digest(),
+                digest,
+                "{label}: bytes changed, identity did not"
+            );
+        }
+
+        // The tier is read from the folded shard headers: dense here, packed for the q4 split
+        // whose pack lives in shard 2.
+        assert_eq!(resolved_artifact_tier(&spec).unwrap(), None);
+        let q4 = sharded_tier_root(&tmp, route, Some(4), false);
+        assert_eq!(
+            resolved_artifact_tier(&tier_spec(&q4, route, Some(Quant::Q4))).unwrap(),
+            Some(Quant::Q4)
+        );
+        let q4_mirrored = sharded_tier_root(&tmp, route, Some(4), true);
+        assert_eq!(
+            verified_artifact(&tier_spec(&q4_mirrored, route, Some(Quant::Q4)))
+                .unwrap()
+                .digest(),
+            verified_artifact(&tier_spec(&q4, route, Some(Quant::Q4)))
+                .unwrap()
+                .digest()
+        );
+
+        // The quality route publishes its bf16 identity over the shard set...
+        let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+        assert!(contract.conformance_errors().is_empty());
+        assert_eq!(
+            contract.calibration.map(|c| c.fingerprint),
+            Some("sensenova-u1-quality-bf16-mlx-shared-ladder-v1".to_owned())
+        );
+        // ...withholds it when the request disagrees with the artifact's tier...
+        assert!(memory_strategy_contract(
+            crate::MODEL_ID,
+            &tier_spec(&root, route, Some(Quant::Q4))
+        )
+        .unwrap()
+        .calibration
+        .is_none());
+        // ...and streams the Gen windows on the deferred shape.
+        let deferred =
+            tier_spec(&root, route, None).with_load_shape(LoadShape::DeferredMaterialization);
+        assert_eq!(
+            memory_strategy_contract(crate::MODEL_ID, &deferred)
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+            MemoryStrategySupport::Implemented
+        );
+    }
+
+    /// **A sharded snapshot fails closed on any inventory mismatch, and the single-file pin is
+    /// unchanged** (sc-22738). A shard the index names but the directory lacks, a `*.safetensors`
+    /// the index does not name, an index that points outside the snapshot, or a malformed index
+    /// all pin nothing — no identity, no tier, no rung 4 — while the contract itself is still
+    /// produced. A single `model.safetensors` still pins as exactly its own SHA-256, which is
+    /// what keeps the recorded campaign digests naming their checkpoints.
+    #[test]
+    fn a_sharded_snapshot_fails_closed_on_any_inventory_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = "sensenova_u1_8b";
+        let broken: Vec<(&str, Breakage)> = vec![
+            (
+                "missing shard",
+                Box::new(|root| std::fs::remove_file(root.join(SHARD_NAMES[1])).unwrap()),
+            ),
+            (
+                "stray unindexed shard",
+                Box::new(|root| {
+                    write_safetensors(
+                        &root.join("model-00003-of-00002.safetensors"),
+                        &linear_entries("language_model.model.layers.1.mlp.up_proj", 8, None),
+                    )
+                }),
+            ),
+            (
+                "index escaping the snapshot",
+                Box::new(|root| {
+                    let escaped = root.join("..").join(SHARD_NAMES[1]);
+                    std::fs::rename(root.join(SHARD_NAMES[1]), &escaped).unwrap();
+                    let body = std::fs::read_to_string(root.join(SHARD_INDEX)).unwrap();
+                    std::fs::write(
+                        root.join(SHARD_INDEX),
+                        body.replace(SHARD_NAMES[1], &format!("../{}", SHARD_NAMES[1])),
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "malformed index",
+                Box::new(|root| {
+                    std::fs::write(root.join(SHARD_INDEX), b"{\"weight_map\":[]}").unwrap()
+                }),
+            ),
+            (
+                "empty weight map",
+                Box::new(|root| {
+                    std::fs::write(root.join(SHARD_INDEX), b"{\"weight_map\":{}}").unwrap()
+                }),
+            ),
+        ];
+        for (label, break_it) in broken {
+            let root = sharded_tier_root(&tmp, route, None, false);
+            let spec = tier_spec(&root, route, None);
+            assert!(
+                verified_artifact(&spec).is_some(),
+                "{label}: intact set must pin"
+            );
+            break_it(&root);
+            assert!(
+                verified_artifact(&spec).is_none(),
+                "{label}: pinned an inventory it cannot prove"
+            );
+            assert!(
+                resolved_artifact_tier(&spec).is_err(),
+                "{label}: read a tier it cannot prove"
+            );
+            let contract = memory_strategy_contract(crate::MODEL_ID, &spec)
+                .unwrap_or_else(|error| panic!("{label}: contract failed: {error}"));
+            assert!(contract.calibration.is_none(), "{label}");
+            assert_eq!(
+                memory_strategy_contract(
+                    crate::MODEL_ID,
+                    &spec.with_load_shape(LoadShape::DeferredMaterialization)
+                )
+                .unwrap()
+                .capability(MemoryStrategy::BoundedTransformerResidency)
+                .unwrap()
+                .support,
+                MemoryStrategySupport::Missing,
+                "{label}"
+            );
+        }
+
+        // Single-file: the identity is the file's own SHA-256, exactly as before.
+        let single = tier_root(&tmp, route, Some(8));
+        let spec = tier_spec(&single, route, Some(Quant::Q8));
+        let artifact = verified_artifact(&spec).unwrap();
+        assert_eq!(artifact.files.len(), 1);
+        let bytes = std::fs::read(single.join(SINGLE_FILE)).unwrap();
+        assert_eq!(
+            artifact.digest(),
+            format!("{:x}", Sha256::digest(&bytes)),
+            "a single-file artifact's identity is its content hash, unchanged by sc-22738"
+        );
+        assert_eq!(resolved_artifact_tier(&spec).unwrap(), Some(Quant::Q8));
+    }
+
+    /// **A sharded artifact opens as one disjoint tensor map under the same pin guard as a single
+    /// file** (sc-22738): every shard's tensors are present, a key repeated across shards is a
+    /// wrong shard set rather than a silent later-wins merge, and a shard mutated after the pin is
+    /// rejected on the next open.
+    #[test]
+    fn a_sharded_artifact_opens_every_shard_under_the_pin_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let route = "sensenova_u1_8b";
+        let root = sharded_tier_root(&tmp, route, None, false);
+        let spec = tier_spec(&root, route, None);
+        let artifact = verified_artifact(&spec).unwrap();
+
+        let weights = artifact.open_weights().expect("a sharded artifact loads");
+        let mut keys: Vec<&str> = weights.keys().collect();
+        keys.sort_unstable();
+        let mut expected: Vec<String> = backbone_entries(None)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "every shard's tensors must be present exactly once"
+        );
+
+        // A key repeated across shards (shard 2 also carrying shard 1's attention weight, which
+        // the index — one shard per key — cannot express) is refused, not merged.
+        let [first, mut second] = shard_split(None);
+        second.push(first[0].clone());
+        write_safetensors(&root.join(SHARD_NAMES[1]), &second);
+        let overlapping = verified_artifact(&spec).unwrap();
+        let error = match overlapping.open_weights() {
+            Ok(_) => panic!("a repeated key across shards must not merge"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("duplicate tensor key"), "got: {error}");
+
+        // A shard mutated after the pin fails the guard on the next open.
+        let [first, second] = shard_split(None);
+        let mut moved = second.clone();
+        moved[0].2[0] += 1;
+        write_safetensors(&root.join(SHARD_NAMES[1]), &moved);
+        let error = match overlapping.open_weights() {
+            Ok(_) => panic!("a shard mutated after the pin must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("replaced or mutated"), "got: {error}");
+        let _ = first;
     }
 
     #[test]
@@ -2874,17 +3423,25 @@ mod tests {
         let artifact =
             verified_artifact(&spec).expect("an HF blob symlink is still an exact single artifact");
 
-        assert_eq!(artifact.loader_path(), std::path::absolute(&entry).unwrap());
+        assert_eq!(
+            artifact.loader_paths().collect::<Vec<_>>(),
+            vec![std::path::absolute(&entry).unwrap().as_path()]
+        );
         assert_eq!(
             artifact
-                .loader_path()
-                .extension()
+                .loader_paths()
+                .next()
+                .and_then(|path| path.extension())
                 .and_then(|value| value.to_str()),
             Some("safetensors"),
             "mlx-rs dispatches the file format from this extension"
         );
         assert!(
-            artifact.identity.canonical_path.extension().is_none(),
+            artifact.files[0]
+                .identity
+                .canonical_path
+                .extension()
+                .is_none(),
             "the canonical HF blob is extensionless — opening IT is the regression"
         );
 

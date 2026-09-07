@@ -37,7 +37,7 @@ use mlx_gen::{
 use crate::config::NeoChatConfig;
 use crate::distill::{resolve_distill_lora, DISTILL_MERGED_MARKER};
 use crate::loader::{check_coverage, load_raw};
-use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
+use crate::t2i::{request_phase_bounds, smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
 
@@ -638,7 +638,11 @@ impl SenseNova {
             let opts = self.options(req, base_seed.wrapping_add(i as u64));
             // Thread cancellation + per-step progress into the denoise loop. Progress now reports the
             // denoise step (Kolors/SDXL semantics), not the image index as the old single tick did.
-            let reporter = StepReporter::new(&req.cancel, on_progress);
+            // The request's two phase boundaries are opened once each — by the first image's loop
+            // and the last image's loop — not once per image (sc-22738).
+            let (opens_denoise, opens_decode) = request_phase_bounds(i, req.count);
+            let reporter = StepReporter::new(&req.cancel, on_progress)
+                .with_phase_bounds(opens_denoise, opens_decode);
             let out = if references.is_empty() {
                 self.model.generate(
                     &self.tokenizer,
