@@ -408,7 +408,14 @@ fn canonical_config(root: &Path) -> gen_core::Result<WanModelConfig> {
     let config = WanModelConfig::from_config_json(&json);
     let mut canonical = WanModelConfig::wan22_ti2v_5b();
     canonical.quantization = quantization;
-    if config != canonical || json != canonical.to_json() {
+    // Compare the snapshot with the inert legacy keys dropped. The shipped rehost
+    // `SceneWorks/wan2.2-ti2v-5b-mlx` still bakes `"max_area": 901120` in every tier's config.json
+    // and `to_json()` stopped emitting it in sc-12308; nothing reads a baked `max_area`, so neither
+    // its presence nor its value can change the loaded configuration. Everything else must still
+    // match `to_json()` exactly, and `config` is the overlaid struct, so any drifted *meaningful*
+    // value is still refused.
+    if config != canonical || crate::config::without_legacy_inert_keys(&json) != canonical.to_json()
+    {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_ID}: config.json is not the complete canonical dense Wan2.2 TI2V-5B configuration"
         )));
@@ -2003,6 +2010,56 @@ mod tests {
         }];
         write_parts(temp.path(), &config, &transformer, &t5, &vae);
         assert!(memory_strategy_contract(&spec(temp.path().to_path_buf())).is_err());
+    }
+
+    /// sc-22738 (defect C): the shipped rehost
+    /// `SceneWorks/wan2.2-ti2v-5b-mlx@bb1b055249614cf9d7cf4373fbdbc184b77dee88` bakes
+    /// `"max_area": 901120` into every tier's `config.json`, and `to_json()` stopped emitting the
+    /// key in sc-12308. Because `model::load` calls `contract_for_loaded` unconditionally and
+    /// propagates its error, the byte-for-byte `json != canonical.to_json()` check refused every
+    /// ordinary production load of all three tiers. The key is inert; the tolerance is exactly it.
+    #[test]
+    fn the_shipped_rehosts_baked_inert_max_area_loads_while_real_drift_is_still_refused() {
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut config, transformer, t5, vae) = checkpoint_parts(quant);
+            config["max_area"] = serde_json::json!(901_120);
+            write_parts(temp.path(), &config, &transformer, &t5, &vae);
+            let load_spec = spec(temp.path().to_path_buf());
+            memory_strategy_contract(&load_spec).expect("the inert legacy key must be tolerated");
+            // The production path: `model::load` propagates `contract_for_loaded`'s error, so the
+            // refusal was an ordinary Resident/Eager job failing to load at all.
+            crate::model::load(&load_spec)
+                .expect("the production load path must accept the rehost");
+        }
+
+        // The tolerance is a key allowlist, not a relaxation of the identity: a drifted meaningful
+        // value, an unknown extra key, and a missing canonical key are all still refused — with the
+        // legacy key present, so this cannot pass by the check having been disabled wholesale.
+        for mutate in [
+            (|config: &mut serde_json::Value| config["ffn_dim"] = serde_json::json!(14335))
+                as fn(&mut serde_json::Value),
+            |config: &mut serde_json::Value| config["dim"] = serde_json::json!(3073),
+            |config: &mut serde_json::Value| config["sample_steps"] = serde_json::json!(49),
+            |config: &mut serde_json::Value| {
+                config["sample_neg_prompt"] = serde_json::json!("drifted")
+            },
+            |config: &mut serde_json::Value| config["an_unknown_key"] = serde_json::json!(1),
+            |config: &mut serde_json::Value| {
+                config.as_object_mut().unwrap().remove("t5_num_buckets");
+            },
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut config, transformer, t5, vae) = checkpoint_parts(None);
+            config["max_area"] = serde_json::json!(901_120);
+            mutate(&mut config);
+            write_parts(temp.path(), &config, &transformer, &t5, &vae);
+            let load_spec = spec(temp.path().to_path_buf());
+            assert!(
+                memory_strategy_contract(&load_spec).is_err(),
+                "only the inert legacy key may be tolerated"
+            );
+        }
     }
 
     #[test]

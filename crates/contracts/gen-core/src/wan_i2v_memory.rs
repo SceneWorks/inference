@@ -1280,6 +1280,22 @@ fn packed_transformer_bytes(
         .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
     {
         let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        // A 2-D `.weight` that is stored float AND carries no quant metadata at all is dense by
+        // pipeline convention, not a packed tensor that lost its leaves: the converter leaves the
+        // output projection (`head.head`) dense BF16 on every packed tier of the shipped rehosts
+        // (`SceneWorks/wan2.2-i2v-a14b-mlx`, `wan2.2-t2v-a14b-mlx`). Skip it here and let the dense
+        // residual pass below price it at the resident float width, exactly as it already prices
+        // every non-2-D dense tensor.
+        //
+        // The discriminator is deliberately conjunctive so genuine corruption still fails closed:
+        // a `U32` weight is unambiguously packed storage and must carry both leaves, and a weight
+        // with a lone `.scales` or `.biases` sibling is a packed tensor missing metadata. Either
+        // case falls through to the errors below.
+        let has_scales = tensors.contains_key(&format!("{base}.scales"));
+        let has_biases = tensors.contains_key(&format!("{base}.biases"));
+        if weight.is_float() && !has_scales && !has_biases {
+            continue;
+        }
         let scales = tensors.get(&format!("{base}.scales")).ok_or_else(|| {
             crate::Error::Unsupported(format!("{} packed {base} lacks scales", path.display()))
         })?;
@@ -4354,6 +4370,94 @@ mod tests {
         assert!(
             PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, "wan2_2_ti2v_5b").is_err()
         );
+    }
+
+    /// sc-22738 (defect B): every packed file of the shipped a14b rehosts
+    /// (`SceneWorks/wan2.2-i2v-a14b-mlx@c6c786170031eccc3a1fac0f98f1ad4ff988271e` and its t2v
+    /// sibling) leaves the output projection `head.head.weight` dense BF16 `[64, 5120]` with no
+    /// `.scales`/`.biases` — the standing converter convention. The first pass demanded scales for
+    /// every 2-D `.weight` and refused before the second pass, which already prices a dense
+    /// residual correctly.
+    #[test]
+    fn a_packed_file_prices_a_dense_output_head_but_still_refuses_stripped_quant_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+            ("blocks.0.norm1.weight", "BF16", &[64]),
+            // Dense by convention on every packed tier — no quant metadata at all.
+            ("head.head.weight", "BF16", &[64, 64]),
+            ("head.head.bias", "BF16", &[64]),
+        ];
+        let path = tmp.path().join("high_noise_model.safetensors");
+        write_safetensors(&path, shipped);
+
+        // Packed triple (MLX prices stored bytes): 64*8*4 + 64*2 + 64*2 = 2304.
+        // Dense residual at the bf16 resident width: (64*64 + 64 + 64) * 2 = 8448.
+        let mlx = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).unwrap();
+        assert_eq!(mlx, 2304 + 8448);
+        // Candle prices the packed block form (20 bytes / 32 Q4 elements) and the same residual.
+        let candle = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).unwrap();
+        assert_eq!(candle, (64 * 64 / 32) * 20 + 8448);
+
+        // The discriminator is "float storage AND no quant metadata at all", so genuine corruption
+        // still fails closed: packed U32 storage that lost both leaves, that lost one of them, and
+        // a float weight carrying a lone leaf are each refused.
+        // Each case pairs the corruption with the message that has to name it, so a guard loosened
+        // to any one of its three conjuncts is caught rather than being absorbed by the second
+        // pass's orphan-leaf backstop.
+        let valid_triple: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+        ];
+        for (corruption, expected) in [
+            // U32 storage with both leaves stripped, alongside a healthy packed sibling: packed
+            // storage is unambiguous, so this can never be read as dense by convention.
+            (
+                vec![
+                    ("blocks.0.ffn.0.weight", "U32", &[64, 8][..]),
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                ],
+                "packed blocks.0.ffn.0 lacks scales",
+            ),
+            // A float weight with a lone `.biases` leaf carries quant metadata, so it is a packed
+            // tensor missing its scales — not a dense head.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.biases", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks scales",
+            ),
+            // …and the mirror case, a lone `.scales` leaf.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.scales", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks biases",
+            ),
+        ] {
+            let mut mutated = valid_triple.to_vec();
+            mutated.extend(corruption.iter().copied());
+            let path = tmp.path().join("mutated.safetensors");
+            write_safetensors(&path, &mutated);
+            let error = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx)
+                .expect_err("a packed tensor missing quant metadata must still be refused")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+
+        // A file whose only 2-D weight is the dense head has no packed weights at all and is not a
+        // packed tier — the emptiness guard must still catch it.
+        let path = tmp.path().join("dense_only.safetensors");
+        write_safetensors(&path, &[("head.head.weight", "BF16", &[64, 64])]);
+        assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
     }
 
     fn request(route: WanI2vRoute) -> GenerationRequest {
