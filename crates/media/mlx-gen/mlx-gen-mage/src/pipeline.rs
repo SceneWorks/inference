@@ -299,12 +299,20 @@ pub(crate) fn denoise_generation_phase(
     })
 }
 
+/// Decode every sample in a batch, opening the request's decode phase first.
+///
+/// **The `Progress::Decoding` boundary is emitted exactly once, before the loop** (sc-22738). The
+/// production `Generator::generate` path used to discard the sink here entirely, so the decode
+/// phase the memory contract declares was invisible to every consumer; emitting per sample instead
+/// would restart the bar per output, which the gen-core progress contract rejects (F-136/F-162).
 pub(crate) fn decode_generation_phase(
     vae: &MageVae,
     denoised: DenoisedGenerationBatch,
     memory: Option<GenerationMemory>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<BatchGenerationTrace> {
+    on_progress(Progress::Decoding);
     let mut samples = Vec::with_capacity(denoised.samples.len());
     for item in denoised.samples {
         let image_u8 = decode_with_memory(vae, &item.tokens, item.gh, item.gw, memory, cancel)?;
@@ -458,12 +466,16 @@ pub(crate) fn denoise_edit_phase(
     })
 }
 
+/// Decode one edited image, opening the request's decode phase first (sc-22738 — see
+/// [`decode_generation_phase`]).
 pub(crate) fn decode_edit_phase(
     vae: &MageVae,
     denoised: DenoisedEdit,
     memory: Option<GenerationMemory>,
     cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
 ) -> Result<EditTrace> {
+    on_progress(Progress::Decoding);
     let image_u8 = decode_with_memory(
         vae,
         &denoised.target,
@@ -1935,5 +1947,135 @@ mod tests {
         assert!(verify_quantized_counts("DiT", 173, 174).is_err());
         assert!(verify_quantized_counts("VAE", 4, 5).is_err());
         assert!(verify_quantized_counts("VAE", 5, 5).is_ok());
+    }
+
+    /// The tiny committed VAE (`tests/fixtures/mage_vae_tiny.safetensors`, sc-14039) — built here
+    /// only so the decode-phase signatures can be driven weights-free. Every assertion below fails
+    /// or returns before a single tensor reaches it.
+    fn tiny_vae() -> MageVae {
+        let w = mlx_gen::weights::Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mage_vae_tiny.safetensors"
+        ))
+        .expect("tiny Mage-VAE fixture");
+        let raw = w
+            .require("fixture.shape")
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap();
+        let v: Vec<i32> = raw.as_slice::<i32>().to_vec();
+        let shape = crate::vae::denoiser::MageVaeShape {
+            patch: v[0],
+            hidden: v[1],
+            hidden_x: v[2],
+            in_channels: v[3],
+            bottleneck: v[4],
+            num_cond_blocks: v[5] as usize,
+            num_mlp_blocks: v[6] as usize,
+            max_freqs: v[7] as usize,
+            attn_tile: v[8],
+        };
+        MageVae::from_weights_with_shape(&w, Dtype::Float32, true, shape, "pipeline")
+            .expect("build tiny Mage-VAE")
+    }
+
+    /// Tokens the decode cannot consume, so the phase's work aborts immediately after the boundary
+    /// and no Metal decode runs in a unit test.
+    fn undecodable_tokens() -> Array {
+        Array::from_slice(&[0f32], &[1, 1, 1])
+    }
+
+    fn generation_sample() -> DenoisedGenerationSample {
+        DenoisedGenerationSample {
+            tokens: undecodable_tokens(),
+            gh: 2,
+            gw: 2,
+            height: 32,
+            width: 32,
+            trajectories: Vec::new(),
+        }
+    }
+
+    /// sc-22738: `Progress::Decoding` reaches the caller **once per request**, before any sample is
+    /// decoded — the production `Generator::generate` closure discarded the sink entirely, so the
+    /// decode phase was invisible on every shipped Mage-Flow member.
+    #[test]
+    fn the_generation_decode_phase_opens_once_before_any_sample() {
+        let vae = tiny_vae();
+        let cancel = CancelFlag::default();
+
+        // Zero samples: a per-sample emit would report nothing at all here.
+        let mut events = Vec::new();
+        decode_generation_phase(
+            &vae,
+            DenoisedGenerationBatch {
+                samples: Vec::new(),
+                packs: Vec::new(),
+            },
+            None,
+            &cancel,
+            &mut |p| events.push(p),
+        )
+        .expect("an empty batch decodes to an empty trace");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event, got {events:?}"
+        );
+        assert!(matches!(events[0], Progress::Decoding));
+
+        // Two samples: a per-sample emit would report twice. The boundary precedes the decode, so
+        // it is recorded even though the first sample's tokens are rejected.
+        let mut events = Vec::new();
+        let result = decode_generation_phase(
+            &vae,
+            DenoisedGenerationBatch {
+                samples: vec![generation_sample(), generation_sample()],
+                packs: Vec::new(),
+            },
+            None,
+            &cancel,
+            &mut |p| events.push(p),
+        );
+        assert!(
+            result.is_err(),
+            "the fixture tokens are deliberately undecodable"
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event, got {events:?}"
+        );
+        assert!(matches!(events[0], Progress::Decoding));
+    }
+
+    /// The edit route reaches decode through its own phase function (sc-22738).
+    #[test]
+    fn the_edit_decode_phase_opens_before_the_decode() {
+        let vae = tiny_vae();
+        let mut events = Vec::new();
+        let result = decode_edit_phase(
+            &vae,
+            DenoisedEdit {
+                target: undecodable_tokens(),
+                reference_tokens: undecodable_tokens(),
+                trajectories: Vec::new(),
+                gh: 2,
+                gw: 2,
+            },
+            None,
+            &CancelFlag::default(),
+            &mut |p| events.push(p),
+        );
+        assert!(
+            result.is_err(),
+            "the fixture tokens are deliberately undecodable"
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event, got {events:?}"
+        );
+        assert!(matches!(events[0], Progress::Decoding));
     }
 }
