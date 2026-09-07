@@ -129,3 +129,67 @@ fn t2i_denoise_matches_reference() {
         "T2I final-frame peak-rel {rel:.3e} exceeds 2e-2"
     );
 }
+
+/// sc-22738 — the T2I denoise loop brackets its steps with the two lifecycle boundaries the
+/// SceneWorks memory-measurement adapter cuts its windows on: `Loading(Renderer)` opens the denoise
+/// phase after the prefill and before step 1, `Decoding` opens the decode phase after the last
+/// step. Driven through the production reporter on the synthetic fixture so the exact ordered
+/// stream is pinned: deleting either emit in `T2iModel::denoise`, or moving one across the loop,
+/// changes this sequence.
+#[test]
+fn t2i_denoise_emits_its_phase_boundaries_around_the_loop() {
+    use mlx_gen::gen_core::{LoadPhase, Progress};
+    use mlx_gen::CancelFlag;
+    use mlx_gen_sensenova::t2i::StepReporter;
+
+    let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
+    let cfg = config_from_meta(&case);
+    let model = T2iModel::from_weights(&w, &cfg).expect("build T2iModel");
+    let width: i32 = case.metadata("width").unwrap().parse().unwrap();
+    let height: i32 = case.metadata("height").unwrap().parse().unwrap();
+    let num_steps: usize = case.metadata("num_steps").unwrap().parse().unwrap();
+    let prefix_ids: Vec<i32> = w
+        .require("prefix.input_ids")
+        .unwrap()
+        .as_slice::<i32>()
+        .to_vec();
+    let raw_noise = w.require("raw_noise").unwrap().clone();
+    let (mut cache, text_len) = model.prefill_ids(&prefix_ids).expect("prefill");
+    let opts = T2iOptions {
+        cfg_scale: 1.0,
+        num_steps,
+        timestep_shift: 1.0,
+        enable_timestep_shift: true,
+        t_eps: 0.02,
+        ..Default::default()
+    };
+
+    let cancel = CancelFlag::new();
+    let mut events: Vec<Progress> = Vec::new();
+    {
+        let mut sink = |p: Progress| events.push(p);
+        model
+            .denoise(
+                &mut cache,
+                text_len,
+                None,
+                width,
+                height,
+                &raw_noise,
+                &opts,
+                Some(StepReporter::new(&cancel, &mut sink)),
+            )
+            .expect("denoise");
+    }
+
+    let mut expected = vec![Progress::Loading(LoadPhase::Renderer)];
+    expected.extend((1..=num_steps).map(|current| Progress::Step {
+        current: current as u32,
+        total: num_steps as u32,
+    }));
+    expected.push(Progress::Decoding);
+    assert_eq!(
+        events, expected,
+        "the denoise phase opens before step 1 and the decode phase after step {num_steps}"
+    );
+}
