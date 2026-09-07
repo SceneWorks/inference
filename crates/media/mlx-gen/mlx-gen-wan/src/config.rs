@@ -522,7 +522,7 @@ impl WanModelConfig {
 }
 
 /// Keys that a converter once baked into `config.json` but that [`WanModelConfig::to_json`] no
-/// longer emits and [`WanModelConfig::overlay_json`] no longer reads.
+/// longer emits and `WanModelConfig::overlay_json` no longer reads.
 ///
 /// `max_area` is the only such key: sc-12308 made it an engine-owned policy constant, dropped it
 /// from `to_json`, and made `overlay_json` ignore a baked one. The already-shipped rehosts still
