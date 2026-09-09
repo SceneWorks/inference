@@ -1119,9 +1119,13 @@ fn inspect_component_tier(root: &Path, component: &str) -> gen_core::Result<Opti
                 "kolors: {component} config claims packing but tensor headers are dense"
             )));
         }
-        if headers.is_empty() || headers.values().any(|header| header.dtype != Dtype::BF16) {
+        // The shipped `SceneWorks/kolors-mlx` rehost stores the upstream Kwai `model.fp16-*` shards
+        // as F16 (ChatGLM and UNet alike); the pipeline reads every dense tensor at F32 through
+        // `mmap_var_builder`/`load_sorted_mmap`, so F16 and BF16 storage are the same load. Either
+        // half-width storage resolves to the BF16 numeric identity below (sc-22738).
+        if headers.is_empty() || !headers.values().all(|header| is_dense_half(header.dtype)) {
             return Err(gen_core::Error::Unsupported(format!(
-                "kolors: dense {component} must contain BF16 tensors only"
+                "kolors: dense {component} must contain F16/BF16 tensors only"
             )));
         }
         return Ok(None);
@@ -1192,13 +1196,21 @@ fn inspect_component_tier(root: &Path, component: &str) -> gen_core::Result<Opti
         if base.is_some_and(|base| packed_bases.contains(base)) {
             continue;
         }
-        if header.dtype != Dtype::BF16 {
+        // Packed tiers keep the embeddings/norms un-packed in the source's own F16 (see the dense
+        // arm above); only the packed `.scales`/`.biases` are pinned to BF16.
+        if !is_dense_half(header.dtype) {
             return Err(gen_core::Error::Unsupported(format!(
-                "kolors: non-packed {component} tensor {name} must be BF16"
+                "kolors: non-packed {component} tensor {name} must be F16 or BF16"
             )));
         }
     }
     Ok(Some((bits, group)))
+}
+
+/// Half-width dense storage the F32 loader accepts unchanged: the rehost's F16 shards or BF16.
+fn is_dense_half(dtype: gen_core::weightsmeta::Dtype) -> bool {
+    use gen_core::weightsmeta::Dtype;
+    matches!(dtype, Dtype::F16 | Dtype::BF16)
 }
 
 /// The selected numeric tier comes from physical tensor headers plus matching configuration, never
@@ -2092,6 +2104,91 @@ mod tests {
         let tier = physical_tier(temp.path()).unwrap();
         assert_eq!(tier.precision, Precision::Bf16);
         assert_eq!(tier.quant, None);
+    }
+
+    /// The shipped `SceneWorks/kolors-mlx@aadbd49f` layout: the bf16 tier is the upstream Kwai
+    /// `model.fp16-*` F16 shards (ChatGLM sharded, UNet single-file), and the packed q4/q8 tiers keep
+    /// the word embeddings and norms un-packed in F16. Every tier must resolve (sc-22738).
+    #[test]
+    fn shipped_f16_storage_resolves_every_tier() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = temp.path().join("text_encoder");
+        let unet = temp.path().join("unet");
+        std::fs::create_dir_all(&text).unwrap();
+        std::fs::create_dir_all(&unet).unwrap();
+        std::fs::write(text.join("config.json"), "{}").unwrap();
+        std::fs::write(unet.join("config.json"), "{}").unwrap();
+        for (shard, name) in [
+            (1, "embedding.word_embeddings.weight"),
+            (2, "encoder.layers.0.input_layernorm.weight"),
+            (3, "encoder.final_layernorm.weight"),
+        ] {
+            write_named_tensors(
+                &text.join(format!("model.fp16-0000{shard}-of-00003.safetensors")),
+                &[(name, "F16", &[2, 3])],
+            );
+        }
+        write_tensor(
+            &unet.join("diffusion_pytorch_model.fp16.safetensors"),
+            "F16",
+            &[2, 3],
+        );
+        let tier = physical_tier(temp.path()).unwrap();
+        assert_eq!(tier.precision, Precision::Bf16);
+        assert_eq!(tier.quant, None);
+
+        for (bits, quant) in [(4, Quant::Q4), (8, Quant::Q8)] {
+            let temp = tempfile::tempdir().unwrap();
+            for component in ["text_encoder", "unet"] {
+                let dir = temp.path().join(component);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("config.json"), packed(bits, 64)).unwrap();
+                let packed_columns = usize::from(bits) * 2;
+                write_named_tensors(
+                    &dir.join("model.safetensors"),
+                    &[
+                        ("linear.weight", "U32", &[2, packed_columns as u64]),
+                        ("linear.scales", "BF16", &[2, 1]),
+                        ("linear.biases", "BF16", &[2, 1]),
+                        ("embedding.word_embeddings.weight", "F16", &[4, 2]),
+                        ("encoder.final_layernorm.weight", "F16", &[2]),
+                    ],
+                );
+            }
+            let tier = physical_tier(temp.path()).unwrap();
+            assert_eq!(tier.precision, Precision::Bf16);
+            assert_eq!(tier.quant, Some(quant));
+        }
+    }
+
+    /// Storage the F32 loader would not read unchanged stays refused: an F32 dense component and a
+    /// packed tier whose `.scales` are F16 rather than BF16.
+    #[test]
+    fn dense_f32_and_f16_scales_stay_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        for component in ["text_encoder", "unet"] {
+            let dir = temp.path().join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), "{}").unwrap();
+            write_tensor(&dir.join("model.safetensors"), "F32", &[2, 3]);
+        }
+        assert!(physical_tier(temp.path()).is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        for component in ["text_encoder", "unet"] {
+            let dir = temp.path().join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), packed(4, 64)).unwrap();
+            write_named_tensors(
+                &dir.join("model.safetensors"),
+                &[
+                    ("linear.weight", "U32", &[2, 8]),
+                    ("linear.scales", "F16", &[2, 1]),
+                    ("linear.biases", "BF16", &[2, 1]),
+                ],
+            );
+        }
+        assert!(physical_tier(temp.path()).is_err());
     }
 
     fn write_tensor(path: &Path, dtype: &str, shape: &[u64]) {
