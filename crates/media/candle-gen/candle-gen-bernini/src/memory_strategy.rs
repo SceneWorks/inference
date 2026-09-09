@@ -1530,6 +1530,32 @@ fn production_calibration_fingerprint(
     ))
 }
 
+/// The production calibration identity of one Candle Bernini load, derived **once** for every seam
+/// that publishes or re-derives a production contract.
+///
+/// ## sc-22738 (epic sc-22723 E1/E4)
+///
+/// sc-22737 minted the identity in [`memory_strategy_contract`] alone — the registry closure. But
+/// the production load path seals its own contract through [`contract_for_loaded`], which passed a
+/// hard-coded `None`, and it is *that* contract a loaded generator publishes and the SceneWorks
+/// worker reads. So a loaded Bernini generator carried no identity on either lane: admission saw an
+/// uncalibrated provider, and no anchor could name the cell it had just loaded, which left every
+/// Candle Bernini evidence cell unrecordable rather than merely unmeasured.
+///
+/// Every seam now calls this one function, so the two derivations cannot drift — there is only one.
+/// [`validate_loaded_contract`] is included deliberately: it rebuilds the contract around the lazy
+/// component load and compares it *by value* against the sealed one, so a seam that minted the
+/// identity while the validator withheld it would refuse every adapter-free render.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::Result<Option<MemoryCalibrationIdentity>> {
+    Ok(
+        production_calibration_fingerprint(provider_id, spec, expected_packing(spec)?)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape)),
+    )
+}
+
 /// Real loads expose load-exact asset/tier identity and, since sc-22737, the per-(provider, tier)
 /// production calibration identity that lets an anchor name this cell. A withheld identity is never
 /// a failed load: `production_assets` is what refuses a crossed tier, and every shape it admits has
@@ -1539,9 +1565,7 @@ pub fn memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<MemoryProviderContract> {
     let (facts, _tier, adapter_identity) = production_assets(provider_id, spec)?;
-    let calibration =
-        production_calibration_fingerprint(provider_id, spec, expected_packing(spec)?)
-            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    let calibration = production_calibration_identity(provider_id, spec)?;
     Ok(contract(
         provider_id,
         spec,
@@ -1561,7 +1585,13 @@ pub fn validate_loaded_contract(
     expected_tier: MemoryNumericTier,
 ) -> gen_core::Result<()> {
     let (facts, actual_tier, adapter_identity) = production_assets(provider_id, spec)?;
-    let actual_contract = contract(provider_id, spec, None, facts, adapter_identity);
+    let actual_contract = contract(
+        provider_id,
+        spec,
+        production_calibration_identity(provider_id, spec)?,
+        facts,
+        adapter_identity,
+    );
     if actual_tier != expected_tier || actual_contract != *expected_contract {
         return Err(gen_core::Error::Unsupported(format!(
             "Bernini {provider_id} lazy-load artifacts changed after the memory contract was sealed"
@@ -2071,19 +2101,25 @@ impl MemoryRequestScope for BerniniMemoryRequestScope {
 /// however fail *closed* at the memory seams: the `Err(reason)` carried here is the refusal a
 /// crossed, corrupted, or unparseable artifact returns from `memory_strategy_safety_check` and
 /// `begin_memory_strategy_request`, instead of the previous silent `Accept`.
+///
+/// The sealed contract carries the same `production_calibration_identity` the registry closure
+/// publishes (sc-22738): this is the contract the loaded generator hands to admission and to the
+/// SceneWorks worker, so withholding it here made the cell unnameable everywhere that matters.
 pub fn contract_for_loaded(
     spec: &LoadSpec,
     provider_id: &str,
 ) -> Result<(MemoryProviderContract, MemoryNumericTier), String> {
-    match production_assets(provider_id, spec) {
-        Ok((facts, loaded_tier, adapter_identity)) => Ok((
-            contract(provider_id, spec, None, facts, adapter_identity),
-            loaded_tier,
-        )),
-        Err(error) => Err(format!(
-            "{provider_id}: no sealed memory receipt for the loaded artifact ({error})"
-        )),
-    }
+    production_assets(provider_id, spec)
+        .and_then(|(facts, loaded_tier, adapter_identity)| {
+            let calibration = production_calibration_identity(provider_id, spec)?;
+            Ok((
+                contract(provider_id, spec, calibration, facts, adapter_identity),
+                loaded_tier,
+            ))
+        })
+        .map_err(|error| {
+            format!("{provider_id}: no sealed memory receipt for the loaded artifact ({error})")
+        })
 }
 
 pub fn registered_valid_fixtures(
@@ -3704,6 +3740,61 @@ mod tests {
 
         // An unknown provider is refused by name before any identity is minted.
         assert!(memory_strategy_contract("not_a_bernini", &honest).is_err());
+    }
+
+    /// **sc-22738: the LOADED contract and the registry closure are one publication, not two.**
+    ///
+    /// sc-22737 put the identity on `memory_strategy_contract` only. `contract_for_loaded` — the
+    /// seam a real load seals, the one a loaded generator publishes and the SceneWorks worker reads
+    /// — still passed `None`, so all six production cells were anonymous where it counted and the
+    /// candle Bernini campaign could not record a single one.
+    ///
+    /// Comparing the WHOLE contract, not just the identity string, is what makes this a drift
+    /// guard: the two seams share one derivation, so any future divergence in tier, load shape, or
+    /// asset facts reds here too. `validate_loaded_contract` is asserted in the same loop because
+    /// it re-derives the sealed contract around the lazy component load and compares it by value —
+    /// publishing an identity the validator withheld would refuse every adapter-free render.
+    #[test]
+    fn the_loaded_contract_publishes_the_same_identity_as_the_registry_closure() {
+        let mut seen = std::collections::BTreeSet::new();
+        for packing in [
+            ComponentPacking::Dense,
+            ComponentPacking::Q4,
+            ComponentPacking::Q8,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_full_snapshot(root.path(), packing);
+            let spec = bernini_candle_tier_spec(root.path(), packing);
+            for provider in [crate::pipeline::MODEL_ID, crate::bernini::MODEL_ID] {
+                let declared = memory_strategy_contract(provider, &spec).unwrap();
+                let (loaded, loaded_tier) = contract_for_loaded(&spec, provider).unwrap();
+                let identity = loaded.calibration.as_ref().unwrap_or_else(|| {
+                    panic!("loaded {provider} {packing:?} publishes no calibration identity")
+                });
+                assert_eq!(
+                    Some(identity),
+                    declared.calibration.as_ref(),
+                    "{provider} {packing:?} drifts between the loaded seam and the closure"
+                );
+                assert_eq!(identity.load_shape, spec.load_shape);
+                assert_ne!(
+                    identity.fingerprint, STATIC_CALIBRATION,
+                    "{provider} {packing:?} seals the weights-free string"
+                );
+                assert_eq!(
+                    loaded, declared,
+                    "{provider} {packing:?} seals a different contract than it declares"
+                );
+                seen.insert(identity.fingerprint.clone());
+                // The lazy-load re-derivation must reproduce what was sealed, identity included.
+                validate_loaded_contract(provider, &spec, &loaded, loaded_tier).unwrap();
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            6,
+            "six cells, six distinct identities: {seen:?}"
+        );
     }
 
     /// The weights-free declaration surface can never publish a production string.

@@ -182,14 +182,13 @@ impl IdeogramLoadReceipt {
         let transformer_paths = direct_safetensors_inventory(&root.join("transformer"))?;
         let text_paths = direct_safetensors_inventory(&root.join("text_encoder"))?;
         let vae_paths = direct_safetensors_inventory(&root.join("vae"))?;
+        // Every pinned tier ships `turbo_lora.safetensors` and `unconditional_transformer/` side by
+        // side under one root, and both registry ids resolve to that root. The turbo loader never
+        // opens the unconditional DiT, so turbo prices nothing for it and its files stay out of the
+        // load-exact inventory (`recursive_loader_inventory`) — they are not a refusal (sc-22738).
         let uncond_paths = if provider_id == MODEL_ID {
             direct_safetensors_inventory(&root.join("unconditional_transformer"))?
         } else {
-            if root.join("unconditional_transformer").exists() {
-                return Err(gen_core::Error::Unsupported(
-                    "ideogram turbo: unexpected unconditional_transformer inventory".into(),
-                ));
-            }
             Vec::new()
         };
         for (paths, component) in [
@@ -503,6 +502,12 @@ fn recursive_loader_inventory(root: &Path, turbo: bool) -> gen_core::Result<Vec<
                 )));
             }
             let relative = path.strip_prefix(tier_root).unwrap_or(&path);
+            // The turbo loader (`pipeline::load_components_turbo`) never opens the co-located
+            // `unconditional_transformer/`; only the quality route reads it.
+            let uncond = relative.starts_with("unconditional_transformer");
+            if turbo && uncond {
+                continue;
+            }
             let direct_component = relative.components().count() == 2
                 && matches!(
                     relative
@@ -857,6 +862,12 @@ fn f32_projection(
     header: &gen_core::weightsmeta::SafetensorsTensorHeader,
 ) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
+    // The shipped VAE containers carry BatchNorm's rank-0 `bn.num_batches_tracked` counter as an
+    // I64 (bf16 rehost) or I32 (packed rehosts) scalar. The shared `Flux2Vae` never loads it, so it
+    // occupies nothing at run time and is priced at zero rather than refused (sc-22738).
+    if matches!(header.dtype, Dtype::I32 | Dtype::I64) && header.shape.is_empty() {
+        return Ok(0);
+    }
     if !matches!(header.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32) {
         return Err(gen_core::Error::Unsupported(format!(
             "ideogram: expected floating tensor {}, got {:?}",
@@ -2250,7 +2261,7 @@ mod tests {
         }
     }
 
-    fn fixture_root(tmp: &Path, provider: &str, tier: &str) -> PathBuf {
+    fn fixture_root(tmp: &Path, _provider: &str, tier: &str) -> PathBuf {
         let (repo, revision) = if tier == "bf16" {
             (BF16_REPOSITORY, BF16_REVISION)
         } else {
@@ -2261,34 +2272,95 @@ mod tests {
             .join("snapshots")
             .join(revision)
             .join(tier);
+        // Every pinned tier ships the TurboTime LoRA and the unconditional DiT side by side under one
+        // root; both registry ids resolve to that same root, so the id shapes nothing (sc-22738).
         component(&root.join("transformer/model.safetensors"), tier, "cond");
         component(&root.join("text_encoder/model.safetensors"), tier, "text");
-        if provider == MODEL_ID {
-            component(
-                &root.join("unconditional_transformer/model.safetensors"),
-                tier,
-                "uncond",
-            );
-        } else {
-            write_safetensors(
-                &root.join(TURBO_LORA_FILE),
-                &[
-                    ("layers.0.lora_down.weight", "F32", &[2, 2], 16),
-                    ("layers.0.lora_up.weight", "F32", &[2, 2], 16),
-                ],
-            );
-        }
+        component(
+            &root.join("unconditional_transformer/model.safetensors"),
+            tier,
+            "uncond",
+        );
+        write_safetensors(
+            &root.join(TURBO_LORA_FILE),
+            &[
+                ("layers.0.lora_down.weight", "F32", &[2, 2], 16),
+                ("layers.0.lora_up.weight", "F32", &[2, 2], 16),
+            ],
+        );
+        // The shipped VAE carries BatchNorm's rank-0 integer counter next to the learned tensors.
+        let counter_dtype = if tier == "bf16" { "I64" } else { "I32" };
+        let counter_bytes = if tier == "bf16" { 8 } else { 4 };
         write_safetensors(
             &root.join("vae/model.safetensors"),
-            &[("decoder.weight", "F32", &[2, 2], 16)],
+            &[
+                ("decoder.weight", "F32", &[2, 2], 16),
+                (VAE_COUNTER, counter_dtype, &[], counter_bytes),
+            ],
         );
         std::fs::create_dir_all(root.join("tokenizer")).unwrap();
         std::fs::write(root.join("tokenizer/tokenizer.json"), b"{}").unwrap();
         std::fs::write(root.join("transformer/config.json"), b"{}").unwrap();
-        if provider == MODEL_ID {
-            std::fs::write(root.join("unconditional_transformer/config.json"), b"{}").unwrap();
-        }
+        std::fs::write(root.join("unconditional_transformer/config.json"), b"{}").unwrap();
         root
+    }
+
+    /// `candle_gen_flux2`'s `VAE_UNUSED_COUNTER`: the one VAE tensor `Flux2Vae` never loads.
+    const VAE_COUNTER: &str = "bn.num_batches_tracked";
+
+    /// The shipped co-located layout resolves for both registry ids: quality prices the
+    /// unconditional DiT and no adapter, turbo prices the adapter and nothing for the unconditional
+    /// DiT, and neither charges the VAE's rank-0 counter (sc-22738).
+    #[test]
+    fn co_located_turbo_root_and_vae_counter_resolve_for_both_ids() {
+        for tier in ["q4", "q8", "bf16"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fixture_root(tmp.path(), MODEL_ID, tier);
+            assert!(root.join(TURBO_LORA_FILE).is_file());
+            assert!(root
+                .join("unconditional_transformer/model.safetensors")
+                .is_file());
+
+            let base =
+                IdeogramLoadReceipt::capture(MODEL_ID, &spec(root.clone(), MODEL_ID)).unwrap();
+            assert!(base.components.unconditional_transformer > 0);
+            assert!(base.turbo_adapter.is_none());
+            assert!(base
+                .inventory
+                .iter()
+                .any(|(path, _, _)| path.starts_with(root.join("unconditional_transformer"))));
+
+            let turbo =
+                IdeogramLoadReceipt::capture(MODEL_ID_TURBO, &spec(root.clone(), MODEL_ID_TURBO))
+                    .unwrap();
+            assert_eq!(turbo.components.unconditional_transformer, 0);
+            assert!(turbo.unconditional_transformer.is_empty());
+            assert!(turbo.turbo_adapter.is_some());
+            assert!(!turbo
+                .inventory
+                .iter()
+                .any(|(path, _, _)| path.starts_with(root.join("unconditional_transformer"))));
+            assert!(turbo
+                .inventory
+                .iter()
+                .any(|(path, _, _)| path == &root.join(TURBO_LORA_FILE)));
+
+            // The VAE is exactly its learned 2x2 F32 tensor; the counter contributes zero bytes.
+            assert_eq!(base.components.vae, 16, "{tier}");
+            assert_eq!(turbo.components.vae, 16, "{tier}");
+        }
+
+        // A rank-1 integer tensor is still not a counter and stays refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fixture_root(tmp.path(), MODEL_ID, "bf16");
+        write_safetensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.weight", "F32", &[2, 2], 16),
+                ("ranked.counter", "I64", &[2], 16),
+            ],
+        );
+        assert!(IdeogramLoadReceipt::capture(MODEL_ID, &spec(root, MODEL_ID)).is_err());
     }
 
     fn spec(root: PathBuf, provider: &'static str) -> LoadSpec {
@@ -2869,17 +2941,25 @@ mod tests {
                         .is_none());
                 }
 
-                // The other route's snapshot is not this route's cell: the base route needs an
-                // unconditional DiT the turbo snapshot does not ship, and the turbo route refuses
-                // one that does.
+                // Both routes resolve the same shipped root (the pinned tiers co-locate the
+                // unconditional DiT and the TurboTime LoRA), yet each publishes its own cell: the
+                // other route's identity from this very root is a different string.
                 let other = if provider == MODEL_ID {
                     MODEL_ID_TURBO
                 } else {
                     MODEL_ID
                 };
-                assert!(
-                    IdeogramLoadReceipt::capture(other, &spec(root.clone(), other)).is_err(),
-                    "{other} must not claim {provider}'s {tier} snapshot"
+                let other_load = spec(root.clone(), other);
+                let other_receipt = IdeogramLoadReceipt::capture(other, &other_load)
+                    .unwrap_or_else(|error| {
+                        panic!("{other} must resolve {provider}'s {tier} root: {error}")
+                    });
+                let other_identity = contract_from_receipt(other, &other_load, &other_receipt)
+                    .calibration
+                    .expect("other route publishes an identity");
+                assert_ne!(
+                    other_identity.fingerprint, expected,
+                    "{other} vs {provider} {tier}"
                 );
                 assert!(published.insert(expected.clone()), "{provider} {tier}");
             }
