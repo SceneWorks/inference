@@ -314,13 +314,21 @@ impl ComponentBytes {
         // — `crate::convert` packs `transformer/` and `transformer_ref/` at the same width, so their
         // markers agree — but leaving the choice to iteration order would make the declaration depend
         // on it.
+        let staged_dit = match spec.components.get(BASE_DIT_PARTITION) {
+            Some(WeightsSource::Dir(staged)) => Some(staged.as_path()),
+            _ => None,
+        };
+        // Use the loader's sibling rule. An upstream dense reference partition is not
+        // loaded when the base DiT was redirected to a packed tier directory.
+        let paths = crate::tier::MiniMaxH3TierPaths::resolve(&root, staged_dit, None);
         let (dit_dir, dit) = DIT_PARTITIONS
             .iter()
             .rev()
             .map(|partition| {
-                let dir = match spec.components.get(*partition) {
-                    Some(WeightsSource::Dir(staged)) => staged.clone(),
-                    _ => root.join(partition),
+                let dir = if *partition == BASE_DIT_PARTITION {
+                    paths.dit_dir.clone()
+                } else {
+                    paths.reference_dit_dir.clone()
                 };
                 let bytes = safetensors_path_bytes(&dir);
                 (dir, bytes)
@@ -2249,6 +2257,43 @@ mod tests {
         )
         .expect("contract");
         assert_eq!(contract.asset_facts.transformer_bytes, Q4_BYTES);
+    }
+
+    #[test]
+    fn a_split_packed_tier_ignores_the_upstream_dense_reference_partition() {
+        let root = tempfile::tempdir().unwrap();
+        sparse_snapshot(
+            root.path(),
+            &[
+                (BASE_DIT_PARTITION, DIT_BF16_BYTES),
+                (REFERENCE_DIT_PARTITION, DIT_BF16_BYTES),
+            ],
+        );
+        for bits in [4, 8] {
+            let staged = tempfile::tempdir().unwrap();
+            let base_bytes = 1_000_000;
+            let reference_bytes = 2_000_000;
+            sparse_snapshot(
+                staged.path(),
+                &[
+                    (BASE_DIT_PARTITION, base_bytes),
+                    (REFERENCE_DIT_PARTITION, reference_bytes),
+                ],
+            );
+            for partition in DIT_PARTITIONS {
+                write_tier_marker(&staged.path().join(partition), bits);
+            }
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                BASE_DIT_PARTITION,
+                WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
+            );
+            let contract = contract_for(&spec).unwrap();
+            assert_eq!(contract.asset_facts.transformer_bytes, reference_bytes);
+            assert_eq!(
+                contract.calibration.unwrap().fingerprint,
+                format!("minimax-h3-q{bits}-candle-staged-joint-av-v1")
+            );
+        }
     }
 
     /// **A `ref2va` snapshot is charged for the partition a `ref2va` render actually reads.**

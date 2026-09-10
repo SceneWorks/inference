@@ -633,14 +633,26 @@ pub(crate) fn safety_check(
     contract: &MemoryProviderContract,
     context: &MemoryRunContext,
 ) -> MemorySafetyDecision {
+    safety_check_for_tier(contract, numeric_tier(Some(Quant::Q4)), context)
+}
+
+fn numeric_tier(quant: Option<Quant>) -> MemoryNumericTier {
+    MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant,
+        component_precision_floors: &[],
+    }
+}
+
+pub(crate) fn safety_check_for_tier(
+    contract: &MemoryProviderContract,
+    loaded_tier: MemoryNumericTier,
+    context: &MemoryRunContext,
+) -> MemorySafetyDecision {
     gen_core::standard_memory_strategy_safety_check(
         contract,
         context,
-        Some(MemoryNumericTier {
-            precision: Precision::Bf16,
-            quant: Some(Quant::Q4),
-            component_precision_floors: &[],
-        }),
+        Some(loaded_tier),
         Some(&|| route_gate(contract, context)),
     )
 }
@@ -776,7 +788,18 @@ fn begin(
     device: Device,
     context: &MemoryRunContext,
 ) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    if let MemorySafetyDecision::Reject { reason } = safety_check(contract, context) {
+    begin_request(contract, numeric_tier(Some(Quant::Q4)), device, context)
+}
+
+pub(crate) fn begin_request(
+    contract: &MemoryProviderContract,
+    loaded_tier: MemoryNumericTier,
+    device: Device,
+    context: &MemoryRunContext,
+) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
+    if let MemorySafetyDecision::Reject { reason } =
+        safety_check_for_tier(contract, loaded_tier, context)
+    {
         return Err(gen_core::Error::Unsupported(reason));
     }
     let mut config = candle_gen::request_scope::CandleRequestScopeConfig::new(
@@ -1068,14 +1091,6 @@ pub(crate) const MEMORY_BEHAVIOR: gen_core::MemoryBehaviorRegistration =
         begin_request: registered_begin_request,
     };
 
-pub(crate) fn begin_request(
-    contract: &MemoryProviderContract,
-    device: Device,
-    context: &MemoryRunContext,
-) -> gen_core::Result<Option<Box<dyn MemoryRequestScope>>> {
-    begin(contract, device, context)
-}
-
 pub(crate) fn selected_decode_cap(
     request: &GenerationRequest,
 ) -> candle_gen::Result<Option<(u32, u32)>> {
@@ -1199,7 +1214,16 @@ mod tests {
             "vae_encoder.safetensors",
             "upsampler.safetensors",
         ] {
-            let file = std::fs::File::create(tier.join(name)).unwrap();
+            // The lazy public loader inspects headers for a model-version declaration.
+            std::fs::write(
+                tier.join(name),
+                [2_u64.to_le_bytes().as_slice(), b"{}"].concat(),
+            )
+            .unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(tier.join(name))
+                .unwrap();
             file.set_len(1024).unwrap();
         }
         std::fs::write(
@@ -1259,6 +1283,89 @@ mod tests {
                 .fingerprint,
             "sc-20772-ltx-2-3-candle-q8-i2v-v1"
         );
+    }
+
+    #[test]
+    fn loaded_generator_admits_its_q4_or_q8_tier_and_rejects_a_crossed_tier() {
+        use gen_core::Generator;
+        for bits in SHIPPED_PACKED_BITS {
+            let snapshot = ltx_candle_tier_dir(bits);
+            let spec = ltx_candle_tier_spec(snapshot.path(), bits);
+            let contract = memory_strategy_contract(&spec).unwrap();
+            // Exercise the public metadata loader too: it previously rejected q8 before
+            // constructing the generator. No tensor materialization is needed here.
+            let loaded = crate::load(&spec).unwrap();
+            assert!(loaded
+                .descriptor()
+                .capabilities
+                .supported_quants
+                .contains(&spec.quantize.unwrap()));
+            let crossed = spec
+                .clone()
+                .with_quant(if bits == 4 { Quant::Q8 } else { Quant::Q4 });
+            assert!(crate::load(&crossed).is_err());
+            let tier = numeric_tier(spec.quantize);
+            let mut context = gen_core::standard_memory_behavior_context(
+                &contract,
+                MemoryStrategy::Resident,
+                tier,
+                MemoryBehaviorRoute {
+                    mode: MemoryMode::Other("image_to_video".into()),
+                    reference_count: 1,
+                    use_pid: false,
+                    has_phases: false,
+                    overlay: Some(reference_axis(768, 512)),
+                },
+            )
+            .unwrap();
+            context.geometry.width = 768;
+            context.geometry.height = 512;
+            context.geometry.frames = 97;
+            let generator = crate::LtxGenerator {
+                descriptor: crate::descriptor(),
+                root: snapshot.path().to_owned(),
+                device: Device::Cpu,
+                gemma_override: None,
+                upsampler_override: None,
+                adapters: vec![],
+                memory_strategy: Some(contract),
+                memory_tier: Some(tier),
+                components: std::sync::Mutex::new(None),
+            };
+            assert!(matches!(
+                generator.memory_strategy_safety_check(&context),
+                MemorySafetyDecision::Accept
+            ));
+            let mut scope = generator
+                .begin_memory_strategy_request(&context)
+                .unwrap()
+                .unwrap();
+            let mut request = GenerationRequest {
+                width: 768,
+                height: 512,
+                frames: Some(97),
+                fps: Some(24),
+                conditioning: vec![gen_core::Conditioning::Reference {
+                    image: gen_core::Image {
+                        width: 768,
+                        height: 512,
+                        pixels: vec![0; 768 * 512 * 3],
+                    },
+                    strength: None,
+                }],
+                ..Default::default()
+            };
+            scope.configure_request(&mut request).unwrap();
+            request.conditioning.clear();
+            assert!(scope.configure_request(&mut request).is_err());
+            drop(scope);
+            context.selection.tier.quant = Some(if bits == 4 { Quant::Q8 } else { Quant::Q4 });
+            assert!(matches!(
+                generator.memory_strategy_safety_check(&context),
+                MemorySafetyDecision::Reject { .. }
+            ));
+            assert!(generator.begin_memory_strategy_request(&context).is_err());
+        }
     }
 
     /// **The artifact decides.** A q8 tier asked for as q4 is refused rather than published under
