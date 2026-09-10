@@ -1214,7 +1214,16 @@ mod tests {
             "vae_encoder.safetensors",
             "upsampler.safetensors",
         ] {
-            let file = std::fs::File::create(tier.join(name)).unwrap();
+            // The lazy public loader inspects headers for a model-version declaration.
+            std::fs::write(
+                tier.join(name),
+                [2_u64.to_le_bytes().as_slice(), b"{}"].concat(),
+            )
+            .unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(tier.join(name))
+                .unwrap();
             file.set_len(1024).unwrap();
         }
         std::fs::write(
@@ -1283,6 +1292,18 @@ mod tests {
             let snapshot = ltx_candle_tier_dir(bits);
             let spec = ltx_candle_tier_spec(snapshot.path(), bits);
             let contract = memory_strategy_contract(&spec).unwrap();
+            // Exercise the public metadata loader too: it previously rejected q8 before
+            // constructing the generator. No tensor materialization is needed here.
+            let loaded = crate::load(&spec).unwrap();
+            assert!(loaded
+                .descriptor()
+                .capabilities
+                .supported_quants
+                .contains(&spec.quantize.unwrap()));
+            let crossed = spec
+                .clone()
+                .with_quant(if bits == 4 { Quant::Q8 } else { Quant::Q4 });
+            assert!(crate::load(&crossed).is_err());
             let tier = numeric_tier(spec.quantize);
             let mut context = gen_core::standard_memory_behavior_context(
                 &contract,

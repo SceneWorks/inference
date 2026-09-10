@@ -1873,7 +1873,7 @@ pub fn descriptor() -> ModelDescriptor {
             // The practical CUDA route is the pre-packed split q4 tier. Dense and q8 remain
             // loadable compatibility paths but are deliberately not advertised as this provider's
             // request-scoped I2V memory surface.
-            supported_quants: &[Quant::Q4],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             // sc-18764 / R2 (per-backend capability honesty). Stated EXPLICITLY rather than left to
             // `Default`, because it is a load-bearing negative: this crate has no `enhance` module
             // on either checkpoint generation, so `enhance_prompt` must be refused by the shared
@@ -2183,10 +2183,23 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             declared_version.unwrap_or_default(),
         )));
     }
-    if spec.quantize.is_some() && spec.quantize != Some(Quant::Q4) {
-        return Err(gen_core::Error::Unsupported(
-            "candle ltx supports only the pre-packed q4 tier; q8/on-the-fly quantization are not a released route".into(),
-        ));
+    if let Some(quant) = spec.quantize {
+        if !matches!(quant, Quant::Q4 | Quant::Q8) {
+            return Err(gen_core::Error::Unsupported(
+                "candle ltx supports only pre-packed q4/q8 tiers".into(),
+            ));
+        }
+        let paths = tier::TierPaths::detect(&root, None).ok_or_else(|| {
+            gen_core::Error::Unsupported(
+                "candle ltx quantization requires a pre-packed tier".into(),
+            )
+        })?;
+        let packed = paths.packed_config()?;
+        if packed.bits != quant.bits() || packed.group_size as usize != quant::GROUP_SIZE {
+            return Err(gen_core::Error::Unsupported(
+                "candle ltx requested quantization disagrees with the packed tier".into(),
+            ));
+        }
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
@@ -2761,10 +2774,11 @@ mod tests {
 
     #[test]
     fn ltx25_descriptor_advertises_both_released_packed_tiers() {
-        // sc-18791: the 2.5 route ships `q4/` and `q8/` side by side, so it overrides the LTX-2.3
-        // descriptor it is derived from (which has no released q8 route) on BOTH variants — the
-        // numeric tier belongs to the converted bundle, not to distilled-vs-dev.
-        assert_eq!(descriptor().capabilities.supported_quants, &[Quant::Q4]);
+        // Both 2.3 and 2.5 load the released q4/q8 packed tiers.
+        assert_eq!(
+            descriptor().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
         for descriptor in [
             descriptor_25(),
             descriptor_25_for_variant(TransformerVariant::Distilled),
