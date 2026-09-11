@@ -589,9 +589,9 @@ fn selected_float_bytes_where(
     selected_headers(paths)?
         .values()
         .try_fold(0_u64, |total, header| {
-            if header.dtype != Dtype::BF16 {
+            if !matches!(header.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32) {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "SD3.5 dense component tensor {} must be BF16, got {:?}",
+                    "SD3.5 dense component tensor {} must be floating point, got {:?}",
                     header.name, header.dtype
                 )));
             }
@@ -1877,6 +1877,47 @@ mod tests {
     /// resident set no anchor measured; and letting the weights-free surface hand out a production
     /// string.
     #[test]
+    fn component_storage_dtype_does_not_change_realized_memory_or_tier() {
+        for route in [Sd35Route::Large, Sd35Route::LargeTurbo, Sd35Route::Medium] {
+            for tier in ["bf16", "q4", "q8"] {
+                let (_temp, root) = fixture(route, tier);
+                let load = spec(route, &root, Vec::new());
+                let baseline = Sd35LoadReceipt::capture(route, &load).unwrap();
+                let path = direct_safetensors(&root.join("text_encoder")).unwrap()[0].clone();
+                for (dtype, width) in [("F16", 2), ("F32", 4), ("BF16", 2)] {
+                    write_safetensors(
+                        &path,
+                        None,
+                        &[(
+                            "text_model.embeddings.position_embedding.weight",
+                            dtype,
+                            &[1],
+                            width,
+                        )],
+                    );
+                    let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+                    assert_eq!(receipt.tier, baseline.tier);
+                    assert_eq!(
+                        contract_from_receipt(&load, &receipt).asset_facts,
+                        contract_from_receipt(&load, &baseline).asset_facts
+                    );
+                }
+                write_safetensors(
+                    &path,
+                    None,
+                    &[(
+                        "text_model.embeddings.position_embedding.weight",
+                        "I32",
+                        &[1],
+                        4,
+                    )],
+                );
+                assert!(Sd35LoadReceipt::capture(route, &load).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn every_clean_base_load_publishes_its_routes_production_identity() {
         let mut published = BTreeSet::new();
         for route in [Sd35Route::Large, Sd35Route::LargeTurbo, Sd35Route::Medium] {
@@ -2224,7 +2265,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            write_safetensors(&path, None, &[("forged.weight", "F32", &[1], 4)]);
+            write_safetensors(&path, None, &[("forged.weight", "I32", &[1], 4)]);
             let load = spec(Sd35Route::LargeTurbo, &root, Vec::new());
             assert!(
                 Sd35LoadReceipt::capture(Sd35Route::LargeTurbo, &load).is_err(),
