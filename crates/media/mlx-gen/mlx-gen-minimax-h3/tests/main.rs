@@ -94,6 +94,9 @@ mod staged_residency;
 #[path = "streamed_generate_real.rs"]
 mod streamed_generate_real;
 
+#[path = "te_load_integrity.rs"]
+mod te_load_integrity;
+
 #[path = "te_parity.rs"]
 mod te_parity;
 
