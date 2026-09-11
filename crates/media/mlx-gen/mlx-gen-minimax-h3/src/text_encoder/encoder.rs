@@ -257,25 +257,39 @@ impl MiniMaxH3TextEncoder {
 
     /// The token-embedding lookup, screened — **this is the sc-17153 detection point.**
     ///
-    /// `hidden_states[0]` is the tensor the hazard actually zeroes: the fault is a first-evaluation
-    /// read of the 1.556 GB dense `embed_tokens` table returning zeros, and everything downstream is
-    /// propagation. Screening here rather than only after the stack matters because **on the
-    /// grounded routes the post-stack screen cannot fire at all**:
-    /// [`Self::forward_grounded`] *overwrites* the `<|image_pad|>` / `<|video_pad|>` rows with the
-    /// vision tower's live embeds (`replace_seq`, a replace and not a blend) before the stack runs.
-    /// With a zeroed table the text rows are dead but the vision rows are not, so `max|context| > 0`
-    /// and a whole-context screen returns `Ok(None)` while the render proceeds carrying **zero
-    /// prompt signal** — for a 1024px keyframe that is ~1024 live vision rows against ~100 dead text
-    /// rows. The tower's embeds are produced independently and screened separately in
-    /// [`run_vision`](super::run_vision), so the two cannot go zero together and mask each other.
-    ///
-    /// The grounded routes are not the safer case, either: they map an extra `VISION_SHARD` and run
-    /// the tower before the encoder, so their race window is at least as wide as `t2va`'s.
-    ///
-    /// Forcing the embedding here does not add work — the stack's first layer consumes it
-    /// immediately — and it costs no extra peak, since the token table has to be resident for the
-    /// forward regardless.
+    /// A zero token table can be hidden by the live image/video features spliced over its pad
+    /// rows. Screen the lookup before that splice so live vision cannot mask missing prompt
+    /// conditioning. Check CPU validity first, then GPU visibility; neither an all-zero output
+    /// nor agreement between two invalid buffers identifies the original read mechanism.
+    /// Only the embedding table is materialized here; deferred layers retain their block window.
     fn embed_screened(&self, producer: &'static str, input_ids: &Array) -> Result<Array> {
+        if let TokenEmbedding::Dense(weight) = &self.embed_tokens {
+            // sc-23053: a failed read can leave BOTH views zero, so agreement
+            // alone is not validation. Check the requested rows on the CPU
+            // before waiting for the GPU's view of the table to agree. This
+            // materializes only the embedding, never the deferred layer stack.
+            let cpu = mlx_rs::StreamOrDevice::cpu();
+            let reference = weight
+                .take_axis_device(input_ids, 0, &cpu)?
+                .as_dtype_device(Dtype::Float32, &cpu)?;
+            if let Some(defect) =
+                super::degeneracy::inspect_conditioning_on(producer, &reference, cpu)?
+            {
+                return Err(Error::Msg(format!(
+                    "CPU token-embedding lookup is invalid; this is not a GPU-only visibility \
+                     disagreement. Check the loaded weights and token IDs. {defect}"
+                )));
+            }
+            let before = mlx_gen::coherence::retries();
+            mlx_gen::coherence::verify_gpu_view([("minimax-h3 embed_tokens", weight)])?;
+            let retries = mlx_gen::coherence::retries().saturating_sub(before);
+            if retries != 0 {
+                eprintln!(
+                    "minimax-h3 {producer}: GPU weight visibility recovered after {retries} \
+                     verification retries (sc-23053); generation has not been retried"
+                );
+            }
+        }
         let hidden = self.embed_tokens.forward(input_ids)?;
         super::degeneracy::refuse_if_degenerate(producer, &hidden)?;
         Ok(hidden)
@@ -854,6 +868,10 @@ mod tests {
             "the refusal must name the embedding stage, not the context: {message}"
         );
         assert!(message.contains("sc-17153"), "{message}");
+        assert!(
+            message.contains("CPU token-embedding lookup is invalid"),
+            "{message}"
+        );
     }
 
     /// The same fixture with a live table must pass, or the arm above would be green for a screen
@@ -982,6 +1000,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("sc-17153"), "{message}");
+        assert!(
+            message.contains("CPU token-embedding lookup is invalid"),
+            "{message}"
+        );
     }
 
     /// The refusal must be **specific**. The same fixture with a live token table has to pass, or
