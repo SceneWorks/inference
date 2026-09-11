@@ -29,7 +29,12 @@ All deterministic reader regressions passed on CPU/GPU, synchronous/asynchronous
 evaluation: EOF, EFAULT, EINTR, partial reads across the 32 MiB batching boundary,
 repeated access, dependent reuse, and independent outputs in the same batch.
 Independent source review and targeted clippy passed. All 37 H3 text-encoder unit
-tests passed on the final native patch.
+tests passed on the final native patch. Broader CI exposed a Chroma fixture that
+truncated its own backing file before evaluating lazy source arrays; a targeted
+search found the same pattern in the Z-Image block-window mutation fixture. Both
+now finish those reads before overwriting the file, preserving the tests' intended
+weight contents instead of depending on swallowed EOF errors. All 38 Chroma unit
+tests and 12 Z-Image block-window tests passed, as did their scoped clippy check.
 
 Real weights were read from the external model drive using the saved prompt and
 image, production keyframe fitting at 768 × 1024, tokenization, vision tower, and

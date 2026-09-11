@@ -130,6 +130,8 @@ impl Scratch {
             };
             named.push((key, value));
         }
+        // Read the lazy source arrays before overwriting their backing file.
+        mlx_rs::transforms::eval(named.iter().map(|(_, array)| array)).unwrap();
         let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &self.file).unwrap();
     }
