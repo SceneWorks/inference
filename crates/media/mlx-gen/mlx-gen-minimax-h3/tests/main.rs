@@ -16,6 +16,9 @@ mod common;
 #[path = "adaln_cache.rs"]
 mod adaln_cache;
 
+#[path = "adaln_cold_start.rs"]
+mod adaln_cold_start;
+
 #[path = "adaln_evict_memory.rs"]
 mod adaln_evict_memory;
 
