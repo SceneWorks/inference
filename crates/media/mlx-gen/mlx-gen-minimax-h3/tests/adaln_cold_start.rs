@@ -34,7 +34,12 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
     assert!(report.unmatched_paths.is_empty());
     assert_eq!(dit.num_layers(), 50);
 
-    let schedule = adaln_schedule(&JointSchedule::with_shifts(4, 6.0, 3.0).unwrap()).unwrap();
+    // The provider accepts model evaluations; the scheduler also counts the terminal endpoint.
+    // Mirror MiniMaxH3::generate's four-evaluation Turbo request (evaluations + 1).
+    let joint = JointSchedule::with_shifts(5, 6.0, 3.0).unwrap();
+    assert_eq!(joint.num_evals(), 4);
+    let schedule = adaln_schedule(&joint).unwrap();
+    assert_eq!(schedule.num_distinct_timesteps(), 9);
     let cache = AdaLnCache::precompute(dit.blocks(), schedule.clone(), |ts| {
         dit.projections().time_embedder.forward(ts)
     })
@@ -88,10 +93,11 @@ fn fresh_adaln_tables_match_warm_projection_with_turbo() {
     assert_eq!(released, projection_bytes);
     assert_eq!(evicted_cache.bytes(), cache.bytes());
     assert!(blocks.iter().all(|block| block.adaln_proj().is_none()));
-    // Array nbytes excludes Metal allocation rounding. Allow 1% for the second cache and its
-    // allocation overhead, still less than one of the 50 equal-sized projections (2%).
+    // Account for the second cache explicitly: its size grows with the schedule. Array nbytes
+    // excludes Metal allocation rounding, so allow another 1% for allocation overhead, still
+    // less than one of the 50 equal-sized projections (2%).
     assert!(
-        before.saturating_sub(after) >= released * 99 / 100,
+        before + evicted_cache.bytes() >= after + released * 99 / 100,
         "projections stayed live: before={before} after={after} released={released}"
     );
     assert!(mlx_rs::memory::get_cache_memory() < released / 100);
