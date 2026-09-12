@@ -459,9 +459,8 @@ fn build_provider_contract(
             attention_chunking: true,
             transformer_window_materialization: streamable,
         },
-        formula: MemoryFormulaKind::PhaseEnvelope {
-            phases,
-            variables: vec![
+        formula: {
+            let variables = vec![
                 MemoryFormulaVariable::AssetBytes,
                 MemoryFormulaVariable::PixelCount,
                 MemoryFormulaVariable::BatchCount,
@@ -470,7 +469,25 @@ fn build_provider_contract(
                 MemoryFormulaVariable::DecodeTileArea,
                 MemoryFormulaVariable::AttentionChunkSize,
                 MemoryFormulaVariable::TransformerWindowSize,
-            ],
+            ];
+            if overlay_bytes == 0 {
+                MemoryFormulaKind::PhaseEnvelope { phases, variables }
+            } else {
+                MemoryFormulaKind::ComponentPhaseEnvelope {
+                    phases,
+                    variables,
+                    // Additive LoRA tensors remain resident beside the base transformer.
+                    // Their existing byte estimate is a separate contribution, never part
+                    // of base_bytes and never removed by a base-transformer window.
+                    resident_components: vec![gen_core::MemoryResidentComponent {
+                        id: "qwen_edit_adapter_stack".to_owned(),
+                        kind: gen_core::MemoryComponentKind::AdapterStack,
+                        resident_bytes: overlay_bytes,
+                        bounded_by: None,
+                        residency: gen_core::MemoryComponentResidency::WholeRender,
+                    }],
+                }
+            }
         },
         calibration: Some(MemoryCalibrationIdentity::new(
             CALIBRATION_FINGERPRINT,
@@ -1758,6 +1775,19 @@ mod tests {
         eager.load_shape = LoadShape::EagerMaterialization;
         for candidate in [adapted, lightning, eager] {
             let contract = provider_contract("qwen_image_edit", &candidate).unwrap();
+            assert!(
+                contract.conformance_errors().is_empty(),
+                "{:?}",
+                contract.conformance_errors()
+            );
+            assert_eq!(
+                contract.auxiliary_resident_bytes(),
+                contract.asset_facts.overlay_bytes
+            );
+            assert_eq!(
+                contract.total_resident_bytes(),
+                contract.asset_facts.base_bytes + contract.asset_facts.overlay_bytes
+            );
             assert_eq!(
                 contract
                     .capability(MemoryStrategy::BoundedTransformerResidency)
