@@ -1,7 +1,7 @@
 //! Exact HF-cache artifact pin for the calibrated FLUX.2 Klein BF16 ladder.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -23,8 +23,10 @@ pub(crate) const KLEIN_REHOST_REVISION: &str = "1902693279fcfb828919370dfac2b892
 pub(crate) const KLEIN_KV_REHOST_REVISION: &str = "bbf22de8d654789de3b177632d2e283cc4f77729";
 const KLEIN_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-mlx";
 const KLEIN_KV_REHOST_CACHE_DIR: &str = "models--SceneWorks--flux2-klein-9b-kv-mlx";
-const TRUE_V2_TRANSFORMER_SHA256: &str =
-    "72ae74528050cd97bf056568000fcb7915012b4d0fd0807de205513e0fdc64b9";
+// Canonical names, dtypes, shapes and payloads, independently checked against the pinned
+// original source checkpoint's exact rename/QKV-split/adaLN-half-swap conversion.
+const TRUE_V2_TENSOR_SHA256: &str =
+    "c7834f2e36e9de053384dd07bd409911bb1d66bd75ddc4f4c6b23cd846aec3db";
 
 /// Discovery roots for a turnkey tier directory. A tier lives at
 /// `<hub>/models--SceneWorks--<repo>/snapshots/<revision>/<tier>` and every file in it is a
@@ -247,6 +249,63 @@ fn sha256(file: &Path, id: &Identity) -> CoreResult<String> {
     Ok(value)
 }
 
+/// Pin tensor content independently of safetensors header/payload ordering. The converter
+/// serializes a HashMap, so valid conversions need not share a whole-file digest.
+fn tensor_content_sha256(file: &Path, id: &Identity) -> CoreResult<String> {
+    static CACHE: OnceLock<Mutex<HashMap<Identity, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(digest) = cache
+        .lock()
+        .map_err(|_| CoreError::Msg("tensor digest cache poisoned".into()))?
+        .get(id)
+        .cloned()
+    {
+        return Ok(digest);
+    }
+    let mut layout = mlx_gen::gen_core::weightsmeta::safetensors_file_tensor_locations(file)?;
+    layout
+        .tensors
+        .sort_by(|a, b| a.header.name.cmp(&b.header.name));
+    let mut reader =
+        BufReader::new(std::fs::File::open(file).map_err(|e| CoreError::Msg(e.to_string()))?);
+    let mut hash = Sha256::new();
+    hash.update(b"flux2-true-v2-tensors-v1\0");
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for tensor in layout.tensors {
+        hash.update(tensor.header.name.as_bytes());
+        hash.update([0]);
+        hash.update(format!("{:?}", tensor.header.dtype).as_bytes());
+        hash.update([0]);
+        hash.update((tensor.header.shape.len() as u64).to_le_bytes());
+        for dim in tensor.header.shape {
+            hash.update((dim as u64).to_le_bytes());
+        }
+        reader
+            .seek(SeekFrom::Start(tensor.file_offset))
+            .map_err(|e| CoreError::Msg(e.to_string()))?;
+        let mut remaining = tensor.header.data_bytes;
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..count])
+                .map_err(|e| CoreError::Msg(e.to_string()))?;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+    }
+    if identity(file).ok().as_ref() != Some(id) {
+        return Err(CoreError::Unsupported(
+            "True-V2 artifact changed while hashing tensors".into(),
+        ));
+    }
+    let digest = format!("{:x}", hash.finalize());
+    cache
+        .lock()
+        .map_err(|_| CoreError::Msg("tensor digest cache poisoned".into()))?
+        .insert(id.clone(), digest.clone());
+    Ok(digest)
+}
+
 #[derive(Clone, Debug)]
 struct Entry {
     source: PathBuf,
@@ -289,6 +348,19 @@ fn path_ends_with(root: &Path, suffix: &[&str]) -> bool {
 }
 
 fn turnkey_identity(root: &Path) -> Option<(TurnkeyFamily, Option<Quant>)> {
+    // True-V2 conversions keep borrowing their original dense base across catalog updates.
+    // This shipped revision still takes the full turnkey component/header validation below.
+    if path_ends_with(
+        root,
+        &[
+            KLEIN_REHOST_CACHE_DIR,
+            "snapshots",
+            "acf05e8d5103838baba6a5e32dc91d6997a56023",
+            "bf16",
+        ],
+    ) {
+        return Some((TurnkeyFamily::Base, None));
+    }
     for (family, cache_dir, revision) in [
         (
             TurnkeyFamily::Base,
@@ -1169,6 +1241,7 @@ impl KleinArtifactInventory {
     fn verify_true_v2(root: PathBuf) -> CoreResult<Self> {
         let text_target = std::fs::read_link(root.join("text_encoder"))
             .map_err(|error| CoreError::Msg(format!("read True-V2 text-encoder link: {error}")))?;
+        let text_target = root.join(text_target);
         let base_root = text_target.parent().ok_or_else(|| {
             CoreError::Unsupported("True-V2 text-encoder link has no base root".to_owned())
         })?;
@@ -1212,13 +1285,18 @@ impl KleinArtifactInventory {
             ),
             (
                 "transformer/diffusion_pytorch_model.safetensors",
-                TRUE_V2_TRANSFORMER_SHA256,
+                TRUE_V2_TENSOR_SHA256,
             ),
         ] {
             let source = root.join(relative);
             let id = identity(&source)
                 .map_err(|error| CoreError::Msg(format!("stat True-V2 {relative}: {error}")))?;
-            if sha256(&source, &id)? != expected {
+            let digest = if relative.ends_with(".safetensors") {
+                tensor_content_sha256(&source, &id)?
+            } else {
+                sha256(&source, &id)?
+            };
+            if digest != expected {
                 return Err(CoreError::Unsupported(format!(
                     "True-V2 {relative} failed its exact converted-content pin"
                 )));
@@ -1666,6 +1744,88 @@ mod tests {
             relative.push(&blob);
             std::os::unix::fs::symlink(relative, &file).unwrap();
         }
+    }
+
+    #[test]
+    fn tensor_content_pin_ignores_serialization_order_but_detects_content_mutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |file: &str, names: &[&str], dtype: &str, shape: &[usize], value: u8| {
+            let path = tmp.path().join(file);
+            let mut header = serde_json::Map::new();
+            let mut bytes = Vec::new();
+            for name in names {
+                let offset = bytes.len();
+                bytes.extend_from_slice(&[if *name == "a" { value } else { 9 }, 0, 0, 0]);
+                header.insert(
+                    (*name).into(),
+                    serde_json::json!({
+                        "dtype":dtype, "shape":shape, "data_offsets":[offset,bytes.len()]
+                    }),
+                );
+            }
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut contents = (header.len() as u64).to_le_bytes().to_vec();
+            contents.extend(header);
+            contents.extend(bytes);
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        let original = write("original", &["a", "b"], "BF16", &[2], 1);
+        let reordered = write("reordered", &["b", "a"], "BF16", &[2], 1);
+        let digest = |path: &Path| tensor_content_sha256(path, &identity(path).unwrap()).unwrap();
+        assert_ne!(
+            sha256(&original, &identity(&original).unwrap()).unwrap(),
+            sha256(&reordered, &identity(&reordered).unwrap()).unwrap()
+        );
+        assert_eq!(digest(&original), digest(&reordered));
+        let formatted = tmp.path().join("formatted");
+        let header = br#"{
+          "b": {"shape": [2], "data_offsets": [4, 8], "dtype": "BF16"},
+          "a": {"shape": [2], "data_offsets": [0, 4], "dtype": "BF16"}
+        }"#;
+        let mut contents = (header.len() as u64).to_le_bytes().to_vec();
+        contents.extend_from_slice(header);
+        contents.extend_from_slice(&[1, 0, 0, 0, 9, 0, 0, 0]);
+        std::fs::write(&formatted, contents).unwrap();
+        assert_eq!(digest(&original), digest(&formatted));
+        for changed in [
+            write("names", &["c", "b"], "BF16", &[2], 1),
+            write("dtype", &["a", "b"], "F16", &[2], 1),
+            write("shape", &["a", "b"], "BF16", &[1, 2], 1),
+            write("payload", &["a", "b"], "BF16", &[2], 2),
+        ] {
+            assert_ne!(digest(&original), digest(&changed), "{}", changed.display());
+        }
+    }
+
+    #[test]
+    fn historical_true_v2_base_keeps_dense_identity_and_validation() {
+        let root = PathBuf::from("/cache/models--SceneWorks--flux2-klein-9b-mlx/snapshots/acf05e8d5103838baba6a5e32dc91d6997a56023/bf16");
+        assert_eq!(turnkey_identity(&root), Some((TurnkeyFamily::Base, None)));
+        assert_eq!(turnkey_identity(&root.with_file_name("q4")), None);
+        assert_eq!(turnkey_identity(&root.with_file_name("q8")), None);
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join(root.strip_prefix("/cache").unwrap());
+        std::fs::create_dir_all(&missing).unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(missing));
+        assert!(
+            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec).is_err(),
+            "recognizing a historical revision must not bypass component validation"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a converted True-V2 installation; set FLUX2_TRUE_V2_DIR"]
+    fn installed_true_v2_retains_its_exact_inventory() {
+        let root = PathBuf::from(std::env::var("FLUX2_TRUE_V2_DIR").expect("FLUX2_TRUE_V2_DIR"));
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+        spec.resolved_route = Some("flux2_klein_9b_true_v2".into());
+        let inventory =
+            KleinArtifactInventory::verify_for_provider(crate::FLUX2_KLEIN_9B_ID, &spec)
+                .expect("installed converted inventory")
+                .expect("True-V2 inventory");
+        assert!(matches!(inventory.kind, KleinArtifactKind::TrueV2));
+        inventory.ensure_unchanged().unwrap();
     }
 
     fn fixture_root(

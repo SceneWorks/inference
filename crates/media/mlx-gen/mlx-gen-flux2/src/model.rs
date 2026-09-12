@@ -440,9 +440,9 @@ fn build_residency_from_admitted_sources(
     text_encoder_load_time_quant_bits: Option<i32>,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let spec_heavy = spec.clone();
-    Residency::from_policy(
+    Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move || {
+        move |_streamable| {
             load_flux2_text(
                 variant,
                 &text_encoder_source,
@@ -450,7 +450,7 @@ fn build_residency_from_admitted_sources(
                 text_encoder_load_time_quant_bits,
             )
         },
-        move |use_pid| load_flux2_heavy(variant, &spec_heavy, use_pid),
+        move |use_pid, _streamable| load_flux2_heavy(variant, &spec_heavy, use_pid),
     )
 }
 
@@ -568,7 +568,7 @@ pub struct Flux2 {
     /// The (small, always-warm) tokenizer. `None` only for the weightless `new_for_tests` instances;
     /// the production load path always populates it.
     tokenizer: Option<TextTokenizer>,
-    /// Component-residency strategy (sc-10840), selected from [`LoadSpec::offload_policy`]. `Resident`
+    /// Component residency: Dev requests can override the [`LoadSpec::offload_policy`] default. `Resident`
     /// (default) holds the text encoder (+ dev vision tower/projector) + DiT + VAE warm; `Sequential`
     /// holds only the per-phase loader closures and re-loads per generation in phase order (encode →
     /// **drop the text encoder** → denoise/decode). Weightless test instances hold loader closures that
@@ -1042,6 +1042,16 @@ impl Generator for Flux2 {
     }
 }
 
+fn request_stages_residency(variant: Flux2Variant, default: bool, req: &GenerationRequest) -> bool {
+    if variant.is_dev() {
+        req.memory
+            .as_ref()
+            .map_or(default, |memory| memory.stage_residency)
+    } else {
+        default
+    }
+}
+
 /// Resolve the classifier-free negative branch for a request.
 ///
 /// All Klein variants share this path (txt2img, edit, and KV edit): an explicit guidance scale above
@@ -1120,14 +1130,16 @@ impl Flux2 {
         // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
         let embedded_guidance = self.variant.uses_embedded_guidance().then_some(guidance);
 
-        // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the text encoder
+        // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
         // then DROPS them + `clear_cache()` before the DiT/VAE load below — the peak-bounding win. Under
         // `Resident` it borrows the warm encoder and runs the identical encode/denoise/decode with no
         // eval/clear. The edit reference conditioning that must PERSIST through denoise is VAE-encoded in
         // the heavy phase (after the TE drop), byte-identical to the resident order (a deterministic,
         // TE-independent VAE encode — same hoist argument as the img2img init latents).
-        self.residency.run(
+        self.residency.run_request_scoped(
+            request_stages_residency(self.variant, self.residency.is_sequential(), req),
+            false,
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -2258,6 +2270,30 @@ mod tests {
             panic!("loaded T2I generator must reject a tier mismatch");
         };
         assert!(reason.contains("does not match loaded tier"), "{reason}");
+    }
+
+    #[test]
+    fn dev_request_staging_overrides_the_load_default_only_when_selected() {
+        for variant in [
+            Flux2Variant::Dev,
+            Flux2Variant::DevEdit,
+            Flux2Variant::Klein9b,
+        ] {
+            for default in [false, true] {
+                let mut req = GenerationRequest::default();
+                assert_eq!(request_stages_residency(variant, default, &req), default);
+                for stage in [true, false, true] {
+                    req.memory = Some(mlx_gen::gen_core::GenerationMemory {
+                        stage_residency: stage,
+                        ..Default::default()
+                    });
+                    assert_eq!(
+                        request_stages_residency(variant, default, &req),
+                        if variant.is_dev() { stage } else { default }
+                    );
+                }
+            }
+        }
     }
 
     fn dev_tier_spec(root: &Path, packed_bits: Option<i32>, requested: Option<Quant>) -> LoadSpec {

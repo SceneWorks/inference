@@ -257,13 +257,20 @@ fn configure_dev_staged_residency(
     spec: &LoadSpec,
     route_is_configured: bool,
 ) {
+    // Base/edit retain rebuildable loaders under both policies, so a tighter request budget
+    // can select staging after a resident cold load. Control still has a fixed-policy driver.
+    let request_scoped = matches!(
+        contract.provider_id.as_str(),
+        FLUX2_DEV_ID | FLUX2_DEV_EDIT_ID
+    );
+    let stages = request_scoped || spec.offload_policy == OffloadPolicy::Sequential;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
             MemoryPhase::Conditioning,
             MemoryPhase::Denoise,
             MemoryPhase::Decode,
         ],
-        synchronized_phase_release: matches!(spec.offload_policy, OffloadPolicy::Sequential),
+        synchronized_phase_release: stages,
         ..Default::default()
     };
     for capability in &mut contract.strategies {
@@ -271,7 +278,7 @@ fn configure_dev_staged_residency(
             MemoryStrategy::Resident => MemoryStrategySupport::Implemented,
             MemoryStrategy::StagedResidency
                 if route_is_configured
-                    && matches!(spec.offload_policy, OffloadPolicy::Sequential)
+                    && stages
                     && spec.load_shape == LoadShape::EagerMaterialization =>
             {
                 MemoryStrategySupport::Implemented
@@ -530,7 +537,7 @@ pub fn registered_dev_control_safety_check(
 
 /// Provider-owned, weights-free conformance fixtures for the exact FLUX.2 Dev routes.
 ///
-/// A staged selection is meaningful only after a sequential load.  Each fixture carries the real
+/// Base/edit can select staging under either load default; control requires Sequential. Each fixture carries the real
 /// route mode, overlay and reference cardinality, so registry conformance cannot accidentally use
 /// text-to-image evidence to authorize edit or control behavior.
 pub(crate) fn registered_dev_fixture(
@@ -1593,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_t2i_contract_is_distinct_conforming_and_resident_only() {
+    fn dev_t2i_contract_is_distinct_conforming_and_request_staged() {
         let t2i = build_dev_t2i_contract();
         let edit = build_contract();
 
@@ -1606,23 +1613,65 @@ mod tests {
         assert_ne!(t2i.calibration, edit.calibration);
         assert!(t2i.conformance_errors().is_empty());
         assert!(t2i.strategies.iter().all(|capability| {
-            capability.strategy == MemoryStrategy::Resident
-                && capability.support == MemoryStrategySupport::Implemented
-                || capability.strategy != MemoryStrategy::Resident
-                    && capability.support == MemoryStrategySupport::Missing
+            matches!(
+                capability.strategy,
+                MemoryStrategy::Resident | MemoryStrategy::StagedResidency
+            ) && capability.support == MemoryStrategySupport::Implemented
+                || !matches!(
+                    capability.strategy,
+                    MemoryStrategy::Resident | MemoryStrategy::StagedResidency
+                ) && capability.support == MemoryStrategySupport::Missing
         }));
 
         let mut non_resident = dev_t2i_context(96.0);
         non_resident.selection.strategy = MemoryStrategy::StagedResidency;
-        let MemorySafetyDecision::Reject { reason } =
-            dev_t2i_safety_check(&t2i, &non_resident, non_resident.selection.tier)
-        else {
-            panic!("a missing non-resident rung must reject");
-        };
-        assert!(
-            reason.contains("cannot execute StagedResidency"),
-            "{reason}"
-        );
+        assert!(matches!(
+            dev_t2i_safety_check(&t2i, &non_resident, non_resident.selection.tier),
+            MemorySafetyDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn resident_dev_routes_open_staged_scopes_without_enabling_control_or_deferred_loads() {
+        let spec = LoadSpec::new(WeightsSource::Dir(Default::default()))
+            .with_offload_policy(OffloadPolicy::Resident);
+        for contract in [
+            build_dev_t2i_contract_for_spec(&spec),
+            build_contract_for_spec(&spec),
+        ] {
+            let fixture = registered_dev_fixture(&spec, &contract, MemoryStrategy::StagedResidency)
+                .unwrap()
+                .pop()
+                .expect("resident-loaded Dev/Edit offers request staging");
+            let mut scope = registered_dev_begin_request(&spec, &contract, &fixture.context)
+                .unwrap()
+                .expect("staging opens a cleanup scope");
+            let mut request = fixture.request;
+            scope.configure_request(&mut request).unwrap();
+            assert!(request.memory.unwrap().stage_residency);
+            scope
+                .finish(mlx_gen::gen_core::MemoryRunOutcome::Canceled)
+                .unwrap();
+        }
+        let control = spec.clone().with_control(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ));
+        let deferred = spec.with_load_shape(LoadShape::DeferredMaterialization);
+        for contract in [
+            build_dev_control_contract(&control),
+            build_dev_t2i_contract_for_spec(&deferred),
+            build_contract_for_spec(&deferred),
+        ] {
+            assert_eq!(
+                contract
+                    .capability(MemoryStrategy::StagedResidency)
+                    .unwrap()
+                    .support,
+                MemoryStrategySupport::Missing,
+                "{}",
+                contract.provider_id
+            );
+        }
     }
 
     #[test]
@@ -1850,8 +1899,10 @@ mod tests {
     fn provider_contract_quarantines_structured_overlays_and_false_reference_summaries() {
         let contract = build_contract();
         assert!(contract.strategies.iter().all(|capability| {
-            capability.strategy == MemoryStrategy::Resident
-                || capability.support == MemoryStrategySupport::Missing
+            matches!(
+                capability.strategy,
+                MemoryStrategy::Resident | MemoryStrategy::StagedResidency
+            ) || capability.support == MemoryStrategySupport::Missing
         }));
 
         let mut structured_overlay = context(128.0);
