@@ -638,14 +638,15 @@ pub(crate) fn weights_free_contract(
 /// The route slug the calibration identity strings carry, for each of the **six** public catalog
 /// routes the two SenseNova providers serve (sc-22734, epic sc-22723 E1/E4). Identical to the MLX
 /// sibling's `route_label`, so the two lanes name the same cell the same way.
+/// Model revisions are part of the route slug, not the fingerprint's single `vN` formula token.
 pub fn route_label(route: &str) -> Option<&'static str> {
     match route {
         "sensenova_u1_8b" => Some("quality"),
         "sensenova_u1_8b_fast" => Some("fast"),
-        "sensenova_u1_8b_infographic_v2" => Some("infographic-v2"),
-        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic-v2-fast"),
-        "sensenova_u1_8b_infographic_v3" => Some("infographic-v3"),
-        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic-v3-fast"),
+        "sensenova_u1_8b_infographic_v2" => Some("infographic2"),
+        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic2-fast"),
+        "sensenova_u1_8b_infographic_v3" => Some("infographic3"),
+        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic3-fast"),
         _ => None,
     }
 }
@@ -1226,6 +1227,11 @@ mod tests {
                 let spec = tier_spec(&root, route, quant);
                 let label = format!("{provider} {route} {tier}");
                 let contract = provider_contract(provider, &spec).unwrap();
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{label}: {:?}",
+                    contract.conformance_errors()
+                );
                 let identity = contract
                     .calibration
                     .as_ref()
@@ -1275,6 +1281,13 @@ mod tests {
                         .calibration
                         .unwrap()
                         .fingerprint,
+                );
+                assert!(
+                    weights_free_contract(provider, &spec)
+                        .unwrap()
+                        .conformance_errors()
+                        .is_empty(),
+                    "{provider} {route} {tier}"
                 );
                 weights_free.insert(
                     weights_free_contract(provider, &spec)

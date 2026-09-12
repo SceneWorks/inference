@@ -681,14 +681,15 @@ pub fn verified_artifact_identity(spec: &LoadSpec) -> Option<String> {
 /// (`validate_resolved_artifact_binding`), so each gets its own slug rather than borrowing a
 /// sibling's evidence — which is exactly what the old veto was protecting against, now expressed as
 /// a distinct key instead of an absent one.
+/// Model revisions are part of the route slug, not the fingerprint's single `vN` formula token.
 pub fn route_label(route: &str) -> Option<&'static str> {
     match route {
         "sensenova_u1_8b" => Some("quality"),
         "sensenova_u1_8b_fast" => Some("fast"),
-        "sensenova_u1_8b_infographic_v2" => Some("infographic-v2"),
-        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic-v2-fast"),
-        "sensenova_u1_8b_infographic_v3" => Some("infographic-v3"),
-        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic-v3-fast"),
+        "sensenova_u1_8b_infographic_v2" => Some("infographic2"),
+        "sensenova_u1_8b_infographic_v2_fast" => Some("infographic2-fast"),
+        "sensenova_u1_8b_infographic_v3" => Some("infographic3"),
+        "sensenova_u1_8b_infographic_v3_fast" => Some("infographic3-fast"),
         _ => None,
     }
 }
@@ -1554,6 +1555,37 @@ mod tests {
         (root, spec)
     }
 
+    #[test]
+    #[ignore = "requires installed SenseNova artifact metadata"]
+    fn installed_infographic_contract_is_structurally_admissible() {
+        let root = std::env::var_os("SENSENOVA_ROOT").expect("SENSENOVA_ROOT");
+        let route = std::env::var("SENSENOVA_ROUTE").expect("SENSENOVA_ROUTE");
+        let provider = if route.ends_with("_fast") {
+            crate::MODEL_ID_FAST
+        } else {
+            crate::MODEL_ID
+        };
+        let spec = LoadSpec::new(WeightsSource::Dir(root.into())).with_resolved_route(&route);
+        let contract = memory_strategy_contract(provider, &spec).unwrap();
+        eprintln!("contract: {contract:#?}");
+        assert_eq!(
+            Some(
+                contract
+                    .calibration
+                    .as_ref()
+                    .expect("installed production identity")
+                    .fingerprint
+                    .clone()
+            ),
+            production_calibration_fingerprint(provider, &spec)
+        );
+        assert!(
+            contract.conformance_errors().is_empty(),
+            "{:?}",
+            contract.conformance_errors()
+        );
+    }
+
     /// The exact geometries `config/manifests/builtin.models.jsonc` advertises for all six shipped
     /// SenseNova ids (`sensenova_u1_8b`, `_fast`, `_infographic_v2`, `_v2_fast`, `_v3`, `_v3_fast` —
     /// six product ids over these two engine ids). None of them is the measured 1024x1024 cell; the
@@ -1757,6 +1789,11 @@ mod tests {
                 let label = format!("{provider} {route} {tier}");
                 assert_eq!(resolved_artifact_tier(&spec).unwrap(), quant, "{label}");
                 let contract = memory_strategy_contract(provider, &spec).unwrap();
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{label}: {:?}",
+                    contract.conformance_errors()
+                );
                 let identity = contract
                     .calibration
                     .as_ref()
