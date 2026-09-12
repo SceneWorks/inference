@@ -311,6 +311,7 @@ fn load_flux2_heavy(
     variant: Flux2Variant,
     spec: &LoadSpec,
     load_pid: bool,
+    stream_transformer_blocks: bool,
 ) -> Result<Flux2HeavyOwned> {
     let root = resolve_root(variant, spec)?;
     let mut transformer = if variant.is_dev() {
@@ -344,9 +345,13 @@ fn load_flux2_heavy(
                     .to_owned(),
             )
         })?;
-        let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
-        transformer = transformer.with_block_stream(inventory, variant.config(), quant);
-        transformer.finalize_block_stream()?;
+        // Deferred loading is an available execution shape, not a request to evict blocks.
+        // Keep the exact inventory check for every lazy load, including shallow requests.
+        if stream_transformer_blocks {
+            let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
+            transformer = transformer.with_block_stream(inventory, variant.config(), quant);
+            transformer.finalize_block_stream()?;
+        }
     }
     // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (`load_pid`, F-177). The student is shared
@@ -450,7 +455,7 @@ fn build_residency_from_admitted_sources(
                 text_encoder_load_time_quant_bits,
             )
         },
-        move |use_pid, _streamable| load_flux2_heavy(variant, &spec_heavy, use_pid),
+        move |use_pid, streamable| load_flux2_heavy(variant, &spec_heavy, use_pid, streamable),
     )
 }
 
@@ -966,8 +971,10 @@ impl Generator for Flux2 {
             self.variant.is_edit(),
             self.variant.is_kv(),
             req,
-        )
-        .map_err(Into::into)
+        )?;
+        request_transformer_window(self.variant, &self.loaded_spec, req)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn generate(
@@ -1042,14 +1049,31 @@ impl Generator for Flux2 {
     }
 }
 
-fn request_stages_residency(variant: Flux2Variant, default: bool, req: &GenerationRequest) -> bool {
-    if variant.is_dev() {
-        req.memory
-            .as_ref()
-            .map_or(default, |memory| memory.stage_residency)
-    } else {
-        default
+fn request_stages_residency(default: bool, req: &GenerationRequest) -> bool {
+    req.memory
+        .as_ref()
+        .map_or(default, |memory| memory.stage_residency)
+}
+
+/// Bind the requested block execution to the admitted load shape before any component work.
+fn request_transformer_window(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<Option<usize>> {
+    let window = crate::memory_strategy::transformer_window(req)?;
+    if let Some(size) = window {
+        if variant.is_dev()
+            || !crate::memory_strategy::klein_streamable(spec)
+            || !request_stages_residency(spec.offload_policy == OffloadPolicy::Sequential, req)
+            || size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE as usize
+        {
+            return Err(Error::Unsupported(
+                "flux2: transformer windows require a streamable Klein load, staged residency, and the supported DiT block window".to_owned(),
+            ));
+        }
     }
+    Ok(window)
 }
 
 /// Resolve the classifier-free negative branch for a request.
@@ -1108,6 +1132,7 @@ impl Flux2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
         // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
         // sampler and diffusion. Calling `default_seed` independently in those phases makes a
         // request irreproducible and lets its provenance name only one of two actual seeds.
@@ -1138,8 +1163,8 @@ impl Flux2 {
         // the heavy phase (after the TE drop), byte-identical to the resident order (a deterministic,
         // TE-independent VAE encode — same hoist argument as the img2img init latents).
         self.residency.run_request_scoped(
-            request_stages_residency(self.variant, self.residency.is_sequential(), req),
-            false,
+            request_stages_residency(self.residency.is_sequential(), req),
+            transformer_window.is_some(),
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -1291,12 +1316,7 @@ impl Flux2 {
                         } else {
                             crate::memory_strategy::attention_plan(req)
                         },
-                        if self.variant.is_dev() {
-                            None
-                        } else {
-                            crate::memory_strategy::transformer_window(req)?
-                                .map(|size| (size, &req.cancel))
-                        },
+                        transformer_window.map(|size| (size, &req.cancel)),
                     )?;
                     let idx =
                         Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
@@ -2273,26 +2293,233 @@ mod tests {
     }
 
     #[test]
-    fn dev_request_staging_overrides_the_load_default_only_when_selected() {
-        for variant in [
-            Flux2Variant::Dev,
-            Flux2Variant::DevEdit,
-            Flux2Variant::Klein9b,
-        ] {
-            for default in [false, true] {
-                let mut req = GenerationRequest::default();
-                assert_eq!(request_stages_residency(variant, default, &req), default);
-                for stage in [true, false, true] {
-                    req.memory = Some(mlx_gen::gen_core::GenerationMemory {
-                        stage_residency: stage,
-                        ..Default::default()
-                    });
-                    assert_eq!(
-                        request_stages_residency(variant, default, &req),
-                        if variant.is_dev() { stage } else { default }
-                    );
-                }
+    fn request_staging_overrides_the_load_default_only_when_selected() {
+        for default in [false, true] {
+            let mut req = GenerationRequest::default();
+            assert_eq!(request_stages_residency(default, &req), default);
+            for stage in [true, false, true] {
+                req.memory = Some(mlx_gen::gen_core::GenerationMemory {
+                    stage_residency: stage,
+                    ..Default::default()
+                });
+                assert_eq!(request_stages_residency(default, &req), stage);
             }
+        }
+    }
+
+    fn deferred_klein_spec() -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        spec.load_shape = mlx_gen::gen_core::LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    #[test]
+    fn klein_request_residency_preserves_warm_and_staged_materialization() {
+        use std::sync::{Arc, Mutex};
+
+        struct Runtime;
+        impl mlx_gen::gen_core::ResidencyRuntime for Runtime {
+            type Error = mlx_gen::Error;
+            fn after_component_drop() {}
+        }
+        struct Component {
+            name: &'static str,
+            streamable: bool,
+            events: Arc<Mutex<Vec<(&'static str, bool)>>>,
+        }
+        impl Drop for Component {
+            fn drop(&mut self) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((self.name, self.streamable));
+            }
+        }
+
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            let spec = deferred_klein_spec();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let text_events = Arc::clone(&events);
+            let heavy_events = Arc::clone(&events);
+            let residency =
+                mlx_gen::gen_core::Residency::<_, _, Runtime>::request_scoped_from_policy(
+                    spec.offload_policy,
+                    move |streamable| {
+                        text_events.lock().unwrap().push(("load-text", streamable));
+                        Ok(Component {
+                            name: "drop-text",
+                            streamable,
+                            events: Arc::clone(&text_events),
+                        })
+                    },
+                    move |_, streamable| {
+                        heavy_events
+                            .lock()
+                            .unwrap()
+                            .push(("load-heavy", streamable));
+                        Ok(Component {
+                            name: "drop-heavy",
+                            streamable,
+                            events: Arc::clone(&heavy_events),
+                        })
+                    },
+                )
+                .unwrap();
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "Sequential load must stay lazy"
+            );
+            let run = |req: &GenerationRequest| {
+                let window = request_transformer_window(variant, &spec, req)?;
+                residency.run_request_scoped(
+                    request_stages_residency(residency.is_sequential(), req),
+                    window.is_some(),
+                    &req.cancel,
+                    false,
+                    &mut |_| {},
+                    |text| Ok(text.streamable),
+                    |_| {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(("materialize", window.is_some()));
+                        Ok(())
+                    },
+                    |heavy, encoded, _| {
+                        assert_eq!(encoded, window.is_some());
+                        assert_eq!(heavy.streamable, window.is_some());
+                        Ok(())
+                    },
+                )
+            };
+            let mut req = GenerationRequest {
+                memory: Some(mlx_gen::gen_core::GenerationMemory::default()),
+                ..Default::default()
+            };
+            run(&req).unwrap();
+            run(&req).unwrap();
+            // Other shallow optimizations preserve the same complete warm components.
+            req.memory.as_mut().unwrap().tile_vae_decode = true;
+            req.memory.as_mut().unwrap().chunk_attention = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("load-text", false), ("load-heavy", false)]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory.as_mut().unwrap().stage_residency = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    ("drop-text", false),
+                    ("drop-heavy", false),
+                    ("load-text", false),
+                    ("materialize", false),
+                    ("drop-text", false),
+                    ("load-heavy", false),
+                    ("drop-heavy", false),
+                ]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory.as_mut().unwrap().stream_transformer_blocks = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    ("load-text", true),
+                    ("materialize", true),
+                    ("drop-text", true),
+                    ("load-heavy", true),
+                    ("drop-heavy", true),
+                ]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory = Some(mlx_gen::gen_core::GenerationMemory::default());
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("load-text", false), ("load-heavy", false)]
+            );
+            events.lock().unwrap().clear();
+            req.memory.as_mut().unwrap().stage_residency = true;
+            req.memory.as_mut().unwrap().stream_transformer_blocks = true;
+            req.cancel.cancel();
+            assert!(matches!(run(&req), Err(Error::Canceled)));
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "cancellation must preserve the warm pair"
+            );
+        }
+    }
+
+    #[test]
+    fn klein_request_windows_reject_incompatible_loads_before_component_work() {
+        let spec = deferred_klein_spec();
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            assert_eq!(
+                request_transformer_window(variant, &spec, &req).unwrap(),
+                Some(1)
+            );
+        }
+        for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
+            assert!(request_transformer_window(variant, &spec, &req).is_err());
+        }
+        let mut model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        for axis in [
+            "resident",
+            "eager",
+            "quantized",
+            "unstaged",
+            "zero-window",
+            "large-window",
+        ] {
+            model.loaded_spec = spec.clone();
+            let mut invalid = req.clone();
+            match axis {
+                "resident" => model.loaded_spec.offload_policy = OffloadPolicy::Resident,
+                "eager" => {
+                    model.loaded_spec.load_shape =
+                        mlx_gen::gen_core::LoadShape::EagerMaterialization
+                }
+                "quantized" => model.loaded_spec.quantize = Some(Quant::Q4),
+                "unstaged" => invalid.memory.as_mut().unwrap().stage_residency = false,
+                "zero-window" => invalid.memory.as_mut().unwrap().transformer_window_size = Some(0),
+                "large-window" => {
+                    invalid.memory.as_mut().unwrap().transformer_window_size = Some(2)
+                }
+                _ => unreachable!(),
+            }
+            let error = model
+                .generate(&invalid, &mut |_| {
+                    panic!("invalid window must not start loading")
+                })
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("transformer windows require"),
+                "{axis}: {error}"
+            );
         }
     }
 
