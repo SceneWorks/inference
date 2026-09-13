@@ -625,7 +625,7 @@ expected_files = ["bf16/model.safetensors"]
 # published re-hosts below are what make these three + two tests wirable at all.
 key = "pid-qwenimage"
 repository = "SceneWorks/pid-qwenimage"
-revision = "39d7b0a9003a3fc934d36d8b5658b2d8ea9c1231"
+revision = "4aeb783a9d3037b75275c42d35d84210c89cb044"
 license = "NVIDIA License"
 size_class = "medium"
 profiles = ["media-macos"]
@@ -635,7 +635,7 @@ expected_files = ["pid_qwenimage_2kto4k.safetensors"]
 [[models]]
 key = "pid-flux"
 repository = "SceneWorks/pid-flux"
-revision = "52d9474830ad05ea8dc55edb59a21cb14d1a4615"
+revision = "6d5c1f1049e863f1757f68fd81c6bc850a95609d"
 license = "NVIDIA License"
 size_class = "medium"
 profiles = ["media-macos"]
