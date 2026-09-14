@@ -77,6 +77,65 @@ fn weightless_spec() -> LoadSpec {
     .with_load_shape(LoadShape::DeferredMaterialization)
 }
 
+/// A snapshot root shaped the way `mlx_gen_sana::convert` writes a DENSE turnkey — the three
+/// component directories, each with its single weight file, and NO `transformer/config.json`
+/// (the turnkey never writes one; the tier self-describes via `.scales`, and a dense file has none)
+/// — carrying header-only stub tensors (sc-22731). It is what a production contract needs to read
+/// the tier it is describing off the same seam the loader packed-detects on; every load through it
+/// is still weights-free, and `generate` still fails on the absent real tensors rather than on
+/// memory.
+fn weight_free_tier_root_spec() -> LoadSpec {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (component, file, tensor, shape) in [
+            (
+                "transformer",
+                "diffusion_pytorch_model.safetensors",
+                "proj_out.weight",
+                [8usize, 64],
+            ),
+            (
+                "vae",
+                "diffusion_pytorch_model.safetensors",
+                "decoder.conv_out.weight",
+                [3, 8],
+            ),
+            (
+                "text_encoder",
+                "gemma-2-2b-it.safetensors",
+                "model.embed_tokens.weight",
+                [16, 64],
+            ),
+        ] {
+            std::fs::create_dir_all(tmp.path().join(component)).expect("component dir");
+            write_dense_bf16_stub(&tmp.path().join(component).join(file), tensor, shape);
+        }
+        assert!(!tmp.path().join("transformer/config.json").exists());
+        tmp
+    });
+    LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()))
+        .with_offload_policy(OffloadPolicy::Sequential)
+        .with_load_shape(LoadShape::DeferredMaterialization)
+}
+
+/// One dense bf16 `[rows, cols]` tensor as a safetensors file: a valid header over a zero-filled
+/// data region, which is all the tier seam (and the loader's packed-detect) ever reads.
+fn write_dense_bf16_stub(path: &std::path::Path, tensor: &str, [rows, cols]: [usize; 2]) {
+    let bytes = rows * cols * 2;
+    let mut json = format!(
+        "{{\"{tensor}\":{{\"dtype\":\"BF16\",\"shape\":[{rows},{cols}],\"data_offsets\":[0,{bytes}]}}}}"
+    )
+    .into_bytes();
+    while json.len() % 8 != 0 {
+        json.push(b' ');
+    }
+    let mut file = (json.len() as u64).to_le_bytes().to_vec();
+    file.extend(json);
+    file.resize(file.len() + bytes, 0);
+    std::fs::write(path, file).expect("stub safetensors");
+}
+
 fn probe_request(memory: GenerationMemory) -> GenerationRequest {
     GenerationRequest {
         prompt: "a red fox in a snowy forest, photograph".into(),
@@ -246,7 +305,15 @@ fn every_declared_surface_is_exact_for_both_entries() {
                 base.selector.id()
             );
         }
-        assert_eq!(base.contract.calibration, sprint.contract.calibration);
+        // sc-22731: the same LADDER, never the same IDENTITY. The two entries are two different
+        // repositories at two different revisions, so an identity they shared would let a Sprint
+        // anchor bind base SANA's measured evidence (the sc-22511 false green).
+        assert_ne!(
+            base.contract.calibration,
+            sprint.contract.calibration,
+            "{} publishes one identity for both routes",
+            base.selector.id()
+        );
     }
 }
 
@@ -427,7 +494,12 @@ fn the_production_route_reaches_the_declared_ladder_for_both_entries() {
 fn the_registered_scope_produces_a_selection_the_production_path_admits() {
     let registry = mlx_gen_sana::provider_registry().expect("SANA provider registry");
     for id in ENTRIES {
-        let spec = weightless_spec();
+        // sc-22731: the production contract publishes its calibration identity only once it can
+        // read the loaded tier off the transformer's `.scales` seam, so this walk — which drives
+        // the PRODUCTION gate — needs a convert-shaped snapshot root. `weight_free_tier_root_spec`
+        // supplies exactly that and nothing else: header-only stubs, so every load is still
+        // weights-free.
+        let spec = weight_free_tier_root_spec();
         let contract = ms::memory_strategy_contract(id, &spec).expect("contract");
         let behavior = registry
             .memory_behavior_registrations()

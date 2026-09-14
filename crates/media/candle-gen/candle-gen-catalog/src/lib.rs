@@ -5500,6 +5500,11 @@ mod tests {
                 .collect(),
                 "{provider_id}"
             );
+            // sc-22735: these are weights-free declarations, so their identities live in the
+            // registry-behavior namespace and carry their own (route, declared tier) key. The
+            // production strings — `krea-2-<route>-<tier>-cuda-staged-residency-v1` — are what a
+            // measured anchor binds to, and no catalog surface may republish one.
+            let mut declared = std::collections::BTreeSet::new();
             for surface in provider_surfaces {
                 assert!(!surface.composed, "{provider_id}");
                 assert_eq!(
@@ -5507,11 +5512,34 @@ mod tests {
                     candle_gen::gen_core::MemoryAssetFacts::default(),
                     "{provider_id}"
                 );
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => "bf16",
+                    MemoryContractSurfaceTier::Q4 => "q4",
+                    MemoryContractSurfaceTier::Q8 => "q8",
+                    other => panic!("{provider_id}: unexpected surface tier {other:?}"),
+                };
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    "krea-candle-request-scoped-staged-residency-v1",
-                    "{provider_id}"
+                    fingerprint,
+                    &format!(
+                        "krea-2-candle-registry-behavior-v1-{}-{tier}",
+                        provider_id.replace('_', "-")
+                    ),
+                    "{provider_id}:{}",
+                    surface.selector.id()
                 );
+                for cell in ["q4", "q8", "bf16"] {
+                    assert_ne!(
+                        fingerprint,
+                        &format!(
+                            "{}-{cell}-cuda-staged-residency-v1",
+                            provider_id.replace('_', "-")
+                        ),
+                        "{provider_id}: a weights-free surface must never republish a production \
+                         calibration identity"
+                    );
+                }
+                declared.insert(fingerprint.clone());
                 for strategy in MemoryStrategy::ALL {
                     let expected = matches!(
                         strategy,
@@ -5526,6 +5554,11 @@ mod tests {
                     );
                 }
             }
+            assert_eq!(
+                declared.len(),
+                3,
+                "{provider_id}: one declaration per artifact tier: {declared:?}"
+            );
         }
     }
 
@@ -5563,17 +5596,15 @@ mod tests {
                 true,
                 "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
             ),
-            (
-                "lens",
-                2,
-                false,
-                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
-            ),
+            // sc-22732: the Lens weights-free surfaces publish a per-cell static behavior identity
+            // instead of leaking the measured q4 Lens-Turbo production string onto all 24 of them,
+            // so these two entries are the route-exact PREFIX of that namespace.
+            ("lens", 2, false, "lens-candle-registry-behavior-v1-lens-"),
             (
                 "lens_turbo",
                 2,
                 false,
-                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+                "lens-candle-registry-behavior-v1-lens-turbo-",
             ),
         ] {
             let provider_surfaces: Vec<_> = surfaces
@@ -5614,11 +5645,32 @@ mod tests {
                 );
                 implemented += usize::from(expected);
                 assert_eq!(surface.composed, composed, "{provider_id}");
-                assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    fingerprint,
-                    "{provider_id}"
-                );
+                let published = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                if provider_id.starts_with("lens") {
+                    assert!(
+                        published.starts_with(fingerprint),
+                        "{provider_id}:{} published {published}",
+                        surface.selector.id()
+                    );
+                    // `…-v1-lens-` is itself a prefix of `…-v1-lens-turbo-`, so the check above
+                    // cannot tell the base route's identity from the turbo route's. Pin the
+                    // discrimination explicitly rather than leaving it to prefix arithmetic.
+                    assert_eq!(
+                        published.starts_with("lens-candle-registry-behavior-v1-lens-turbo-"),
+                        provider_id == "lens_turbo",
+                        "{provider_id}:{} published {published}",
+                        surface.selector.id()
+                    );
+                    // The weights-free namespace must never be the measured production string.
+                    assert_ne!(
+                        published.as_str(),
+                        "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+                        "{provider_id}:{} leaks the measured production identity",
+                        surface.selector.id()
+                    );
+                } else {
+                    assert_eq!(published, fingerprint, "{provider_id}");
+                }
                 assert_eq!(
                     surface.contract.asset_facts,
                     candle_gen::gen_core::MemoryAssetFacts::default(),

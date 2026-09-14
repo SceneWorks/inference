@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationRequest, LoadShape, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemoryRunOutcome,
     MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision,
+    MemoryStructuralResidentEvidence, MemoryWindowMaterialization, Precision, Quant,
     ResidentOnlyMemoryContractRegistration, ResidentRequestMemory, WeightsSource,
     MEMORY_STRUCTURAL_RESIDENT_EVIDENCE_ABI,
 };
@@ -24,6 +24,80 @@ pub const PUBLIC_BUCKETS: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 704),
 pub const PUBLIC_FRAMES: &[u32] = &[45, 61, 77];
 /// Domain separator for the provider-side animation-carrier content digest.
 const CARRIER_DIGEST_DOMAIN: &str = "scail2-candle-carrier-v1";
+
+/// Backend token for every identity and receipt this module mints (sc-22736).
+///
+/// It is load-bearing for a reason peculiar to SCAIL-2: the manifest ships **one** repository
+/// (`SceneWorks/scail2-mlx`) to both lanes, so the MLX and Candle providers seal receipts over
+/// *byte-identical* bf16 roots. Without this token the two lanes' `receipt_sha256` collide and a
+/// measurement taken on one lane reads as evidence for the other, even though the Candle route
+/// loads the DiT at F32 and the MLX route does not.
+const CALIBRATION_BACKEND: &str = "candle";
+
+/// The one composition this provider runs: Resident residency, eager materialization.
+///
+/// It is named in the identity rather than left implicit because `MemoryCalibrationIdentity`
+/// carries the load shape as a separate field, and a reader comparing two strings should not have
+/// to consult that field to know they name different compositions.
+const CALIBRATION_LOAD_COMPOSITION: &str = "resident-eager";
+
+/// The one load shape [`CALIBRATION_LOAD_COMPOSITION`] names.
+const CALIBRATION_LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
+
+/// The weights-free conformance witness, deliberately **not** a production string: a catalog walk
+/// reads no artifact, so it can never prove a tier and must never publish a measurable identity.
+const WEIGHTS_FREE_CALIBRATION_FINGERPRINT: &str = "scail2-14b-candle-weights-free-conformance-v1";
+
+/// The production calibration identity TABLE for a Candle SCAIL-2 load of `artifact_tier`.
+///
+/// All three shipped tiers, since sc-22736. The Candle lane RENDERS q4 and q8 — SceneWorks'
+/// `crates/sceneworks-worker/src/video_jobs/candle.rs::resolve_candle_scail2_tier` accepts
+/// `advanced.mlxQuantize` of 4, 8 or `<= 0`, and `pipeline::load` requires
+/// `spec.quantize == config.packed_quant` — so a memory contract that stopped at dense bf16 left
+/// two thirds of this lane's shipped cells with no identity for an anchor to bind. Closing it took
+/// the packed layout's byte accounting (`packed_dit_bytes`), which is what the strings below now
+/// stand on.
+///
+/// This is the TABLE, not the binding: only `production_calibration_identity`, which takes the
+/// tier PROVEN from the snapshot's own `config.json` marker and canonical tier directory, may turn
+/// one of these into a contract identity. `artifact_tier` is never [`LoadSpec::quantize`] read on
+/// its own.
+///
+/// The tier is a key because three tiers are three different resident sets. The backend is a key
+/// because the manifest ships ONE repository to both lanes and the two hold those bytes
+/// differently — see `CALIBRATION_BACKEND`.
+pub fn production_calibration_fingerprint(artifact_tier: MemoryNumericTier) -> Option<String> {
+    let tier = match artifact_tier.quant {
+        None => "bf16",
+        Some(gen_core::Quant::Q4) => "q4",
+        Some(gen_core::Quant::Q8) => "q8",
+        // No SCAIL-2 artifact can prove any other packing, so there is no cell to name.
+        Some(_) => return None,
+    };
+    Some(format!(
+        "scail2-14b-{tier}-{CALIBRATION_BACKEND}-{CALIBRATION_LOAD_COMPOSITION}-v1"
+    ))
+}
+
+/// The identity a **sealed** receipt publishes, or `None` when the cell cannot be proven.
+///
+/// Withheld — never a load failure — when:
+///
+/// * an adapter overlays the sealed tier, because the overlaid run is not the cell a measurement
+///   was taken on;
+/// * the spec's load shape is not [`CALIBRATION_LOAD_SHAPE`], because the published composition
+///   would then disagree with the one that actually ran.
+fn production_calibration_identity(
+    spec: &LoadSpec,
+    tier: MemoryNumericTier,
+    adapters_present: bool,
+) -> Option<MemoryCalibrationIdentity> {
+    if adapters_present || spec.load_shape != CALIBRATION_LOAD_SHAPE {
+        return None;
+    }
+    production_calibration_fingerprint(tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdapterRealization {
@@ -192,6 +266,9 @@ struct ArtifactReceipt {
     root: PathBuf,
     pins: Vec<gen_core::PinnedWeightsFile>,
     canonical: bool,
+    /// The tier PROVEN from the snapshot's own `config.json` marker, never `LoadSpec::quantize`
+    /// read on its own (sc-22736).
+    packed: Option<Quant>,
     facts: MemoryAssetFacts,
 }
 
@@ -206,9 +283,21 @@ impl ArtifactReceipt {
         let root = std::fs::canonicalize(root)?;
         let config = crate::config::Scail2Config::from_model_dir(&root)
             .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
-        if config.packed_quant.is_some() || spec.quantize.is_some() {
+        // sc-22736: the tier is the ARTIFACT's — the `quantization.bits` marker the converter wrote
+        // into the snapshot's own `config.json`, which is the very value `pipeline::load` compares
+        // `spec.quantize` against. A request that disagrees with the artifact is refused here for
+        // the same reason the loader refuses it: the two would then describe different resident
+        // sets under one receipt.
+        let packed = config.packed_quant;
+        if spec.quantize != packed {
             return Err(gen_core::Error::Unsupported(format!(
-                "{PROVIDER_ID}: Candle public animation accepts dense bf16 only"
+                "{PROVIDER_ID}: requested tier {:?} does not match the snapshot's {packed:?} DiT layout",
+                spec.quantize
+            )));
+        }
+        if !matches!(packed, None | Some(Quant::Q4) | Some(Quant::Q8)) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: unsupported on-disk quantization {packed:?}"
             )));
         }
         let files = crate::pipeline::SHARED_TIER_FILES
@@ -262,7 +351,13 @@ impl ArtifactReceipt {
             .ok_or_else(|| {
                 gen_core::Error::Msg(format!("{PROVIDER_ID}: conditioning byte overflow"))
             })?;
-        let transformer_bytes = component_bytes("dit.safetensors")?;
+        // The DiT is the ONE component whose realization moves with the tier: a packed snapshot's
+        // projections stay packed in memory (`QLinear::Quantized`), while every dense leaf — and
+        // the whole of the TE, CLIP and VAE, which the packer never touches — is upcast to F32.
+        let transformer_bytes = match packed {
+            None => component_bytes("dit.safetensors")?,
+            Some(quant) => packed_dit_bytes(&root.join("dit.safetensors"), quant)?,
+        };
         let decoder_bytes = component_bytes("vae.safetensors")?;
         let base_bytes = conditioning_bytes
             .checked_add(transformer_bytes)
@@ -271,8 +366,9 @@ impl ArtifactReceipt {
         let receipt = Self {
             root: root.clone(),
             pins,
-            canonical: canonical_artifact_path(&root)
+            canonical: canonical_artifact_path(&root, packed)
                 && spec.resolved_route.as_deref() == Some(PROVIDER_ID),
+            packed,
             facts: MemoryAssetFacts {
                 base_bytes,
                 conditioning_bytes,
@@ -301,8 +397,158 @@ impl ArtifactReceipt {
     }
 }
 
-fn canonical_artifact_path(root: &Path) -> bool {
-    root.file_name().and_then(|name| name.to_str()) == Some("bf16")
+/// The snapshot subdirectory the manifest ships each tier of `SceneWorks/scail2-mlx` under.
+const fn tier_directory(packed: Option<Quant>) -> &'static str {
+    match packed {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        // Unreachable: `ArtifactReceipt::capture` refuses every other marker before this is asked.
+        Some(_) => "unsupported",
+    }
+}
+
+/// Bytes the Candle loader materializes for a PACKED SCAIL-2 DiT (sc-22736).
+///
+/// The two realizations in one file are priced separately, because that is what the loader builds:
+///
+/// * an MLX-affine packed projection (`<base>.weight` as `U32` plus `<base>.scales` /
+///   `<base>.biases`) is re-packed into a GGUF `QLinear::Quantized` weight — `Q4_1` at 20 bytes per
+///   32 elements, `Q8_0` at 34 — and the affine scales/biases are CONSUMED by that repack, so they
+///   carry no residency of their own;
+/// * every remaining leaf is a dense tensor the loader upcasts to F32 (`pipeline::transformer_vb`
+///   loads the DiT at `DType::F32`), so it is charged 4 bytes per element.
+///
+/// The typed geometry is cross-checked rather than trusted: a packed base must carry both affine
+/// leaves, the group-64 width must come out to exactly the selected bit width, and an orphan
+/// `.scales` / `.biases` or an unaccounted non-float leaf is a refusal. That is the same shape
+/// `gen_core::wan_i2v_memory`'s `packed_transformer_bytes` enforces for the Wan tiers, which is the
+/// other consumer of these same MLX-affine rehosts.
+fn packed_dit_bytes(path: &Path, quant: Quant) -> gen_core::Result<u64> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const GROUP: usize = 64;
+    /// GGUF `Q4_1` / `Q8_0` block bytes for one 32-element block.
+    const BLOCK_ELEMENTS: u64 = 32;
+    let headers = gen_core::weightsmeta::safetensors_path_tensor_headers(path)?;
+    let tensors = headers
+        .into_iter()
+        .map(|header| (header.name.clone(), header))
+        .collect::<BTreeMap<_, _>>();
+    let mut packed_bases = BTreeSet::new();
+    let mut packed = 0_u64;
+    for weight in tensors
+        .values()
+        .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
+    {
+        let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        let (Some(scales), Some(biases)) = (
+            tensors.get(&format!("{base}.scales")),
+            tensors.get(&format!("{base}.biases")),
+        ) else {
+            // A dense 2-D leaf beside packed ones is legitimate (the packer skips norms and
+            // embeddings); the dense fold below charges it.
+            continue;
+        };
+        if weight.dtype != gen_core::weightsmeta::Dtype::U32
+            || !scales.is_float()
+            || !biases.is_float()
+            || scales.shape != biases.shape
+            || scales.shape.len() != 2
+            || scales.shape.first() != weight.shape.first()
+        {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: packed {base} has invalid typed geometry"
+            )));
+        }
+        let input = scales.shape[1]
+            .checked_mul(GROUP)
+            .ok_or_else(|| gen_core::Error::Msg(format!("{PROVIDER_ID}: packed input overflow")))?;
+        let packed_bits = weight.shape[1]
+            .checked_mul(32)
+            .and_then(|bits| bits.checked_div(input))
+            .ok_or_else(|| {
+                gen_core::Error::Unsupported(format!("{PROVIDER_ID}: packed width is inconsistent"))
+            })?;
+        if input == 0 || packed_bits != quant.bits() as usize {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: packed {base} does not encode Q{} group-{GROUP}",
+                quant.bits()
+            )));
+        }
+        let elements = u64::try_from(weight.shape[0])
+            .ok()
+            .and_then(|rows| {
+                u64::try_from(input)
+                    .ok()
+                    .and_then(|cols| rows.checked_mul(cols))
+            })
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{PROVIDER_ID}: packed element count overflow"))
+            })?;
+        if !elements.is_multiple_of(BLOCK_ELEMENTS) {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: packed {base} element count is not block aligned"
+            )));
+        }
+        let bytes = elements
+            .checked_div(BLOCK_ELEMENTS)
+            .and_then(|blocks| blocks.checked_mul(if quant == Quant::Q4 { 20 } else { 34 }))
+            .ok_or_else(|| {
+                gen_core::Error::Msg(format!("{PROVIDER_ID}: packed resident bytes overflow"))
+            })?;
+        packed = packed.checked_add(bytes).ok_or_else(|| {
+            gen_core::Error::Msg(format!("{PROVIDER_ID}: packed resident total overflow"))
+        })?;
+        packed_bases.insert(base.to_owned());
+    }
+    if packed_bases.is_empty() {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{PROVIDER_ID}: {} has no packed transformer weights",
+            path.display()
+        )));
+    }
+    let dense = tensors.values().try_fold(0_u64, |total, header| {
+        if let Some(base) = header
+            .name
+            .strip_suffix(".scales")
+            .or_else(|| header.name.strip_suffix(".biases"))
+        {
+            if !packed_bases.contains(base) {
+                return Err(gen_core::Error::Unsupported(format!(
+                    "{PROVIDER_ID}: orphan packed leaf {}",
+                    header.name
+                )));
+            }
+            // Consumed by the GGUF repack; charged inside the packed weight above.
+            return Ok(total);
+        }
+        if header
+            .name
+            .strip_suffix(".weight")
+            .is_some_and(|base| packed_bases.contains(base))
+        {
+            return Ok(total);
+        }
+        if !header.is_float() {
+            return Err(gen_core::Error::Unsupported(format!(
+                "{PROVIDER_ID}: unaccounted non-float tensor {}",
+                header.name
+            )));
+        }
+        total
+            .checked_add(header.materialized_bytes(4)?)
+            .ok_or_else(|| gen_core::Error::Msg(format!("{PROVIDER_ID}: dense residual overflow")))
+    })?;
+    packed.checked_add(dense).ok_or_else(|| {
+        gen_core::Error::Msg(format!(
+            "{PROVIDER_ID}: transformer resident bytes overflow"
+        ))
+    })
+}
+
+fn canonical_artifact_path(root: &Path, packed: Option<Quant>) -> bool {
+    root.file_name().and_then(|name| name.to_str()) == Some(tier_directory(packed))
         && root.components().any(|part| {
             matches!(
                 part.as_os_str().to_str(),
@@ -335,17 +581,24 @@ impl PreparedMemory {
             .map(|(ordinal, adapter)| AdapterReceipt::capture(spec, ordinal, adapter))
             .collect::<gen_core::Result<Vec<_>>>()?;
         let artifact = ArtifactReceipt::capture(spec)?;
+        // The numeric tier is the ARTIFACT's proven one (sc-22736): the DiT's packed marker decides
+        // it, and `Precision::Bf16` stays the source precision every tier was packed from.
         let tier = MemoryNumericTier {
             precision: Precision::Bf16,
-            quant: None,
+            quant: artifact.packed,
             component_precision_floors: &[],
         };
         if !artifact.canonical {
             return Err(gen_core::Error::Unsupported(format!(
-                "{PROVIDER_ID}: weights must be the canonical {CANONICAL_REPOSITORY}@{CANONICAL_REVISION}/bf16 artifact"
+                "{PROVIDER_ID}: weights must be the canonical {CANONICAL_REPOSITORY}@{CANONICAL_REVISION}/{} artifact",
+                tier_directory(artifact.packed)
             )));
         }
-        let contract = build_contract(spec, artifact.facts);
+        let contract = build_contract(
+            spec,
+            artifact.facts,
+            production_calibration_identity(spec, tier, !adapters.is_empty()),
+        );
         let structural_evidence = build_structural_evidence(&artifact, &adapters, tier);
         structural_evidence.validate()?;
         Ok(Self {
@@ -579,6 +832,9 @@ fn build_structural_evidence(
     let mut hasher = Sha256::new();
     hasher.update(CANONICAL_REPOSITORY);
     hasher.update(CANONICAL_REVISION);
+    // sc-22736: both lanes seal the same `SceneWorks/scail2-mlx` bf16 root, so without a backend
+    // token the two receipts are the same 64 hex characters.
+    hasher.update(CALIBRATION_BACKEND);
     hasher.update("bf16");
     for pin in &artifact.pins {
         hasher.update(format!("{pin:?}"));
@@ -611,8 +867,13 @@ fn build_structural_evidence(
 }
 
 fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
+    // sc-22736: `quantize` names which SHIPPED tier of the canonical rehost is being opened — the
+    // loader compares it to the snapshot's own `quantization.bits` marker and refuses a
+    // disagreement — so Q4 and Q8 are inside the public surface. It is never a request to pack a
+    // dense checkpoint at load: `ArtifactReceipt::capture` requires the artifact to already carry
+    // the tier being named.
     if spec.precision != Precision::Bf16
-        || spec.quantize.is_some()
+        || !matches!(spec.quantize, None | Some(Quant::Q4) | Some(Quant::Q8))
         || spec.control.is_some()
         || !spec.extra_controls.is_empty()
         || spec.ip_adapter.is_some()
@@ -621,7 +882,7 @@ fn validate_load_spec(spec: &LoadSpec) -> gen_core::Result<()> {
         || spec.text_encoder.is_some()
     {
         return Err(gen_core::Error::Unsupported(format!(
-            "{PROVIDER_ID}: load is outside the dense-bf16 public animation surface"
+            "{PROVIDER_ID}: load is outside the shipped public animation surface"
         )));
     }
     gen_core::reject_unknown_components(spec, &[], PROVIDER_ID)
@@ -685,7 +946,11 @@ fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
     }
 }
 
-fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderContract {
+fn build_contract(
+    spec: &LoadSpec,
+    facts: MemoryAssetFacts,
+    calibration: Option<MemoryCalibrationIdentity>,
+) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -735,7 +1000,7 @@ fn build_contract(spec: &LoadSpec, facts: MemoryAssetFacts) -> MemoryProviderCon
                 MemoryFormulaVariable::OverlayBytes,
             ],
         },
-        calibration: None,
+        calibration,
         asset_facts: facts,
         runtime: gen_core::MemoryRuntimeSemantics::default(),
     }
@@ -745,18 +1010,43 @@ pub fn provider_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderCont
     PreparedMemory::prepare(spec).map(|prepared| prepared.contract)
 }
 
+/// The structural resident receipt a load of `spec` seals — the same one the loaded generator
+/// carries (sc-22736).
+///
+/// [`request_evidence_revision`] takes that receipt, and until now only a LOADED generator held
+/// one, so a caller that must PRESENT an admitted request identity — a measurement harness driving
+/// this provider's own registered admission check — had no way to mint it. This exposes exactly
+/// what `PreparedMemory::prepare` seals and nothing else: it opens the same artifact, proves the
+/// same tier off the snapshot's own marker, and fails the same way for a non-canonical root.
+pub fn structural_resident_evidence(
+    spec: &LoadSpec,
+) -> gen_core::Result<MemoryStructuralResidentEvidence> {
+    PreparedMemory::prepare(spec).map(|prepared| prepared.structural_evidence)
+}
+
 /// Weights-free catalog witness for the sole shipped dense-bf16 Resident surface. Production loads
 /// still require the immutable canonical receipt in [`PreparedMemory::prepare`].
 fn weights_free_resident_contract(spec: &LoadSpec) -> gen_core::Result<MemoryProviderContract> {
     validate_load_spec(spec)?;
-    Ok(build_contract(spec, MemoryAssetFacts::default()))
+    // A weights-free witness proves no tier, so it publishes the conformance string and never a
+    // production one. `assert_ne!` in the tests below is what keeps the two apart.
+    Ok(build_contract(
+        spec,
+        MemoryAssetFacts::default(),
+        Some(MemoryCalibrationIdentity::new(
+            WEIGHTS_FREE_CALIBRATION_FINGERPRINT.to_owned(),
+            spec.load_shape,
+        )),
+    ))
 }
 
+/// The witness set for the Resident-only Candle SCAIL-2 surface.
+///
+/// All three shipped tiers since sc-22736 — `SceneWorks/scail2-mlx` ships `bf16`, `q8` and `q4` to
+/// every platform, and this lane loads all three — across both offload and materialization
+/// selectors, which the contract itself does not vary on.
 fn resident_surface_specs() -> Vec<gen_core::MemoryContractSurfaceSpec> {
     gen_core::candle_memory_contract_surface_specs()
-        .into_iter()
-        .filter(|surface| surface.selector.tier == gen_core::MemoryContractSurfaceTier::Bf16)
-        .collect()
 }
 
 fn validate_route(
@@ -969,7 +1259,7 @@ pub(crate) mod tests {
             }
         }
         let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from("/unread")));
-        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        let contract = build_contract(&spec, MemoryAssetFacts::default(), None);
         for strategy in MemoryStrategy::ALL {
             let expected = if strategy == MemoryStrategy::Resident {
                 MemoryStrategySupport::Implemented
@@ -1003,7 +1293,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
-        let contract = build_contract(&spec, MemoryAssetFacts::default());
+        let contract = build_contract(&spec, MemoryAssetFacts::default(), None);
         assert_eq!(
             contract.architecture_facts,
             gen_core::MemoryArchitectureFacts {
@@ -1162,7 +1452,19 @@ pub(crate) mod tests {
         ] {
             let (_temp, spec) = candle_fixture(adapter);
             let prepared = PreparedMemory::prepare(&spec).unwrap();
-            assert_eq!(prepared.contract.calibration, None);
+            // sc-22736: the dense-bf16 cell publishes its production identity, and an adapter
+            // overlay withholds it — an overlaid run is not the cell a measurement was taken on.
+            assert_eq!(
+                prepared
+                    .contract
+                    .calibration
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                adapter
+                    .is_none()
+                    .then_some("scail2-14b-bf16-candle-resident-eager-v1"),
+                "{adapter:?}"
+            );
             assert!(prepared.contract.asset_facts.base_bytes > 0);
             assert_eq!(prepared.contract.asset_facts.overlay_bytes, 0);
             assert_eq!(
@@ -1191,7 +1493,13 @@ pub(crate) mod tests {
             selection,
             optimization_authority: gen_core::MemoryOptimizationAuthority::Resident,
             calibration_abi: gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: String::new(),
+            // Handshake against whatever the sealed contract publishes (sc-22736).
+            calibration_fingerprint: prepared
+                .contract
+                .calibration
+                .as_ref()
+                .map(|identity| identity.fingerprint.clone())
+                .unwrap_or_default(),
             load_shape: prepared.contract.load_shape,
             mode: gen_core::MemoryMode::Other(mode.to_owned()),
             has_reference: true,
@@ -1361,5 +1669,230 @@ pub(crate) mod tests {
         };
         std::fs::write(root.join("dit.safetensors"), b"mutated").unwrap();
         assert!(base_prepared.ensure_unchanged(&base_spec.adapters).is_err());
+    }
+
+    /// The MLX peer's bf16 production string, repeated here as a literal on purpose.
+    ///
+    /// `mlx-gen-scail2` is not a dependency of this crate (and cannot be — it does not build off
+    /// macOS), so the only way to prove the two lanes do not collide is to name the peer's string
+    /// and assert the inequality. If the peer's string ever changes, this literal must be updated
+    /// in the same commit, which is exactly the review the collision deserves.
+    const MLX_PEER_BF16_FINGERPRINT: &str = "scail2-14b-bf16-mlx-resident-eager-v1";
+
+    /// The Candle bf16 cell names its own lane, and never the MLX peer's.
+    ///
+    /// Both lanes seal receipts over the *same* `SceneWorks/scail2-mlx@<rev>/bf16` snapshot, so a
+    /// backend-free identity would let a Candle measurement be read as MLX evidence.
+    #[test]
+    fn the_candle_bf16_identity_names_its_lane_and_never_collides_with_the_mlx_peer() {
+        let bf16 = MemoryNumericTier {
+            precision: Precision::Bf16,
+            quant: None,
+            component_precision_floors: &[],
+        };
+        let published = production_calibration_fingerprint(bf16).unwrap();
+        assert_eq!(published, "scail2-14b-bf16-candle-resident-eager-v1");
+        assert_ne!(published, MLX_PEER_BF16_FINGERPRINT);
+        assert!(published.contains(CALIBRATION_BACKEND));
+
+        // A weights-free witness reads no artifact, so it must not be able to publish a production
+        // string.
+        let (_temp, spec) = candle_fixture(None);
+        let free = weights_free_resident_contract(&spec).unwrap();
+        let free_fingerprint = free.calibration.as_ref().unwrap().fingerprint.clone();
+        assert_eq!(free_fingerprint, WEIGHTS_FREE_CALIBRATION_FINGERPRINT);
+        assert_ne!(free_fingerprint, published);
+        assert_ne!(free_fingerprint, MLX_PEER_BF16_FINGERPRINT);
+    }
+
+    /// A group-64 MLX-affine packed DiT with one packed projection and one dense residual leaf —
+    /// the layout `SceneWorks/scail2-mlx`'s `q4` / `q8` tiers ship.
+    fn write_packed_dit(path: &Path, quant: Quant) {
+        use safetensors::{serialize, tensor::TensorView, Dtype};
+
+        // One group of 64 inputs across two rows: 128 elements, block-aligned for GGUF's 32.
+        let rows = 2_usize;
+        let groups = 1_usize;
+        let code_cols = groups * 64 * quant.bits() as usize / 32;
+        let weight = vec![0_u8; rows * code_cols * 4];
+        let affine = vec![0_u8; rows * groups * 4];
+        let bias = vec![0_u8; rows * 4];
+        let weight = TensorView::new(Dtype::U32, vec![rows, code_cols], &weight).unwrap();
+        let scales = TensorView::new(Dtype::F32, vec![rows, groups], &affine).unwrap();
+        let biases = TensorView::new(Dtype::F32, vec![rows, groups], &affine).unwrap();
+        let dense = TensorView::new(Dtype::F32, vec![rows], &bias).unwrap();
+        std::fs::write(
+            path,
+            serialize(
+                [
+                    ("proj.weight", weight),
+                    ("proj.scales", scales),
+                    ("proj.biases", biases),
+                    ("proj.bias", dense),
+                ],
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A canonical packed-tier fixture: the `q4` / `q8` sibling of [`candle_fixture`].
+    fn candle_packed_fixture(quant: Quant) -> (tempfile::TempDir, LoadSpec) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .join("models--SceneWorks--scail2-mlx")
+            .join("snapshots")
+            .join(CANONICAL_REVISION)
+            .join(tier_directory(Some(quant)));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            format!(
+                r#"{{"quantization":{{"bits":{},"group_size":64}}}}"#,
+                quant.bits()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
+        for (name, size) in [
+            ("t5_encoder.safetensors", 3),
+            ("clip.safetensors", 5),
+            ("vae.safetensors", 11),
+        ] {
+            write_tensor(&root.join(name), "weight", size);
+        }
+        write_packed_dit(&root.join("dit.safetensors"), quant);
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone())).with_quant(quant);
+        spec.resolved_route = Some(PROVIDER_ID.to_owned());
+        let pins = crate::pipeline::SHARED_TIER_FILES
+            .iter()
+            .map(|file| gen_core::PinnedWeightsFile::pin(root.join(file)).unwrap())
+            .collect::<Vec<_>>();
+        spec.prepare_with_file_pins(pins).unwrap();
+        (temp, spec)
+    }
+
+    /// sc-22736: every SHIPPED Candle SCAIL-2 tier seals a receipt and publishes its own identity,
+    /// the packed DiT is priced as GGUF blocks plus F32 dense residual, and the three strings are
+    /// pairwise distinct.
+    ///
+    /// Before this story `production_calibration_fingerprint` minted only the bf16 string and
+    /// `ArtifactReceipt::capture` refused any packed marker, so the two cells this lane RENDERS
+    /// (`resolve_candle_scail2_tier` accepts `advanced.mlxQuantize` 4 and 8) had no identity for an
+    /// anchor to bind.
+    ///
+    /// Mutation that fails this: pricing the packed DiT with `component_bytes` (the dense
+    /// `materialized_bytes(4)` path) — the q4 and q8 transformer bytes then equal each other and
+    /// the ordering assertion below fires.
+    #[test]
+    fn every_shipped_candle_tier_seals_a_receipt_and_publishes_its_own_identity() {
+        let mut published: Vec<(String, String)> = Vec::new();
+        let mut transformer_bytes = Vec::new();
+
+        let (_dense_temp, dense_spec) = candle_fixture(None);
+        let dense = PreparedMemory::prepare(&dense_spec).expect("dense bf16 seals");
+        published.push((
+            "bf16".to_owned(),
+            dense
+                .contract
+                .calibration
+                .as_ref()
+                .expect("bf16 publishes")
+                .fingerprint
+                .clone(),
+        ));
+
+        for quant in [Quant::Q4, Quant::Q8] {
+            let (_temp, spec) = candle_packed_fixture(quant);
+            let prepared = PreparedMemory::prepare(&spec)
+                .unwrap_or_else(|error| panic!("{quant:?} must seal: {error}"));
+            assert_eq!(
+                prepared.tier.quant,
+                Some(quant),
+                "{quant:?}: the tier is the artifact's"
+            );
+            let fingerprint = prepared
+                .contract
+                .calibration
+                .as_ref()
+                .unwrap_or_else(|| panic!("{quant:?} publishes an identity"))
+                .fingerprint
+                .clone();
+            assert_eq!(
+                fingerprint,
+                format!(
+                    "scail2-14b-{}-candle-resident-eager-v1",
+                    tier_directory(Some(quant))
+                )
+            );
+            transformer_bytes.push(prepared.contract.asset_facts.transformer_bytes);
+            published.push((tier_directory(Some(quant)).to_owned(), fingerprint));
+        }
+
+        // 128 elements = 4 GGUF blocks; Q4_1 is 20 bytes a block and Q8_0 is 34, and both carry the
+        // same 8-byte F32 dense bias. The affine scales/biases are consumed by the repack.
+        assert_eq!(transformer_bytes, vec![4 * 20 + 8, 4 * 34 + 8]);
+
+        for (index, (tier, fingerprint)) in published.iter().enumerate() {
+            for (other_tier, other) in &published[index + 1..] {
+                assert_ne!(
+                    fingerprint, other,
+                    "{tier} and {other_tier} share one identity"
+                );
+            }
+        }
+        // And the whole set stays out of the weights-free namespace and off the MLX peer's strings.
+        for (_, fingerprint) in &published {
+            assert_ne!(fingerprint, WEIGHTS_FREE_CALIBRATION_FINGERPRINT);
+            assert!(fingerprint.contains(CALIBRATION_BACKEND));
+        }
+    }
+
+    /// A request tier that disagrees with the artifact is refused by name, on both sides of the
+    /// disagreement — the same refusal `pipeline::load` makes, so admission cannot admit a load the
+    /// loader will reject.
+    #[test]
+    fn a_crossed_request_and_artifact_tier_is_refused_by_name() {
+        // A packed root opened as dense.
+        let (_temp, spec) = candle_packed_fixture(Quant::Q4);
+        let mut dense_request = spec.clone();
+        dense_request.quantize = None;
+        let error = PreparedMemory::prepare(&dense_request)
+            .expect_err("a q4 root opened as dense must be refused")
+            .to_string();
+        assert!(error.contains("does not match the snapshot"), "{error}");
+
+        // A packed root opened as the OTHER packed tier.
+        let mut crossed = spec.clone();
+        crossed.quantize = Some(Quant::Q8);
+        let error = PreparedMemory::prepare(&crossed)
+            .expect_err("a q4 root opened as q8 must be refused")
+            .to_string();
+        assert!(error.contains("does not match the snapshot"), "{error}");
+
+        // A dense root opened as packed.
+        let (_dense_temp, dense_spec) = candle_fixture(None);
+        let mut packed_request = dense_spec.clone();
+        packed_request.quantize = Some(Quant::Q4);
+        let error = PreparedMemory::prepare(&packed_request)
+            .expect_err("a dense root opened as q4 must be refused")
+            .to_string();
+        assert!(error.contains("does not match the snapshot"), "{error}");
+
+        // And a packed root under the WRONG canonical tier directory is not a cell of the table.
+        let (temp, _unused) = candle_packed_fixture(Quant::Q4);
+        let q4 = temp
+            .path()
+            .join("models--SceneWorks--scail2-mlx")
+            .join("snapshots")
+            .join(CANONICAL_REVISION)
+            .join("q4");
+        let renamed = q4.with_file_name("bf16");
+        std::fs::rename(&q4, &renamed).unwrap();
+        let mut moved = LoadSpec::new(WeightsSource::Dir(renamed)).with_quant(Quant::Q4);
+        moved.resolved_route = Some(PROVIDER_ID.to_owned());
+        assert!(PreparedMemory::prepare(&moved).is_err());
     }
 }

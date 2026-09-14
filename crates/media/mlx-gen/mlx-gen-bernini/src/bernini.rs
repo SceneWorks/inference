@@ -47,7 +47,8 @@ use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    Generator, LoadPhase, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
+    WeightsSource,
 };
 
 use mlx_gen_wan::config::WanModelConfig;
@@ -742,6 +743,16 @@ impl Bernini {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // The conditioning phase the memory contract declares (`memory_strategy.rs`:
+        // `MemoryPhase::Conditioning`) opens HERE, at the planner load — not at the first
+        // `Progress::Step`, which the MAR loop only reaches once the ~15 GB planner is resident
+        // (sc-22738). Everything up to and including the UMT5-XXL encode below belongs to it: this
+        // engine has no single "text encoder" component, so the shared `LoadPhase::TextEncoder`
+        // boundary marks the whole conditioning stage, exactly as `residency::run_two_phase` uses
+        // it for the engines that do. Bernini cannot adopt that driver: it loads, uses and frees
+        // TWO conditioning components (planner, then UMT5) around a `clear_cache`, which the
+        // two-phase order (one text component, then the heavy one) cannot express.
+        on_progress(Progress::Loading(LoadPhase::TextEncoder));
         let planner = BerniniPlanner::load(&self.root, self.quant)?;
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1015,6 +1026,10 @@ impl Bernini {
                 Ok((dit, None))
             }
         };
+        // The denoise phase (`MemoryPhase::Denoise`) opens at the expert loads, not at the first
+        // renderer `Progress::Step` — which fires only once BOTH ~28 GB experts are resident
+        // (sc-22738).
+        on_progress(Progress::Loading(LoadPhase::Renderer));
         let latents = {
             let (low_dit, low_stream) = load_expert("low_noise_model.safetensors")?;
             if req.cancel.is_cancelled() {
@@ -1550,6 +1565,58 @@ mod tests {
         for (s, arr) in noise.iter().enumerate() {
             let np = (schedule[s].len() as i32).max(1);
             assert_eq!(arr.shape(), &[np, 3584], "step {s} noise shape");
+        }
+    }
+
+    /// sc-22738 — the conditioning phase opens **before the planner load**, on the production
+    /// `Generator::generate` entry point, for both the still and the video route.
+    ///
+    /// Bernini used to emit no `Progress::Loading(_)` at all: the first event a caller saw was the
+    /// MAR loop's `Progress::Step`, which fires only once the ~15 GB planner is already resident,
+    /// so the conditioning phase its memory contract declares had no observable start. Driving the
+    /// registered generator off [`weightless_snapshot_root`] pins exactly that ordering — the
+    /// boundary is recorded, then the planner load fails because there are no weights. Deleting
+    /// the emit, or moving it below the load, leaves this with an empty log.
+    ///
+    /// The renderer boundary cannot be reached without the ~56 GB dual-expert stack; it is asserted
+    /// in `tests/conformance.rs`, with the rest of the real-weight progress contract.
+    #[test]
+    fn the_conditioning_phase_opens_before_the_planner_load_on_both_routes() {
+        let root = weightless_snapshot_root();
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().to_path_buf()));
+        let generator = crate::provider_registry()
+            .unwrap()
+            .load(MODEL_ID, &spec)
+            .expect("weights-free load");
+
+        for frames in [1u32, 49] {
+            let req = GenerationRequest {
+                prompt: "a cat walking across a sunny garden".into(),
+                width: 256,
+                height: 256,
+                frames: Some(frames),
+                steps: Some(1),
+                ..Default::default()
+            };
+            let mut events: Vec<Progress> = Vec::new();
+            let error = generator
+                .generate(&req, &mut |p| events.push(p))
+                .expect_err("no weights: the planner load must fail");
+            assert!(
+                !matches!(error, mlx_gen::gen_core::Error::Unsupported(_)),
+                "frames={frames}: the request must reach generate_impl, not bounce off validate: \
+                 {error}"
+            );
+            assert_eq!(
+                events.len(),
+                1,
+                "frames={frames}: expected exactly the conditioning boundary, got {events:?}"
+            );
+            assert!(
+                matches!(events[0], Progress::Loading(LoadPhase::TextEncoder)),
+                "frames={frames}: got {:?}",
+                events[0]
+            );
         }
     }
 }

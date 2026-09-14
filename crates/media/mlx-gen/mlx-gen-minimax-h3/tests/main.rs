@@ -16,6 +16,9 @@ mod common;
 #[path = "adaln_cache.rs"]
 mod adaln_cache;
 
+#[path = "adaln_cold_start.rs"]
+mod adaln_cold_start;
+
 #[path = "adaln_evict_memory.rs"]
 mod adaln_evict_memory;
 
@@ -93,6 +96,9 @@ mod staged_residency;
 
 #[path = "streamed_generate_real.rs"]
 mod streamed_generate_real;
+
+#[path = "te_load_integrity.rs"]
+mod te_load_integrity;
 
 #[path = "te_parity.rs"]
 mod te_parity;

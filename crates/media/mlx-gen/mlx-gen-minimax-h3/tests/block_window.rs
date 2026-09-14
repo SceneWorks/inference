@@ -327,30 +327,38 @@ fn the_windowed_adaln_precompute_matches_the_resident_one() {
     let resident = AdaLnCache::precompute(&blocks, schedule.clone(), |_| Ok(temb.clone())).unwrap();
 
     let stream = DitBlockStream::new(staged.path(), Dtype::Float32, cfg.clone()).unwrap();
-    let plan = stream.plan(1).unwrap();
-    let cancel = mlx_gen::CancelFlag::default();
-    let windowed =
-        mlx_gen_minimax_h3::precompute_adaln_windowed(&stream, &plan, &cancel, schedule, temb)
-            .unwrap();
+    // Cover both one-block windows and a window spanning the whole lazy stack.
+    for window in [1, cfg.num_layers as usize] {
+        let plan = stream.plan(window).unwrap();
+        let cancel = mlx_gen::CancelFlag::default();
+        let windowed = mlx_gen_minimax_h3::precompute_adaln_windowed(
+            &stream,
+            &plan,
+            &cancel,
+            schedule.clone(),
+            temb,
+        )
+        .unwrap();
 
-    assert_eq!(windowed.num_layers(), resident.num_layers());
-    assert_eq!(
-        windowed.bytes(),
-        resident.bytes(),
-        "the windowed cache must retain the same table bytes; a different figure means a different \
-         schedule or a dropped layer"
-    );
-    for layer in 0..resident.num_layers() {
-        let (want, got) = (
-            resident.modulation(layer).unwrap(),
-            windowed.modulation(layer).unwrap(),
+        assert_eq!(windowed.num_layers(), resident.num_layers());
+        assert_eq!(
+            windowed.bytes(),
+            resident.bytes(),
+            "the windowed cache must retain the same table bytes; a different figure means a different \
+             schedule or a dropped layer"
         );
-        for (i, (a, b)) in want.tables().zip(got.tables()).enumerate() {
-            let delta = max_abs(a, b);
-            assert_eq!(
-                delta, 0.0,
-                "layer {layer} table {i}: the windowed projection moved by {delta:e}"
+        for layer in 0..resident.num_layers() {
+            let (want, got) = (
+                resident.modulation(layer).unwrap(),
+                windowed.modulation(layer).unwrap(),
             );
+            for (i, (a, b)) in want.tables().zip(got.tables()).enumerate() {
+                let delta = max_abs(a, b);
+                assert_eq!(
+                    delta, 0.0,
+                    "layer {layer} table {i}: the windowed projection moved by {delta:e}"
+                );
+            }
         }
     }
 }

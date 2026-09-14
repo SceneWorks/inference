@@ -71,6 +71,9 @@ mod img2img_real_weights;
 #[path = "img_guidance_spike.rs"]
 mod img_guidance_spike;
 
+#[path = "klein_rehost_real_weights.rs"]
+mod klein_rehost_real_weights;
+
 #[path = "kv_cache_parity.rs"]
 mod kv_cache_parity;
 

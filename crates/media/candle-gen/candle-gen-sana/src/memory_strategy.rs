@@ -393,6 +393,10 @@ fn build_contract(
         variant,
         spec,
         format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex(&assembly.finalize())),
+        Some(MemoryCalibrationIdentity::new(
+            production_calibration_fingerprint(variant),
+            spec.load_shape,
+        )),
         MemoryAssetFacts {
             base_bytes: conditioning
                 .saturating_add(transformer)
@@ -405,13 +409,40 @@ fn build_contract(
     ))
 }
 
+/// The route label the identity strings carry.
+const fn route_label(variant: SanaVariant) -> &'static str {
+    match variant {
+        SanaVariant::Base => "base",
+        SanaVariant::Sprint => "sprint",
+    }
+}
+
+/// The PRODUCTION calibration identity of one Candle SANA route (sc-22731, epic sc-22723 E1/E4):
+/// `sana-candle-dense-{base|sprint}-full-ladder-v1`, the strings the SceneWorks manifest declares.
+/// The lane loads exactly one tier (`validate_load_spec` refuses `quantize = Some(_)`), so the
+/// tier is spelled `dense` rather than carried as an axis.
+pub fn production_calibration_fingerprint(variant: SanaVariant) -> String {
+    format!("sana-candle-dense-{}-full-ladder-v1", route_label(variant))
+}
+
+/// The weights-free registry-conformance identity: the same route in a namespace that can never
+/// collide with [`production_calibration_fingerprint`], so a fixture contract can never be mistaken
+/// for measured evidence of the load it describes.
+pub fn weights_free_calibration_fingerprint(variant: SanaVariant) -> String {
+    format!(
+        "sana-candle-dense-{}-weights-free-conformance-v1",
+        route_label(variant)
+    )
+}
+
 /// The registry-only, weights-free contract: the exact route declaration the sealed contract
 /// publishes, with zero asset facts injected and no filesystem traversal.
 ///
 /// The physical receipt is deliberately absent rather than synthesized — it is a digest OF the
 /// pinned assets, and a stand-in would be a machine-independent-looking value standing for facts
 /// nobody measured. The route stays distinguishable through `contract.calibration`, which is keyed
-/// on the variant.
+/// on the variant — in the [`weights_free_calibration_fingerprint`] namespace, never the production
+/// one, so this contract cannot be filed as evidence of a real load.
 pub fn weights_free_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
@@ -421,6 +452,10 @@ pub fn weights_free_contract(
         variant,
         spec,
         String::new(),
+        Some(MemoryCalibrationIdentity::new(
+            weights_free_calibration_fingerprint(variant),
+            spec.load_shape,
+        )),
         MemoryAssetFacts::default(),
     ))
 }
@@ -482,6 +517,7 @@ fn assemble_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
     receipt: String,
+    calibration: Option<MemoryCalibrationIdentity>,
     asset_facts: MemoryAssetFacts,
 ) -> MemoryProviderContract {
     let transformer = asset_facts.transformer_bytes;
@@ -576,16 +612,7 @@ fn assemble_contract(
             }]
         },
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        format!(
-            "sana-candle-dense-{}-full-ladder-v1",
-            match variant {
-                SanaVariant::Base => "base",
-                SanaVariant::Sprint => "sprint",
-            }
-        ),
-        spec.load_shape,
-    ));
+    contract.calibration = calibration;
     contract.asset_facts = asset_facts;
     contract
 }
@@ -1494,6 +1521,49 @@ mod tests {
                 "{}: a weights-free contract has no measured resident bytes to attest",
                 contract.provider_id
             );
+        }
+    }
+
+    /// **A weights-free declaration never publishes the string a production load publishes**
+    /// (sc-22731). The sealed contract carries `sana-candle-dense-{base|sprint}-full-ladder-v1` —
+    /// the strings the SceneWorks manifest declares — and the registry-only contract carries the
+    /// same route in the `…-weights-free-conformance-v1` namespace, so a fixture contract can never
+    /// be filed as evidence of a real load.
+    ///
+    /// Mutation that fails this: passing `production_calibration_fingerprint` from
+    /// `weights_free_contract` (or hard-coding the string back into `assemble_contract`) — the
+    /// two contracts publish one identity.
+    #[test]
+    fn the_weights_free_identity_is_never_the_production_identity() {
+        for (variant, production, conformance) in [
+            (
+                SanaVariant::Base,
+                "sana-candle-dense-base-full-ladder-v1",
+                "sana-candle-dense-base-weights-free-conformance-v1",
+            ),
+            (
+                SanaVariant::Sprint,
+                "sana-candle-dense-sprint-full-ladder-v1",
+                "sana-candle-dense-sprint-weights-free-conformance-v1",
+            ),
+        ] {
+            let (_temp, seal) = sealed(variant);
+            let sealed_identity = seal.contract().calibration.clone().unwrap();
+            assert_eq!(sealed_identity.fingerprint, production);
+            assert_eq!(
+                sealed_identity.load_shape,
+                LoadShape::DeferredMaterialization
+            );
+
+            let mut spec = LoadSpec::new(WeightsSource::Dir("unused".into()));
+            spec.load_shape = LoadShape::EagerMaterialization;
+            let fixture = weights_free_contract(variant, &spec).unwrap();
+            let fixture_identity = fixture.calibration.clone().unwrap();
+            assert_eq!(fixture_identity.fingerprint, conformance);
+            assert_eq!(fixture_identity.load_shape, LoadShape::EagerMaterialization);
+            assert_ne!(fixture_identity.fingerprint, sealed_identity.fingerprint);
+            assert_eq!(production_calibration_fingerprint(variant), production);
+            assert_eq!(weights_free_calibration_fingerprint(variant), conformance);
         }
     }
 

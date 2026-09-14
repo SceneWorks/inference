@@ -1310,6 +1310,7 @@ fn decode_tiling_sweep_against_single_pass() {
             latent_height: latent_h,
             latent_width: latent_w,
             fps: 24,
+            memory: Default::default(),
         };
         let l = generate_latents(
             &transformer,
@@ -1725,6 +1726,7 @@ fn v2v_strength_zero_is_latent_identity() {
         latent_height: latent_h,
         latent_width: latent_w,
         fps: 24,
+        memory: Default::default(),
     };
     let out = generate_v2v_latents(
         &transformer,
@@ -3000,6 +3002,7 @@ fn long_clip_coherence_under_the_bounded_window() {
                     latent_height: latent_h,
                     latent_width: latent_w,
                     fps: 24,
+                    memory: Default::default(),
                 };
                 // Print a per-step mark. This sweep is long enough that a silent run is
                 // indistinguishable from a hung one, and the per-step cadence is also how a

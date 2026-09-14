@@ -107,6 +107,13 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 12, 24];
 pub const TRANSFORMER_BLOCK_COUNT: u32 = 48;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "lens-candle-cuda-shared-ladder-device-format-blocks-v1";
+/// Static, weights-free identity namespace for the registry declaration walk. Never a measurement.
+///
+/// A contract built from a real load leaves an unnameable route's calibration `None`, so admission
+/// must name an explicit estimate authority. The weights-free surfaces cannot do that: the shared
+/// conformance walk needs *some* identity. This namespace supplies one whose value is structural,
+/// and it is asserted disjoint from every production string.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "lens-candle-registry-behavior-v1";
 /// Fixed harmony-preamble `Current date:`. The preamble is the first [`TXT_OFFSET`] tokens, which are
 /// **sliced off** before the DiT conditioning, so the date never reaches the image path — a fixed
 /// constant keeps generation deterministic regardless of wall-clock.
@@ -931,6 +938,7 @@ fn build_lens_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
         MODEL_ID_TURBO,
         spec,
         streams_dit_blocks(spec),
+        production_calibration_identity(MODEL_ID_TURBO, spec),
     )
 }
 
@@ -939,7 +947,12 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
     spec: &LoadSpec,
     streamable: bool,
 ) -> gen_core::MemoryProviderContract {
-    build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
+    build_lens_memory_strategy_contract_with_eligibility(
+        MODEL_ID_TURBO,
+        spec,
+        streamable,
+        production_calibration_identity(MODEL_ID_TURBO, spec),
+    )
 }
 
 /// Architecture axes for the Lens / Lens-Turbo routes (epic SC-22657, E2).
@@ -1322,13 +1335,18 @@ fn build_lens_memory_strategy_contract(
         provider_id,
         spec,
         streams_dit_blocks(spec),
+        production_calibration_identity(provider_id, spec),
     )
 }
 
+/// `streamable` drives the RUNG declarations; `calibration` is decided by the caller, because the
+/// production paths bind it to the artifact on disk while the weights-free surfaces — which have no
+/// artifact — must publish the static behavior namespace instead (sc-22732).
 fn build_lens_memory_strategy_contract_with_eligibility(
     provider_id: &'static str,
     spec: &LoadSpec,
     streamable: bool,
+    calibration: Option<gen_core::MemoryCalibrationIdentity>,
 ) -> gen_core::MemoryProviderContract {
     use gen_core::{
         MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
@@ -1430,7 +1448,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
                 MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: memory_calibration(spec, streamable),
+        calibration,
         asset_facts: gen_core::MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -2163,19 +2181,188 @@ fn streams_dit_blocks(spec: &LoadSpec) -> bool {
     streams_text_encoder(spec) && transformer_numeric_tier_matches(spec, expected_bits)
 }
 
-fn memory_calibration(
-    spec: &LoadSpec,
-    _streamable: bool,
-) -> Option<gen_core::MemoryCalibrationIdentity> {
-    // The base resident envelope does not carry typed adapter/PiD component bytes. Refuse calibrated
-    // admission for those load shapes until they have their own measured component accounting.
-    if !is_plain_measured_load(spec) {
+/// The declared packed tier of one component, read from its `config.json` `quantization` marker.
+///
+/// `None` means "no packed marker" — either a dense component or a missing/unreadable config, both
+/// of which fail closed at the caller. This is the marker only; the safetensors cross-check for the
+/// transformer is [`transformer_numeric_tier_matches`].
+fn component_marker_bits(spec: &LoadSpec, component: &str) -> Option<i32> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return None;
+    };
+    let json = std::fs::read_to_string(root.join(component).join("config.json")).ok()?;
+    let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    candle_gen::quant::PackedConfig::from_config(&config).map(|packed| packed.bits)
+}
+
+/// Whether a component is PROVABLY dense: its shards are readable and carry no packed affine
+/// triple.
+///
+/// Both halves matter. A `.scales` tensor is the packed marker in the tensor inventory itself, so a
+/// component with no declared tier but packed triples on disk is self-inconsistent, not dense. And
+/// an ABSENT component proves nothing at all: without the shard read, a `LoadSpec` pointing at a
+/// path that does not exist would read as "no marker, no triples" and borrow the bf16 cell's string.
+fn component_is_provably_dense(spec: &LoadSpec, component: &str) -> bool {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return false;
+    };
+    let Ok(files) = candle_gen::sorted_safetensors(&root.join(component), "lens") else {
+        return false;
+    };
+    if files.is_empty() {
+        return false;
+    }
+    // SAFETY: read-only model artifacts, mapped only long enough to inspect the immutable headers.
+    let Ok(source) = (unsafe { MmapedSafetensors::multi(&files) }) else {
+        return false;
+    };
+    !source
+        .tensors()
+        .iter()
+        .any(|(name, _)| name.ends_with(".scales"))
+}
+
+/// The tier the snapshot on disk actually is: the declared `config.json` marker cross-checked
+/// against the packed triples in the safetensors headers, both components.
+///
+/// `None` — nothing nameable: not a directory, the components are absent or unreadable, or the two
+/// disagree. `Some(None)` — dense bf16: both components are readable, neither declares a tier and
+/// neither carries a `.scales` triple. `Some(Some(_))` —
+/// both components declare the same 4/8-bit tier AND [`transformer_numeric_tier_matches`] confirms
+/// the DiT's packed triples against that declaration (dtypes, matching rows, exact packed-column
+/// arithmetic, and every U32 weight belonging to a validated triple).
+///
+/// The encoder side is proven by its declared marker rather than by
+/// [`packed_text_encoder_config`]'s full expert-inventory walk. That walk stays exactly where it is,
+/// as the rung-4 streamability gate ([`streams_text_encoder`]) — but it demands the complete
+/// gpt-oss-20b packed inventory, roughly 10 GB of expert tensors, so it is not something a fixture
+/// can stand up. Naming the (route, tier) CELL does not need it: the DiT half is fully cross-checked
+/// here, and the two halves must agree.
+fn resolved_artifact_tier(spec: &LoadSpec) -> Option<Option<Quant>> {
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
         return None;
     }
-    Some(gen_core::MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+    let text = component_marker_bits(spec, "text_encoder");
+    let dit = component_marker_bits(spec, "transformer");
+    match (text, dit) {
+        (Some(text_bits), Some(dit_bits)) if text_bits == dit_bits => {
+            let quant = match dit_bits {
+                4 => Quant::Q4,
+                8 => Quant::Q8,
+                _ => return None,
+            };
+            transformer_numeric_tier_matches(spec, dit_bits as usize).then_some(Some(quant))
+        }
+        (None, None) => (component_is_provably_dense(spec, "text_encoder")
+            && component_is_provably_dense(spec, "transformer"))
+        .then_some(None),
+        _ => None,
+    }
+}
+
+/// Production calibration identity table of the clean Lens base routes, keyed on
+/// (route, proven artifact tier) (sc-22732, epic sc-22723 E1/E4).
+///
+/// This is the TABLE, not the binding: only `production_calibration_identity` — which proves the
+/// tier against the artifact on disk first — may turn one of these strings into a contract identity.
+///
+/// Before sc-22732 this crate published ONE string, [`MEMORY_CALIBRATION_FINGERPRINT`], for all six
+/// (route, tier) cells and for all 24 weights-free registry surfaces, gated on nothing but
+/// `is_plain_measured_load`. That is an identity collision: a memory anchor binding to it could
+/// not tell which cell it had priced. The crate's own measurement record — the
+/// [`DEFAULT_TEXT_ENCODER_WINDOW`] doc comment — names exactly one shape behind that string: "An
+/// end-to-end q4 Lens-Turbo request (512x512, one denoise step, seed 15800) produced byte-identical
+/// pixels while reducing RESERVED request peak from 21.875 GiB resident to 8.281 GiB
+/// Sequential+Deferred/window-1 (62.1%)", and it records the dense/MXFP4 control as "deliberately
+/// ineligible". So `(lens_turbo, q4)` keeps that string byte-for-byte and the other eight cells —
+/// which never had evidence behind it — get their own keys, which no anchor has priced yet but which
+/// an anchor can now bind to.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// [`gen_core::MemoryCalibrationIdentity::load_shape`] carries the materialization axis, and the
+/// rung declarations this crate gates on `streamable` are unaffected by the identity.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<Quant>,
+) -> Option<String> {
+    let tier = match artifact_tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(_) => return None,
+    };
+    match (provider_id, artifact_tier) {
+        // The one measured Candle/CUDA cell, preserved byte-for-byte at exactly the cell the
+        // SC-15800 end-to-end result measured.
+        (MODEL_ID_TURBO, Some(Quant::Q4)) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        (MODEL_ID_BASE, _) => Some(format!("lens-base-{tier}-candle-cuda-shared-ladder-v1")),
+        (MODEL_ID_TURBO, _) => Some(format!("lens-turbo-{tier}-candle-cuda-shared-ladder-v1")),
+        _ => None,
+    }
+}
+
+/// The identity a loaded Lens route publishes, bound to the artifact it opens.
+///
+/// Three fail-closed gates, all of which the single `is_plain_measured_load` check this replaces
+/// left open:
+///
+/// * [`is_plain_measured_load`] — the base resident envelope carries no typed adapter/PiD component
+///   bytes, so an overlay stack is a different resident set. Kept exactly as it was;
+/// * bf16 execution precision — the anchors priced the checkpoint dtype; and
+/// * the tier must be PROVEN from disk ([`resolved_artifact_tier`]) and must equal `spec.quantize`.
+///   `spec.quantize` transcodes the encoder experts and the DiT linears AT LOAD when the snapshot is
+///   not already that tier, and no anchor measured that peak.
+///
+/// Withholding is never fatal: the contract builder is infallible and simply publishes no identity,
+/// which leaves admission to explicit estimate authority.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    if !is_plain_measured_load(spec) || spec.precision != Precision::Bf16 {
+        return None;
+    }
+    let artifact_tier = resolved_artifact_tier(spec)?;
+    if artifact_tier != spec.quantize {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, artifact_tier)
+        .map(|fingerprint| gen_core::MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
+/// Per-route static behavior identity for the weights-free declaration surfaces.
+///
+/// Those surfaces have no snapshot to prove anything against, so they must never carry a production
+/// string — before sc-22732 all 24 of them published [`MEMORY_CALIBRATION_FINGERPRINT`], which is a
+/// measured q4 Lens-Turbo result. Keying the static identity on the exact axes the contract shape
+/// depends on — provider, numeric tier, offload policy, plus the load shape the identity already
+/// carries — keeps the declaration walk fail-closed the way the production identities are.
+/// Modelled on `mlx-gen-lens/src/memory_strategy.rs`'s `static_behavior_identity`.
+fn static_behavior_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::MemoryCalibrationIdentity {
+    let precision = match spec.precision {
+        Precision::Bf16 => "bf16",
+        Precision::Fp32 => "fp32",
+    };
+    let quant = match spec.quantize {
+        None => "dense",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+    };
+    let policy = match spec.offload_policy {
+        OffloadPolicy::Resident => "resident",
+        OffloadPolicy::Sequential => "sequential",
+    };
+    // `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens, and the provider
+    // ids are snake_case, so `lens_turbo` has to be spelled `lens-turbo` here.
+    let route = provider_id.replace('_', "-");
+    gen_core::MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{route}-{precision}-{quant}-{policy}"),
         spec.load_shape,
-    ))
+    )
 }
 
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
@@ -2301,7 +2488,12 @@ fn weights_free_lens_memory_strategy_contract(
             gen_core::LoadShape::DeferredMaterialization
         )
         && is_plain_measured_load(spec);
-    build_lens_memory_strategy_contract_with_eligibility(provider_id, spec, streamable)
+    build_lens_memory_strategy_contract_with_eligibility(
+        provider_id,
+        spec,
+        streamable,
+        Some(static_behavior_identity(provider_id, spec)),
+    )
 }
 
 fn surface_selector_matches_spec(
@@ -2353,6 +2545,7 @@ fn weights_free_lens_surface_contract(
         provider_id,
         spec,
         streamable,
+        Some(static_behavior_identity(provider_id, spec)),
     ))
 }
 
@@ -2651,10 +2844,15 @@ mod weights_free_behavior_tests {
 
     #[test]
     fn cpu_scope_executes_the_registered_lens_behavior() {
+        // The weights-free declaration surface, not the production builder: this path resolves no
+        // snapshot, so after sc-22732 a production contract over it proves no tier and publishes no
+        // identity, and `standard_memory_behavior_context` needs one. The static behavior namespace
+        // is exactly what the declaration walk exists to supply.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
+            .with_quant(Quant::Q4)
             .with_offload_policy(candle_gen::gen_core::OffloadPolicy::Sequential)
             .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization);
-        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
+        let contract = weights_free_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec);
         let mut fixture = registered_lens_valid_fixture(
             &spec,
             &contract,
@@ -2978,11 +3176,85 @@ mod integration_tests {
         ]);
         candle_gen::candle_core::safetensors::save(&tensors, text.join("model.safetensors"))
             .unwrap();
+        write_packed_transformer(&root, bits);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_quant(quant)
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
         (root, spec)
+    }
+
+    /// A `transformer/` half whose declared marker and packed triple satisfy
+    /// `transformer_numeric_tier_matches` at `bits`.
+    ///
+    /// That predicate's arithmetic is `weight_cols * (32 / bits) == scales_cols * group_size`, so at
+    /// group size 64 and one scales column the U32 codes column count is exactly `2 * bits`: 8 for
+    /// q4, 16 for q8. Every U32 `.weight` must belong to a validated triple, so the shard carries
+    /// exactly one.
+    fn write_packed_transformer(root: &Path, bits: i32) {
+        let component = root.join("transformer");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("config.json"),
+            format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+        )
+        .unwrap();
+        let cols = 2 * bits as usize;
+        let tensors = std::collections::HashMap::from([
+            (
+                "proj.weight".to_owned(),
+                Tensor::zeros((4, cols), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.scales".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.biases".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, component.join("model.safetensors"))
+            .unwrap();
+    }
+
+    /// The dense/bf16 tier of the same fixture family: no `quantization` marker and no packed
+    /// triple in either component, which is what `resolved_artifact_tier` proves `Some(None)` from.
+    fn dense_memory_spec(tmp: &tempfile::TempDir) -> (PathBuf, LoadSpec) {
+        let root = tmp.path().join("sc22732_lens_contract_dense");
+        for component in ["text_encoder", "transformer"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), r#"{"dtype": "bfloat16"}"#).unwrap();
+            let tensors = std::collections::HashMap::from([(
+                "proj.weight".to_owned(),
+                Tensor::zeros((4, 64), DType::BF16, &Device::Cpu).unwrap(),
+            )]);
+            candle_gen::candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))
+                .unwrap();
+        }
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        (root, spec)
+    }
+
+    /// One snapshot per production tier, in the layout `resolved_artifact_tier` proves.
+    fn tier_fixture(tmp: &tempfile::TempDir, quant: Option<Quant>) -> PathBuf {
+        match quant {
+            None => dense_memory_spec(tmp).0,
+            Some(quant) => packed_memory_spec(tmp, quant).0,
+        }
+    }
+
+    fn tier_spec(
+        root: &Path,
+        quant: Option<Quant>,
+        offload: OffloadPolicy,
+        load_shape: gen_core::LoadShape,
+    ) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        spec.quantize = quant;
+        spec.with_offload_policy(offload)
+            .with_load_shape(load_shape)
     }
 
     fn mini_packed_inventory(tmp: &tempfile::TempDir, complete: bool) -> (PathBuf, EncoderConfig) {
@@ -3030,6 +3302,273 @@ mod integration_tests {
         candle_gen::candle_core::safetensors::save(&tensors, root.join("model.safetensors"))
             .unwrap();
         (root, cfg)
+    }
+
+    /// Every (route, tier) cell the six-cell Candle/CUDA table names.
+    const PRODUCTION_TIERS: [(&str, Option<Quant>); 3] = [
+        ("bf16", None),
+        ("q4", Some(Quant::Q4)),
+        ("q8", Some(Quant::Q8)),
+    ];
+
+    /// The two shapes an anchor capture drives: the worker's Resident/Eager still-image shape, and
+    /// the staged Sequential/Deferred one.
+    const CAPTURE_SHAPES: [(OffloadPolicy, gen_core::LoadShape); 2] = [
+        (
+            OffloadPolicy::Resident,
+            gen_core::LoadShape::EagerMaterialization,
+        ),
+        (
+            OffloadPolicy::Sequential,
+            gen_core::LoadShape::DeferredMaterialization,
+        ),
+    ];
+
+    fn production_fingerprints() -> std::collections::BTreeSet<String> {
+        [MODEL_ID_BASE, MODEL_ID_TURBO]
+            .into_iter()
+            .flat_map(|provider| {
+                PRODUCTION_TIERS.into_iter().map(move |(_, quant)| {
+                    production_calibration_fingerprint(provider, quant).unwrap()
+                })
+            })
+            .collect()
+    }
+
+    /// sc-22732 (epic sc-22723, E1 measurable / E4 production loader): all six Candle/CUDA cells —
+    /// two routes x three artifact tiers — publish their OWN production calibration identity through
+    /// the production builder the loader calls, under the worker's Resident/Eager shape and under
+    /// the staged Sequential/Deferred one. Before sc-22732 all six published one string,
+    /// `MEMORY_CALIBRATION_FINGERPRINT`, gated on nothing but `is_plain_measured_load`.
+    ///
+    /// *Mutations this kills:* restoring `memory_calibration`'s `is_plain_measured_load`-only body
+    /// (the six strings collapse to one and the distinctness assert reds, and the wrong-quant loop
+    /// reds too); dropping the `{tier}` token from the table's format string (the six collapse to
+    /// two); dropping the route token (they collapse to three); keying the string on the offload
+    /// policy or the load shape (the two shapes below disagree); and deleting the
+    /// `artifact_tier != spec.quantize` refusal (the wrong-quant loop reds, because a
+    /// requantize-at-load peak is nobody's anchor).
+    #[test]
+    fn every_lens_tier_publishes_its_routes_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut published = std::collections::BTreeSet::new();
+        for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (tier, quant) in PRODUCTION_TIERS {
+                let expected = production_calibration_fingerprint(provider, quant).unwrap();
+                assert!(
+                    expected.contains(tier) || expected == MEMORY_CALIBRATION_FINGERPRINT,
+                    "{provider} {tier}: {expected}"
+                );
+                let root = tier_fixture(&tmp, quant);
+                for (offload, load_shape) in CAPTURE_SHAPES {
+                    let spec = tier_spec(&root, quant, offload, load_shape);
+                    let contract = build_lens_memory_strategy_contract(provider, &spec);
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {offload:?} {load_shape:?} publishes none")
+                    });
+                    assert_eq!(
+                        identity.fingerprint, expected,
+                        "{provider} {tier} {offload:?} {load_shape:?}"
+                    );
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                }
+
+                // The request knob never outranks the artifact: every tier the snapshot is NOT.
+                for wrong in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    if wrong == quant {
+                        continue;
+                    }
+                    let spec = tier_spec(
+                        &root,
+                        wrong,
+                        OffloadPolicy::Sequential,
+                        gen_core::LoadShape::DeferredMaterialization,
+                    );
+                    assert!(
+                        build_lens_memory_strategy_contract(provider, &spec)
+                            .calibration
+                            .is_none(),
+                        "{provider} {tier} must publish nothing for a {wrong:?} load quant"
+                    );
+                }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{provider} {tier} repeats another cell's identity: {expected}"
+                );
+                std::fs::remove_dir_all(root).ok();
+            }
+        }
+        // Six distinct strings: two routes x three tiers. A route-only key collapses this to 3, a
+        // tier-only key to 2.
+        assert_eq!(published.len(), 6);
+    }
+
+    /// The preserved measured string stays on the one cell its evidence covers, the weights-free
+    /// namespace is disjoint from the whole production set, and an overlay-carrying load publishes
+    /// nothing.
+    ///
+    /// The evidence for the `(lens_turbo, q4)` cell is this crate's own measurement record, the
+    /// `DEFAULT_TEXT_ENCODER_WINDOW` doc comment: an end-to-end q4 Lens-Turbo request at 512x512,
+    /// one denoise step, seed 15800, with the dense/MXFP4 control called out as deliberately
+    /// ineligible. The other eight (route, tier, lane) cells never had evidence behind that string.
+    ///
+    /// *Mutations this kills:* moving `MEMORY_CALIBRATION_FINGERPRINT` off the `(lens_turbo, q4)`
+    /// cell or letting a second cell reach it; handing a weights-free path a production identity
+    /// (the disjointness loops red — this is the leak that put a measured q4 string on all 24
+    /// registry surfaces); and dropping `is_plain_measured_load` (the adapter and PiD loads publish
+    /// a clean-base string).
+    #[test]
+    fn the_preserved_lens_fingerprint_is_reachable_at_exactly_one_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let production = production_fingerprints();
+        assert_eq!(production.len(), 6);
+
+        let mut measured_cells = Vec::new();
+        for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (tier, quant) in PRODUCTION_TIERS {
+                let root = tier_fixture(&tmp, quant);
+                for (offload, load_shape) in CAPTURE_SHAPES {
+                    let spec = tier_spec(&root, quant, offload, load_shape);
+                    let fingerprint = build_lens_memory_strategy_contract(provider, &spec)
+                        .calibration
+                        .unwrap()
+                        .fingerprint;
+                    if fingerprint == MEMORY_CALIBRATION_FINGERPRINT {
+                        measured_cells.push((provider, tier));
+                    }
+                }
+                std::fs::remove_dir_all(root).ok();
+            }
+        }
+        assert_eq!(
+            measured_cells,
+            vec![(MODEL_ID_TURBO, "q4"), (MODEL_ID_TURBO, "q4")],
+            "the measured string covers the q4 Lens-Turbo cell on both capture shapes and nothing \
+             else"
+        );
+
+        // Both weights-free surfaces publish the static namespace, never a production string.
+        let registry = register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(TURBO_REGISTRATION)
+                .register_generator(BASE_REGISTRATION),
+        )
+        .build()
+        .expect("Lens surface registry");
+        let surfaces = registry
+            .memory_contract_surfaces()
+            .expect("weights-free Lens surfaces");
+        assert_eq!(surfaces.len(), 24);
+        let mut static_seen = std::collections::BTreeSet::new();
+        for surface in &surfaces {
+            let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+            assert!(
+                fingerprint.starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{} carries {fingerprint}",
+                surface.selector.id()
+            );
+            assert!(
+                !production.contains(fingerprint),
+                "{} leaks a production string: {fingerprint}",
+                surface.selector.id()
+            );
+            static_seen.insert(fingerprint.clone());
+        }
+        // 12 distinct static keys: 3 tiers x 2 policies per route, the load shape riding the
+        // identity's own `load_shape` field rather than the string.
+        assert_eq!(static_seen.len(), 12);
+        for provider_id in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (_, quant) in PRODUCTION_TIERS {
+                let spec = tier_spec(
+                    Path::new("/nonexistent/lens"),
+                    quant,
+                    OffloadPolicy::Sequential,
+                    gen_core::LoadShape::DeferredMaterialization,
+                );
+                let fingerprint = weights_free_lens_memory_strategy_contract(provider_id, &spec)
+                    .calibration
+                    .unwrap()
+                    .fingerprint;
+                assert!(!production.contains(&fingerprint), "{fingerprint}");
+            }
+        }
+
+        // An overlay stack is a different resident set than any clean-base anchor priced.
+        let (root, base) = packed_memory_spec(&tmp, Quant::Q4);
+        assert!(build_lens_turbo_memory_strategy_contract(&base)
+            .calibration
+            .is_some());
+        let mut adapted = base.clone();
+        adapted.adapters.push(AdapterSpec::new(
+            root.join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        let mut external_text = base.clone();
+        external_text.text_encoder = Some(WeightsSource::Dir(root.join("te")));
+        for (label, spec) in [("adapter", &adapted), ("external encoder", &external_text)] {
+            assert!(
+                build_lens_turbo_memory_strategy_contract(spec)
+                    .calibration
+                    .is_none(),
+                "an {label} load publishes no clean-base identity"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A snapshot whose two components declare different tiers publishes NO identity, and the
+    /// contract builder still returns a usable contract — nothing about a self-inconsistent tree may
+    /// turn a loadable snapshot into a refused one.
+    ///
+    /// *Mutations this kills:* dropping the `text_bits == dit_bits` agreement arm (a half-packed
+    /// tree borrows a tier's string); and dropping `transformer_numeric_tier_matches` from the
+    /// packed arm (a tree whose DiT declares q4 while its tensors are dense borrows the q4 string).
+    #[test]
+    fn a_disagreeing_component_marker_withholds_the_identity_without_failing_the_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = packed_memory_spec(&tmp, Quant::Q4);
+        // The DiT half now declares q8 while the text encoder still declares q4.
+        write_packed_transformer(&root, 8);
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+                let spec = tier_spec(
+                    &root,
+                    quant,
+                    OffloadPolicy::Sequential,
+                    gen_core::LoadShape::DeferredMaterialization,
+                );
+                assert!(resolved_artifact_tier(&spec).is_none());
+                let contract = build_lens_memory_strategy_contract(provider, &spec);
+                assert!(
+                    contract.calibration.is_none(),
+                    "{provider} {quant:?} must publish no identity for a disagreeing tree"
+                );
+                assert!(contract.conformance_errors().is_empty());
+            }
+        }
+
+        // A declared tier whose tensors do not back it is likewise unnameable.
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        let spec = tier_spec(
+            &root,
+            Some(Quant::Q4),
+            OffloadPolicy::Sequential,
+            gen_core::LoadShape::DeferredMaterialization,
+        );
+        assert!(
+            resolved_artifact_tier(&spec).is_none(),
+            "the q8-shaped packed triple does not back a q4 declaration"
+        );
+        assert!(build_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec)
+            .calibration
+            .is_none());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3692,8 +4231,12 @@ mod integration_tests {
         let (eligible_root, eligible) = packed_memory_spec(&tmp, Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&eligible, true);
         let _detected_contract = build_lens_memory_strategy_contract(MODEL_ID_BASE, &eligible);
-        let base_contract =
-            build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_BASE, &eligible, true);
+        let base_contract = build_lens_memory_strategy_contract_with_eligibility(
+            MODEL_ID_BASE,
+            &eligible,
+            true,
+            production_calibration_identity(MODEL_ID_BASE, &eligible),
+        );
         assert_eq!(base_contract.provider_id, MODEL_ID_BASE);
         assert!(base_contract.conformance_errors().is_empty());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
@@ -3740,10 +4283,16 @@ mod integration_tests {
             contract.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
         );
+        // sc-22732: q4 and q8 are two different resident sets, so they are two different cells. The
+        // pre-sc-22732 `assert_eq!` here was the identity collision itself, asserted as a property.
         let (q8_root, q8_spec) = packed_memory_spec(&tmp, Quant::Q8);
         let q8_contract =
             build_lens_turbo_memory_strategy_contract_with_eligibility(&q8_spec, true);
-        assert_eq!(contract.calibration, q8_contract.calibration);
+        assert_ne!(contract.calibration, q8_contract.calibration);
+        assert_eq!(
+            q8_contract.calibration.as_ref().unwrap().fingerprint,
+            "lens-turbo-q8-candle-cuda-shared-ladder-v1"
+        );
         let mut adapted = eligible.clone();
         adapted.adapters.push(AdapterSpec::new(
             eligible_root.join("adapter.safetensors"),
@@ -3775,10 +4324,10 @@ mod integration_tests {
                     .support,
                 MemoryStrategySupport::Missing
             ));
-            assert_eq!(
-                contract.calibration.as_ref().unwrap().fingerprint,
-                MEMORY_CALIBRATION_FINGERPRINT
-            );
+            // sc-22732: these three specs point at `/nonexistent/lens`, so no tier is provable and
+            // no cell is nameable. Before sc-22732 they all published the measured q4 Lens-Turbo
+            // string, which is the weights-free/unprovable leak this story closes.
+            assert!(contract.calibration.is_none());
         }
         std::fs::remove_dir_all(eligible_root).ok();
         std::fs::remove_dir_all(q8_root).ok();

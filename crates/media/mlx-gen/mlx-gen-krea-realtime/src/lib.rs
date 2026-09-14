@@ -164,7 +164,10 @@ pub use load::{
     resolve_snapshot_quant, verify_transformer_tensors, TensorSpec, PACKED_LINEARS_PER_BLOCK,
 };
 pub use memory_strategy::resolved_numeric_tier;
-pub use memory_strategy::{canonical_artifact_identity, memory_strategy_contract};
+pub use memory_strategy::{
+    canonical_artifact_identity, memory_strategy_contract, production_calibration_fingerprint,
+    production_calibration_identity, STATIC_BEHAVIOR_FINGERPRINT,
+};
 pub use pipeline::{descriptor, load as load_generator, KreaRealtime, SELF_FORCING_SAMPLER};
 pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS};
 pub use t2v::{

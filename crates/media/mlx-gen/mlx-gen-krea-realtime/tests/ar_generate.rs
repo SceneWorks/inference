@@ -230,6 +230,7 @@ fn params(seed: u64, frames: usize, steps: Option<usize>) -> ArGenParams {
         latent_height: 4,
         latent_width: 4,
         fps: 16,
+        memory: Default::default(),
     }
 }
 
@@ -394,6 +395,7 @@ fn generate_latents_rejects_geometry_mismatch() {
         latent_height: 8,
         latent_width: 4,
         fps: 16,
+        memory: Default::default(),
     };
     let err = generate_latents(&causal, &cfg, &ctx, &bad, &no_cancel(), &mut sink())
         .expect_err("mismatched per-frame token count must be rejected");

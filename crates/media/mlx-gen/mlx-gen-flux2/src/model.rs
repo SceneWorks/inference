@@ -185,6 +185,10 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
             mlx_gen::residency::warn_sequential_requantize(variant.id(), q.bits());
         }
     }
+    // Verify the Klein artifact inventory ONCE for this load, before the encoder source is
+    // selected, and thread it through the memory contract instead of re-walking every component
+    // directory per consumer. A pinned turnkey that fails its inventory refuses here.
+    let inventory = klein_inventory_for(variant, spec)?;
     // The dev checkpoint has a different tokenizer (Mistral3, not Qwen3) than klein.
     let text_encoder_source = variant.encoder_contract().source_for_load(spec, root)?;
     let tokenizer = if variant.is_dev() {
@@ -196,7 +200,11 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
-        memory_strategy: crate::memory_strategy::contract_for_variant(variant, spec)?,
+        memory_strategy: crate::memory_strategy::contract_for_variant_with_inventory(
+            variant,
+            spec,
+            inventory.as_ref(),
+        )?,
         memory_numeric_tier: Some(memory_numeric_tier),
         loaded_spec: spec.clone(),
         tokenizer: Some(tokenizer),
@@ -263,6 +271,9 @@ fn load_flux2_text(
     multimodal_encoder_source: &mlx_gen::gen_core::ValidatedEncoderSource,
     text_encoder_load_time_quant_bits: Option<i32>,
 ) -> Result<Flux2TextOwned> {
+    // Derived from the *validated* source, never from a second read of the on-disk `quantization`
+    // block (sc-22727).
+    let klein_quant = loader::validated_text_encoder_quant(text_encoder_source);
     text_encoder_source.read_unchanged(|source| {
         let (mut text_encoder, vision_tower, projector) = if variant.is_dev() {
             let (encoder, vision_tower, projector) =
@@ -271,7 +282,11 @@ fn load_flux2_text(
                 })?;
             (encoder, Some(vision_tower), Some(projector))
         } else {
-            (loader::load_text_encoder_from_source(source)?, None, None)
+            (
+                loader::load_text_encoder_from_source(source, klein_quant)?,
+                None,
+                None,
+            )
         };
         if let Some(bits) = text_encoder_load_time_quant_bits {
             text_encoder.quantize(bits)?;
@@ -296,6 +311,7 @@ fn load_flux2_heavy(
     variant: Flux2Variant,
     spec: &LoadSpec,
     load_pid: bool,
+    stream_transformer_blocks: bool,
 ) -> Result<Flux2HeavyOwned> {
     let root = resolve_root(variant, spec)?;
     let mut transformer = if variant.is_dev() {
@@ -329,9 +345,13 @@ fn load_flux2_heavy(
                     .to_owned(),
             )
         })?;
-        let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
-        transformer = transformer.with_block_stream(inventory, variant.config(), quant);
-        transformer.finalize_block_stream()?;
+        // Deferred loading is an available execution shape, not a request to evict blocks.
+        // Keep the exact inventory check for every lazy load, including shallow requests.
+        if stream_transformer_blocks {
+            let quant = crate::loader::read_component_quant(&root.join("transformer"))?;
+            transformer = transformer.with_block_stream(inventory, variant.config(), quant);
+            transformer.finalize_block_stream()?;
+        }
     }
     // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
     // when the spec carries it AND this generate uses it (`load_pid`, F-177). The student is shared
@@ -396,14 +416,8 @@ fn build_residency_with_source_and_multimodal_contracts(
     vision_contract: mlx_gen::gen_core::VisionEncoderContract,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let root = resolve_root(variant, spec)?;
-    // Klein artifacts intentionally keep Qwen3 dense in every Q4/Q8 tier. Dev applies the
-    // effective transformer tier to its language tower, including an already-packed snapshot.
-    let effective_quant_bits = variant
-        .is_dev()
-        .then(|| effective_base_quant(spec, root, variant.id()))
-        .transpose()?
-        .flatten()
-        .map(mlx_gen::gen_core::Quant::bits);
+    let effective_quant_bits =
+        expected_language_quant_bits(variant, spec, root, &text_encoder_source)?;
     let text_encoder_load_time_quant_bits =
         text_encoder_source.load_time_quant_bits(effective_quant_bits, variant.id())?;
     let multimodal_encoder_source = if variant.is_dev() {
@@ -431,9 +445,9 @@ fn build_residency_from_admitted_sources(
     text_encoder_load_time_quant_bits: Option<i32>,
 ) -> Result<Residency<Flux2TextOwned, Flux2HeavyOwned>> {
     let spec_heavy = spec.clone();
-    Residency::from_policy(
+    Residency::request_scoped_from_policy(
         spec.offload_policy,
-        move || {
+        move |_streamable| {
             load_flux2_text(
                 variant,
                 &text_encoder_source,
@@ -441,8 +455,60 @@ fn build_residency_from_admitted_sources(
                 text_encoder_load_time_quant_bits,
             )
         },
-        move |use_pid| load_flux2_heavy(variant, &spec_heavy, use_pid),
+        move |use_pid, streamable| load_flux2_heavy(variant, &spec_heavy, use_pid, streamable),
     )
+}
+
+/// Verify the Klein artifact inventory for one load or admission — `None` for Dev, for a
+/// [`LoadSpec::text_encoder`] override (which skips artifact verification), and for a Klein
+/// source that matches no pinned artifact. A pinned turnkey that fails its inventory is an error,
+/// never a fallback to the ordinary path.
+///
+/// Callers hold the result and thread it through
+/// [`crate::memory_strategy::contract_for_variant_with_inventory`] so one load/admission verifies
+/// the inventory exactly once instead of re-walking three component directories and re-parsing
+/// every shard header per consumer. The text encoder itself always takes
+/// [`mlx_gen::gen_core::EncoderContract::source_for_load`]: the inventory admits no encoder the
+/// shared contract would refuse (sc-22760).
+pub(crate) fn klein_inventory_for(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+) -> Result<Option<crate::artifact_inventory::KleinArtifactInventory>> {
+    if variant.is_dev() || spec.text_encoder.is_some() {
+        return Ok(None);
+    }
+    Ok(crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(variant.id(), spec)?)
+}
+
+/// The packed tier the language tower is expected to run at, or `None` for dense.
+///
+/// Dev applies the effective transformer tier to its language tower, so a dense Mistral tower is
+/// folded at load and a pre-packed one must already sit at that tier. Klein admits its Qwen3 tower
+/// exactly as stored: a dense encoder stays dense (every pinned turnkey tier, sc-22727/sc-22760),
+/// and a packed encoder must sit at the transformer's own tier — a tier is a whole-pipeline
+/// contract, so a Q8 encoder on a Q4 transformer is refused rather than silently served above tier.
+///
+/// # Reachability
+///
+/// The Klein packed arm (`selected.packed_quant_bits().is_some()`) is **unreachable for every
+/// pinned revision**: the SceneWorks re-hosts ship a dense Qwen3 tower at every tier and
+/// `KleinArtifactInventory` refuses any text-encoder `quantization` marker (sc-22760), so only an
+/// unpinned Klein snapshot or a [`LoadSpec::text_encoder`] override can reach it. Landing a packed
+/// Klein tower is **not** a drop-in: SceneWorks `config/tier-integrity.jsonc` declares an
+/// unconditional dense text-encoder exception for the klein rows with fixed `costBytesByTier`, so
+/// such an artifact and a matching `tier-integrity.jsonc` update must land together or admission
+/// will price the tower dense while the load runs it packed.
+fn expected_language_quant_bits(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    root: &Path,
+    selected: &mlx_gen::gen_core::ValidatedEncoderSource,
+) -> Result<Option<i32>> {
+    if variant.is_dev() || selected.packed_quant_bits().is_some() {
+        Ok(effective_base_quant(spec, root, variant.id())?.map(mlx_gen::gen_core::Quant::bits))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn effective_base_quant(
@@ -507,7 +573,7 @@ pub struct Flux2 {
     /// The (small, always-warm) tokenizer. `None` only for the weightless `new_for_tests` instances;
     /// the production load path always populates it.
     tokenizer: Option<TextTokenizer>,
-    /// Component-residency strategy (sc-10840), selected from [`LoadSpec::offload_policy`]. `Resident`
+    /// Component residency: Dev requests can override the [`LoadSpec::offload_policy`] default. `Resident`
     /// (default) holds the text encoder (+ dev vision tower/projector) + DiT + VAE warm; `Sequential`
     /// holds only the per-phase loader closures and re-loads per generation in phase order (encode →
     /// **drop the text encoder** → denoise/decode). Weightless test instances hold loader closures that
@@ -905,8 +971,10 @@ impl Generator for Flux2 {
             self.variant.is_edit(),
             self.variant.is_kv(),
             req,
-        )
-        .map_err(Into::into)
+        )?;
+        request_transformer_window(self.variant, &self.loaded_spec, req)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     fn generate(
@@ -981,6 +1049,33 @@ impl Generator for Flux2 {
     }
 }
 
+fn request_stages_residency(default: bool, req: &GenerationRequest) -> bool {
+    req.memory
+        .as_ref()
+        .map_or(default, |memory| memory.stage_residency)
+}
+
+/// Bind the requested block execution to the admitted load shape before any component work.
+fn request_transformer_window(
+    variant: Flux2Variant,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<Option<usize>> {
+    let window = crate::memory_strategy::transformer_window(req)?;
+    if let Some(size) = window {
+        if variant.is_dev()
+            || !crate::memory_strategy::klein_streamable(spec)
+            || !request_stages_residency(spec.offload_policy == OffloadPolicy::Sequential, req)
+            || size != crate::memory_strategy::TRANSFORMER_WINDOW_SIZE as usize
+        {
+            return Err(Error::Unsupported(
+                "flux2: transformer windows require a streamable Klein load, staged residency, and the supported DiT block window".to_owned(),
+            ));
+        }
+    }
+    Ok(window)
+}
+
 /// Resolve the classifier-free negative branch for a request.
 ///
 /// All Klein variants share this path (txt2img, edit, and KV edit): an explicit guidance scale above
@@ -1037,6 +1132,7 @@ impl Flux2 {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        let transformer_window = request_transformer_window(self.variant, &self.loaded_spec, req)?;
         // Resolve an omitted seed exactly once, then share it with both the autoregressive caption
         // sampler and diffusion. Calling `default_seed` independently in those phases makes a
         // request irreproducible and lets its provenance name only one of two actual seeds.
@@ -1059,14 +1155,16 @@ impl Flux2 {
         // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
         let embedded_guidance = self.variant.uses_embedded_guidance().then_some(guidance);
 
-        // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the text encoder
+        // Request-selected staging (or the Sequential load default) loads the text encoder
         // (+ dev vision tower/projector), runs any caption upsample + the prompt encode, materializes,
         // then DROPS them + `clear_cache()` before the DiT/VAE load below — the peak-bounding win. Under
         // `Resident` it borrows the warm encoder and runs the identical encode/denoise/decode with no
         // eval/clear. The edit reference conditioning that must PERSIST through denoise is VAE-encoded in
         // the heavy phase (after the TE drop), byte-identical to the resident order (a deterministic,
         // TE-independent VAE encode — same hoist argument as the img2img init latents).
-        self.residency.run(
+        self.residency.run_request_scoped(
+            request_stages_residency(self.residency.is_sequential(), req),
+            transformer_window.is_some(),
             &req.cancel,
             req.use_pid,
             on_progress,
@@ -1218,12 +1316,7 @@ impl Flux2 {
                         } else {
                             crate::memory_strategy::attention_plan(req)
                         },
-                        if self.variant.is_dev() {
-                            None
-                        } else {
-                            crate::memory_strategy::transformer_window(req)?
-                                .map(|size| (size, &req.cancel))
-                        },
+                        transformer_window.map(|size| (size, &req.cancel)),
                     )?;
                     let idx =
                         Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
@@ -1564,10 +1657,41 @@ pub(crate) fn component_footprint_for(
     include_builtin_multimodal: bool,
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    // A pinned Klein turnkey that fails its artifact inventory refuses the footprint outright
+    // rather than pricing the ordinary encoder path over the same directory.
+    klein_inventory_for(variant, spec)?;
     component_footprint_for_with_contracts(
         variant,
         provider_id,
         include_builtin_multimodal,
+        spec,
+        variant.encoder_contract(),
+        crate::config::DEV_ENCODER_CONTRACT,
+        crate::config::DEV_VISION_ENCODER_CONTRACT,
+    )
+}
+
+/// [`component_footprint_for`] for a Klein provider whose inventory the caller has already
+/// verified — the admission path (`memory_strategy::klein_contract_with_inventory`) holds one and
+/// must not re-verify it, and the footprint itself prices from the shared encoder contract alone.
+pub(crate) fn klein_component_footprint(
+    provider_id: &str,
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let variant = match provider_id {
+        crate::config::FLUX2_KLEIN_9B_ID => Flux2Variant::Klein9b,
+        crate::config::FLUX2_KLEIN_9B_EDIT_ID => Flux2Variant::Klein9bEdit,
+        crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID => Flux2Variant::Klein9bKvEdit,
+        _ => {
+            return Err(mlx_gen::gen_core::Error::Unsupported(format!(
+                "unknown FLUX.2 Klein memory provider {provider_id}"
+            )))
+        }
+    };
+    component_footprint_for_with_contracts(
+        variant,
+        provider_id,
+        false,
         spec,
         variant.encoder_contract(),
         crate::config::DEV_ENCODER_CONTRACT,
@@ -1600,20 +1724,10 @@ fn component_footprint_for_with_contracts(
         }
     };
     let selected = language_contract.source_for_load(spec, root)?;
-    // Dev's selected language tower follows the transformer tier exactly, including a pre-packed
-    // base selected without `LoadSpec::quantize`. Klein intentionally keeps Qwen dense. Resolve and
-    // validate that policy here, at the registry footprint consumed by the estimated fit fallback,
-    // so admission cannot underprice a dense alternate or accept a packed mismatch the loader rejects.
-    let expected_language_bits = if variant.is_dev() {
-        effective_base_quant(spec, root, provider_id)?.map(mlx_gen::Quant::bits)
-    } else {
-        // Klein's published tiers deliberately keep Qwen exactly as stored. Do not inherit the
-        // transformer request or reinterpret an existing encoder pack in this Dev-only fallback.
-        None
-    };
-    // Always run the selected source through the contract's packed-policy gate. Klein's deliberate
-    // `None` rejects packed Dir/File/complete-snapshot encoders instead of admitting a surface the
-    // concrete loader rejects.
+    // Resolve and validate the language-tier policy here, at the registry footprint consumed by
+    // the estimated fit fallback, so admission cannot underprice a dense alternate or accept a
+    // packed mismatch the loader rejects: see `expected_language_quant_bits`.
+    let expected_language_bits = expected_language_quant_bits(variant, spec, root, &selected)?;
     let language_load_time_quant_bits =
         selected.load_time_quant_bits(expected_language_bits, provider_id)?;
     let language = selected.materialized_language_tensor_headers(&language_contract)?;
@@ -2176,6 +2290,237 @@ mod tests {
             panic!("loaded T2I generator must reject a tier mismatch");
         };
         assert!(reason.contains("does not match loaded tier"), "{reason}");
+    }
+
+    #[test]
+    fn request_staging_overrides_the_load_default_only_when_selected() {
+        for default in [false, true] {
+            let mut req = GenerationRequest::default();
+            assert_eq!(request_stages_residency(default, &req), default);
+            for stage in [true, false, true] {
+                req.memory = Some(mlx_gen::gen_core::GenerationMemory {
+                    stage_residency: stage,
+                    ..Default::default()
+                });
+                assert_eq!(request_stages_residency(default, &req), stage);
+            }
+        }
+    }
+
+    fn deferred_klein_spec() -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(OffloadPolicy::Sequential);
+        spec.load_shape = mlx_gen::gen_core::LoadShape::DeferredMaterialization;
+        spec
+    }
+
+    #[test]
+    fn klein_request_residency_preserves_warm_and_staged_materialization() {
+        use std::sync::{Arc, Mutex};
+
+        struct Runtime;
+        impl mlx_gen::gen_core::ResidencyRuntime for Runtime {
+            type Error = mlx_gen::Error;
+            fn after_component_drop() {}
+        }
+        struct Component {
+            name: &'static str,
+            streamable: bool,
+            events: Arc<Mutex<Vec<(&'static str, bool)>>>,
+        }
+        impl Drop for Component {
+            fn drop(&mut self) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push((self.name, self.streamable));
+            }
+        }
+
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            let spec = deferred_klein_spec();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let text_events = Arc::clone(&events);
+            let heavy_events = Arc::clone(&events);
+            let residency =
+                mlx_gen::gen_core::Residency::<_, _, Runtime>::request_scoped_from_policy(
+                    spec.offload_policy,
+                    move |streamable| {
+                        text_events.lock().unwrap().push(("load-text", streamable));
+                        Ok(Component {
+                            name: "drop-text",
+                            streamable,
+                            events: Arc::clone(&text_events),
+                        })
+                    },
+                    move |_, streamable| {
+                        heavy_events
+                            .lock()
+                            .unwrap()
+                            .push(("load-heavy", streamable));
+                        Ok(Component {
+                            name: "drop-heavy",
+                            streamable,
+                            events: Arc::clone(&heavy_events),
+                        })
+                    },
+                )
+                .unwrap();
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "Sequential load must stay lazy"
+            );
+            let run = |req: &GenerationRequest| {
+                let window = request_transformer_window(variant, &spec, req)?;
+                residency.run_request_scoped(
+                    request_stages_residency(residency.is_sequential(), req),
+                    window.is_some(),
+                    &req.cancel,
+                    false,
+                    &mut |_| {},
+                    |text| Ok(text.streamable),
+                    |_| {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(("materialize", window.is_some()));
+                        Ok(())
+                    },
+                    |heavy, encoded, _| {
+                        assert_eq!(encoded, window.is_some());
+                        assert_eq!(heavy.streamable, window.is_some());
+                        Ok(())
+                    },
+                )
+            };
+            let mut req = GenerationRequest {
+                memory: Some(mlx_gen::gen_core::GenerationMemory::default()),
+                ..Default::default()
+            };
+            run(&req).unwrap();
+            run(&req).unwrap();
+            // Other shallow optimizations preserve the same complete warm components.
+            req.memory.as_mut().unwrap().tile_vae_decode = true;
+            req.memory.as_mut().unwrap().chunk_attention = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("load-text", false), ("load-heavy", false)]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory.as_mut().unwrap().stage_residency = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    ("drop-text", false),
+                    ("drop-heavy", false),
+                    ("load-text", false),
+                    ("materialize", false),
+                    ("drop-text", false),
+                    ("load-heavy", false),
+                    ("drop-heavy", false),
+                ]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory.as_mut().unwrap().stream_transformer_blocks = true;
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    ("load-text", true),
+                    ("materialize", true),
+                    ("drop-text", true),
+                    ("load-heavy", true),
+                    ("drop-heavy", true),
+                ]
+            );
+            events.lock().unwrap().clear();
+
+            req.memory = Some(mlx_gen::gen_core::GenerationMemory::default());
+            run(&req).unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                [("load-text", false), ("load-heavy", false)]
+            );
+            events.lock().unwrap().clear();
+            req.memory.as_mut().unwrap().stage_residency = true;
+            req.memory.as_mut().unwrap().stream_transformer_blocks = true;
+            req.cancel.cancel();
+            assert!(matches!(run(&req), Err(Error::Canceled)));
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "cancellation must preserve the warm pair"
+            );
+        }
+    }
+
+    #[test]
+    fn klein_request_windows_reject_incompatible_loads_before_component_work() {
+        let spec = deferred_klein_spec();
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            memory: Some(mlx_gen::gen_core::GenerationMemory {
+                stage_residency: true,
+                stream_transformer_blocks: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for variant in [
+            Flux2Variant::Klein9b,
+            Flux2Variant::Klein9bEdit,
+            Flux2Variant::Klein9bKvEdit,
+        ] {
+            assert_eq!(
+                request_transformer_window(variant, &spec, &req).unwrap(),
+                Some(1)
+            );
+        }
+        for variant in [Flux2Variant::Dev, Flux2Variant::DevEdit] {
+            assert!(request_transformer_window(variant, &spec, &req).is_err());
+        }
+        let mut model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        for axis in [
+            "resident",
+            "eager",
+            "quantized",
+            "unstaged",
+            "zero-window",
+            "large-window",
+        ] {
+            model.loaded_spec = spec.clone();
+            let mut invalid = req.clone();
+            match axis {
+                "resident" => model.loaded_spec.offload_policy = OffloadPolicy::Resident,
+                "eager" => {
+                    model.loaded_spec.load_shape =
+                        mlx_gen::gen_core::LoadShape::EagerMaterialization
+                }
+                "quantized" => model.loaded_spec.quantize = Some(Quant::Q4),
+                "unstaged" => invalid.memory.as_mut().unwrap().stage_residency = false,
+                "zero-window" => invalid.memory.as_mut().unwrap().transformer_window_size = Some(0),
+                "large-window" => {
+                    invalid.memory.as_mut().unwrap().transformer_window_size = Some(2)
+                }
+                _ => unreachable!(),
+            }
+            let error = model
+                .generate(&invalid, &mut |_| {
+                    panic!("invalid window must not start loading")
+                })
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("transformer windows require"),
+                "{axis}: {error}"
+            );
+        }
     }
 
     fn dev_tier_spec(root: &Path, packed_bits: Option<i32>, requested: Option<Quant>) -> LoadSpec {
@@ -3309,6 +3654,7 @@ mod tests {
         } else {
             crate::config::bounded_klein_encoder_contract()
         };
+        klein_inventory_for(variant, spec)?;
         component_footprint_for_with_contracts(
             variant,
             provider_id,
@@ -3556,24 +3902,18 @@ mod tests {
         );
     }
 
+    /// sc-22727: Klein admits its Qwen3 tower exactly as stored. Dense facts price dense with no
+    /// load-time fold; packed facts price their stored packed bytes only at the transformer's own
+    /// tier. A packed encoder over a dense (bf16) transformer, or at the other packed tier, is
+    /// refused rather than silently served above or below the whole-pipeline tier.
     #[test]
-    fn klein_projection_policy_keeps_dense_language_stored_and_rejects_packed_facts() {
+    fn klein_projection_policy_prices_language_as_stored_and_rejects_off_tier_packing() {
         let routes = [
             FLUX2_KLEIN_9B_ID,
             FLUX2_KLEIN_9B_EDIT_ID,
             crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
         ];
         let dense_headers = exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, None);
-        let packed_headers = [
-            (
-                4,
-                exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, Some(4)),
-            ),
-            (
-                8,
-                exact_encoder_header_facts(crate::config::KLEIN_ENCODER_CONTRACT, Some(8)),
-            ),
-        ];
         let expected_dense = expected_stored_header_bytes(&dense_headers);
 
         for route in routes {
@@ -3590,42 +3930,81 @@ mod tests {
                 expected_dense,
                 "dense {route}"
             );
-            for (packed_bits, headers) in &packed_headers {
-                let error = projected_conditioning_from_exact_facts(
+            for packed_bits in [4, 8] {
+                let headers = exact_encoder_header_facts(
                     crate::config::KLEIN_ENCODER_CONTRACT,
-                    headers,
-                    Some(*packed_bits),
-                    None,
-                    None,
-                    route,
-                )
-                .unwrap_err()
-                .to_string();
-                assert!(
-                    error.contains(route)
-                        && error.contains("pre-quantized")
-                        && error.contains("model policy"),
-                    "packed Q{packed_bits} {route}: {error}"
+                    Some(packed_bits),
                 );
+                let expected_packed = expected_stored_header_bytes(&headers);
+                assert!(expected_packed < expected_dense, "Q{packed_bits} {route}");
+                assert_eq!(
+                    projected_conditioning_from_exact_facts(
+                        crate::config::KLEIN_ENCODER_CONTRACT,
+                        &headers,
+                        Some(packed_bits),
+                        Some(packed_bits),
+                        None,
+                        route,
+                    )
+                    .unwrap(),
+                    expected_packed,
+                    "packed Q{packed_bits} at tier {route}"
+                );
+                let other_bits = if packed_bits == 4 { 8 } else { 4 };
+                for expected_bits in [None, Some(other_bits)] {
+                    let error = projected_conditioning_from_exact_facts(
+                        crate::config::KLEIN_ENCODER_CONTRACT,
+                        &headers,
+                        Some(packed_bits),
+                        expected_bits,
+                        None,
+                        route,
+                    )
+                    .unwrap_err()
+                    .to_string();
+                    assert!(
+                        error.contains(route)
+                            && error.contains("pre-quantized")
+                            && error.contains("model policy"),
+                        "packed Q{packed_bits} against {expected_bits:?} {route}: {error}"
+                    );
+                }
             }
         }
 
-        // One complete-snapshot packed source proves the registry still feeds selected-source
-        // quantization evidence into the pure Klein policy. The exhaustive assertions above keep
-        // all three routes and both packed tiers covered from distinct in-memory policy facts.
-        let packed_tmp = tempfile::tempdir().unwrap();
-        let packed = klein_footprint_spec(
-            packed_tmp.path(),
+        // The registry seam feeds selected-source quantization evidence into the same policy: a
+        // complete-snapshot Q4 encoder over a Q4 base prices as stored, and the same encoder over
+        // a Q8 base is refused.
+        let matched_tmp = tempfile::tempdir().unwrap();
+        let matched = klein_footprint_spec(
+            matched_tmp.path(),
+            DevFootprintSelection::CompleteSnapshot,
+            Some(4),
+            None,
+            Some(4),
+        );
+        let footprint = bounded_component_footprint_for(
+            Flux2Variant::Klein9bKvEdit,
+            crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
+            false,
+            &matched,
+        )
+        .unwrap();
+        assert!(footprint.text_encoder > 0);
+
+        let mismatched_tmp = tempfile::tempdir().unwrap();
+        let mismatched = klein_footprint_spec(
+            mismatched_tmp.path(),
             DevFootprintSelection::CompleteSnapshot,
             Some(8),
-            Some(Quant::Q4),
+            None,
             Some(4),
         );
         let error = bounded_component_footprint_for(
             Flux2Variant::Klein9bKvEdit,
             crate::config::FLUX2_KLEIN_9B_KV_EDIT_ID,
             false,
-            &packed,
+            &mismatched,
         )
         .unwrap_err()
         .to_string();

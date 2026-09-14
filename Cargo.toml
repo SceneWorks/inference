@@ -45,7 +45,9 @@ mlx-gen-catalog = { path = "crates/media/mlx-gen/mlx-gen-catalog" }
 candle-gen-catalog = { path = "crates/media/candle-gen/candle-gen-catalog" }
 candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 
-# MLX fork pinned by commit SHA. The pinned rev is bd8f0e3c = 7151a9b2 + the sc-21382 prebuilt
+# MLX fork pinned by commit SHA. d5a7fc01 adds sc-23053 recoverable async read errors,
+# EINTR/partial-read handling, and per-array failure isolation. Its parent bd8f0e3c
+# is 7151a9b2 + the sc-21382 prebuilt
 # seam (build.rs links a prebuilt libmlx from PMETAL_MLX_PREBUILT_DIR after verifying its
 # manifest key, declares rerun-if-env-changed on the deployment target, and the fork's
 # prebuilt-mlx workflow publishes per-commit `prebuilt-<sha12>` releases —
@@ -58,8 +60,8 @@ candle-audio-catalog = { path = "crates/audio/candle-audio-catalog" }
 # Metal, CUDA, and no-GPU backend definitions, and fail-closed Metal ABI/index/dispatch admission on top of the
 # collision-free retained compiler leases and safe TLS teardown while preserving MLX 0.32.0.
 # See mlx-gen/Cargo.toml for lineage.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1" }
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "d5a7fc018d713a37091e1cd102873eab355a00c6" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "d5a7fc018d713a37091e1cd102873eab355a00c6" }
 
 # Candle pins are shared by media and LLM providers.
 # Upstream PR #3531 removes O(groups) launches from unit-stride depthwise convs (sc-12111).

@@ -41,17 +41,49 @@ fn is_edit(provider_id: &str) -> bool {
     )
 }
 
-fn fingerprint(provider_id: &str) -> gen_core::Result<String> {
-    if PROVIDER_IDS.contains(&provider_id) {
-        Ok(format!(
-            "mage-flow-cuda-shared-ladder-provider-abi-v2-{}",
-            provider_id.replace('_', "-")
-        ))
-    } else {
-        Err(gen_core::Error::Unsupported(format!(
-            "unknown Mage-Flow memory provider {provider_id}"
-        )))
+/// The label a tier carries inside a calibration string. `Quant`s this family does not ship are
+/// unnameable; `resolved_quant` has already refused them by the time a string is built.
+fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
     }
+}
+
+/// The production calibration identity of one Candle Mage-Flow (route, tier) cell (sc-22733, epic
+/// sc-22723 E1/E4): `mage-flow-cuda-<provider>-<tier>-shared-ladder-v3`, eighteen distinct
+/// strings.
+///
+/// The tier is an axis of the key because the three tiers of one route are three different
+/// resident sets and one memory anchor cannot price all three. It comes from [`resolved_quant`],
+/// i.e. `spec.quantize` — which on this lane IS the loaded tier: the loader reads the packed DiT
+/// config for that tier (`transformer_has_device_format`) and `crate::quant::component_quant`
+/// folds the request-time quant per component, so there is no separate on-disk tier a knob could
+/// disagree with. The offload policy and the load shape are deliberately NOT axes:
+/// `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately.
+///
+/// `-v3` replaces the per-provider `…-provider-abi-v2-<provider>` string, whose meaning changed:
+/// it named one identity across all three tiers, so no anchor could say which tier it measured.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    quant: Option<Quant>,
+) -> gen_core::Result<String> {
+    if !PROVIDER_IDS.contains(&provider_id) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "unknown Mage-Flow memory provider {provider_id}"
+        )));
+    }
+    let tier = calibration_tier_label(quant).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "Mage-Flow does not ship the {quant:?} numeric tier"
+        ))
+    })?;
+    Ok(format!(
+        "mage-flow-cuda-{}-{tier}-shared-ladder-v3",
+        provider_id.replace('_', "-")
+    ))
 }
 
 fn streamable(spec: &LoadSpec) -> bool {
@@ -516,7 +548,8 @@ pub(crate) fn provider_contract_with_components(
     spec: &LoadSpec,
     components: gen_core::PerComponentBytes,
 ) -> gen_core::Result<MemoryProviderContract> {
-    let calibration_fingerprint = fingerprint(provider_id)?;
+    let calibration_fingerprint =
+        production_calibration_fingerprint(provider_id, resolved_quant(spec)?)?;
     let streamable = streamable(spec) && transformer_has_device_format(spec)?;
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -1633,6 +1666,69 @@ mod tests {
             .unwrap()
             .architecture_facts
             .is_empty());
+    }
+
+    /// sc-22733 (epic sc-22723, E1 measurable / E4 production loader): every Candle Mage cell —
+    /// six routes × three tiers — publishes its OWN production identity, keyed on the route and
+    /// the tier, under both load shapes and both offload policies, so a memory anchor can name the
+    /// cell it measured. Before this the crate published one string per route across all three
+    /// tiers (`…-provider-abi-v2-<provider>`).
+    ///
+    /// *Mutations this kills:* restoring the tier-free `-v2` string (eighteen collapse to six and
+    /// the distinctness assert fails); keying on the load shape or the offload policy (the four
+    /// specs per cell disagree); replaying one route's string on another; and naming a tier this
+    /// family does not ship (`Nvfp4` must be an error, never a neighbour's string).
+    #[test]
+    fn every_cell_publishes_its_own_per_tier_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut published = std::collections::BTreeSet::new();
+        for id in PROVIDER_IDS {
+            for (quant, tier) in [
+                (None, "bf16"),
+                (Some(Quant::Q4), "q4"),
+                (Some(Quant::Q8), "q8"),
+            ] {
+                let expected = production_calibration_fingerprint(id, quant).unwrap();
+                assert!(expected.contains(tier), "{id} {tier}: {expected}");
+                assert!(expected.ends_with("-shared-ladder-v3"), "{expected}");
+                assert!(!expected.contains("abi-v2"), "{expected}");
+                for (offload, load_shape) in [
+                    (
+                        gen_core::OffloadPolicy::Resident,
+                        LoadShape::EagerMaterialization,
+                    ),
+                    (
+                        gen_core::OffloadPolicy::Sequential,
+                        LoadShape::EagerMaterialization,
+                    ),
+                    (
+                        gen_core::OffloadPolicy::Resident,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                    (
+                        gen_core::OffloadPolicy::Sequential,
+                        LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let mut spec = spec(&tmp)
+                        .with_offload_policy(offload)
+                        .with_load_shape(load_shape);
+                    spec.quantize = quant;
+                    let contract = provider_contract_for(id, &spec).unwrap();
+                    let identity = contract.calibration.as_ref().unwrap();
+                    assert_eq!(identity.fingerprint, expected, "{id} {tier}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{id} {tier} repeats another cell's identity: {expected}"
+                );
+            }
+            assert!(production_calibration_fingerprint(id, Some(Quant::Nvfp4)).is_err());
+        }
+        assert_eq!(published.len(), PROVIDER_IDS.len() * 3);
+        assert!(production_calibration_fingerprint("mage_flow_unknown", None).is_err());
     }
 
     #[test]

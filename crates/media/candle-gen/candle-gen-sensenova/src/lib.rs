@@ -332,10 +332,20 @@ impl SenseNovaGenerator {
                 )?
             };
             // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
-            Ok(tensor_to_image(&img)?)
+            decode_generated_image(&img, on_progress)
         })?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+// SenseNova denoises directly in pixel space. Its decode phase is the final RGB8
+// materialization and device-to-host transfer, which still needs a lifecycle boundary.
+fn decode_generated_image(
+    image: &candle_gen::candle_core::Tensor,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<gen_core::Image> {
+    on_progress(Progress::Decoding);
+    Ok(tensor_to_image(image)?)
 }
 
 impl Generator for SenseNovaGenerator {
@@ -1113,6 +1123,24 @@ mod tests {
             }
             self.outcomes.push(outcome);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn rgb_materialization_reports_decode_before_success_or_failure() {
+        use candle_gen::candle_core::Tensor;
+        for channels in [3, 2] {
+            let pixels = Tensor::zeros((1, channels, 2, 4), DType::F32, &Device::Cpu).unwrap();
+            let mut events = Vec::new();
+            let result = decode_generated_image(&pixels, &mut |event| events.push(event));
+            assert_eq!(events.len(), 1);
+            assert!(matches!(events[0], Progress::Decoding));
+            if channels == 3 {
+                let image = result.unwrap();
+                assert_eq!((image.width, image.height, image.pixels.len()), (4, 2, 24));
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 

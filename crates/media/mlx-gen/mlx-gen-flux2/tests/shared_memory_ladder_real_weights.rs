@@ -451,3 +451,63 @@ fn full_ladder_composes_with_the_pid_decode_domain() {
         image.height,
     );
 }
+
+/// sc-23207: the application may admit Resident after selecting a deferred load shape.
+/// Exercise both PreserveLoadDefaults (the provider's Resident scope) and explicit Resident
+/// through the same installed True-V2 generator, rather than querying metadata alone.
+#[test]
+#[ignore = "requires installed True-V2 weights and exclusive Apple/Metal access"]
+fn deferred_true_v2_executes_resident_requests() {
+    let spec = spec_for(true_v2_assembly(), true).with_resolved_route("flux2_klein_9b_true_v2");
+    let generator = mlx_gen_flux2::provider_registry()
+        .unwrap()
+        .load(mlx_gen_flux2::FLUX2_KLEIN_9B_ID, &spec)
+        .unwrap();
+    let mut baseline: Option<Image> = None;
+    for (index, memory) in [None, Some(GenerationMemory::default())]
+        .into_iter()
+        .enumerate()
+    {
+        let mut req = request(GenerationMemory::default());
+        req.memory = memory;
+        let output = generator
+            .generate(&req, &mut |event| {
+                if matches!(event, Progress::Step { .. } | Progress::Decoding) {
+                    eprintln!("True-V2 resident request {index}: {event:?}");
+                }
+            })
+            .expect("deferred True-V2 must execute an admitted Resident request");
+        let GenerationOutput::Images(mut images) = output else {
+            panic!("expected images")
+        };
+        assert_eq!(images.len(), 1);
+        let image = images.pop().unwrap();
+        assert_eq!((image.width, image.height), (req.width, req.height));
+        assert!(
+            image.pixels.iter().any(|pixel| *pixel != image.pixels[0]),
+            "constant output"
+        );
+        if let Some(previous) = &baseline {
+            let (max, mean) = image_delta(previous, &image);
+            assert!(
+                max <= 1,
+                "Resident policy changed pixels: max={max}, mean={mean}"
+            );
+        }
+        if let Some(dir) = std::env::var_os("FLUX2_KLEIN_OUTPUT_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            image::save_buffer(
+                dir.join(format!("true-v2-resident-{index}.png")),
+                &image.pixels,
+                image.width,
+                image.height,
+                image::ColorType::Rgb8,
+            )
+            .unwrap();
+        }
+        baseline = Some(image);
+    }
+    drop(generator);
+    clear_cache();
+}

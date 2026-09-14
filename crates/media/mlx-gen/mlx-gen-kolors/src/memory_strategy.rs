@@ -507,6 +507,170 @@ pub const TRANSFORMER_WINDOW_COMPONENT: TransformerComponent = TransformerCompon
 /// evidence for a Kolors fit, which is precisely the substitution the epic forbids.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "kolors-mlx-chatglm3-sdxl-unet-ladder-v1";
 
+/// Source-owned identity of the **weights-free registry-conformance** surface (sc-22732, epic
+/// sc-22723 E1/E4).
+///
+/// It exists so the declaration walk — which never opens a weight file and therefore never proves
+/// an artifact tier — stops publishing a PRODUCTION string. Until sc-22732 all three entry points
+/// funnelled through `contract_with_asset_facts`, which hard-assigned
+/// [`MEMORY_CALIBRATION_FINGERPRINT`]: a registry-conformance context assembled with no snapshot on
+/// disk satisfied the calibration handshake of a real q4 load.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "kolors-mlx-registry-behavior-v1";
+
+/// Per-surface static behavior identity for the weights-free declaration surfaces.
+///
+/// Same shape as `mlx_gen_lens::memory_strategy::static_behavior_identity`, minus its route token:
+/// **`kolors` is a single provider id.** ControlNet, IP-Adapter and PiD are load-time OVERLAYS on
+/// that one id rather than sibling provider ids, so there is no second route whose handshake could
+/// be replayed against this one and nothing for a route token to discriminate. The axes that do
+/// vary the declared contract shape — execution precision, requested quant and offload policy, plus
+/// the load shape [`MemoryCalibrationIdentity`] already carries — are keyed here so a context
+/// assembled for one declared surface cannot be replayed against another.
+///
+/// `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens, which every token
+/// below already is (this provider id has no `_` to spell as `-`).
+fn static_behavior_identity(spec: &LoadSpec) -> MemoryCalibrationIdentity {
+    let precision = match spec.precision {
+        mlx_gen::Precision::Bf16 => "bf16",
+        mlx_gen::Precision::Fp32 => "fp32",
+    };
+    let quant = match spec.quantize {
+        None => "dense",
+        Some(mlx_gen::Quant::Q4) => "q4",
+        Some(mlx_gen::Quant::Q8) => "q8",
+        Some(mlx_gen::Quant::Nvfp4) => "nvfp4",
+    };
+    let policy = match spec.offload_policy {
+        OffloadPolicy::Resident => "resident",
+        OffloadPolicy::Sequential => "sequential",
+    };
+    MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{precision}-{quant}-{policy}"),
+        spec.load_shape,
+    )
+}
+
+/// Production calibration identity TABLE, keyed on (route, **proven artifact tier**) — sc-22732,
+/// epic sc-22723 E1/E4.
+///
+/// This is the table, not the binding: only `production_calibration_identity`, which proves the
+/// tier against the snapshot on disk first, may turn one of these strings into a contract identity.
+///
+/// Before sc-22732 this family published ONE string for all three advertised tiers, so a memory
+/// anchor captured on q4 was indistinguishable from one captured on q8 or bf16 — three different
+/// resident sets, one key. The q4 cell **preserves** [`MEMORY_CALIBRATION_FINGERPRINT`]
+/// byte-for-byte because q4 is the tier the existing evidence was actually measured on: the module
+/// doc's measured table is labelled "q4 unless stated" (line 40), [`ATTENTION_SUPPORT`] states
+/// "Both are measured on the q4 tier at 1024²" (line 210), and [`TRANSFORMER_WINDOW_SIZE`] records
+/// that "Exactly one row is asserted — q4 / 1024², the sweep's default tier and geometry, which is
+/// also the catalog's default tier" (lines 298-303). Retiring that string would have retired a
+/// measured cell; q8 and bf16 were never measured under it, so they take new, distinct names.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// [`MemoryCalibrationIdentity::load_shape`] carries the materialization axis separately.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<mlx_gen::Quant>,
+) -> Option<String> {
+    if provider_id != crate::MODEL_ID {
+        return None;
+    }
+    match artifact_tier {
+        // The measured cell, preserved verbatim.
+        Some(mlx_gen::Quant::Q4) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        Some(mlx_gen::Quant::Q8) => Some("kolors-q8-mlx-shared-ladder-v1".to_owned()),
+        None => Some("kolors-bf16-mlx-shared-ladder-v1".to_owned()),
+        // A tier this family does not ship is unnameable rather than collapsed onto a neighbour.
+        Some(mlx_gen::Quant::Nvfp4) => None,
+    }
+}
+
+/// Whether this load is a **clean base** load: the three base components and nothing else.
+///
+/// Mirrors `mlx_gen_flux::memory_strategy`'s `clean_base` (its `contract_with_asset_facts`, the
+/// reviewed precedent). Every slot below adds a network that is resident for the whole render —
+/// [`resident_overlay_components`] prices exactly that — so an overlay or an adapter stack is a
+/// different resident set than any clean-base anchor priced, and it must publish no identity.
+fn clean_base(spec: &LoadSpec) -> bool {
+    spec.control.is_none()
+        && spec.extra_controls.is_empty()
+        && spec.ip_adapter.is_none()
+        && spec.identity.is_none()
+        && spec.pid.is_none()
+        && spec.text_encoder.is_none()
+        && spec.components.is_empty()
+        && spec.adapters.is_empty()
+}
+
+/// The tier the snapshot on disk actually **is**, read from the `quantization` marker the converter
+/// writes into each component's `config.json`.
+///
+/// The outer `Option` is "is there an artifact to name at all": `None` for a non-directory source,
+/// which this engine refuses to load anyway (`registry::resolve_root`). The inner `Option<Quant>`
+/// is the tier itself, with `None` meaning dense/bf16.
+///
+/// This crate pins no turnkey repository/revision list, so — exactly as `mlx-gen-chroma` does, the
+/// accepted precedent for an unpinned MLX crate — the on-disk marker alone is the proof, and no
+/// pinned list is invented here to dress it up as a stronger one. The UNet and the ChatGLM3 tower
+/// must AGREE: a snapshot whose two heavy components are packed differently is an error, not a
+/// silent dense answer (the same refusal `candle_gen_kolors::memory_strategy::physical_tier` makes).
+fn resolved_artifact_tier(spec: &LoadSpec) -> mlx_gen::Result<Option<Option<mlx_gen::Quant>>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(None);
+    };
+    let unet = mlx_gen::quant::packed_quant_bits(root, "unet")?;
+    let text_encoder = mlx_gen::quant::packed_quant_bits(root, "text_encoder")?;
+    if unet != text_encoder {
+        return Err(mlx_gen::Error::Unsupported(format!(
+            "kolors: UNet and ChatGLM3 physical tiers differ ({unet:?} vs {text_encoder:?})"
+        )));
+    }
+    Ok(Some(match unet {
+        None => None,
+        Some(4) => Some(mlx_gen::Quant::Q4),
+        Some(8) => Some(mlx_gen::Quant::Q8),
+        Some(bits) => {
+            return Err(mlx_gen::Error::Unsupported(format!(
+                "kolors: unsupported packed tier {bits}-bit"
+            )))
+        }
+    }))
+}
+
+/// The identity a loaded Kolors generator publishes, bound to the artifact it opens.
+///
+/// Four fail-closed gates, in order, with **no short-circuit ahead of the tier proof**:
+///
+/// 1. the id must be this provider — the overlays ride the same id, they are not sibling routes;
+/// 2. the load must be a [`clean_base`] one, because an overlay or an adapter stack is a resident
+///    set no clean-base anchor measured;
+/// 3. execution precision must be bf16, the precision every measured row above was taken at; and
+/// 4. `spec.quantize` must be the tier the artifact on disk already **is**. This engine quantizes
+///    dense at load — see [`load_leaves_blocks_lazy`] — so a dense snapshot opened with
+///    `quantize = Some(Q4)` is a genuine runtime requantization whose peak no anchor priced, while
+///    a packed snapshot opened at its own tier is the checked no-op the worker performs.
+///
+/// Withholding is never fatal. `registry.rs` propagates [`memory_strategy_contract`]'s error into
+/// the LOAD, so a damaged or self-inconsistent marker binds through `.ok().flatten()?` — no
+/// identity, but still a loadable snapshot.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<MemoryCalibrationIdentity> {
+    if provider_id != crate::MODEL_ID
+        || !clean_base(spec)
+        || spec.precision != mlx_gen::Precision::Bf16
+    {
+        return None;
+    }
+    let artifact_tier = resolved_artifact_tier(spec).ok().flatten()?;
+    if artifact_tier != spec.quantize {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, artifact_tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
 /// Whether THIS load can execute rung 4. **Four** independent facts decide it.
 ///
 /// 1. **A re-openable snapshot.** The window rebuilds blocks from the U-Net checkpoint, so the load
@@ -631,6 +795,7 @@ pub fn memory_strategy_contract(
         components.dit,
         components.vae,
         resident_overlay_components(spec)?,
+        production_calibration_identity(provider_id, spec),
     )
 }
 
@@ -773,7 +938,19 @@ pub(crate) fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     // No overlays either: sizing one means opening its checkpoint, and this path exists precisely to
     // produce the declaration without touching a weight file.
-    contract_with_asset_facts(provider_id, spec, streamable(spec), 0, 0, 0, Vec::new())
+    //
+    // For the same reason it cannot prove an artifact tier, so it publishes the source-owned
+    // [`STATIC_BEHAVIOR_FINGERPRINT`] surface identity rather than a production string (sc-22732).
+    contract_with_asset_facts(
+        provider_id,
+        spec,
+        streamable(spec),
+        0,
+        0,
+        0,
+        Vec::new(),
+        Some(static_behavior_identity(spec)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -839,9 +1016,15 @@ pub fn weights_free_surface_contract(
         0,
         0,
         Vec::new(),
+        // Also weights-free: the selector NAMES a resolved tier, it does not prove one on disk.
+        Some(static_behavior_identity(&surface.spec)),
     )
 }
 
+// The three base-component byte counts are one measured triple, and the calibration identity added
+// by sc-22732 pushed the arity one over clippy's default. Bundling them into a struct here would
+// only rename `PerComponentBytes`, which the weights-free callers deliberately do not have.
+#[allow(clippy::too_many_arguments)]
 fn contract_with_asset_facts(
     provider_id: &str,
     spec: &LoadSpec,
@@ -850,6 +1033,7 @@ fn contract_with_asset_facts(
     transformer_bytes: u64,
     decoder_bytes: u64,
     overlays: Vec<MemoryResidentComponent>,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> CoreResult<MemoryProviderContract> {
     let decode_policies = spec.decode_geometry_policies_for_loaded_contract(
         mlx_gen::gen_core::MemoryBackend::Mlx,
@@ -883,10 +1067,10 @@ fn contract_with_asset_facts(
         &mlx_gen_sdxl::VaeConfig::sdxl_base(),
         mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
     );
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
-        spec.load_shape,
-    ));
+    // Decided by the CALLER, never here (sc-22732): production binds the artifact-proven
+    // `production_calibration_identity`, the two weights-free surfaces bind
+    // `static_behavior_identity`, and the two must never be spelled the same.
+    contract.calibration = calibration;
     // Only what the PUBLISHED rungs consume. `DecodeTileArea` and `AttentionChunkSize` are absent
     // because rungs 2 and 3 are declared `Missing` here — a formula that reads a parameter no
     // selectable strategy can set would invite calibration keyed on a value that never varies.
@@ -1480,8 +1664,313 @@ mod tests {
             self
         }
 
+        /// Stamp the advertised tier onto the two heavy components exactly the way the SceneWorks
+        /// converter does: `q4`/`q8` carry the `quantization` marker
+        /// [`mlx_gen::quant::packed_quant_bits`] reads out of `<component>/config.json`, and `bf16`
+        /// carries no marker at all (a missing config is `Ok(None)`, i.e. dense).
+        fn with_tier(self, tier: &str) -> Self {
+            let bits = match tier {
+                "bf16" => return self,
+                "q4" => 4,
+                "q8" => 8,
+                other => panic!("unhandled fixture tier {other}"),
+            };
+            for component in ["unet", "text_encoder"] {
+                std::fs::write(
+                    self.0.join(component).join("config.json"),
+                    format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+                )
+                .unwrap();
+            }
+            self
+        }
+
         fn path(&self, rel: &str) -> std::path::PathBuf {
             self.0.join(rel)
+        }
+    }
+
+    /// The three advertised tiers, paired with the load quant that opens each as the no-op it is.
+    const ADVERTISED_TIERS: [(&str, Option<mlx_gen::Quant>); 3] = [
+        ("bf16", None),
+        ("q4", Some(mlx_gen::Quant::Q4)),
+        ("q8", Some(mlx_gen::Quant::Q8)),
+    ];
+
+    fn tiered_snapshot(tmp: &tempfile::TempDir, tier: &str) -> Snapshot {
+        Snapshot::new(tmp, tier).with_base().with_tier(tier)
+    }
+
+    /// The worker's own MLX still-image load shape, parameterized by the requested quant.
+    fn production_spec(root: &std::path::Path, quant: Option<mlx_gen::Quant>) -> LoadSpec {
+        let spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        match quant {
+            Some(quant) => spec.with_quant(quant),
+            None => spec,
+        }
+    }
+
+    /// Every string the production table can mint, for the distinctness assertions below.
+    fn production_fingerprint_set() -> std::collections::BTreeSet<String> {
+        ADVERTISED_TIERS
+            .into_iter()
+            .filter_map(|(_, quant)| production_calibration_fingerprint(crate::MODEL_ID, quant))
+            .collect()
+    }
+
+    /// sc-22732 (epic sc-22723, E1 measurable / E4 production loader): every advertised Kolors tier
+    /// the worker can load publishes its OWN production calibration identity, under the worker's
+    /// default load shape and under the staged/deferred one, so a memory anchor capture has a
+    /// fingerprint that names the (route, tier) cell it measured. Before sc-22732 all three tiers
+    /// published one string.
+    ///
+    /// *Mutations this kills:* dropping `{tier}` from the table (the three strings collapse to one
+    /// and `published.len()` fails); keying the string on the offload policy or the load shape (the
+    /// two specs per cell would disagree); publishing the weights-free registry string in
+    /// production; and dropping the `artifact_tier != spec.quantize` refusal — the last block opens
+    /// each snapshot at every tier it is NOT, which this engine serves by requantizing at load, a
+    /// peak no anchor measured.
+    #[test]
+    fn every_advertised_tier_publishes_its_own_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut published = std::collections::BTreeSet::new();
+        for (tier, quant) in ADVERTISED_TIERS {
+            let expected = production_calibration_fingerprint(crate::MODEL_ID, quant).unwrap();
+            if quant == Some(mlx_gen::Quant::Q4) {
+                // The one PRESERVED cell: q4 is the tier the module's measured tables were taken
+                // on, so it keeps `MEMORY_CALIBRATION_FINGERPRINT` byte-for-byte and names its
+                // tier only implicitly.
+                assert_eq!(expected, MEMORY_CALIBRATION_FINGERPRINT);
+            } else {
+                assert!(expected.contains(tier), "{tier}: {expected}");
+            }
+            let snapshot = tiered_snapshot(&tmp, tier);
+            assert_eq!(
+                resolved_artifact_tier(&production_spec(&snapshot.0, quant)).unwrap(),
+                Some(quant),
+                "{tier}: the on-disk marker is the proof"
+            );
+
+            for (offload, load_shape) in [
+                (OffloadPolicy::Resident, LoadShape::EagerMaterialization),
+                (
+                    OffloadPolicy::Sequential,
+                    LoadShape::DeferredMaterialization,
+                ),
+            ] {
+                let spec = production_spec(&snapshot.0, quant)
+                    .with_offload_policy(offload)
+                    .with_load_shape(load_shape);
+                let contract = memory_strategy_contract(crate::MODEL_ID, &spec).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{tier} {load_shape:?} publishes no identity"));
+                assert_eq!(identity.fingerprint, expected, "{tier}");
+                assert_eq!(identity.load_shape, load_shape, "{tier}");
+                let weights_free = static_behavior_identity(&spec).fingerprint;
+                assert_ne!(identity.fingerprint, weights_free, "{tier}");
+                assert!(contract.conformance_errors().is_empty(), "{tier}");
+            }
+
+            // The request knob never outranks the artifact: every tier the snapshot is NOT.
+            for (wrong_tier, wrong) in ADVERTISED_TIERS {
+                if wrong == quant {
+                    continue;
+                }
+                assert!(
+                    memory_strategy_contract(crate::MODEL_ID, &production_spec(&snapshot.0, wrong))
+                        .unwrap()
+                        .calibration
+                        .is_none(),
+                    "{tier} must publish nothing for a {wrong_tier} load quant"
+                );
+            }
+            assert!(
+                published.insert(expected.clone()),
+                "{tier} repeats another tier's identity: {expected}"
+            );
+        }
+        // Three distinct strings, one per advertised tier. A tier-blind key collapses this to 1.
+        assert_eq!(published.len(), ADVERTISED_TIERS.len());
+        // The measured cell keeps its byte-for-byte name.
+        assert_eq!(
+            production_calibration_fingerprint(crate::MODEL_ID, Some(mlx_gen::Quant::Q4)).unwrap(),
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
+    }
+
+    /// sc-22732: the two weights-free registry surfaces publish the source-owned
+    /// [`STATIC_BEHAVIOR_FINGERPRINT`] namespace and never a production string. Until sc-22732 all
+    /// three entry points funnelled through `contract_with_asset_facts`, which hard-assigned
+    /// [`MEMORY_CALIBRATION_FINGERPRINT`] — so a conformance context assembled with no snapshot on
+    /// disk satisfied a real q4 load's calibration handshake.
+    ///
+    /// *Mutations this kills:* restoring the unconditional
+    /// `contract.calibration = Some(MemoryCalibrationIdentity::new(MEMORY_CALIBRATION_FINGERPRINT,
+    /// spec.load_shape))` in `contract_with_asset_facts`; and passing
+    /// `production_calibration_identity` from either weights-free entry point.
+    #[test]
+    fn the_weights_free_surfaces_never_publish_a_production_string() {
+        let production = production_fingerprint_set();
+        assert_eq!(production.len(), ADVERTISED_TIERS.len());
+        for shape in [
+            LoadShape::EagerMaterialization,
+            LoadShape::DeferredMaterialization,
+        ] {
+            let contract = weights_free_memory_strategy_contract(crate::MODEL_ID, &spec(shape))
+                .unwrap()
+                .calibration
+                .expect("the declaration surface still carries an identity");
+            assert!(
+                contract
+                    .fingerprint
+                    .starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{}",
+                contract.fingerprint
+            );
+            assert!(!production.contains(&contract.fingerprint));
+            assert_eq!(contract.load_shape, shape);
+        }
+        let surfaces = mlx_gen::gen_core::mlx_memory_contract_surface_specs();
+        assert!(!surfaces.is_empty());
+        for surface in &surfaces {
+            let selector = surface.selector;
+            let contract = weights_free_surface_contract(crate::MODEL_ID, surface).unwrap();
+            let identity = contract.calibration.as_ref().unwrap();
+            assert!(
+                identity
+                    .fingerprint
+                    .starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{selector:?}: {}",
+                identity.fingerprint
+            );
+            assert!(
+                !production.contains(&identity.fingerprint),
+                "{selector:?} replays a production string"
+            );
+            assert_eq!(identity.load_shape, surface.spec.load_shape, "{selector:?}");
+            assert!(contract.conformance_errors().is_empty(), "{selector:?}");
+        }
+    }
+
+    /// sc-22732: an overlay or an adapter stack is a different resident set than the clean base any
+    /// anchor priced ([`resident_overlay_components`] declares exactly those extra networks), so it
+    /// publishes no production identity at all.
+    ///
+    /// *Mutation this kills:* dropping the [`clean_base`] guard from
+    /// `production_calibration_identity` — each load below then borrows the clean q4 cell.
+    #[test]
+    fn an_overlay_or_adapter_load_publishes_no_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tiered_snapshot(&tmp, "q4");
+        let overlay = Snapshot::new(&tmp, "overlay").with_base();
+        let base = production_spec(&snapshot.0, Some(mlx_gen::Quant::Q4));
+        assert!(
+            memory_strategy_contract(crate::MODEL_ID, &base)
+                .unwrap()
+                .calibration
+                .is_some(),
+            "the clean base control must publish one"
+        );
+
+        // `resident_overlay_components` prices an IP-Adapter from these two exact files.
+        overlay.write(
+            "image_encoder/model.safetensors",
+            "vision.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+        overlay.write(
+            "ip_adapter_plus_general.safetensors",
+            "resampler.weight",
+            safetensors::Dtype::F16,
+            &[4, 8],
+        );
+
+        let control = WeightsSource::File(overlay.path("unet/diffusion_pytorch_model.safetensors"));
+        let mut with_control = base.clone();
+        with_control.control = Some(control.clone());
+        let mut with_extra_control = base.clone();
+        with_extra_control.extra_controls = vec![control];
+        let mut with_ip = base.clone();
+        with_ip.ip_adapter = Some(WeightsSource::Dir(overlay.0.clone()));
+        let mut with_text_encoder = base.clone();
+        with_text_encoder.text_encoder = Some(WeightsSource::Dir(snapshot.0.clone()));
+        let mut with_component = base.clone();
+        with_component
+            .components
+            .insert("aux".to_owned(), WeightsSource::Dir(snapshot.0.clone()));
+        let mut with_adapter = base.clone();
+        with_adapter.adapters = vec![AdapterSpec {
+            path: overlay.path("unet/diffusion_pytorch_model.safetensors"),
+            scale: 1.0,
+            kind: mlx_gen::AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }];
+
+        for (label, spec) in [
+            ("control", with_control),
+            ("extra_controls", with_extra_control),
+            ("ip_adapter", with_ip),
+            ("text_encoder", with_text_encoder),
+            ("components", with_component),
+            ("adapters", with_adapter),
+        ] {
+            assert!(
+                !clean_base(&spec),
+                "{label} must not read as a clean base load"
+            );
+            assert!(
+                memory_strategy_contract(crate::MODEL_ID, &spec)
+                    .unwrap()
+                    .calibration
+                    .is_none(),
+                "{label} must publish no production identity"
+            );
+        }
+    }
+
+    /// sc-22732: a snapshot whose UNet and ChatGLM3 markers disagree — or whose marker does not
+    /// parse — WITHHOLDS the identity rather than failing the LOAD. `registry.rs` propagates
+    /// [`memory_strategy_contract`]'s error into the load, so an escaping error would turn a
+    /// loadable snapshot into a refused one.
+    ///
+    /// *Mutation this kills:* `resolved_artifact_tier(spec).ok().flatten()?` ->
+    /// `resolved_artifact_tier(spec).unwrap()?` (the error escapes and the contract is never
+    /// produced).
+    #[test]
+    fn a_disagreeing_tier_marker_withholds_the_identity_without_failing_the_load() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // The UNet is packed at 4 bits and the conditioning tower at 8: two proofs, one snapshot.
+        let disagreeing = tiered_snapshot(&tmp, "q4");
+        std::fs::write(
+            disagreeing.path("text_encoder/config.json"),
+            r#"{"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .unwrap();
+        // The marker itself does not parse.
+        let unparseable = tiered_snapshot(&tmp, "q8");
+        std::fs::write(unparseable.path("unet/config.json"), b"{ not json").unwrap();
+
+        for (label, snapshot, quant) in [
+            ("disagreeing markers", &disagreeing, mlx_gen::Quant::Q4),
+            ("unparseable marker", &unparseable, mlx_gen::Quant::Q8),
+        ] {
+            let spec = production_spec(&snapshot.0, Some(quant));
+            assert!(
+                resolved_artifact_tier(&spec).is_err(),
+                "{label}: the tier proof itself keeps its hard error"
+            );
+            let contract = memory_strategy_contract(crate::MODEL_ID, &spec)
+                .unwrap_or_else(|error| panic!("{label} must not fail the load: {error}"));
+            assert!(
+                contract.calibration.is_none(),
+                "{label} must publish no calibration identity"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{label}");
         }
     }
 
@@ -2374,10 +2863,23 @@ mod tests {
             MEMORY_CALIBRATION_FINGERPRINT,
             "sdxl-mlx-unet-shared-ladder-v2"
         );
-        let contract = contract(LoadShape::DeferredMaterialization);
+        // sc-22732: the fingerprint reaches a contract through the artifact-proven production
+        // table, not through the weights-free declaration surface, so assert it there.
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tiered_snapshot(&tmp, "q4");
+        let contract = memory_strategy_contract(
+            crate::MODEL_ID,
+            &production_spec(&snapshot.0, Some(mlx_gen::Quant::Q4))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        )
+        .unwrap();
         assert_eq!(
             contract.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
         );
+        for fingerprint in production_fingerprint_set() {
+            assert!(fingerprint.starts_with("kolors-"));
+            assert_ne!(fingerprint, "sdxl-mlx-unet-shared-ladder-v2");
+        }
     }
 }

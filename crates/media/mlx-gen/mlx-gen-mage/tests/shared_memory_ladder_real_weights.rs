@@ -179,7 +179,13 @@ fn context(
         optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
         selection,
         calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-        calibration_fingerprint: mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+        // sc-22733: the LOADED provider's own per-(route, tier) identity, never a crate const.
+        calibration_fingerprint: contract
+            .calibration
+            .as_ref()
+            .expect("a shipped Mage tier publishes its production identity")
+            .fingerprint
+            .clone(),
         load_shape: LoadShape::DeferredMaterialization,
         mode: mode(),
         has_reference: mode() == MemoryMode::Edit,
@@ -545,7 +551,10 @@ fn serial_shared_ladder_and_terminal_recovery() {
         "RESULT status=pass provider={provider} mode={} tier={:?} fingerprint={} load_shape={:?} size={} decode_edge=512 decode_overlap=256 attention_chunk_size={} transformer_window_size=1 transformer_component=both resident_peak_bytes={} rung4_peak_bytes={} rung4_post_clear_active_bytes={} rung4_post_clear_cache_bytes={}",
         mode().as_key(),
         tier(),
-        mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT,
+        contract
+            .calibration
+            .as_ref()
+            .map_or("none", |identity| identity.fingerprint.as_str()),
         contract.load_shape,
         size(),
         mlx_gen_mage::model::ATTENTION_CHUNK_SIZE,

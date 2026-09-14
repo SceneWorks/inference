@@ -66,6 +66,12 @@ fn mlx_route_config(route: WanI2vRoute) -> &'static str {
         WanI2vRoute::Ti2v5b => {
             r#"{"model_type":"ti2v","model_version":"2.2","dim":3072,"dual_model":false}"#
         }
+        // `WanModelConfig::from_config_json` resolves `t2v` to `wan22_t2v_14b` and `i2v` to
+        // `wan22_i2v_14b`; the two A14B routes therefore need *different* `model_type` strings even
+        // though their file inventory is identical.
+        WanI2vRoute::T2v14b => {
+            r#"{"model_type":"t2v","model_version":"2.2","dim":5120,"dual_model":true}"#
+        }
         WanI2vRoute::I2v14b => {
             r#"{"model_type":"i2v","model_version":"2.2","dim":5120,"dual_model":true}"#
         }
@@ -81,7 +87,7 @@ pub fn write_mlx_snapshot(base: &Path, route: WanI2vRoute) -> LoadSpec {
     let root = fixture_snapshot_root(base, WanI2vBackend::Mlx, route);
     std::fs::create_dir_all(&root).unwrap();
     match route {
-        WanI2vRoute::Ti2v5b | WanI2vRoute::I2v14b => {
+        WanI2vRoute::Ti2v5b | WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
             std::fs::write(root.join("config.json"), mlx_route_config(route)).unwrap();
             std::fs::write(root.join("tokenizer.json"), "{}").unwrap();
             let files: &[(&str, usize)] = match route {
@@ -146,7 +152,7 @@ pub fn write_candle_snapshot(base: &Path, route: WanI2vRoute) -> LoadSpec {
     std::fs::create_dir_all(root.join("tokenizer")).unwrap();
     std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
     match route {
-        WanI2vRoute::Ti2v5b | WanI2vRoute::I2v14b => {
+        WanI2vRoute::Ti2v5b | WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
             std::fs::write(root.join("model_index.json"), "{}").unwrap();
             let components: &[&str] = match route {
                 WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
@@ -211,12 +217,7 @@ mod tests {
     /// Every route on both backends seals: the writers are only useful if `prepare` accepts them.
     #[test]
     fn every_synthetic_snapshot_seals_a_receipt() {
-        for route in [
-            WanI2vRoute::Ti2v5b,
-            WanI2vRoute::I2v14b,
-            WanI2vRoute::Vace,
-            WanI2vRoute::VaceFun,
-        ] {
+        for route in WanI2vRoute::ALL {
             let tmp = tempfile::tempdir().unwrap();
             let spec = write_candle_snapshot(tmp.path(), route);
             let prepared =

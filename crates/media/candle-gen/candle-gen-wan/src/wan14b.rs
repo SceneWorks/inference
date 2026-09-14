@@ -1276,14 +1276,12 @@ fn build_generator(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Wan14b
     let device = candle_gen::default_device()?;
     // Video retains the explicit load-time policy contract (sc-12733).
     let offload = spec.offload_policy;
-    let i2v_memory = if variant == Variant::I2v
-        && spec.resolved_route.as_deref() == Some(MODEL_ID_I2V_14B)
-        && spec.prepared_file_pins().is_prepared()
-    {
-        Some(crate::i2v_memory_strategy::prepare(spec, MODEL_ID_I2V_14B)?)
-    } else {
-        None
-    };
+    let i2v_memory =
+        if spec.resolved_route.as_deref() == Some(id) && spec.prepared_file_pins().is_prepared() {
+            Some(crate::i2v_memory_strategy::prepare(spec, id)?)
+        } else {
+            None
+        };
     Ok(Wan14bGenerator {
         descriptor: descriptor_for(variant),
         variant,
@@ -1421,6 +1419,101 @@ candle_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_a14b_public_loaders_publish_prepared_contracts_at_every_tier() {
+        use gen_core::wan_i2v_memory::{fixture_snapshot_root, WanI2vBackend, WanI2vRoute};
+        use gen_core::Quant;
+        for (variant, route, repository, revision) in [
+            (
+                Variant::T2v,
+                WanI2vRoute::T2v14b,
+                "SceneWorks--wan2.2-t2v-a14b-candle",
+                "da1909b66b360e1ea8cdeb3e39e40dca172cfa32",
+            ),
+            (
+                Variant::I2v,
+                WanI2vRoute::I2v14b,
+                "SceneWorks--wan2.2-i2v-a14b-candle",
+                "d01bf1ea995c01a5bc545cefb977a320c9cb9fd0",
+            ),
+        ] {
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = if let Some(quant) = quant {
+                    temp.path()
+                        .join(format!("models--{repository}"))
+                        .join("snapshots")
+                        .join(revision)
+                        .join(if quant == Quant::Q4 { "q4" } else { "q8" })
+                } else {
+                    fixture_snapshot_root(temp.path(), WanI2vBackend::Candle, route)
+                };
+                std::fs::create_dir_all(root.join("tokenizer")).unwrap();
+                std::fs::write(root.join("model_index.json"), "{}").unwrap();
+                std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
+                for component in ["transformer", "transformer_2", "vae", "text_encoder"] {
+                    let dir = root.join(component);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("config.json"), "{}").unwrap();
+                    let mut headers = serde_json::Map::new();
+                    let mut offset = 0usize;
+                    let mut add = |name: &str, dtype: &str, shape: Vec<usize>, width: usize| {
+                        let end = offset + shape.iter().product::<usize>() * width;
+                        headers.insert(name.to_owned(), serde_json::json!({"dtype":dtype,"shape":shape,"data_offsets":[offset,end]}));
+                        offset = end;
+                    };
+                    if let Some(quant) = quant.filter(|_| component.starts_with("transformer")) {
+                        add(
+                            "proj.weight",
+                            "U32",
+                            vec![2, if quant == Quant::Q4 { 8 } else { 16 }],
+                            4,
+                        );
+                        add("proj.scales", "F32", vec![2, 1], 4);
+                        add("proj.biases", "F32", vec![2, 1], 4);
+                        std::fs::write(
+                            dir.join("quantize_config.json"),
+                            format!(
+                                "{{\"bits\":{},\"quantization\":{{\"group_size\":64}}}}",
+                                quant.bits()
+                            ),
+                        )
+                        .unwrap();
+                    } else {
+                        add("weight", "F32", vec![2, 64], 4);
+                    }
+                    let mut header = serde_json::to_vec(&headers).unwrap();
+                    while !header.len().is_multiple_of(8) {
+                        header.push(b' ');
+                    }
+                    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+                    bytes.extend(header);
+                    bytes.resize(bytes.len() + offset, 0);
+                    std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+                }
+                let mut spec =
+                    LoadSpec::new(WeightsSource::Dir(root)).with_resolved_route(variant.id());
+                spec.quantize = quant;
+                let registry = crate::provider_registry().unwrap();
+                assert!(registry
+                    .load(variant.id(), &spec)
+                    .unwrap()
+                    .memory_strategy_contract()
+                    .is_none());
+                crate::i2v_memory_strategy::prepare_load_spec(&mut spec, variant.id()).unwrap();
+                let prepared = crate::i2v_memory_strategy::prepare(&spec, variant.id()).unwrap();
+                let loaded = registry.load(variant.id(), &spec).unwrap();
+                let contract = loaded
+                    .memory_strategy_contract()
+                    .expect("prepared public loader retains its contract");
+                assert_eq!(contract.provider_id, variant.id());
+                assert_eq!(contract.calibration, prepared.contract.calibration);
+                assert_eq!(contract.asset_facts, prepared.contract.asset_facts);
+                assert_eq!(prepared.tier.quant, quant);
+            }
+        }
+    }
 
     #[test]
     fn registers_both_as_candle_video() {

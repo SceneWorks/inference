@@ -202,10 +202,13 @@ pub fn precompute_adaln_windowed(
         // LOAD-BEARING, and it must cover the tables produced **so far** rather than only this
         // window's: `AdaLnModulation` is six lazy arrays, and one left unevaluated pins its
         // projection's 520 MB (bf16) past the release. Re-evaluating an already-materialized array
-        // is free.
+        // is free. Keep each eval to one block: a large window must not combine cold reads into
+        // the same Metal submission and reintroduce the resident-stack timeout (sc-23108).
         |acc: &Vec<AdaLnModulation>| {
-            let flat: Vec<&Array> = acc.iter().flat_map(AdaLnModulation::tables).collect();
-            mlx_rs::transforms::eval(flat).map_err(Into::into)
+            for layer in acc {
+                mlx_rs::transforms::eval(layer.tables())?;
+            }
+            Ok(())
         },
     )?;
     if layers.len() != stream.n_blocks() {

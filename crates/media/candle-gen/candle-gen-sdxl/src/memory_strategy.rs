@@ -67,14 +67,14 @@ pub const SDXL_ROUTES: &[SdxlRoute] = &[
     SdxlRoute {
         id: "illustrious_xl_v1",
         repository: "SceneWorks/illustrious-xl-v1-mlx",
-        revision: "c5a92a902dd4e6ee99c2a57981ecf66209905dd1",
+        revision: "778c3f02b7703b0c2755d0c0447592897193c6b5",
         edit: true,
         lightning: false,
     },
     SdxlRoute {
         id: "illustrious_xl_v2",
         repository: "SceneWorks/illustrious-xl-v2-mlx",
-        revision: "7c5c8b2bb75a8f38a7365e70bdf84d38d6204473",
+        revision: "672e9851ede4dc856fa945649b6691975c9d74a3",
         edit: true,
         lightning: false,
     },
@@ -1666,11 +1666,29 @@ mod tests {
     }
 
     fn dense_spec(temp: &tempfile::TempDir) -> (LoadSpec, PathBuf) {
-        let route = SDXL_ROUTES[0];
+        dense_spec_for(temp, SDXL_ROUTES[0], SDXL_ROUTES[0].revision)
+    }
+
+    /// The `dense_spec` fixture for an arbitrary route, resolved from an arbitrary revision.
+    ///
+    /// `revision` is a separate parameter rather than `route.revision` on purpose: the drift this
+    /// crate shipped (sc-22729) was invisible to every fixture that built its snapshot path out of
+    /// the very constant under test. The shipped-catalog test passes the manifest's revision here,
+    /// so a route whose constant does not equal the shipped revision fails to seal.
+    fn dense_spec_for(
+        temp: &tempfile::TempDir,
+        route: SdxlRoute,
+        revision: &str,
+    ) -> (LoadSpec, PathBuf) {
+        let name = route
+            .repository
+            .rsplit('/')
+            .next()
+            .unwrap_or(route.repository);
         let root = temp
             .path()
-            .join("SceneWorks__sdxl-base-mlx")
-            .join(route.revision)
+            .join(format!("SceneWorks__{name}"))
+            .join(revision)
             .join("bf16");
         for component in ["unet", "text_encoder", "text_encoder_2"] {
             std::fs::create_dir_all(root.join(component)).unwrap();
@@ -1710,11 +1728,274 @@ mod tests {
         std::fs::write(&clip_g, b"{}").unwrap();
         write_vae(&vae);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
-            .with_resolved_route("sdxl")
+            .with_resolved_route(route.id)
             .with_component("tokenizer_clip_l", WeightsSource::File(clip_l))
             .with_component("tokenizer_clip_bigg", WeightsSource::File(clip_g))
             .with_component("vae_fp16_fix", WeightsSource::File(vae));
         (spec, root)
+    }
+
+    /// The five route revisions the SceneWorks catalog actually ships, transcribed from
+    /// `config/manifests/builtin.models.jsonc` — the `downloads[].revision` of the `sdxl`,
+    /// `realvisxl`, `realvisxl_lightning`, `illustrious_xl_v1` and `illustrious_xl_v2` entries.
+    ///
+    /// This is deliberately a SECOND declaration of the same fact rather than a read of
+    /// [`SDXL_ROUTES`]. The two Illustrious routes shipped pinned to revisions the catalog had
+    /// already moved past (SceneWorks `0f2b7d1`, 2026-08-23, re-published both turnkeys with
+    /// reviewed authorities), and because [`SdxlArtifactSeal::capture`] matches the *engine's own*
+    /// literal through `path_has_snapshot`, every candle-lane load of those two models refused for
+    /// every user — `candle_gen_sdxl::load` propagates the seal error. Every fixture that builds
+    /// its snapshot path out of `route.revision` is blind to that class of drift by construction;
+    /// this table is not. Update it and [`SDXL_ROUTES`] together, from the manifest.
+    ///
+    /// This table cannot detect a *future* manifest bump — it is a second literal transcription,
+    /// checked at the moment it was written, not a read of the manifest. It catches a half-edit
+    /// where [`SDXL_ROUTES`] changes without this table (or vice versa); it cannot catch both
+    /// drifting together when the manifest moves again. The authoritative currency gate for "does
+    /// this pinned revision still match what the catalog ships today" lives SceneWorks-side,
+    /// against `config/manifests/builtin.models.jsonc` itself — the manifest is the source of
+    /// truth, this is a tripwire plus documentation of what the code assumed at write time.
+    const SHIPPED_ROUTE_REVISIONS: &[(&str, &str, &str)] = &[
+        (
+            "sdxl",
+            "SceneWorks/sdxl-base-mlx",
+            "36699bb8a6353e61c920e3bf19f0e6f8e4151c55",
+        ),
+        (
+            "realvisxl",
+            "SceneWorks/realvisxl-mlx",
+            "e40202d63baef826c7df95a639a811698c1178d2",
+        ),
+        (
+            "realvisxl_lightning",
+            "SceneWorks/realvisxl-lightning-mlx",
+            "c09fd586989bdc3c658d4acd03e8ae81677ade8e",
+        ),
+        (
+            "illustrious_xl_v1",
+            "SceneWorks/illustrious-xl-v1-mlx",
+            "778c3f02b7703b0c2755d0c0447592897193c6b5",
+        ),
+        (
+            "illustrious_xl_v2",
+            "SceneWorks/illustrious-xl-v2-mlx",
+            "672e9851ede4dc856fa945649b6691975c9d74a3",
+        ),
+    ];
+
+    /// The five shared-component revisions gating [`validate_shared_component_revisions`],
+    /// [`validate_ip_spec`] and [`validate_detail_spec`]'s hard refusals, transcribed a SECOND
+    /// time from `config/manifests/builtin.models.jsonc` (the CLIP-L/CLIP-bigG/VAE `downloads[]`
+    /// entries and the tile-ControlNet utility entry) and from SceneWorks
+    /// `crates/sceneworks-worker/src/image_jobs/sdxl_ipadapter.rs`'s
+    /// `SDXL_IPADAPTER_REVISION` (the IP-Adapter entry). Same defect class and same caveat as
+    /// [`SHIPPED_ROUTE_REVISIONS`]: it cannot detect a future bump on either side, only a
+    /// half-edit of the constant against this transcription.
+    ///
+    /// Deliberately literal strings, not references to [`CLIP_L_REVISION`] etc. — a reference
+    /// would drift in lockstep with the constant it names and never catch a hand-edit, the exact
+    /// defect class this table exists to catch.
+    const SHIPPED_COMPONENT_REVISIONS: &[(&str, &str, &str, &str)] = &[
+        (
+            "tokenizer_clip_l",
+            "openai/clip-vit-large-patch14",
+            "32bd64288804d66eefd0ccbe215aa642df71cc41",
+            "manifest downloads[]: openai/clip-vit-large-patch14",
+        ),
+        (
+            "tokenizer_clip_bigg",
+            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+            "743c27bd53dfe508a0ade0f50698f99b39d03bec",
+            "manifest downloads[]: laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+        ),
+        (
+            "vae_fp16_fix",
+            "madebyollin/sdxl-vae-fp16-fix",
+            "207b116dae70ace3637169f1ddd2434b91b3a8cd",
+            "manifest downloads[]: madebyollin/sdxl-vae-fp16-fix",
+        ),
+        (
+            "ip_adapter",
+            "h94/IP-Adapter",
+            "018e402774aeeddd60609b4ecdb7e298259dc729",
+            "SceneWorks sdxl_ipadapter.rs: SDXL_IPADAPTER_REVISION",
+        ),
+        (
+            "tile_controlnet",
+            "xinsir/controlnet-tile-sdxl-1.0",
+            "1ae8d9529efe58f7362a987363ff86a7904dc84f",
+            "manifest utility entry: xinsir/controlnet-tile-sdxl-1.0",
+        ),
+    ];
+
+    /// sc-22729: every route resolves from the revision the catalog ships, in every tier, in each
+    /// of the three snapshot layouts `path_has_snapshot` accepts — and refuses any other revision.
+    ///
+    /// Also covers the five shared-component revisions ([`CLIP_L_REVISION`], [`CLIP_BIGG_REVISION`],
+    /// [`VAE_REVISION`], [`IP_REVISION`], [`TILE_CONTROL_REVISION`]) that gate the same class of
+    /// hard refusal in [`validate_shared_component_revisions`], [`validate_ip_spec`] and
+    /// [`validate_detail_spec`].
+    ///
+    /// *Mutations that red this:* restoring either Illustrious route's pre-`0f2b7d1` revision;
+    /// dropping any one of the three layout arms of `path_has_snapshot`; comparing the revision
+    /// by prefix instead of by whole path component; editing any one of the five component
+    /// constants (`CLIP_L_REVISION`, `CLIP_BIGG_REVISION`, `VAE_REVISION`, `IP_REVISION`,
+    /// `TILE_CONTROL_REVISION`) away from the transcribed table.
+    #[test]
+    fn every_route_seals_from_the_shipped_catalog_revision() {
+        assert_eq!(
+            SDXL_ROUTES.len(),
+            SHIPPED_ROUTE_REVISIONS.len(),
+            "the shipped-revision table must name every route"
+        );
+        for (route, &(id, repository, revision)) in SDXL_ROUTES.iter().zip(SHIPPED_ROUTE_REVISIONS)
+        {
+            assert_eq!(route.id, id, "route order must match the shipped table");
+            assert_eq!(route.repository, repository);
+            assert_eq!(
+                route.revision, revision,
+                "route {id} is pinned to a revision the SceneWorks catalog does not ship; \
+                 every load of it refuses at the artifact seal"
+            );
+        }
+
+        let actual_component_revisions: &[(&str, &str, &str)] = &[
+            ("tokenizer_clip_l", CLIP_L_REPO, CLIP_L_REVISION),
+            ("tokenizer_clip_bigg", CLIP_BIGG_REPO, CLIP_BIGG_REVISION),
+            ("vae_fp16_fix", VAE_REPO, VAE_REVISION),
+            ("ip_adapter", IP_REPO, IP_REVISION),
+            ("tile_controlnet", TILE_CONTROL_REPO, TILE_CONTROL_REVISION),
+        ];
+        for (
+            &(id, repository, revision),
+            &(expected_id, expected_repository, expected_revision, source),
+        ) in actual_component_revisions
+            .iter()
+            .zip(SHIPPED_COMPONENT_REVISIONS)
+        {
+            assert_eq!(
+                id, expected_id,
+                "component order must match the shipped table"
+            );
+            assert_eq!(
+                repository, expected_repository,
+                "component {id} repository drifted from {source}"
+            );
+            assert_eq!(
+                revision, expected_revision,
+                "component {id} is pinned to a revision that does not match {source}; \
+                 loads gating on it hard-refuse at admission"
+            );
+        }
+
+        // Path-level: each accepted snapshot layout, at each tier, for each route.
+        let stale = "0".repeat(40);
+        for route in SDXL_ROUTES.iter().copied() {
+            let name = route
+                .repository
+                .rsplit('/')
+                .next()
+                .unwrap_or(route.repository);
+            let marker = format!("models--{}", route.repository.replace('/', "--"));
+            for tier in ["q4", "q8", "bf16"] {
+                for shape in [
+                    Path::new("/cache")
+                        .join(&marker)
+                        .join("snapshots")
+                        .join(route.revision)
+                        .join(tier),
+                    Path::new("/cache")
+                        .join(name)
+                        .join(route.revision)
+                        .join(tier),
+                    Path::new("/cache")
+                        .join(format!("SceneWorks__{name}"))
+                        .join(route.revision)
+                        .join(tier),
+                ] {
+                    assert!(
+                        path_has_snapshot(&shape, route, tier),
+                        "{} must resolve from {}",
+                        route.id,
+                        shape.display()
+                    );
+                }
+                assert!(
+                    !path_has_snapshot(
+                        &Path::new("/cache").join(name).join(&stale).join(tier),
+                        route,
+                        tier
+                    ),
+                    "{} must refuse a snapshot that is not its pinned revision",
+                    route.id
+                );
+            }
+        }
+
+        // Seal-level, weights-free: a complete dense fixture rooted at the SHIPPED revision.
+        for &(id, _, revision) in SHIPPED_ROUTE_REVISIONS {
+            let route = SDXL_ROUTES
+                .iter()
+                .copied()
+                .find(|route| route.id == id)
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let (spec, _) = dense_spec_for(&temp, route, revision);
+            let seal = SdxlArtifactSeal::capture(&spec).unwrap_or_else(|error| {
+                panic!("{id} must seal from the shipped snapshot {revision}: {error}")
+            });
+            assert!(seal.contract().conformance_errors().is_empty());
+
+            let (drifted, _) = dense_spec_for(&temp, route, &stale);
+            assert!(
+                SdxlArtifactSeal::capture(&drifted).is_err(),
+                "{id} must refuse a snapshot directory that is not the pinned revision"
+            );
+        }
+
+        // Fingerprint-level: `route_fingerprint` is the join key SceneWorks calibration records
+        // are written against — pin the literal, not just self-consistency against the function
+        // that produces it. Every other fingerprint assertion in this crate is self-referential
+        // (compares the contract to `route_fingerprint(*route)`, or only checks uniqueness), so
+        // none of them catch a change to the format literal in `route_fingerprint` or to
+        // `route_identity_tokens`'s token rendering.
+        //
+        // *Mutation that reds this:* changing the `"sdxl-candle-{}-staged-decode-attention-v1"`
+        // format literal in `route_fingerprint` (e.g. to `"…-staged-decode-attn-v1"`).
+        const SHIPPED_ROUTE_FINGERPRINTS: &[(&str, &str)] = &[
+            ("sdxl", "sdxl-candle-sdxl-staged-decode-attention-v1"),
+            (
+                "realvisxl",
+                "sdxl-candle-realvisxl-staged-decode-attention-v1",
+            ),
+            (
+                "realvisxl_lightning",
+                "sdxl-candle-realvisxl-lightning-staged-decode-attention-v1",
+            ),
+            (
+                "illustrious_xl_v1",
+                "sdxl-candle-illustrious-xl-rev1-staged-decode-attention-v1",
+            ),
+            (
+                "illustrious_xl_v2",
+                "sdxl-candle-illustrious-xl-rev2-staged-decode-attention-v1",
+            ),
+        ];
+        assert_eq!(SDXL_ROUTES.len(), SHIPPED_ROUTE_FINGERPRINTS.len());
+        for (route, &(id, expected_fingerprint)) in
+            SDXL_ROUTES.iter().zip(SHIPPED_ROUTE_FINGERPRINTS)
+        {
+            assert_eq!(
+                route.id, id,
+                "fingerprint table order must match SDXL_ROUTES"
+            );
+            assert_eq!(
+                route_fingerprint(*route),
+                expected_fingerprint,
+                "{id}'s calibration fingerprint drifted from the literal SceneWorks records \
+                 are written against"
+            );
+        }
     }
 
     /// AC (epic SC-22657, E1): every SDXL asset field prices what the loader materializes.

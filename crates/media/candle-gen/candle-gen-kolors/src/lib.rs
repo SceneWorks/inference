@@ -301,13 +301,16 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             &root,
             &spec.adapters,
             spec.pid.as_ref(),
+            spec.load_shape,
         )?;
         let contract = seal.contract().clone();
         (Some(seal), contract)
     } else {
         // Registry/catalog introspection intentionally permits a missing lazy root. It cannot begin
         // an admitted request: physical-tier and receipt validation both require the real source.
-        (None, memory_strategy::provider_contract())
+        // sc-22732: the declaration surface carries the SPEC's load shape, so this arm and
+        // `memory_strategy::registered_contract` cannot disagree about it.
+        (None, memory_strategy::weights_free_contract(spec)?)
     };
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),

@@ -737,6 +737,9 @@ mod tests {
             );
             named.push((format!("{p}.norms.{i}.weight"), tensor(vec![hidden], 1.0)));
         }
+        // Saving truncates the same file backing `existing`'s lazy arrays.
+        // Finish those reads first; otherwise the fixture reads its own EOF.
+        mlx_rs::transforms::eval(named.iter().map(|(_, array)| array)).unwrap();
         let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         (path, cfg)

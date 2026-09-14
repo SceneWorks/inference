@@ -400,7 +400,16 @@ pub fn register_providers(
         .register_memory_contract_fixture(memory_strategy::MEMORY_FIXTURE)
         .register_memory_behavior(memory_strategy::MEMORY_BEHAVIOR)
         .register_generator(model::T2V_14B_REGISTRATION)
+        // sc-22736 (epic sc-22723, E1): the two A14B routes get the pre-load half of what their
+        // loaded generators already do. Without these three registrations a plan anchor naming
+        // either route resolves nothing before the weights exist, so the cell is unmeasurable.
+        .register_memory_strategy(i2v_memory_strategy::t2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::t2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::t2v_14b::MEMORY_BEHAVIOR)
         .register_generator(model::I2V_14B_REGISTRATION)
+        .register_memory_strategy(i2v_memory_strategy::i2v_14b::MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(i2v_memory_strategy::i2v_14b::MEMORY_FIXTURE)
+        .register_memory_behavior(i2v_memory_strategy::i2v_14b::MEMORY_BEHAVIOR)
         .register_generator(model_vace::VACE_REGISTRATION)
         .register_generator(model_vace::VACE_FUN_REGISTRATION)
         .register_trainer(training::T2V_14B_TRAINER_REGISTRATION)

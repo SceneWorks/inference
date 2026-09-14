@@ -64,19 +64,162 @@ pub const TRANSFORMER_WINDOW_SIZE: u32 = 1;
 pub const DECODE_TILE_EDGE: u32 = 512;
 pub const DECODE_OVERLAP: u32 = 64;
 pub const ATTENTION_CHUNK_SIZE: u32 = mlx_gen::attention::CONSTRAINED_ATTN_SCORES_BUDGET as u32;
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
-    "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
 /// The Wan terminal decoder has not been measured as part of Krea's whole-request ladder. A separate
 /// identity prevents native-decoder evidence from being reused and forces conservative
 /// asset-facts + headroom estimation (including SceneWorks' estimate margin).
 pub const WAN_DECODER_CALIBRATION_FINGERPRINT: &str =
     "krea-2-mlx-wan21-decoder-unmeasured-composite-2026-08-10-v1";
 
-fn calibration_fingerprint(spec: &LoadSpec) -> &'static str {
+/// Static, weights-free identity prefix for the registry declaration walk. Never a production
+/// calibration.
+///
+/// A contract built from a real load leaves an unprovable route's calibration `None` so admission
+/// has to name an explicit estimate authority. The weights-free surfaces cannot do that: the shared
+/// conformance walk builds its run context through
+/// [`mlx_gen::gen_core::standard_memory_behavior_context`], and the SceneWorks fit gate
+/// (`every_planned_mlx_lane_resolves_a_weights_free_provider_contract`) requires *some* identity
+/// whose `load_shape` matches the spec's. This prefix supplies one whose value is structural, keyed
+/// per route, resolved tier, and residency policy so a context assembled for one selector can never
+/// hand its handshake to another — and so it can never equal a production string.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-2-mlx-registry-behavior-v1";
+
+/// Production calibration identity table of the four registered base Krea 2 routes, keyed on
+/// (route, tier).
+///
+/// `tier` is `bf16`, `q4`, or `q8` — the tier the base transformer ACTUALLY runs at, never the
+/// request knob alone. Anything else, and any provider id outside the base family, is `None`.
+///
+/// **Every** base route — `krea_2_turbo` included — is keyed per (route, tier) as
+/// `krea-2-<route>-<tier>-mlx-shared-ladder-v1`. Before sc-22735 all four routes published one
+/// measured turbo string at every tier, so a `krea_2_raw` bf16 anchor was indistinguishable by
+/// calibration identity from a `krea_2_turbo` q4 anchor, and the capture apparatus binds records
+/// by exactly this string.
+///
+/// Turbo was carved out of the first sc-22735 pass on the argument that its three shipped plan rows
+/// already declared the shared key. That argument does not survive the evidence: SceneWorks'
+/// `config/memory-anchors.json` holds **no** measured `krea_2_turbo` MLX record at any tier (the one
+/// turbo anchor in the catalog is `krea_2_turbo:candle:q4`, which is a Candle string owned by
+/// `candle-gen-krea`). Three MLX plan rows sharing a string with nothing measured behind it is not
+/// preserved evidence — it is an ambiguity with no offsetting gain, so the retired
+/// `krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3` is retained nowhere.
+///
+/// Offload policy and load shape are deliberately not inputs: the identity names the artifact the
+/// evidence was captured against, and [`MemoryCalibrationIdentity`]`::load_shape` carries the
+/// materialization axis separately.
+///
+/// This is the table, not the binding. The tier here is a caller-supplied token; only the contract
+/// builder — which proves the tier against the artifact's own packed marker before publishing —
+/// may turn one of these strings into a contract identity.
+pub fn production_calibration_fingerprint(provider_id: &str, tier: &str) -> Option<String> {
+    if !matches!(tier, "bf16" | "q4" | "q8") {
+        return None;
+    }
+    let route = match provider_id {
+        crate::model::KREA_2_TURBO_ID => "turbo",
+        crate::model::KREA_2_RAW_ID => "raw",
+        crate::model::KREA_2_EDIT_ID => "edit",
+        crate::model::KREA_2_TURBO_EDIT_ID => "turbo-edit",
+        _ => return None,
+    };
+    Some(format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"))
+}
+
+/// The tier token proven from the ARTIFACT, never from `LoadSpec::quantize` alone.
+///
+/// The SceneWorks worker passes `LoadSpec::quantize = None` for the packed MLX turnkeys at every
+/// tier (`mlx_load_quant_for_resolved_artifact`), so keying on the request knob would collapse all
+/// three tiers onto one string. [`crate::model::effective_base_quant_tier`] resolves the load plan
+/// and returns the tier the base actually runs at, read from `transformer/config.json`'s packed
+/// marker — the same seam `registered_safety_check` reads — so the declared calibration and the
+/// admitted tier cannot disagree.
+///
+/// Fails closed to `None`: an unreadable artifact, a packed-vs-requested mismatch, or an
+/// unsupported quantization tier publishes no identity rather than fabricating one or failing the
+/// contract build. `None` is the honest answer — admission then has to name an explicit estimate
+/// authority.
+fn proven_tier_token(provider_id: &str, spec: &LoadSpec) -> Option<&'static str> {
+    match crate::model::effective_base_quant_tier(spec, provider_id) {
+        Ok(None) => Some("bf16"),
+        Ok(Some(mlx_gen::Quant::Q4)) => Some("q4"),
+        Ok(Some(mlx_gen::Quant::Q8)) => Some("q8"),
+        Ok(Some(_)) => None,
+        Err(_) => None,
+    }
+}
+
+/// The production identity a real load publishes, or `None` when no cell can be proven.
+///
+/// Precedence is unchanged from the pre-sc-22735 shape: an additive Wan terminal decoder
+/// ([`mlx_gen::VAE_COMPONENT`]) is an unmeasured composite and keeps
+/// [`WAN_DECODER_CALIBRATION_FINGERPRINT`], winning over the base table so native whole-request
+/// evidence can never authorize the composite decode path.
+///
+/// A [`WeightsSource::File`] import publishes nothing: its dequantized-to-bf16 residency is a
+/// different load source with no promoted cell, and the evidence matrix has no load-source axis.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<MemoryCalibrationIdentity> {
     if spec.components.contains_key(mlx_gen::VAE_COMPONENT) {
-        WAN_DECODER_CALIBRATION_FINGERPRINT
-    } else {
-        MEMORY_CALIBRATION_FINGERPRINT
+        return Some(MemoryCalibrationIdentity::new(
+            WAN_DECODER_CALIBRATION_FINGERPRINT,
+            spec.load_shape,
+        ));
+    }
+    if matches!(spec.weights, WeightsSource::File(_)) {
+        return None;
+    }
+    let tier = proven_tier_token(provider_id, spec)?;
+    production_calibration_fingerprint(provider_id, tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
+/// Per-(route, tier, policy) static behavior identity for the two weights-free declaration seams.
+///
+/// `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens with exactly one
+/// `vN`, so every component spelled into the identity is already one and the route is the provider
+/// id with `_` replaced by `-`.
+fn static_behavior_identity(
+    provider_id: &str,
+    tier: &str,
+    offload_policy: OffloadPolicy,
+    load_shape: LoadShape,
+) -> MemoryCalibrationIdentity {
+    let policy = match offload_policy {
+        OffloadPolicy::Resident => "resident",
+        OffloadPolicy::Sequential => "sequential",
+    };
+    let route = provider_id.replace('_', "-");
+    MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{route}-{tier}-{policy}"),
+        load_shape,
+    )
+}
+
+/// The already-resolved artifact tier named by a registry surface selector — the resolver seam's
+/// tier source, which touches no filesystem.
+fn selector_tier_token(tier: mlx_gen::gen_core::MemoryContractSurfaceTier) -> &'static str {
+    match tier {
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16 => "bf16",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => "q4",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => "q8",
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => "nvfp4",
+    }
+}
+
+/// The tier a bare weights-free `LoadSpec` names, for the fixture seam that has no selector.
+///
+/// Deliberately the same vocabulary [`selector_tier_token`] produces, so a dense bf16 witness gets
+/// one identity whichever seam built it, and — like its sibling in [`crate::memory_strategy`] — it
+/// touches no filesystem. A non-bf16 activation precision must not collapse onto the dense bf16
+/// token, so it is spelled out.
+fn spec_tier_token(spec: &LoadSpec) -> &'static str {
+    match (spec.precision, spec.quantize) {
+        (Precision::Fp32, _) => "fp32",
+        (_, None) => "bf16",
+        (_, Some(mlx_gen::Quant::Q4)) => "q4",
+        (_, Some(mlx_gen::Quant::Q8)) => "q8",
+        (_, Some(mlx_gen::Quant::Nvfp4)) => "nvfp4",
     }
 }
 
@@ -204,12 +347,17 @@ pub(crate) fn memory_strategy_contract_with_plan(
             spec,
             components,
             plan.streamable_transformer,
+            production_calibration_identity(provider_id, spec),
         )?,
         plan,
     ))
 }
 
 /// Declaration-equivalent contract used only by weights-free registry conformance.
+///
+/// Publishes the source-owned [`static_behavior_identity`], never a production key: this seam
+/// describes a *declaration*, not a measurement. Its tier comes from `spec.quantize` — the seam
+/// carries no selector and must touch no filesystem.
 pub(crate) fn weights_free_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -220,6 +368,12 @@ pub(crate) fn weights_free_memory_strategy_contract(
         spec,
         Default::default(),
         plan.streamable_transformer,
+        Some(static_behavior_identity(
+            provider_id,
+            spec_tier_token(spec),
+            spec.offload_policy,
+            spec.load_shape,
+        )),
     )
 }
 
@@ -287,6 +441,12 @@ pub(crate) fn weights_free_memory_strategy_surface_contract(
         &surface.spec,
         Default::default(),
         streamable,
+        Some(static_behavior_identity(
+            provider_id,
+            selector_tier_token(surface.resolved_artifact_tier()),
+            surface.spec.offload_policy,
+            surface.spec.load_shape,
+        )),
     )
 }
 
@@ -347,11 +507,18 @@ pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryAr
     }
 }
 
+/// `calibration` is supplied by the caller rather than derived here, because the seams differ in
+/// kind: the two production callers pass [`production_calibration_identity`] (a measured or
+/// per-(route, tier) key, or `None` when no cell can be proven), while the two weights-free seams
+/// pass a [`static_behavior_identity`] that is never a measurement. Deriving one identity inside
+/// this shared builder is exactly the sc-22735 defect — it republished the turbo measured key on
+/// every route, every tier, and both declaration surfaces.
 fn memory_strategy_contract_with_components(
     provider_id: &str,
     spec: &LoadSpec,
     components: mlx_gen::PerComponentBytes,
     streamable: bool,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> CoreResult<MemoryProviderContract> {
     let routes = decode_routes(provider_id)?;
     let mut contract = MemoryProviderContract::compatibility_default(
@@ -381,10 +548,7 @@ fn memory_strategy_contract_with_components(
             MemoryFormulaVariable::TransformerWindowSize,
         ],
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        calibration_fingerprint(spec),
-        spec.load_shape,
-    ));
+    contract.calibration = calibration;
     contract.asset_facts.base_bytes = components
         .text_encoder
         .saturating_add(components.dit)
@@ -462,13 +626,18 @@ fn memory_strategy_contract_with_components(
 /// dequantized projection-by-projection to bf16, while its scale/descriptor tensors are consumed and
 /// dropped; the text encoder and VAE remain sourced from the resident base snapshot.
 ///
-/// Keeping the snapshot and imported forms on the same provider/calibration identity is intentional:
-/// the implementation, phase model, and non-transformer components are the same. The promoted-memory
+/// Keeping the snapshot and imported forms on the same provider id is intentional: the
+/// implementation, phase model, and non-transformer components are the same. The promoted-memory
 /// evidence matrix does not currently have a load-source axis, however. Consequently a published
 /// snapshot (`Dir`) rung-4 cell must not be described as an imported-file measurement merely because
 /// this contract can re-open a pinned `File`; the `File` route needs its own real-path measurement
 /// before release evidence may claim that cell. The lower-level loader may still be reopened for its
 /// story smoke; the public contract must pass `streamable = false` until that evidence exists.
+///
+/// sc-22735 makes that separation visible in the *calibration* too:
+/// [`production_calibration_identity`] publishes no identity for a `File` import, so admission has
+/// to name an explicit estimate authority instead of inheriting a snapshot key. An additive Wan
+/// terminal decoder still publishes [`WAN_DECODER_CALIBRATION_FINGERPRINT`] on either source.
 pub(crate) fn native_memory_strategy_contract_from_spec(
     provider_id: &str,
     spec: &LoadSpec,
@@ -548,7 +717,13 @@ pub(crate) fn native_memory_strategy_contract_from_spec(
         vae: stored(&base_snapshot_dir.join("vae"), "base VAE")?
             .saturating_add(alternate_decoder_bytes),
     };
-    memory_strategy_contract_with_components(provider_id, spec, components, streamable)
+    memory_strategy_contract_with_components(
+        provider_id,
+        spec,
+        components,
+        streamable,
+        production_calibration_identity(provider_id, spec),
+    )
 }
 
 /// Compatibility shim for the pre-registry native loader. New call sites carry the base snapshot in
@@ -1397,6 +1572,327 @@ mod tests {
         }
     }
 
+    /// The four registered base routes. Every calibration-identity expectation below is derived
+    /// from this product rather than a frozen list of strings or a frozen count.
+    const BASE_ROUTES: [&str; 4] = [
+        crate::model::KREA_2_TURBO_ID,
+        crate::model::KREA_2_RAW_ID,
+        crate::model::KREA_2_EDIT_ID,
+        crate::model::KREA_2_TURBO_EDIT_ID,
+    ];
+    const BASE_TIERS: [&str; 3] = ["bf16", "q4", "q8"];
+
+    /// The full {4 routes} x {3 tiers} product of the production table.
+    fn production_cells() -> Vec<(&'static str, &'static str, String)> {
+        BASE_ROUTES
+            .into_iter()
+            .flat_map(|provider_id| {
+                BASE_TIERS.into_iter().map(move |tier| {
+                    (
+                        provider_id,
+                        tier,
+                        production_calibration_fingerprint(provider_id, tier).unwrap_or_else(
+                            || panic!("{provider_id}:{tier} must have a production cell"),
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn write_transformer_quant_marker(root: &std::path::Path, bits: Option<u32>) {
+        let json = match bits {
+            Some(bits) => format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#),
+            None => "{}".to_owned(),
+        };
+        std::fs::write(root.join("transformer/config.json"), json).unwrap();
+    }
+
+    /// **sc-22735 (a)/(b)/(c): the collision this story exists to close.**
+    ///
+    /// Before this change all four base routes published the single measured turbo string at all
+    /// three tiers, so a `krea_2_raw` bf16 anchor was indistinguishable by calibration identity
+    /// from a `krea_2_turbo` q4 anchor. Every one of the twelve cells — turbo's three included —
+    /// must now be pairwise distinct and match the documented format.
+    #[test]
+    fn every_base_route_and_tier_cell_publishes_its_own_production_string() {
+        let cells = production_cells();
+        assert_eq!(cells.len(), BASE_ROUTES.len() * BASE_TIERS.len());
+
+        let mut per_tier = Vec::new();
+        for (provider_id, tier, fingerprint) in &cells {
+            mlx_gen::gen_core::validate_calibration_fingerprint(fingerprint)
+                .unwrap_or_else(|reason| panic!("{provider_id}:{tier} fingerprint {reason}"));
+            let route = provider_id
+                .strip_prefix("krea_2_")
+                .expect("base route ids are krea_2_*")
+                .replace('_', "-");
+            assert_eq!(
+                *fingerprint,
+                format!("krea-2-{route}-{tier}-mlx-shared-ladder-v1"),
+                "{provider_id}:{tier}"
+            );
+            per_tier.push(fingerprint.clone());
+        }
+
+        assert_eq!(
+            per_tier.len(),
+            BASE_ROUTES.len() * BASE_TIERS.len(),
+            "every route is keyed per tier"
+        );
+        let distinct: std::collections::BTreeSet<_> = per_tier.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            per_tier.len(),
+            "no two (route, tier) cells may collide: {per_tier:?}"
+        );
+        // The retired shared key is retained by no cell: no MLX turbo record was ever measured
+        // against it, so preserving it would only re-create the ambiguity.
+        for fingerprint in &per_tier {
+            assert_ne!(
+                fingerprint, RETIRED_SHARED_MLX_FINGERPRINT,
+                "the retired shared MLX key must not come back"
+            );
+        }
+    }
+
+    /// The string every base route used to publish at every tier, kept here and nowhere else so a
+    /// re-collapse onto it reddens a named test rather than passing as a plausible identity.
+    const RETIRED_SHARED_MLX_FINGERPRINT: &str =
+        "krea-2-mlx-full-ladder-native-pid-attn64m-window1-2026-08-03-v3";
+
+    /// (c) `krea_2_raw` never returns the turbo key at any tier — stated on its own so a
+    /// provider-match mutation that folds raw back onto turbo reddens a named test.
+    #[test]
+    fn raw_never_publishes_the_turbo_key() {
+        for tier in BASE_TIERS {
+            let raw = production_calibration_fingerprint(crate::model::KREA_2_RAW_ID, tier)
+                .expect("raw ships every tier");
+            assert_ne!(raw, RETIRED_SHARED_MLX_FINGERPRINT, "{tier}");
+            for turbo_tier in BASE_TIERS {
+                assert_ne!(
+                    raw,
+                    production_calibration_fingerprint(crate::model::KREA_2_TURBO_ID, turbo_tier)
+                        .expect("turbo ships every tier"),
+                    "{tier} vs turbo {turbo_tier}"
+                );
+            }
+            assert!(raw.starts_with("krea-2-raw-"), "{raw}");
+        }
+    }
+
+    /// (f) an unknown provider id, and any tier outside the shipped ladder, get `None` from the
+    /// table rather than a fabricated string.
+    #[test]
+    fn the_production_table_refuses_unknown_routes_and_tiers() {
+        for tier in BASE_TIERS {
+            assert_eq!(
+                production_calibration_fingerprint("krea_2_unknown", tier),
+                None
+            );
+            assert_eq!(
+                production_calibration_fingerprint(
+                    crate::model_control::KREA_2_TURBO_CONTROL_ID,
+                    tier
+                ),
+                None,
+                "the pose-control route owns its own identity in `crate::memory_strategy`"
+            );
+        }
+        for tier in ["nvfp4", "fp32", "", "Q4"] {
+            for provider_id in BASE_ROUTES {
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, tier),
+                    None,
+                    "{provider_id}:{tier}"
+                );
+            }
+        }
+    }
+
+    /// **The load-bearing binding**: the tier in the published string is proven from the ARTIFACT's
+    /// packed marker, not from `LoadSpec::quantize`. The SceneWorks worker passes
+    /// `quantize = None` for these routes at every tier on MLX, so a `spec.quantize` key would
+    /// collapse all three tiers onto one string.
+    #[test]
+    fn production_contracts_key_on_the_proven_artifact_tier_not_the_request_knob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = fixture(&tmp);
+        let mut published = Vec::new();
+        for (bits, tier) in [(Some(4), "q4"), (Some(8), "q8"), (None, "bf16")] {
+            write_transformer_quant_marker(&root, bits);
+            let mut spec = base.clone();
+            // Exactly what the worker sends: no quant request at ANY tier.
+            spec.quantize = None;
+            for provider_id in BASE_ROUTES {
+                assert_eq!(
+                    proven_tier_token(provider_id, &spec),
+                    Some(tier),
+                    "{provider_id}: packed marker {bits:?}"
+                );
+                let contract = memory_strategy_contract(provider_id, &spec).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .expect("a proven base cell publishes an identity");
+                assert_eq!(
+                    identity.fingerprint,
+                    production_calibration_fingerprint(provider_id, tier).unwrap(),
+                    "{provider_id}:{tier}"
+                );
+                assert_eq!(identity.load_shape, spec.load_shape);
+                assert_eq!(identity.load_shape, contract.load_shape);
+                assert!(contract.conformance_errors().is_empty(), "{provider_id}");
+                published.push((provider_id, tier, identity.fingerprint.clone()));
+            }
+        }
+        // The nine non-turbo cells that were built from real contracts are pairwise distinct.
+        let non_turbo: Vec<_> = published
+            .iter()
+            .filter(|(provider_id, ..)| *provider_id != crate::model::KREA_2_TURBO_ID)
+            .map(|(.., fingerprint)| fingerprint.clone())
+            .collect();
+        let distinct: std::collections::BTreeSet<_> = non_turbo.iter().collect();
+        assert_eq!(distinct.len(), non_turbo.len(), "{non_turbo:?}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// (d) both weights-free seams publish a static-behavior identity — keyed per route, tier and
+    /// residency policy — that is never any production string, and never `None` (the SceneWorks
+    /// fit gate resolves the fixture registration for every planned MLX anchor and requires an
+    /// identity whose `load_shape` equals the spec's).
+    #[test]
+    fn weights_free_seams_publish_a_static_behavior_identity_that_is_never_production() {
+        let production: std::collections::BTreeSet<String> = production_cells()
+            .into_iter()
+            .map(|(.., fingerprint)| fingerprint)
+            .chain([WAN_DECODER_CALIBRATION_FINGERPRINT.to_owned()])
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, spec) = fixture(&tmp);
+        let surfaces = mlx_gen::gen_core::mlx_memory_contract_surface_specs();
+        let expected_distinct: std::collections::BTreeSet<_> = surfaces
+            .iter()
+            .map(|surface| {
+                (
+                    selector_tier_token(surface.resolved_artifact_tier()),
+                    matches!(surface.spec.offload_policy, OffloadPolicy::Sequential),
+                )
+            })
+            .collect();
+
+        let mut across_routes = std::collections::BTreeSet::new();
+        for provider_id in BASE_ROUTES {
+            let route = provider_id.replace('_', "-");
+
+            // Fixture seam: tier from `spec.quantize` (the fixture carries Q4).
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            let identity = contract
+                .calibration
+                .as_ref()
+                .expect("fixture seam identity");
+            assert_eq!(
+                identity.fingerprint,
+                format!("{STATIC_BEHAVIOR_FINGERPRINT}-{route}-q4-sequential")
+            );
+            assert!(!production.contains(&identity.fingerprint));
+            assert_eq!(identity.load_shape, spec.load_shape);
+            assert_eq!(identity.load_shape, contract.load_shape);
+            assert!(contract.conformance_errors().is_empty(), "{provider_id}");
+
+            // Resolver seam: tier from the surface selector, no filesystem read.
+            let mut seen = std::collections::BTreeSet::new();
+            for surface in &surfaces {
+                let contract =
+                    weights_free_memory_strategy_surface_contract(provider_id, surface).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .expect("resolver seam identity");
+                let policy = match surface.spec.offload_policy {
+                    OffloadPolicy::Resident => "resident",
+                    OffloadPolicy::Sequential => "sequential",
+                };
+                assert_eq!(
+                    identity.fingerprint,
+                    format!(
+                        "{STATIC_BEHAVIOR_FINGERPRINT}-{route}-{}-{policy}",
+                        selector_tier_token(surface.resolved_artifact_tier())
+                    ),
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                assert!(
+                    !production.contains(&identity.fingerprint),
+                    "{provider_id}: {} republished a production key",
+                    surface.selector.id()
+                );
+                assert_eq!(identity.load_shape, surface.spec.load_shape);
+                assert_eq!(identity.load_shape, contract.load_shape);
+                assert!(contract.conformance_errors().is_empty());
+                seen.insert(identity.fingerprint.clone());
+            }
+            assert_eq!(
+                seen.len(),
+                expected_distinct.len(),
+                "{provider_id}: one identity per (tier, policy) the surface catalog names"
+            );
+            across_routes.extend(seen);
+        }
+        assert_eq!(
+            across_routes.len(),
+            expected_distinct.len() * BASE_ROUTES.len(),
+            "the route is part of the identity, so no two routes may share one"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// (e) fail closed to `None`, never fail the load: an imported single-file DiT has no promoted
+    /// cell (the evidence matrix has no load-source axis) and an artifact whose tier cannot be
+    /// resolved proves nothing — both publish no identity while the contract still builds.
+    #[test]
+    fn an_unprovable_route_publishes_no_calibration_and_still_builds_a_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, base) = fixture(&tmp);
+        let native = root.join("single.safetensors");
+        write_native_i8_safetensors(&native);
+        let file = LoadSpec::new(WeightsSource::File(native.clone())).with_component(
+            mlx_gen::BASE_SNAPSHOT_COMPONENT,
+            WeightsSource::Dir(root.clone()),
+        );
+        for provider_id in BASE_ROUTES {
+            let contract = memory_strategy_contract(provider_id, &file)
+                .unwrap_or_else(|error| panic!("{provider_id}: {error}"));
+            assert_eq!(
+                contract.calibration, None,
+                "{provider_id}: an imported file must not inherit a snapshot key"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{provider_id}");
+        }
+
+        // A packed-vs-requested mismatch and an unreadable marker both fail closed.
+        write_transformer_quant_marker(&root, Some(8));
+        let mut mismatched = base.clone();
+        mismatched.quantize = Some(Quant::Q4);
+        for provider_id in BASE_ROUTES {
+            assert!(
+                crate::model::effective_base_quant_tier(&mismatched, provider_id).is_err(),
+                "{provider_id}"
+            );
+            assert_eq!(proven_tier_token(provider_id, &mismatched), None);
+        }
+
+        std::fs::write(root.join("transformer/config.json"), "{ malformed").unwrap();
+        for provider_id in BASE_ROUTES {
+            assert_eq!(
+                proven_tier_token(provider_id, &base),
+                None,
+                "{provider_id}: an unreadable marker proves no tier"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn identical_fingerprint_is_separated_by_typed_load_shape() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1425,7 +1921,9 @@ mod tests {
         write_minimal_safetensors(&donor);
         let composite = memory_strategy_contract(
             "krea_2_turbo",
-            &spec.with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
+            &spec
+                .clone()
+                .with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor)),
         )
         .unwrap();
         assert_eq!(
@@ -1444,8 +1942,29 @@ mod tests {
         );
         assert_eq!(
             native.calibration.as_ref().unwrap().fingerprint,
-            MEMORY_CALIBRATION_FINGERPRINT
+            production_calibration_fingerprint(crate::model::KREA_2_TURBO_ID, "q4").unwrap(),
+            "the fixture packs the transformer at q4, so the native contract names the turbo q4 cell"
         );
+
+        // sc-22735: the VAE-composite marker keeps precedence over the per-(route, tier) base
+        // table on EVERY route, not just the one turbo cell that happens to share a string with
+        // the measured key.
+        let donor = tmp.path().join("wan-vae-shared.safetensors");
+        write_minimal_safetensors(&donor);
+        for provider_id in BASE_ROUTES {
+            let composite = memory_strategy_contract(
+                provider_id,
+                &spec
+                    .clone()
+                    .with_component(mlx_gen::VAE_COMPONENT, WeightsSource::File(donor.clone())),
+            )
+            .unwrap();
+            assert_eq!(
+                composite.calibration.as_ref().unwrap().fingerprint,
+                WAN_DECODER_CALIBRATION_FINGERPRINT,
+                "{provider_id}"
+            );
+        }
     }
 
     fn resident_context(

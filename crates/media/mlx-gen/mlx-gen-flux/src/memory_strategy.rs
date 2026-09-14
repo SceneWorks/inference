@@ -4,8 +4,25 @@
 //! contract. The clean schnell/dev routes use the shared head-once/tail-tiled native VAE decode and
 //! thread the shared bounded-attention kernel through every double- and single-stream block. Control
 //! and every loaded overlay remain `Missing` until their additional paths have independent coverage.
-//! Production calibration is limited to the exact measured FLUX.1-dev Q4 deferred artifact and
-//! request geometry; weights-free registry conformance receives an isolated synthetic identity.
+//!
+//! ## Production calibration identity (sc-22726, epic sc-22723 E1/E4)
+//!
+//! Every clean schnell/dev base load publishes a production calibration identity keyed on the
+//! route and the loaded artifact tier (`bf16`/`q4`/`q8`) — see [`production_calibration_fingerprint`]
+//! for the table and [`has_base_cell`] for the routes that have one. The identity is independent
+//! of `OffloadPolicy` and `LoadShape`: the worker's base text-to-image path loads
+//! `Resident + EagerMaterialization`, and an identity that existed only for
+//! `Sequential + DeferredMaterialization` left every resident anchor with nothing to bind. The
+//! tier in the string is the tier of the artifact on disk, never the request knob alone: the
+//! contract builder proves `LoadSpec::quantize` against the admitted packed inventory's marker or,
+//! off the streamable route, against every component's marker and packed content
+//! (`crate::artifact_inventory::resolved_artifact_tier`), and a dense snapshot the loader would
+//! requantize at runtime publishes no identity. The measured `2026-08-03` FLUX.1-dev Q4 string is
+//! preserved byte-for-byte for the (dev, q4) cell; the exact composite pin now gates only the
+//! real-weight runner ([`verified_runner_artifact`] / [`validate_runner_gate`]), never the
+//! published identity, and the measured-geometry clause in `safety_check` keys on that runner's
+//! `DeferredMaterialization` shape. Weights-free registry conformance receives an isolated
+//! synthetic identity that never equals a production string.
 //!
 //! ## Envelope vs. structure in the request route gate (sc-20569 twin)
 //!
@@ -492,7 +509,8 @@ fn build_contract(
 }
 
 /// Production contract. Filesystem-backed asset facts are real; rung 4 is declared loadable only
-/// for an exact pinned packed inventory, while calibration remains absent until real measurement.
+/// for an exact pinned packed inventory, and every clean base route carries its per-tier
+/// production calibration identity regardless of offload policy or load shape.
 pub fn memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
@@ -538,29 +556,92 @@ pub fn verified_runner_artifact(provider_id: &str, spec: &LoadSpec) -> CoreResul
     Ok(inventory.composite_sha256().to_owned())
 }
 
+/// The production calibration identity a base load publishes, bound to the artifact it loads.
+///
+/// The (provider, tier) string comes from [`production_calibration_fingerprint`]; what this
+/// function adds is the proof that the requested tier is the tier of the artifact on disk
+/// (sc-22726 review): with an admitted packed inventory the tier is its pinned marker
+/// (`PackedArtifactInventory::resolved_quant`); without one — the worker's
+/// `Resident + EagerMaterialization` shape, or any non-streamable snapshot — it is resolved
+/// header-only from every component's marker and packed content
+/// (`crate::artifact_inventory::resolved_artifact_tier`). A snapshot whose resolved tier is not
+/// `spec.quantize` publishes `None`: a dense snapshot loaded with `quantize = Some(_)` is a
+/// runtime requantization (`warn_sequential_requantize`) whose peak no anchor measured, and a
+/// packed snapshot loaded with `quantize = None` is not a shipped load shape either.
 fn production_calibration_identity(
     provider_id: &str,
     spec: &LoadSpec,
     inventory: Option<&crate::artifact_inventory::PackedArtifactInventory>,
 ) -> Option<MemoryCalibrationIdentity> {
-    let inventory = inventory?;
-    production_calibration_fingerprint(provider_id, spec, inventory.composite_sha256())
+    if !has_base_cell(provider_id, spec) {
+        return None;
+    }
+    let artifact_tier = match inventory {
+        Some(inventory) => inventory.resolved_quant(),
+        None => crate::artifact_inventory::resolved_artifact_tier(spec).ok()?,
+    };
+    if artifact_tier != spec.quantize {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, spec)
         .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
 }
 
-fn production_calibration_fingerprint(
-    provider_id: &str,
-    spec: &LoadSpec,
-    composite_sha256: &str,
-) -> Option<&'static str> {
-    (provider_id == crate::FLUX1_DEV_ID
-        && composite_sha256 == CALIBRATED_Q4_COMPOSITE_SHA256
-        && spec.precision == mlx_gen::Precision::Bf16
-        && spec.quantize == Some(mlx_gen::Quant::Q4)
-        && spec.offload_policy == OffloadPolicy::Sequential
-        && spec.load_shape == mlx_gen::LoadShape::DeferredMaterialization
-        && route_overlay(provider_id, spec).is_none())
-    .then_some(MEMORY_CALIBRATION_FINGERPRINT)
+/// Artifact-tier label of a FLUX.1 base load, as the loader resolves it: a prepacked Q4/Q8
+/// turnkey carries its matching `LoadSpec::quantize` (a checked no-op against the component
+/// marker) and a dense snapshot carries `None`. `None` for a non-bf16 execution precision or a
+/// tier this family does not ship. Shared with `mlx-gen-pulid`, which rides the same backbone.
+pub fn calibration_tier_label(spec: &LoadSpec) -> Option<&'static str> {
+    if spec.precision != mlx_gen::Precision::Bf16 {
+        return None;
+    }
+    match spec.quantize {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Whether `spec` on `provider_id` is a load that has a measurable base cell at all: a clean
+/// schnell/dev route (no overlay — adapters, IP-adapter, PiD, identity, external text encoder,
+/// control), bf16 execution, and a shipped `bf16`/`q4`/`q8` tier. Non-allocating; the
+/// (provider, tier) string itself is [`production_calibration_fingerprint`], and the binding of
+/// that string to the artifact on disk is the contract builder's job. Shared with
+/// `mlx-gen-pulid`, which rides the same backbone.
+pub fn has_base_cell(provider_id: &str, spec: &LoadSpec) -> bool {
+    matches!(provider_id, crate::FLUX1_SCHNELL_ID | crate::FLUX1_DEV_ID)
+        && route_overlay(provider_id, spec).is_none()
+        && calibration_tier_label(spec).is_some()
+}
+
+/// Production calibration identity table of the clean FLUX.1 base routes, keyed on
+/// (provider, tier).
+///
+/// `None` exactly when [`has_base_cell`] is false. The measured FLUX.1-dev Q4 key
+/// [`MEMORY_CALIBRATION_FINGERPRINT`] is returned unchanged for (dev, q4); every other cell is
+/// `flux1-<route>-<tier>-mlx-shared-ladder-v1`. Offload policy and load shape are deliberately
+/// not inputs (sc-22726): the identity names the artifact the evidence was captured against, and
+/// `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately.
+///
+/// This is the table, not the binding: the tier here is `spec.quantize`, and only the production
+/// contract builder — which proves that tier against the artifact's markers and content before
+/// publishing — may turn one of these strings into a contract identity.
+pub fn production_calibration_fingerprint(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+    if !has_base_cell(provider_id, spec) {
+        return None;
+    }
+    let route = match provider_id {
+        crate::FLUX1_SCHNELL_ID => "schnell",
+        crate::FLUX1_DEV_ID => "dev",
+        _ => return None,
+    };
+    let tier = calibration_tier_label(spec)?;
+    Some(if provider_id == crate::FLUX1_DEV_ID && tier == "q4" {
+        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("flux1-{route}-{tier}-mlx-shared-ladder-v1")
+    })
 }
 
 /// Fail closed unless the real-weight runner is bound to the exact measured production key.
@@ -773,11 +854,17 @@ pub(crate) fn safety_check(
         // admitting THAT would grade a request against evidence captured at a different geometry.
         let claims_measured_evidence =
             context.optimization_authority == MemoryOptimizationAuthority::Calibrated;
-        if contract
-            .calibration
-            .as_ref()
-            .is_some_and(|identity| identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT)
-            && context.selection.strategy.is_optimized()
+        // sc-22726: the (dev, q4) string is now published for every load shape of every dev Q4
+        // artifact, but the 2026-08-03 evidence behind this clause was captured on exactly one of
+        // them — the `Sequential + DeferredMaterialization` runner shape `validate_runner_gate`
+        // pins. Key the measured-geometry envelope on that shape, not on the string alone: a
+        // `Resident + EagerMaterialization` dev-q4 contract carries the same string but binds a
+        // resident anchor recorded at whatever geometry the catalog measured, and this clause
+        // must not refuse a `Calibrated` request at that geometry.
+        if contract.calibration.as_ref().is_some_and(|identity| {
+            identity.fingerprint == MEMORY_CALIBRATION_FINGERPRINT
+                && identity.load_shape == mlx_gen::LoadShape::DeferredMaterialization
+        }) && context.selection.strategy.is_optimized()
             && claims_measured_evidence
             && (context.mode != MemoryMode::TextToImage
                 || context.geometry.reference_count != 0
@@ -1345,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn production_rung4_needs_verified_exact_inventory_and_unknown_fixture_stays_uncalibrated() {
+    fn production_rung4_needs_verified_exact_inventory_and_runner_key_stays_pinned() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
         write_exact_snapshot(&root, Some(mlx_gen::Quant::Q4));
@@ -1360,8 +1447,14 @@ mod tests {
                 .composite_sha256()
                 .to_owned();
         assert_eq!(artifact.len(), 64);
-        assert!(contract.calibration.is_none());
+        // sc-22726: the (dev, q4) identity is published for any dev Q4 artifact — the composite
+        // pin gates only the real-weight runner, which still refuses this unknown snapshot.
+        assert_eq!(
+            contract.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).is_err());
+        assert!(validate_runner_gate(crate::FLUX1_DEV_ID, &artifact, &contract).is_err());
         assert_eq!(
             contract
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1370,13 +1463,18 @@ mod tests {
             MemoryStrategySupport::Implemented
         );
 
-        std::fs::write(
-            root.join("transformer/model-00002-of-00002.safetensors"),
-            [5_u8; 8],
-        )
-        .unwrap();
+        crate::artifact_inventory::write_test_shard(&root, "transformer", Some(mlx_gen::Quant::Q4));
         let sharded = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
-        assert!(sharded.calibration.is_none());
+        // A sharded (non-streamable) artifact loses rung 4, not its (dev, q4) identity: with no
+        // pinned inventory the tier is proven header-only across every shard.
+        assert!(
+            crate::artifact_inventory::verified_stream_inventory(crate::FLUX1_DEV_ID, &spec)
+                .is_none()
+        );
+        assert_eq!(
+            sharded.calibration.as_ref().unwrap().fingerprint,
+            MEMORY_CALIBRATION_FINGERPRINT
+        );
         assert_eq!(
             sharded
                 .capability(MemoryStrategy::BoundedTransformerResidency)
@@ -1387,55 +1485,296 @@ mod tests {
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &spec).is_err());
         let resident = spec.clone().with_offload_policy(OffloadPolicy::Resident);
         assert!(verified_runner_artifact(crate::FLUX1_DEV_ID, &resident).is_err());
+        // A shard whose header cannot be read leaves the tier unprovable: no identity at all.
+        std::fs::write(
+            root.join("transformer/model-00003-of-00003.safetensors"),
+            [5_u8; 8],
+        )
+        .unwrap();
+        let unreadable = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        assert!(unreadable.calibration.is_none());
     }
 
+    /// The worker's base text-to-image load is `Resident + EagerMaterialization` and the
+    /// evidence runner's is `Sequential + DeferredMaterialization`; both are the same artifact.
+    fn worker_load_shapes() -> [(OffloadPolicy, mlx_gen::LoadShape); 2] {
+        [
+            (
+                OffloadPolicy::Resident,
+                mlx_gen::LoadShape::EagerMaterialization,
+            ),
+            (
+                OffloadPolicy::Sequential,
+                mlx_gen::LoadShape::DeferredMaterialization,
+            ),
+        ]
+    }
+
+    /// The (provider, tier) production identity table. The (dev, q4) cell is the retained
+    /// `2026-08-03` measured key, byte-identical to what the old exact-inventory gate published.
+    const PRODUCTION_IDENTITIES: [(&str, Option<mlx_gen::Quant>, &str); 6] = [
+        (
+            crate::FLUX1_DEV_ID,
+            Some(mlx_gen::Quant::Q4),
+            MEMORY_CALIBRATION_FINGERPRINT,
+        ),
+        (
+            crate::FLUX1_DEV_ID,
+            Some(mlx_gen::Quant::Q8),
+            "flux1-dev-q8-mlx-shared-ladder-v1",
+        ),
+        (
+            crate::FLUX1_DEV_ID,
+            None,
+            "flux1-dev-bf16-mlx-shared-ladder-v1",
+        ),
+        (
+            crate::FLUX1_SCHNELL_ID,
+            Some(mlx_gen::Quant::Q4),
+            "flux1-schnell-q4-mlx-shared-ladder-v1",
+        ),
+        (
+            crate::FLUX1_SCHNELL_ID,
+            Some(mlx_gen::Quant::Q8),
+            "flux1-schnell-q8-mlx-shared-ladder-v1",
+        ),
+        (
+            crate::FLUX1_SCHNELL_ID,
+            None,
+            "flux1-schnell-bf16-mlx-shared-ladder-v1",
+        ),
+    ];
+
+    /// sc-22726 (epic sc-22723 E1/E4): every clean schnell/dev base load publishes a production
+    /// calibration identity keyed on (provider, tier), for the worker's resident shape as well as
+    /// the deferred evidence shape, and the (dev, q4) string is the retained measured key.
+    ///
+    /// Mutation that fails this: restoring the `composite_sha256 == CALIBRATED_Q4_COMPOSITE_SHA256
+    /// && offload_policy == Sequential && load_shape == Deferred` gate — every cell but
+    /// (dev, q4, Sequential+Deferred, exact pin) drops to `None`; or making
+    /// `production_calibration_identity` return `None` when no inventory was admitted — every
+    /// `Resident + EagerMaterialization` cell drops to `None`.
     #[test]
-    fn production_calibration_key_is_exact_and_all_other_axes_fail_closed() {
-        let exact = LoadSpec::new(WeightsSource::Dir("/exact-q4".into()))
-            .with_offload_policy(OffloadPolicy::Sequential)
-            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization)
-            .with_quant(mlx_gen::Quant::Q4);
+    fn every_clean_base_route_publishes_its_per_tier_identity_for_every_worker_load_shape() {
+        let mut published = std::collections::BTreeSet::new();
+        for (provider_id, quant, expected) in PRODUCTION_IDENTITIES {
+            for (offload_policy, load_shape) in worker_load_shapes() {
+                let root_tmp = tempfile::tempdir().unwrap();
+                let root = root_tmp.path().to_path_buf();
+                write_exact_snapshot(&root, quant);
+                let mut spec = LoadSpec::new(WeightsSource::Dir(root))
+                    .with_offload_policy(offload_policy)
+                    .with_load_shape(load_shape);
+                if let Some(quant) = quant {
+                    spec = spec.with_quant(quant);
+                }
+                assert_eq!(
+                    production_calibration_fingerprint(provider_id, &spec).as_deref(),
+                    Some(expected),
+                    "{provider_id} {quant:?} {offload_policy:?} {load_shape:?}"
+                );
+                let contract = memory_strategy_contract(provider_id, &spec).unwrap();
+                // Both artifact bindings are exercised: the deferred shape admits the pinned
+                // inventory and takes the tier from its marker, the resident shape has no
+                // inventory and proves the tier header-only from the snapshot.
+                assert_eq!(
+                    crate::artifact_inventory::verified_stream_inventory(provider_id, &spec)
+                        .is_some(),
+                    offload_policy == OffloadPolicy::Sequential,
+                    "{provider_id} {quant:?} {offload_policy:?} {load_shape:?}"
+                );
+                let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                    panic!("{provider_id} {quant:?} {offload_policy:?} {load_shape:?}: no identity")
+                });
+                assert_eq!(identity.fingerprint, expected);
+                assert_eq!(identity.load_shape, load_shape);
+                assert_eq!(contract.load_shape, load_shape);
+                assert!(
+                    contract.conformance_errors().is_empty(),
+                    "{:?}",
+                    contract.conformance_errors()
+                );
+                // The weights-free conformance identity is a synthetic string that never names a
+                // production cell, under either registry entry point.
+                let fixture = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+                assert_ne!(fixture.calibration.unwrap().fingerprint, expected);
+            }
+            published.insert(expected);
+        }
+        assert_eq!(
+            published.len(),
+            PRODUCTION_IDENTITIES.len(),
+            "two (provider, tier) cells share one identity"
+        );
         assert_eq!(
             production_calibration_fingerprint(
                 crate::FLUX1_DEV_ID,
-                &exact,
-                CALIBRATED_Q4_COMPOSITE_SHA256,
-            ),
-            Some(MEMORY_CALIBRATION_FINGERPRINT)
-        );
-        assert!(production_calibration_fingerprint(
-            crate::FLUX1_SCHNELL_ID,
-            &exact,
-            CALIBRATED_Q4_COMPOSITE_SHA256,
-        )
-        .is_none());
-        assert!(production_calibration_fingerprint(crate::FLUX1_DEV_ID, &exact, "stale").is_none());
-        for changed in [
-            exact.clone().with_quant(mlx_gen::Quant::Q8),
-            exact.clone().with_offload_policy(OffloadPolicy::Resident),
-            exact
-                .clone()
-                .with_load_shape(mlx_gen::LoadShape::EagerMaterialization),
-        ] {
-            assert!(production_calibration_fingerprint(
-                crate::FLUX1_DEV_ID,
-                &changed,
-                CALIBRATED_Q4_COMPOSITE_SHA256,
+                &LoadSpec::new(WeightsSource::Dir("/any".into())).with_quant(mlx_gen::Quant::Q4),
             )
-            .is_none());
+            .as_deref(),
+            Some("flux1-dev-q4-mlx-shared-ladder-2026-08-03-v1"),
+            "the retained (dev, q4) key must stay byte-identical"
+        );
+        for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+            for provider_id in [crate::FLUX1_SCHNELL_ID, crate::FLUX1_DEV_ID] {
+                let resolved = weights_free_memory_surface_contract(provider_id, &surface).unwrap();
+                let fingerprint = resolved.calibration.unwrap().fingerprint;
+                assert!(
+                    !published.contains(fingerprint.as_str()),
+                    "{provider_id} surface {} resolved to production identity {fingerprint}",
+                    surface.selector.id()
+                );
+            }
         }
-        let mut overlay = exact;
-        overlay.adapters.push(mlx_gen::AdapterSpec::new(
+    }
+
+    /// sc-22726 review: the tier in the published string is the tier of the artifact on disk.
+    /// The (provider, tier) table still answers for the request knob alone, but the production
+    /// contract withholds the identity whenever the snapshot's markers and packed content do not
+    /// encode `spec.quantize`: a dense snapshot loaded with `quantize = Some(_)` is a runtime
+    /// requantization no anchor measured (it used to publish the measured (dev, q4) key), and a
+    /// packed snapshot loaded with `quantize = None` or the other packed tier is no shipped load.
+    ///
+    /// Mutation that fails this: deleting the `artifact_tier != spec.quantize` refusal in
+    /// `production_calibration_identity` — every mismatched cell publishes the requested tier's
+    /// string.
+    #[test]
+    fn production_identity_is_withheld_when_the_requested_tier_is_not_the_artifacts_tier() {
+        for (artifact, requested) in [
+            (None, Some(mlx_gen::Quant::Q4)),
+            (None, Some(mlx_gen::Quant::Q8)),
+            (Some(mlx_gen::Quant::Q4), None),
+            (Some(mlx_gen::Quant::Q4), Some(mlx_gen::Quant::Q8)),
+            (Some(mlx_gen::Quant::Q8), Some(mlx_gen::Quant::Q4)),
+        ] {
+            for provider_id in [crate::FLUX1_SCHNELL_ID, crate::FLUX1_DEV_ID] {
+                for (offload_policy, load_shape) in worker_load_shapes() {
+                    let root_tmp = tempfile::tempdir().unwrap();
+                    let root = root_tmp.path().to_path_buf();
+                    write_exact_snapshot(&root, artifact);
+                    let mut spec = LoadSpec::new(WeightsSource::Dir(root))
+                        .with_offload_policy(offload_policy)
+                        .with_load_shape(load_shape);
+                    spec.quantize = requested;
+                    let label =
+                        format!("{provider_id} artifact {artifact:?} requested {requested:?} {offload_policy:?} {load_shape:?}");
+                    assert!(
+                        production_calibration_fingerprint(provider_id, &spec).is_some(),
+                        "{label}: the table answers for the request knob"
+                    );
+                    assert_eq!(
+                        crate::artifact_inventory::resolved_artifact_tier(&spec).unwrap(),
+                        artifact,
+                        "{label}"
+                    );
+                    let contract = memory_strategy_contract(provider_id, &spec).unwrap();
+                    assert!(
+                        contract.calibration.is_none(),
+                        "{label}: published {:?}",
+                        contract.calibration
+                    );
+                }
+            }
+        }
+    }
+
+    /// sc-22726 review: the measured-geometry envelope clause is keyed on the runner's
+    /// `Sequential + DeferredMaterialization` shape, the only shape the 2026-08-03 (dev, q4)
+    /// evidence was captured on. A `Resident + EagerMaterialization` dev-q4 contract carries the
+    /// same string but binds a resident anchor recorded at the catalog's geometry, so a
+    /// `Calibrated` optimized request at that geometry is admitted, while the deferred contract
+    /// still refuses it.
+    ///
+    /// Mutation that fails this: dropping the `identity.load_shape == DeferredMaterialization`
+    /// conjunct from the clause in `safety_check` — the resident contract refuses 1280x720.
+    #[test]
+    fn resident_dev_q4_contract_admits_calibrated_optimized_requests_off_the_runner_geometry() {
+        for (offload_policy, load_shape) in worker_load_shapes() {
+            let root_tmp = tempfile::tempdir().unwrap();
+            let root = root_tmp.path().to_path_buf();
+            write_exact_snapshot(&root, Some(mlx_gen::Quant::Q4));
+            let spec = LoadSpec::new(WeightsSource::Dir(root))
+                .with_offload_policy(offload_policy)
+                .with_load_shape(load_shape)
+                .with_quant(mlx_gen::Quant::Q4);
+            let contract = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                MEMORY_CALIBRATION_FINGERPRINT
+            );
+            let tier = MemoryNumericTier {
+                precision: spec.precision,
+                quant: spec.quantize,
+                component_precision_floors: &[],
+            };
+            let mut context = route_context(&contract, MemoryStrategy::BoundedAttention, tier);
+            context.optimization_authority = MemoryOptimizationAuthority::Calibrated;
+            assert_eq!(
+                registered_safety_check(&spec, &contract, &context),
+                MemorySafetyDecision::Accept,
+                "{offload_policy:?} {load_shape:?} at the runner geometry"
+            );
+            context.geometry.width = 1280;
+            context.geometry.height = 720;
+            let decision = registered_safety_check(&spec, &contract, &context);
+            if load_shape == mlx_gen::LoadShape::DeferredMaterialization {
+                assert!(
+                    matches!(decision, MemorySafetyDecision::Reject { .. }),
+                    "the deferred runner shape is held to its measured 1024x1024 cell"
+                );
+            } else {
+                assert_eq!(
+                    decision,
+                    MemorySafetyDecision::Accept,
+                    "the resident shape is not held to the deferred runner's geometry"
+                );
+            }
+        }
+    }
+
+    /// The identity is withheld only where there is no measurable base cell: an overlay on the
+    /// route, the control provider, a non-bf16 execution precision, or a foreign tier.
+    #[test]
+    fn production_identity_is_withheld_only_for_routes_without_a_base_cell() {
+        let base = LoadSpec::new(WeightsSource::Dir("/any".into())).with_quant(mlx_gen::Quant::Q4);
+        assert!(has_base_cell(crate::FLUX1_DEV_ID, &base));
+        assert!(production_calibration_fingerprint(crate::FLUX1_DEV_ID, &base).is_some());
+        assert!(!has_base_cell(crate::FLUX1_DEV_CONTROL_ID, &base));
+        assert!(production_calibration_fingerprint(crate::FLUX1_DEV_CONTROL_ID, &base).is_none());
+        assert!(!has_base_cell("flux1_unknown", &base));
+        assert!(production_calibration_fingerprint("flux1_unknown", &base).is_none());
+        let mut adapters = base.clone();
+        adapters.adapters.push(mlx_gen::AdapterSpec::new(
             "/adapter.safetensors".into(),
             1.0,
             mlx_gen::AdapterKind::Lora,
         ));
-        assert!(production_calibration_fingerprint(
-            crate::FLUX1_DEV_ID,
-            &overlay,
-            CALIBRATED_Q4_COMPOSITE_SHA256,
-        )
-        .is_none());
+        let mut control = base.clone();
+        control.control = Some(WeightsSource::File("/control.safetensors".into()));
+        let mut ip_adapter = base.clone();
+        ip_adapter.ip_adapter = Some(WeightsSource::Dir("/ip".into()));
+        let mut external_te = base.clone();
+        external_te.text_encoder = Some(WeightsSource::Dir("/te".into()));
+        let mut fp32 = base.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        let nvfp4 = base.with_quant(mlx_gen::Quant::Nvfp4);
+        for (label, spec) in [
+            ("adapters", adapters),
+            ("control", control),
+            ("ip-adapter", ip_adapter),
+            ("external-text-encoder", external_te),
+            ("fp32", fp32),
+            ("nvfp4", nvfp4),
+        ] {
+            assert!(
+                !has_base_cell(crate::FLUX1_DEV_ID, &spec),
+                "{label} has no base cell"
+            );
+            assert!(
+                production_calibration_fingerprint(crate::FLUX1_DEV_ID, &spec).is_none(),
+                "{label} must not publish a base-cell identity"
+            );
+        }
     }
 
     #[test]
@@ -2075,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn production_unknown_artifact_has_no_calibration_and_rejects_static_context() {
+    fn production_contract_rejects_the_static_conformance_context() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path().to_path_buf();
         for component in ["text_encoder", "text_encoder_2", "transformer", "vae"] {
@@ -2084,6 +2423,8 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_offload_policy(OffloadPolicy::Sequential);
         let runtime = memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
+        // sc-22726: these components are not header-readable, so no tier can be proven against
+        // the artifact and the production contract publishes no identity.
         assert!(runtime.calibration.is_none());
         let fixture = weights_free_memory_strategy_contract(crate::FLUX1_DEV_ID, &spec).unwrap();
         let context = registered_valid_fixture(&spec, &fixture, MemoryStrategy::StagedResidency)

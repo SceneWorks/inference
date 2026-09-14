@@ -932,17 +932,23 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 54);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 51);
+        // 58/55 = 54/51 plus two independent sibling additions on this epic branch:
+        // `ideogram_4` and `ideogram_4_turbo` joined the memory registry in sc-22732 — the crate
+        // had no `MemoryProviderContract` at all before, so both ids were absent from every count
+        // below — and sc-22736 added `wan2_2_t2v_14b` and `wan2_2_i2v_14b`, which now carry the
+        // pre-load half of what their loaded generators already publish.
+        assert_eq!(registry.memory_strategy_registrations().len(), 58);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 55);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b", "svd_xt"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // 49 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync, FLUX.2 Dev Control has its exact fixture, and LTX-2.5
-        // now publishes its physical-tier-aware ladder): these
+        // 51 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
+        // joined them in the sc-17137 sync, FLUX.2 Dev Control has its exact fixture, LTX-2.5
+        // now publishes its physical-tier-aware ladder, and `ideogram_4` / `ideogram_4_turbo`
+        // joined in sc-22732 with the crate's first memory contract): these
         // providers publish every tier and materialization selector, even where a provider correctly
         // classifies a strategy as Missing. Two video providers publish narrower, truthful
         // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
@@ -950,7 +956,11 @@ mod tests {
         // tier. SVD is instead covered by the separate resident-only witness assertion above.
         // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
         // rather than folded into a single total.
-        assert_eq!(surfaces.len(), 49 * 12 + 6 + 3);
+        //
+        // sc-22736 adds the two A14B routes as a THIRD narrowed shape: both ship all three tiers,
+        // and the MLX worker loads every one of them Resident + eagerly materialized, so each
+        // witnesses one selector per tier — 3 apiece, not 12.
+        assert_eq!(surfaces.len(), 51 * 12 + 6 + 3 + 2 * 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -1076,9 +1086,28 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
+                // sc-22733: a weights-free surface publishes the conformance family for ITS
+                // resolved tier — never the single pre-sc-22733 string, and never a production
+                // `mage-flow-<route>-<tier>-mlx-shared-ladder-v1` cell, which only a loaded
+                // artifact may name.
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => None,
+                    MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
+                    MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
+                    MemoryContractSurfaceTier::Nvfp4 => Some(mlx_gen::Quant::Nvfp4),
+                };
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT
+                    *fingerprint,
+                    mlx_gen_mage::model::weights_free_calibration_fingerprint(provider_id, tier)
+                        .unwrap(),
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                assert_ne!(
+                    *fingerprint,
+                    mlx_gen_mage::model::production_calibration_fingerprint(provider_id, tier)
+                        .unwrap()
                 );
             }
             assert_eq!(
@@ -1203,10 +1232,27 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
-                assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+                // sc-22735: the weights-free declaration surface publishes a per-(route, tier,
+                // policy) STATIC identity, never a production calibration key. It used to
+                // republish the measured turbo string on all four routes at all three tiers.
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                assert!(
+                    fingerprint.starts_with(
+                        mlx_gen_krea::block_memory_strategy::STATIC_BEHAVIOR_FINGERPRINT
+                    ),
+                    "{provider_id}: {fingerprint}"
                 );
+                for tier in ["bf16", "q4", "q8"] {
+                    assert_ne!(
+                        *fingerprint,
+                        mlx_gen_krea::block_memory_strategy::production_calibration_fingerprint(
+                            provider_id,
+                            tier
+                        )
+                        .expect("every base route ships every tier"),
+                        "{provider_id}: declaration surface republished a production key"
+                    );
+                }
             }
             assert_eq!(implemented, 3, "{provider_id}");
         }

@@ -1,32 +1,13 @@
 //! Runtime degeneracy screening for the conditioning tensors this crate hands the DiT (sc-17153).
 //!
-//! # Why a runtime check exists on a shipped path
+//! Dense bf16 zero contexts were observed in sc-17153. Those observations did not establish
+//! a mechanism or prove that packed tiers cannot fail. In sc-23053, fault injection reproduced
+//! the same zero embedding by making a lazy weight read fail: MLX discarded its exception.
+//! The loader now propagates those errors. Dense embeddings also check a CPU lookup before
+//! verifying GPU visibility, because matching CPU/GPU zero buffers are not valid weights.
 //!
-//! The **bf16 dense** H3 text encoder intermittently returns an **all-zero forward**: `max|out|` and
-//! `sum|out|` both exactly `0.0`, correct shapes, no Metal error, no allocation anomaly. Measured
-//! incidence was **4 sightings in ~30 instrumented forwards (~13%)** on real weights. Nothing
-//! downstream notices — the DiT happily denoises against a zero context and returns a video with no
-//! relationship to the prompt, which is indistinguishable from "the model is bad at this prompt"
-//! unless someone thinks to inspect the conditioning.
-//!
-//! The mechanism is **below this crate** and, as of 2026-08-20, **unattributed**. Each of the
-//! obvious explanations was disproven by counter-measurement:
-//!
-//! - **Not window-size-specific.** Reversing the window order `[50, 10, 5, 1]` moved the zero to
-//!   window 50 rather than keeping it on a fixed window.
-//! - **Not deferred/windowing-specific.** 2 of the 4 sightings were plain RESIDENT forwards, one on
-//!   a path that never calls [`MiniMaxH3TextEncoder::from_dir_deferred`](super::MiniMaxH3TextEncoder::from_dir_deferred).
-//! - **Not warm/cold page cache.** 12/12 warm trials were correct, and a deliberately cold run at
-//!   ~60 MB free pages was 4/4 correct.
-//! - **Not tier-general.** Zero sightings across ~12 packed q4/q8 arms — it is specific to the
-//!   **bf16 dense** encoder, whose token table and projections take a different loader path
-//!   ([`mlx_gen::quant::embedding`] returns [`TokenEmbedding::Dense`](mlx_gen::nn::TokenEmbedding)
-//!   rather than the packed triple).
-//!
-//! Because the mechanism is unattributed, the only thing this crate can honestly do is **notice and
-//! refuse**. The screen is deliberately *not* a retry: a retry would return a render the user cannot
-//! tell apart from a good one on the ~87% of attempts that succeed, and it would erase the incidence
-//! data the investigation still needs. See [`Self`](self) and `tests/te_tier_real_weights.rs`.
+//! This final screen still rejects zero or non-finite conditioning without retrying generation.
+//! An all-zero tensor alone cannot identify the cause of a historical incident.
 //!
 //! # Why the defect is typed here and not in [`mlx_gen::Error`]
 //!
@@ -39,8 +20,8 @@
 //! [`Error::Msg`] carrying the actionable text — no contract churn, no
 //! speculative enum arm on a shared seam.
 
-use mlx_rs::ops::{abs, max, sum};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::{abs_device, max_device, sum_device};
+use mlx_rs::{Array, Dtype, StreamOrDevice};
 
 use mlx_gen::{Error, Result};
 
@@ -84,13 +65,10 @@ impl std::fmt::Display for DegenerateConditioning {
         write!(
             f,
             "minimax-h3 te ({}): refusing to render from a degenerate conditioning tensor — {} at \
-             shape {:?} (max|out| {:e}, sum|out| {:e}). The DiT would have denoised against it and \
-             returned video unrelated to the prompt. This is NOT retried on purpose: an all-zero \
-             context is the intermittent bf16-DENSE text-encoder zeroing tracked by sc-17153 (~13% \
-             of forwards; mechanism unattributed as of 2026-08-20), it has never been observed on \
-             the q4/q8 packed tiers, so re-running on a packed text-encoder tier is the available \
-             workaround — and a silent retry would hide the incidence data that investigation still \
-             needs. See crates/media/mlx-gen/mlx-gen-minimax-h3/src/text_encoder/degeneracy.rs.",
+             shape {:?} (max|out| {:e}, sum|out| {:e}). Conditioning was rejected before video \
+             denoising; generation is NOT retried. This observation alone does not distinguish \
+             invalid loaded data from a CPU/GPU visibility failure. See sc-23053 (original \
+             observations: sc-17153) and any preceding weight-load diagnostic.",
             self.producer,
             self.defect.describe(),
             self.shape,
@@ -141,14 +119,26 @@ pub fn inspect_conditioning(
     producer: &'static str,
     x: &Array,
 ) -> Result<Option<DegenerateConditioning>> {
-    let magnitude = abs(x)?;
+    inspect_conditioning_on(producer, x, StreamOrDevice::default())
+}
+
+/// Keep the CPU diagnosis entirely on the CPU, including its reductions and cast.
+pub(crate) fn inspect_conditioning_on(
+    producer: &'static str,
+    x: &Array,
+    stream: StreamOrDevice,
+) -> Result<Option<DegenerateConditioning>> {
+    let magnitude = abs_device(x, &stream)?;
     // `try_item`, never `item`: `Array::item` is `try_item().unwrap()` in the pinned mlx-rs
     // (`mlx-rs/src/array/mod.rs:309-311`), and it is `try_item` that runs the `eval`. A screen on a
     // shipped render path, reached with ~53 GB resident, is exactly where an allocation failure is
     // plausible — this must return `Err` there, not panic the worker.
-    let scalar = |a: Array| -> Result<f32> { Ok(a.as_dtype(Dtype::Float32)?.try_item::<f32>()?) };
-    let max_abs = scalar(max(&magnitude, None)?)?;
-    let sum_abs = scalar(sum(&magnitude, None)?)?;
+    let scalar = |a: Array| -> Result<f32> {
+        Ok(a.as_dtype_device(Dtype::Float32, &stream)?
+            .try_item::<f32>()?)
+    };
+    let max_abs = scalar(max_device(&magnitude, None, &stream)?)?;
+    let sum_abs = scalar(sum_device(&magnitude, None, &stream)?)?;
 
     let defect = if !max_abs.is_finite() || !sum_abs.is_finite() {
         ConditioningDefect::NonFinite
@@ -178,6 +168,7 @@ pub(crate) fn refuse_if_degenerate(producer: &'static str, x: &Array) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::{abs, max};
 
     fn ctx(values: &[f32]) -> Array {
         Array::from_slice(values, &[1, 2, 2])
@@ -304,16 +295,16 @@ mod tests {
     /// deliberate, give the operator something to do, and lead the next engineer to the
     /// investigation. Pinned so a later reword cannot quietly drop one of them.
     #[test]
-    fn the_refusal_names_the_observation_the_workaround_and_the_investigation() {
+    fn the_refusal_reports_the_observation_without_claiming_a_cause() {
         let e = refuse_if_degenerate("t2va", &ctx(&[0.0; 4]))
             .expect_err("an all-zero context must refuse")
             .to_string();
         assert!(e.contains("every element is exactly zero"), "{e}");
         assert!(e.contains("max|out| 0e0"), "{e}");
         assert!(e.contains("NOT retried"), "{e}");
-        assert!(e.contains("packed text-encoder tier"), "{e}");
+        assert!(e.contains("does not distinguish"), "{e}");
         assert!(e.contains("sc-17153"), "{e}");
-        assert!(e.contains("degeneracy.rs"), "{e}");
+        assert!(e.contains("sc-23053"), "{e}");
     }
 
     /// The defect crosses the crate boundary as a message-carrying `Error`, not as a bare
