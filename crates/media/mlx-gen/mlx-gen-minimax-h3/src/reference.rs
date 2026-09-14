@@ -90,6 +90,27 @@ pub const MAX_TOTAL_REFERENCES: usize = 12;
 /// references and the generated canvas which share the one canvas rule. This is the concrete form
 /// of "references do not bind the generated geometry": a 2048-short-edge image reference conditions
 /// a 768-short-edge render.
+///
+/// **Upstream's own value, not a SceneWorks choice** (sc-23402). The reference implementation
+/// declares it as a pipeline config default —
+/// `diffusers/src/diffusers/modular_pipelines/minimax_h3/before_encoder.py:220`,
+/// `ConfigSpec("reference_image_short_edge", 2048)` in `MiniMaxH3Ref2VASetupStep.expected_configs`
+/// — and applies it at `:490-492`:
+///
+/// ```text
+/// scale = components.config.reference_image_short_edge / min(width, height)
+/// target_height = max(multiple, round(height * scale / multiple) * multiple)
+/// target_width  = max(multiple, round(width  * scale / multiple) * multiple)
+/// ```
+///
+/// which is exactly [`normalize_reference_image`] below, including the unconditional (upscaling)
+/// scale and the `max(multiple, …)` floor. The "high detail, upscaling included, no area cap"
+/// rationale is upstream's own comment at `:462-464`. `ModelTC/Minimax-H3-Turbo`'s
+/// `minimax_h3_ref2va_pipeline.py:35` re-declares the same `REFERENCE_SHORT_EDGE = 2048` when it
+/// offers *alternative* resize policies (`match`, `max`) beside the stock one, which it names
+/// `diffusers` and describes as forcing a 2048-pixel short edge — so 2048 with upscaling is the
+/// released checkpoint's rule, and the cheaper policies are an opt-in deviation from it. This crate
+/// implements the stock rule only.
 pub const REFERENCE_IMAGE_SHORT_EDGE: i32 = 2048;
 
 /// The rate the **conditioner** reads a video reference at — every `24 / 2 = 12`th frame of the

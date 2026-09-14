@@ -307,9 +307,18 @@ fn the_seventeen_load_at_the_published_geometry() {
 /// (head before `embed_context`, `adaln_proj` before the precompute, bodies after the eviction),
 /// and building the velocity model leaves none of them unverified.
 ///
+/// The **ordering** of the adaln group against the eviction is asserted separately from the fact of
+/// it: `JointDit::adaln_unverified_at_eviction` is read inside the residency branch, before
+/// `precompute_and_evict`, so 0 there is the invariant that verifying afterwards would break —
+/// forcing 26 GB of just-released `adaln_proj` weight back into residency. `released_bytes` is the
+/// eviction's own accounting and can only say the eviction happened at all, so it stays as the
+/// secondary check.
+///
 /// MUTATION: delete any one of the three `verify_*_sources` calls in `JointDit::new` — the
-/// corresponding count stays non-zero and this reds. Mis-partition a key (`adaln_proj` into
-/// `body`) — the `[38, 4, 20]` split reds.
+/// corresponding count stays non-zero and this reds. Move `dit.verify_adaln_sources()?` below the
+/// residency `match` — `adaln_unverified_at_eviction` becomes 4 and this reds while `[0, 0, 0]` and
+/// `released_bytes > 0` both still pass. Mis-partition a key (`adaln_proj` into `body`) — the
+/// `[38, 4, 20]` split reds.
 #[test]
 fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() {
     use mlx_gen_minimax_h3::denoise::{adaln_schedule, JointSchedule};
@@ -353,6 +362,14 @@ fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() 
         [0, 0, 0],
         "JointDit::new must verify the head, adaln and body groups"
     );
+    // The ORDERING invariant, read at the eviction itself rather than inferred from its accounting.
+    assert_eq!(
+        model.adaln_unverified_at_eviction(),
+        0,
+        "the adaln group must already be verified when the precompute-and-evict branch runs; \
+         verifying it afterwards would force the just-released weight back into residency"
+    );
+    // Secondary: the eviction this ordering is about did happen.
     assert!(
         model.released_bytes() > 0,
         "the eviction still happens after the adaln verification"

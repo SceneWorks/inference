@@ -218,7 +218,10 @@ fn cold_second_load_token_embedding_incidence_probe() {
                     .expect("resident encoder");
                 let t_te_build = secs(t);
                 let retries_te = retries() - r0;
-                assert!(encoder.token_table_is_quantized() || cfg.num_layers > 0);
+                assert!(
+                    encoder.token_table_is_quantized(),
+                    "the incidence probe must run the packed tier"
+                );
 
                 let r0 = retries();
                 let t = Instant::now();

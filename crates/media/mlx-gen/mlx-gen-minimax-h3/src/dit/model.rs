@@ -734,6 +734,10 @@ pub struct JointDit {
     resident_adaln_indices: Option<Array>,
     /// Bytes of `adaln_proj` weight released by the eviction, 0 when resident.
     released_bytes: usize,
+    /// `adaln_proj` source tensors still awaiting their sc-22414 GPU-view verification **at the
+    /// moment the residency branch ran** — read inside the branch, before the precompute and its
+    /// eviction. See [`Self::adaln_unverified_at_eviction`].
+    adaln_unverified_at_eviction: usize,
     forwards: usize,
     /// The rung-3 plan every step's block stack runs under (sc-18661).
     ///
@@ -799,9 +803,14 @@ impl JointDit {
         // Both residencies consume `adaln_proj` next: the precompute reads all of it at once, the
         // resident sampler reads it per step. Verify it here, once, before either.
         dit.verify_adaln_sources()?;
-        let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes) =
+        let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes, unverified) =
             match residency {
                 AdaLnResidency::PrecomputeAndEvict => {
+                    // Read INSIDE the branch, before the eviction: `unverified.adaln` holds
+                    // refcounted handles on the very buffers `precompute_and_evict` is about to
+                    // release, so verifying them afterwards would force 26 GB the eviction had just
+                    // freed back into residency. The ordering is the invariant, not the call.
+                    let unverified = dit.unverified_source_counts()[1];
                     // The timestep embedding is captured out of the closure so `norm_out`'s own
                     // table is projected from the SAME `temb` the block stack's was — a second
                     // `embed_timesteps` call would be a second chance to bind the wrong timesteps.
@@ -834,9 +843,13 @@ impl JointDit {
                         Some(norm_out),
                         None,
                         released,
+                        unverified,
                     )
                 }
                 AdaLnResidency::Resident => {
+                    // The same reading, on the branch that never evicts: the resident sampler reads
+                    // `adaln_proj` per step, so it too must be verified before this point.
+                    let unverified = dit.unverified_source_counts()[1];
                     // One temb row per ROW CLASS, rebuilt per step; the index tensors are therefore
                     // the local `row_class · MODALITY_NUM + tag`, which is constant across steps
                     // because neither the class nor the tag of a row ever moves.
@@ -846,7 +859,7 @@ impl JointDit {
                         &mlx_rs::ops::multiply(&classes, Array::from_int(MODALITY_NUM))?,
                         &tags,
                     )?;
-                    (Modulation::Resident, None, Some(local), 0)
+                    (Modulation::Resident, None, Some(local), 0, unverified)
                 }
             };
         // After the eviction: the bodies are now exactly what step 1 will hold, so forcing and
@@ -862,6 +875,7 @@ impl JointDit {
             norm_out_modulation,
             resident_adaln_indices,
             released_bytes,
+            adaln_unverified_at_eviction: unverified,
             forwards: 0,
             // Unbounded until a measured rung selects otherwise — the ladder's rule everywhere.
             attention_budget: AttentionBudget::UNBOUNDED,
@@ -944,6 +958,9 @@ impl JointDit {
             resident_adaln_indices: None,
             // Nothing was released, because nothing was ever resident.
             released_bytes: 0,
+            // A deferred load never holds `adaln_proj` in the map at all: each window's projection
+            // is verified by `DitBlockStream::materialize_adaln`, so there is nothing owed here.
+            adaln_unverified_at_eviction: 0,
             forwards: 0,
             attention_budget: AttentionBudget::UNBOUNDED,
             attention_axis: AttentionChunkAxis::Heads,
@@ -983,6 +1000,18 @@ impl JointDit {
             None => AttentionPlan::budgeted(self.attention_budget),
         };
         BoundedAttention::new(plan, self.attention_axis)
+    }
+
+    /// `adaln_proj` source tensors that were still unverified when the residency branch executed —
+    /// **0 is the sc-23402 ordering invariant**, and the observable for it.
+    ///
+    /// `released_bytes` is the eviction's own bookkeeping and cannot say whether the verification
+    /// preceded it. This can: the count is read inside the branch, immediately before
+    /// `AdaLnCache::precompute_and_evict`. Non-zero means the check would run *after* the eviction
+    /// and force 26 GB of just-released `adaln_proj` weight back into residency — a phase-peak
+    /// regression with no error of its own.
+    pub fn adaln_unverified_at_eviction(&self) -> usize {
+        self.adaln_unverified_at_eviction
     }
 
     /// Bytes of `adaln_proj` weight the eviction released — 0 under
