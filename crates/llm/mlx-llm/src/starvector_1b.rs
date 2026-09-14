@@ -37,6 +37,12 @@ pub const PROVIDER_ID: &str = "mlx-starvector-1b";
 const SNAPSHOT_REPOSITORY: &str = "starvector/starvector-1b-im2svg";
 const SVG_PROMPT: &str = "<svg";
 const EOS_TOKEN_ID: i32 = 0;
+const MAX_CONTEXT_TOKENS: usize = 8_192;
+// `IMAGE_TOKENS` is the CLIP class+patch sequence. The exact snapshot tokenizer encodes the
+// fixed decoder prompt as two IDs; load validates that fact against the real tokenizer.
+const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+const MAX_NEW_TOKENS: u32 =
+    (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// Snapshot of the MLX allocator while this provider is loaded.
 ///
@@ -108,11 +114,19 @@ impl StarVector1bProvider {
         }
         let dir = Path::new(&spec.source);
         validate_snapshot(dir).map_err(to_core)?;
+        let descriptor = descriptor();
+        let starvector = starvector_descriptor();
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        validate_loaded_context_cap(
+            &descriptor,
+            &starvector,
+            tokenizer.encode(SVG_PROMPT, false)?.len(),
+        )?;
         Ok(Self {
-            descriptor: descriptor(),
-            starvector: starvector_descriptor(),
+            descriptor,
+            starvector,
             model: StarVector1bModel::from_dir(dir).map_err(to_core)?,
-            tokenizer: Tokenizer::from_file(dir.join("tokenizer.json"))?,
+            tokenizer,
         })
     }
 
@@ -369,8 +383,8 @@ pub fn descriptor() -> TextLlmDescriptor {
         family: "starvector".into(),
         backend: "mlx".into(),
         capabilities: TextLlmCapabilities {
-            max_context_tokens: 8_192,
-            max_new_tokens: 4_000,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            max_new_tokens: MAX_NEW_TOKENS,
             supports_system_prompt: false,
             supports_vision: true,
             supports_video: false,
@@ -380,6 +394,26 @@ pub fn descriptor() -> TextLlmDescriptor {
             supported_constraints: Vec::new(),
         },
     }
+}
+
+fn validate_loaded_context_cap(
+    descriptor: &TextLlmDescriptor,
+    starvector: &StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> CoreResult<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| {
+            CoreError::InvalidRequest("StarVector-1B image prefix does not fit usize".into())
+        })?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("StarVector-1B prefill token count overflow".into())
+        })?;
+    core_llm::validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
 }
 
 /// Tensor-neutral model facts visible through the shared StarVector contract.
@@ -535,6 +569,14 @@ mod tests {
         let star = starvector_descriptor();
         assert_eq!(text.id, PROVIDER_ID);
         assert!(text.capabilities.supports_vision);
+        assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(text.capabilities.max_new_tokens, 7_933);
+        core_llm::validate_advertised_generated_token_cap(
+            text.capabilities.max_new_tokens,
+            text.capabilities.max_context_tokens,
+            IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT,
+        )
+        .unwrap();
         assert_eq!(star.tier, StarVectorTier::OneB);
         assert_eq!(star.preprocessing.image_size, 224);
         assert_eq!(star.projection.vision_hidden_size, 1024);
