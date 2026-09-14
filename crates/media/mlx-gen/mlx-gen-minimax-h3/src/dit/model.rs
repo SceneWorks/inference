@@ -56,6 +56,59 @@ use crate::dit::rope::{MmRope, MmRopeTables};
 /// Tensors the published `transformer/` partition carries: `50 · 12 + 21 + 17`.
 pub const PUBLISHED_DIT_TENSORS: usize = 638;
 
+/// Source handles a load still owes the sc-22414 GPU-view verification (sc-23402), grouped by the
+/// point in a request's residency schedule at which each group can be verified **without raising
+/// the phase peak**.
+///
+/// A resident DiT cannot simply `materialize` its map at load: the AdaLN precompute runs over
+/// `adaln_proj` alone (26.02 GB bf16) and evicts it before the block bodies (38.7 GB) are ever
+/// touched, so forcing all 62 GB up front would stack the two phases the residency design keeps
+/// apart. Each group is instead verified exactly where the shipped schedule first consumes it —
+/// see [`JointDit::new`] — which changes *when* the bytes land, never *which* bytes are resident.
+/// The handles are refcounted copies of the arrays the built modules hold, so keeping them costs
+/// nothing; each group is dropped once verified.
+#[derive(Debug, Clone, Default)]
+struct UnverifiedSources {
+    /// The 17 projections and the 21 refiner tensors: resident for the whole request, first
+    /// consumed by [`MiniMaxH3Dit::embed_context`].
+    head: Vec<(String, Array)>,
+    /// `transformer_blocks.{i}.adaln_proj.*`: first consumed by the AdaLN precompute (or, under
+    /// [`AdaLnResidency::Resident`], per step), and evicted right after the precompute.
+    adaln: Vec<(String, Array)>,
+    /// The ten body tensors of every block: first consumed by denoise step 1.
+    body: Vec<(String, Array)>,
+}
+
+impl UnverifiedSources {
+    fn partition(entries: Vec<(String, Array)>) -> Self {
+        let mut groups = Self::default();
+        for (key, array) in entries {
+            let group = if key.contains(".adaln_proj.") {
+                &mut groups.adaln
+            } else if key.starts_with("transformer_blocks.") {
+                &mut groups.body
+            } else {
+                &mut groups.head
+            };
+            group.push((key, array));
+        }
+        groups
+    }
+
+    /// Evaluate + verify one group and release its handles.
+    fn verify(group: &mut Vec<(String, Array)>) -> Result<()> {
+        {
+            let mut named: Vec<(&str, &Array)> = group
+                .iter()
+                .map(|(key, array)| (key.as_str(), array))
+                .collect();
+            Weights::materialize_named(&mut named)?;
+        }
+        group.clear();
+        Ok(())
+    }
+}
+
 /// The full DiT — every tensor of `transformer/`.
 #[derive(Debug, Clone)]
 pub struct MiniMaxH3Dit {
@@ -69,6 +122,10 @@ pub struct MiniMaxH3Dit {
     stream: Option<DitBlockStream>,
     rope: MmRope,
     dtype: Dtype,
+    /// Source tensors not yet GPU-verified (sc-23402). Empty once [`JointDit`] has consumed the
+    /// model; a deferred load only ever holds the `head` group here, its blocks being verified
+    /// per window by [`DitBlockStream::materialize`].
+    unverified: UnverifiedSources,
 }
 
 impl MiniMaxH3Dit {
@@ -91,7 +148,38 @@ impl MiniMaxH3Dit {
             stream: None,
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             dtype,
+            // Every tensor read above, still lazy — verified group by group from `JointDit::new`.
+            unverified: UnverifiedSources::partition(w.accessed_entries()),
         })
+    }
+
+    /// Evaluate + GPU-verify (sc-22414) the resident head — projections and refiner — if it has
+    /// not been yet. Idempotent; called before the first consumer, [`Self::embed_context`].
+    pub fn verify_head_sources(&mut self) -> Result<()> {
+        UnverifiedSources::verify(&mut self.unverified.head)
+    }
+
+    /// Evaluate + GPU-verify the `adaln_proj` sources if they have not been yet — before the
+    /// precompute that consumes (and then evicts) them. Peak-neutral: the precompute materializes
+    /// exactly these next.
+    pub fn verify_adaln_sources(&mut self) -> Result<()> {
+        UnverifiedSources::verify(&mut self.unverified.adaln)
+    }
+
+    /// Evaluate + GPU-verify the block bodies if they have not been yet — after the AdaLN
+    /// eviction, before step 1. Peak-neutral: step 1 holds every body tensor at once regardless.
+    pub fn verify_body_sources(&mut self) -> Result<()> {
+        UnverifiedSources::verify(&mut self.unverified.body)
+    }
+
+    /// Source tensors still awaiting verification, as `[head, adaln, body]` counts — the
+    /// observable the sc-23402 accounting test pins (`tests/dit_io.rs`).
+    pub fn unverified_source_counts(&self) -> [usize; 3] {
+        [
+            self.unverified.head.len(),
+            self.unverified.adaln.len(),
+            self.unverified.body.len(),
+        ]
     }
 
     /// Load **only** the 38 non-block tensors and describe the 600 block ones — rung 4's
@@ -119,11 +207,13 @@ impl MiniMaxH3Dit {
         cfg.validate()?;
         let stream = DitBlockStream::new(dir, dtype, cfg.clone())?;
 
-        let (projections, refiner) = {
+        let (projections, refiner, unverified) = {
             let mut w = Weights::from_dir(dir)?;
             let projections = DitProjections::from_weights(&mut w, &cfg)?;
             let refiner = TokenRefiner::from_weights(&mut w, "token_refiner", &cfg, dtype)?;
-            (projections, refiner)
+            // The 38 head tensors only: nothing under `transformer_blocks.` was read.
+            let unverified = UnverifiedSources::partition(w.accessed_entries());
+            (projections, refiner, unverified)
         };
 
         Ok(Self {
@@ -134,6 +224,7 @@ impl MiniMaxH3Dit {
             stream: Some(stream),
             rope: MmRope::new(cfg.rope_freq_dim, cfg.rope_theta)?,
             dtype,
+            unverified,
         })
     }
 
@@ -671,6 +762,15 @@ impl JointDit {
     ///   the four row-class timesteps per step.
     ///
     /// Consumes the model because the eviction mutates it irreversibly.
+    ///
+    /// # Where the load is GPU-verified (sc-23402)
+    ///
+    /// A resident load's source tensors are verified against the sc-22414 stale-view defect in
+    /// three groups, each immediately before the shipped schedule first consumes it, so the check
+    /// moves no residency: the head before [`MiniMaxH3Dit::embed_context`], `adaln_proj` before the
+    /// precompute that reads and evicts it, and the block bodies after that eviction — the first
+    /// point at which they are the whole of what step 1 holds. See
+    /// [`MiniMaxH3Dit::verify_body_sources`].
     pub fn new(
         mut dit: MiniMaxH3Dit,
         layout: PackedLayout,
@@ -685,6 +785,7 @@ impl JointDit {
                 crate::denoise::NUM_ROW_CLASSES
             )));
         }
+        dit.verify_head_sources()?;
         let text_rows = dit.embed_context(context)?;
         if text_rows.shape()[1] != layout.num_text_tokens() {
             return Err(Error::Msg(format!(
@@ -695,6 +796,9 @@ impl JointDit {
         }
         let tables = dit.rope.tables(layout.position_ids())?;
 
+        // Both residencies consume `adaln_proj` next: the precompute reads all of it at once, the
+        // resident sampler reads it per step. Verify it here, once, before either.
+        dit.verify_adaln_sources()?;
         let (modulation, norm_out_modulation, resident_adaln_indices, released_bytes) =
             match residency {
                 AdaLnResidency::PrecomputeAndEvict => {
@@ -745,6 +849,9 @@ impl JointDit {
                     (Modulation::Resident, None, Some(local), 0)
                 }
             };
+        // After the eviction: the bodies are now exactly what step 1 will hold, so forcing and
+        // verifying them here is peak-neutral and takes the cold reads out of the step-1 graph.
+        dit.verify_body_sources()?;
 
         Ok(Self {
             dit,
@@ -780,7 +887,7 @@ impl JointDit {
     ///   a run-state-dependent sampler can project per step, which is precisely the residency rung 4
     ///   removes.
     pub fn new_windowed(
-        dit: MiniMaxH3Dit,
+        mut dit: MiniMaxH3Dit,
         layout: PackedLayout,
         context: &Array,
         schedule: TimestepSchedule,
@@ -805,6 +912,9 @@ impl JointDit {
             .clone();
         let plan = stream.plan(window)?;
 
+        // The resident head is all a deferred load holds; its blocks are verified per window by
+        // `DitBlockStream::materialize` / `materialize_adaln` (sc-23402).
+        dit.verify_head_sources()?;
         let text_rows = dit.embed_context(context)?;
         if text_rows.shape()[1] != layout.num_text_tokens() {
             return Err(Error::Msg(format!(

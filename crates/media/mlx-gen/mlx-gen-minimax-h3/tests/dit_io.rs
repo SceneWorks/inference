@@ -302,6 +302,63 @@ fn the_seventeen_load_at_the_published_geometry() {
     assert!(DitProjections::from_weights(&mut broken, &tiny).is_err());
 }
 
+/// **sc-23402 accounting.** A resident DiT records every source tensor it read, partitioned into
+/// the three groups `JointDit::new` verifies at three different points of the residency schedule
+/// (head before `embed_context`, `adaln_proj` before the precompute, bodies after the eviction),
+/// and building the velocity model leaves none of them unverified.
+///
+/// MUTATION: delete any one of the three `verify_*_sources` calls in `JointDit::new` — the
+/// corresponding count stays non-zero and this reds. Mis-partition a key (`adaln_proj` into
+/// `body`) — the `[38, 4, 20]` split reds.
+#[test]
+fn a_resident_dit_verifies_every_source_group_before_the_schedule_consumes_it() {
+    use mlx_gen_minimax_h3::denoise::{adaln_schedule, JointSchedule};
+    use mlx_gen_minimax_h3::{
+        t2va_layout, AdaLnResidency, JointDit, JointGeometry, RequestGeometry,
+    };
+
+    let mut w = fixture();
+    let cfg = dit_fixture_config();
+    let mut dit = MiniMaxH3Dit::from_weights(&mut w, &cfg, Dtype::Float32).expect("the whole DiT");
+    // 17 projections + 21 refiner tensors; 2 `adaln_proj` tensors and 10 body tensors per block,
+    // at the fixture's 2 blocks. The fixture's `in.*` / `out.*` / `layout.*` keys were never read.
+    assert_eq!(dit.unverified_source_counts(), [38, 4, 20]);
+
+    // Each group verifies independently and exactly once.
+    dit.verify_adaln_sources().unwrap();
+    assert_eq!(dit.unverified_source_counts(), [38, 0, 20]);
+    dit.verify_adaln_sources().unwrap();
+    assert_eq!(dit.unverified_source_counts(), [38, 0, 20]);
+
+    // The shipped path: `JointDit::new` consumes the model and clears all three.
+    let dit = MiniMaxH3Dit::from_weights(&mut fixture(), &cfg, Dtype::Float32).unwrap();
+    let context = w.require("in.refiner.context").unwrap().clone();
+    let geometry = RequestGeometry {
+        width: 32 * 6,
+        height: 32 * 4,
+        joint: JointGeometry::new(5, 4, 6).unwrap(),
+    };
+    let layout = t2va_layout(&geometry, context.shape()[1], [1, 2, 2]).unwrap();
+    let schedule = adaln_schedule(&JointSchedule::new(3).unwrap()).unwrap();
+    let model = JointDit::new(
+        dit,
+        layout,
+        &context,
+        schedule,
+        AdaLnResidency::PrecomputeAndEvict,
+    )
+    .expect("velocity model over the fixture");
+    assert_eq!(
+        model.dit().unverified_source_counts(),
+        [0, 0, 0],
+        "JointDit::new must verify the head, adaln and body groups"
+    );
+    assert!(
+        model.released_bytes() > 0,
+        "the eviction still happens after the adaln verification"
+    );
+}
+
 /// **The whole-model golden** (sc-17147): the reference's own
 /// `MiniMaxH3Transformer3DModel.forward` over the fixture's packed layout, reproduced by
 /// [`MiniMaxH3Dit::forward_packed`] — which is the very function `JointDit` calls per step.

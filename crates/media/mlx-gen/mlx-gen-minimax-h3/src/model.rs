@@ -1109,6 +1109,10 @@ impl MiniMaxH3 {
             VISION_PREFIX,
             VISION_GROUP_SIZE,
         )?;
+        // sc-23402: the tower's 351 source tensors are the read set of `w` at this point — force
+        // and GPU-verify them (sc-22414) before the first tower kernel touches them cold. Peak
+        // -neutral: the tower is resident for the whole `run_vision` either way.
+        w.materialize_accessed()?;
         let grounded = crate::text_encoder::run_vision(&vision, keyframes)?;
         // Force the tower's output BEFORE dropping it, and drop its tensors out of `w` too — the
         // same discipline `encode_prompt` documents. Under lazy evaluation `grounded` is a graph
@@ -1615,11 +1619,14 @@ impl MiniMaxH3 {
             &read("metadata.json")?,
         )?;
         let mut w = Weights::from_dir(self.root.join("audio_vae"))?;
-        crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
+        let encoder = crate::audio_vae_encoder::MiniMaxH3AudioVaeEncoder::from_weights(
             &mut w,
             &cfg,
             Dtype::Float32,
-        )
+        )?;
+        // sc-23402: force + GPU-verify the read set (sc-22414) before the first encode.
+        w.materialize_accessed()?;
+        Ok(encoder)
     }
 
     /// The `ref2va` presentation: the vision tower over every **visual** reference, spliced into
@@ -1682,6 +1689,10 @@ impl MiniMaxH3 {
             VISION_PREFIX,
             VISION_GROUP_SIZE,
         )?;
+        // sc-23402: same as `encode_prompt_grounded` — the tower is the FIRST big load of a
+        // `ref2va` request and the packed token table the second; both are verified at their
+        // load boundary now, the table in `MiniMaxH3TextEncoder::from_weights`.
+        w.materialize_accessed()?;
         let grounded = crate::text_encoder::run_vision(&vision, &sources)?;
         let mut forced: Vec<&mlx_rs::Array> = grounded.embeds.iter().collect();
         forced.extend(grounded.deepstack.iter().flatten());
@@ -1785,6 +1796,8 @@ impl MiniMaxH3 {
         )?;
         let mut w = Weights::from_dir(self.root.join("audio_vae"))?;
         let vae = MiniMaxH3AudioVae::from_weights(&mut w, &cfg, Dtype::Float32)?;
+        // sc-23402: force + GPU-verify the read set (sc-22414) before the decode consumes it.
+        w.materialize_accessed()?;
         let track = vae.decode_audio_track(latents)?;
         release((vae, w));
         Ok(track)
