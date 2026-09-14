@@ -35,6 +35,12 @@ pub const VOCAB_SIZE: usize = 49_156;
 const SVG_PROMPT: &str = "<svg";
 /// StarCoderBase's `<|endoftext|>` id. It terminates generation and is never decoded as source.
 const EOS_TOKEN_ID: i32 = 0;
+const MAX_CONTEXT_TOKENS: usize = 8_192;
+// The loaded snapshot tokenizer must still encode the fixed decoder prompt as two IDs; `load`
+// checks that before the descriptor is trusted by request validation.
+const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+const MAX_NEW_TOKENS: u32 =
+    (MAX_CONTEXT_TOKENS - (IMAGE_TOKEN_COUNT + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// Join the half-precision vision adapter output to the decoder's dense embedding stream.
 ///
@@ -378,14 +384,17 @@ impl CandleStarVectorProvider {
         }
         let tokenizer =
             core_llm::Tokenizer::from_file(Path::new(&spec.source).join("tokenizer.json"))?;
-        let prompt = tokenizer
+        let prompt: Vec<i32> = tokenizer
             .encode(SVG_PROMPT, false)?
             .into_iter()
             .map(|id| id as i32)
             .collect();
+        let descriptor = descriptor();
+        let svg = svg_descriptor();
+        validate_loaded_context_cap(&descriptor, &svg, prompt.len())?;
         Ok(Self {
-            descriptor: descriptor(),
-            svg: svg_descriptor(),
+            descriptor,
+            svg,
             processor: StarVectorImageProcessor::default(),
             tokenizer,
             prompt,
@@ -399,8 +408,8 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
         family: "starvector-1b".into(),
         backend: "candle".into(),
         capabilities: core_llm::TextLlmCapabilities {
-            max_context_tokens: 8192,
-            max_new_tokens: 4096,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            max_new_tokens: MAX_NEW_TOKENS,
             supports_system_prompt: false,
             supports_vision: true,
             supports_video: false,
@@ -410,6 +419,26 @@ pub fn descriptor() -> core_llm::TextLlmDescriptor {
             supported_constraints: vec![],
         },
     }
+}
+
+fn validate_loaded_context_cap(
+    descriptor: &core_llm::TextLlmDescriptor,
+    starvector: &core_llm::StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> core_llm::Result<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| {
+            core_llm::Error::InvalidRequest("StarVector-1B image prefix does not fit usize".into())
+        })?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| {
+            core_llm::Error::InvalidRequest("StarVector-1B prefill token count overflow".into())
+        })?;
+    core_llm::validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
 }
 pub fn svg_descriptor() -> core_llm::StarVectorDescriptor {
     core_llm::StarVectorDescriptor {
@@ -469,7 +498,7 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             _ => core_llm::FinishReason::Stop,
         };
         let usage = core_llm::Usage {
-            prompt_tokens: (257 + self.prompt.len()) as u32,
+            prompt_tokens: (IMAGE_TOKEN_COUNT + self.prompt.len()) as u32,
             generated_tokens: out.generated_tokens,
         };
         events(core_llm::StreamEvent::Done {
@@ -572,7 +601,10 @@ impl core_llm::StarVectorProvider for CandleStarVectorProvider {
                 let embed = model.decoder.embeddings(&next).map_err(to_core)?;
                 logits = model
                     .decoder
-                    .forward_embeds(&embed, 257 + self.prompt.len() + index as usize)
+                    .forward_embeds(
+                        &embed,
+                        IMAGE_TOKEN_COUNT + self.prompt.len() + index as usize,
+                    )
                     .map_err(to_core)?;
             }
             if stream.output().is_err() {
@@ -640,6 +672,19 @@ mod tests {
         malformed = exact_config();
         malformed["starcoder_model_name"] = json!("bigcode/starcoder2-3b");
         assert!(StarVectorConfig::from_json(&malformed).is_err());
+    }
+
+    #[test]
+    fn descriptor_reserves_the_exact_image_and_svg_prefill() {
+        let text = descriptor();
+        assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(text.capabilities.max_new_tokens, 7_933);
+        core_llm::validate_advertised_generated_token_cap(
+            text.capabilities.max_new_tokens,
+            text.capabilities.max_context_tokens,
+            IMAGE_TOKEN_COUNT + SVG_PROMPT_TOKEN_COUNT,
+        )
+        .unwrap();
     }
 
     #[test]

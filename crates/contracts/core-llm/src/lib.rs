@@ -83,10 +83,11 @@ pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
 pub use starvector::{
-    DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorBoundedStream,
-    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
-    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier,
-    VisionEncoderArchitecture,
+    generated_token_budget, validate_advertised_generated_token_cap,
+    validate_generated_token_budget, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,
+    StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
+    StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
+    StarVectorTier, VisionEncoderArchitecture,
 };
 pub use stop::{StopChunk, StopMatcher};
 pub use template::{

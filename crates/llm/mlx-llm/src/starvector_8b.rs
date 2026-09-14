@@ -41,6 +41,12 @@ const IMAGE_SIZE: usize = 384;
 const IMAGE_TOKENS: i32 = 576;
 const VISION_HIDDEN: i32 = 1024;
 const DECODER_HIDDEN: i32 = 4608;
+const MAX_CONTEXT_TOKENS: usize = 16_000;
+// The exact snapshot tokenizer encodes the fixed `<svg` decoder prompt as two IDs; `load`
+// verifies this against the local snapshot before provider advertisement is trusted.
+const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+const MAX_NEW_TOKENS: u32 =
+    (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// A fully loaded StarVector-8B MLX model. Dropping it releases all MLX array handles; reload is
 /// an ordinary new explicit-registry load.
@@ -157,15 +163,23 @@ impl StarVector8bProvider {
         }
         let dir = Path::new(&spec.source);
         validate_snapshot(dir).map_err(to_core)?;
+        let descriptor = descriptor();
+        let starvector = starvector_descriptor();
+        let tokenizer = Tokenizer::from_hf_byte_level_bpe(
+            dir.join("vocab.json"),
+            dir.join("merges.txt"),
+            dir.join("tokenizer_config.json"),
+        )?;
+        validate_loaded_context_cap(
+            &descriptor,
+            &starvector,
+            tokenizer.encode(SVG_PROMPT, false)?.len(),
+        )?;
         Ok(Self {
-            descriptor: descriptor(),
-            starvector: starvector_descriptor(),
+            descriptor,
+            starvector,
             model: StarVector8bModel::from_dir(dir).map_err(to_core)?,
-            tokenizer: Tokenizer::from_hf_byte_level_bpe(
-                dir.join("vocab.json"),
-                dir.join("merges.txt"),
-                dir.join("tokenizer_config.json"),
-            )?,
+            tokenizer,
         })
     }
 
@@ -417,8 +431,8 @@ pub fn descriptor() -> TextLlmDescriptor {
         family: "starvector".into(),
         backend: "mlx".into(),
         capabilities: TextLlmCapabilities {
-            max_context_tokens: 16_000,
-            max_new_tokens: 4_000,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            max_new_tokens: MAX_NEW_TOKENS,
             supports_system_prompt: false,
             supports_vision: true,
             supports_video: false,
@@ -428,6 +442,26 @@ pub fn descriptor() -> TextLlmDescriptor {
             supported_constraints: Vec::new(),
         },
     }
+}
+
+fn validate_loaded_context_cap(
+    descriptor: &TextLlmDescriptor,
+    starvector: &StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> CoreResult<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| {
+            CoreError::InvalidRequest("StarVector-8B image prefix does not fit usize".into())
+        })?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("StarVector-8B prefill token count overflow".into())
+        })?;
+    core_llm::validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
 }
 
 /// Tensor-neutral model facts visible through the shared StarVector contract.
@@ -591,6 +625,14 @@ mod tests {
         let star = starvector_descriptor();
         assert_eq!(text.id, PROVIDER_ID);
         assert!(text.capabilities.supports_vision);
+        assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(text.capabilities.max_new_tokens, 15_422);
+        core_llm::validate_advertised_generated_token_cap(
+            text.capabilities.max_new_tokens,
+            text.capabilities.max_context_tokens,
+            IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT,
+        )
+        .unwrap();
         assert_eq!(star.tier, StarVectorTier::EightB);
         assert_eq!(star.preprocessing.image_size, 384);
         assert!(!star.preprocessing.preserve_aspect_ratio);
