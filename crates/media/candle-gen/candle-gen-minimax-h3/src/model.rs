@@ -1100,12 +1100,21 @@ impl MiniMaxH3 {
         // --- 0. normalize every reference onto the model's own rates and resolutions ------------
         // References do NOT bind the canvas: the geometry was already resolved (16:9 by default)
         // and each reference is put on its own resolution here.
+        //
+        // The image short edge is the request's effective one (sc-23402), validated before any
+        // weight was read. It sizes the reference and its latent rows only.
+        let reference_short_edge =
+            candle_gen::gen_core::effective_reference_image_short_edge(req) as i32;
         let mut normalized: Vec<Ref2VaReference> = Vec::with_capacity(references.len());
         for r in references.as_slice() {
             normalized.push(match r {
-                Ref2VaReference::Image(img) => Ref2VaReference::Image(
-                    crate::reference::normalize_reference_image(img, SPATIAL_STRIDE as i32)?,
-                ),
+                Ref2VaReference::Image(img) => {
+                    Ref2VaReference::Image(crate::reference::normalize_reference_image(
+                        img,
+                        SPATIAL_STRIDE as i32,
+                        reference_short_edge,
+                    )?)
+                }
                 Ref2VaReference::Video(v) => Ref2VaReference::Video(VideoReference {
                     frames: crate::reference::normalize_reference_clip(
                         &v.frames,
@@ -1721,6 +1730,11 @@ impl Generator for MiniMaxH3 {
         // sc-19571 — the conditioning-strength refusal runs at the request boundary, not deep
         // inside a render that has already mapped the text encoder.
         reject_keyframe_strength(&req.keyframes())?;
+
+        // sc-23402 — the reference-image short edge, refused here for the same reason: this is the
+        // only gate that runs before any weight is read. Unconditional rather than ref2va-only, so
+        // a value typed onto a request carrying no image reference is still caught.
+        candle_gen::gen_core::validate_reference_image_short_edge(MODEL_ID, req)?;
 
         // **The area budget runs HERE, not only inside `generate`** (sc-17152).
         //

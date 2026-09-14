@@ -426,6 +426,24 @@ pub struct GenerationRequest {
     /// [`Capabilities::supports_generated_keyframes`]: an engine that does not advertise it
     /// refuses a positive value on the shared floor.
     pub num_generated_keyframes: Option<u32>,
+    /// The **short edge an image reference is encoded at**, in pixels (sc-23402). Admitted range
+    /// [`REFERENCE_IMAGE_SHORT_EDGE_MIN`]`..=`[`REFERENCE_IMAGE_SHORT_EDGE_MAX`] inclusive; `None`
+    /// ⇒ [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`], which is upstream's own
+    /// `reference_image_short_edge` pipeline default.
+    ///
+    /// This sizes the **reference**, never the render: a reference is encoded at its own resolution
+    /// and does not bind the generated geometry, so lowering it trades reference *token count*
+    /// (roughly quadratic in the short edge) against how much detail the conditioner and the
+    /// reference-latent rows carry. It is not an output-resolution control.
+    ///
+    /// An out-of-range value is **refused** before any weight is read, naming the field, the value
+    /// and the range — never clamped, because a silently clamped reference changes the token budget
+    /// the caller believes it measured. Read the effective value with
+    /// [`effective_reference_image_short_edge`]; the consumer records that in the attempt's recipe,
+    /// exactly as it records [`steps`](Self::steps) / [`guidance`](Self::guidance).
+    ///
+    /// Today only MiniMax-H3's `ref2va` task reads it; other models ignore it.
+    pub reference_image_short_edge: Option<u32>,
     /// Number of DFR temporal ×2 refine rounds, `0..=2` (reference `--temporal-upsample-rounds`:
     /// each round doubles the frame rate, splits the canvas into `2^round` keyframe-seam tiles and
     /// re-denoises them ancestrally). Requires the temporal latent upsampler component and a
@@ -921,6 +939,7 @@ impl Default for GenerationRequest {
             video_mode: None,
             trim_first_frames: None,
             num_generated_keyframes: None,
+            reference_image_short_edge: None,
             temporal_upsample_rounds: None,
             auto_duration: None,
             motion_bucket_id: None,
@@ -1167,6 +1186,9 @@ impl GenerationRequest {
             trim_first_frames: _,
             // Integer DFR knobs (sc-18789): slot count + round count carry no floats.
             num_generated_keyframes: _,
+            // sc-23402: an integer pixel extent, range-checked by
+            // `validate_reference_image_short_edge` rather than by the float floor.
+            reference_image_short_edge: _,
             temporal_upsample_rounds: _,
             // sc-18778: the auto-duration range's floats are validated at construction
             // (`AutoDurationRange::new` refuses non-finite / inverted / non-positive bounds), so
@@ -1645,6 +1667,60 @@ pub fn default_seed() -> u64 {
         // Fall back to a nonzero value: 0 is the "no seed" sentinel a caller would pass to mean
         // "pick one", so the default must never itself be 0 (F-089).
         .unwrap_or(1)
+}
+
+/// Smallest admitted [`GenerationRequest::reference_image_short_edge`] (sc-23402).
+///
+/// The floor is a judgement, not a checkpoint constant: below roughly 1024 the reference stops
+/// carrying the subject detail the conditioner and the reference-latent rows are there to supply,
+/// and the saving is already ~4× the token count of the default.
+pub const REFERENCE_IMAGE_SHORT_EDGE_MIN: u32 = 1024;
+
+/// Largest admitted [`GenerationRequest::reference_image_short_edge`], equal to
+/// [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`] (sc-23402).
+///
+/// The knob only ever goes **downward** from upstream's default: upstream's value is the released
+/// checkpoint's own rule (see `mlx_gen_minimax_h3::reference::REFERENCE_IMAGE_SHORT_EDGE` for the
+/// citation), so admitting more than it would be inventing a regime nothing was conditioned on.
+pub const REFERENCE_IMAGE_SHORT_EDGE_MAX: u32 = 2048;
+
+/// [`GenerationRequest::reference_image_short_edge`] when the request omits one — upstream's own
+/// `reference_image_short_edge` pipeline default (sc-23402).
+pub const REFERENCE_IMAGE_SHORT_EDGE_DEFAULT: u32 = 2048;
+
+/// The **effective** reference-image short edge for one request: the requested value, or
+/// [`REFERENCE_IMAGE_SHORT_EDGE_DEFAULT`] when it omits one (sc-23402).
+///
+/// One resolver, shared by the engine that applies the value and by the consumer that records it in
+/// the attempt's recipe, so the recorded number cannot drift from the rendered one. It resolves
+/// *without* range-checking — [`validate_reference_image_short_edge`] is the refusal, and it runs
+/// before any weight is read.
+pub fn effective_reference_image_short_edge(req: &GenerationRequest) -> u32 {
+    req.reference_image_short_edge
+        .unwrap_or(REFERENCE_IMAGE_SHORT_EDGE_DEFAULT)
+}
+
+/// Refuse an out-of-range [`GenerationRequest::reference_image_short_edge`] (sc-23402).
+///
+/// **Fail closed, never clamp.** The value changes the reference token count, which is the whole
+/// reason a caller sets it; a silently clamped request would report one budget and render another.
+/// The message names the field, the value and the admitted range so the caller can tell a typo from
+/// an unsupported control.
+///
+/// `id` is the model's descriptor id, as everywhere else on the request floor. A request that omits
+/// the field validates vacuously, so this is inert for every caller that has not opted in.
+pub fn validate_reference_image_short_edge(id: &str, req: &GenerationRequest) -> Result<()> {
+    if let Some(edge) = req.reference_image_short_edge {
+        if !(REFERENCE_IMAGE_SHORT_EDGE_MIN..=REFERENCE_IMAGE_SHORT_EDGE_MAX).contains(&edge) {
+            return Err(Error::Msg(format!(
+                "{id}: reference_image_short_edge must be in \
+                 {REFERENCE_IMAGE_SHORT_EDGE_MIN}..={REFERENCE_IMAGE_SHORT_EDGE_MAX}, got {edge} \
+                 (it sizes the REFERENCE, not the render — it is refused rather than clamped \
+                 because clamping would change the reference token budget silently)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Typed conditioning inputs. Each image family uses the subset its `Capabilities` advertises.
@@ -6426,5 +6502,65 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ok.first_nonfinite_float(), None);
+    }
+
+    /// sc-23402 — the reference-image short edge is admitted over 1024..=2048 INCLUSIVE, and an
+    /// out-of-range value is refused rather than clamped.
+    ///
+    /// The two boundary pairs are the whole point: an exclusive upper bound, an off-by-one floor, or
+    /// a `clamp` in place of the refusal each flips exactly one of these four.
+    #[test]
+    fn reference_image_short_edge_admits_1024_through_2048_inclusive_and_refuses_outside() {
+        let with = |edge: Option<u32>| GenerationRequest {
+            reference_image_short_edge: edge,
+            ..Default::default()
+        };
+
+        validate_reference_image_short_edge("m", &with(Some(1024))).expect("1024 is admitted");
+        validate_reference_image_short_edge("m", &with(Some(2048))).expect("2048 is admitted");
+        validate_reference_image_short_edge("m", &with(None)).expect("an absent knob is vacuous");
+
+        for bad in [0, 1, 1023, 2049, u32::MAX] {
+            let message = validate_reference_image_short_edge("m", &with(Some(bad)))
+                .expect_err("out of range is refused, never clamped")
+                .to_string();
+            assert!(
+                message.contains("reference_image_short_edge")
+                    && message.contains(&bad.to_string())
+                    && message.contains("1024..=2048"),
+                "the refusal must name the field, the value and the range, got: {message}"
+            );
+        }
+    }
+
+    /// The effective value is the request's, or upstream's 2048 when absent — the one resolver the
+    /// engine applies and the consumer records, so a recipe cannot drift from the render.
+    #[test]
+    fn effective_reference_image_short_edge_defaults_to_upstreams_2048() {
+        let default_request = GenerationRequest::default();
+        assert_eq!(default_request.reference_image_short_edge, None);
+        assert_eq!(
+            effective_reference_image_short_edge(&default_request),
+            REFERENCE_IMAGE_SHORT_EDGE_DEFAULT
+        );
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, 2048);
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_MAX, 2048);
+        assert_eq!(REFERENCE_IMAGE_SHORT_EDGE_MIN, 1024);
+
+        for asked in [
+            REFERENCE_IMAGE_SHORT_EDGE_MIN,
+            1536,
+            REFERENCE_IMAGE_SHORT_EDGE_MAX,
+        ] {
+            let req = GenerationRequest {
+                reference_image_short_edge: Some(asked),
+                ..Default::default()
+            };
+            assert_eq!(
+                effective_reference_image_short_edge(&req),
+                asked,
+                "the resolver must return the REQUESTED value, not a constant"
+            );
+        }
     }
 }

@@ -205,14 +205,24 @@ pub fn sample_video_condition_frames(
     Ok((indices, block_timestamps))
 }
 
-/// Resize an **image** reference onto its own [`REFERENCE_IMAGE_SHORT_EDGE`], on the stride-32
-/// lattice.
+/// Resize an **image** reference onto `short_edge`, on the stride-32 lattice.
 ///
 /// **No area cap and upscaling included** — an image reference is encoded at high detail, unlike a
 /// video reference and the generated canvas which share the one canvas rule. This is the concrete
 /// mechanism behind "references do not bind the generated geometry": the returned size depends only
-/// on the image, never on the request's canvas.
-pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<Image> {
+/// on the image and `short_edge`, never on the request's canvas.
+///
+/// `short_edge` is the request's effective
+/// [`reference_image_short_edge`](candle_gen::gen_core::GenerationRequest::reference_image_short_edge)
+/// — [`REFERENCE_IMAGE_SHORT_EDGE`] unless the caller lowered it, admitted over 1024..=2048
+/// (sc-23402). It buys **reference token count**, roughly quadratic in it, and does not change the
+/// rendered clip's size. The caller passes an already-validated value; a non-positive one is refused
+/// here as a defect rather than silently producing a degenerate plate.
+pub fn normalize_reference_image(
+    image: &Image,
+    canvas_multiple: i32,
+    short_edge: i32,
+) -> Result<Image> {
     if image.width == 0 || image.height == 0 {
         return Err(CandleError::Msg(
             "minimax-h3 ref2va: cannot normalize a zero-extent reference image".into(),
@@ -223,8 +233,13 @@ pub fn normalize_reference_image(image: &Image, canvas_multiple: i32) -> Result<
             "minimax-h3 ref2va: canvas multiple must be positive, got {canvas_multiple}"
         )));
     }
+    if short_edge <= 0 {
+        return Err(CandleError::Msg(format!(
+            "minimax-h3 ref2va: reference_image_short_edge must be positive, got {short_edge}"
+        )));
+    }
     let (w, h) = (f64::from(image.width), f64::from(image.height));
-    let scale = f64::from(REFERENCE_IMAGE_SHORT_EDGE) / w.min(h);
+    let scale = f64::from(short_edge) / w.min(h);
     let m = f64::from(canvas_multiple);
     let round_to =
         |v: f64| (crate::keyframe::round_half_to_even(v * scale / m) * m).max(m) as i32 as u32;
@@ -1106,7 +1121,9 @@ mod tests {
     #[test]
     fn an_image_reference_is_normalized_to_its_own_short_edge_with_no_area_cap() {
         let stride = crate::pipeline::SPATIAL_STRIDE as i32;
-        let up = normalize_reference_image(&image(64, 64), stride).unwrap();
+        let up =
+            normalize_reference_image(&image(64, 64), stride, REFERENCE_IMAGE_SHORT_EDGE as i32)
+                .unwrap();
         assert_eq!((up.width, up.height), (2048, 2048));
         assert!(
             u64::from(up.width) * u64::from(up.height)
@@ -1115,13 +1132,59 @@ mod tests {
         );
 
         // Aspect is preserved and both edges land on the 32 lattice.
-        let wide = normalize_reference_image(&image(400, 200), stride).unwrap();
+        let wide =
+            normalize_reference_image(&image(400, 200), stride, REFERENCE_IMAGE_SHORT_EDGE as i32)
+                .unwrap();
         assert_eq!((wide.width, wide.height), (4096, 2048));
         assert_eq!(wide.width % crate::pipeline::SPATIAL_STRIDE, 0);
         assert_eq!(wide.height % crate::pipeline::SPATIAL_STRIDE, 0);
 
-        assert!(normalize_reference_image(&image(0, 8), 32).is_err());
-        assert!(normalize_reference_image(&image(8, 8), 0).is_err());
+        assert!(normalize_reference_image(&image(0, 8), 32, 2048).is_err());
+        assert!(normalize_reference_image(&image(8, 8), 0, 2048).is_err());
+        assert!(normalize_reference_image(&image(8, 8), 32, 0).is_err());
+    }
+
+    /// sc-23402 — the requested short edge really drives the normalized geometry, and 1024 costs
+    /// about a quarter the reference tokens 2048 does.
+    ///
+    /// A 576x320 plate (the film harness's working aspect) is asserted at its **scaled dimensions**
+    /// rather than against the constant, so a caller-supplied value that was ignored, clamped back to
+    /// the default, or applied to the wrong edge all red here.
+    #[test]
+    fn the_requested_short_edge_scales_the_reference_and_quarters_its_token_count() {
+        let stride = crate::pipeline::SPATIAL_STRIDE as i32;
+        let plate = image(576, 320);
+
+        let at_2048 = normalize_reference_image(&plate, stride, 2048).unwrap();
+        let at_1024 = normalize_reference_image(&plate, stride, 1024).unwrap();
+
+        assert_eq!((at_2048.width, at_2048.height), (3680, 2048));
+        assert_eq!((at_1024.width, at_1024.height), (1856, 1024));
+        for edge in [at_2048.width, at_2048.height, at_1024.width, at_1024.height] {
+            assert_eq!(
+                edge % crate::pipeline::SPATIAL_STRIDE,
+                0,
+                "off the 32 lattice"
+            );
+        }
+
+        // Tokens are proportional to area; 1024 is one quarter of 2048's, up to lattice rounding.
+        let area = |i: &Image| u64::from(i.width) * u64::from(i.height);
+        let ratio = area(&at_2048) as f64 / area(&at_1024) as f64;
+        assert!(
+            (3.9..=4.1).contains(&ratio),
+            "halving the short edge must quarter the reference token count, got {ratio}x"
+        );
+
+        // The default is upstream's 2048 — the same geometry, reached without naming a value.
+        let default_edge = candle_gen::gen_core::effective_reference_image_short_edge(
+            &candle_gen::gen_core::GenerationRequest::default(),
+        ) as i32;
+        let at_default = normalize_reference_image(&plate, stride, default_edge).unwrap();
+        assert_eq!(
+            (at_default.width, at_default.height),
+            (at_2048.width, at_2048.height)
+        );
     }
 
     /// A clip too short to fill one merged vision group is rejected rather than padded, and the
