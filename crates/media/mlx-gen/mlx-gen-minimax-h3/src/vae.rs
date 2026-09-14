@@ -223,6 +223,9 @@ impl MiniMaxH3VideoVae {
         let cfg = MiniMaxH3VaeConfig::from_diffusers_json(&text)?;
         let mut w = Weights::from_dir(&dir)?;
         let vae = Self::from_weights(&mut w, &cfg, dtype)?;
+        // sc-23402: force + GPU-verify the 703-tensor read set (sc-22414) at the load boundary.
+        // Peak-neutral — the VAE is resident for the whole encode or decode it is loaded for.
+        w.materialize_accessed()?;
         // **Production is strict.** `from_weights` tolerates a decode-only weight map because the
         // committed parity fixture is one; a real `vae/` component always ships all 703 tensors,
         // so a snapshot missing the encode half is a broken download, not a supported shape. Fail

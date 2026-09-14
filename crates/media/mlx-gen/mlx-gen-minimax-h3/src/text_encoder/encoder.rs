@@ -18,8 +18,8 @@
 //! proves this by asserting the port matches `hidden_states[50]` *and* differs from both
 //! `hidden_states[49]` and `hidden_states[51]`, so a shift in either direction fails.
 
-use mlx_rs::ops::{add, concatenate_axis};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::{add, concatenate_axis, dequantize_device};
+use mlx_rs::{Array, Dtype, StreamOrDevice};
 
 use mlx_gen::nn::{build_mask, TextRope, TokenEmbedding};
 use mlx_gen::weights::Weights;
@@ -89,6 +89,17 @@ impl MiniMaxH3TextEncoder {
     ///
     /// Deliberately loads **only** the layers it will run — `{prefix}.norm.weight`, layers
     /// `select_hidden..num_layers` and `lm_head.weight` are never touched.
+    ///
+    /// # The consumed set is materialized and GPU-verified before this returns (sc-23402)
+    ///
+    /// Every tensor this constructor read out of `w` is evaluated and its GPU view checked against
+    /// the CPU's ([`mlx_gen::coherence`], sc-22414) through [`Weights::materialize_accessed`] —
+    /// exactly the read set, never the map's unused tail. The resident forward holds all of these
+    /// at once anyway (the `layers` vector keeps every weight reachable for the whole walk), so the
+    /// stage peak is unchanged; what changes is that no cold `Load` is first touched by a Metal
+    /// kernel *inside* the forward, where a stale view reads as zeros and walks the stack unseen.
+    /// The q4 tier's packed token table is what did exactly that on the `ref2va` route
+    /// (sc-23402): the dense-only screen in `embed_screened` never covered it.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &MiniMaxH3TeConfig) -> Result<Self> {
         let out_layer = cfg.out_layer()?;
         if out_layer as i32 >= cfg.num_layers {
@@ -110,8 +121,13 @@ impl MiniMaxH3TextEncoder {
                 cfg.rms_norm_eps,
             )?);
         }
+        let embed_tokens = embedding(w, &join_key(prefix, "embed_tokens"))?;
+        // LOAD-BEARING (sc-23402): evaluate + GPU-verify the read set before any forward — see the
+        // constructor doc. This is the resident twin of the per-window `materialize_accessed` in
+        // `crate::block_stream`.
+        w.materialize_accessed()?;
         Ok(Self {
-            embed_tokens: embedding(w, &join_key(prefix, "embed_tokens"))?,
+            embed_tokens,
             layers,
             stream: None,
             window: None,
@@ -155,8 +171,10 @@ impl MiniMaxH3TextEncoder {
     ///   window held a second, independent map over the same 14 shard files.
     ///
     /// Forcing it here costs no extra bytes — the table has to be resident for the forward either
-    /// way — and is the idiom `mlx-gen-krea`'s encoder already uses
-    /// ([`TokenEmbedding::materialize_weights`]).
+    /// way. It is forced **through the map** ([`Weights::materialize_accessed`]) rather than by a
+    /// bare eval of the built table, so the force is also the sc-22414 GPU-view check on the packed
+    /// or dense source tensors (sc-23402); `mlx-gen-krea`'s
+    /// [`TokenEmbedding::materialize_weights`] idiom evaluates without verifying.
     pub fn from_dir_deferred(
         dir: impl AsRef<std::path::Path>,
         prefix: &str,
@@ -176,7 +194,9 @@ impl MiniMaxH3TextEncoder {
             let w = Weights::from_dir(dir)?;
             let embed_tokens = embedding(&w, &join_key(prefix, "embed_tokens"))?;
             // LOAD-BEARING, and it must happen before `w` goes out of scope — see the doc above.
-            embed_tokens.materialize_weights()?;
+            // The map's read set is exactly the token table's one (dense) or three (packed)
+            // tensors, so this forces and verifies precisely that.
+            w.materialize_accessed()?;
             embed_tokens
         };
         Ok(Self {
@@ -262,37 +282,90 @@ impl MiniMaxH3TextEncoder {
     /// conditioning. Check CPU validity first, then GPU visibility; neither an all-zero output
     /// nor agreement between two invalid buffers identifies the original read mechanism.
     /// Only the embedding table is materialized here; deferred layers retain their block window.
+    ///
+    /// # Both table representations are screened (sc-23402)
+    ///
+    /// Until sc-23402 the CPU check and the GPU-view verification ran for a **dense** table only;
+    /// a packed `q4` / `q8` table (the tier every SceneWorks MiniMax-H3 render ships) went straight
+    /// to the Metal gather, and on the `ref2va` route that gather was the first GPU touch of three
+    /// cold `Load` buffers — `wq`, `scales`, `biases` — exposed to the sc-22414 stale-view defect.
+    /// The packed arm reproduces the dense one exactly: the requested rows are gathered **and
+    /// dequantized on the CPU stream** as the validity reference, then all three source tensors are
+    /// verified at the GPU view.
     fn embed_screened(&self, producer: &'static str, input_ids: &Array) -> Result<Array> {
-        if let TokenEmbedding::Dense(weight) = &self.embed_tokens {
-            // sc-23053: a failed read can leave BOTH views zero, so agreement
-            // alone is not validation. Check the requested rows on the CPU
-            // before waiting for the GPU's view of the table to agree. This
-            // materializes only the embedding, never the deferred layer stack.
-            let cpu = mlx_rs::StreamOrDevice::cpu();
-            let reference = weight
-                .take_axis_device(input_ids, 0, &cpu)?
-                .as_dtype_device(Dtype::Float32, &cpu)?;
-            if let Some(defect) =
-                super::degeneracy::inspect_conditioning_on(producer, &reference, cpu)?
-            {
-                return Err(Error::Msg(format!(
-                    "CPU token-embedding lookup is invalid; this is not a GPU-only visibility \
-                     disagreement. Check the loaded weights and token IDs. {defect}"
-                )));
-            }
-            let before = mlx_gen::coherence::retries();
-            mlx_gen::coherence::verify_gpu_view([("minimax-h3 embed_tokens", weight)])?;
-            let retries = mlx_gen::coherence::retries().saturating_sub(before);
-            if retries != 0 {
-                eprintln!(
-                    "minimax-h3 {producer}: GPU weight visibility recovered after {retries} \
-                     verification retries (sc-23053); generation has not been retried"
-                );
-            }
+        // sc-23053: a failed read can leave BOTH views zero, so agreement alone is not validation.
+        // Check the requested rows on the CPU before waiting for the GPU's view of the table to
+        // agree. This materializes only the embedding, never the deferred layer stack.
+        let cpu = StreamOrDevice::cpu();
+        let reference = self.cpu_token_lookup(input_ids, &cpu)?;
+        if let Some(defect) = super::degeneracy::inspect_conditioning_on(producer, &reference, cpu)?
+        {
+            return Err(Error::Msg(format!(
+                "CPU token-embedding lookup is invalid; this is not a GPU-only visibility \
+                 disagreement. Check the loaded weights and token IDs. {defect}"
+            )));
+        }
+        let before = mlx_gen::coherence::retries();
+        mlx_gen::coherence::verify_gpu_view(self.token_table_sources())?;
+        let retries = mlx_gen::coherence::retries().saturating_sub(before);
+        if retries != 0 {
+            eprintln!(
+                "minimax-h3 {producer}: GPU weight visibility recovered after {retries} \
+                 verification retries (sc-23053); generation has not been retried"
+            );
         }
         let hidden = self.embed_tokens.forward(input_ids)?;
         super::degeneracy::refuse_if_degenerate(producer, &hidden)?;
         Ok(hidden)
+    }
+
+    /// The token-table lookup for `input_ids`, computed **entirely on `stream`** (the CPU one, in
+    /// [`Self::embed_screened`]) as f32 — the validity reference that does not depend on the GPU's
+    /// view of the table. A packed table is gathered per row and dequantized on the same stream.
+    fn cpu_token_lookup(&self, input_ids: &Array, stream: &StreamOrDevice) -> Result<Array> {
+        let rows = match &self.embed_tokens {
+            TokenEmbedding::Dense(weight) => weight.take_axis_device(input_ids, 0, stream)?,
+            TokenEmbedding::Quantized {
+                wq,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => {
+                let pw = wq.take_axis_device(input_ids, 0, stream)?;
+                let sc = scales.take_axis_device(input_ids, 0, stream)?;
+                let bi = biases.take_axis_device(input_ids, 0, stream)?;
+                dequantize_device(&pw, &sc, Some(&bi), *group_size, *bits, stream)?
+            }
+        };
+        Ok(rows.as_dtype_device(Dtype::Float32, stream)?)
+    }
+
+    /// The source tensors the token-table lookup reads — one for a dense table, three for a packed
+    /// one — named for the sc-22414 coherence check.
+    fn token_table_sources(&self) -> Vec<(&'static str, &Array)> {
+        match &self.embed_tokens {
+            TokenEmbedding::Dense(weight) => vec![("minimax-h3 embed_tokens.weight", weight)],
+            TokenEmbedding::Quantized {
+                wq, scales, biases, ..
+            } => vec![
+                ("minimax-h3 embed_tokens.weight", wq),
+                ("minimax-h3 embed_tokens.scales", scales),
+                ("minimax-h3 embed_tokens.biases", biases),
+            ],
+        }
+    }
+
+    /// The screened token-embedding lookup on its own — `embed_screened` for the `ref2va` route,
+    /// without the splice or the decoder walk.
+    ///
+    /// This is the seam the sc-23402 real-weight repro drives
+    /// (`tests/ref2va_reference_partition_real.rs`): it performs the same cold-second-load
+    /// sequence the shipped `ref2va` path does and stops at the first GPU touch of the token table,
+    /// so an incidence count is a few seconds per iteration rather than a 50-layer forward over a
+    /// 14 801-row presentation. Not a render path.
+    pub fn screened_ref2va_token_embedding(&self, input_ids: &Array) -> Result<Array> {
+        self.embed_screened(GroundedRoute::Ref2va.embed_label(), input_ids)
     }
 
     /// [`Self::run_layers`] without the screen — the residency dispatch on its own.
@@ -741,6 +814,21 @@ mod tests {
         }
     }
 
+    /// [`tiny_config`] at widths a 64-element quantization group divides: every packable last
+    /// dimension (`hidden_size` for the token table and the q/k/v/gate/up projections,
+    /// `intermediate_size` for `down_proj`, `num_heads · head_dim` for `o_proj`) is 64, so
+    /// `MiniMaxH3TextEncoder::quantize` accepts it. Used by the packed-table arms only; the dense
+    /// arms keep the narrower geometry.
+    fn packed_tiny_config() -> MiniMaxH3TeConfig {
+        MiniMaxH3TeConfig {
+            hidden_size: 64,
+            intermediate_size: 64,
+            head_dim: 32,
+            mrope_section: [8, 4, 4],
+            ..tiny_config()
+        }
+    }
+
     /// A deterministic, non-constant, sign-mixed bf16 weight.
     fn weight(seed: u64, shape: &[i32]) -> Array {
         let n: usize = shape.iter().map(|&d| d as usize).product();
@@ -887,6 +975,92 @@ mod tests {
             .forward_with_images(&g.input_ids, &g.mask, &g.embeds, &g.deepstack, &g.grids)
             .expect("a live grounded encoder must forward");
         assert_eq!(context.shape(), &[1, 6, cfg.hidden_size]);
+    }
+
+    /// **The sc-23402 mutation target.** A *packed* token table — the q4/q8 tier every shipped
+    /// MiniMax-H3 render uses — must be screened at the CPU lookup exactly like a dense one, on the
+    /// `ref2va` route. Until sc-23402 `embed_screened` matched `TokenEmbedding::Dense` only, so a
+    /// zeroed packed table reached the Metal gather unscreened and unverified.
+    ///
+    /// Restore the dense-only `if let` around the CPU check and the coherence call: the refusal
+    /// still fires (from the post-lookup screen) but without the `CPU token-embedding lookup is
+    /// invalid` clause, and this arm reds while every dense arm stays green.
+    #[test]
+    fn forward_with_references_screens_a_zeroed_packed_token_table_at_the_cpu_lookup() {
+        let cfg = packed_tiny_config();
+        let mut te =
+            MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, false), TEST_PREFIX, &cfg)
+                .expect("build tiny encoder");
+        te.quantize(4).expect("pack the tiny encoder in place");
+        assert!(te.token_table_is_quantized(), "the fixture must be packed");
+        let g = tiny_grounded(&cfg);
+
+        let message = te
+            .forward_with_references(&g.input_ids, &g.mask, &g.embeds, &g.deepstack, &g.grids)
+            .expect_err("a zeroed packed token table must be refused on the ref2va route")
+            .to_string();
+        assert!(
+            message.contains("ref2va token embedding"),
+            "the refusal must name the ref2va embedding stage: {message}"
+        );
+        assert!(
+            message.contains("CPU token-embedding lookup is invalid"),
+            "the packed table must be screened at the CPU lookup, not only after the gather: \
+             {message}"
+        );
+    }
+
+    /// The packed arm's CPU reference is the same lookup the GPU gather performs: a live packed
+    /// table passes the screen with no coherence retry, and the CPU-stream dequantized rows equal
+    /// the default-stream ones element for element. Without this the arm above would be green for
+    /// a CPU lookup that dequantizes garbage.
+    #[test]
+    fn a_live_packed_token_table_passes_the_screen_and_matches_the_gpu_lookup() {
+        let cfg = packed_tiny_config();
+        let mut te =
+            MiniMaxH3TextEncoder::from_weights(&tiny_weights(&cfg, true), TEST_PREFIX, &cfg)
+                .expect("build tiny encoder");
+        te.quantize(4).expect("pack the tiny encoder in place");
+        let (ids, _) = tiny_prompt(&cfg);
+
+        let before = mlx_gen::coherence::retries();
+        let hidden = te
+            .screened_ref2va_token_embedding(&ids)
+            .expect("a live packed table must pass the screen");
+        assert_eq!(hidden.shape(), &[1, 6, cfg.hidden_size]);
+        assert_eq!(
+            mlx_gen::coherence::retries(),
+            before,
+            "a coherent table needs no GPU re-read"
+        );
+
+        let cpu = StreamOrDevice::cpu();
+        let reference = te.cpu_token_lookup(&ids, &cpu).unwrap();
+        let gpu = te.embed_tokens.forward(&ids).unwrap();
+        let drift = reference
+            .subtract(&gpu)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        // The two streams round the affine dequantize differently at bf16 (one ulp at |x|≈0.5
+        // measured: 1/512); anything wider would be a different lookup, not a rounding.
+        assert!(
+            drift <= 4.0e-3,
+            "CPU and GPU dequantized lookups must agree to bf16 rounding, drift {drift}"
+        );
+        let magnitude = reference.abs().unwrap().max(None).unwrap().item::<f32>();
+        assert!(
+            magnitude > 0.0,
+            "the CPU reference must carry the live rows"
+        );
+        assert_eq!(
+            te.token_table_sources().len(),
+            3,
+            "a packed table verifies weight, scales and biases"
+        );
     }
 
     /// **Why the post-stack screen is not enough**, stated as a measurement rather than an argument:
