@@ -49,7 +49,9 @@ use mlx_gen::media::Image;
 use mlx_gen_boogu::VisionTower;
 use mlx_gen_minimax_h3::model::{load, DIT_COMPONENT, TEXT_ENCODER_COMPONENT};
 use mlx_gen_minimax_h3::pipeline::{resolve_geometry, PATCH_SIZE, SPATIAL_STRIDE};
-use mlx_gen_minimax_h3::reference::{normalize_reference_image, ReferencePresentation};
+use mlx_gen_minimax_h3::reference::{
+    normalize_reference_image, ReferencePresentation, REFERENCE_IMAGE_SHORT_EDGE,
+};
 use mlx_gen_minimax_h3::text_encoder::{
     self as te, ConditioningDefect, MiniMaxH3TeConfig, MiniMaxH3TextEncoder, MiniMaxH3Tokenizer,
     GROUP_SIZE, LM_PREFIX, VISION_PREFIX,
@@ -152,7 +154,10 @@ fn cold_second_load_token_embedding_incidence_probe() {
     // tower sees it — that is where a 576x320 plate becomes ~7 400 vision tokens.
     let images: Vec<Image> = reference_images()
         .iter()
-        .map(|i| normalize_reference_image(i, SPATIAL_STRIDE as i32).expect("normalize"))
+        .map(|i| {
+            normalize_reference_image(i, SPATIAL_STRIDE as i32, REFERENCE_IMAGE_SHORT_EDGE)
+                .expect("normalize")
+        })
         .collect();
     let retries = mlx_gen::coherence::retries;
 
@@ -340,7 +345,9 @@ fn reference_partition_step_cost_against_base() {
         let per_image: Vec<i32> = reference_images()
             .iter()
             .map(|i| {
-                let n = normalize_reference_image(i, SPATIAL_STRIDE as i32).unwrap();
+                let n =
+                    normalize_reference_image(i, SPATIAL_STRIDE as i32, REFERENCE_IMAGE_SHORT_EDGE)
+                        .unwrap();
                 ((n.width / 32) * (n.height / 32)) as i32
             })
             .collect();

@@ -129,13 +129,16 @@ pub use execution_domains::{
 pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
+    default_seed, effective_component_quant, effective_reference_image_short_edge,
+    reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
     AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
     ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
     ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
     Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
     PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
     StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+    REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
+    REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
 pub use hdr::{
     exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
