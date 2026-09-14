@@ -17,6 +17,7 @@ MODELS = ROOT / "release/real-weight-models.toml"
 CORPUS = ROOT / "release/starvector-terminal-corpus-v1.json"
 SCHEMA = ROOT / "release/starvector-terminal-receipt-v1.schema.json"
 V2_SCHEMA = ROOT / "release/starvector-terminal-receipt-v2.schema.json"
+V2_OUTCOME_SCHEMA = ROOT / "release/starvector-terminal-receipt-v2-outcome-parity.schema.json"
 HARNESS = ROOT / "scripts/release/starvector_terminal_evidence.mjs"
 PREFLIGHT_ASSEMBLER = ROOT / "scripts/release/starvector_terminal_preflight.mjs"
 
@@ -233,6 +234,10 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
         self.assertEqual(len(corpus["upstream_image_quality_cases"]["sources"]), 4)
 
     def test_v2_schema_adds_closed_failed_campaign_lineage_without_mutating_v1(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(V2_SCHEMA.read_bytes()).hexdigest(),
+            "9971014cde19faf49f2ac7a091d9057851ecb83537de05cb390be56f4302c71d",
+        )
         schema = json.loads(V2_SCHEMA.read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
         self.assertIn("campaign_lineage", schema["required"])
@@ -269,6 +274,7 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             schema["$defs"]["source_artifact"]["properties"]["digest"]["pattern"],
             "^sha256:[0-9a-f]{64}$",
         )
+
         self.assertEqual(
             set(schema["$defs"]["source_artifact"]["required"]),
             {
@@ -299,6 +305,15 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             "#/$defs/quarantine_entry",
         )
         self.assertEqual(schema["$defs"]["artifact_manifest"]["properties"]["entries"]["maxItems"], 100000)
+
+    def test_v2_outcome_parity_profile_is_separate_from_archived_v2_schema(self) -> None:
+        schema = json.loads(V2_OUTCOME_SCHEMA.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        parity = schema["$defs"]["upstream_parity"]
+        self.assertEqual(parity["properties"]["contract_version"]["const"], 2)
+        cases = parity["properties"]["cases"]["items"]
+        self.assertIn("native_outcome", cases["properties"])
+        self.assertIn("native_rejection_code", cases["properties"])
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))

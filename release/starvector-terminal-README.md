@@ -48,11 +48,26 @@ strictly positive; no producer-supplied bootstrap, median, validity, or p95 fiel
 
 ## Current receipt V2
 
-V1 remains an immutable historical format. Current V2 deliberately replaces its two-native-run
-repeatability check with 20 native-to-upstream comparisons per backend/tier. The cases are the first
-five rows of each selected source (quality indices 0–4, 30–34, 60–64, 90–94), with seed equal to parity
-index. Each case binds its input PNG, native preview, upstream SVG and upstream preview, and requires
-rendered SSIM >= 0.995. `upstream_reference` binds the official StarVector implementation at
+V1 remains an immutable historical format. V2 deliberately replaced its two-native-run
+repeatability check with 20 native-to-upstream comparisons per backend/tier. Historical V2 receipts
+and the exact `starvector-terminal-receipt-v2.schema.json` bytes remain unchanged. The separate
+`starvector-terminal-receipt-v2-outcome-parity.schema.json` profile validates new receipts. Receipts
+without a parity sub-contract version keep their original rule: every case binds two rendered
+previews and requires SSIM >= 0.995. New V2 receipts set `deterministic_parity.contract_version` to
+`2`. They must match the upstream accept/reject decision on all 20 cases. Accepted pairs bind the
+native preview, upstream SVG and upstream preview and still require rendered SSIM >= 0.995. Rejected
+pairs bind both typed rejection reasons, the same normalized sanitizer or generation-limit class,
+the native provider transcript, the upstream raw SVG, and any sanitizer diagnostics; sanitizer
+rejections also bind the retained native raw SVG. Rejections carry no preview or SSIM and do not
+count toward the separate 120-case image-quality conversion rate.
+
+The current campaign passes the selected profile path and SHA-256 to the production validator.
+That selection requires receipt schema V2 and parity contract version 2 on every run. Omitting the
+profile flags is supported only for archived V1/V2 recovery validation; it cannot validate a new
+outcome-parity campaign.
+
+The cases are the first five rows of each selected source (quality indices 0–4, 30–34, 60–64, 90–94),
+with seed equal to parity index. `upstream_reference` binds the official StarVector implementation at
 `0e083c1911760aa31bc576ca7f337a7f8ee605ec`, exact checkpoint repository/revision/inventory, config,
 processor and execution transcript. The oracle runs independently in terminal tooling, never in a
 shipping provider. V2's p95 <=120-second latency criterion applies to the 1B tiers only; all image
@@ -81,7 +96,9 @@ not fabricate one-byte fixture sizes. Run:
 node scripts/release/starvector_terminal_evidence.mjs validate-receipt \
   --corpus release/starvector-terminal-corpus-v1.json --receipt receipt.json \
   --inference-revision <main-revision> --sceneworks-revision <head> \
-  --evidence-root <canonical-evidence-directory>
+  --evidence-root <canonical-evidence-directory> \
+  --profile-schema release/starvector-terminal-receipt-v2-outcome-parity.schema.json \
+  --profile-sha256 fc11cf850f46ed6553a387dd2b6e7b3471a729f40e5116bd39c8fec2c6899e35
 ```
 
 The current receipt, producer, actual workflow/API provenance, and files must be reconciled together
