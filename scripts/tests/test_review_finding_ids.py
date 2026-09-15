@@ -170,9 +170,10 @@ class ReviewFindingIdTests(unittest.TestCase):
         (self.root / document).unlink()
         self.write_registry(list(self.gate.LEGACY_ALLOCATIONS))
         resolved = subprocess.CompletedProcess(["git", "rev-parse"], 0)
+        listed = subprocess.CompletedProcess(["git", "ls-tree"], 0, stdout=self.gate.REGISTRY.as_posix() + "\n")
         shown = subprocess.CompletedProcess(["git", "show"], 0, stdout=base_registry)
         with mock.patch.object(
-            self.gate.subprocess, "run", side_effect=[resolved, shown]
+            self.gate.subprocess, "run", side_effect=[resolved, listed, shown]
         ) as run:
             result, stdout, stderr = self.run_main("reachable-base")
 
@@ -180,14 +181,15 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("warning:", stderr)
         self.assertIn("allocation registry is append-only", stderr)
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[1].args[0][:2], ["git", "show"])
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[2].args[0][:2], ["git", "show"])
 
     def test_reachable_base_registry_read_failure_does_not_fall_back(self) -> None:
         resolved = subprocess.CompletedProcess(["git", "rev-parse"], 0)
+        listed = subprocess.CompletedProcess(["git", "ls-tree"], 0, stdout=self.gate.REGISTRY.as_posix() + "\n")
         show_failure = subprocess.CalledProcessError(128, ["git", "show"])
         with mock.patch.object(
-            self.gate.subprocess, "run", side_effect=[resolved, show_failure]
+            self.gate.subprocess, "run", side_effect=[resolved, listed, show_failure]
         ):
             result, stdout, stderr = self.run_main("reachable-base")
 
@@ -195,6 +197,34 @@ class ReviewFindingIdTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertNotIn("warning:", stderr)
         self.assertIn("error: unable to inspect base revision", stderr)
+
+    def test_base_before_registry_introduction_still_validates_current_tree(self) -> None:
+        # Exercise real Git: a reachable historical commit has no registry, while
+        # the working tree introduces one. A corrupt current registry still fails.
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+             "commit", "--allow-empty", "-qm", "Before registry"],
+            cwd=self.root, check=True,
+        )
+        result, stdout, stderr = self.run_main("HEAD")
+        self.assertEqual(result, 0)
+        self.assertIn("review finding ids: OK", stdout)
+        self.assertEqual(stderr, "")
+        (self.root / self.gate.REGISTRY).write_text("malformed registry\n", encoding="utf-8")
+        result, stdout, stderr = self.run_main("HEAD")
+        self.assertEqual(result, 1)
+        self.assertIn("four tab-separated fields", stderr)
+
+    def test_base_tree_read_failure_does_not_fall_back(self) -> None:
+        resolved = subprocess.CompletedProcess(["git", "rev-parse"], 0)
+        failure = subprocess.CalledProcessError(128, ["git", "ls-tree"])
+        with mock.patch.object(self.gate.subprocess, "run", side_effect=[resolved, failure]):
+            result, stdout, stderr = self.run_main("reachable-base")
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("error: unable to inspect base revision", stderr)
+        self.assertNotIn("warning:", stderr)
 
     def test_base_resolution_usage_failure_does_not_fall_back(self) -> None:
         usage_failure = subprocess.CompletedProcess(
