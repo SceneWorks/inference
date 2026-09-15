@@ -50,6 +50,13 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"MLX terminal command missing {name}")
     if mlx.count("--exact --ignored --nocapture") != 2:
         errors.append("MLX terminal command missing exact filters")
+    for acquisition in (
+        "ensure_model_snapshot.py",
+        "real-weights-huggingface-hub-macos-arm64-py312.txt",
+        "-m pip install",
+    ):
+        if acquisition in mlx:
+            errors.append(f"MLX terminal lane may not acquire snapshots or Hub packages: {acquisition}")
     for artifact in (
         "inventory/starvector-1b-inventory.json",
         "inventory/starvector-8b-inventory.json",
@@ -84,6 +91,13 @@ def terminal_workflow_errors(workflow: str) -> list[str]:
             errors.append(f"Candle terminal command missing {name}")
     if candle.count("--exact --ignored --nocapture") != 2:
         errors.append("Candle terminal command missing exact filters")
+    for acquisition in (
+        "ensure_model_snapshot.py",
+        "real-weights-huggingface-hub-windows-x64-py312.txt",
+        "-m pip install",
+    ):
+        if acquisition in candle:
+            errors.append(f"Candle terminal lane may not acquire snapshots or Hub packages: {acquisition}")
     for artifact in (
         "candle-cuda-starvector-1b.log",
         "candle-cuda-starvector-8b.log",
@@ -149,6 +163,9 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
             (mutate(mlx_start, candle_start, "--exact --ignored --nocapture"), "MLX terminal command missing exact filters"),
             (mutate(mlx_start, candle_start, "inputs.profile == 'starvector-terminal'"), "MLX terminal lane is not dispatch-only"),
             (mutate(candle_start, candle_end, ' --workflow-run-attempt "%GITHUB_RUN_ATTEMPT%"'), "workflow-run-attempt"),
+            (mutate(mlx_start, candle_start, "verify_model_snapshot.py"), "MLX terminal command missing"),
+            (workflow[:mlx_start] + workflow[mlx_start:candle_start] + "\n          python3.12 scripts/release/ensure_model_snapshot.py\n" + workflow[candle_start:], "MLX terminal lane may not acquire snapshots"),
+            (workflow[:candle_start] + workflow[candle_start:candle_end] + "\n          %REVIEWED_PYTHON% -m pip install huggingface-hub\n" + workflow[candle_end:], "Candle terminal lane may not acquire snapshots"),
         )
         for mutated, expected in cases:
             with self.subTest(expected=expected):
@@ -317,6 +334,15 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
 
     def test_harness_rejects_a_corpus_count_mutation(self) -> None:
         corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+        valid = subprocess.run(
+            ["node", str(HARNESS), "validate-plan", "--corpus", str(CORPUS)],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertRegex(valid.stdout, r"^corpus_sha256=[0-9a-f]{64}\s*$")
         corpus["upstream_image_quality_cases"]["sources"][0]["row_count"] = 29
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mutated.json"

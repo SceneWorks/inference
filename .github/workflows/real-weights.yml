@@ -1589,14 +1589,11 @@ jobs:
         run: >-
           scripts/ci/report_runner_disk_headroom.sh
           STARVECTOR_1B_SNAPSHOT STARVECTOR_8B_SNAPSHOT
-      - name: Materialize and verify exact native snapshots
+      - name: Verify pre-provisioned exact native snapshots
         env:
           STARVECTOR_TERMINAL_DIR: ${{ runner.temp }}/starvector-terminal-mlx
         run: |
           set -o pipefail
-          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT"
-          PYTHONPATH="$RUNNER_TEMP/huggingface-hub" python3.12 scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT"
           mkdir -p "$STARVECTOR_TERMINAL_DIR/inventory" "$STARVECTOR_TERMINAL_DIR/hooks"
           python3.12 scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "$STARVECTOR_1B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/inventory/starvector-1b-inventory.json"
           python3.12 scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "$STARVECTOR_8B_SNAPSHOT" --inventory-output "$STARVECTOR_TERMINAL_DIR/inventory/starvector-8b-inventory.json"
@@ -1663,13 +1660,9 @@ jobs:
           if not defined REVIEWED_PYTHON exit /b 1
           "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
           echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
-      - name: Materialize and verify exact native snapshots
+      - name: Verify pre-provisioned exact native snapshots
         shell: cmd
         run: |
-          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
-          set "PYTHONPATH=%RUNNER_TEMP%\\huggingface-hub"
-          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" || exit /b 1
-          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" || exit /b 1
           if not exist "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" mkdir "%RUNNER_TEMP%\\starvector-terminal-candle-inventory" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-1b-im2svg --snapshot "%STARVECTOR_1B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-1b-inventory.json" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/verify_model_snapshot.py --model starvector-8b-im2svg --snapshot "%STARVECTOR_8B_SNAPSHOT%" --inventory-output "%RUNNER_TEMP%\\starvector-terminal-candle-inventory\\starvector-8b-inventory.json" || exit /b 1

@@ -172,7 +172,8 @@ test("V2 uses measured current artifact sizes with complete immutable overlap an
     for(const entry of currentArtifactReferences(value,corpus)) {
       const hostileMatch=entry.path.match(/^hostile\/(\d+)\/input$/),promptMatch=entry.path.match(/^prompt\/(\d+)\/prompt_sha256$/);
       const bytes=hostileMatch?hostilePayload(Number(hostileMatch[1])):promptMatch?promptPayload(Number(promptMatch[1])):`realistic current artifact ${entry.path}\n${"data ".repeat(29)}`;
-      const file=join(directory,...entry.path.split("/"));mkdirSync(join(file,".."),{recursive:true});writeFileSync(file,bytes);sizes.set(entry.path,statSync(file).size);
+      const physicalPath=(hostileMatch||promptMatch||process.platform!=="win32")?entry.path:entry.path.replaceAll(":","__colon__");
+      const file=join(directory,...physicalPath.split("/"));mkdirSync(join(file,".."),{recursive:true});writeFileSync(file,bytes);sizes.set(entry.path,statSync(file).size);
     }
     value.artifact_manifest=buildManifest(value,sizes);value.producer.artifact_manifest_sha256=value.artifact_manifest.aggregate_sha256;
     assert(value.artifact_manifest.entries.filter(entry=>!entry.path.startsWith("lineage/")&&!entry.path.startsWith("quarantine/")).every(entry=>entry.byte_size>1));
